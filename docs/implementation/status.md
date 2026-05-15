@@ -6,8 +6,8 @@ R1 Foundation Alpha.
 
 ## Active Task
 
-R1 Foundation Alpha local execution is complete. The next active task is R1
-hardening/examples or the first R2 Kubernetes Distributed Alpha design slice.
+R1 Foundation Alpha and R1.1 hardening/examples are complete. The next active
+task is the first R2 Kubernetes Distributed Alpha design and skeleton slice.
 
 ## Completed
 
@@ -39,6 +39,13 @@ hardening/examples or the first R2 Kubernetes Distributed Alpha design slice.
 - Added embedded/single-node SQL-over-Parquet parity coverage.
 - Added R1 CLI golden tests for `sql` and `explain`.
 - Updated R1 SQL compatibility, crate map, file guide, and tracker docs.
+- Created R1 checkpoint commit `dd19774`.
+- Added runnable Cargo examples for embedded SQL over Parquet and bounded memory streams.
+- Added batch SQL README commands for `krishiv sql`, `krishiv explain`, and Parquet registration.
+- Added broader R1 CLI contract tests for projection, filter, aggregate, limit, invalid SQL, and missing Parquet files.
+- Added Parquet aggregate golden output.
+- Added R1 Foundation Alpha release notes.
+- Updated R1 tracker with the R1.1 hardening checklist.
 
 ## In Progress
 
@@ -46,10 +53,10 @@ hardening/examples or the first R2 Kubernetes Distributed Alpha design slice.
 
 ## Next Steps
 
-1. Add examples for embedded SQL over Parquet and bounded memory streams.
-2. Add broader R1 SQL golden coverage for projection, filter, aggregate, and limit.
-3. Decide whether to start R2 coordinator/executor skeletons or finish R1 examples first.
-4. Keep R1 embedded and single-node behavior semantically aligned while R2 starts.
+1. Start R2 by adding `crates/krishiv-proto` and `crates/krishiv-scheduler`.
+2. Define R2 job, stage, task, and executor identifiers plus state models.
+3. Add in-process coordinator/executor skeletons before Kubernetes manifests.
+4. Keep all R1 embedded and single-node validation green while R2 starts.
 
 ## Known Blockers
 
@@ -68,6 +75,8 @@ hardening/examples or the first R2 Kubernetes Distributed Alpha design slice.
 - `cargo run -p krishiv-cli -- sql --query "select 1 as value"` passed.
 - `cargo run -p krishiv-cli -- explain --query "select 1 as value"` passed.
 - `cargo run -p krishiv-cli -- jobs` passed.
+- `cargo run -p krishiv-api --example local_sql_parquet` passed.
+- `cargo run -p krishiv-api --example memory_stream` passed.
 - `cargo run -p krishiv-cli -- --help` passed.
 - `cargo run -p krishiv-cli -- explain --help` passed.
 - `find . -path './target' -prune -o -type f -print | sort` confirmed the bootstrap file inventory.
@@ -80,4 +89,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r1-foundation-alpha.md`.
-4. Continue with R1 examples/hardening or begin the R2 tracker, depending on the user's next request.
+4. Begin the R2 tracker with coordinator/executor skeletons, unless the user asks for more R1 polish.

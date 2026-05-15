@@ -1,15 +1,19 @@
-# Embedded Example Placeholder
+# Embedded Examples
 
-This directory will hold R1 embedded-mode examples.
+R1 embedded examples are compiled as Cargo examples on the `krishiv-api`
+crate, where they can reuse the public Rust API directly.
 
-Expected first example:
+Run local SQL over a generated Parquet file:
 
-```rust
-use krishiv_api::{ExecutionMode, Session};
-
-let session = Session::builder()
-    .with_execution_mode(ExecutionMode::Embedded)
-    .build()?;
+```bash
+cargo run -p krishiv-api --example local_sql_parquet
 ```
 
-The current bootstrap slice only validates the API shape.
+Run a bounded in-memory stream pipeline:
+
+```bash
+cargo run -p krishiv-api --example memory_stream
+```
+
+The source files live under `crates/krishiv-api/examples/` so Cargo can build
+and validate them with the rest of the workspace.

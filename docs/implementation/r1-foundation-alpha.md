@@ -137,6 +137,21 @@ R1 is complete when:
 - [x] Embedded and single-node execution produce the same results for supported features.
 - [x] R1 SQL compatibility and known limitations are documented.
 
+## R1.1 Hardening Checklist
+
+Post-acceptance hardening before R2 starts:
+
+- [x] Commit a clean R1 Foundation Alpha checkpoint.
+- [x] Add runnable embedded SQL-over-Parquet example.
+- [x] Add runnable bounded memory stream example.
+- [x] Add batch SQL command examples.
+- [x] Add broader CLI coverage for projection, filter, aggregate, and limit.
+- [x] Add CLI Parquet query-path coverage.
+- [x] Add invalid SQL error coverage.
+- [x] Add missing Parquet file error coverage.
+- [x] Add R1 release notes.
+- [x] Update status ledger and file guide.
+
 ## Risks And Mitigations
 
 | Risk | Mitigation |

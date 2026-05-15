@@ -1730,7 +1730,10 @@ dependencies = [
 name = "krishiv-cli"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "krishiv-api",
+ "parquet",
+ "tempfile",
 ]
 
 [[package]]

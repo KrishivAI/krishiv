@@ -17,10 +17,13 @@ This guide explains the files introduced by the R1 bootstrap slice. It is meant 
 |---|---|
 | `crates/krishiv-api/Cargo.toml` | Defines the public API crate, local dependencies, and Arrow/Tokio integration. |
 | `crates/krishiv-api/src/lib.rs` | Exposes `Session`, `SessionBuilder`, `DataFrame`, `Stream`, `ExecutionMode`, Arrow-backed `QueryResult`, and `StreamBatch`. |
+| `crates/krishiv-api/examples/local_sql_parquet.rs` | Runnable embedded example that writes a small Parquet file, registers it, and runs SQL. |
+| `crates/krishiv-api/examples/memory_stream.rs` | Runnable embedded example for bounded local memory stream collection. |
 | `crates/krishiv-cli/Cargo.toml` | Defines the CLI crate and `krishiv` binary target. |
 | `crates/krishiv-cli/src/lib.rs` | Owns help text, command parsing, `sql`, `explain`, and `jobs` dispatch. |
 | `crates/krishiv-cli/src/main.rs` | Thin binary entrypoint that forwards arguments to `krishiv-cli` dispatch. |
 | `crates/krishiv-cli/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
+| `crates/krishiv-cli/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |
 | `crates/krishiv-sql/Cargo.toml` | Defines the SQL seam crate and Arrow/DataFusion dependencies. |
 | `crates/krishiv-sql/src/lib.rs` | Owns DataFusion session integration, Parquet registration, SQL collect, and explain formatting. |
 | `crates/krishiv-plan/Cargo.toml` | Defines the plan crate. |
@@ -40,6 +43,7 @@ This guide explains the files introduced by the R1 bootstrap slice. It is meant 
 | `docs/architecture/file-guide.md` | This file; explains each R1 file. |
 | `docs/engineering/standards.md` | Rust, async, testing, error handling, and documentation standards. |
 | `docs/engineering/codex-workflow.md` | Rate-limit and session-resumability workflow for Codex. |
+| `docs/releases/r1-foundation-alpha.md` | R1 alpha release notes, features, limitations, example commands, and validation commands. |
 | `docs/sql-compatibility/r1.md` | R1 SQL compatibility baseline, supported surfaces, and known limitations. |
 
 ## Implementation Trackers
@@ -63,12 +67,13 @@ This guide explains the files introduced by the R1 bootstrap slice. It is meant 
 
 | File | Purpose |
 |---|---|
-| `examples/embedded/README.md` | Placeholder for future embedded-mode examples. |
-| `examples/batch-sql/README.md` | Placeholder for future local batch SQL examples. |
+| `examples/embedded/README.md` | Documents how to run R1 embedded Cargo examples. |
+| `examples/batch-sql/README.md` | Documents R1 local SQL and explain CLI commands. |
 | `tests/integration/README.md` | Placeholder for future cross-crate integration tests. |
-| `tests/golden/README.md` | Placeholder for future SQL/plan/CLI golden tests. |
+| `tests/golden/README.md` | Describes SQL/plan/CLI golden test fixtures. |
 | `tests/golden/r1-sql-literal.txt` | Golden output for a minimal `krishiv sql` query. |
 | `tests/golden/r1-explain-literal.txt` | Golden output for a minimal `krishiv explain` query. |
+| `tests/golden/r1-sql-parquet-aggregate.txt` | Golden output for a Parquet-backed projection/filter/aggregate/limit query. |
 
 ## Codex Skill Source
 
