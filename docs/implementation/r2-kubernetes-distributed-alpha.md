@@ -54,8 +54,8 @@ Out of scope:
 
 - [x] Add `krishiv submit` CLI skeleton.
 - [x] Add distributed job status output to `krishiv jobs`.
-- [ ] Define `KrishivJob` CRD.
-- [ ] Add minimal Kubernetes manifests under `k8s/`.
+- [x] Define `KrishivJob` CRD.
+- [x] Add minimal Kubernetes manifests under `k8s/`.
 - [x] Define coordinator/executor RPC messages in `krishiv-proto`.
 - [ ] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
 
@@ -79,9 +79,9 @@ Out of scope:
 - [x] Task lifecycle tests pass.
 - [x] Lost-executor marking tests pass.
 - [x] CLI submit/status tests pass.
+- [x] `KrishivJob` manifest validation tests pass.
 - [ ] Heartbeat timeout tests pass.
 - [ ] Stage retry tests pass.
-- [ ] `KrishivJob` manifest validation tests pass.
 - [ ] Kubernetes `kind` smoke test submits one batch job.
 - [ ] Kubernetes `kind` smoke test submits one early streaming job.
 

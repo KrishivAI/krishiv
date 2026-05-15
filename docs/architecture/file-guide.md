@@ -52,6 +52,21 @@ meant for humans and Codex sessions resuming implementation work.
 | `docs/releases/r1-foundation-alpha.md` | R1 alpha release notes, features, limitations, example commands, and validation commands. |
 | `docs/sql-compatibility/r1.md` | R1 SQL compatibility baseline, supported surfaces, and known limitations. |
 
+## Kubernetes Manifests
+
+| File | Purpose |
+|---|---|
+| `k8s/README.md` | Explains the R2 static Kubernetes manifest skeleton and limitations. |
+| `k8s/crds/krishivjobs.yaml` | Defines the first `krishiv.io/v1alpha1` `KrishivJob` CRD. |
+| `k8s/manifests/kustomization.yaml` | Groups the R2 CRD and minimal runtime manifests for `kubectl apply -k`. |
+| `k8s/manifests/namespace.yaml` | Defines the `krishiv-system` namespace. |
+| `k8s/manifests/serviceaccount.yaml` | Defines the controller service account. |
+| `k8s/manifests/rbac.yaml` | Defines minimal R2 controller RBAC for jobs, status, pods, services, events, and deployments. |
+| `k8s/manifests/coordinator-deployment.yaml` | Defines the single active coordinator deployment with `replicas: 1`. |
+| `k8s/manifests/coordinator-service.yaml` | Defines the coordinator service ports. |
+| `k8s/manifests/executor-deployment.yaml` | Defines replaceable executor pods for R2 static scheduling. |
+| `k8s/manifests/sample-krishivjob.yaml` | Provides a sample v1alpha1 batch `KrishivJob`. |
+
 ## Implementation Trackers
 
 | File | Purpose |
@@ -80,6 +95,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `tests/golden/r1-sql-literal.txt` | Golden output for a minimal `krishiv sql` query. |
 | `tests/golden/r1-explain-literal.txt` | Golden output for a minimal `krishiv explain` query. |
 | `tests/golden/r1-sql-parquet-aggregate.txt` | Golden output for a Parquet-backed projection/filter/aggregate/limit query. |
+| `crates/krishiv-scheduler/tests/r2_k8s_manifests.rs` | Validates the static R2 Kubernetes manifest shape offline. |
 
 ## Codex Skill Source
 

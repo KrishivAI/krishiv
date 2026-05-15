@@ -52,13 +52,27 @@ claiming Kubernetes submission:
   known to the current process.
 - `krishiv jobs` without flags preserves the R1 process-local job behavior.
 
+## Kubernetes Surface
+
+The first R2 Kubernetes slice adds static manifests under `k8s/`:
+
+- `k8s/crds/krishivjobs.yaml` defines the `krishiv.io/v1alpha1` `KrishivJob`
+  custom resource.
+- `k8s/manifests/` defines the namespace, service account, RBAC, one
+  coordinator deployment, coordinator service, replaceable executor deployment,
+  and a sample batch `KrishivJob`.
+- The coordinator deployment is intentionally `replicas: 1` to preserve the R2
+  single-active-coordinator rule.
+- Manifest tests validate the expected offline shape without requiring a
+  Kubernetes cluster.
+
 ## Limitations
 
-- No Kubernetes API integration yet.
-- No `KrishivJob` CRD yet.
+- No Kubernetes controller/operator implementation yet.
 - No gRPC/protobuf wire transport yet.
 - No durable metadata store.
 - No persistent cross-process job history.
 - No stage-level retry implementation yet.
+- No Kubernetes `kind` smoke test yet.
 - No exactly-once semantics.
 - No shuffle, checkpoint, or savepoint ownership.

@@ -6,9 +6,9 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 CLI/status slice is complete. The next active task is adding the first
-`KrishivJob` CRD and minimal Kubernetes manifests, or implementing stage-level
-retry inside the scheduler.
+R2 static Kubernetes manifest slice is complete. The next active task is
+implementing stage-level retry inside the scheduler or adding a Kubernetes
+`kind` smoke path once a controller exists.
 
 ## Completed
 
@@ -61,6 +61,10 @@ retry inside the scheduler.
 - Added scheduler detail snapshots for job/stage/task status consumers.
 - Added CLI tests for submit, distributed jobs, and submit validation.
 - Updated R2 control-plane docs and examples with the new CLI surface.
+- Added the first `krishiv.io/v1alpha1` `KrishivJob` CRD.
+- Added minimal static Kubernetes manifests under `k8s/` for namespace, service account, RBAC, one coordinator, coordinator service, executors, and a sample job.
+- Added offline manifest validation tests for the CRD, kustomization, coordinator, executor, RBAC, and sample job.
+- Updated R2 tracker, control-plane docs, file guide, and Kubernetes README.
 
 ## In Progress
 
@@ -68,9 +72,9 @@ retry inside the scheduler.
 
 ## Next Steps
 
-1. Add the first `KrishivJob` CRD and minimal Kubernetes manifests.
-2. Add manifest validation tests for the R2 Kubernetes shape.
-3. Implement stage-level retry in `krishiv-scheduler`.
+1. Implement stage-level retry in `krishiv-scheduler`.
+2. Add heartbeat timeout handling beyond manual lost-executor marking.
+3. Add status endpoint or basic Web UI for jobs, stages, tasks, and executors.
 4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
@@ -92,6 +96,7 @@ retry inside the scheduler.
 - `cargo run -p krishiv-cli -- jobs` passed.
 - `cargo run -p krishiv-cli -- submit --job-id job-demo --name demo --tasks 2 --launch` passed.
 - `cargo run -p krishiv-cli -- jobs --distributed` passed.
+- `cargo test -p krishiv-scheduler` passed, including offline R2 manifest validation tests.
 - `cargo run -p krishiv-api --example local_sql_parquet` passed.
 - `cargo run -p krishiv-api --example memory_stream` passed.
 - `cargo run -p krishiv-cli -- --help` passed.
@@ -106,4 +111,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 with `KrishivJob` manifests or stage-level retry, unless the user asks for more CLI polish.
+4. Continue R2 with stage-level retry or heartbeat timeout handling, unless the user asks for Kubernetes controller work.
