@@ -18,6 +18,39 @@ use krishiv_proto::{
 /// Scheduler result alias.
 pub type SchedulerResult<T> = Result<T, SchedulerError>;
 
+/// Coordinator behavior knobs for deterministic R2 scheduler tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+    max_stage_retries: u32,
+    heartbeat_timeout_ticks: u64,
+}
+
+impl CoordinatorConfig {
+    /// Create a coordinator config.
+    pub fn new(max_stage_retries: u32, heartbeat_timeout_ticks: u64) -> Self {
+        Self {
+            max_stage_retries,
+            heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
+        }
+    }
+
+    /// Maximum number of stage-level retries after an executor reports failure.
+    pub fn max_stage_retries(&self) -> u32 {
+        self.max_stage_retries
+    }
+
+    /// Number of scheduler ticks an executor can miss before it is marked lost.
+    pub fn heartbeat_timeout_ticks(&self) -> u64 {
+        self.heartbeat_timeout_ticks
+    }
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self::new(1, 3)
+    }
+}
+
 /// Scheduler and coordinator errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerError {
@@ -75,6 +108,7 @@ impl Error for SchedulerError {}
 pub struct Coordinator {
     coordinator_id: CoordinatorId,
     state: CoordinatorState,
+    config: CoordinatorConfig,
     executors: ExecutorRegistry,
     jobs: Vec<JobRecord>,
 }
@@ -82,20 +116,32 @@ pub struct Coordinator {
 impl Coordinator {
     /// Create an active R2 coordinator.
     pub fn active(coordinator_id: CoordinatorId) -> Self {
+        Self::active_with_config(coordinator_id, CoordinatorConfig::default())
+    }
+
+    /// Create an active R2 coordinator with explicit config.
+    pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
         Self {
             coordinator_id,
             state: CoordinatorState::Active,
-            executors: ExecutorRegistry::default(),
+            config,
+            executors: ExecutorRegistry::new(config.heartbeat_timeout_ticks()),
             jobs: Vec::new(),
         }
     }
 
     /// Create a standby R2 coordinator.
     pub fn standby(coordinator_id: CoordinatorId) -> Self {
+        Self::standby_with_config(coordinator_id, CoordinatorConfig::default())
+    }
+
+    /// Create a standby R2 coordinator with explicit config.
+    pub fn standby_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
         Self {
             coordinator_id,
             state: CoordinatorState::Standby,
-            executors: ExecutorRegistry::default(),
+            config,
+            executors: ExecutorRegistry::new(config.heartbeat_timeout_ticks()),
             jobs: Vec::new(),
         }
     }
@@ -108,6 +154,11 @@ impl Coordinator {
     /// Coordinator state.
     pub fn state(&self) -> CoordinatorState {
         self.state
+    }
+
+    /// Coordinator config.
+    pub fn config(&self) -> CoordinatorConfig {
+        self.config
     }
 
     /// Register an executor with the active coordinator.
@@ -128,6 +179,12 @@ impl Coordinator {
         self.executors.mark_lost(executor_id)
     }
 
+    /// Advance the deterministic heartbeat clock and mark timed-out executors lost.
+    pub fn advance_heartbeat_clock(&mut self, ticks: u64) -> SchedulerResult<Vec<ExecutorId>> {
+        self.ensure_active()?;
+        Ok(self.executors.advance_clock(ticks))
+    }
+
     /// Submit a job and statically assign its tasks.
     pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<()> {
         self.ensure_active()?;
@@ -141,7 +198,7 @@ impl Coordinator {
 
         let executors = self.executors.schedulable_executors();
         let assignments = StaticScheduler::place(&spec, &executors)?;
-        let mut record = JobRecord::from_spec(spec);
+        let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
         self.jobs.push(record);
         Ok(())
@@ -211,12 +268,29 @@ impl Coordinator {
 }
 
 /// Executor registry skeleton.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ExecutorRegistry {
     executors: Vec<ExecutorRecord>,
+    current_tick: u64,
+    heartbeat_timeout_ticks: u64,
+}
+
+impl Default for ExecutorRegistry {
+    fn default() -> Self {
+        Self::new(CoordinatorConfig::default().heartbeat_timeout_ticks())
+    }
 }
 
 impl ExecutorRegistry {
+    /// Create an executor registry with deterministic heartbeat timeout ticks.
+    pub fn new(heartbeat_timeout_ticks: u64) -> Self {
+        Self {
+            executors: Vec::new(),
+            current_tick: 0,
+            heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
+        }
+    }
+
     /// Register an executor.
     pub fn register(&mut self, descriptor: ExecutorDescriptor) -> SchedulerResult<()> {
         if self
@@ -229,7 +303,8 @@ impl ExecutorRegistry {
             });
         }
 
-        self.executors.push(ExecutorRecord::new(descriptor));
+        self.executors
+            .push(ExecutorRecord::new(descriptor, self.current_tick));
         Ok(())
     }
 
@@ -245,6 +320,7 @@ impl ExecutorRegistry {
 
         executor.state = heartbeat.state();
         executor.running_tasks = heartbeat.running_tasks().to_vec();
+        executor.last_heartbeat_tick = self.current_tick;
         Ok(())
     }
 
@@ -263,9 +339,35 @@ impl ExecutorRegistry {
         Ok(())
     }
 
+    /// Advance the deterministic heartbeat clock.
+    pub fn advance_clock(&mut self, ticks: u64) -> Vec<ExecutorId> {
+        self.current_tick = self.current_tick.saturating_add(ticks);
+        let mut lost = Vec::new();
+
+        for executor in &mut self.executors {
+            if executor.state().can_accept_work()
+                && self
+                    .current_tick
+                    .saturating_sub(executor.last_heartbeat_tick)
+                    >= self.heartbeat_timeout_ticks
+            {
+                executor.state = ExecutorState::Lost;
+                executor.running_tasks.clear();
+                lost.push(executor.executor_id().clone());
+            }
+        }
+
+        lost
+    }
+
     /// List registered executors.
     pub fn list(&self) -> &[ExecutorRecord] {
         &self.executors
+    }
+
+    /// Current deterministic heartbeat tick.
+    pub fn current_tick(&self) -> u64 {
+        self.current_tick
     }
 
     fn schedulable_executors(&self) -> Vec<ExecutorDescriptor> {
@@ -285,14 +387,16 @@ pub struct ExecutorRecord {
     descriptor: ExecutorDescriptor,
     state: ExecutorState,
     running_tasks: Vec<TaskId>,
+    last_heartbeat_tick: u64,
 }
 
 impl ExecutorRecord {
-    fn new(descriptor: ExecutorDescriptor) -> Self {
+    fn new(descriptor: ExecutorDescriptor, last_heartbeat_tick: u64) -> Self {
         Self {
             descriptor,
             state: ExecutorState::Registered,
             running_tasks: Vec::new(),
+            last_heartbeat_tick,
         }
     }
 
@@ -314,6 +418,11 @@ impl ExecutorRecord {
     /// Running task ids last reported by heartbeat.
     pub fn running_tasks(&self) -> &[TaskId] {
         &self.running_tasks
+    }
+
+    /// Last deterministic heartbeat tick.
+    pub fn last_heartbeat_tick(&self) -> u64 {
+        self.last_heartbeat_tick
     }
 }
 
@@ -349,11 +458,12 @@ impl StaticScheduler {
 pub struct JobRecord {
     spec: JobSpec,
     state: JobState,
+    max_stage_retries: u32,
     stages: Vec<StageRecord>,
 }
 
 impl JobRecord {
-    fn from_spec(spec: JobSpec) -> Self {
+    fn from_spec(spec: JobSpec, max_stage_retries: u32) -> Self {
         let stages = spec
             .stages()
             .iter()
@@ -363,6 +473,7 @@ impl JobRecord {
         Self {
             spec,
             state: JobState::Accepted,
+            max_stage_retries,
             stages,
         }
     }
@@ -405,6 +516,7 @@ impl JobRecord {
             for task in &mut stage.tasks {
                 if task.state == TaskState::Assigned {
                     task.state = TaskState::Running;
+                    task.attempt = task.attempt.saturating_add(1);
                     launched += 1;
                 }
             }
@@ -428,7 +540,7 @@ impl JobRecord {
                 stage_id: update.stage_id().clone(),
             })?;
 
-        stage.apply_task_update(update)?;
+        stage.apply_task_update(update, self.max_stage_retries)?;
         self.refresh_state();
         Ok(())
     }
@@ -494,6 +606,7 @@ impl JobRecord {
 pub struct StageRecord {
     spec: StageSpec,
     state: StageState,
+    retry_count: u32,
     tasks: Vec<TaskRecord>,
 }
 
@@ -508,6 +621,7 @@ impl StageRecord {
         Self {
             spec,
             state: StageState::Pending,
+            retry_count: 0,
             tasks,
         }
     }
@@ -527,7 +641,16 @@ impl StageRecord {
         &self.tasks
     }
 
-    fn apply_task_update(&mut self, update: TaskStatusUpdate) -> SchedulerResult<()> {
+    /// Number of stage-level retries already scheduled.
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    fn apply_task_update(
+        &mut self,
+        update: TaskStatusUpdate,
+        max_stage_retries: u32,
+    ) -> SchedulerResult<()> {
         let task = self
             .tasks
             .iter_mut()
@@ -539,8 +662,25 @@ impl StageRecord {
         task.state = update.state();
         task.assigned_executor = Some(update.executor_id().clone());
         task.attempt = update.attempt();
+        if update.state() == TaskState::Failed && self.retry_count < max_stage_retries {
+            self.retry_stage();
+            return Ok(());
+        }
         self.refresh_state();
         Ok(())
+    }
+
+    fn retry_stage(&mut self) {
+        self.retry_count = self.retry_count.saturating_add(1);
+        self.state = StageState::Retrying;
+
+        for task in &mut self.tasks {
+            task.state = if task.assigned_executor.is_some() {
+                TaskState::Assigned
+            } else {
+                TaskState::Pending
+            };
+        }
     }
 
     fn refresh_state(&mut self) {
@@ -577,6 +717,7 @@ impl StageRecord {
         StageSnapshot {
             stage_id: self.spec.stage_id().clone(),
             state: self.state,
+            retry_count: self.retry_count,
             task_count: self.tasks.len(),
             tasks: self.tasks.iter().map(TaskRecord::snapshot).collect(),
         }
@@ -711,6 +852,7 @@ impl JobDetailSnapshot {
 pub struct StageSnapshot {
     stage_id: StageId,
     state: StageState,
+    retry_count: u32,
     task_count: usize,
     tasks: Vec<TaskSnapshot>,
 }
@@ -724,6 +866,11 @@ impl StageSnapshot {
     /// Stage state.
     pub fn state(&self) -> StageState {
         self.state
+    }
+
+    /// Number of stage-level retries already scheduled.
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
     }
 
     /// Number of tasks in this stage.
@@ -790,7 +937,9 @@ mod tests {
         TaskStatusUpdate,
     };
 
-    use super::{Coordinator, ExecutorRegistry, SchedulerError, StaticScheduler};
+    use super::{
+        Coordinator, CoordinatorConfig, ExecutorRegistry, SchedulerError, StaticScheduler,
+    };
 
     #[test]
     fn standby_coordinator_rejects_mutation() {
@@ -818,6 +967,34 @@ mod tests {
 
         assert_eq!(registry.list().len(), 1);
         assert_eq!(registry.list()[0].state(), ExecutorState::Healthy);
+        assert_eq!(registry.list()[0].last_heartbeat_tick(), 0);
+    }
+
+    #[test]
+    fn heartbeat_timeout_marks_executor_lost() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active_with_config(
+            CoordinatorId::try_new("coord-1").unwrap(),
+            CoordinatorConfig::new(1, 2),
+        );
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+            .unwrap();
+        coordinator
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                executor_id.clone(),
+                ExecutorState::Healthy,
+            ))
+            .unwrap();
+
+        assert!(coordinator.advance_heartbeat_clock(1).unwrap().is_empty());
+        let lost = coordinator.advance_heartbeat_clock(1).unwrap();
+
+        assert_eq!(lost, vec![executor_id]);
+        assert_eq!(
+            coordinator.executor_snapshots()[0].state(),
+            ExecutorState::Lost
+        );
     }
 
     #[test]
@@ -890,7 +1067,10 @@ mod tests {
 
     #[test]
     fn task_failure_marks_stage_and_job_failed() {
-        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let mut coordinator = Coordinator::active_with_config(
+            CoordinatorId::try_new("coord-1").unwrap(),
+            CoordinatorConfig::new(0, 3),
+        );
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
         coordinator
             .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
@@ -920,6 +1100,77 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Failed);
         assert_eq!(snapshot.failed_task_count(), 1);
+    }
+
+    #[test]
+    fn task_failure_retries_entire_stage_before_terminal_failure() {
+        let mut coordinator = Coordinator::active_with_config(
+            CoordinatorId::try_new("coord-1").unwrap(),
+            CoordinatorConfig::new(1, 3),
+        );
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let first_task = job.stages()[0].tasks()[0].task_id().clone();
+        let second_task = job.stages()[0].tasks()[1].task_id().clone();
+
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+        coordinator
+            .apply_task_update(TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id.clone(),
+                first_task.clone(),
+                executor_id.clone(),
+                TaskState::Failed,
+                1,
+            ))
+            .unwrap();
+
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Running);
+        assert_eq!(snapshot.assigned_task_count(), 2);
+        assert_eq!(snapshot.failed_task_count(), 0);
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(detail.stages()[0].retry_count(), 1);
+        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Assigned);
+        assert_eq!(detail.stages()[0].tasks()[1].state(), TaskState::Assigned);
+
+        assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 2);
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(detail.stages()[0].tasks()[0].attempt(), 2);
+        assert_eq!(detail.stages()[0].tasks()[1].attempt(), 2);
+
+        coordinator
+            .apply_task_update(TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id.clone(),
+                first_task,
+                executor_id.clone(),
+                TaskState::Succeeded,
+                2,
+            ))
+            .unwrap();
+        coordinator
+            .apply_task_update(TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id,
+                second_task,
+                executor_id,
+                TaskState::Succeeded,
+                2,
+            ))
+            .unwrap();
+
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
+        assert_eq!(snapshot.succeeded_task_count(), 2);
     }
 
     #[test]

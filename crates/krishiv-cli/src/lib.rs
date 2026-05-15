@@ -660,7 +660,7 @@ mod tests {
         assert!(
             response
                 .stdout
-                .contains("task-1\tstage-1\trunning\texec-local-1\t0")
+                .contains("task-1\tstage-1\trunning\texec-local-1\t1")
         );
         assert!(response.stdout.contains("EXECUTOR\tSTATE\tSLOTS\tHOST"));
     }

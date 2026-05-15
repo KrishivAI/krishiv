@@ -31,14 +31,23 @@ leases, fencing tokens, and failover are intentionally deferred to R9.
 ## Executor Model
 
 Executors are replaceable data-plane workers. In this slice, executors can
-register, heartbeat, become healthy, and be marked lost. Executors do not own
-durable job truth.
+register, heartbeat, become healthy, and be marked lost. Heartbeat timeouts are
+modeled with deterministic scheduler ticks in R2 so tests and future
+controllers can drive timeout behavior without wall-clock coupling. Executors
+do not own durable job truth.
 
 ## Scheduling Model
 
 The R2 scheduler uses static round-robin placement over schedulable executors.
 It does not autoscale, rebalance running tasks, use resource queues, or perform
 adaptive placement.
+
+## Retry Model
+
+R2 implements conservative stage-level retry. A failed task retries the whole
+stage up to the coordinator's configured `max_stage_retries`. Retried tasks keep
+their static executor assignment and move back through the assigned/running
+lifecycle. Once retry budget is exhausted, the stage and job become failed.
 
 ## CLI Surface
 
@@ -72,7 +81,6 @@ The first R2 Kubernetes slice adds static manifests under `k8s/`:
 - No gRPC/protobuf wire transport yet.
 - No durable metadata store.
 - No persistent cross-process job history.
-- No stage-level retry implementation yet.
 - No Kubernetes `kind` smoke test yet.
 - No exactly-once semantics.
 - No shuffle, checkpoint, or savepoint ownership.

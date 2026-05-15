@@ -67,7 +67,7 @@ Out of scope:
 - [x] Implement task launch.
 - [x] Implement task completion reporting.
 - [x] Implement task failure reporting.
-- [ ] Implement stage-level retry.
+- [x] Implement stage-level retry.
 - [ ] Route distributed batch DAG execution through the scheduler.
 - [ ] Route distributed streaming DAG execution through the scheduler with local-only state semantics.
 - [ ] Preserve R1 embedded/single-node behavior.
@@ -80,8 +80,8 @@ Out of scope:
 - [x] Lost-executor marking tests pass.
 - [x] CLI submit/status tests pass.
 - [x] `KrishivJob` manifest validation tests pass.
-- [ ] Heartbeat timeout tests pass.
-- [ ] Stage retry tests pass.
+- [x] Heartbeat timeout tests pass.
+- [x] Stage retry tests pass.
 - [ ] Kubernetes `kind` smoke test submits one batch job.
 - [ ] Kubernetes `kind` smoke test submits one early streaming job.
 
