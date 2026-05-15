@@ -40,12 +40,25 @@ The R2 scheduler uses static round-robin placement over schedulable executors.
 It does not autoscale, rebalance running tasks, use resource queues, or perform
 adaptive placement.
 
+## CLI Surface
+
+The first R2 CLI slice exposes the in-process scheduler skeleton without
+claiming Kubernetes submission:
+
+- `krishiv submit` builds a synthetic distributed job spec, registers one local
+  executor, statically places tasks, and prints job, stage, task, and executor
+  status.
+- `krishiv jobs --distributed` prints the distributed status shape for jobs
+  known to the current process.
+- `krishiv jobs` without flags preserves the R1 process-local job behavior.
+
 ## Limitations
 
 - No Kubernetes API integration yet.
 - No `KrishivJob` CRD yet.
 - No gRPC/protobuf wire transport yet.
 - No durable metadata store.
+- No persistent cross-process job history.
 - No stage-level retry implementation yet.
 - No exactly-once semantics.
 - No shuffle, checkpoint, or savepoint ownership.

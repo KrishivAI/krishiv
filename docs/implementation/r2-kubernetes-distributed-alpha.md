@@ -52,8 +52,8 @@ Out of scope:
 
 ## API And Interface Deliverables
 
-- [ ] Add `krishiv submit` CLI skeleton.
-- [ ] Add distributed job status output to `krishiv jobs`.
+- [x] Add `krishiv submit` CLI skeleton.
+- [x] Add distributed job status output to `krishiv jobs`.
 - [ ] Define `KrishivJob` CRD.
 - [ ] Add minimal Kubernetes manifests under `k8s/`.
 - [x] Define coordinator/executor RPC messages in `krishiv-proto`.
@@ -78,6 +78,7 @@ Out of scope:
 - [x] Executor unit tests pass.
 - [x] Task lifecycle tests pass.
 - [x] Lost-executor marking tests pass.
+- [x] CLI submit/status tests pass.
 - [ ] Heartbeat timeout tests pass.
 - [ ] Stage retry tests pass.
 - [ ] `KrishivJob` manifest validation tests pass.

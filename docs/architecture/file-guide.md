@@ -21,7 +21,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-api/examples/local_sql_parquet.rs` | Runnable embedded example that writes a small Parquet file, registers it, and runs SQL. |
 | `crates/krishiv-api/examples/memory_stream.rs` | Runnable embedded example for bounded local memory stream collection. |
 | `crates/krishiv-cli/Cargo.toml` | Defines the CLI crate and `krishiv` binary target. |
-| `crates/krishiv-cli/src/lib.rs` | Owns help text, command parsing, `sql`, `explain`, and `jobs` dispatch. |
+| `crates/krishiv-cli/src/lib.rs` | Owns help text, command parsing, `sql`, `explain`, `submit`, and `jobs` dispatch. |
 | `crates/krishiv-cli/src/main.rs` | Thin binary entrypoint that forwards arguments to `krishiv-cli` dispatch. |
 | `crates/krishiv-cli/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
 | `crates/krishiv-cli/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |

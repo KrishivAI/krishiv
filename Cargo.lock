@@ -1732,6 +1732,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-api",
+ "krishiv-proto",
+ "krishiv-scheduler",
  "parquet",
  "tempfile",
 ]

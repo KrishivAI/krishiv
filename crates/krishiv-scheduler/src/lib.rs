@@ -165,6 +165,16 @@ impl Coordinator {
         self.find_job(job_id).map(JobRecord::snapshot)
     }
 
+    /// Snapshot one job with stage and task detail.
+    pub fn job_detail_snapshot(&self, job_id: &JobId) -> SchedulerResult<JobDetailSnapshot> {
+        self.find_job(job_id).map(JobRecord::detail_snapshot)
+    }
+
+    /// Snapshot all known jobs.
+    pub fn job_snapshots(&self) -> Vec<JobSnapshot> {
+        self.jobs.iter().map(JobRecord::snapshot).collect()
+    }
+
     /// Snapshot all known executors.
     pub fn executor_snapshots(&self) -> Vec<ExecutorRecord> {
         self.executors.list().to_vec()
@@ -470,6 +480,13 @@ impl JobRecord {
             failed_task_count,
         }
     }
+
+    fn detail_snapshot(&self) -> JobDetailSnapshot {
+        JobDetailSnapshot {
+            job: self.snapshot(),
+            stages: self.stages.iter().map(StageRecord::snapshot).collect(),
+        }
+    }
 }
 
 /// Stage record owned by a job coordinator.
@@ -555,6 +572,15 @@ impl StageRecord {
             self.state = StageState::Pending;
         }
     }
+
+    fn snapshot(&self) -> StageSnapshot {
+        StageSnapshot {
+            stage_id: self.spec.stage_id().clone(),
+            state: self.state,
+            task_count: self.tasks.len(),
+            tasks: self.tasks.iter().map(TaskRecord::snapshot).collect(),
+        }
+    }
 }
 
 /// Task record owned by a job coordinator.
@@ -594,6 +620,15 @@ impl TaskRecord {
     /// Current attempt number.
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    fn snapshot(&self) -> TaskSnapshot {
+        TaskSnapshot {
+            task_id: self.spec.task_id().clone(),
+            state: self.state,
+            assigned_executor: self.assigned_executor.clone(),
+            attempt: self.attempt,
+        }
     }
 }
 
@@ -649,6 +684,87 @@ impl JobSnapshot {
     /// Number of failed tasks.
     pub fn failed_task_count(&self) -> usize {
         self.failed_task_count
+    }
+}
+
+/// Detailed job status for CLI/UI use in later R2 slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobDetailSnapshot {
+    job: JobSnapshot,
+    stages: Vec<StageSnapshot>,
+}
+
+impl JobDetailSnapshot {
+    /// Job summary.
+    pub fn job(&self) -> &JobSnapshot {
+        &self.job
+    }
+
+    /// Stage summaries.
+    pub fn stages(&self) -> &[StageSnapshot] {
+        &self.stages
+    }
+}
+
+/// Stage status summary for CLI/UI use in later R2 slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSnapshot {
+    stage_id: StageId,
+    state: StageState,
+    task_count: usize,
+    tasks: Vec<TaskSnapshot>,
+}
+
+impl StageSnapshot {
+    /// Stage id.
+    pub fn stage_id(&self) -> &StageId {
+        &self.stage_id
+    }
+
+    /// Stage state.
+    pub fn state(&self) -> StageState {
+        self.state
+    }
+
+    /// Number of tasks in this stage.
+    pub fn task_count(&self) -> usize {
+        self.task_count
+    }
+
+    /// Task summaries.
+    pub fn tasks(&self) -> &[TaskSnapshot] {
+        &self.tasks
+    }
+}
+
+/// Task status summary for CLI/UI use in later R2 slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    task_id: TaskId,
+    state: TaskState,
+    assigned_executor: Option<ExecutorId>,
+    attempt: u32,
+}
+
+impl TaskSnapshot {
+    /// Task id.
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// Task state.
+    pub fn state(&self) -> TaskState {
+        self.state
+    }
+
+    /// Assigned executor, if any.
+    pub fn assigned_executor(&self) -> Option<&ExecutorId> {
+        self.assigned_executor.as_ref()
+    }
+
+    /// Current attempt number.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
     }
 }
 
@@ -765,6 +881,11 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 2);
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(detail.stages().len(), 1);
+        assert_eq!(detail.stages()[0].tasks().len(), 2);
+        assert_eq!(coordinator.job_snapshots().len(), 1);
     }
 
     #[test]

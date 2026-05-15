@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
-//! Command-line shell for Krishiv R1.
+//! Command-line shell for Krishiv R1/R2.
 
 use std::path::PathBuf;
 
 use krishiv_api::{ExecutionMode, Session};
+use krishiv_proto::{
+    CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
+    JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
+};
+use krishiv_scheduler::{Coordinator, JobDetailSnapshot, JobSnapshot};
 
 /// CLI response used by `main` and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,18 +47,31 @@ struct QueryCommand {
     parquet_tables: Vec<(String, PathBuf)>,
 }
 
+#[derive(Debug, Clone)]
+struct SubmitCommand {
+    job_id: String,
+    name: String,
+    kind: JobKind,
+    tasks: usize,
+    executor_id: String,
+    launch: bool,
+}
+
 /// Dispatch CLI arguments after the binary name.
 pub fn dispatch(args: &[&str]) -> CliResponse {
     match args {
         [] | ["--help"] | ["-h"] | ["help"] => CliResponse::ok(main_help()),
         ["sql"] | ["sql", "--help"] | ["sql", "-h"] => CliResponse::ok(sql_help()),
         ["explain"] | ["explain", "--help"] | ["explain", "-h"] => CliResponse::ok(explain_help()),
+        ["submit"] | ["submit", "--help"] | ["submit", "-h"] => CliResponse::ok(submit_help()),
         ["jobs", "--help"] | ["jobs", "-h"] => CliResponse::ok(jobs_help()),
         ["help", "sql"] => CliResponse::ok(sql_help()),
         ["help", "explain"] => CliResponse::ok(explain_help()),
+        ["help", "submit"] => CliResponse::ok(submit_help()),
         ["help", "jobs"] => CliResponse::ok(jobs_help()),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
+        ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
         [unknown, ..] => {
             CliResponse::err(format!("unknown command: {unknown}\n\n{}", main_help()), 2)
@@ -72,6 +90,7 @@ pub fn main_help() -> String {
          Commands:\n\
            sql       Run a local SQL query\n\
            explain   Show logical/physical plan information\n\
+           submit    Submit a distributed job to the R2 local scheduler\n\
            jobs      List local jobs for this process\n\
            help      Show help for a command\n\
          \n\
@@ -108,16 +127,36 @@ pub fn explain_help() -> String {
     )
 }
 
+/// Help text for `krishiv submit`.
+pub fn submit_help() -> String {
+    String::from(
+        "Submit a distributed job to the R2 local scheduler.\n\
+         \n\
+         Usage:\n\
+           krishiv submit [--job-id <ID>] [--name <NAME>] [--kind <batch|streaming>] [--tasks <N>] [--executor <ID>] [--launch]\n\
+         \n\
+         Examples:\n\
+           krishiv submit --job-id job-1 --name demo --tasks 2\n\
+           krishiv submit --kind streaming --tasks 1 --launch\n\
+         \n\
+         R2 note:\n\
+           This command uses the in-process scheduler skeleton. Kubernetes submission starts in a later R2 slice.\n",
+    )
+}
+
 /// Help text for `krishiv jobs`.
 pub fn jobs_help() -> String {
     String::from(
         "List local jobs for this process.\n\
          \n\
          Usage:\n\
-           krishiv jobs\n\
+           krishiv jobs [--distributed]\n\
          \n\
          R1 note:\n\
-           Jobs are local to the current process. Persistent job history starts later.\n",
+           Jobs are local to the current process. Persistent job history starts later.\n\
+         \n\
+         R2 note:\n\
+           --distributed shows the R2 scheduler status shape for this process.\n",
     )
 }
 
@@ -162,7 +201,27 @@ fn run_explain(args: &[&str]) -> CliResponse {
     }
 }
 
+fn run_submit(args: &[&str]) -> CliResponse {
+    let command = match parse_submit_command(args) {
+        Ok(command) => command,
+        Err(message) => return CliResponse::err(format!("{message}\n\n{}", submit_help()), 2),
+    };
+
+    match submit_to_local_scheduler(&command) {
+        Ok(output) => CliResponse::ok(output),
+        Err(error) => CliResponse::err(format!("{error}\n"), 1),
+    }
+}
+
 fn run_jobs(args: &[&str]) -> CliResponse {
+    if args == ["--distributed"] {
+        let coordinator = match active_local_coordinator() {
+            Ok(coordinator) => coordinator,
+            Err(error) => return CliResponse::err(format!("{error}\n"), 1),
+        };
+        return CliResponse::ok(render_distributed_jobs(&coordinator.job_snapshots()));
+    }
+
     if !args.is_empty() {
         return CliResponse::err(
             format!("unexpected arguments for jobs\n\n{}", jobs_help()),
@@ -191,6 +250,141 @@ fn run_jobs(args: &[&str]) -> CliResponse {
     }
 
     CliResponse::ok(output)
+}
+
+fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> {
+    let mut coordinator = active_local_coordinator()?;
+    let executor_id =
+        ExecutorId::try_new(command.executor_id.clone()).map_err(|error| error.to_string())?;
+    let slots = command.tasks.max(1);
+    coordinator
+        .register_executor(ExecutorDescriptor::new(
+            executor_id.clone(),
+            "local-r2-executor",
+            slots,
+        ))
+        .map_err(|error| error.to_string())?;
+    coordinator
+        .executor_heartbeat(ExecutorHeartbeat::new(
+            executor_id.clone(),
+            ExecutorState::Healthy,
+        ))
+        .map_err(|error| error.to_string())?;
+
+    let job = build_submit_job(command)?;
+    let job_id = job.job_id().clone();
+    coordinator
+        .submit_job(job)
+        .map_err(|error| error.to_string())?;
+    if command.launch {
+        coordinator
+            .launch_assigned_tasks(&job_id)
+            .map_err(|error| error.to_string())?;
+    }
+
+    let detail = coordinator
+        .job_detail_snapshot(&job_id)
+        .map_err(|error| error.to_string())?;
+    Ok(render_submit_result(
+        command.kind,
+        &detail,
+        &coordinator.executor_snapshots(),
+    ))
+}
+
+fn active_local_coordinator() -> Result<Coordinator, String> {
+    let coordinator_id =
+        CoordinatorId::try_new("coord-local").map_err(|error| error.to_string())?;
+    Ok(Coordinator::active(coordinator_id))
+}
+
+fn build_submit_job(command: &SubmitCommand) -> Result<JobSpec, String> {
+    let job_id = JobId::try_new(command.job_id.clone()).map_err(|error| error.to_string())?;
+    let mut stage = StageSpec::new(
+        StageId::try_new("stage-1").map_err(|error| error.to_string())?,
+        "r2-cli-stage",
+    );
+
+    for idx in 1..=command.tasks {
+        let task_id = TaskId::try_new(format!("task-{idx}")).map_err(|error| error.to_string())?;
+        stage = stage.with_task(TaskSpec::new(task_id, format!("r2 cli task {idx}")));
+    }
+
+    Ok(JobSpec::new(job_id, command.name.clone(), command.kind).with_stage(stage))
+}
+
+fn render_submit_result(
+    kind: JobKind,
+    detail: &JobDetailSnapshot,
+    executors: &[krishiv_scheduler::ExecutorRecord],
+) -> String {
+    let mut output = format!("Submitted distributed {kind} job through the R2 local scheduler.\n");
+    output.push_str(&render_distributed_jobs(&[detail.job().clone()]));
+
+    output.push_str("\nSTAGE\tSTATE\tTASKS\n");
+    for stage in detail.stages() {
+        output.push_str(&format!(
+            "{}\t{}\t{}\n",
+            stage.stage_id(),
+            stage.state(),
+            stage.task_count()
+        ));
+    }
+
+    output.push_str("\nTASK\tSTAGE\tSTATE\tEXECUTOR\tATTEMPT\n");
+    for stage in detail.stages() {
+        for task in stage.tasks() {
+            let executor = task
+                .assigned_executor()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| String::from("-"));
+            output.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                task.task_id(),
+                stage.stage_id(),
+                task.state(),
+                executor,
+                task.attempt()
+            ));
+        }
+    }
+
+    output.push_str("\nEXECUTOR\tSTATE\tSLOTS\tHOST\n");
+    for executor in executors {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            executor.executor_id(),
+            executor.state(),
+            executor.descriptor().slots(),
+            executor.descriptor().host()
+        ));
+    }
+
+    output
+}
+
+fn render_distributed_jobs(jobs: &[JobSnapshot]) -> String {
+    if jobs.is_empty() {
+        return String::from("No distributed jobs in this process.\n");
+    }
+
+    let mut output =
+        String::from("JOB\tSTATE\tSTAGES\tTASKS\tASSIGNED\tRUNNING\tSUCCEEDED\tFAILED\n");
+    for job in jobs {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            job.job_id(),
+            job.state(),
+            job.stage_count(),
+            job.task_count(),
+            job.assigned_task_count(),
+            job.running_task_count(),
+            job.succeeded_task_count(),
+            job.failed_task_count()
+        ));
+    }
+
+    output
 }
 
 fn build_session(command: &QueryCommand) -> Result<Session, String> {
@@ -257,6 +451,101 @@ fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     })
 }
 
+fn parse_submit_command(args: &[&str]) -> Result<SubmitCommand, String> {
+    let mut job_id = String::from("job-1");
+    let mut name = String::from("demo-distributed-job");
+    let mut kind = JobKind::Batch;
+    let mut tasks = 1;
+    let mut executor_id = String::from("exec-local-1");
+    let mut launch = false;
+    let mut idx = 0;
+
+    while idx < args.len() {
+        match args[idx] {
+            "--job-id" => {
+                idx += 1;
+                job_id = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --job-id"))?
+                    .to_string();
+            }
+            "--name" => {
+                idx += 1;
+                name = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --name"))?
+                    .to_string();
+            }
+            "--kind" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --kind"))?;
+                kind = parse_job_kind(value)?;
+            }
+            "--tasks" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --tasks"))?;
+                tasks = parse_positive_usize(value, "--tasks")?;
+            }
+            "--executor" => {
+                idx += 1;
+                executor_id = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --executor"))?
+                    .to_string();
+            }
+            "--launch" => {
+                launch = true;
+            }
+            "--help" | "-h" => {
+                return Err(String::from("help requested"));
+            }
+            unknown => return Err(format!("unknown option: {unknown}")),
+        }
+        idx += 1;
+    }
+
+    if job_id.trim().is_empty() {
+        return Err(String::from("job id cannot be empty"));
+    }
+    if name.trim().is_empty() {
+        return Err(String::from("job name cannot be empty"));
+    }
+    if executor_id.trim().is_empty() {
+        return Err(String::from("executor id cannot be empty"));
+    }
+
+    Ok(SubmitCommand {
+        job_id,
+        name,
+        kind,
+        tasks,
+        executor_id,
+        launch,
+    })
+}
+
+fn parse_job_kind(value: &str) -> Result<JobKind, String> {
+    match value {
+        "batch" => Ok(JobKind::Batch),
+        "streaming" => Ok(JobKind::Streaming),
+        other => Err(format!("unsupported job kind: {other}")),
+    }
+}
+
+fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
 fn parse_mode(value: &str) -> Result<ExecutionMode, String> {
     match value {
         "embedded" => Ok(ExecutionMode::Embedded),
@@ -291,6 +580,7 @@ mod tests {
         assert!(response.stdout.contains("Commands:"));
         assert!(response.stdout.contains("sql"));
         assert!(response.stdout.contains("explain"));
+        assert!(response.stdout.contains("submit"));
         assert!(response.stdout.contains("jobs"));
     }
 
@@ -300,6 +590,14 @@ mod tests {
 
         assert_eq!(response.exit_code, 0);
         assert!(response.stdout.contains("krishiv explain"));
+    }
+
+    #[test]
+    fn submit_help_is_available() {
+        let response = dispatch(&["help", "submit"]);
+
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("krishiv submit"));
     }
 
     #[test]
@@ -334,5 +632,48 @@ mod tests {
 
         assert_eq!(response.exit_code, 0);
         assert!(response.stdout.contains("No local jobs"));
+    }
+
+    #[test]
+    fn jobs_command_reports_empty_distributed_process() {
+        let response = dispatch(&["jobs", "--distributed"]);
+
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("No distributed jobs"));
+    }
+
+    #[test]
+    fn submit_command_uses_r2_scheduler_status_shape() {
+        let response = dispatch(&[
+            "submit", "--job-id", "job-demo", "--name", "demo", "--tasks", "2", "--launch",
+        ]);
+
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("Submitted distributed batch job"));
+        assert!(response.stdout.contains("JOB\tSTATE\tSTAGES\tTASKS"));
+        assert!(response.stdout.contains("job-demo\trunning\t1\t2"));
+        assert!(
+            response
+                .stdout
+                .contains("TASK\tSTAGE\tSTATE\tEXECUTOR\tATTEMPT")
+        );
+        assert!(
+            response
+                .stdout
+                .contains("task-1\tstage-1\trunning\texec-local-1\t0")
+        );
+        assert!(response.stdout.contains("EXECUTOR\tSTATE\tSLOTS\tHOST"));
+    }
+
+    #[test]
+    fn submit_command_rejects_zero_tasks() {
+        let response = dispatch(&["submit", "--tasks", "0"]);
+
+        assert_eq!(response.exit_code, 2);
+        assert!(
+            response
+                .stderr
+                .contains("--tasks must be greater than zero")
+        );
     }
 }

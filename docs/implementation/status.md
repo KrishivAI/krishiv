@@ -6,9 +6,9 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 slice 1 control-plane skeleton is complete. The next active task is exposing
-the skeleton through CLI/status surfaces or adding the first Kubernetes
-`KrishivJob` manifest slice.
+R2 CLI/status slice is complete. The next active task is adding the first
+`KrishivJob` CRD and minimal Kubernetes manifests, or implementing stage-level
+retry inside the scheduler.
 
 ## Completed
 
@@ -55,6 +55,12 @@ the skeleton through CLI/status surfaces or adding the first Kubernetes
 - Added executor registry, heartbeat handling, lost-executor marking, static task placement, task launch, task completion/failure updates, and job snapshots.
 - Documented the R2 control-plane skeleton and limitations.
 - Updated R2 tracker, crate map, and file guide.
+- Added `krishiv submit` CLI skeleton backed by the R2 scheduler/proto model.
+- Added `krishiv jobs --distributed` status output while preserving R1 `krishiv jobs`.
+- Added CLI output for distributed job, stage, task, and executor status in the submit path.
+- Added scheduler detail snapshots for job/stage/task status consumers.
+- Added CLI tests for submit, distributed jobs, and submit validation.
+- Updated R2 control-plane docs and examples with the new CLI surface.
 
 ## In Progress
 
@@ -62,9 +68,9 @@ the skeleton through CLI/status surfaces or adding the first Kubernetes
 
 ## Next Steps
 
-1. Add `krishiv submit` CLI skeleton backed by the scheduler data model.
-2. Add distributed job status output to `krishiv jobs` without changing R1 local behavior.
-3. Add the first `KrishivJob` CRD and minimal Kubernetes manifests.
+1. Add the first `KrishivJob` CRD and minimal Kubernetes manifests.
+2. Add manifest validation tests for the R2 Kubernetes shape.
+3. Implement stage-level retry in `krishiv-scheduler`.
 4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
@@ -84,6 +90,8 @@ the skeleton through CLI/status surfaces or adding the first Kubernetes
 - `cargo run -p krishiv-cli -- sql --query "select 1 as value"` passed.
 - `cargo run -p krishiv-cli -- explain --query "select 1 as value"` passed.
 - `cargo run -p krishiv-cli -- jobs` passed.
+- `cargo run -p krishiv-cli -- submit --job-id job-demo --name demo --tasks 2 --launch` passed.
+- `cargo run -p krishiv-cli -- jobs --distributed` passed.
 - `cargo run -p krishiv-api --example local_sql_parquet` passed.
 - `cargo run -p krishiv-api --example memory_stream` passed.
 - `cargo run -p krishiv-cli -- --help` passed.
@@ -98,4 +106,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 with CLI/status or Kubernetes manifest work, unless the user asks for more scheduler internals.
+4. Continue R2 with `KrishivJob` manifests or stage-level retry, unless the user asks for more CLI polish.

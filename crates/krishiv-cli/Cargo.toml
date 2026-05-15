@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
 
 [dev-dependencies]
 arrow = { workspace = true }
