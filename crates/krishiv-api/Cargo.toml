@@ -1,0 +1,17 @@
+[package]
+name = "krishiv-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-runtime = { path = "../krishiv-runtime" }
+krishiv-sql = { path = "../krishiv-sql" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Krishiv Engine"
+  short_description: "Build Krishiv engine features consistently"
+  default_prompt: "Use $krishiv-engine to implement the next Krishiv roadmap task."

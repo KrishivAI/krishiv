@@ -1,0 +1,16 @@
+[package]
+name = "krishiv-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "krishiv"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

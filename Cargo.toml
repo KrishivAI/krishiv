@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/krishiv-api",
+    "crates/krishiv-cli",
+    "crates/krishiv-exec",
+    "crates/krishiv-plan",
+    "crates/krishiv-runtime",
+    "crates/krishiv-sql",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
