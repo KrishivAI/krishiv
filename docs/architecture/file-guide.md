@@ -35,8 +35,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-exec/src/lib.rs` | Defines physical operator descriptors and placeholder logical-to-physical lowering. |
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
 | `crates/krishiv-runtime/src/lib.rs` | Owns runtime traits, local backend acceptance, job/task status, and local job registry. |
-| `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate. |
-| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, executor registry, static placement, and task lifecycle updates. |
+| `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate and its plan/proto dependencies. |
+| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, executor registry, static placement, Krishiv DAG routing, retry/timeout behavior, and task lifecycle updates. |
 
 ## Architecture And Engineering Docs
 

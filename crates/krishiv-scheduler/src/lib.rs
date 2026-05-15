@@ -9,10 +9,11 @@
 use std::error::Error;
 use std::fmt;
 
+use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
     CoordinatorId, CoordinatorState, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
-    ExecutorState, JobId, JobSpec, JobState, StageId, StageSpec, StageState, TaskAssignment,
-    TaskId, TaskSpec, TaskState, TaskStatusUpdate,
+    ExecutorState, JobId, JobKind, JobSpec, JobState, StageId, StageSpec, StageState,
+    TaskAssignment, TaskId, TaskSpec, TaskState, TaskStatusUpdate,
 };
 
 /// Scheduler result alias.
@@ -75,6 +76,8 @@ pub enum SchedulerError {
     UnknownTask { task_id: TaskId },
     /// Job submission was invalid.
     InvalidJob { message: String },
+    /// Distributed DAG conversion failed.
+    InvalidPlan { message: String },
 }
 
 impl fmt::Display for SchedulerError {
@@ -97,6 +100,7 @@ impl fmt::Display for SchedulerError {
             Self::UnknownStage { stage_id } => write!(f, "unknown stage: {stage_id}"),
             Self::UnknownTask { task_id } => write!(f, "unknown task: {task_id}"),
             Self::InvalidJob { message } => write!(f, "invalid job: {message}"),
+            Self::InvalidPlan { message } => write!(f, "invalid plan: {message}"),
         }
     }
 }
@@ -204,6 +208,24 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Convert and submit a Krishiv logical DAG through the R2 scheduler.
+    pub fn submit_logical_plan(
+        &mut self,
+        job_id: JobId,
+        plan: &LogicalPlan,
+    ) -> SchedulerResult<()> {
+        self.submit_job(job_spec_from_logical_plan(job_id, plan)?)
+    }
+
+    /// Convert and submit a Krishiv physical DAG through the R2 scheduler.
+    pub fn submit_physical_plan(
+        &mut self,
+        job_id: JobId,
+        plan: &PhysicalPlan,
+    ) -> SchedulerResult<()> {
+        self.submit_job(job_spec_from_physical_plan(job_id, plan)?)
+    }
+
     /// Launch all assigned tasks for a job.
     pub fn launch_assigned_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
         self.ensure_active()?;
@@ -265,6 +287,16 @@ impl Coordinator {
                 job_id: job_id.clone(),
             })
     }
+}
+
+/// Convert a Krishiv logical plan into an R2 distributed job spec.
+pub fn job_spec_from_logical_plan(job_id: JobId, plan: &LogicalPlan) -> SchedulerResult<JobSpec> {
+    job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes())
+}
+
+/// Convert a Krishiv physical plan into an R2 distributed job spec.
+pub fn job_spec_from_physical_plan(job_id: JobId, plan: &PhysicalPlan) -> SchedulerResult<JobSpec> {
+    job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes())
 }
 
 /// Executor registry skeleton.
@@ -583,6 +615,7 @@ impl JobRecord {
 
         JobSnapshot {
             job_id: self.spec.job_id().clone(),
+            kind: self.spec.kind(),
             state: self.state,
             stage_count: self.stages.len(),
             task_count,
@@ -777,6 +810,7 @@ impl TaskRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSnapshot {
     job_id: JobId,
+    kind: JobKind,
     state: JobState,
     stage_count: usize,
     task_count: usize,
@@ -790,6 +824,11 @@ impl JobSnapshot {
     /// Job id.
     pub fn job_id(&self) -> &JobId {
         &self.job_id
+    }
+
+    /// Job kind.
+    pub fn kind(&self) -> JobKind {
+        self.kind
     }
 
     /// Job state.
@@ -929,8 +968,65 @@ fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
     Ok(())
 }
 
+fn job_spec_from_plan_parts(
+    job_id: JobId,
+    plan_name: &str,
+    kind: PlanExecutionKind,
+    nodes: &[PlanNode],
+) -> SchedulerResult<JobSpec> {
+    let job_kind = match kind {
+        PlanExecutionKind::Batch => JobKind::Batch,
+        PlanExecutionKind::Streaming => JobKind::Streaming,
+    };
+    let job_name = if plan_name.trim().is_empty() {
+        String::from("unnamed-distributed-dag")
+    } else {
+        plan_name.to_owned()
+    };
+    let stage_id = StageId::try_new("stage-1").map_err(|error| SchedulerError::InvalidPlan {
+        message: error.to_string(),
+    })?;
+
+    let mut stage = StageSpec::new(stage_id, format!("{job_name}-stage"));
+    if nodes.is_empty() {
+        let task_id = TaskId::try_new("task-1").map_err(|error| SchedulerError::InvalidPlan {
+            message: error.to_string(),
+        })?;
+        stage = stage.with_task(TaskSpec::new(
+            task_id,
+            format!("{job_kind} plan task for {job_name}"),
+        ));
+    } else {
+        for (idx, node) in nodes.iter().enumerate() {
+            let task_id = TaskId::try_new(format!("task-{}", idx + 1)).map_err(|error| {
+                SchedulerError::InvalidPlan {
+                    message: error.to_string(),
+                }
+            })?;
+            stage = stage.with_task(TaskSpec::new(task_id, plan_node_description(node)));
+        }
+    }
+
+    Ok(JobSpec::new(job_id, job_name, job_kind).with_stage(stage))
+}
+
+fn plan_node_description(node: &PlanNode) -> String {
+    if node.inputs().is_empty() {
+        format!("{} [{}] {}", node.id(), node.kind(), node.label())
+    } else {
+        format!(
+            "{} [{}] {} <- {}",
+            node.id(),
+            node.kind(),
+            node.label(),
+            node.inputs().join(", ")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
         JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec, TaskState,
@@ -939,6 +1035,7 @@ mod tests {
 
     use super::{
         Coordinator, CoordinatorConfig, ExecutorRegistry, SchedulerError, StaticScheduler,
+        job_spec_from_logical_plan,
     };
 
     #[test]
@@ -1010,6 +1107,112 @@ mod tests {
         assert_eq!(assignments.len(), 2);
         assert_eq!(assignments[0].executor_id().as_str(), "exec-a");
         assert_eq!(assignments[1].executor_id().as_str(), "exec-b");
+    }
+
+    #[test]
+    fn converts_batch_logical_plan_into_distributed_job_spec() {
+        let plan = LogicalPlan::new("batch-dag", PlanExecutionKind::Batch)
+            .with_node(PlanNode::new(
+                "scan",
+                "scan parquet",
+                PlanExecutionKind::Batch,
+            ))
+            .with_node(
+                PlanNode::new("aggregate", "count", PlanExecutionKind::Batch).with_inputs(["scan"]),
+            );
+
+        let job = job_spec_from_logical_plan(JobId::try_new("job-batch").unwrap(), &plan).unwrap();
+
+        assert_eq!(job.kind(), JobKind::Batch);
+        assert_eq!(job.name(), "batch-dag");
+        assert_eq!(job.task_count(), 2);
+        assert!(job.stages()[0].tasks()[1].description().contains("scan"));
+    }
+
+    #[test]
+    fn coordinator_routes_batch_logical_plan_through_scheduler() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                2,
+            ))
+            .unwrap();
+
+        let plan = LogicalPlan::new("batch-dag", PlanExecutionKind::Batch)
+            .with_node(PlanNode::new(
+                "scan",
+                "scan parquet",
+                PlanExecutionKind::Batch,
+            ))
+            .with_node(
+                PlanNode::new("project", "project columns", PlanExecutionKind::Batch)
+                    .with_inputs(["scan"]),
+            );
+        let job_id = JobId::try_new("job-batch").unwrap();
+
+        coordinator
+            .submit_logical_plan(job_id.clone(), &plan)
+            .unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+
+        assert_eq!(snapshot.kind(), JobKind::Batch);
+        assert_eq!(snapshot.task_count(), 2);
+        assert_eq!(snapshot.assigned_task_count(), 2);
+        assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 2);
+        assert_eq!(
+            coordinator
+                .job_snapshot(&job_id)
+                .unwrap()
+                .running_task_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn coordinator_routes_streaming_physical_plan_with_local_state_semantics() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                1,
+            ))
+            .unwrap();
+
+        let plan =
+            PhysicalPlan::new("stream-dag", PlanExecutionKind::Streaming).with_node(PlanNode::new(
+                "memory-source",
+                "local memory stream",
+                PlanExecutionKind::Streaming,
+            ));
+        let job_id = JobId::try_new("job-stream").unwrap();
+
+        coordinator
+            .submit_physical_plan(job_id.clone(), &plan)
+            .unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+
+        assert_eq!(snapshot.kind(), JobKind::Streaming);
+        assert_eq!(snapshot.task_count(), 1);
+        assert_eq!(snapshot.assigned_task_count(), 1);
+    }
+
+    #[test]
+    fn empty_plan_routes_as_single_distributed_task() {
+        let plan = PhysicalPlan::new("empty-physical", PlanExecutionKind::Batch);
+
+        let job = super::job_spec_from_physical_plan(JobId::try_new("job-empty").unwrap(), &plan)
+            .unwrap();
+
+        assert_eq!(job.kind(), JobKind::Batch);
+        assert_eq!(job.task_count(), 1);
+        assert!(
+            job.stages()[0].tasks()[0]
+                .description()
+                .contains("empty-physical")
+        );
     }
 
     #[test]

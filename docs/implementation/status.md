@@ -6,9 +6,9 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 stage retry and heartbeat timeout slice is complete. The next active task is
-adding a status endpoint/basic Web UI or routing real distributed batch and
-early streaming DAG execution through the scheduler.
+R2 distributed DAG routing slice is complete. The next active task is adding a
+status endpoint/basic Web UI, or starting controller work needed before
+Kubernetes `kind` smoke tests can become meaningful.
 
 ## Completed
 
@@ -70,6 +70,11 @@ early streaming DAG execution through the scheduler.
 - Implemented heartbeat timeout handling that marks stale executors lost.
 - Added scheduler tests for stage retry and heartbeat timeout behavior.
 - Updated R2 tracker and control-plane docs for retry and timeout semantics.
+- Added conversion from Krishiv logical/physical plans into R2 scheduler job specs.
+- Added coordinator APIs to submit logical and physical DAGs through the scheduler.
+- Routed batch DAGs as `JobKind::Batch` and streaming DAGs as `JobKind::Streaming` with R1-level local state semantics.
+- Added scheduler tests for batch logical DAG routing, streaming physical DAG routing, and empty-plan routing.
+- Updated R2 tracker, crate map, file guide, and control-plane docs for DAG routing.
 
 ## In Progress
 
@@ -77,9 +82,9 @@ early streaming DAG execution through the scheduler.
 
 ## Next Steps
 
-1. Route distributed batch DAG execution through the scheduler.
-2. Route distributed streaming DAG execution through the scheduler with R1-level local state semantics.
-3. Add status endpoint or basic Web UI for jobs, stages, tasks, and executors.
+1. Add status endpoint or basic Web UI for jobs, stages, tasks, and executors.
+2. Start controller/operator work needed to reconcile `KrishivJob` resources.
+3. Add Kubernetes `kind` smoke tests after the controller path exists.
 4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers

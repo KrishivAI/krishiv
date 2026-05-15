@@ -68,9 +68,9 @@ Out of scope:
 - [x] Implement task completion reporting.
 - [x] Implement task failure reporting.
 - [x] Implement stage-level retry.
-- [ ] Route distributed batch DAG execution through the scheduler.
-- [ ] Route distributed streaming DAG execution through the scheduler with local-only state semantics.
-- [ ] Preserve R1 embedded/single-node behavior.
+- [x] Route distributed batch DAG execution through the scheduler.
+- [x] Route distributed streaming DAG execution through the scheduler with local-only state semantics.
+- [x] Preserve R1 embedded/single-node behavior.
 
 ## Test Checklist
 
@@ -91,9 +91,9 @@ R2 is complete when:
 
 - [ ] A simple distributed batch job can be submitted on Kubernetes.
 - [ ] A simple distributed streaming job can be submitted on Kubernetes.
-- [ ] Job, stage, task, and executor status are visible through CLI or Web UI.
-- [ ] Failed tasks are retried at stage level.
-- [ ] Embedded and single-node R1 tests still pass unchanged.
+- [x] Job, stage, task, and executor status are visible through CLI or Web UI.
+- [x] Failed tasks are retried at stage level.
+- [x] Embedded and single-node R1 tests still pass unchanged.
 
 ## Risks And Mitigations
 

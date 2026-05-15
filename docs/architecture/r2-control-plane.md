@@ -42,6 +42,18 @@ The R2 scheduler uses static round-robin placement over schedulable executors.
 It does not autoscale, rebalance running tasks, use resource queues, or perform
 adaptive placement.
 
+## DAG Routing Model
+
+R2 can convert Krishiv logical and physical DAG wrappers from `krishiv-plan`
+into distributed scheduler jobs:
+
+- Batch DAGs map to `JobKind::Batch`.
+- Streaming DAGs map to `JobKind::Streaming` with R1-level local state
+  semantics only.
+- Each plan node becomes a static task in the first R2 stage.
+- Empty plans are represented as one scheduler task so bootstrap physical plans
+  can still flow through the distributed path.
+
 ## Retry Model
 
 R2 implements conservative stage-level retry. A failed task retries the whole

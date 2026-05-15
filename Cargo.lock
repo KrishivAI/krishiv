@@ -1764,6 +1764,7 @@ dependencies = [
 name = "krishiv-scheduler"
 version = "0.1.0"
 dependencies = [
+ "krishiv-plan",
  "krishiv-proto",
 ]
 
