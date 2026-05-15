@@ -15,5 +15,12 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 
+[workspace.dependencies]
+arrow = { version = "55.1.0", features = ["prettyprint"] }
+datafusion = "48.0.1"
+parquet = "55.1.0"
+tempfile = "3"
+tokio = { version = "1.45", features = ["macros", "rt", "rt-multi-thread"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"

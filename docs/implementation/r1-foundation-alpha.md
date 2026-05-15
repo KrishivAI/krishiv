@@ -78,13 +78,13 @@ Goal: create a compiling workspace with crate boundaries, API stubs, runtime stu
 
 ## SQL And Planning Deliverables
 
-- [ ] Integrate DataFusion session context in `krishiv-sql`.
-- [ ] Support registering local Parquet paths as tables.
-- [ ] Support simple `SELECT`, `WHERE`, projection, aggregate, and limit queries through DataFusion.
+- [x] Integrate DataFusion session context in `krishiv-sql`.
+- [x] Support registering local Parquet paths as tables.
+- [x] Support simple `SELECT`, `WHERE`, projection, aggregate, and limit queries through DataFusion.
 - [x] Add Krishiv logical plan wrapper in `krishiv-plan`.
 - [x] Add physical plan wrapper in `krishiv-plan`.
-- [ ] Implement `EXPLAIN` output for logical plan.
-- [ ] Implement `EXPLAIN` output for physical plan.
+- [x] Implement `EXPLAIN` output for logical plan.
+- [x] Implement `EXPLAIN` output for physical plan.
 - [x] Document R1 SQL subset in `docs/sql-compatibility/r1.md`.
 
 ## Runtime Deliverables
@@ -92,50 +92,50 @@ Goal: create a compiling workspace with crate boundaries, API stubs, runtime stu
 - [x] Define `ExecutionBackend` trait in `krishiv-runtime`.
 - [x] Define embedded backend.
 - [x] Define single-node backend.
-- [ ] Route local SQL execution through the selected backend.
-- [ ] Route local stream execution through the selected backend.
+- [x] Route local SQL execution through the selected backend.
+- [x] Route local stream execution through the selected backend.
 - [x] Add local job registry for `krishiv jobs`.
 - [x] Add simple job states: pending, running, succeeded, failed.
 
 ## CLI Deliverables
 
-- [ ] Implement `krishiv sql`.
-- [ ] Implement `krishiv explain`.
-- [ ] Implement `krishiv jobs`.
+- [x] Implement `krishiv sql`.
+- [x] Implement `krishiv explain`.
+- [x] Implement `krishiv jobs`.
 - [x] Add CLI help text and examples.
-- [ ] Add basic error reporting for missing files, invalid SQL, and unsupported features.
+- [x] Add basic error reporting for missing files, invalid SQL, and unsupported features.
 
 ## Streaming Deliverables
 
 - [x] Add local memory stream source.
 - [x] Support bounded memory stream for tests.
-- [ ] Support simple unbounded memory stream abstraction for future streaming tests.
-- [ ] Add basic map/filter-style stream API skeleton if practical.
+- [x] Support simple unbounded memory stream abstraction for future streaming tests.
+- [x] Add basic map/filter-style stream API skeleton if practical.
 - [x] Keep R1 streaming local-only.
-- [ ] Document R1 streaming limitations.
+- [x] Document R1 streaming limitations.
 
 ## Test Checklist
 
 - [x] Workspace builds.
 - [x] Unit tests pass.
-- [ ] SQL golden tests pass.
-- [ ] Embedded SQL over Parquet test passes.
-- [ ] Single-node SQL over Parquet test passes.
-- [ ] Embedded and single-node produce the same result for supported SQL.
+- [x] SQL golden tests pass.
+- [x] Embedded SQL over Parquet test passes.
+- [x] Single-node SQL over Parquet test passes.
+- [x] Embedded and single-node produce the same result for supported SQL.
 - [x] Memory stream source test passes.
-- [ ] `krishiv explain` snapshot test passes.
+- [x] `krishiv explain` snapshot test passes.
 - [x] CLI smoke tests pass.
 
 ## Acceptance Gate
 
 R1 is complete when:
 
-- [ ] A user can run a local SQL query over Parquet.
-- [ ] A user can run a simple in-memory stream pipeline.
-- [ ] `krishiv explain` shows logical and physical plans.
-- [ ] `krishiv jobs` shows local job status.
-- [ ] Embedded and single-node execution produce the same results for supported features.
-- [ ] R1 SQL compatibility and known limitations are documented.
+- [x] A user can run a local SQL query over Parquet.
+- [x] A user can run a simple in-memory stream pipeline.
+- [x] `krishiv explain` shows logical and physical plans.
+- [x] `krishiv jobs` shows local job status.
+- [x] Embedded and single-node execution produce the same results for supported features.
+- [x] R1 SQL compatibility and known limitations are documented.
 
 ## Risks And Mitigations
 

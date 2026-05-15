@@ -1,18 +1,26 @@
 #![forbid(unsafe_code)]
 
-//! Public Rust API stubs for Krishiv R1.
+//! Public Rust API for Krishiv R1.
 //!
-//! This crate owns the long-term user-facing Rust API. The R1 bootstrap surface
-//! is intentionally thin and avoids exposing DataFusion internals directly.
+//! This crate owns the long-term user-facing Rust API. DataFusion is used under
+//! the hood through `krishiv-sql`, while Arrow record batches are exposed as the
+//! public data interchange shape.
 
 use std::error::Error;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
+use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
+use krishiv_runtime::{EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend};
+use krishiv_sql::{SqlDataFrame, SqlEngine};
 
+pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
-pub use krishiv_runtime::{JobState, JobStatus, LocalJobRegistry};
+pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
 
 /// API result alias.
 pub type Result<T> = std::result::Result<T, KrishivError>;
@@ -20,7 +28,7 @@ pub type Result<T> = std::result::Result<T, KrishivError>;
 /// Public API errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KrishivError {
-    /// A requested capability is not available in the current release slice.
+    /// A requested capability is not available in the current release.
     Unsupported { feature: String },
     /// User-provided configuration is invalid.
     InvalidConfig { message: String },
@@ -57,6 +65,14 @@ impl From<krishiv_runtime::RuntimeError> for KrishivError {
     }
 }
 
+impl From<krishiv_sql::SqlError> for KrishivError {
+    fn from(value: krishiv_sql::SqlError) -> Self {
+        Self::Runtime {
+            message: value.to_string(),
+        }
+    }
+}
+
 /// Execution mode selected for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -78,102 +94,14 @@ impl fmt::Display for ExecutionMode {
     }
 }
 
-/// R1 bootstrap stand-in for an Arrow field.
-///
-/// This type keeps the API compiling without a network dependency download.
-/// It will be replaced by, or adapted to, Arrow schema types when Arrow is
-/// introduced in the DataFusion integration slice.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Field {
-    name: String,
-    data_type: String,
-}
-
-impl Field {
-    /// Create a field.
-    pub fn new(name: impl Into<String>, data_type: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            data_type: data_type.into(),
-        }
-    }
-
-    /// Field name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Field data type.
-    pub fn data_type(&self) -> &str {
-        &self.data_type
-    }
-}
-
-/// R1 bootstrap stand-in for an Arrow schema.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Schema {
-    fields: Vec<Field>,
-}
-
-impl Schema {
-    /// Create a schema.
-    pub fn new(fields: Vec<Field>) -> Self {
-        Self { fields }
-    }
-
-    /// Schema fields.
-    pub fn fields(&self) -> &[Field] {
-        &self.fields
-    }
-}
-
-/// Minimal scalar value for R1 stubs.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ScalarValue {
-    /// Null value.
-    Null,
-    /// Boolean value.
-    Boolean(bool),
-    /// 64-bit integer value.
-    Int64(i64),
-    /// 64-bit float value.
-    Float64(f64),
-    /// UTF-8 string value.
-    Utf8(String),
-}
-
-/// R1 bootstrap stand-in for an Arrow record batch.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecordBatch {
-    schema: Schema,
-    rows: Vec<Vec<ScalarValue>>,
-}
-
-impl RecordBatch {
-    /// Create a record batch.
-    pub fn new(schema: Schema, rows: Vec<Vec<ScalarValue>>) -> Self {
-        Self { schema, rows }
-    }
-
-    /// Batch schema.
-    pub fn schema(&self) -> &Schema {
-        &self.schema
-    }
-
-    /// Batch rows.
-    pub fn rows(&self) -> &[Vec<ScalarValue>] {
-        &self.rows
-    }
-}
-
-/// Query result wrapper.
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Query result wrapper around Arrow record batches.
+#[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     batches: Vec<RecordBatch>,
 }
 
 impl QueryResult {
-    /// Create a query result from batches.
+    /// Create a query result from Arrow batches.
     pub fn new(batches: Vec<RecordBatch>) -> Self {
         Self { batches }
     }
@@ -182,10 +110,20 @@ impl QueryResult {
     pub fn batches(&self) -> &[RecordBatch] {
         &self.batches
     }
+
+    /// Total row count across all batches.
+    pub fn row_count(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Format the result as an ASCII table for CLI and tests.
+    pub fn pretty(&self) -> Result<String> {
+        krishiv_sql::pretty_batches(&self.batches).map_err(Into::into)
+    }
 }
 
 /// Stream batch wrapper.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct StreamBatch {
     sequence: u64,
     batch: RecordBatch,
@@ -205,6 +143,24 @@ impl StreamBatch {
     /// Record batch payload.
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
+    }
+}
+
+/// R1 local stream mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// Bounded stream backed by known in-memory batches.
+    Bounded,
+    /// Unbounded stream placeholder for future local streaming tests.
+    Unbounded,
+}
+
+impl fmt::Display for StreamMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bounded => f.write_str("bounded"),
+            Self::Unbounded => f.write_str("unbounded"),
+        }
     }
 }
 
@@ -239,7 +195,9 @@ impl SessionBuilder {
     pub fn build(self) -> Result<Session> {
         Ok(Session {
             mode: self.mode,
-            jobs: LocalJobRegistry::default(),
+            sql_engine: SqlEngine::new(),
+            jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
+            next_job_id: Arc::new(AtomicU64::new(1)),
         })
     }
 }
@@ -248,7 +206,9 @@ impl SessionBuilder {
 #[derive(Debug, Clone)]
 pub struct Session {
     mode: ExecutionMode,
-    jobs: LocalJobRegistry,
+    sql_engine: SqlEngine,
+    jobs: Arc<Mutex<LocalJobRegistry>>,
+    next_job_id: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -263,84 +223,236 @@ impl Session {
     }
 
     /// Known local jobs.
-    pub fn jobs(&self) -> &[JobStatus] {
-        self.jobs.list()
+    pub fn jobs(&self) -> Vec<JobStatus> {
+        self.jobs
+            .lock()
+            .map(|jobs| jobs.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Register a local Parquet path as a SQL table.
+    pub fn register_parquet(
+        &self,
+        table_name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        ensure_local_mode(self.mode)?;
+        let table_name = table_name.as_ref().to_owned();
+        let path = path.as_ref().to_path_buf();
+        block_on_krishiv(async {
+            self.sql_engine
+                .register_parquet(table_name, path)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    /// Asynchronously register a local Parquet path as a SQL table.
+    pub async fn register_parquet_async(
+        &self,
+        table_name: impl AsRef<str>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        ensure_local_mode(self.mode)?;
+        self.sql_engine
+            .register_parquet(table_name, path)
+            .await
+            .map_err(Into::into)
     }
 
     /// Create a DataFrame from a SQL query.
-    pub fn sql(&self, query: impl Into<String>) -> Result<DataFrame> {
-        let sql_plan =
-            krishiv_sql::plan_sql(query).map_err(|error| KrishivError::InvalidConfig {
-                message: error.to_string(),
-            })?;
-
-        Ok(DataFrame::new(sql_plan.logical_plan().clone()))
+    pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        ensure_local_mode(self.mode)?;
+        block_on_krishiv(self.sql_async(query))
     }
 
-    /// Register a Parquet path as a DataFrame placeholder.
+    /// Asynchronously create a DataFrame from a SQL query.
+    pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        ensure_local_mode(self.mode)?;
+        let query = query.as_ref().to_owned();
+        let sql_dataframe = self.sql_engine.sql(&query).await?;
+        Ok(DataFrame::from_sql_dataframe(
+            self.mode,
+            sql_dataframe,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+        ))
+    }
+
+    /// Create a DataFrame by reading a local Parquet path directly.
     pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
+        ensure_local_mode(self.mode)?;
         let path = path.as_ref().to_path_buf();
-        Ok(DataFrame::from_parquet_path(path))
+        block_on_krishiv(self.read_parquet_async(path))
+    }
+
+    /// Asynchronously create a DataFrame by reading a local Parquet path directly.
+    pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
+        ensure_local_mode(self.mode)?;
+        let sql_dataframe = self.sql_engine.read_parquet(path).await?;
+        Ok(DataFrame::from_sql_dataframe(
+            self.mode,
+            sql_dataframe,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+        ))
     }
 
     /// Create a bounded local memory stream.
     pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Stream {
-        Stream::new(name, batches)
+        Stream::for_session(name, StreamMode::Bounded, batches, self.mode)
+    }
+
+    /// Create an unbounded local memory stream placeholder.
+    pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Stream {
+        Stream::for_session(name, StreamMode::Unbounded, Vec::new(), self.mode)
     }
 }
 
-/// DataFrame API skeleton.
+/// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Debug, Clone)]
 pub struct DataFrame {
     logical_plan: LogicalPlan,
+    sql_dataframe: Option<SqlDataFrame>,
+    mode: ExecutionMode,
+    jobs: Arc<Mutex<LocalJobRegistry>>,
+    next_job_id: Arc<AtomicU64>,
 }
 
 impl DataFrame {
-    /// Create a DataFrame from a logical plan.
+    /// Create a logical-only DataFrame.
     pub fn new(logical_plan: LogicalPlan) -> Self {
-        Self { logical_plan }
+        Self {
+            logical_plan,
+            sql_dataframe: None,
+            mode: ExecutionMode::Embedded,
+            jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
+            next_job_id: Arc::new(AtomicU64::new(1)),
+        }
     }
 
-    fn from_parquet_path(path: PathBuf) -> Self {
-        let label = format!("parquet scan: {}", path.display());
-        let logical_plan = LogicalPlan::new("parquet-read", ExecutionKind::Batch)
-            .with_node(PlanNode::new("parquet-scan", label, ExecutionKind::Batch));
-
-        Self { logical_plan }
+    fn from_sql_dataframe(
+        mode: ExecutionMode,
+        sql_dataframe: SqlDataFrame,
+        jobs: Arc<Mutex<LocalJobRegistry>>,
+        next_job_id: Arc<AtomicU64>,
+    ) -> Self {
+        let logical_plan = sql_dataframe.krishiv_logical_plan();
+        Self {
+            logical_plan,
+            sql_dataframe: Some(sql_dataframe),
+            mode,
+            jobs,
+            next_job_id,
+        }
     }
 
-    /// Borrow the logical plan.
+    /// Borrow the Krishiv logical plan wrapper.
     pub fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
     }
 
-    /// Explain the current logical plan.
-    pub fn explain(&self) -> String {
-        self.logical_plan.describe()
+    /// Explain the current plan.
+    pub fn explain(&self) -> Result<String> {
+        block_on_krishiv(self.explain_async())
+    }
+
+    /// Asynchronously explain the current plan.
+    pub async fn explain_async(&self) -> Result<String> {
+        ensure_local_mode(self.mode)?;
+        match &self.sql_dataframe {
+            Some(dataframe) => dataframe.explain().await.map_err(Into::into),
+            None => Ok(self.logical_plan.describe()),
+        }
+    }
+
+    /// Explain the Krishiv logical wrapper only.
+    pub fn explain_logical(&self) -> String {
+        match &self.sql_dataframe {
+            Some(dataframe) => dataframe.explain_logical(),
+            None => self.logical_plan.describe(),
+        }
     }
 
     /// Collect results.
-    ///
-    /// R1 bootstrap exposes the method shape but does not execute queries yet.
     pub fn collect(&self) -> Result<QueryResult> {
-        Err(KrishivError::unsupported(
-            "DataFrame::collect requires the DataFusion execution slice",
-        ))
+        block_on_krishiv(self.collect_async())
+    }
+
+    /// Asynchronously collect results.
+    pub async fn collect_async(&self) -> Result<QueryResult> {
+        ensure_local_mode(self.mode)?;
+        let job_id = self.start_job("local-dataframe");
+        self.update_job(&job_id, "local-dataframe", JobState::Running);
+
+        let result = if let Err(error) = accept_plan_with_backend(
+            self.mode,
+            self.logical_plan.name(),
+            self.logical_plan.kind(),
+        ) {
+            Err(error)
+        } else {
+            match &self.sql_dataframe {
+                Some(dataframe) => dataframe
+                    .collect()
+                    .await
+                    .map(QueryResult::new)
+                    .map_err(Into::into),
+                None => Err(KrishivError::unsupported(
+                    "logical-only DataFrame cannot be collected",
+                )),
+            }
+        };
+
+        match &result {
+            Ok(_) => self.update_job(&job_id, "local-dataframe", JobState::Succeeded),
+            Err(_) => self.update_job(&job_id, "local-dataframe", JobState::Failed),
+        }
+
+        result
+    }
+
+    fn start_job(&self, name: &str) -> JobId {
+        let id = JobId::new(format!(
+            "local-{}",
+            self.next_job_id.fetch_add(1, Ordering::SeqCst)
+        ));
+        self.update_job(&id, name, JobState::Pending);
+        id
+    }
+
+    fn update_job(&self, id: &JobId, name: &str, state: JobState) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.upsert(JobStatus::new(id.clone(), name, state));
+        }
     }
 }
 
-/// Stream API skeleton.
+/// Stream API for R1 local memory streams.
 #[derive(Debug, Clone)]
 pub struct Stream {
     name: String,
+    mode: StreamMode,
+    execution_mode: ExecutionMode,
     batches: Vec<StreamBatch>,
 }
 
 impl Stream {
     /// Create a stream.
-    pub fn new(name: impl Into<String>, batches: Vec<StreamBatch>) -> Self {
+    pub fn new(name: impl Into<String>, mode: StreamMode, batches: Vec<StreamBatch>) -> Self {
+        Self::for_session(name, mode, batches, ExecutionMode::Embedded)
+    }
+
+    fn for_session(
+        name: impl Into<String>,
+        mode: StreamMode,
+        batches: Vec<StreamBatch>,
+        execution_mode: ExecutionMode,
+    ) -> Self {
         Self {
             name: name.into(),
+            mode,
+            execution_mode,
             batches,
         }
     }
@@ -350,20 +462,126 @@ impl Stream {
         &self.name
     }
 
-    /// Borrow bootstrap batches.
+    /// Stream mode.
+    pub fn mode(&self) -> StreamMode {
+        self.mode
+    }
+
+    /// Whether this stream is bounded.
+    pub fn is_bounded(&self) -> bool {
+        self.mode == StreamMode::Bounded
+    }
+
+    /// Borrow local batches.
     pub fn batches(&self) -> &[StreamBatch] {
         &self.batches
     }
 
     /// Collect bounded in-memory stream batches.
-    pub fn collect_bounded(&self) -> Vec<StreamBatch> {
-        self.batches.clone()
+    pub fn collect_bounded(&self) -> Result<Vec<StreamBatch>> {
+        ensure_local_mode(self.execution_mode)?;
+        if !self.is_bounded() {
+            return Err(KrishivError::unsupported(
+                "unbounded stream collection requires a streaming runtime",
+            ));
+        }
+
+        accept_plan_with_backend(self.execution_mode, &self.name, ExecutionKind::Streaming)?;
+        Ok(self.batches.clone())
     }
+
+    /// Map local stream batches.
+    pub fn map_batches(&self, mut f: impl FnMut(&StreamBatch) -> StreamBatch) -> Result<Stream> {
+        if !self.is_bounded() {
+            return Err(KrishivError::unsupported(
+                "unbounded stream mapping requires a streaming runtime",
+            ));
+        }
+
+        ensure_local_mode(self.execution_mode)?;
+
+        Ok(Self::for_session(
+            self.name.clone(),
+            self.mode,
+            self.batches.iter().map(&mut f).collect(),
+            self.execution_mode,
+        ))
+    }
+
+    /// Filter local stream batches.
+    pub fn filter_batches(&self, mut f: impl FnMut(&StreamBatch) -> bool) -> Result<Stream> {
+        ensure_local_mode(self.execution_mode)?;
+        if !self.is_bounded() {
+            return Err(KrishivError::unsupported(
+                "unbounded stream filtering requires a streaming runtime",
+            ));
+        }
+
+        Ok(Self::for_session(
+            self.name.clone(),
+            self.mode,
+            self.batches
+                .iter()
+                .filter(|batch| f(batch))
+                .cloned()
+                .collect(),
+            self.execution_mode,
+        ))
+    }
+}
+
+fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
+    match mode {
+        ExecutionMode::Embedded | ExecutionMode::SingleNode => Ok(()),
+        ExecutionMode::Distributed => Err(KrishivError::unsupported(
+            "distributed execution starts in R2",
+        )),
+    }
+}
+
+fn accept_plan_with_backend(
+    mode: ExecutionMode,
+    plan_name: &str,
+    kind: ExecutionKind,
+) -> Result<()> {
+    ensure_local_mode(mode)?;
+    let physical_plan = PhysicalPlan::new(plan_name, kind);
+
+    match mode {
+        ExecutionMode::Embedded => {
+            let mut backend = EmbeddedBackend;
+            backend.execute(&physical_plan)?;
+        }
+        ExecutionMode::SingleNode => {
+            let mut backend = SingleNodeBackend;
+            backend.execute(&physical_plan)?;
+        }
+        ExecutionMode::Distributed => unreachable!("distributed mode is rejected above"),
+    }
+
+    Ok(())
+}
+
+fn block_on_krishiv<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| KrishivError::Runtime {
+            message: error.to_string(),
+        })?
+        .block_on(future)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionMode, Field, RecordBatch, ScalarValue, Schema, Session, StreamBatch};
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use tempfile::tempdir;
+
+    use super::{DataType, ExecutionMode, Field, RecordBatch, Schema, Session, StreamBatch};
 
     #[test]
     fn session_builder_defaults_to_embedded() {
@@ -389,31 +607,147 @@ mod tests {
     }
 
     #[test]
-    fn sql_creates_dataframe_plan() {
+    fn sql_collects_literal_query() {
         let session = match Session::builder().build() {
             Ok(session) => session,
             Err(error) => panic!("unexpected API error: {error}"),
         };
 
-        let dataframe = match session.sql("select 1") {
+        let dataframe = match session.sql("select 1 as value") {
             Ok(dataframe) => dataframe,
             Err(error) => panic!("unexpected API error: {error}"),
         };
+        let result = match dataframe.collect() {
+            Ok(result) => result,
+            Err(error) => panic!("unexpected collect error: {error}"),
+        };
 
-        assert!(dataframe.explain().contains("sql placeholder"));
+        assert_eq!(result.row_count(), 1);
+        assert!(result.pretty().unwrap_or_default().contains("value"));
+        assert_eq!(session.jobs().len(), 1);
+        assert_eq!(
+            session.jobs()[0].state(),
+            krishiv_runtime::JobState::Succeeded
+        );
     }
 
     #[test]
-    fn memory_stream_collects_bounded_batches() {
+    fn embedded_and_single_node_sql_over_parquet_match() {
+        let temp = match tempdir() {
+            Ok(temp) => temp,
+            Err(error) => panic!("unexpected tempdir error: {error}"),
+        };
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+
+        let embedded = Session::builder()
+            .with_execution_mode(ExecutionMode::Embedded)
+            .build()
+            .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
+        let single_node = Session::builder()
+            .with_execution_mode(ExecutionMode::SingleNode)
+            .build()
+            .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
+
+        embedded
+            .register_parquet("people", &parquet_path)
+            .unwrap_or_else(|error| panic!("unexpected register error: {error}"));
+        single_node
+            .register_parquet("people", &parquet_path)
+            .unwrap_or_else(|error| panic!("unexpected register error: {error}"));
+
+        let query = "select city, count(*) as count from people group by city order by city";
+        let embedded_pretty = embedded
+            .sql(query)
+            .and_then(|dataframe| dataframe.collect())
+            .and_then(|result| result.pretty())
+            .unwrap_or_else(|error| panic!("unexpected embedded query error: {error}"));
+        let single_node_pretty = single_node
+            .sql(query)
+            .and_then(|dataframe| dataframe.collect())
+            .and_then(|result| result.pretty())
+            .unwrap_or_else(|error| panic!("unexpected single-node query error: {error}"));
+
+        assert_eq!(embedded_pretty, single_node_pretty);
+        assert!(embedded_pretty.contains("London"));
+        assert!(embedded_pretty.contains("Paris"));
+    }
+
+    #[test]
+    fn read_parquet_collects_rows() {
+        let temp = tempdir().unwrap_or_else(|error| panic!("unexpected tempdir error: {error}"));
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+        let session = Session::builder()
+            .build()
+            .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
+
+        let result = session
+            .read_parquet(&parquet_path)
+            .and_then(|dataframe| dataframe.collect())
+            .unwrap_or_else(|error| panic!("unexpected parquet read error: {error}"));
+
+        assert_eq!(result.row_count(), 3);
+    }
+
+    #[test]
+    fn memory_stream_supports_bounded_map_filter_collect() {
         let session = match Session::builder().build() {
             Ok(session) => session,
             Err(error) => panic!("unexpected API error: {error}"),
         };
-        let schema = Schema::new(vec![Field::new("value", "int64")]);
-        let batch = RecordBatch::new(schema, vec![vec![ScalarValue::Int64(1)]]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
         let stream = session.memory_stream("numbers", vec![StreamBatch::new(0, batch)]);
+        let mapped = stream
+            .map_batches(|batch| batch.clone())
+            .unwrap_or_else(|error| panic!("unexpected stream map error: {error}"));
+        let filtered = mapped
+            .filter_batches(|batch| batch.sequence() == 0)
+            .unwrap_or_else(|error| panic!("unexpected stream filter error: {error}"));
 
-        assert_eq!(stream.name(), "numbers");
-        assert_eq!(stream.collect_bounded().len(), 1);
+        assert_eq!(filtered.name(), "numbers");
+        assert_eq!(filtered.collect_bounded().unwrap_or_default().len(), 1);
+    }
+
+    #[test]
+    fn unbounded_memory_stream_rejects_collect() {
+        let session = Session::builder()
+            .build()
+            .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
+        let stream = session.unbounded_memory_stream("events");
+
+        assert!(!stream.is_bounded());
+        assert!(stream.collect_bounded().is_err());
+    }
+
+    fn write_people_parquet(path: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("city", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["London", "Paris", "London"])),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
+        let file = File::create(path)
+            .unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .unwrap_or_else(|error| panic!("unexpected parquet writer error: {error}"));
+        writer
+            .write(&batch)
+            .unwrap_or_else(|error| panic!("unexpected parquet write error: {error}"));
+        writer
+            .close()
+            .unwrap_or_else(|error| panic!("unexpected parquet close error: {error}"));
     }
 }

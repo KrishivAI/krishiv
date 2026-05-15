@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+krishiv-api = { path = "../krishiv-api" }
+
 [[bin]]
 name = "krishiv"
 path = "src/main.rs"

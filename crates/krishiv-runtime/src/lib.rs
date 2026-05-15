@@ -74,6 +74,17 @@ pub enum JobState {
     Failed,
 }
 
+impl fmt::Display for JobState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => f.write_str("pending"),
+            Self::Running => f.write_str("running"),
+            Self::Succeeded => f.write_str("succeeded"),
+            Self::Failed => f.write_str("failed"),
+        }
+    }
+}
+
 /// Minimal job status surfaced by `krishiv jobs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobStatus {
@@ -117,12 +128,26 @@ pub struct LocalJobRegistry {
 impl LocalJobRegistry {
     /// Add a job status to the registry.
     pub fn record(&mut self, status: JobStatus) {
-        self.jobs.push(status);
+        self.upsert(status);
+    }
+
+    /// Add or replace a job status.
+    pub fn upsert(&mut self, status: JobStatus) {
+        if let Some(existing) = self.jobs.iter_mut().find(|job| job.id == status.id) {
+            *existing = status;
+        } else {
+            self.jobs.push(status);
+        }
     }
 
     /// List known jobs.
     pub fn list(&self) -> &[JobStatus] {
         &self.jobs
+    }
+
+    /// Snapshot known jobs.
+    pub fn snapshot(&self) -> Vec<JobStatus> {
+        self.jobs.clone()
     }
 }
 

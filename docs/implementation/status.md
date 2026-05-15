@@ -6,7 +6,8 @@ R1 Foundation Alpha.
 
 ## Active Task
 
-R1 bootstrap workspace and stubs are complete. Next active task is the first real R1 execution slice: Arrow/DataFusion-backed local SQL planning and execution.
+R1 Foundation Alpha local execution is complete. The next active task is R1
+hardening/examples or the first R2 Kubernetes Distributed Alpha design slice.
 
 ## Completed
 
@@ -28,6 +29,16 @@ R1 bootstrap workspace and stubs are complete. Next active task is the first rea
 - Added R1 bootstrap architecture docs, crate map, SQL compatibility placeholder, and example/test placeholders.
 - Added `docs/architecture/file-guide.md` to explain each bootstrap file.
 - Added `.gitignore` for local build artifacts.
+- Added Arrow/DataFusion dependencies behind `krishiv-sql`.
+- Implemented DataFusion-backed local SQL execution and `EXPLAIN`.
+- Implemented local Parquet registration and direct Parquet reads.
+- Replaced bootstrap result placeholders with Arrow `RecordBatch` results.
+- Implemented bounded and unbounded local memory stream API shapes with bounded map/filter/collect support.
+- Routed embedded and single-node local execution through the runtime backend seam.
+- Implemented `krishiv sql`, `krishiv explain`, and `krishiv jobs`.
+- Added embedded/single-node SQL-over-Parquet parity coverage.
+- Added R1 CLI golden tests for `sql` and `explain`.
+- Updated R1 SQL compatibility, crate map, file guide, and tracker docs.
 
 ## In Progress
 
@@ -35,16 +46,14 @@ R1 bootstrap workspace and stubs are complete. Next active task is the first rea
 
 ## Next Steps
 
-1. Initialize git if the user wants versioned checkpoints.
-2. Start the next R1 slice by introducing Arrow/DataFusion dependencies.
-3. Register local Parquet paths through `krishiv-sql`/`krishiv-api`.
-4. Execute a minimal SQL query locally and return real Arrow-backed batches or a stable Krishiv wrapper.
-5. Preserve embedded/single-node parity while replacing bootstrap placeholders.
+1. Add examples for embedded SQL over Parquet and bounded memory streams.
+2. Add broader R1 SQL golden coverage for projection, filter, aggregate, and limit.
+3. Decide whether to start R2 coordinator/executor skeletons or finish R1 examples first.
+4. Keep R1 embedded and single-node behavior semantically aligned while R2 starts.
 
 ## Known Blockers
 
-- Git is not initialized in this workspace yet.
-- Arrow/DataFusion integration has not started.
+- None known.
 
 ## Last Validation
 
@@ -53,13 +62,16 @@ R1 bootstrap workspace and stubs are complete. Next active task is the first rea
 - `find docs/implementation -maxdepth 1 -type f -print | sort` shows R1-R10 trackers, README, and status files.
 - `wc -l docs/implementation/*.md` completed successfully.
 - `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/gopal/.agents/skills/krishiv-engine` passed after tracker-index sync.
-- `cargo fmt --check` passed.
+- `cargo fmt --all --check` passed.
 - `cargo check --workspace` passed.
 - `cargo test --workspace` passed.
+- `cargo run -p krishiv-cli -- sql --query "select 1 as value"` passed.
+- `cargo run -p krishiv-cli -- explain --query "select 1 as value"` passed.
+- `cargo run -p krishiv-cli -- jobs` passed.
 - `cargo run -p krishiv-cli -- --help` passed.
 - `cargo run -p krishiv-cli -- explain --help` passed.
 - `find . -path './target' -prune -o -type f -print | sort` confirmed the bootstrap file inventory.
-- `rg -n "TODO|\[TODO|Pending final validation|Pending validation" AGENTS.md Cargo.toml crates docs examples tests codex/skills/krishiv-engine/SKILL.md` returned no matches.
+- Placeholder scan across repo docs and crates returned no actionable markers.
 
 ## Resume Instructions
 
@@ -68,4 +80,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r1-foundation-alpha.md`.
-4. Continue with the first unchecked DataFusion/Parquet execution deliverable.
+4. Continue with R1 examples/hardening or begin the R2 tracker, depending on the user's next request.

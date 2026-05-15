@@ -1,5 +1,8 @@
 # Golden Tests
 
-SQL, plan, and CLI snapshot fixtures will live here as Krishiv behavior becomes stable enough for golden files.
+SQL, plan, and CLI snapshot fixtures live here when Krishiv behavior is stable
+enough for golden files.
 
-Current R1 bootstrap behavior is covered by crate-local unit tests.
+R1 includes golden fixtures for the minimal `krishiv sql` and `krishiv explain`
+literal-query paths. Broader SQL compatibility coverage should add focused
+fixtures here before changing public output formatting.
