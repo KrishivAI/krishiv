@@ -1,0 +1,15 @@
+[package]
+name = "krishiv-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+krishiv-proto = { path = "../krishiv-proto" }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -2,12 +2,13 @@
 
 ## Current Phase
 
-R1 Foundation Alpha.
+R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R1 Foundation Alpha and R1.1 hardening/examples are complete. The next active
-task is the first R2 Kubernetes Distributed Alpha design and skeleton slice.
+R2 slice 1 control-plane skeleton is complete. The next active task is exposing
+the skeleton through CLI/status surfaces or adding the first Kubernetes
+`KrishivJob` manifest slice.
 
 ## Completed
 
@@ -46,6 +47,14 @@ task is the first R2 Kubernetes Distributed Alpha design and skeleton slice.
 - Added Parquet aggregate golden output.
 - Added R1 Foundation Alpha release notes.
 - Updated R1 tracker with the R1.1 hardening checklist.
+- Added `crates/krishiv-proto` for R2 control-plane contracts.
+- Added typed coordinator, job, stage, task, and executor identifiers.
+- Added coordinator, job, stage, task, and executor lifecycle states.
+- Added R2 job/stage/task specs, executor heartbeat, task assignment, and task status update contracts.
+- Added `crates/krishiv-scheduler` for the R2 in-process active coordinator skeleton.
+- Added executor registry, heartbeat handling, lost-executor marking, static task placement, task launch, task completion/failure updates, and job snapshots.
+- Documented the R2 control-plane skeleton and limitations.
+- Updated R2 tracker, crate map, and file guide.
 
 ## In Progress
 
@@ -53,10 +62,10 @@ task is the first R2 Kubernetes Distributed Alpha design and skeleton slice.
 
 ## Next Steps
 
-1. Start R2 by adding `crates/krishiv-proto` and `crates/krishiv-scheduler`.
-2. Define R2 job, stage, task, and executor identifiers plus state models.
-3. Add in-process coordinator/executor skeletons before Kubernetes manifests.
-4. Keep all R1 embedded and single-node validation green while R2 starts.
+1. Add `krishiv submit` CLI skeleton backed by the scheduler data model.
+2. Add distributed job status output to `krishiv jobs` without changing R1 local behavior.
+3. Add the first `KrishivJob` CRD and minimal Kubernetes manifests.
+4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
 
@@ -88,5 +97,5 @@ For a new Codex session:
 
 1. Read `AGENTS.md`.
 2. Read this file.
-3. Read `docs/implementation/r1-foundation-alpha.md`.
-4. Begin the R2 tracker with coordinator/executor skeletons, unless the user asks for more R1 polish.
+3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
+4. Continue R2 with CLI/status or Kubernetes manifest work, unless the user asks for more scheduler internals.

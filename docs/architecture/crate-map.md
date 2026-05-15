@@ -14,6 +14,8 @@ DataFusion while keeping public Krishiv APIs stable.
 | `krishiv-plan` | Krishiv logical/physical plan wrappers and DAG-level concepts | SQL parser details, physical operator execution |
 | `krishiv-exec` | Physical operator descriptors and future Arrow execution operators | User-facing API, distributed scheduling |
 | `krishiv-runtime` | Runtime traits, local backends, job/task status, execution backend boundary | SQL parsing, connector-specific guarantees, Kubernetes CRDs |
+| `krishiv-proto` | R2 control-plane contracts: typed ids, lifecycle states, job/stage/task specs, executor heartbeats, and task updates | Runtime scheduling decisions, Kubernetes clients, transport servers |
+| `krishiv-scheduler` | R2 active coordinator skeleton, executor registry, static placement, task lifecycle updates, and job snapshots | SQL parsing, DataFusion execution, Kubernetes CRDs, durable metadata |
 
 ## Dependency Direction
 
@@ -38,6 +40,11 @@ krishiv-exec
 krishiv-runtime
   -> krishiv-plan
 
+krishiv-scheduler
+  -> krishiv-proto
+
+krishiv-proto
+
 krishiv-plan
 ```
 
@@ -53,6 +60,6 @@ Future dependencies should preserve a simple rule: user-facing crates can depend
 
 ## Next Expected Slice
 
-The next implementation slice should harden R1 local execution with broader
-SQL golden coverage and example applications, then prepare R2 coordinator and
-executor skeletons without changing R1 semantics.
+The next implementation slice should extend the R2 skeleton into CLI-visible
+distributed job submission and status while keeping scheduling static and one
+coordinator active.

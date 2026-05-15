@@ -1748,10 +1748,21 @@ name = "krishiv-plan"
 version = "0.1.0"
 
 [[package]]
+name = "krishiv-proto"
+version = "0.1.0"
+
+[[package]]
 name = "krishiv-runtime"
 version = "0.1.0"
 dependencies = [
  "krishiv-plan",
+]
+
+[[package]]
+name = "krishiv-scheduler"
+version = "0.1.0"
+dependencies = [
+ "krishiv-proto",
 ]
 
 [[package]]

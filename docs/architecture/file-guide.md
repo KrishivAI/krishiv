@@ -1,6 +1,7 @@
-# R1 Bootstrap File Guide
+# Krishiv File Guide
 
-This guide explains the files introduced by the R1 bootstrap slice. It is meant for humans and Codex sessions resuming implementation work.
+This guide explains the files introduced by the R1 and early R2 slices. It is
+meant for humans and Codex sessions resuming implementation work.
 
 ## Workspace Root
 
@@ -28,10 +29,14 @@ This guide explains the files introduced by the R1 bootstrap slice. It is meant 
 | `crates/krishiv-sql/src/lib.rs` | Owns DataFusion session integration, Parquet registration, SQL collect, and explain formatting. |
 | `crates/krishiv-plan/Cargo.toml` | Defines the plan crate. |
 | `crates/krishiv-plan/src/lib.rs` | Owns `ExecutionKind`, `PlanNode`, `LogicalPlan`, and `PhysicalPlan`. |
+| `crates/krishiv-proto/Cargo.toml` | Defines the R2 control-plane contract crate. |
+| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, and RPC-style message structs. |
 | `crates/krishiv-exec/Cargo.toml` | Defines the physical execution crate. |
 | `crates/krishiv-exec/src/lib.rs` | Defines physical operator descriptors and placeholder logical-to-physical lowering. |
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
 | `crates/krishiv-runtime/src/lib.rs` | Owns runtime traits, local backend acceptance, job/task status, and local job registry. |
+| `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate. |
+| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, executor registry, static placement, and task lifecycle updates. |
 
 ## Architecture And Engineering Docs
 
@@ -40,7 +45,8 @@ This guide explains the files introduced by the R1 bootstrap slice. It is meant 
 | `docs/architecture/krishiv-roadmap.md` | Canonical 10-release roadmap and high-level architecture. |
 | `docs/architecture/crate-map.md` | Explains crate ownership and dependency direction. |
 | `docs/architecture/r1-bootstrap.md` | Explains what the bootstrap and local execution slices deliver, what remains stubbed, and streaming limitations. |
-| `docs/architecture/file-guide.md` | This file; explains each R1 file. |
+| `docs/architecture/r2-control-plane.md` | Explains the R2 coordinator/executor skeleton, static scheduling, and deferred distributed features. |
+| `docs/architecture/file-guide.md` | This file; explains each current project file. |
 | `docs/engineering/standards.md` | Rust, async, testing, error handling, and documentation standards. |
 | `docs/engineering/codex-workflow.md` | Rate-limit and session-resumability workflow for Codex. |
 | `docs/releases/r1-foundation-alpha.md` | R1 alpha release notes, features, limitations, example commands, and validation commands. |

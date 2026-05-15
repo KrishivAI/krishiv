@@ -4,7 +4,9 @@ members = [
     "crates/krishiv-cli",
     "crates/krishiv-exec",
     "crates/krishiv-plan",
+    "crates/krishiv-proto",
     "crates/krishiv-runtime",
+    "crates/krishiv-scheduler",
     "crates/krishiv-sql",
 ]
 resolver = "3"

@@ -40,15 +40,15 @@ Out of scope:
 
 ## Architecture Deliverables
 
-- [ ] Add `crates/krishiv-scheduler`.
-- [ ] Add `crates/krishiv-proto`.
-- [ ] Define coordinator service lifecycle.
-- [ ] Define executor service lifecycle.
-- [ ] Define task, stage, executor, and job identifiers.
-- [ ] Define distributed job state model.
-- [ ] Define distributed task state model.
-- [ ] Keep one active coordinator for R2.
-- [ ] Document R2 control-plane limitations.
+- [x] Add `crates/krishiv-scheduler`.
+- [x] Add `crates/krishiv-proto`.
+- [x] Define coordinator service lifecycle.
+- [x] Define executor service lifecycle.
+- [x] Define task, stage, executor, and job identifiers.
+- [x] Define distributed job state model.
+- [x] Define distributed task state model.
+- [x] Keep one active coordinator for R2.
+- [x] Document R2 control-plane limitations.
 
 ## API And Interface Deliverables
 
@@ -56,17 +56,17 @@ Out of scope:
 - [ ] Add distributed job status output to `krishiv jobs`.
 - [ ] Define `KrishivJob` CRD.
 - [ ] Add minimal Kubernetes manifests under `k8s/`.
-- [ ] Define coordinator/executor RPC messages in `krishiv-proto`.
+- [x] Define coordinator/executor RPC messages in `krishiv-proto`.
 - [ ] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
 
 ## Runtime Deliverables
 
-- [ ] Implement executor registration.
-- [ ] Implement executor heartbeat.
-- [ ] Implement static task placement.
-- [ ] Implement task launch.
-- [ ] Implement task completion reporting.
-- [ ] Implement task failure reporting.
+- [x] Implement executor registration.
+- [x] Implement executor heartbeat.
+- [x] Implement static task placement.
+- [x] Implement task launch.
+- [x] Implement task completion reporting.
+- [x] Implement task failure reporting.
 - [ ] Implement stage-level retry.
 - [ ] Route distributed batch DAG execution through the scheduler.
 - [ ] Route distributed streaming DAG execution through the scheduler with local-only state semantics.
@@ -74,9 +74,10 @@ Out of scope:
 
 ## Test Checklist
 
-- [ ] Coordinator unit tests pass.
-- [ ] Executor unit tests pass.
-- [ ] Task lifecycle tests pass.
+- [x] Coordinator unit tests pass.
+- [x] Executor unit tests pass.
+- [x] Task lifecycle tests pass.
+- [x] Lost-executor marking tests pass.
 - [ ] Heartbeat timeout tests pass.
 - [ ] Stage retry tests pass.
 - [ ] `KrishivJob` manifest validation tests pass.
