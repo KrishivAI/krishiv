@@ -57,7 +57,7 @@ Out of scope:
 - [x] Define `KrishivJob` CRD.
 - [x] Add minimal Kubernetes manifests under `k8s/`.
 - [x] Define coordinator/executor RPC messages in `krishiv-proto`.
-- [ ] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
+- [x] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
 
 ## Runtime Deliverables
 

@@ -6,9 +6,9 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 distributed DAG routing slice is complete. The next active task is adding a
-status endpoint/basic Web UI, or starting controller work needed before
-Kubernetes `kind` smoke tests can become meaningful.
+R2 status endpoint/basic Web UI slice is complete. The next active task is
+starting controller work needed before Kubernetes `kind` smoke tests can become
+meaningful.
 
 ## Completed
 
@@ -75,6 +75,11 @@ Kubernetes `kind` smoke tests can become meaningful.
 - Routed batch DAGs as `JobKind::Batch` and streaming DAGs as `JobKind::Streaming` with R1-level local state semantics.
 - Added scheduler tests for batch logical DAG routing, streaming physical DAG routing, and empty-plan routing.
 - Updated R2 tracker, crate map, file guide, and control-plane docs for DAG routing.
+- Added `crates/krishiv-ui` as a Rust-native R2 status API and server-rendered Web UI using `axum` and `askama`.
+- Added `/healthz`, `/readyz`, `/api/v1/jobs`, `/api/v1/jobs/{job_id}`, `/api/v1/executors`, `/ui`, and `/ui/jobs/{job_id}` routes.
+- Added deterministic UI demo state with one local coordinator, executor, and running job.
+- Added UI route tests for health, job listing, job detail, missing job, and HTML rendering.
+- Updated R2 tracker, crate map, file guide, and control-plane docs for the status API/Web UI.
 
 ## In Progress
 
@@ -82,8 +87,8 @@ Kubernetes `kind` smoke tests can become meaningful.
 
 ## Next Steps
 
-1. Add status endpoint or basic Web UI for jobs, stages, tasks, and executors.
-2. Start controller/operator work needed to reconcile `KrishivJob` resources.
+1. Start controller/operator work needed to reconcile `KrishivJob` resources.
+2. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
 3. Add Kubernetes `kind` smoke tests after the controller path exists.
 4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
@@ -107,7 +112,13 @@ Kubernetes `kind` smoke tests can become meaningful.
 - `cargo run -p krishiv-cli -- submit --job-id job-demo --name demo --tasks 2 --launch` passed.
 - `cargo run -p krishiv-cli -- jobs --distributed` passed.
 - `cargo test -p krishiv-scheduler` passed, including offline R2 manifest validation tests.
+- `cargo test -p krishiv-ui` passed.
 - `cargo test -p krishiv-cli` passed.
+- `cargo run -p krishiv-ui -- --help` passed.
+- `cargo run -p krishiv-ui -- --demo --addr 127.0.0.1:18080` started the demo status server.
+- `curl http://127.0.0.1:18080/healthz` returned `ok`.
+- `curl http://127.0.0.1:18080/api/v1/jobs` returned the demo `job-demo` status.
+- `curl http://127.0.0.1:18080/ui` rendered the R2 status HTML page.
 - `cargo run -p krishiv-api --example local_sql_parquet` passed.
 - `cargo run -p krishiv-api --example memory_stream` passed.
 - `cargo run -p krishiv-cli -- --help` passed.
@@ -122,4 +133,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 with distributed DAG routing or status endpoint/Web UI work, unless the user asks for Kubernetes controller work.
+4. Continue R2 with controller/operator work for `KrishivJob` reconciliation, unless the user asks for another status/UI slice.

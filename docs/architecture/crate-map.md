@@ -1,8 +1,9 @@
 # Krishiv Crate Map
 
-This map explains the R1 crate ownership boundaries. The bootstrap slice
-created the rails, and the R1 local execution slice now runs SQL through
-DataFusion while keeping public Krishiv APIs stable.
+This map explains the current crate ownership boundaries. R1 established the
+local API, SQL, planning, execution, and runtime rails. R2 is adding the first
+distributed control-plane, scheduler, Kubernetes, and status UI surfaces while
+keeping public Krishiv APIs stable.
 
 ## Workspace Crates
 
@@ -16,10 +17,11 @@ DataFusion while keeping public Krishiv APIs stable.
 | `krishiv-runtime` | Runtime traits, local backends, job/task status, execution backend boundary | SQL parsing, connector-specific guarantees, Kubernetes CRDs |
 | `krishiv-proto` | R2 control-plane contracts: typed ids, lifecycle states, job/stage/task specs, executor heartbeats, and task updates | Runtime scheduling decisions, Kubernetes clients, transport servers |
 | `krishiv-scheduler` | R2 active coordinator skeleton, executor registry, static placement, Krishiv DAG-to-job conversion, task lifecycle updates, and job snapshots | SQL parsing, DataFusion execution, Kubernetes CRDs, durable metadata |
+| `krishiv-ui` | R2 status HTTP API, health/readiness endpoints, and server-rendered Web UI over scheduler snapshots | Scheduling decisions, Kubernetes controllers, durable metadata, SQL execution |
 
 ## Dependency Direction
 
-Current R1 dependency direction:
+Current dependency direction:
 
 ```text
 krishiv-cli
@@ -44,6 +46,12 @@ krishiv-scheduler
   -> krishiv-plan
   -> krishiv-proto
 
+krishiv-ui
+  -> krishiv-proto
+  -> krishiv-scheduler
+  -> axum
+  -> askama
+
 krishiv-proto
 
 krishiv-plan
@@ -61,6 +69,6 @@ Future dependencies should preserve a simple rule: user-facing crates can depend
 
 ## Next Expected Slice
 
-The next implementation slice should extend the R2 skeleton into CLI-visible
-distributed job submission and status while keeping scheduling static and one
+The next implementation slice should start the R2 controller/operator path for
+reconciling `KrishivJob` resources while keeping scheduling static and one
 coordinator active.

@@ -12,7 +12,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `.gitignore` | Ignores local build output such as `target/`. |
 | `AGENTS.md` | Repo-wide Codex instructions, architecture invariants, and resumability workflow. |
 
-## R1 Crates
+## Workspace Crates
 
 | File | Purpose |
 |---|---|
@@ -37,6 +37,11 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-runtime/src/lib.rs` | Owns runtime traits, local backend acceptance, job/task status, and local job registry. |
 | `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate and its plan/proto dependencies. |
 | `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, executor registry, static placement, Krishiv DAG routing, retry/timeout behavior, and task lifecycle updates. |
+| `crates/krishiv-ui/Cargo.toml` | Defines the R2 status API/Web UI crate and its `axum`, `askama`, scheduler, and proto dependencies. |
+| `crates/krishiv-ui/src/lib.rs` | Owns the R2 status router, JSON API models, HTML rendering, health/readiness endpoints, and deterministic demo state. |
+| `crates/krishiv-ui/src/main.rs` | Runs the standalone R2 status server with optional demo data. |
+| `crates/krishiv-ui/templates/jobs.html` | Renders the job and executor status overview page. |
+| `crates/krishiv-ui/templates/job.html` | Renders one job's stage, task, and executor detail page. |
 
 ## Architecture And Engineering Docs
 

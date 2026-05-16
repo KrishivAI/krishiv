@@ -73,6 +73,24 @@ claiming Kubernetes submission:
   known to the current process.
 - `krishiv jobs` without flags preserves the R1 process-local job behavior.
 
+## Status API And Web UI
+
+The R2 status UI is implemented in `krishiv-ui` as a Rust-native `axum` server
+with server-rendered `askama` templates. It reads the same scheduler snapshot
+types used by the CLI and exposes:
+
+- `GET /healthz` for process liveness.
+- `GET /readyz` for coordinator snapshot readiness.
+- `GET /api/v1/jobs` for job summaries.
+- `GET /api/v1/jobs/{job_id}` for stage/task detail.
+- `GET /api/v1/executors` for executor summaries.
+- `GET /ui` and `GET /ui/jobs/{job_id}` for the HTML status pages.
+
+The standalone server can be run with `cargo run -p krishiv-ui -- --demo` to
+seed one local coordinator, one executor, and one running demo job. In R2 this
+is an in-process status surface only; persistence, authentication,
+OpenTelemetry, and Kubernetes-backed job history are deferred.
+
 ## Kubernetes Surface
 
 The first R2 Kubernetes slice adds static manifests under `k8s/`:

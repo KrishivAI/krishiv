@@ -1,0 +1,17 @@
+[package]
+name = "krishiv-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+askama.workspace = true
+axum.workspace = true
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+serde.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
