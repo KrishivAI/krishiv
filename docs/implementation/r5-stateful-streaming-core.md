@@ -2,9 +2,13 @@
 
 ## Goal
 
-Deliver Krishiv's Flink-style stateful streaming core: keyed streams, event time, watermarks, timers, windows, state TTL, stream-table join baseline, and state inspection.
+Deliver Krishiv's stateful streaming core in two sequential sub-milestones.
 
-R5 proves that Krishiv can run stateful streaming pipelines with deterministic behavior before adding full checkpoint/savepoint reliability in R6.
+**R5.1** delivers exactly one certified streaming path end-to-end: Kafka source → tumbling event-time window → in-memory keyed state → Kafka sink, running deterministically under replay. One correct path proves the streaming execution model is right before adding more window types.
+
+**R5.2** hardens the streaming core with RocksDB, sliding and session windows, multi-source watermarks, state TTL, and stream-table join.
+
+**Rule:** R5.2 cannot begin until R5.1's acceptance gate passes. The streaming execution model must be proven correct on one path before being generalized.
 
 ## Scope
 
@@ -12,102 +16,171 @@ In scope:
 
 - Keyed stream API.
 - Event-time timestamp assignment.
-- Watermark propagation.
+- Watermark propagation (single source in R5.1; multi-source in R5.2).
 - Processing-time and event-time timers.
-- Tumbling, sliding, and session windows.
+- Tumbling windows (R5.1).
+- Sliding and session windows (R5.2).
 - Keyed state API.
-- In-memory state backend.
-- RocksDB state backend.
-- State TTL.
-- Stream-table join baseline.
+- In-memory state backend (R5.1).
+- RocksDB state backend (R5.2).
+- State TTL (R5.2).
+- Stream-table join baseline (R5.2).
 - State inspection CLI.
 - Deterministic replay tests.
+- Checkpoint-barrier and watermark interaction protocol design.
 
 Out of scope:
 
-- Exactly-once.
-- Durable checkpoint coordination.
-- Savepoints.
-- State rescaling.
+- Exactly-once (deferred to R6).
+- Durable checkpoint coordination (R6).
+- Savepoints (R6).
+- State rescaling (R6+).
 - Tiered remote state.
 - Complex Event Processing.
-- Production HA coordinator failover.
+- Production HA coordinator failover (R9).
+- Streaming Python UDFs (post-GA via subprocess model; batch UDFs only in R8.1).
 
 ## Dependencies
 
 - R1 streaming API skeleton exists.
 - R2 distributed streaming DAG submission exists.
-- R3 Kafka source/sink contracts exist.
+- R3.1 real executor and gRPC transport exist.
+- R3.2 Kafka source/sink contracts exist.
 - R4 partitioning model can support keyed distribution.
+- `docs/architecture/streaming-execution-model.md` is written and approved (R4 deliverable; R5.1 must not start until this document exists).
 
-## Architecture Deliverables
+---
+
+## R5.1: One Certified Streaming Path
+
+### Goal
+
+Prove the streaming execution model is correct on a single end-to-end path before generalizing. The acceptance gate is strict: deterministic replay must produce identical output given identical input.
+
+**Certified path:** Kafka (single partition) → event-time tumbling window → in-memory keyed state → Kafka sink.
+
+### Architecture Deliverables
 
 - [ ] Add `crates/krishiv-state`.
-- [ ] Define keyed state API.
+- [ ] Define keyed state API (read, write, clear per key).
 - [ ] Define state namespace model.
-- [ ] Define timer service abstraction.
-- [ ] Define watermark propagation rules.
-- [ ] Define state TTL semantics.
-- [ ] Define state inspection safety boundaries.
-- [ ] Document R5 streaming semantics and limitations.
+- [ ] Define timer service abstraction (event-time only in R5.1).
+- [ ] Define single-source watermark propagation rules.
+- [ ] Define in-memory state backend interface.
+- [ ] Define continuous operator execution loop: how a streaming stage differs from a batch stage in the executor (no terminal completion; produces output continuously).
+- [ ] Define streaming job lifecycle in the scheduler (streaming jobs never transition to Succeeded while running).
+- [ ] Define checkpoint-barrier and watermark interaction protocol for R6 checkpoint implementation.
+- [ ] Define how barriers flow through single-source tumbling windows without closing windows incorrectly.
+- [ ] Document R5.1 streaming semantics, limitations, and the exact watermark model used.
 
-## API And Interface Deliverables
+### API And Interface Deliverables
 
 - [ ] Add `key_by` to the stream API.
 - [ ] Add event-time timestamp assignment API.
-- [ ] Add watermark configuration API.
-- [ ] Add timer API for internal operators.
+- [ ] Add watermark configuration API (single source, fixed lag).
 - [ ] Add tumbling window API.
+- [ ] Add event-time timer API for internal operators.
+
+### Runtime Deliverables
+
+- [ ] Implement continuous operator execution loop on executor (input RecordBatch loop, no terminal state).
+- [ ] Implement streaming job lifecycle in coordinator (no auto-transition to Succeeded).
+- [ ] Implement in-memory keyed state backend.
+- [ ] Implement event-time timers.
+- [ ] Implement single-source watermark propagation.
+- [ ] Implement tumbling window aggregation.
+- [ ] Implement deterministic replay harness (replay the same Kafka input, compare outputs).
+- [ ] Implement checkpoint-barrier protocol simulation for the certified path (metadata only; durable checkpoints remain R6).
+
+### Test Checklist
+
+- [ ] Keyed state read/write/clear unit tests pass.
+- [ ] In-memory state backend tests pass.
+- [ ] Event-time timer fires at correct watermark.
+- [ ] Single-source watermark propagation advances correctly.
+- [ ] Tumbling window correctness tests pass (windows close at the right watermark).
+- [ ] Deterministic replay test: same Kafka input produces identical output on two consecutive runs.
+- [ ] Checkpoint-barrier simulation preserves watermark/window ordering.
+- [ ] Streaming job remains in Running state in coordinator and does not auto-transition to Succeeded.
+- [ ] R1-R4 batch behavior still passes (no regression).
+
+### Acceptance Gate For R5.1
+
+- [ ] Kafka (single partition) → tumbling window → in-memory state → Kafka sink runs end-to-end on real executors.
+- [ ] Watermarks close windows correctly.
+- [ ] Deterministic replay produces identical output.
+- [ ] Streaming job lifecycle is correctly modeled in the coordinator.
+- [ ] Checkpoint-barrier and watermark interaction is documented and validated in simulation before R6 starts.
+- [ ] R1-R4 supported batch behavior still passes.
+- [ ] `docs/architecture/streaming-execution-model.md` was reviewed and used as the implementation spec.
+
+---
+
+## R5.2: Streaming Hardening
+
+### Goal
+
+Generalize the proven R5.1 streaming model to multiple window types, RocksDB, multi-source watermarks, state TTL, and stream-table join. R5.2 begins only after R5.1's acceptance gate passes.
+
+### Architecture Deliverables
+
+- [ ] Define RocksDB async isolation boundary using `spawn_blocking` (all RocksDB calls must leave the Tokio worker thread).
+- [ ] Define RocksDB compaction thread budget (must not starve Tokio workers).
+- [ ] Define multi-source watermark reconciliation rules (min watermark across all sources).
+- [ ] Define state TTL semantics and cleanup trigger model.
+- [ ] Define state inspection safety boundaries (read-only metadata; no mutation from inspection).
+
+### API And Interface Deliverables
+
 - [ ] Add sliding window API.
 - [ ] Add session window API.
+- [ ] Add processing-time timer API.
+- [ ] Add multi-source watermark configuration API.
 - [ ] Add state TTL configuration.
 - [ ] Add `krishiv state inspect` CLI skeleton.
 
-## Runtime Deliverables
+### Runtime Deliverables
 
-- [ ] Implement in-memory keyed state backend.
 - [ ] Implement RocksDB keyed state backend.
 - [ ] Implement processing-time timers.
-- [ ] Implement event-time timers.
-- [ ] Implement watermark propagation.
-- [ ] Implement tumbling window aggregation.
+- [ ] Implement multi-source watermark propagation.
 - [ ] Implement sliding window aggregation.
 - [ ] Implement session window aggregation.
 - [ ] Implement state TTL cleanup.
 - [ ] Implement stream-table join baseline.
 - [ ] Implement safe state metadata inspection.
-- [ ] Add deterministic replay harness.
+- [ ] Add RocksDB latency tests vs in-memory backend under load.
 
-## Test Checklist
+### Test Checklist
 
-- [ ] Keyed state unit tests pass.
-- [ ] In-memory state backend tests pass.
 - [ ] RocksDB state backend tests pass.
-- [ ] Timer tests pass.
-- [ ] Watermark propagation tests pass.
-- [ ] Tumbling window tests pass.
+- [ ] Processing-time timer tests pass.
+- [ ] Multi-source watermark propagation tests pass.
 - [ ] Sliding window tests pass.
 - [ ] Session window tests pass.
-- [ ] State TTL tests pass.
-- [ ] Stream-table join baseline tests pass.
-- [ ] Deterministic replay tests pass.
-
-## Acceptance Gate
-
-R5 is complete when:
-
-- [ ] A recoverable stateful window aggregation behaves deterministically under replay.
-- [ ] Watermarks close windows correctly.
 - [ ] State TTL removes expired state.
-- [ ] State inspection can read supported state metadata without mutating state.
-- [ ] R1-R4 supported batch behavior still passes.
+- [ ] Stream-table join baseline tests pass.
+- [ ] RocksDB does not block Tokio worker threads under sustained load.
+- [ ] R5.1 certified streaming path still passes with RocksDB backend.
+
+### Acceptance Gate For R5.2
+
+- [ ] A recoverable stateful window aggregation behaves deterministically under replay using RocksDB backend.
+- [ ] Multi-source watermarks close windows correctly.
+- [ ] State TTL removes expired state.
+- [ ] State inspection reads metadata without mutating state.
+- [ ] R1-R5.1 supported behavior still passes.
+
+---
 
 ## Risks And Mitigations
 
 | Risk | Mitigation |
 |---|---|
-| State correctness bugs | Add deterministic replay and model tests before optimizing |
-| Watermark semantics are unclear | Document event-time and lateness behavior in R5 docs |
-| RocksDB introduces blocking work in async paths | Isolate RocksDB operations away from Tokio worker threads |
-| State inspection mutates or corrupts state | Keep inspection read-only and metadata-focused in R5 |
-| Streaming APIs overfit early examples | Keep public APIs small and document beta semantics |
+| R5.1 streaming execution model is wrong; R5.2 would generalize a broken model | Gate R5.2 on R5.1 deterministic replay acceptance; do not generalize until replay proves correctness |
+| Watermark semantics are underspecified | `docs/architecture/streaming-execution-model.md` must exist and be approved before R5.1 implementation starts |
+| Checkpoint barriers conflict with watermarks | Define and simulate barrier/watermark ordering in R5.1 before durable checkpoints arrive in R6 |
+| RocksDB introduces blocking work in async paths | Define `spawn_blocking` isolation boundary and compaction thread budget in R5.2 architecture before any RocksDB code is written |
+| State inspection mutates or corrupts live state | Keep inspection read-only and metadata-focused; add mutation-detection assertion in tests |
+| Streaming APIs overfit the R5.1 example | Keep public APIs minimal; document beta semantics; design `key_by`/window API to generalize to R5.2 window types |
+| R5.1 acceptance gate takes too long | Do not relax the gate; adjust R5.2 start date instead |

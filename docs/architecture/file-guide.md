@@ -11,7 +11,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `Cargo.lock` | Locks the current dependency graph, including Arrow/DataFusion for R1 local SQL. |
 | `.gitignore` | Ignores local build output such as `target/`. |
 | `.dockerignore` | Keeps local build and Git metadata out of the runtime image build context. |
-| `Dockerfile` | Builds the R2-compatible runtime image containing `krishiv`, `krishiv-ui`, and `krishiv-operator`. |
+| `Dockerfile` | Builds the runtime image containing `krishiv`, `krishiv-ui`, `krishiv-operator`, and the R3.1 `krishiv-executor` skeleton. |
 | `AGENTS.md` | Repo-wide Codex instructions, architecture invariants, and resumability workflow. |
 
 ## Workspace Crates
@@ -27,12 +27,15 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-cli/src/main.rs` | Thin binary entrypoint that forwards arguments to `krishiv-cli` dispatch. |
 | `crates/krishiv-cli/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
 | `crates/krishiv-cli/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |
+| `crates/krishiv-executor/Cargo.toml` | Defines the R3.1 executor crate and `krishiv-executor` binary target. |
+| `crates/krishiv-executor/src/lib.rs` | Owns executor startup configuration, the minimal runtime facade, and construction of versioned registration/heartbeat requests. |
+| `crates/krishiv-executor/src/main.rs` | Runs the R3.1 executor skeleton CLI and prints the versioned registration/heartbeat contract it would send. |
 | `crates/krishiv-sql/Cargo.toml` | Defines the SQL seam crate and Arrow/DataFusion dependencies. |
 | `crates/krishiv-sql/src/lib.rs` | Owns DataFusion session integration, Parquet registration, SQL collect, and explain formatting. |
 | `crates/krishiv-plan/Cargo.toml` | Defines the plan crate. |
 | `crates/krishiv-plan/src/lib.rs` | Owns `ExecutionKind`, `PlanNode`, `LogicalPlan`, and `PhysicalPlan`. |
-| `crates/krishiv-proto/Cargo.toml` | Defines the R2 control-plane contract crate. |
-| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, and RPC-style message structs. |
+| `crates/krishiv-proto/Cargo.toml` | Defines the R2/R3.1 control-plane contract crate. |
+| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, R2 RPC-style message structs, and R3.1 versioned coordinator/executor transport contracts. |
 | `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/UI/serde dependencies. |
 | `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, shared coordinator runtime, in-process reconciliation, live Kubernetes watch adapter, and status patching. |
 | `crates/krishiv-operator/src/main.rs` | Runs the live R2 Kubernetes operator controller loop and optional scheduler-backed status server. |
@@ -56,6 +59,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `docs/architecture/crate-map.md` | Explains crate ownership and dependency direction. |
 | `docs/architecture/r1-bootstrap.md` | Explains what the bootstrap and local execution slices deliver, what remains stubbed, and streaming limitations. |
 | `docs/architecture/r2-control-plane.md` | Explains the R2 coordinator/executor skeleton, static scheduling, and deferred distributed features. |
+| `docs/architecture/stage-local-execution.md` | Defines the R3.1 coordinator/executor stage-local execution contract, task attempts, leases, metadata recovery, and handoff boundaries for shuffle, streaming, and checkpoints. |
+| `docs/architecture/streaming-execution-model.md` | Defines the R5 continuous operator model, watermark protocol, state interaction model, streaming lifecycle, and deterministic replay contract. |
 | `docs/architecture/file-guide.md` | This file; explains each current project file. |
 | `docs/engineering/standards.md` | Rust, async, testing, error handling, and documentation standards. |
 | `docs/engineering/codex-workflow.md` | Rate-limit and session-resumability workflow for Codex. |

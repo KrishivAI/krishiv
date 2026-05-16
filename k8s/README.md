@@ -41,7 +41,8 @@ R2 limitations:
   first live Kubernetes watch/status-patch path, and shared in-process
   coordinator runtime used by the status API.
 - Executor pods are still a R2 manifest/runtime placeholder; the operator uses
-  a bootstrap executor until real executor registration is added.
+  a bootstrap executor until the R3.1 `krishiv-executor` binary is wired to the
+  coordinator over gRPC.
 - No HA leader election, leases, or fencing tokens are included in R2.
 - The `kind` smoke tests are opt-in because they require Docker, `kind`,
   `kubectl`, and a locally built or published image.

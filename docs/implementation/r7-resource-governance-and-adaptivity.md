@@ -2,78 +2,117 @@
 
 ## Goal
 
-Deliver multi-tenant production controls and adaptive runtime behavior: resource manager, queues, priorities, quotas, admission control, namespace isolation, cost metrics, backpressure, source throttling, hot-key splitting, and adaptive repartitioning.
+Deliver multi-tenant production control in two sub-milestones. R7.1 delivers the resource manager, queues, admission control, quotas, and cost metrics — the governance foundation. R7.2 delivers backpressure, adaptivity, and hot-key handling.
 
-R7 makes Krishiv safer to operate with many teams and mixed workloads.
+Splitting into sub-milestones reduces the risk of R7 stalling R8–R10. R7.1 can ship and be validated independently before R7.2 begins.
 
 ## Scope
 
 In scope:
 
 - Resource manager service.
-- `KrishivQueue` CRD.
-- Queues and priorities.
+- Job queues and priorities.
 - Admission control.
 - CPU and memory quotas.
-- Namespace isolation model.
+- Namespace isolation.
 - Runtime cost metrics.
 - Bounded operator queues.
-- Credit-based flow control.
+- Credit-based backpressure.
 - Source throttling.
-- Slow-sink detection.
 - Hot-key detection and splitting.
 - Adaptive repartitioning.
-- Manual override for adaptive behavior.
-- Explainable adaptive-decision logs.
+- Manual override and explainable decisions.
 
 Out of scope:
 
-- Full cluster autoscaler integration.
-- Cloud-provider cost optimization.
-- ML-based scheduling.
-- Cross-cell scheduling.
-- Hard multi-tenant security enforcement beyond documented isolation model.
+- Global multi-region resource pooling.
+- GPU quota and scheduling.
+- Fine-grained billing integration.
+- Automatic cost-based autoscaling across cloud providers.
+- Full backpressure re-architecture beyond credit-based flow.
 
 ## Dependencies
 
-- R2 scheduler and executor model exists.
-- R4 runtime stats and partitioning exist.
-- R5 stateful streaming exists.
-- R6 checkpoint semantics can protect adaptive changes for stateful jobs.
-- Kubernetes CRD patterns are established.
+- R2 coordinator/executor model exists.
+- R4 runtime statistics model exists.
+- R6 checkpoint semantics do not interfere with throttled jobs.
+- Job/stage/task status API can expose queue and admission state.
 
-## Architecture Deliverables
+---
+
+## R7.1: Resource Management Foundation
+
+### Goal
+
+Deliver job queues, priorities, admission control, quotas, namespace isolation, and cost metrics. Prove that the coordinator can enforce resource policy before work is submitted to executors.
+
+### Architecture Deliverables
 
 - [ ] Add resource manager service.
-- [ ] Define scheduler/resource-manager boundary.
-- [ ] Define queue and priority model.
-- [ ] Define admission control model.
-- [ ] Define quota model.
-- [ ] Define namespace isolation model.
-- [ ] Define backpressure signal model.
-- [ ] Define adaptive decision model.
-- [ ] Document manual override behavior.
-
-## API And Interface Deliverables
-
 - [ ] Define `KrishivQueue` CRD.
-- [ ] Add job queue selection.
-- [ ] Add job priority selection.
+- [ ] Define queue and priority model.
+- [ ] Define admission control policy model.
+- [ ] Define CPU and memory quota model.
+- [ ] Define namespace isolation model.
+- [ ] Define cost metric model.
+- [ ] Document resource manager API and operator guide.
+
+### API And Interface Deliverables
+
+- [ ] Add job queue configuration.
+- [ ] Add job priority field to `JobSpec`.
+- [ ] Add admission control configuration.
 - [ ] Add quota configuration.
-- [ ] Add CLI/status visibility for queued jobs.
-- [ ] Add CLI/status visibility for throttled jobs.
-- [ ] Add adaptive decision logs.
-- [ ] Add cost metric output for jobs and operators.
+- [ ] Add namespace isolation configuration.
+- [ ] Add cost metrics to the status API and Web UI.
 
-## Runtime Deliverables
+### Runtime Deliverables
 
+- [ ] Implement resource manager service.
 - [ ] Implement job queues.
 - [ ] Implement job priorities.
 - [ ] Implement admission control.
-- [ ] Implement CPU quota checks.
-- [ ] Implement memory quota checks.
-- [ ] Implement namespace isolation hooks.
+- [ ] Implement CPU and memory quota enforcement.
+- [ ] Implement namespace isolation enforcement.
 - [ ] Add runtime cost metrics.
+- [ ] Add quota/admission tests.
+
+### Acceptance Gate For R7.1
+
+- [ ] Jobs above quota are rejected or queued.
+- [ ] Admission control rejects jobs when resources are unavailable.
+- [ ] Cost metrics are visible per job in the status API.
+- [ ] Queue and priority ordering is visible through the CLI and Web UI.
+
+---
+
+## R7.2: Backpressure And Adaptivity
+
+### Goal
+
+Deliver credit-based backpressure, bounded operator queues, source throttling, hot-key detection and splitting, and adaptive repartitioning. R7.2 begins after R7.1 acceptance gate passes.
+
+### Architecture Deliverables
+
+- [ ] Define bounded operator queue model.
+- [ ] Define credit-based flow control protocol.
+- [ ] Define source throttling hooks.
+- [ ] Define slow-sink detection model.
+- [ ] Define hot-key detection and splitting model.
+- [ ] Define adaptive repartitioning model.
+- [ ] Define manual override and explainable-decision log model.
+
+### API And Interface Deliverables
+
+- [ ] Add operator queue configuration.
+- [ ] Add backpressure visibility to the status API.
+- [ ] Add source throttling configuration.
+- [ ] Add hot-key detection output.
+- [ ] Add manual override for adaptive decisions.
+- [ ] Add explainable adaptive-decision logs.
+
+### Runtime Deliverables
+
 - [ ] Implement bounded operator queues.
 - [ ] Implement credit-based flow control.
 - [ ] Implement source throttling.
@@ -81,39 +120,25 @@ Out of scope:
 - [ ] Detect hot keys.
 - [ ] Implement hot-key splitting.
 - [ ] Implement adaptive repartitioning.
-- [ ] Add manual override for adaptive behavior.
+- [ ] Add backpressure stress tests.
+- [ ] Add hot-key simulation tests.
 
-## Test Checklist
-
-- [ ] Queue ordering tests pass.
-- [ ] Priority scheduling tests pass.
-- [ ] Admission control tests pass.
-- [ ] CPU quota tests pass.
-- [ ] Memory quota tests pass.
-- [ ] Namespace isolation tests pass.
-- [ ] Backpressure stress tests pass.
-- [ ] Source throttling tests pass.
-- [ ] Slow-sink tests pass.
-- [ ] Hot-key tests pass.
-- [ ] Adaptive repartition tests pass.
-- [ ] Cost metric validation tests pass.
-
-## Acceptance Gate
-
-R7 is complete when:
+### Acceptance Gate For R7.2
 
 - [ ] Overloaded jobs are throttled without destabilizing other jobs.
-- [ ] Jobs above quota are rejected or queued.
 - [ ] Hot-key tests show load reduction after splitting.
 - [ ] Adaptive decisions are visible to operators.
-- [ ] Manual override can disable adaptive behavior for a job.
+- [ ] Manual override disables adaptive behavior correctly.
+
+---
 
 ## Risks And Mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Adaptive behavior destabilizes jobs | Use conservative defaults and manual override |
-| Quotas reject valid workloads | Add explainable admission decisions and queue visibility |
-| Backpressure causes deadlocks | Use bounded queues and targeted stress tests |
-| Hot-key splitting breaks state semantics | Protect stateful repartition changes with checkpoint-aware transitions |
-| Cost metrics are misleading | Label early metrics as runtime estimates and validate against deterministic tests |
+| R7.1 or R7.2 independently takes too long | Keep each sub-milestone independently shippable; do not gate R8 on R7.2 if R7.1 is complete |
+| Adaptive behavior destabilizes jobs | Conservative defaults; manual override required; explainable decisions logged |
+| Quota enforcement breaks existing tests | Run R1–R6 parity tests after every R7.1 change |
+| Hot-key splitting causes state redistribution issues | Defer state-aware hot-key splitting to R9; keep R7.2 splitting stateless |
+| Backpressure spreads through pipelines | Add credit-based flow before source throttling; measure separately |
+| Cost metrics are inaccurate | Validate stats in deterministic tests before using them for admission decisions |

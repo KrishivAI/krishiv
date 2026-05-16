@@ -2,14 +2,15 @@
 
 ## Current Phase
 
-R2 Kubernetes Distributed Alpha.
+R3.1 Distributed Execution Foundation.
 
 ## Active Task
 
-R2 operator-owned coordinator runtime and scheduler-backed status API wiring is
-complete. The next active task is running the opt-in Kubernetes `kind` smoke
-tests against a locally built image, then improving executor truth beyond the
-current bootstrap executor.
+The first R3.1 code slice is complete: `krishiv-executor` exists and
+`krishiv-proto` now has versioned coordinator/executor transport contracts with
+task attempt ids and executor lease generations. The next active task is wiring
+those contracts into a `tonic` service boundary and scheduler-side
+attempt/lease validation.
 
 ## Completed
 
@@ -94,9 +95,17 @@ current bootstrap executor.
 - Added sample early streaming `KrishivJob` manifest and included it in the R2 kustomization.
 - Added Docker image build support for the R2 binaries with `Dockerfile` and `.dockerignore`.
 - Added opt-in `kind` smoke tests for batch and early streaming `KrishivJob` status reconciliation, gated by `KRISHIV_KIND_E2E=1`.
+- Applied roadmap review: added executor binary, gRPC transport, `MetadataStore` trait, and typed plan node items to R3; added minimal `FencingToken` to R6; split R7 into R7.1/R7.2 sub-milestones; split R8 into R8.1/R8.2 sub-milestones; added numeric benchmark target requirement to R10; updated `docs/architecture/krishiv-roadmap.md` and all affected tracker files.
+- Applied reliability pull-forward review: added R3.1 task attempts, idempotent task updates, executor leases, coordinator restart recovery, durable job event log, Kubernetes finalizer cleanup, and basic stability metrics; added R4 shuffle orphan cleanup; added R5 checkpoint-barrier/watermark protocol design; added R6 versioned checkpoint/savepoint metadata and coordinator restart recovery; added R9 stale-coordinator rejection; added R10 metadata schema upgrade tests.
 - Added a shared R2 coordinator handle so the live operator reconciler and status API read/write the same scheduler state.
 - Added optional scheduler-backed status serving to `krishiv-operator` with `--status-addr`.
 - Updated Kubernetes manifests so the single operator replica owns the active R2 coordinator runtime and the `krishiv-coordinator` service exposes that runtime's HTTP status surface.
+- Added `docs/architecture/stage-local-execution.md` for the R3.1 stage-local coordinator/executor execution contract, including task attempts, executor leases, `MetadataStore` recovery, event-log expectations, failure handling, status metrics, and R4-R6 handoff boundaries.
+- Updated the R3.1 and R4 trackers, roadmap, and file guide to mark the Stage-Local Execution Model as written while keeping review/approval and runtime acceptance gates open.
+- Added `crates/krishiv-executor` with an executor startup config, minimal runtime facade, CLI skeleton, and construction of versioned registration/heartbeat requests.
+- Added R3.1 versioned coordinator/executor transport contracts to `krishiv-proto`: `TransportVersion`, `AttemptId`, `LeaseGeneration`, registration, heartbeat, task assignment, task status, input partition, plan fragment, output contract, and response disposition types.
+- Updated the runtime image build to include `krishiv-executor`.
+- Updated R3.1 roadmap/tracker/docs to mark the executor crate and transport contracts complete while leaving real gRPC, scheduler idempotency, and lease-expiry behavior open.
 
 ## In Progress
 
@@ -104,13 +113,14 @@ current bootstrap executor.
 
 ## Next Steps
 
-1. Run the opt-in `kind` smoke tests with a locally built image and mark the Kubernetes acceptance items once they pass in a real cluster.
-2. Replace the bootstrap executor path with executor registration from real executor pods or a first executor heartbeat path.
-3. Keep scheduling static and maintain exactly one active coordinator in R2.
+1. Add the `tonic` coordinator/executor service boundary in `krishiv-proto` and adapter layer without changing scheduler semantics yet.
+2. Wire executor registration and heartbeat from `krishiv-executor` to the coordinator over the new service.
+3. Teach the scheduler to store and validate `AttemptId` and `LeaseGeneration`, including stale-attempt and stale-lease rejection.
+4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
 
 ## Known Blockers
 
-- None known.
+- R2 `kind` smoke validation is deferred because local Podman image build hit a TLS certificate trust issue while pulling the Rust base image.
 
 ## Last Validation
 
@@ -146,6 +156,15 @@ current bootstrap executor.
 - `cargo run -p krishiv-cli -- explain --help` passed.
 - `find . -path './target' -prune -o -type f -print | sort` confirmed the bootstrap file inventory.
 - Placeholder scan across repo docs and crates returned no actionable markers.
+- `git diff --check` passed after the R3.1 Stage-Local Execution Model document update.
+- Placeholder scan across the updated R3.1/R4 roadmap and tracker docs returned no actionable markers.
+- `cargo fmt --all --check` passed after adding `krishiv-executor` and R3.1 transport contracts.
+- `cargo check --workspace` passed.
+- `cargo test -p krishiv-proto -p krishiv-executor` passed.
+- `cargo run -p krishiv-executor -- --help` passed.
+- `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:8080` passed and printed registration/heartbeat contract summaries.
+- `git diff --check` passed after the R3.1 executor/transport contract slice.
+- Placeholder scan across the R3.1 executor/transport contract files and updated docs returned no actionable markers.
 
 ## Resume Instructions
 
@@ -153,5 +172,5 @@ For a new Codex session:
 
 1. Read `AGENTS.md`.
 2. Read this file.
-3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 by running `KRISHIV_KIND_E2E=1 KRISHIV_KIND_IMAGE=krishiv:dev cargo test -p krishiv-operator --test r2_kind_smoke` after building `docker build -t krishiv:dev .`, unless the user asks for another slice.
+3. Read `docs/implementation/r3-connector-contracts.md`.
+4. Continue R3.1 by wiring the versioned coordinator/executor contracts into a `tonic` service boundary, then add scheduler-side attempt and lease validation.

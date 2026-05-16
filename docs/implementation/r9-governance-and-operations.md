@@ -36,7 +36,9 @@ Out of scope:
 ## Dependencies
 
 - R2 coordinator/executor model exists.
+- R3 task attempts, executor leases, coordinator restart recovery, and durable job event log exist.
 - R6 checkpoint ownership and epoch metadata exist.
+- R6 checkpoint/savepoint metadata is versioned and recovery-tested.
 - R7 resource manager and queues exist.
 - R8 client surfaces exist for Python and Flight SQL.
 - Runtime services emit enough metadata for observability.
@@ -52,8 +54,9 @@ Out of scope:
 - [ ] Define row/column masking hook boundaries.
 - [ ] Define HA coordinator deployment model.
 - [ ] Define per-job leader election model.
-- [ ] Define durable lease model.
+- [ ] Define durable lease model building on R3 executor leases and R6 checkpoint ownership.
 - [ ] Define fencing token model.
+- [ ] Define stale-coordinator rejection path for every failover-sensitive write.
 - [ ] Define replay bundle contents.
 - [ ] Define Helm chart structure.
 
@@ -92,6 +95,7 @@ Out of scope:
 - [ ] Implement per-job leader election.
 - [ ] Implement durable leases.
 - [ ] Implement fencing tokens.
+- [ ] Implement stale-coordinator rejection for checkpoint, savepoint, task assignment, and sink commit ownership.
 - [ ] Implement replay bundle generation.
 - [ ] Implement plan diffing.
 - [ ] Add Helm chart.
@@ -109,6 +113,7 @@ Out of scope:
 - [ ] Masking hook tests pass.
 - [ ] Kubernetes `kind` e2e tests pass.
 - [ ] Per-job leader failover tests pass.
+- [ ] Stale coordinator write rejection tests pass.
 - [ ] Fencing-token tests pass.
 - [ ] Replay bundle tests pass.
 - [ ] Plan diff tests pass.
@@ -120,6 +125,8 @@ R9 is complete when:
 
 - [ ] Coordinator failover does not allow duplicate checkpoint ownership.
 - [ ] Fencing tokens prevent stale coordinators from committing.
+- [ ] R3 task-attempt and executor-lease invariants still hold after per-job coordinator failover.
+- [ ] R6 checkpoint/savepoint recovery invariants still hold after per-job coordinator failover.
 - [ ] OpenTelemetry signals are emitted for supported jobs.
 - [ ] Audit and lineage events are emitted for supported actions.
 - [ ] Helm chart can deploy the supported R9 cluster shape.
@@ -129,6 +136,7 @@ R9 is complete when:
 | Risk | Mitigation |
 |---|---|
 | Control-plane correctness fails under failover | Use leases, fencing tokens, and durable ownership metadata |
+| HA introduces new recovery semantics too late | Build on R3 task attempts/executor leases/event log and R6 versioned checkpoint metadata |
 | Observability is bolted on inconsistently | Make metrics/traces/logs mandatory for runtime services |
 | Policy hooks become a full governance product | Keep R9 hooks pluggable and defer policy engine depth |
 | Audit logs miss sensitive actions | Define audit event taxonomy before implementation |

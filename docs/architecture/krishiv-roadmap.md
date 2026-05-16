@@ -87,14 +87,31 @@ Control-plane evolution:
 |---|---|
 | R1 | In-process coordinator for embedded and single-node execution. |
 | R2 | One active Kubernetes coordinator with many executors. |
-| R3 | Durable metadata for job ownership, offsets, and task state. |
-| R4 | Independent shuffle metadata and recovery hooks. |
-| R5 | Per-job coordinator ownership for stateful jobs. |
-| R6 | Checkpoint/savepoint metadata sufficient for coordinator recovery. |
+| R3 | Durable metadata for job ownership, task state, task attempts, executor leases, and coordinator restart recovery. |
+| R4 | Independent shuffle metadata, recovery hooks, garbage collection, and orphan detection. |
+| R5 | Per-job coordinator ownership for stateful jobs plus checkpoint-barrier and watermark protocol design. |
+| R6 | Versioned checkpoint/savepoint metadata sufficient for coordinator recovery. |
 | R7 | Resource manager, queues, admission control, and scheduler isolation. |
 | R8 | Active-active API entry points for Python and Flight SQL clients. |
 | R9 | HA coordinators, per-job leader election, leases, and fencing tokens. |
 | R10 | Cell-based production control plane. |
+
+### Reliability Pull-Forward Plan
+
+Some stability features must arrive before their full production releases so
+later work is not built on a fragile base:
+
+- R3.1 must include task attempt IDs, idempotent task status updates, executor
+  leases, coordinator restart recovery, a durable job event log, Kubernetes
+  finalizer cleanup, and basic scheduler/executor metrics.
+- R4 must include shuffle garbage collection and orphan detection with
+  deterministic cleanup tests.
+- R5 must define the checkpoint-barrier and watermark interaction protocol
+  before durable checkpoint implementation starts in R6.
+- R6 must version checkpoint and savepoint metadata from the first format and
+  include coordinator/executor/sink chaos tests before any exactly-once claim.
+- R9 remains the full HA release, but it must build on the R3 and R6 recovery
+  invariants rather than introducing recovery semantics for the first time.
 
 ## Repository Architecture
 
@@ -250,22 +267,53 @@ Acceptance gate:
 
 ### R3: Connector Contracts
 
-Scope: production I/O baseline.
+Scope: distributed execution foundation and production I/O baseline. Split into two gated sub-milestones.
 
-Features:
+**Architecture invariant established in R3:** Stage-Local Execution Model — coordinator partitions work into stages and assigns input partitions to executors; each executor runs a full local DataFusion context for its assigned partitions; shuffle moves data between stages.
 
-- Connector traits.
-- Parquet read/write.
-- Kafka source/sink.
-- S3-compatible object storage.
-- Source offsets.
-- At-least-once sink contract.
-- CDC design.
-- Connector certification test kit.
+#### R3.1: Distributed Execution Foundation
+
+Checklist:
+
+- [x] Add `crates/krishiv-executor` binary crate.
+- [ ] Add `tonic` gRPC transport to `krishiv-proto`.
+- [ ] Implement executor registration, task assignment, and status update RPCs.
+- [x] Add versioned coordinator/executor transport contracts in `krishiv-proto`.
+- [x] Add task attempt IDs to R3.1 transport task assignments and status updates.
+- [ ] Reject stale or duplicate task status updates idempotently.
+- [x] Add executor lease generation to R3.1 registration, heartbeat, task assignment, and task status contracts.
+- [ ] Define executor lease model with heartbeat generation and expiry.
+- [ ] Add durable job event log for job, stage, task, executor, and checkpoint events.
+- [ ] Add Kubernetes finalizer cleanup for `KrishivJob` delete/cancel paths.
+- [ ] Add basic scheduler/executor stability metrics: heartbeat age, retry count, task duration, failed assignments.
+- [ ] Define `MetadataStore` trait in `krishiv-runtime` with in-memory implementation.
+- [ ] Plug `MetadataStore` into `Coordinator` for durable job/stage/task persistence.
+- [ ] Replace `PlanNode` string labels with a typed operator enum in `krishiv-plan`.
+- [ ] Add schema propagation through `LogicalPlan` nodes.
+- [ ] Add estimated cardinality fields to plan nodes for R4 CBO.
+- [x] Write `docs/architecture/stage-local-execution.md`.
+
+Acceptance gate for R3.1:
+
+- [ ] Real SQL query completes end-to-end over gRPC (coordinator → executor).
+- [ ] Executor crash is detected and task is reassigned.
+- [ ] Coordinator restart recovers job, task, attempt, lease, and event-log state.
+- [ ] Stale task attempts and duplicate status updates are rejected or ignored safely.
+- [ ] Operator restart during reconciliation does not create duplicate scheduler jobs.
+- [ ] Deleting a `KrishivJob` runs finalizer cleanup and leaves no active task assignments.
+- [x] Stage-Local Execution Model document is written.
+- [ ] Stage-Local Execution Model document is reviewed and approved.
+
+#### R3.2: Connector Contracts
+
+Goal: Parquet, Kafka, S3, and catalog — running on real R3.1 executors. Cannot start until R3.1 acceptance gate passes.
 
 Checklist:
 
 - [ ] Add `krishiv-connectors` crate.
+- [ ] Add `krishiv-catalog` crate.
+- [ ] Define `TableProvider`, `CatalogProvider`, and column statistics model in `krishiv-catalog`.
+- [ ] Implement in-memory catalog backed by DataFusion `SessionContext`.
 - [ ] Define `Source` trait.
 - [ ] Define `Sink` trait.
 - [ ] Define `Offset` model.
@@ -274,7 +322,7 @@ Checklist:
 - [ ] Include capability flags: bounded, unbounded, rewindable, transactional, idempotent.
 - [ ] Implement Parquet reader.
 - [ ] Implement Parquet writer.
-- [ ] Implement S3-compatible object store integration.
+- [ ] Implement S3-compatible object store integration (unpartitioned only; partitioned writes depend on R4).
 - [ ] Implement Kafka source.
 - [ ] Implement Kafka sink.
 - [ ] Add source offset tracking.
@@ -283,12 +331,13 @@ Checklist:
 - [ ] Write CDC design document under `docs/rfcs/`.
 - [ ] Add connector certification test kit.
 
-Acceptance gate:
+Acceptance gate for R3.2:
 
-- [ ] Parquet connector passes certification tests.
+- [ ] Parquet connector passes certification tests running on real executors.
 - [ ] Kafka connector passes certification tests for supported semantics.
 - [ ] S3-compatible object store integration passes read/write tests.
 - [ ] Every connector declares capability flags.
+- [ ] Kafka → Parquet pipeline runs end-to-end on real executors.
 
 ### R4: Shuffle And Batch AQE
 
@@ -308,12 +357,18 @@ Features:
 
 Checklist:
 
+- [x] Add `docs/architecture/stage-local-execution.md` (Stage-Local Execution Model).
+- [ ] Add `docs/architecture/streaming-execution-model.md` (continuous operator model, watermark protocol, state interaction, streaming job lifecycle — must be approved before R5.1 starts).
 - [ ] Add `krishiv-shuffle` crate.
+- [ ] Add `krishiv-optimizer` crate.
+- [ ] Define optimizer rule trait, CBO cost model, AQE rewrite rule, stream planning rule, and skew detection rule interfaces in `krishiv-optimizer`.
 - [ ] Define shuffle writer API.
 - [ ] Define shuffle reader API.
 - [ ] Define shuffle metadata model.
+- [ ] Define shuffle garbage collection and orphan detection model.
 - [ ] Implement hash partitioning.
 - [ ] Implement shuffle read/write path.
+- [ ] Implement shuffle cleanup for completed, failed, and cancelled jobs.
 - [ ] Add compression hooks.
 - [ ] Add spill hooks.
 - [ ] Implement local pre-aggregation.
@@ -328,58 +383,71 @@ Checklist:
 
 Acceptance gate:
 
+- [ ] Usable Product Gate passes: distributed batch SQL on Parquet+S3, TPC-H SF10 correctness, Kafka→Parquet pipeline, live Kubernetes CLI, published TPC-H result. Project made public after this gate.
 - [ ] Distributed join correctness tests pass.
 - [ ] Distributed aggregation correctness tests pass.
 - [ ] Spill tests pass.
 - [ ] Skew simulation identifies hot partitions.
 - [ ] Shuffle metadata remains recoverable after executor failure.
+- [ ] Orphan shuffle data is detected and cleaned up deterministically.
+- [ ] `docs/architecture/streaming-execution-model.md` is written and approved.
 
 ### R5: Stateful Streaming Core
 
-Scope: Flink-style stateful stream processing.
+Scope: Flink-style stateful stream processing. Split into two gated sub-milestones. R5.1 cannot start until `docs/architecture/streaming-execution-model.md` is approved.
 
-Features:
+#### R5.1: One Certified Streaming Path
 
-- `key_by`.
-- Event time and watermarks.
-- Timers.
-- Tumbling, sliding, and session windows.
-- Keyed state API.
-- In-memory and RocksDB state backends.
-- State TTL.
-- Stream-table join baseline.
-- State inspection CLI.
+Certified path: Kafka (single partition) → tumbling event-time window → in-memory keyed state → Kafka sink, deterministic replay.
 
 Checklist:
 
 - [ ] Add `krishiv-state` crate.
-- [ ] Define keyed state API.
-- [ ] Implement in-memory state backend.
-- [ ] Implement RocksDB state backend.
+- [ ] Implement continuous operator execution loop on executor.
+- [ ] Implement streaming job lifecycle in coordinator (never Succeeded while running).
+- [ ] Define checkpoint-barrier and watermark interaction protocol.
+- [ ] Implement in-memory keyed state backend.
+- [ ] Implement single-source watermark propagation.
+- [ ] Implement tumbling window aggregation.
+- [ ] Implement event-time timers.
+- [ ] Implement deterministic replay harness.
+- [ ] Add `key_by`, tumbling window, and event-time watermark APIs.
+
+Acceptance gate for R5.1:
+
+- [ ] Certified path runs end-to-end on real executors.
+- [ ] Watermarks close windows correctly.
+- [ ] Deterministic replay produces identical output.
+- [ ] Streaming job lifecycle is correctly modeled (never Succeeded while running).
+- [ ] Checkpoint-barrier and watermark protocol is documented before R6 implementation starts.
+- [ ] R1-R4 batch behavior passes (no regression).
+
+#### R5.2: Streaming Hardening
+
+Checklist:
+
+- [ ] Implement RocksDB keyed state backend (with `spawn_blocking` isolation).
 - [ ] Implement state TTL.
 - [ ] Implement `key_by`.
 - [ ] Implement event-time timestamp assignment.
-- [ ] Implement watermark propagation.
+- [ ] Implement multi-source watermark propagation.
 - [ ] Implement processing-time timers.
-- [ ] Implement event-time timers.
-- [ ] Implement tumbling windows.
 - [ ] Implement sliding windows.
 - [ ] Implement session windows.
 - [ ] Implement stream-table join baseline.
 - [ ] Add `krishiv state inspect`.
-- [ ] Add deterministic replay tests.
 - [ ] Add watermark/window correctness tests.
 
-Acceptance gate:
+Acceptance gate for R5.2:
 
-- [ ] Recoverable stateful window aggregation behaves deterministically.
-- [ ] Watermarks close windows correctly.
+- [ ] Recoverable stateful window aggregation behaves deterministically (RocksDB backend).
+- [ ] Multi-source watermarks close windows correctly.
 - [ ] State TTL removes expired state.
-- [ ] State inspection can read supported state metadata.
+- [ ] State inspection reads metadata without mutating state.
 
 ### R6: Checkpoints And Savepoints
 
-Scope: reliable stateful execution.
+Scope: reliable stateful execution. Exactly-once certified for one specific triple only: Kafka source + in-memory state + S3/Parquet sink. All other combinations are at-least-once in R6. Mandatory chaos test suite required before acceptance gate.
 
 Features:
 
@@ -390,15 +458,19 @@ Features:
 - Rescaling metadata.
 - Source offset coordination.
 - Two-phase commit sink API.
-- Certified Kafka transactions.
 - State schema evolution baseline.
+- Chaos test suite (coordinator kill, executor kill, sink kill mid-checkpoint).
 
 Checklist:
 
 - [ ] Add `krishiv-checkpoint` crate.
+- [ ] Define minimal `FencingToken` type in `krishiv-proto` (monotonic epoch counter).
+- [ ] Enforce fencing token checks on checkpoint epoch ownership transitions.
 - [ ] Define checkpoint epoch model.
-- [ ] Define checkpoint metadata format.
+- [ ] Define versioned checkpoint metadata format.
+- [ ] Define versioned savepoint metadata format.
 - [ ] Implement async checkpoint coordinator.
+- [ ] Implement checkpoint metadata version compatibility tests from the first version.
 - [ ] Implement incremental checkpoint metadata.
 - [ ] Coordinate source offsets with checkpoint epochs.
 - [ ] Coordinate state snapshots with checkpoint epochs.
@@ -418,10 +490,13 @@ Acceptance gate:
 - [ ] Savepoint restore resumes stateful execution.
 - [ ] Failed checkpoints do not commit sink transactions.
 - [ ] Completed checkpoints can be listed and inspected.
+- [ ] Checkpoint/savepoint metadata versions are readable across supported upgrades.
 
 ### R7: Resource Governance And Adaptivity
 
-Scope: multi-tenant production control.
+Scope: multi-tenant production control. Split into two sub-milestones to contain scope and reduce stall risk.
+
+#### R7.1: Resource Management Foundation
 
 Features:
 
@@ -431,10 +506,6 @@ Features:
 - Quotas.
 - Namespace isolation.
 - Cost metrics.
-- Credit-based backpressure.
-- Source throttling.
-- Hot-key splitting.
-- Adaptive repartitioning.
 
 Checklist:
 
@@ -446,6 +517,28 @@ Checklist:
 - [ ] Implement CPU and memory quota model.
 - [ ] Implement namespace isolation model.
 - [ ] Add runtime cost metrics.
+- [ ] Add quota/admission tests.
+
+Acceptance gate for R7.1:
+
+- [ ] Jobs above quota are rejected or queued.
+- [ ] Admission control rejects jobs when resources are unavailable.
+- [ ] Cost metrics are visible per job in the status API.
+
+#### R7.2: Backpressure And Adaptivity
+
+Features:
+
+- Bounded operator queues.
+- Credit-based backpressure.
+- Source throttling.
+- Slow-sink detection.
+- Hot-key detection and splitting.
+- Adaptive repartitioning.
+- Manual override and explainable decisions.
+
+Checklist:
+
 - [ ] Implement bounded operator queues.
 - [ ] Implement credit-based flow control.
 - [ ] Implement source throttling.
@@ -456,28 +549,28 @@ Checklist:
 - [ ] Add manual override for adaptive behavior.
 - [ ] Add explainable adaptive-decision logs.
 - [ ] Add backpressure stress tests.
-- [ ] Add quota/admission tests.
+- [ ] Add hot-key simulation tests.
 
-Acceptance gate:
+Acceptance gate for R7.2:
 
 - [ ] Overloaded jobs are throttled without destabilizing other jobs.
-- [ ] Jobs above quota are rejected or queued.
 - [ ] Hot-key tests show load reduction after splitting.
 - [ ] Adaptive decisions are visible to operators.
+- [ ] Manual override disables adaptive behavior correctly.
 
 ### R8: Lakehouse And Python Beta
 
-Scope: broader data platform usability.
+Scope: broader data platform usability. Split into two sub-milestones to isolate unrelated workstreams and prevent blocking.
+
+#### R8.1: Python Bindings, UDFs, And Flight SQL
 
 Features:
 
-- Python bindings.
-- Vectorized Python UDFs.
-- Rust UDF/UDAF/UDTF contracts.
-- Iceberg read/write beta.
-- Snapshot reads.
-- Schema and partition evolution.
-- Time travel.
+- Python bindings via PyO3.
+- Python `Session` and `DataFrame` bindings.
+- Vectorized Python UDFs over Arrow batches.
+- UDF isolation boundary.
+- Stable Rust UDF/UDAF/UDTF contracts.
 - Flight SQL endpoint.
 
 Checklist:
@@ -485,6 +578,9 @@ Checklist:
 - [ ] Add `krishiv-python` crate with PyO3.
 - [ ] Add Python `Session` binding.
 - [ ] Add Python `DataFrame` binding.
+- [ ] Add Python `Stream` binding (bounded collect only; full streaming deferred post-GA).
+- [ ] Add `await session.sql_async()` for `asyncio` callers.
+- [ ] Add `session.read_parquet()`, `session.read_kafka()`, `session.read_iceberg()` Python connector wrappers.
 - [ ] Add Python query execution smoke tests.
 - [ ] Add vectorized Python UDF support over Arrow batches.
 - [ ] Add UDF isolation boundary.
@@ -492,6 +588,30 @@ Checklist:
 - [ ] Stabilize Rust UDF contract.
 - [ ] Stabilize Rust UDAF contract.
 - [ ] Stabilize Rust UDTF contract.
+- [ ] Implement maturin build pipeline for manylinux wheels.
+- [ ] Generate `.pyi` type stub files for all public Python APIs.
+- [ ] Add Flight SQL endpoint.
+- [ ] Mark Python API as beta.
+
+Acceptance gate for R8.1:
+
+- [ ] Python query smoke tests pass.
+- [ ] Vectorized Python UDF tests pass.
+- [ ] Flight SQL smoke tests pass.
+- [ ] Python API is clearly marked beta.
+
+#### R8.2: Iceberg And Lakehouse Integration
+
+Features:
+
+- Iceberg read/write beta.
+- Snapshot reads.
+- Schema and partition evolution.
+- Time travel.
+- Lakehouse catalog integration.
+
+Checklist:
+
 - [ ] Add `krishiv-lakehouse` crate.
 - [ ] Implement Iceberg read beta.
 - [ ] Implement Iceberg write beta.
@@ -499,15 +619,14 @@ Checklist:
 - [ ] Implement Iceberg schema evolution support.
 - [ ] Implement Iceberg partition evolution support.
 - [ ] Implement Iceberg time travel support.
-- [ ] Add Flight SQL endpoint.
-- [ ] Mark Python and lakehouse APIs as beta.
+- [ ] Mark lakehouse APIs as beta.
 
-Acceptance gate:
+Acceptance gate for R8.2:
 
-- [ ] Python query smoke tests pass.
-- [ ] Vectorized Python UDF tests pass.
 - [ ] Iceberg snapshot read/write smoke tests pass.
-- [ ] Flight SQL smoke tests pass.
+- [ ] Schema evolution tests pass.
+- [ ] Time travel queries return correct historical snapshots.
+- [ ] Lakehouse APIs are clearly marked beta.
 
 ### R9: Governance And Operations
 
@@ -576,6 +695,7 @@ Features:
 - Materialized views baseline.
 - Data quality rules.
 - Upgrade tests.
+- Metadata schema upgrade tests.
 - Chaos suite.
 - TPC-H, TPC-DS, and Nexmark benchmarks.
 
@@ -593,6 +713,7 @@ Checklist:
 - [ ] Add rejected-row output support.
 - [ ] Add dead-letter sink support.
 - [ ] Add upgrade test suite.
+- [ ] Add metadata schema upgrade tests for job, event-log, checkpoint, savepoint, connector, and catalog metadata.
 - [ ] Add chaos test suite.
 - [ ] Add TPC-H benchmark suite.
 - [ ] Add TPC-DS benchmark suite.
@@ -603,11 +724,13 @@ Checklist:
 
 Acceptance gate:
 
-- [ ] GA benchmark gates pass.
+- [ ] GA benchmark gates pass with defined numeric thresholds (TPC-H SF100 per-query targets, TPC-DS SF100 targets, Nexmark events/second target; targets must be published before R10 implementation begins).
 - [ ] Upgrade tests pass.
+- [ ] Metadata schema compatibility tests pass for all GA-supported persisted metadata.
 - [ ] Chaos suite passes.
 - [ ] Certified connector matrix passes.
 - [ ] Public API stability policy is documented.
+- [ ] SQL and function compatibility matrix is published.
 
 ## Cross-Cutting Risks And Mitigations
 
@@ -616,9 +739,14 @@ Acceptance gate:
 | Hybrid engine scope grows too large | Delayed releases and unstable foundations | Keep each release narrow and preserve explicit acceptance gates |
 | Single coordinator becomes bottleneck | Poor scalability and availability | Move from single coordinator to per-job coordinators and cell-based scheduling |
 | Full multi-master causes correctness bugs | Duplicate checkpoint ownership or duplicate sink commits | Avoid active-active scheduling for the same job |
+| Durable metadata is introduced too late | Restart and recovery semantics become bolted on | Pull `MetadataStore`, task attempts, executor leases, and job event log into R3.1 |
+| Duplicate task attempts commit side effects | Incorrect output under retries or executor restarts | Use attempt IDs, idempotent updates, and stale-attempt rejection before connector certification |
+| Kubernetes deletes leave runtime state behind | Leaked tasks, shuffle data, or status | Add finalizers and cleanup paths before production connector execution |
 | Split-brain during failover | State corruption or duplicate output | Use durable leases, fencing tokens, and checkpoint epoch ownership |
 | Shuffle overwhelms network or disk | Spark-like performance bottlenecks | Add push-style shuffle, partition coalescing, compression, spill, and skew detection |
+| Shuffle artifacts leak after retries | Disk/object-store growth and incorrect recovery | Add shuffle garbage collection and orphan detection in R4 |
 | Stateful jobs grow too large | Slow checkpoints and recovery | Use pluggable state backends, TTL, incremental checkpoints, and tiered snapshots |
+| Observability arrives too late | Failures are hard to diagnose during R3-R6 | Add basic scheduler/executor stability metrics in R3 and full OpenTelemetry in R9 |
 | Backpressure spreads through pipelines | High latency or stalled jobs | Add credit-based flow control, bounded queues, and source throttling |
 | Connector semantics are inconsistent | Incorrect delivery guarantees | Require capability flags and connector certification |
 | Exactly-once is overpromised | User trust and correctness risk | Certify exactly-once only for specific source/sink/checkpoint combinations |
@@ -629,9 +757,9 @@ Acceptance gate:
 
 Release-level testing:
 
-- R1-R3: SQL golden tests, embedded/single-node parity tests, API tests, connector contract tests, Parquet/Kafka/S3 integration tests.
-- R4: shuffle correctness, join correctness, spill tests, skew simulation, small-file planning tests, TPC-H smoke benchmark.
-- R5-R6: watermark/window correctness, state replay, checkpoint restore, duplicate prevention, transactional sink tests, executor-kill recovery.
+- R1-R3: SQL golden tests, embedded/single-node parity tests, API tests, connector contract tests, Parquet/Kafka/S3 integration tests, coordinator restart tests, executor lease expiry tests, stale-attempt tests, and operator restart tests.
+- R4: shuffle correctness, join correctness, spill tests, skew simulation, small-file planning tests, shuffle orphan cleanup tests, TPC-H smoke benchmark.
+- R5-R6: watermark/window correctness, checkpoint-barrier protocol tests, state replay, checkpoint restore, metadata-version compatibility tests, duplicate prevention, transactional sink tests, executor-kill recovery.
 - R7: backpressure stress tests, quota/admission tests, hot-key tests, adaptive repartition tests, cost metric validation.
 - R8: Python API tests, vectorized UDF tests, Iceberg snapshot/schema evolution tests, Flight SQL smoke tests.
 - R9: Kubernetes `kind` e2e tests, RBAC/TLS tests, per-job failover tests, fencing-token tests, lineage/audit validation.

@@ -22,6 +22,7 @@ In scope:
 - Rejected-row output support.
 - Dead-letter sink support.
 - Upgrade test suite.
+- Metadata schema upgrade and downgrade-readiness tests for job, event-log, checkpoint, savepoint, connector, and catalog metadata.
 - Chaos test suite.
 - TPC-H benchmark suite.
 - TPC-DS benchmark suite.
@@ -56,6 +57,8 @@ Out of scope:
 - [ ] Define materialized views baseline architecture.
 - [ ] Define data quality rule model.
 - [ ] Define upgrade compatibility policy.
+- [ ] Define metadata schema compatibility policy for every persisted metadata family.
+- [ ] Define benchmark performance targets (TPC-H SF100 per-query time limits, TPC-DS SF100 limits, Nexmark minimum events/second on reference hardware) before R10 implementation begins.
 - [ ] Define benchmark reporting policy.
 
 ## API And Interface Deliverables
@@ -83,6 +86,7 @@ Out of scope:
 - [ ] Implement rejected-row output.
 - [ ] Implement dead-letter sink support.
 - [ ] Implement upgrade test suite.
+- [ ] Implement metadata schema upgrade tests for job, event-log, checkpoint, savepoint, connector, and catalog metadata.
 - [ ] Implement chaos test suite.
 - [ ] Implement TPC-H benchmark suite.
 - [ ] Implement TPC-DS benchmark suite.
@@ -104,6 +108,7 @@ Out of scope:
 - [ ] Rejected-row output tests pass.
 - [ ] Dead-letter sink tests pass.
 - [ ] Upgrade tests pass.
+- [ ] Metadata schema upgrade tests pass for every GA-supported persisted metadata family.
 - [ ] Chaos suite passes.
 - [ ] TPC-H benchmark gate passes.
 - [ ] TPC-DS benchmark gate passes.
@@ -113,8 +118,9 @@ Out of scope:
 
 R10 is complete when:
 
-- [ ] GA benchmark gates pass.
+- [ ] GA benchmark gates pass against the published numeric performance targets.
 - [ ] Upgrade tests pass.
+- [ ] Metadata schema compatibility tests pass.
 - [ ] Chaos suite passes.
 - [ ] Certified connector matrix passes.
 - [ ] Public API stability policy is documented.
@@ -126,6 +132,7 @@ R10 is complete when:
 | Risk | Mitigation |
 |---|---|
 | Performance gaps vs Spark/Flink | Publish benchmark matrix and optimize top regressions before GA |
+| Benchmark targets are defined too late | Publish numeric targets before R10 implementation starts; use R8 engine measurements as the baseline |
 | GA scope keeps expanding | Freeze scope to compatibility, certification, benchmarks, and production hardening |
 | Stable API freezes weak designs | Freeze only APIs proven across previous releases |
 | JDBC/ODBC bypass governance | Route BI gateways through the same session, auth, audit, and planner paths |

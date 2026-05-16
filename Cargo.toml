@@ -2,6 +2,7 @@
 members = [
     "crates/krishiv-api",
     "crates/krishiv-cli",
+    "crates/krishiv-executor",
     "crates/krishiv-exec",
     "crates/krishiv-plan",
     "crates/krishiv-proto",

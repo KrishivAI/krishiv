@@ -1,0 +1,19 @@
+[package]
+name = "krishiv-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+krishiv-proto = { path = "../krishiv-proto" }
+
+[[bin]]
+name = "krishiv-executor"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

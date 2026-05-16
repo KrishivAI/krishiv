@@ -19,8 +19,16 @@ In scope:
 - Savepoint creation and restore.
 - Rescaling metadata model.
 - Two-phase commit sink API.
-- Kafka transaction support where certified.
 - State schema evolution baseline.
+- Mandatory chaos test suite (coordinator kill, executor kill, sink kill mid-checkpoint).
+- Versioned checkpoint and savepoint metadata from the first supported format.
+
+Certified exactly-once triple for R6:
+- **Source:** Kafka (single partition, transactional consumer group).
+- **State:** In-memory state backend.
+- **Sink:** S3/Parquet (object-level atomic writes).
+
+All other source/state/sink combinations are at-least-once in R6. Kafka transaction certification and RocksDB state backend exactly-once are deferred to post-R6.
 
 Out of scope:
 
@@ -40,10 +48,13 @@ Out of scope:
 ## Architecture Deliverables
 
 - [ ] Add `crates/krishiv-checkpoint`.
+- [ ] Define minimal `FencingToken` type in `krishiv-proto` (monotonic epoch counter, upgradeable to durable lease in R9).
+- [ ] Enforce fencing token checks on all checkpoint epoch ownership transitions.
 - [ ] Define checkpoint epoch ownership.
-- [ ] Define checkpoint metadata format.
+- [ ] Define versioned checkpoint metadata format.
 - [ ] Define checkpoint storage abstraction.
-- [ ] Define savepoint metadata format.
+- [ ] Define versioned savepoint metadata format.
+- [ ] Define metadata compatibility policy for future upgrades.
 - [ ] Define restore flow.
 - [ ] Define rescaling metadata model.
 - [ ] Define state schema evolution baseline.
@@ -64,6 +75,7 @@ Out of scope:
 - [ ] Implement checkpoint coordinator.
 - [ ] Implement checkpoint epoch creation.
 - [ ] Implement async incremental checkpoint metadata.
+- [ ] Implement checkpoint/savepoint metadata version compatibility checks.
 - [ ] Coordinate source offsets with checkpoint epochs.
 - [ ] Coordinate state snapshots with checkpoint epochs.
 - [ ] Coordinate sink commit handles with checkpoint epochs.
@@ -72,30 +84,37 @@ Out of scope:
 - [ ] Implement failed-checkpoint cleanup.
 - [ ] Implement Kafka transaction support where certified.
 - [ ] Add executor kill/restart recovery path.
+- [ ] Add coordinator restart recovery path from durable checkpoint metadata.
 - [ ] Add stale epoch rejection.
 
 ## Test Checklist
 
 - [ ] Checkpoint metadata tests pass.
+- [ ] Checkpoint/savepoint metadata version compatibility tests pass.
 - [ ] Checkpoint storage tests pass.
+- [ ] Fencing token epoch transition tests pass (stale token rejected).
 - [ ] Source offset coordination tests pass.
 - [ ] State snapshot coordination tests pass.
 - [ ] Two-phase commit sink tests pass.
 - [ ] Savepoint restore tests pass.
 - [ ] Failed checkpoint cleanup tests pass.
-- [ ] Executor kill/restart tests pass.
-- [ ] Duplicate-output prevention tests pass for certified paths.
 - [ ] State schema evolution baseline tests pass.
+- [ ] **Chaos test 1:** Kill the coordinator mid-checkpoint; restart; verify no duplicate output on the certified path.
+- [ ] **Chaos test 1a:** Restart the coordinator from durable checkpoint metadata and verify checkpoint ownership resumes safely.
+- [ ] **Chaos test 2:** Kill one executor mid-checkpoint; restart; verify no duplicate output on the certified path.
+- [ ] **Chaos test 3:** Kill the Kafka sink mid-write; restart; verify no duplicate records in S3/Parquet output.
 
 ## Acceptance Gate
 
 R6 is complete when:
 
-- [ ] A certified Kafka-to-object-store path survives executor restart without duplicate output.
+- [ ] The certified triple (Kafka source + in-memory state + S3/Parquet sink) survives all three chaos tests without duplicate output.
 - [ ] Savepoint restore resumes stateful execution.
 - [ ] Failed checkpoints do not commit sink transactions.
 - [ ] Completed checkpoints can be listed and inspected.
-- [ ] Exactly-once documentation names only certified connector combinations.
+- [ ] Checkpoint/savepoint metadata versions are readable across supported upgrades.
+- [ ] Fencing token checks prevent a stale coordinator from committing a superseded epoch.
+- [ ] Exactly-once documentation explicitly names only the certified triple; all other combinations are documented as at-least-once.
 
 ## Risks And Mitigations
 
