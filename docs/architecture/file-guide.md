@@ -31,6 +31,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-plan/src/lib.rs` | Owns `ExecutionKind`, `PlanNode`, `LogicalPlan`, and `PhysicalPlan`. |
 | `crates/krishiv-proto/Cargo.toml` | Defines the R2 control-plane contract crate. |
 | `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, and RPC-style message structs. |
+| `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/serde dependencies. |
+| `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, in-process reconciliation, and status patch planning. |
 | `crates/krishiv-exec/Cargo.toml` | Defines the physical execution crate. |
 | `crates/krishiv-exec/src/lib.rs` | Defines physical operator descriptors and placeholder logical-to-physical lowering. |
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
@@ -101,6 +103,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `tests/golden/r1-explain-literal.txt` | Golden output for a minimal `krishiv explain` query. |
 | `tests/golden/r1-sql-parquet-aggregate.txt` | Golden output for a Parquet-backed projection/filter/aggregate/limit query. |
 | `crates/krishiv-scheduler/tests/r2_k8s_manifests.rs` | Validates the static R2 Kubernetes manifest shape offline. |
+| `crates/krishiv-operator/src/lib.rs` | Includes unit tests for `KrishivJob` validation, scheduler conversion, waiting-for-executor behavior, submit/observe reconciliation, and status counters. |
 
 ## Codex Skill Source
 

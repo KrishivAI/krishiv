@@ -58,6 +58,7 @@ Out of scope:
 - [x] Add minimal Kubernetes manifests under `k8s/`.
 - [x] Define coordinator/executor RPC messages in `krishiv-proto`.
 - [x] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
+- [x] Add `KrishivJob` operator reconciliation foundation.
 
 ## Runtime Deliverables
 
@@ -70,6 +71,8 @@ Out of scope:
 - [x] Implement stage-level retry.
 - [x] Route distributed batch DAG execution through the scheduler.
 - [x] Route distributed streaming DAG execution through the scheduler with local-only state semantics.
+- [x] Convert `KrishivJob` resources into static scheduler jobs.
+- [x] Produce `KrishivJob/status` patch models from scheduler snapshots.
 - [x] Preserve R1 embedded/single-node behavior.
 
 ## Test Checklist
@@ -82,6 +85,7 @@ Out of scope:
 - [x] `KrishivJob` manifest validation tests pass.
 - [x] Heartbeat timeout tests pass.
 - [x] Stage retry tests pass.
+- [x] Operator reconciliation tests pass.
 - [ ] Kubernetes `kind` smoke test submits one batch job.
 - [ ] Kubernetes `kind` smoke test submits one early streaming job.
 

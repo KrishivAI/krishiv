@@ -6,9 +6,9 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 status endpoint/basic Web UI slice is complete. The next active task is
-starting controller work needed before Kubernetes `kind` smoke tests can become
-meaningful.
+R2 `KrishivJob` operator reconciliation foundation is complete. The next active
+task is attaching that reconciler to a live Kubernetes watch/controller
+entrypoint so `kind` smoke tests can become meaningful.
 
 ## Completed
 
@@ -80,6 +80,11 @@ meaningful.
 - Added deterministic UI demo state with one local coordinator, executor, and running job.
 - Added UI route tests for health, job listing, job detail, missing job, and HTML rendering.
 - Updated R2 tracker, crate map, file guide, and control-plane docs for the status API/Web UI.
+- Added `crates/krishiv-operator` for typed `KrishivJob` resource models, validation, scheduler job conversion, and status reconciliation.
+- Added `KrishivJobReconciler` to submit resources into the active R2 coordinator or return an accepted `NoExecutors` status when placement cannot happen yet.
+- Added `KrishivJob/status` models for phase, coordinator, observed generation, stage count, task counters, and conditions.
+- Added operator tests for batch/streaming resource conversion, invalid resources, waiting for executors, submit/observe reconciliation, running task counters, and succeeded status.
+- Updated R2 tracker, crate map, file guide, Kubernetes README, and control-plane docs for the operator reconciliation model.
 
 ## In Progress
 
@@ -87,9 +92,9 @@ meaningful.
 
 ## Next Steps
 
-1. Start controller/operator work needed to reconcile `KrishivJob` resources.
+1. Attach `KrishivJobReconciler` to a live Kubernetes watch/controller loop and status subresource patch path.
 2. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
-3. Add Kubernetes `kind` smoke tests after the controller path exists.
+3. Add Kubernetes `kind` smoke tests after the live controller path exists.
 4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
@@ -113,6 +118,7 @@ meaningful.
 - `cargo run -p krishiv-cli -- jobs --distributed` passed.
 - `cargo test -p krishiv-scheduler` passed, including offline R2 manifest validation tests.
 - `cargo test -p krishiv-ui` passed.
+- `cargo test -p krishiv-operator` passed.
 - `cargo test -p krishiv-cli` passed.
 - `cargo run -p krishiv-ui -- --help` passed.
 - `cargo run -p krishiv-ui -- --demo --addr 127.0.0.1:18080` started the demo status server.
@@ -133,4 +139,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 with controller/operator work for `KrishivJob` reconciliation, unless the user asks for another status/UI slice.
+4. Continue R2 by wiring `KrishivJobReconciler` into a live Kubernetes watch/controller loop, unless the user asks for another slice.

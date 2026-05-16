@@ -1936,6 +1936,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-operator"
+version = "0.1.0"
+dependencies = [
+ "krishiv-proto",
+ "krishiv-scheduler",
+ "serde",
+]
+
+[[package]]
 name = "krishiv-plan"
 version = "0.1.0"
 

@@ -105,9 +105,32 @@ The first R2 Kubernetes slice adds static manifests under `k8s/`:
 - Manifest tests validate the expected offline shape without requiring a
   Kubernetes cluster.
 
+## Operator Reconciliation Model
+
+The first operator slice is implemented in `krishiv-operator`. It does not run
+a live Kubernetes watch loop yet; instead, it pins the reconciliation behavior
+that the future controller will call:
+
+- Typed Rust models mirror the R2 `krishiv.io/v1alpha1` `KrishivJob` shape.
+- Resource validation rejects unsupported API versions, kinds, empty names,
+  empty images, zero tasks, and zero parallelism.
+- A namespaced `KrishivJob` maps to a URL-safe scheduler id in the form
+  `<namespace>.<name>`.
+- `spec.mode` maps to `JobKind::Batch` or `JobKind::Streaming`.
+- `spec.tasks` becomes static `task-1..task-N` entries in `stage-1`.
+- If no healthy executor is available, reconciliation returns an accepted
+  status with a `Scheduled=False` / `NoExecutors` condition instead of marking
+  the resource failed.
+- Once a scheduler job exists, reconciliation refreshes `.status.phase`,
+  `.status.stages`, `.status.tasks`, `.status.coordinator`, and
+  `.status.conditions` from scheduler snapshots.
+
+The next controller slice should connect this reconciler to Kubernetes watch
+events and status subresource patches.
+
 ## Limitations
 
-- No Kubernetes controller/operator implementation yet.
+- No live Kubernetes watch/controller loop yet.
 - No gRPC/protobuf wire transport yet.
 - No durable metadata store.
 - No persistent cross-process job history.
