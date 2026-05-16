@@ -2199,6 +2199,7 @@ dependencies = [
  "k8s-openapi",
  "krishiv-proto",
  "krishiv-scheduler",
+ "krishiv-ui",
  "kube",
  "serde",
  "serde_json",

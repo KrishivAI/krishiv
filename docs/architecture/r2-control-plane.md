@@ -87,9 +87,12 @@ types used by the CLI and exposes:
 - `GET /ui` and `GET /ui/jobs/{job_id}` for the HTML status pages.
 
 The standalone server can be run with `cargo run -p krishiv-ui -- --demo` to
-seed one local coordinator, one executor, and one running demo job. In R2 this
-is an in-process status surface only; persistence, authentication,
-OpenTelemetry, and Kubernetes-backed job history are deferred.
+seed one local coordinator, one executor, and one running demo job. In
+Kubernetes, `krishiv-operator --status-addr` serves the same router over the
+operator-owned shared coordinator, so `/api/v1/jobs` and `/ui` report scheduler
+state produced by live `KrishivJob` reconciliation rather than standalone demo
+data. Persistence, authentication, OpenTelemetry, and Kubernetes-backed job
+history are deferred.
 
 ## Kubernetes Surface
 
@@ -98,10 +101,12 @@ The first R2 Kubernetes slice adds static manifests under `k8s/`:
 - `k8s/crds/krishivjobs.yaml` defines the `krishiv.io/v1alpha1` `KrishivJob`
   custom resource.
 - `k8s/manifests/` defines the namespace, service account, RBAC, one
-  coordinator deployment, coordinator service, replaceable executor deployment,
-  and a sample batch `KrishivJob`.
-- The coordinator deployment is intentionally `replicas: 1` to preserve the R2
-  single-active-coordinator rule.
+  operator-owned coordinator runtime, coordinator service, replaceable executor
+  deployment, and sample batch/streaming `KrishivJob` resources.
+- The operator deployment is intentionally `replicas: 1` because it owns the R2
+  active coordinator runtime and scheduler state.
+- The `krishiv-coordinator` service selects the operator pod and exposes its
+  scheduler-backed HTTP status surface on port 8080.
 - Manifest tests validate the expected offline shape without requiring a
   Kubernetes cluster.
 
@@ -127,10 +132,14 @@ reconciliation behavior and the first live Kubernetes watch/status-patch path:
   `krishivjobs.krishiv.io`, convert apply/init events into typed resources,
   call `KrishivJobReconciler`, and patch the `status` subresource with a merge
   patch.
+- `KubernetesControllerRuntime` owns one shared active `Coordinator`; the
+  reconciler mutates it and the optional status server reads the same handle.
 - Delete events are observed but do not trigger cleanup in R2 because
   finalizer cleanup and durable ownership are deferred.
 - `k8s/manifests/operator-deployment.yaml` adds one operator replica using the
-  existing `krishiv-controller` service account and RBAC.
+  existing `krishiv-controller` service account and RBAC, with `/healthz`,
+  `/readyz`, `/api/v1/jobs`, `/api/v1/executors`, and `/ui` exposed through the
+  coordinator service.
 - `crates/krishiv-operator/tests/r2_kind_smoke.rs` provides opt-in `kind`
   smoke tests for batch and early streaming `KrishivJob` resources. These tests
   are gated behind `KRISHIV_KIND_E2E=1` because they require Docker, `kind`,
@@ -145,6 +154,9 @@ acceptance gate can be marked complete.
 - No gRPC/protobuf wire transport yet.
 - No durable metadata store.
 - No persistent cross-process job history.
-- No Kubernetes `kind` smoke test yet.
+- Executor pods are still a manifest/runtime placeholder; R2 uses bootstrap
+  executor registration until the executor heartbeat path is implemented.
+- Kubernetes `kind` smoke tests are opt-in and not part of the default test
+  suite.
 - No exactly-once semantics.
 - No shuffle, checkpoint, or savepoint ownership.

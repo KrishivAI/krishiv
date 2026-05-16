@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::net::SocketAddr;
 
-use krishiv_ui::{demo_state, empty_state, router};
+use krishiv_ui::{demo_state, empty_state, serve};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_addr = listener.local_addr()?;
 
     println!("Krishiv R2 status UI listening on http://{local_addr}/ui");
-    axum::serve(listener, router(state)).await?;
+    serve(listener, state).await?;
     Ok(())
 }
 

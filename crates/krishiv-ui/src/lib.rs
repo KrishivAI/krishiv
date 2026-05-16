@@ -8,7 +8,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, RwLock};
 
 use askama::Template;
 use axum::extract::{Path, State};
@@ -22,7 +21,7 @@ use krishiv_proto::{
     JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
-    Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, SchedulerError,
+    Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, SchedulerError, SharedCoordinator,
 };
 use serde::Serialize;
 
@@ -32,15 +31,18 @@ pub type UiResult<T> = Result<T, UiError>;
 /// Shared state for the R2 status server.
 #[derive(Debug, Clone)]
 pub struct UiState {
-    coordinator: Arc<RwLock<Coordinator>>,
+    coordinator: SharedCoordinator,
 }
 
 impl UiState {
     /// Create UI state from an existing coordinator.
     pub fn new(coordinator: Coordinator) -> Self {
-        Self {
-            coordinator: Arc::new(RwLock::new(coordinator)),
-        }
+        Self::from_shared_coordinator(SharedCoordinator::new(coordinator))
+    }
+
+    /// Create UI state from a shared coordinator runtime handle.
+    pub fn from_shared_coordinator(coordinator: SharedCoordinator) -> Self {
+        Self { coordinator }
     }
 }
 
@@ -108,6 +110,11 @@ pub fn router(state: UiState) -> Router {
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
         .route("/assets/krishiv.css", get(stylesheet))
         .with_state(state)
+}
+
+/// Serve the R2 status API and Web UI with an existing listener.
+pub async fn serve(listener: tokio::net::TcpListener, state: UiState) -> std::io::Result<()> {
+    axum::serve(listener, router(state)).await
 }
 
 /// Create an empty active coordinator state for real status serving.
@@ -629,9 +636,13 @@ tr:last-child td {
 mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use krishiv_proto::{
+        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState,
+    };
+    use krishiv_scheduler::{Coordinator, SharedCoordinator};
     use tower::ServiceExt;
 
-    use super::{demo_state, empty_state, router};
+    use super::{UiState, demo_state, empty_state, router};
 
     #[tokio::test]
     async fn health_route_reports_ok() {
@@ -666,6 +677,44 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("job-demo"));
         assert!(body.contains("running"));
+    }
+
+    #[tokio::test]
+    async fn api_jobs_reads_shared_runtime_state() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-runtime").unwrap(),
+        ));
+        {
+            let mut coordinator = shared.write().unwrap();
+            let executor_id = ExecutorId::try_new("exec-runtime-1").unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "runtime-executor",
+                    1,
+                ))
+                .unwrap();
+            coordinator
+                .executor_heartbeat(ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy))
+                .unwrap();
+        }
+
+        let response = router(UiState::from_shared_coordinator(shared))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/executors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("exec-runtime-1"));
+        assert!(body.contains("runtime-executor"));
     }
 
     #[tokio::test]

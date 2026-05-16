@@ -34,6 +34,19 @@ spec:
             - $(KRISHIV_COORDINATOR_ID)
             - --bootstrap-executor-slots
             - "2"
+            - --status-addr
+            - 0.0.0.0:8080
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
           env:
             - name: KRISHIV_COORDINATOR_ID
               valueFrom:

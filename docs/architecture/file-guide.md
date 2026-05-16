@@ -33,18 +33,18 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-plan/src/lib.rs` | Owns `ExecutionKind`, `PlanNode`, `LogicalPlan`, and `PhysicalPlan`. |
 | `crates/krishiv-proto/Cargo.toml` | Defines the R2 control-plane contract crate. |
 | `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, and RPC-style message structs. |
-| `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/serde dependencies. |
-| `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, in-process reconciliation, live Kubernetes watch adapter, and status patching. |
-| `crates/krishiv-operator/src/main.rs` | Runs the live R2 Kubernetes operator controller loop. |
+| `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/UI/serde dependencies. |
+| `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, shared coordinator runtime, in-process reconciliation, live Kubernetes watch adapter, and status patching. |
+| `crates/krishiv-operator/src/main.rs` | Runs the live R2 Kubernetes operator controller loop and optional scheduler-backed status server. |
 | `crates/krishiv-exec/Cargo.toml` | Defines the physical execution crate. |
 | `crates/krishiv-exec/src/lib.rs` | Defines physical operator descriptors and placeholder logical-to-physical lowering. |
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
 | `crates/krishiv-runtime/src/lib.rs` | Owns runtime traits, local backend acceptance, job/task status, and local job registry. |
 | `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate and its plan/proto dependencies. |
-| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, executor registry, static placement, Krishiv DAG routing, retry/timeout behavior, and task lifecycle updates. |
+| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, shared coordinator handle, executor registry, static placement, Krishiv DAG routing, retry/timeout behavior, and task lifecycle updates. |
 | `crates/krishiv-ui/Cargo.toml` | Defines the R2 status API/Web UI crate and its `axum`, `askama`, scheduler, and proto dependencies. |
-| `crates/krishiv-ui/src/lib.rs` | Owns the R2 status router, JSON API models, HTML rendering, health/readiness endpoints, and deterministic demo state. |
-| `crates/krishiv-ui/src/main.rs` | Runs the standalone R2 status server with optional demo data. |
+| `crates/krishiv-ui/src/lib.rs` | Owns the R2 status router, JSON API models, HTML rendering, health/readiness endpoints, shared-coordinator integration, and deterministic demo state. |
+| `crates/krishiv-ui/src/main.rs` | Runs the standalone R2 status server with optional demo data for local UI development. |
 | `crates/krishiv-ui/templates/jobs.html` | Renders the job and executor status overview page. |
 | `crates/krishiv-ui/templates/job.html` | Renders one job's stage, task, and executor detail page. |
 
@@ -72,9 +72,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `k8s/manifests/namespace.yaml` | Defines the `krishiv-system` namespace. |
 | `k8s/manifests/serviceaccount.yaml` | Defines the controller service account. |
 | `k8s/manifests/rbac.yaml` | Defines minimal R2 controller RBAC for jobs, status, pods, services, events, and deployments. |
-| `k8s/manifests/operator-deployment.yaml` | Defines the single R2 operator deployment that watches `KrishivJob` resources and patches status. |
-| `k8s/manifests/coordinator-deployment.yaml` | Defines the single active coordinator deployment with `replicas: 1`. |
-| `k8s/manifests/coordinator-service.yaml` | Defines the coordinator service ports. |
+| `k8s/manifests/operator-deployment.yaml` | Defines the single R2 operator deployment that owns the active coordinator runtime, watches `KrishivJob` resources, patches status, and serves scheduler-backed status pages. |
+| `k8s/manifests/coordinator-service.yaml` | Exposes the operator-owned coordinator status API and Web UI. |
 | `k8s/manifests/executor-deployment.yaml` | Defines replaceable executor pods for R2 static scheduling. |
 | `k8s/manifests/sample-krishivjob.yaml` | Provides a sample v1alpha1 batch `KrishivJob`. |
 | `k8s/manifests/sample-streaming-krishivjob.yaml` | Provides a sample v1alpha1 early streaming `KrishivJob`. |

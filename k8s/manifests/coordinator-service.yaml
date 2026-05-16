@@ -11,11 +11,8 @@ spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: krishiv
-    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/component: operator
   ports:
     - name: http
       port: 8080
       targetPort: http
-    - name: rpc
-      port: 9090
-      targetPort: rpc

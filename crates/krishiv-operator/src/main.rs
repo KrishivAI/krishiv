@@ -1,9 +1,15 @@
 #![forbid(unsafe_code)]
 
 use std::error::Error;
+use std::net::SocketAddr;
 
-use krishiv_operator::{BootstrapExecutor, KubernetesControllerConfig, run_kubernetes_controller};
+use krishiv_operator::{
+    BootstrapExecutor, KubernetesControllerConfig, KubernetesControllerRuntime,
+    run_kubernetes_controller_runtime_with_client,
+};
 use krishiv_proto::CoordinatorId;
+use krishiv_ui::{UiState, serve};
+use kube::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -13,12 +19,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let controller_config = config.clone().into_controller_config()?;
+    let runtime = KubernetesControllerRuntime::new(&controller_config)?;
     println!(
         "Krishiv operator watching {} as coordinator {}",
         config.watch_target(),
         config.coordinator_id
     );
-    run_kubernetes_controller(config.into_controller_config()?).await?;
+
+    let client = Client::try_default().await?;
+    if let Some(status_addr) = config.status_addr {
+        run_controller_with_status_server(client, controller_config, runtime, status_addr).await?;
+    } else {
+        run_kubernetes_controller_runtime_with_client(client, controller_config, runtime).await?;
+    }
+    Ok(())
+}
+
+async fn run_controller_with_status_server(
+    client: Client,
+    controller_config: KubernetesControllerConfig,
+    runtime: KubernetesControllerRuntime,
+    status_addr: SocketAddr,
+) -> Result<(), Box<dyn Error>> {
+    let listener = tokio::net::TcpListener::bind(status_addr).await?;
+    let local_addr = listener.local_addr()?;
+    let status_state = UiState::from_shared_coordinator(runtime.coordinator());
+    println!("Krishiv operator status API listening on http://{local_addr}/ui");
+
+    tokio::select! {
+        result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
+            result?;
+        }
+        result = serve(listener, status_state) => {
+            result?;
+        }
+    }
+
     Ok(())
 }
 
@@ -32,6 +69,7 @@ struct OperatorCliConfig {
     bootstrap_executor_id: Option<String>,
     bootstrap_executor_host: String,
     bootstrap_executor_slots: Option<usize>,
+    status_addr: Option<SocketAddr>,
     help: bool,
 }
 
@@ -49,6 +87,7 @@ impl OperatorCliConfig {
             bootstrap_executor_id: None,
             bootstrap_executor_host: String::from("operator-bootstrap-executor"),
             bootstrap_executor_slots: None,
+            status_addr: None,
             help: false,
         };
         let mut args = args.into_iter();
@@ -91,6 +130,14 @@ impl OperatorCliConfig {
                         ));
                     }
                     config.bootstrap_executor_slots = Some(slots);
+                }
+                "--status-addr" => {
+                    let value = next_arg(&mut args, "--status-addr")?;
+                    config.status_addr = Some(
+                        value
+                            .parse()
+                            .map_err(|_| format!("invalid socket address: {value}"))?,
+                    );
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
@@ -163,6 +210,7 @@ impl OperatorCliConfig {
            --bootstrap-executor-id <ID>     Optional bootstrap executor id\n\
            --bootstrap-executor-host <HOST> Optional bootstrap executor host label\n\
            --bootstrap-executor-slots <N>   Register a bootstrap executor with N slots\n\
+           --status-addr <HOST:PORT>        Serve scheduler-backed status API/UI on this address\n\
            -h, --help                       Show help\n"
     }
 }
@@ -201,6 +249,15 @@ mod tests {
         assert!(config.all_namespaces);
         assert_eq!(controller.namespace(), None);
         assert_eq!(controller.coordinator_id().as_str(), "coord-1");
+    }
+
+    #[test]
+    fn parses_status_addr() {
+        let config =
+            OperatorCliConfig::parse([String::from("--status-addr"), String::from("0.0.0.0:8080")])
+                .unwrap();
+
+        assert_eq!(config.status_addr.unwrap().to_string(), "0.0.0.0:8080");
     }
 
     #[test]

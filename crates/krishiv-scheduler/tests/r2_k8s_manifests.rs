@@ -2,8 +2,7 @@
 
 const CRD: &str = include_str!("../../../k8s/crds/krishivjobs.yaml");
 const KUSTOMIZATION: &str = include_str!("../../../k8s/manifests/kustomization.yaml");
-const COORDINATOR_DEPLOYMENT: &str =
-    include_str!("../../../k8s/manifests/coordinator-deployment.yaml");
+const COORDINATOR_SERVICE: &str = include_str!("../../../k8s/manifests/coordinator-service.yaml");
 const EXECUTOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/executor-deployment.yaml");
 const OPERATOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/operator-deployment.yaml");
 const RBAC: &str = include_str!("../../../k8s/manifests/rbac.yaml");
@@ -51,7 +50,6 @@ fn kustomization_references_all_r2_manifests() {
             "serviceaccount.yaml",
             "rbac.yaml",
             "operator-deployment.yaml",
-            "coordinator-deployment.yaml",
             "coordinator-service.yaml",
             "executor-deployment.yaml",
             "sample-krishivjob.yaml",
@@ -61,15 +59,20 @@ fn kustomization_references_all_r2_manifests() {
 }
 
 #[test]
-fn coordinator_manifest_keeps_one_active_coordinator() {
+fn operator_manifest_runs_one_active_coordinator_runtime() {
     assert_contains_all(
-        COORDINATOR_DEPLOYMENT,
+        OPERATOR_DEPLOYMENT,
         &[
             "kind: Deployment",
-            "name: krishiv-coordinator",
-            "app.kubernetes.io/component: coordinator",
+            "name: krishiv-operator",
+            "app.kubernetes.io/component: operator",
             "replicas: 1",
             "serviceAccountName: krishiv-controller",
+            "- krishiv-operator",
+            "--status-addr",
+            "0.0.0.0:8080",
+            "readinessProbe:",
+            "livenessProbe:",
             "KRISHIV_COORDINATOR_ID",
         ],
     );
@@ -89,8 +92,24 @@ fn operator_manifest_watches_jobs_and_patches_status() {
             "--namespace",
             "--coordinator-id",
             "--bootstrap-executor-slots",
+            "--status-addr",
             "KRISHIV_COORDINATOR_ID",
             "KRISHIV_NAMESPACE",
+        ],
+    );
+}
+
+#[test]
+fn coordinator_service_exposes_operator_owned_status_runtime() {
+    assert_contains_all(
+        COORDINATOR_SERVICE,
+        &[
+            "kind: Service",
+            "name: krishiv-coordinator",
+            "app.kubernetes.io/component: operator",
+            "name: http",
+            "port: 8080",
+            "targetPort: http",
         ],
     );
 }
@@ -106,6 +125,7 @@ fn executor_manifest_declares_replaceable_executors() {
             "replicas: 2",
             "KRISHIV_EXECUTOR_ID",
             "KRISHIV_TASK_SLOTS",
+            "http://krishiv-coordinator.krishiv-system.svc:8080",
         ],
     );
 }

@@ -6,9 +6,10 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 live `KrishivJob` operator watch/status-patch path is complete. The next
-active task is adding Kubernetes `kind` smoke tests for batch and early
-streaming `KrishivJob` submissions.
+R2 operator-owned coordinator runtime and scheduler-backed status API wiring is
+complete. The next active task is running the opt-in Kubernetes `kind` smoke
+tests against a locally built image, then improving executor truth beyond the
+current bootstrap executor.
 
 ## Completed
 
@@ -62,8 +63,8 @@ streaming `KrishivJob` submissions.
 - Added CLI tests for submit, distributed jobs, and submit validation.
 - Updated R2 control-plane docs and examples with the new CLI surface.
 - Added the first `krishiv.io/v1alpha1` `KrishivJob` CRD.
-- Added minimal static Kubernetes manifests under `k8s/` for namespace, service account, RBAC, one coordinator, coordinator service, executors, and a sample job.
-- Added offline manifest validation tests for the CRD, kustomization, coordinator, executor, RBAC, and sample job.
+- Added minimal static Kubernetes manifests under `k8s/` for namespace, service account, RBAC, coordinator service, operator-owned coordinator runtime, executors, and a sample job.
+- Added offline manifest validation tests for the CRD, kustomization, coordinator service, operator runtime, executor, RBAC, and sample job.
 - Updated R2 tracker, control-plane docs, file guide, and Kubernetes README.
 - Added coordinator configuration for stage retry and deterministic heartbeat timeout ticks.
 - Implemented stage-level retry before terminal job failure.
@@ -93,6 +94,9 @@ streaming `KrishivJob` submissions.
 - Added sample early streaming `KrishivJob` manifest and included it in the R2 kustomization.
 - Added Docker image build support for the R2 binaries with `Dockerfile` and `.dockerignore`.
 - Added opt-in `kind` smoke tests for batch and early streaming `KrishivJob` status reconciliation, gated by `KRISHIV_KIND_E2E=1`.
+- Added a shared R2 coordinator handle so the live operator reconciler and status API read/write the same scheduler state.
+- Added optional scheduler-backed status serving to `krishiv-operator` with `--status-addr`.
+- Updated Kubernetes manifests so the single operator replica owns the active R2 coordinator runtime and the `krishiv-coordinator` service exposes that runtime's HTTP status surface.
 
 ## In Progress
 
@@ -101,7 +105,7 @@ streaming `KrishivJob` submissions.
 ## Next Steps
 
 1. Run the opt-in `kind` smoke tests with a locally built image and mark the Kubernetes acceptance items once they pass in a real cluster.
-2. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
+2. Replace the bootstrap executor path with executor registration from real executor pods or a first executor heartbeat path.
 3. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
@@ -130,7 +134,7 @@ streaming `KrishivJob` submissions.
 - `cargo test -p krishiv-operator --test r2_kind_smoke` passed with the default skip path.
 - `cargo check -p krishiv-operator` passed.
 - `cargo test -p krishiv-cli` passed.
-- `cargo run -p krishiv-operator -- --help` passed.
+- `cargo run -p krishiv-operator -- --help` passed and listed `--status-addr`.
 - `cargo run -p krishiv-ui -- --help` passed.
 - `cargo run -p krishiv-ui -- --demo --addr 127.0.0.1:18080` started the demo status server.
 - `curl http://127.0.0.1:18080/healthz` returned `ok`.

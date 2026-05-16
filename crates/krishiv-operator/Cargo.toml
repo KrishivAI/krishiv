@@ -10,7 +10,8 @@ futures.workspace = true
 k8s-openapi.workspace = true
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-ui = { path = "../krishiv-ui" }
 kube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }

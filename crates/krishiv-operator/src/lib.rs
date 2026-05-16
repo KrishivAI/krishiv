@@ -16,7 +16,7 @@ use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
     JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec,
 };
-use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError};
+use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError, SharedCoordinator};
 use kube::Client;
 use kube::api::{Api, Patch, PatchParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
@@ -50,6 +50,8 @@ pub enum OperatorError {
     Kubernetes { message: String },
     /// Serialization or deserialization failed.
     Serialization { message: String },
+    /// Shared coordinator lock was poisoned.
+    CoordinatorLockPoisoned,
 }
 
 impl fmt::Display for OperatorError {
@@ -59,6 +61,7 @@ impl fmt::Display for OperatorError {
             Self::Scheduler(error) => write!(f, "{error}"),
             Self::Kubernetes { message } => write!(f, "kubernetes operation failed: {message}"),
             Self::Serialization { message } => write!(f, "serialization failed: {message}"),
+            Self::CoordinatorLockPoisoned => f.write_str("shared coordinator lock was poisoned"),
         }
     }
 }
@@ -434,6 +437,38 @@ pub struct KubernetesControllerConfig {
     bootstrap_executor: Option<BootstrapExecutor>,
 }
 
+/// Runtime state owned by the live R2 Kubernetes controller process.
+#[derive(Debug, Clone)]
+pub struct KubernetesControllerRuntime {
+    coordinator: SharedCoordinator,
+    reconciler: KrishivJobReconciler,
+}
+
+impl KubernetesControllerRuntime {
+    /// Create an active coordinator runtime from controller config.
+    pub fn new(config: &KubernetesControllerConfig) -> OperatorResult<Self> {
+        let mut coordinator = Coordinator::active(config.coordinator_id.clone());
+        if let Some(executor) = &config.bootstrap_executor {
+            register_bootstrap_executor(&mut coordinator, executor)?;
+        }
+
+        Ok(Self {
+            coordinator: SharedCoordinator::new(coordinator),
+            reconciler: KrishivJobReconciler::new(config.coordinator_id.clone()),
+        })
+    }
+
+    /// Shared coordinator handle used by the controller and status server.
+    pub fn coordinator(&self) -> SharedCoordinator {
+        self.coordinator.clone()
+    }
+
+    /// Reconciler bound to the active coordinator id.
+    pub fn reconciler(&self) -> &KrishivJobReconciler {
+        &self.reconciler
+    }
+}
+
 impl KubernetesControllerConfig {
     /// Create a config for one namespace.
     pub fn namespaced(namespace: impl Into<String>, coordinator_id: CoordinatorId) -> Self {
@@ -513,25 +548,54 @@ pub async fn run_kubernetes_controller_with_client(
     client: Client,
     config: KubernetesControllerConfig,
 ) -> OperatorResult<()> {
+    let runtime = KubernetesControllerRuntime::new(&config)?;
+    run_kubernetes_controller_runtime_with_client(client, config, runtime).await
+}
+
+/// Run the live Kubernetes controller with an explicit shared runtime.
+pub async fn run_kubernetes_controller_runtime_with_client(
+    client: Client,
+    config: KubernetesControllerConfig,
+    runtime: KubernetesControllerRuntime,
+) -> OperatorResult<()> {
     let jobs = krishivjob_api(client, config.namespace())?;
     let watcher_config = watcher_config(&config);
-    let reconciler = KrishivJobReconciler::new(config.coordinator_id.clone());
-    let mut coordinator = Coordinator::active(config.coordinator_id.clone());
-    if let Some(executor) = &config.bootstrap_executor {
-        register_bootstrap_executor(&mut coordinator, executor)?;
-    }
 
     let mut events = watcher::watcher(jobs.clone(), watcher_config).boxed();
     while let Some(event) = events.next().await {
         match event? {
             WatchEvent::Apply(object) | WatchEvent::InitApply(object) => {
-                reconcile_dynamic_object(&jobs, &reconciler, &mut coordinator, object).await?;
+                reconcile_dynamic_object_with_runtime(&jobs, &runtime, object).await?;
             }
             WatchEvent::Delete(_) | WatchEvent::Init | WatchEvent::InitDone => {}
         }
     }
 
     Ok(())
+}
+
+/// Reconcile one Kubernetes dynamic object using a shared controller runtime.
+pub async fn reconcile_dynamic_object_with_runtime(
+    jobs: &Api<DynamicObject>,
+    runtime: &KubernetesControllerRuntime,
+    object: DynamicObject,
+) -> OperatorResult<KubernetesReconcileReport> {
+    let resource = resource_from_dynamic_object(&object)?;
+    let outcome = {
+        let mut coordinator = runtime
+            .coordinator
+            .write()
+            .map_err(|_| OperatorError::CoordinatorLockPoisoned)?;
+        runtime.reconciler.reconcile(&mut coordinator, &resource)?
+    };
+    patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
+
+    Ok(KubernetesReconcileReport {
+        namespace: resource.metadata.namespace_or_default().to_owned(),
+        name: resource.metadata.name,
+        action: outcome.action(),
+        status: outcome.status().clone(),
+    })
 }
 
 /// Reconcile one Kubernetes dynamic object and patch its status.
@@ -843,9 +907,10 @@ mod tests {
 
     use super::{
         BootstrapExecutor, ConditionStatus, KrishivJobMode, KrishivJobPhase, KrishivJobReconciler,
-        KrishivJobResource, KrishivJobSpec, KubernetesControllerConfig, ObjectMeta, OperatorError,
-        ReconcileAction, demo_coordinator, job_spec_from_resource, krishivjob_api_resource,
-        resource_from_dynamic_object, status_patch,
+        KrishivJobResource, KrishivJobSpec, KubernetesControllerConfig,
+        KubernetesControllerRuntime, ObjectMeta, OperatorError, ReconcileAction, demo_coordinator,
+        job_spec_from_resource, krishivjob_api_resource, resource_from_dynamic_object,
+        status_patch,
     };
     use krishiv_scheduler::Coordinator;
     use kube::core::DynamicObject;
@@ -1054,6 +1119,25 @@ mod tests {
         assert_eq!(namespaced.namespace(), Some("krishiv-system"));
         assert_eq!(all.namespace(), None);
         assert_eq!(all.coordinator_id().as_str(), "coord-1");
+    }
+
+    #[test]
+    fn controller_runtime_shares_bootstrap_coordinator_state() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let config = KubernetesControllerConfig::namespaced("krishiv-system", coordinator_id)
+            .with_bootstrap_executor(BootstrapExecutor::new("exec-1", "executor", 2));
+
+        let runtime = KubernetesControllerRuntime::new(&config).unwrap();
+        let shared = runtime.coordinator();
+        let coordinator = shared.read().unwrap();
+
+        assert_eq!(coordinator.coordinator_id().as_str(), "coord-1");
+        assert_eq!(coordinator.executor_snapshots().len(), 1);
+        assert_eq!(
+            coordinator.executor_snapshots()[0].state(),
+            ExecutorState::Healthy
+        );
+        assert_eq!(runtime.reconciler().coordinator_id().as_str(), "coord-1");
     }
 
     #[test]

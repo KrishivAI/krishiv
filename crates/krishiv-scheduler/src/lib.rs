@@ -8,6 +8,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
@@ -115,6 +116,31 @@ pub struct Coordinator {
     config: CoordinatorConfig,
     executors: ExecutorRegistry,
     jobs: Vec<JobRecord>,
+}
+
+/// Shared handle to the active coordinator owned by an R2 runtime process.
+#[derive(Debug, Clone)]
+pub struct SharedCoordinator {
+    inner: Arc<RwLock<Coordinator>>,
+}
+
+impl SharedCoordinator {
+    /// Create a shared coordinator handle.
+    pub fn new(coordinator: Coordinator) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(coordinator)),
+        }
+    }
+
+    /// Borrow the coordinator for read-only status snapshots.
+    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, Coordinator>> {
+        self.inner.read()
+    }
+
+    /// Borrow the coordinator for scheduler mutations.
+    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Coordinator>> {
+        self.inner.write()
+    }
 }
 
 impl Coordinator {
@@ -1034,8 +1060,8 @@ mod tests {
     };
 
     use super::{
-        Coordinator, CoordinatorConfig, ExecutorRegistry, SchedulerError, StaticScheduler,
-        job_spec_from_logical_plan,
+        Coordinator, CoordinatorConfig, ExecutorRegistry, SchedulerError, SharedCoordinator,
+        StaticScheduler, job_spec_from_logical_plan,
     };
 
     #[test]
@@ -1091,6 +1117,32 @@ mod tests {
         assert_eq!(
             coordinator.executor_snapshots()[0].state(),
             ExecutorState::Lost
+        );
+    }
+
+    #[test]
+    fn shared_coordinator_exposes_same_scheduler_state_to_clones() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let observer = shared.clone();
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+                .unwrap();
+            coordinator
+                .executor_heartbeat(ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy))
+                .unwrap();
+        }
+
+        let coordinator = observer.read().unwrap();
+        assert_eq!(coordinator.executor_snapshots().len(), 1);
+        assert_eq!(
+            coordinator.executor_snapshots()[0].state(),
+            ExecutorState::Healthy
         );
     }
 

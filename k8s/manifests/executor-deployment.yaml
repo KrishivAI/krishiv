@@ -28,7 +28,7 @@ spec:
           args:
             - executor
             - --coordinator
-            - http://krishiv-coordinator.krishiv-system.svc:9090
+            - http://krishiv-coordinator.krishiv-system.svc:8080
           env:
             - name: KRISHIV_EXECUTOR_ID
               valueFrom:

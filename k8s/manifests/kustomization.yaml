@@ -6,7 +6,6 @@ resources:
   - serviceaccount.yaml
   - rbac.yaml
   - operator-deployment.yaml
-  - coordinator-deployment.yaml
   - coordinator-service.yaml
   - executor-deployment.yaml
   - sample-krishivjob.yaml

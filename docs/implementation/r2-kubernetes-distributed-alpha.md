@@ -61,6 +61,7 @@ Out of scope:
 - [x] Add `KrishivJob` operator reconciliation foundation.
 - [x] Add live Kubernetes watch/controller loop and status patch path.
 - [x] Add opt-in `kind` smoke test harness for batch and early streaming jobs.
+- [x] Expose scheduler-backed status API/Web UI from the operator-owned coordinator runtime.
 
 ## Runtime Deliverables
 
@@ -76,6 +77,7 @@ Out of scope:
 - [x] Convert `KrishivJob` resources into static scheduler jobs.
 - [x] Produce `KrishivJob/status` patch models from scheduler snapshots.
 - [x] Patch `KrishivJob/status` from live controller apply/init events.
+- [x] Share one active coordinator between the live reconciler and status server.
 - [x] Preserve R1 embedded/single-node behavior.
 
 ## Test Checklist
@@ -91,6 +93,7 @@ Out of scope:
 - [x] Operator reconciliation tests pass.
 - [x] Live operator adapter and status patch tests pass.
 - [x] Operator manifest validation tests pass.
+- [x] Shared coordinator/status runtime tests pass.
 - [ ] Kubernetes `kind` smoke test submits one batch job with `KRISHIV_KIND_E2E=1`.
 - [ ] Kubernetes `kind` smoke test submits one early streaming job with `KRISHIV_KIND_E2E=1`.
 
