@@ -11,12 +11,18 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use futures::StreamExt;
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
     JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError};
+use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
+use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::runtime::watcher::{self, Event as WatchEvent};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 /// Krishiv Kubernetes API group.
 pub const API_GROUP: &str = "krishiv.io";
@@ -40,6 +46,10 @@ pub enum OperatorError {
     InvalidResource { message: String },
     /// Scheduler operation failed.
     Scheduler(SchedulerError),
+    /// Kubernetes client or runtime operation failed.
+    Kubernetes { message: String },
+    /// Serialization or deserialization failed.
+    Serialization { message: String },
 }
 
 impl fmt::Display for OperatorError {
@@ -47,6 +57,8 @@ impl fmt::Display for OperatorError {
         match self {
             Self::InvalidResource { message } => write!(f, "invalid KrishivJob: {message}"),
             Self::Scheduler(error) => write!(f, "{error}"),
+            Self::Kubernetes { message } => write!(f, "kubernetes operation failed: {message}"),
+            Self::Serialization { message } => write!(f, "serialization failed: {message}"),
         }
     }
 }
@@ -56,6 +68,30 @@ impl Error for OperatorError {}
 impl From<SchedulerError> for OperatorError {
     fn from(value: SchedulerError) -> Self {
         Self::Scheduler(value)
+    }
+}
+
+impl From<kube::Error> for OperatorError {
+    fn from(value: kube::Error) -> Self {
+        Self::Kubernetes {
+            message: value.to_string(),
+        }
+    }
+}
+
+impl From<watcher::Error> for OperatorError {
+    fn from(value: watcher::Error) -> Self {
+        Self::Kubernetes {
+            message: value.to_string(),
+        }
+    }
+}
+
+impl From<serde_json::Error> for OperatorError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Serialization {
+            message: value.to_string(),
+        }
     }
 }
 
@@ -361,10 +397,242 @@ impl ReconcileOutcome {
     }
 }
 
+/// Optional executor registered at controller startup for the R2 bootstrap path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapExecutor {
+    /// Executor id.
+    pub executor_id: String,
+    /// Host or pod label used in scheduler snapshots.
+    pub host: String,
+    /// Static task slots.
+    pub slots: usize,
+}
+
+impl BootstrapExecutor {
+    /// Create a bootstrap executor descriptor.
+    pub fn new(executor_id: impl Into<String>, host: impl Into<String>, slots: usize) -> Self {
+        Self {
+            executor_id: executor_id.into(),
+            host: host.into(),
+            slots,
+        }
+    }
+}
+
+/// Live Kubernetes controller configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesControllerConfig {
+    /// Namespace to watch. `None` watches all namespaces.
+    namespace: Option<String>,
+    /// Active R2 coordinator id.
+    coordinator_id: CoordinatorId,
+    /// Optional label selector for the watcher.
+    label_selector: Option<String>,
+    /// Optional field selector for the watcher.
+    field_selector: Option<String>,
+    /// Optional bootstrap executor for R2 static scheduling.
+    bootstrap_executor: Option<BootstrapExecutor>,
+}
+
+impl KubernetesControllerConfig {
+    /// Create a config for one namespace.
+    pub fn namespaced(namespace: impl Into<String>, coordinator_id: CoordinatorId) -> Self {
+        Self {
+            namespace: Some(namespace.into()),
+            coordinator_id,
+            label_selector: None,
+            field_selector: None,
+            bootstrap_executor: None,
+        }
+    }
+
+    /// Create a config for all namespaces.
+    pub fn all_namespaces(coordinator_id: CoordinatorId) -> Self {
+        Self {
+            namespace: None,
+            coordinator_id,
+            label_selector: None,
+            field_selector: None,
+            bootstrap_executor: None,
+        }
+    }
+
+    /// Namespace being watched, if scoped.
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// Coordinator id used by the live controller.
+    pub fn coordinator_id(&self) -> &CoordinatorId {
+        &self.coordinator_id
+    }
+
+    /// Add a Kubernetes label selector.
+    #[must_use]
+    pub fn with_label_selector(mut self, selector: impl Into<String>) -> Self {
+        self.label_selector = Some(selector.into());
+        self
+    }
+
+    /// Add a Kubernetes field selector.
+    #[must_use]
+    pub fn with_field_selector(mut self, selector: impl Into<String>) -> Self {
+        self.field_selector = Some(selector.into());
+        self
+    }
+
+    /// Register a bootstrap executor when the controller starts.
+    #[must_use]
+    pub fn with_bootstrap_executor(mut self, executor: BootstrapExecutor) -> Self {
+        self.bootstrap_executor = Some(executor);
+        self
+    }
+}
+
+/// One live Kubernetes reconciliation report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesReconcileReport {
+    /// Namespace containing the reconciled resource.
+    pub namespace: String,
+    /// Resource name.
+    pub name: String,
+    /// Reconciler action.
+    pub action: ReconcileAction,
+    /// Status patched to Kubernetes.
+    pub status: KrishivJobStatus,
+}
+
+/// Run the live Kubernetes controller using in-cluster config or local kubeconfig.
+pub async fn run_kubernetes_controller(config: KubernetesControllerConfig) -> OperatorResult<()> {
+    let client = Client::try_default().await?;
+    run_kubernetes_controller_with_client(client, config).await
+}
+
+/// Run the live Kubernetes controller with an explicit Kubernetes client.
+pub async fn run_kubernetes_controller_with_client(
+    client: Client,
+    config: KubernetesControllerConfig,
+) -> OperatorResult<()> {
+    let jobs = krishivjob_api(client, config.namespace())?;
+    let watcher_config = watcher_config(&config);
+    let reconciler = KrishivJobReconciler::new(config.coordinator_id.clone());
+    let mut coordinator = Coordinator::active(config.coordinator_id.clone());
+    if let Some(executor) = &config.bootstrap_executor {
+        register_bootstrap_executor(&mut coordinator, executor)?;
+    }
+
+    let mut events = watcher::watcher(jobs.clone(), watcher_config).boxed();
+    while let Some(event) = events.next().await {
+        match event? {
+            WatchEvent::Apply(object) | WatchEvent::InitApply(object) => {
+                reconcile_dynamic_object(&jobs, &reconciler, &mut coordinator, object).await?;
+            }
+            WatchEvent::Delete(_) | WatchEvent::Init | WatchEvent::InitDone => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Reconcile one Kubernetes dynamic object and patch its status.
+pub async fn reconcile_dynamic_object(
+    jobs: &Api<DynamicObject>,
+    reconciler: &KrishivJobReconciler,
+    coordinator: &mut Coordinator,
+    object: DynamicObject,
+) -> OperatorResult<KubernetesReconcileReport> {
+    let resource = resource_from_dynamic_object(&object)?;
+    let outcome = reconciler.reconcile(coordinator, &resource)?;
+    patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
+
+    Ok(KubernetesReconcileReport {
+        namespace: resource.metadata.namespace_or_default().to_owned(),
+        name: resource.metadata.name,
+        action: outcome.action(),
+        status: outcome.status().clone(),
+    })
+}
+
+/// Convert a Kubernetes dynamic object into a typed `KrishivJobResource`.
+pub fn resource_from_dynamic_object(object: &DynamicObject) -> OperatorResult<KrishivJobResource> {
+    let value = serde_json::to_value(object)?;
+    let mut resource: KrishivJobResource = serde_json::from_value(value)?;
+    if resource.api_version.is_empty() {
+        resource.api_version = format!("{API_GROUP}/{API_VERSION}");
+    }
+    if resource.kind.is_empty() {
+        resource.kind = KIND.to_owned();
+    }
+    Ok(resource)
+}
+
+/// Patch the `KrishivJob/status` subresource.
+pub async fn patch_krishivjob_status(
+    jobs: &Api<DynamicObject>,
+    resource: &KrishivJobResource,
+    status: &KrishivJobStatus,
+) -> OperatorResult<()> {
+    let params = PatchParams::default();
+    let patch = status_patch(status);
+    jobs.patch_status(&resource.metadata.name, &params, &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+/// Build the Kubernetes status merge patch.
+pub fn status_patch(status: &KrishivJobStatus) -> Value {
+    json!({ "status": status })
+}
+
+/// API resource descriptor for `krishivjobs.krishiv.io`.
+pub fn krishivjob_api_resource() -> ApiResource {
+    let gvk = GroupVersionKind::gvk(API_GROUP, API_VERSION, KIND);
+    ApiResource::from_gvk_with_plural(&gvk, "krishivjobs")
+}
+
+/// Kubernetes API handle for `KrishivJob` dynamic objects.
+pub fn krishivjob_api(
+    client: Client,
+    namespace: Option<&str>,
+) -> OperatorResult<Api<DynamicObject>> {
+    let api_resource = krishivjob_api_resource();
+    Ok(match namespace {
+        Some(namespace) => Api::namespaced_with(client, namespace, &api_resource),
+        None => Api::all_with(client, &api_resource),
+    })
+}
+
 /// R2 in-process reconciler used before the live Kubernetes watcher exists.
 #[derive(Debug, Clone)]
 pub struct KrishivJobReconciler {
     coordinator_id: CoordinatorId,
+}
+
+fn watcher_config(config: &KubernetesControllerConfig) -> watcher::Config {
+    let mut watcher_config = watcher::Config::default();
+    watcher_config.label_selector = config.label_selector.clone();
+    watcher_config.field_selector = config.field_selector.clone();
+    watcher_config
+}
+
+fn register_bootstrap_executor(
+    coordinator: &mut Coordinator,
+    executor: &BootstrapExecutor,
+) -> OperatorResult<()> {
+    if executor.slots == 0 {
+        return Err(OperatorError::InvalidResource {
+            message: String::from("bootstrap executor slots must be greater than zero"),
+        });
+    }
+
+    let executor_id = ExecutorId::try_new(executor.executor_id.clone()).map_err(invalid_id)?;
+    coordinator.register_executor(ExecutorDescriptor::new(
+        executor_id.clone(),
+        executor.host.clone(),
+        executor.slots,
+    ))?;
+    coordinator.executor_heartbeat(ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy))?;
+    Ok(())
 }
 
 impl KrishivJobReconciler {
@@ -574,11 +842,14 @@ mod tests {
     };
 
     use super::{
-        ConditionStatus, KrishivJobMode, KrishivJobPhase, KrishivJobReconciler, KrishivJobResource,
-        KrishivJobSpec, ObjectMeta, OperatorError, ReconcileAction, demo_coordinator,
-        job_spec_from_resource,
+        BootstrapExecutor, ConditionStatus, KrishivJobMode, KrishivJobPhase, KrishivJobReconciler,
+        KrishivJobResource, KrishivJobSpec, KubernetesControllerConfig, ObjectMeta, OperatorError,
+        ReconcileAction, demo_coordinator, job_spec_from_resource, krishivjob_api_resource,
+        resource_from_dynamic_object, status_patch,
     };
     use krishiv_scheduler::Coordinator;
+    use kube::core::DynamicObject;
+    use serde_json::json;
 
     #[test]
     fn builds_scheduler_job_spec_from_batch_resource() {
@@ -717,6 +988,72 @@ mod tests {
 
         assert_eq!(job.kind().to_string(), "streaming");
         assert_eq!(job.task_count(), 1);
+    }
+
+    #[test]
+    fn krishivjob_api_resource_declares_explicit_plural() {
+        let resource = krishivjob_api_resource();
+
+        assert_eq!(resource.group, "krishiv.io");
+        assert_eq!(resource.version, "v1alpha1");
+        assert_eq!(resource.kind, "KrishivJob");
+        assert_eq!(resource.plural, "krishivjobs");
+    }
+
+    #[test]
+    fn converts_dynamic_object_into_typed_resource() {
+        let api_resource = krishivjob_api_resource();
+        let mut object = DynamicObject::new("sample-batch", &api_resource)
+            .within("krishiv-system")
+            .data(json!({
+                "spec": {
+                    "mode": "batch",
+                    "image": "ghcr.io/krishiv/krishiv:dev",
+                    "tasks": 2,
+                    "parallelism": 2,
+                    "restartPolicy": "Never"
+                }
+            }));
+        object.metadata.generation = Some(7);
+
+        let resource = resource_from_dynamic_object(&object).unwrap();
+
+        assert_eq!(resource.metadata.name, "sample-batch");
+        assert_eq!(
+            resource.metadata.namespace.as_deref(),
+            Some("krishiv-system")
+        );
+        assert_eq!(resource.metadata.generation, 7);
+        assert_eq!(resource.spec.tasks, 2);
+    }
+
+    #[test]
+    fn status_patch_wraps_status_subresource() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = demo_coordinator(coordinator_id, 2).unwrap();
+        let resource = sample_resource();
+
+        let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
+        let patch = status_patch(outcome.status());
+
+        assert_eq!(patch["status"]["phase"], "Running");
+        assert_eq!(patch["status"]["coordinator"], "coord-1");
+        assert_eq!(patch["status"]["tasks"]["assigned"], 2);
+    }
+
+    #[test]
+    fn controller_config_can_scope_or_watch_all_namespaces() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let namespaced =
+            KubernetesControllerConfig::namespaced("krishiv-system", coordinator_id.clone());
+        let all = KubernetesControllerConfig::all_namespaces(coordinator_id)
+            .with_label_selector("app.kubernetes.io/name=krishiv")
+            .with_bootstrap_executor(BootstrapExecutor::new("exec-1", "executor", 2));
+
+        assert_eq!(namespaced.namespace(), Some("krishiv-system"));
+        assert_eq!(all.namespace(), None);
+        assert_eq!(all.coordinator_id().as_str(), "coord-1");
     }
 
     #[test]

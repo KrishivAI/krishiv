@@ -32,7 +32,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-proto/Cargo.toml` | Defines the R2 control-plane contract crate. |
 | `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, and RPC-style message structs. |
 | `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/serde dependencies. |
-| `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, in-process reconciliation, and status patch planning. |
+| `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, in-process reconciliation, live Kubernetes watch adapter, and status patching. |
+| `crates/krishiv-operator/src/main.rs` | Runs the live R2 Kubernetes operator controller loop. |
 | `crates/krishiv-exec/Cargo.toml` | Defines the physical execution crate. |
 | `crates/krishiv-exec/src/lib.rs` | Defines physical operator descriptors and placeholder logical-to-physical lowering. |
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
@@ -69,6 +70,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `k8s/manifests/namespace.yaml` | Defines the `krishiv-system` namespace. |
 | `k8s/manifests/serviceaccount.yaml` | Defines the controller service account. |
 | `k8s/manifests/rbac.yaml` | Defines minimal R2 controller RBAC for jobs, status, pods, services, events, and deployments. |
+| `k8s/manifests/operator-deployment.yaml` | Defines the single R2 operator deployment that watches `KrishivJob` resources and patches status. |
 | `k8s/manifests/coordinator-deployment.yaml` | Defines the single active coordinator deployment with `replicas: 1`. |
 | `k8s/manifests/coordinator-service.yaml` | Defines the coordinator service ports. |
 | `k8s/manifests/executor-deployment.yaml` | Defines replaceable executor pods for R2 static scheduling. |
@@ -103,7 +105,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `tests/golden/r1-explain-literal.txt` | Golden output for a minimal `krishiv explain` query. |
 | `tests/golden/r1-sql-parquet-aggregate.txt` | Golden output for a Parquet-backed projection/filter/aggregate/limit query. |
 | `crates/krishiv-scheduler/tests/r2_k8s_manifests.rs` | Validates the static R2 Kubernetes manifest shape offline. |
-| `crates/krishiv-operator/src/lib.rs` | Includes unit tests for `KrishivJob` validation, scheduler conversion, waiting-for-executor behavior, submit/observe reconciliation, and status counters. |
+| `crates/krishiv-operator/src/lib.rs` | Includes unit tests for `KrishivJob` validation, scheduler conversion, dynamic object parsing, status patch generation, waiting-for-executor behavior, submit/observe reconciliation, and status counters. |
 
 ## Codex Skill Source
 

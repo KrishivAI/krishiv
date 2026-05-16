@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+futures.workspace = true
+k8s-openapi.workspace = true
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
+kube.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

@@ -6,9 +6,9 @@ R2 Kubernetes Distributed Alpha.
 
 ## Active Task
 
-R2 `KrishivJob` operator reconciliation foundation is complete. The next active
-task is attaching that reconciler to a live Kubernetes watch/controller
-entrypoint so `kind` smoke tests can become meaningful.
+R2 live `KrishivJob` operator watch/status-patch path is complete. The next
+active task is adding Kubernetes `kind` smoke tests for batch and early
+streaming `KrishivJob` submissions.
 
 ## Completed
 
@@ -85,6 +85,11 @@ entrypoint so `kind` smoke tests can become meaningful.
 - Added `KrishivJob/status` models for phase, coordinator, observed generation, stage count, task counters, and conditions.
 - Added operator tests for batch/streaming resource conversion, invalid resources, waiting for executors, submit/observe reconciliation, running task counters, and succeeded status.
 - Updated R2 tracker, crate map, file guide, Kubernetes README, and control-plane docs for the operator reconciliation model.
+- Added live Kubernetes watch/controller support to `krishiv-operator` using `kube` dynamic objects and watcher events.
+- Added `KrishivJob/status` merge patching through the Kubernetes status subresource.
+- Added the `krishiv-operator` binary entrypoint with namespace/all-namespace watching, selectors, coordinator id, and optional R2 bootstrap executor flags.
+- Added `k8s/manifests/operator-deployment.yaml` and included it in the R2 kustomization.
+- Added tests for dynamic object conversion, explicit API resource plural, status patch shape, operator CLI parsing, and operator manifest validation.
 
 ## In Progress
 
@@ -92,9 +97,9 @@ entrypoint so `kind` smoke tests can become meaningful.
 
 ## Next Steps
 
-1. Attach `KrishivJobReconciler` to a live Kubernetes watch/controller loop and status subresource patch path.
-2. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
-3. Add Kubernetes `kind` smoke tests after the live controller path exists.
+1. Add Kubernetes `kind` smoke tests for one batch `KrishivJob`.
+2. Add Kubernetes `kind` smoke tests for one early streaming `KrishivJob`.
+3. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
 4. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
@@ -117,9 +122,12 @@ entrypoint so `kind` smoke tests can become meaningful.
 - `cargo run -p krishiv-cli -- submit --job-id job-demo --name demo --tasks 2 --launch` passed.
 - `cargo run -p krishiv-cli -- jobs --distributed` passed.
 - `cargo test -p krishiv-scheduler` passed, including offline R2 manifest validation tests.
+- `cargo test -p krishiv-scheduler --test r2_k8s_manifests` passed.
 - `cargo test -p krishiv-ui` passed.
 - `cargo test -p krishiv-operator` passed.
+- `cargo check -p krishiv-operator` passed.
 - `cargo test -p krishiv-cli` passed.
+- `cargo run -p krishiv-operator -- --help` passed.
 - `cargo run -p krishiv-ui -- --help` passed.
 - `cargo run -p krishiv-ui -- --demo --addr 127.0.0.1:18080` started the demo status server.
 - `curl http://127.0.0.1:18080/healthz` returned `ok`.
@@ -139,4 +147,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 by wiring `KrishivJobReconciler` into a live Kubernetes watch/controller loop, unless the user asks for another slice.
+4. Continue R2 by adding Kubernetes `kind` smoke tests around the live operator path, unless the user asks for another slice.

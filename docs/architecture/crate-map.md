@@ -16,7 +16,7 @@ keeping public Krishiv APIs stable.
 | `krishiv-exec` | Physical operator descriptors and future Arrow execution operators | User-facing API, distributed scheduling |
 | `krishiv-runtime` | Runtime traits, local backends, job/task status, execution backend boundary | SQL parsing, connector-specific guarantees, Kubernetes CRDs |
 | `krishiv-proto` | R2 control-plane contracts: typed ids, lifecycle states, job/stage/task specs, executor heartbeats, and task updates | Runtime scheduling decisions, Kubernetes clients, transport servers |
-| `krishiv-operator` | R2 `KrishivJob` resource models, resource validation, scheduler job conversion, and status reconciliation | Live Kubernetes watch loops, scheduling policy, durable metadata, SQL execution |
+| `krishiv-operator` | R2 `KrishivJob` resource models, resource validation, scheduler job conversion, status reconciliation, live Kubernetes watch loop, and status subresource patching | Scheduling policy, durable metadata, SQL execution, HA leadership |
 | `krishiv-scheduler` | R2 active coordinator skeleton, executor registry, static placement, Krishiv DAG-to-job conversion, task lifecycle updates, and job snapshots | SQL parsing, DataFusion execution, Kubernetes CRDs, durable metadata |
 | `krishiv-ui` | R2 status HTTP API, health/readiness endpoints, and server-rendered Web UI over scheduler snapshots | Scheduling decisions, Kubernetes controllers, durable metadata, SQL execution |
 
@@ -47,6 +47,7 @@ krishiv-operator
   -> krishiv-proto
   -> krishiv-scheduler
   -> serde
+  -> kube
 
 krishiv-scheduler
   -> krishiv-plan
@@ -75,6 +76,6 @@ Future dependencies should preserve a simple rule: user-facing crates can depend
 
 ## Next Expected Slice
 
-The next implementation slice should attach the `krishiv-operator`
-reconciliation behavior to a live Kubernetes watch/controller entrypoint while
-keeping scheduling static and one coordinator active.
+The next implementation slice should add Kubernetes `kind` smoke tests around
+the live `krishiv-operator` watch/status path while keeping scheduling static
+and one coordinator active.

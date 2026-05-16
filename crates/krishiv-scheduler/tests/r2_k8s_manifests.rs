@@ -5,6 +5,7 @@ const KUSTOMIZATION: &str = include_str!("../../../k8s/manifests/kustomization.y
 const COORDINATOR_DEPLOYMENT: &str =
     include_str!("../../../k8s/manifests/coordinator-deployment.yaml");
 const EXECUTOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/executor-deployment.yaml");
+const OPERATOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/operator-deployment.yaml");
 const RBAC: &str = include_str!("../../../k8s/manifests/rbac.yaml");
 const SAMPLE_JOB: &str = include_str!("../../../k8s/manifests/sample-krishivjob.yaml");
 
@@ -47,6 +48,7 @@ fn kustomization_references_all_r2_manifests() {
             "namespace.yaml",
             "serviceaccount.yaml",
             "rbac.yaml",
+            "operator-deployment.yaml",
             "coordinator-deployment.yaml",
             "coordinator-service.yaml",
             "executor-deployment.yaml",
@@ -66,6 +68,26 @@ fn coordinator_manifest_keeps_one_active_coordinator() {
             "replicas: 1",
             "serviceAccountName: krishiv-controller",
             "KRISHIV_COORDINATOR_ID",
+        ],
+    );
+}
+
+#[test]
+fn operator_manifest_watches_jobs_and_patches_status() {
+    assert_contains_all(
+        OPERATOR_DEPLOYMENT,
+        &[
+            "kind: Deployment",
+            "name: krishiv-operator",
+            "app.kubernetes.io/component: operator",
+            "replicas: 1",
+            "serviceAccountName: krishiv-controller",
+            "- krishiv-operator",
+            "--namespace",
+            "--coordinator-id",
+            "--bootstrap-executor-slots",
+            "KRISHIV_COORDINATOR_ID",
+            "KRISHIV_NAMESPACE",
         ],
     );
 }

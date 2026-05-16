@@ -107,9 +107,8 @@ The first R2 Kubernetes slice adds static manifests under `k8s/`:
 
 ## Operator Reconciliation Model
 
-The first operator slice is implemented in `krishiv-operator`. It does not run
-a live Kubernetes watch loop yet; instead, it pins the reconciliation behavior
-that the future controller will call:
+The operator is implemented in `krishiv-operator`. It owns both the pure
+reconciliation behavior and the first live Kubernetes watch/status-patch path:
 
 - Typed Rust models mirror the R2 `krishiv.io/v1alpha1` `KrishivJob` shape.
 - Resource validation rejects unsupported API versions, kinds, empty names,
@@ -124,13 +123,19 @@ that the future controller will call:
 - Once a scheduler job exists, reconciliation refreshes `.status.phase`,
   `.status.stages`, `.status.tasks`, `.status.coordinator`, and
   `.status.conditions` from scheduler snapshots.
+- The live controller uses `kube` dynamic objects to watch
+  `krishivjobs.krishiv.io`, convert apply/init events into typed resources,
+  call `KrishivJobReconciler`, and patch the `status` subresource with a merge
+  patch.
+- Delete events are observed but do not trigger cleanup in R2 because
+  finalizer cleanup and durable ownership are deferred.
+- `k8s/manifests/operator-deployment.yaml` adds one operator replica using the
+  existing `krishiv-controller` service account and RBAC.
 
-The next controller slice should connect this reconciler to Kubernetes watch
-events and status subresource patches.
+The next controller slice should add `kind` smoke tests around this live path.
 
 ## Limitations
 
-- No live Kubernetes watch/controller loop yet.
 - No gRPC/protobuf wire transport yet.
 - No durable metadata store.
 - No persistent cross-process job history.

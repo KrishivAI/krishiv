@@ -59,6 +59,7 @@ Out of scope:
 - [x] Define coordinator/executor RPC messages in `krishiv-proto`.
 - [x] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
 - [x] Add `KrishivJob` operator reconciliation foundation.
+- [x] Add live Kubernetes watch/controller loop and status patch path.
 
 ## Runtime Deliverables
 
@@ -73,6 +74,7 @@ Out of scope:
 - [x] Route distributed streaming DAG execution through the scheduler with local-only state semantics.
 - [x] Convert `KrishivJob` resources into static scheduler jobs.
 - [x] Produce `KrishivJob/status` patch models from scheduler snapshots.
+- [x] Patch `KrishivJob/status` from live controller apply/init events.
 - [x] Preserve R1 embedded/single-node behavior.
 
 ## Test Checklist
@@ -86,6 +88,8 @@ Out of scope:
 - [x] Heartbeat timeout tests pass.
 - [x] Stage retry tests pass.
 - [x] Operator reconciliation tests pass.
+- [x] Live operator adapter and status patch tests pass.
+- [x] Operator manifest validation tests pass.
 - [ ] Kubernetes `kind` smoke test submits one batch job.
 - [ ] Kubernetes `kind` smoke test submits one early streaming job.
 
