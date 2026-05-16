@@ -6,11 +6,10 @@ R3.1 Distributed Execution Foundation.
 
 ## Active Task
 
-The first R3.1 code slice is complete: `krishiv-executor` exists and
-`krishiv-proto` now has versioned coordinator/executor transport contracts with
-task attempt ids and executor lease generations. The next active task is wiring
-those contracts into a `tonic` service boundary and scheduler-side
-attempt/lease validation.
+The R3.1 networked coordinator/executor gRPC path is complete for registration,
+heartbeat, and task-status updates. The next active task is scheduler-side
+attempt/lease validation: store executor lease generations, reject stale
+heartbeats/status updates, and make duplicate task status updates idempotent.
 
 ## Completed
 
@@ -106,6 +105,18 @@ attempt/lease validation.
 - Added R3.1 versioned coordinator/executor transport contracts to `krishiv-proto`: `TransportVersion`, `AttemptId`, `LeaseGeneration`, registration, heartbeat, task assignment, task status, input partition, plan fragment, output contract, and response disposition types.
 - Updated the runtime image build to include `krishiv-executor`.
 - Updated R3.1 roadmap/tracker/docs to mark the executor crate and transport contracts complete while leaving real gRPC, scheduler idempotency, and lease-expiry behavior open.
+- Added tonic as the R3.1 coordinator/executor service-boundary dependency.
+- Added tonic-shaped coordinator/executor service traits to `krishiv-proto`.
+- Added `CoordinatorExecutorTonicService` in `krishiv-scheduler` to apply executor registration, heartbeat, and task-status requests to the shared active coordinator.
+- Added executor runtime helpers to call coordinator registration and heartbeat through the tonic-shaped service boundary.
+- Updated the executor Kubernetes deployment to run `krishiv-executor` directly before the networked gRPC path landed.
+- Added generated protobuf/tonic contracts for the R3.1 `CoordinatorExecutor` service in `krishiv-proto`.
+- Added domain-to-wire conversion helpers for registration, heartbeat, and task-status messages.
+- Added a scheduler-backed networked coordinator/executor gRPC server in `krishiv-scheduler`.
+- Added executor gRPC client helpers and CLI modes for one-shot registration and long-running heartbeat loops.
+- Wired the operator binary to optionally serve the coordinator/executor gRPC endpoint alongside the status API.
+- Updated Kubernetes manifests so the coordinator service exposes gRPC on port 9090 and executor pods connect with `krishiv-executor --connect`.
+- Added networked registration, heartbeat, and task-status smoke coverage.
 
 ## In Progress
 
@@ -113,9 +124,9 @@ attempt/lease validation.
 
 ## Next Steps
 
-1. Add the `tonic` coordinator/executor service boundary in `krishiv-proto` and adapter layer without changing scheduler semantics yet.
-2. Wire executor registration and heartbeat from `krishiv-executor` to the coordinator over the new service.
-3. Teach the scheduler to store and validate `AttemptId` and `LeaseGeneration`, including stale-attempt and stale-lease rejection.
+1. Teach the scheduler to store and validate `AttemptId` and `LeaseGeneration`, including stale-attempt and stale-lease rejection.
+2. Add duplicate task-status idempotency rules and tests.
+3. Add task assignment RPC from coordinator to executor.
 4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
 
 ## Known Blockers
@@ -165,6 +176,27 @@ attempt/lease validation.
 - `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:8080` passed and printed registration/heartbeat contract summaries.
 - `git diff --check` passed after the R3.1 executor/transport contract slice.
 - Placeholder scan across the R3.1 executor/transport contract files and updated docs returned no actionable markers.
+- `cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after adding tonic-shaped services.
+- `cargo fmt --all --check` passed after adding tonic-shaped services.
+- `cargo check --workspace` passed after adding tonic-shaped services.
+- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed.
+- `cargo test -p krishiv-scheduler --test r2_k8s_manifests` passed after updating the executor manifest command.
+- `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:8080` passed after adding the tonic-shaped service helpers.
+- `git diff --check` passed after the tonic-shaped service boundary slice.
+- Placeholder scan across the tonic-shaped service boundary files and updated docs returned no actionable markers.
+- `cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-operator` passed after adding the networked gRPC server/client path.
+- `cargo test -p krishiv-scheduler grpc_service_registers_and_heartbeats_over_network` passed; the test skips only when the local sandbox denies loopback sockets.
+- `cargo test -p krishiv-scheduler grpc_service_registers_and_heartbeats_over_network -- --nocapture` passed with elevated loopback-socket permission and exercised the real networked gRPC path.
+- `cargo fmt --all --check` passed after formatting the gRPC transport slice.
+- `cargo check --workspace` passed after adding protobuf generation and tonic transport dependencies.
+- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-operator` passed.
+- `cargo test -p krishiv-executor` passed after the executor heartbeat-loop polish.
+- `cargo check --workspace` passed again after final code/doc updates.
+- `cargo run -p krishiv-executor -- --help` passed and listed `--register-once`, `--connect`, and `--heartbeat-interval-secs`.
+- `cargo run -p krishiv-operator -- --help` passed and listed `--executor-grpc-addr`.
+- `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:9090` passed and printed dry-run registration/heartbeat summaries.
+- `git diff --check` passed after the networked gRPC transport slice.
+- Stale network-placeholder scan across `crates`, `docs`, and `k8s` returned no matches.
 
 ## Resume Instructions
 
@@ -173,4 +205,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Continue R3.1 by wiring the versioned coordinator/executor contracts into a `tonic` service boundary, then add scheduler-side attempt and lease validation.
+4. Continue R3.1 by adding scheduler-side attempt and lease validation, then duplicate-status idempotency.

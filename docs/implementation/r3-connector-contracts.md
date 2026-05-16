@@ -63,7 +63,8 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Add `crates/krishiv-scheduler`.
 - [x] Add `crates/krishiv-proto`.
 - [x] Add `crates/krishiv-executor` binary crate.
-- [ ] Add `tonic` gRPC transport layer to `krishiv-proto`.
+- [x] Add `tonic` gRPC transport layer to `krishiv-proto`.
+- [x] Add tonic-shaped coordinator/executor service boundary in `krishiv-proto`.
 - [x] Add versioned coordinator/executor transport contracts in `krishiv-proto` for executor registration, heartbeat, task assignment, and task status updates.
 - [x] Add task attempt IDs to R3.1 transport task assignments and task status updates.
 - [ ] Define stale-attempt rejection and duplicate-status idempotency rules.
@@ -81,10 +82,13 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 
 ### API And Interface Deliverables
 
-- [ ] Implement executor registration RPC (executor → coordinator on startup).
+- [x] Implement executor registration through the tonic-shaped service boundary (executor → coordinator).
+- [x] Expose executor registration through a networked gRPC server/client.
 - [ ] Implement task assignment RPC (coordinator → executor).
-- [ ] Implement task status update RPC (executor → coordinator).
-- [ ] Implement executor heartbeat over gRPC transport.
+- [x] Implement task status update through the tonic-shaped service boundary (executor → coordinator).
+- [x] Expose task status updates through a networked gRPC server/client.
+- [x] Implement executor heartbeat through the tonic-shaped service boundary.
+- [x] Expose executor heartbeat through a networked gRPC server/client.
 - [x] Include executor lease generation and task attempt ID in coordinator/executor transport contracts.
 - [ ] Add status API fields for executor lease age, task attempt, retry count, and last failure reason.
 - [ ] Add cancel/delete API path used by Kubernetes finalizers.
@@ -107,7 +111,9 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] gRPC task assignment and status update round-trip tests pass.
 - [x] Versioned transport contract unit tests pass.
 - [x] Executor binary config and request-construction tests pass.
-- [ ] Executor registers with coordinator and appears in executor registry.
+- [x] Tonic service registration, heartbeat, and task status adapter tests pass.
+- [x] Networked registration, heartbeat, and task-status gRPC smoke test passes.
+- [x] Executor registers with coordinator and appears in executor registry.
 - [ ] Executor deregisters cleanly on shutdown.
 - [ ] `MetadataStore` persistence tests pass.
 - [ ] Coordinator restart recovery tests pass.

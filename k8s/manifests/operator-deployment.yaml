@@ -36,9 +36,13 @@ spec:
             - "2"
             - --status-addr
             - 0.0.0.0:8080
+            - --executor-grpc-addr
+            - 0.0.0.0:9090
           ports:
             - name: http
               containerPort: 8080
+            - name: grpc
+              containerPort: 9090
           readinessProbe:
             httpGet:
               path: /readyz

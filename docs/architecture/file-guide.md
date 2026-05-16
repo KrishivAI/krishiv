@@ -28,23 +28,25 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-cli/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
 | `crates/krishiv-cli/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |
 | `crates/krishiv-executor/Cargo.toml` | Defines the R3.1 executor crate and `krishiv-executor` binary target. |
-| `crates/krishiv-executor/src/lib.rs` | Owns executor startup configuration, the minimal runtime facade, and construction of versioned registration/heartbeat requests. |
-| `crates/krishiv-executor/src/main.rs` | Runs the R3.1 executor skeleton CLI and prints the versioned registration/heartbeat contract it would send. |
+| `crates/krishiv-executor/src/lib.rs` | Owns executor startup configuration, the minimal runtime facade, construction of versioned registration/heartbeat requests, tonic-shaped coordinator service calls, and the networked gRPC client path. |
+| `crates/krishiv-executor/src/main.rs` | Runs the R3.1 executor CLI in dry-run, one-shot registration, or heartbeat-loop mode. |
 | `crates/krishiv-sql/Cargo.toml` | Defines the SQL seam crate and Arrow/DataFusion dependencies. |
 | `crates/krishiv-sql/src/lib.rs` | Owns DataFusion session integration, Parquet registration, SQL collect, and explain formatting. |
 | `crates/krishiv-plan/Cargo.toml` | Defines the plan crate. |
 | `crates/krishiv-plan/src/lib.rs` | Owns `ExecutionKind`, `PlanNode`, `LogicalPlan`, and `PhysicalPlan`. |
-| `crates/krishiv-proto/Cargo.toml` | Defines the R2/R3.1 control-plane contract crate. |
-| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, R2 RPC-style message structs, and R3.1 versioned coordinator/executor transport contracts. |
+| `crates/krishiv-proto/Cargo.toml` | Defines the R2/R3.1 control-plane contract crate and protobuf generation dependencies. |
+| `crates/krishiv-proto/build.rs` | Generates tonic/prost Rust code from the R3.1 coordinator/executor protobuf schema. |
+| `crates/krishiv-proto/proto/krishiv/transport/v1/coordinator_executor.proto` | Defines the versioned coordinator/executor gRPC service and protobuf wire messages. |
+| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, R2 RPC-style message structs, R3.1 versioned coordinator/executor transport contracts, tonic-shaped service traits, generated protobuf modules, and domain/wire conversions. |
 | `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/UI/serde dependencies. |
 | `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, shared coordinator runtime, in-process reconciliation, live Kubernetes watch adapter, and status patching. |
-| `crates/krishiv-operator/src/main.rs` | Runs the live R2 Kubernetes operator controller loop and optional scheduler-backed status server. |
+| `crates/krishiv-operator/src/main.rs` | Runs the live R2/R3.1 Kubernetes operator controller loop with optional scheduler-backed status server and coordinator/executor gRPC server. |
 | `crates/krishiv-exec/Cargo.toml` | Defines the physical execution crate. |
 | `crates/krishiv-exec/src/lib.rs` | Defines physical operator descriptors and placeholder logical-to-physical lowering. |
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
 | `crates/krishiv-runtime/src/lib.rs` | Owns runtime traits, local backend acceptance, job/task status, and local job registry. |
 | `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate and its plan/proto dependencies. |
-| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, shared coordinator handle, executor registry, static placement, Krishiv DAG routing, retry/timeout behavior, and task lifecycle updates. |
+| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, shared coordinator handle, executor registry, static placement, Krishiv DAG routing, tonic-shaped coordinator service adapter, networked coordinator/executor gRPC server, retry/timeout behavior, and task lifecycle updates. |
 | `crates/krishiv-ui/Cargo.toml` | Defines the R2 status API/Web UI crate and its `axum`, `askama`, scheduler, and proto dependencies. |
 | `crates/krishiv-ui/src/lib.rs` | Owns the R2 status router, JSON API models, HTML rendering, health/readiness endpoints, shared-coordinator integration, and deterministic demo state. |
 | `crates/krishiv-ui/src/main.rs` | Runs the standalone R2 status server with optional demo data for local UI development. |
@@ -78,8 +80,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `k8s/manifests/serviceaccount.yaml` | Defines the controller service account. |
 | `k8s/manifests/rbac.yaml` | Defines minimal R2 controller RBAC for jobs, status, pods, services, events, and deployments. |
 | `k8s/manifests/operator-deployment.yaml` | Defines the single R2 operator deployment that owns the active coordinator runtime, watches `KrishivJob` resources, patches status, and serves scheduler-backed status pages. |
-| `k8s/manifests/coordinator-service.yaml` | Exposes the operator-owned coordinator status API and Web UI. |
-| `k8s/manifests/executor-deployment.yaml` | Defines replaceable executor pods for R2 static scheduling. |
+| `k8s/manifests/coordinator-service.yaml` | Exposes the operator-owned coordinator status API/Web UI and R3.1 coordinator/executor gRPC endpoint. |
+| `k8s/manifests/executor-deployment.yaml` | Defines replaceable executor pods that connect to the coordinator gRPC endpoint and heartbeat. |
 | `k8s/manifests/sample-krishivjob.yaml` | Provides a sample v1alpha1 batch `KrishivJob`. |
 | `k8s/manifests/sample-streaming-krishivjob.yaml` | Provides a sample v1alpha1 early streaming `KrishivJob`. |
 

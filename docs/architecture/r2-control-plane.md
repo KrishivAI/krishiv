@@ -151,11 +151,13 @@ acceptance gate can be marked complete.
 
 ## Limitations
 
-- No gRPC/protobuf wire transport yet.
+- R2 itself has no production task-assignment transport; R3.1 now provides the
+  first coordinator/executor gRPC path for registration, heartbeat, and task
+  status.
 - No durable metadata store.
 - No persistent cross-process job history.
-- Executor pods are still a manifest/runtime placeholder; R2 uses bootstrap
-  executor registration until the executor heartbeat path is implemented.
+- Executor pods can register and heartbeat over the R3.1 gRPC path, but
+  stage-local task execution and assignment are still pending.
 - Kubernetes `kind` smoke tests are opt-in and not part of the default test
   suite.
 - No exactly-once semantics.

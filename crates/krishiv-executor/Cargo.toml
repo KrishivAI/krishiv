@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 krishiv-proto = { path = "../krishiv-proto" }
+tokio = { workspace = true, features = ["time"] }
+tonic.workspace = true
 
 [[bin]]
 name = "krishiv-executor"

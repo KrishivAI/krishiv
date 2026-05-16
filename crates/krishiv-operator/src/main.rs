@@ -8,6 +8,7 @@ use krishiv_operator::{
     run_kubernetes_controller_runtime_with_client,
 };
 use krishiv_proto::CoordinatorId;
+use krishiv_scheduler::serve_coordinator_executor_grpc_with_listener;
 use krishiv_ui::{UiState, serve};
 use kube::Client;
 
@@ -28,31 +29,92 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let client = Client::try_default().await?;
-    if let Some(status_addr) = config.status_addr {
-        run_controller_with_status_server(client, controller_config, runtime, status_addr).await?;
+    if config.status_addr.is_some() || config.executor_grpc_addr.is_some() {
+        run_controller_with_servers(
+            client,
+            controller_config,
+            runtime,
+            config.status_addr,
+            config.executor_grpc_addr,
+        )
+        .await?;
     } else {
         run_kubernetes_controller_runtime_with_client(client, controller_config, runtime).await?;
     }
     Ok(())
 }
 
-async fn run_controller_with_status_server(
+async fn run_controller_with_servers(
     client: Client,
     controller_config: KubernetesControllerConfig,
     runtime: KubernetesControllerRuntime,
-    status_addr: SocketAddr,
+    status_addr: Option<SocketAddr>,
+    executor_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), Box<dyn Error>> {
-    let listener = tokio::net::TcpListener::bind(status_addr).await?;
-    let local_addr = listener.local_addr()?;
-    let status_state = UiState::from_shared_coordinator(runtime.coordinator());
-    println!("Krishiv operator status API listening on http://{local_addr}/ui");
-
-    tokio::select! {
-        result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
-            result?;
+    let status_listener = match status_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            println!(
+                "Krishiv operator status API listening on http://{}/ui",
+                listener.local_addr()?
+            );
+            Some(listener)
         }
-        result = serve(listener, status_state) => {
-            result?;
+        None => None,
+    };
+    let grpc_listener = match executor_grpc_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            println!(
+                "Krishiv coordinator/executor gRPC listening on {}",
+                listener.local_addr()?
+            );
+            Some(listener)
+        }
+        None => None,
+    };
+
+    match (status_listener, grpc_listener) {
+        (Some(status_listener), Some(grpc_listener)) => {
+            let status_state = UiState::from_shared_coordinator(runtime.coordinator());
+            let grpc_coordinator = runtime.coordinator().clone();
+            tokio::select! {
+                result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
+                    result?;
+                }
+                result = serve(status_listener, status_state) => {
+                    result?;
+                }
+                result = serve_coordinator_executor_grpc_with_listener(grpc_listener, grpc_coordinator) => {
+                    result?;
+                }
+            }
+        }
+        (Some(status_listener), None) => {
+            let status_state = UiState::from_shared_coordinator(runtime.coordinator());
+            tokio::select! {
+                result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
+                    result?;
+                }
+                result = serve(status_listener, status_state) => {
+                    result?;
+                }
+            }
+        }
+        (None, Some(grpc_listener)) => {
+            let grpc_coordinator = runtime.coordinator().clone();
+            tokio::select! {
+                result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
+                    result?;
+                }
+                result = serve_coordinator_executor_grpc_with_listener(grpc_listener, grpc_coordinator) => {
+                    result?;
+                }
+            }
+        }
+        (None, None) => {
+            run_kubernetes_controller_runtime_with_client(client, controller_config, runtime)
+                .await?;
         }
     }
 
@@ -70,6 +132,7 @@ struct OperatorCliConfig {
     bootstrap_executor_host: String,
     bootstrap_executor_slots: Option<usize>,
     status_addr: Option<SocketAddr>,
+    executor_grpc_addr: Option<SocketAddr>,
     help: bool,
 }
 
@@ -88,6 +151,7 @@ impl OperatorCliConfig {
             bootstrap_executor_host: String::from("operator-bootstrap-executor"),
             bootstrap_executor_slots: None,
             status_addr: None,
+            executor_grpc_addr: None,
             help: false,
         };
         let mut args = args.into_iter();
@@ -134,6 +198,14 @@ impl OperatorCliConfig {
                 "--status-addr" => {
                     let value = next_arg(&mut args, "--status-addr")?;
                     config.status_addr = Some(
+                        value
+                            .parse()
+                            .map_err(|_| format!("invalid socket address: {value}"))?,
+                    );
+                }
+                "--executor-grpc-addr" => {
+                    let value = next_arg(&mut args, "--executor-grpc-addr")?;
+                    config.executor_grpc_addr = Some(
                         value
                             .parse()
                             .map_err(|_| format!("invalid socket address: {value}"))?,
@@ -211,6 +283,7 @@ impl OperatorCliConfig {
            --bootstrap-executor-host <HOST> Optional bootstrap executor host label\n\
            --bootstrap-executor-slots <N>   Register a bootstrap executor with N slots\n\
            --status-addr <HOST:PORT>        Serve scheduler-backed status API/UI on this address\n\
+           --executor-grpc-addr <HOST:PORT> Serve coordinator/executor gRPC on this address\n\
            -h, --help                       Show help\n"
     }
 }
@@ -258,6 +331,20 @@ mod tests {
                 .unwrap();
 
         assert_eq!(config.status_addr.unwrap().to_string(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn parses_executor_grpc_addr() {
+        let config = OperatorCliConfig::parse([
+            String::from("--executor-grpc-addr"),
+            String::from("0.0.0.0:9090"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.executor_grpc_addr.unwrap().to_string(),
+            "0.0.0.0:9090"
+        );
     }
 
     #[test]

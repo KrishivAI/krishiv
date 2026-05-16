@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package krishiv.transport.v1;
+
+service CoordinatorExecutor {
+  rpc RegisterExecutor(RegisterExecutorRequest) returns (RegisterExecutorResponse);
+  rpc ExecutorHeartbeat(ExecutorHeartbeatRequest) returns (ExecutorHeartbeatResponse);
+  rpc TaskStatus(TaskStatusRequest) returns (TaskStatusResponse);
+}
+
+message TransportVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+message ExecutorDescriptor {
+  string executor_id = 1;
+  string host = 2;
+  uint64 slots = 3;
+}
+
+message RegisterExecutorRequest {
+  TransportVersion version = 1;
+  ExecutorDescriptor descriptor = 2;
+}
+
+message RegisterExecutorResponse {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  TransportDisposition disposition = 4;
+  string message = 5;
+}
+
+message TaskAttemptRef {
+  string job_id = 1;
+  string stage_id = 2;
+  string task_id = 3;
+  uint32 attempt_id = 4;
+}
+
+message ExecutorHeartbeatRequest {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  ExecutorState state = 4;
+  repeated TaskAttemptRef running_attempts = 5;
+}
+
+message ExecutorHeartbeatResponse {
+  TransportVersion version = 1;
+  uint64 lease_generation = 2;
+  TransportDisposition disposition = 3;
+  string message = 4;
+}
+
+message TaskStatusRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  string executor_id = 6;
+  uint64 lease_generation = 7;
+  TaskState state = 8;
+  string message = 9;
+}
+
+message TaskStatusResponse {
+  TransportVersion version = 1;
+  TransportDisposition disposition = 2;
+  string message = 3;
+}
+
+enum ExecutorState {
+  EXECUTOR_STATE_UNSPECIFIED = 0;
+  EXECUTOR_STATE_REGISTERED = 1;
+  EXECUTOR_STATE_HEALTHY = 2;
+  EXECUTOR_STATE_LOST = 3;
+  EXECUTOR_STATE_DRAINING = 4;
+  EXECUTOR_STATE_REMOVED = 5;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING = 1;
+  TASK_STATE_ASSIGNED = 2;
+  TASK_STATE_RUNNING = 3;
+  TASK_STATE_SUCCEEDED = 4;
+  TASK_STATE_FAILED = 5;
+  TASK_STATE_RETRYING = 6;
+  TASK_STATE_CANCELLED = 7;
+}
+
+enum TransportDisposition {
+  TRANSPORT_DISPOSITION_UNSPECIFIED = 0;
+  TRANSPORT_DISPOSITION_ACCEPTED = 1;
+  TRANSPORT_DISPOSITION_REJECTED = 2;
+  TRANSPORT_DISPOSITION_DUPLICATE = 3;
+  TRANSPORT_DISPOSITION_STALE_ATTEMPT = 4;
+  TRANSPORT_DISPOSITION_STALE_LEASE = 5;
+  TRANSPORT_DISPOSITION_UNKNOWN_JOB = 6;
+  TRANSPORT_DISPOSITION_UNKNOWN_TASK = 7;
+  TRANSPORT_DISPOSITION_UNKNOWN_EXECUTOR = 8;
+}

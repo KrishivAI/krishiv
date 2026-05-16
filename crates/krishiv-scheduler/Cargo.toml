@@ -8,6 +8,9 @@ license.workspace = true
 [dependencies]
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
+tokio = { workspace = true, features = ["net"] }
+tokio-stream.workspace = true
+tonic.workspace = true
 
 [lib]
 path = "src/lib.rs"

@@ -25,10 +25,14 @@ spec:
         - name: executor
           image: ghcr.io/krishiv/krishiv:dev
           imagePullPolicy: IfNotPresent
+          command:
+            - krishiv-executor
           args:
-            - executor
             - --coordinator
-            - http://krishiv-coordinator.krishiv-system.svc:8080
+            - http://krishiv-coordinator.krishiv-system.svc:9090
+            - --connect
+            - --heartbeat-interval-secs
+            - "10"
           env:
             - name: KRISHIV_EXECUTOR_ID
               valueFrom:

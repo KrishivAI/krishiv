@@ -2,11 +2,13 @@
 
 use std::env;
 use std::process;
+use std::time::Duration;
 
 use krishiv_executor::{ExecutorConfig, ExecutorRuntime};
 
-fn main() {
-    match run(env::args().skip(1)) {
+#[tokio::main]
+async fn main() {
+    match run(env::args().skip(1)).await {
         Ok(()) => {}
         Err(error) => {
             eprintln!("{error}");
@@ -15,14 +17,25 @@ fn main() {
     }
 }
 
-fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let config = ExecutorCliConfig::parse(args)?;
     if config.help {
         print!("{}", ExecutorCliConfig::help());
         return Ok(());
     }
 
+    let mode = config.mode;
+    let heartbeat_interval_secs = config.heartbeat_interval_secs;
     let runtime = ExecutorRuntime::new(config.into_executor_config()?);
+
+    match mode {
+        ExecutorMode::DryRun => print_contract_summary(&runtime),
+        ExecutorMode::RegisterOnce => register_once(&runtime).await,
+        ExecutorMode::Connect => heartbeat_loop(&runtime, heartbeat_interval_secs).await,
+    }
+}
+
+fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
     let registration = runtime.registration_request();
     let heartbeat = runtime.heartbeat_request();
 
@@ -45,13 +58,69 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     Ok(())
 }
 
+async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
+    println!("{}", runtime.startup_summary());
+    let (registration, heartbeat) = runtime
+        .register_and_heartbeat_once()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    println!(
+        "registration response version={} executor={} lease_generation={} disposition={} message={}",
+        registration.version(),
+        registration.executor_id(),
+        registration.lease_generation(),
+        registration.disposition(),
+        registration.message().unwrap_or("")
+    );
+    println!(
+        "heartbeat response version={} lease_generation={} disposition={} message={}",
+        heartbeat.version(),
+        heartbeat.lease_generation(),
+        heartbeat.disposition(),
+        heartbeat.message().unwrap_or("")
+    );
+    Ok(())
+}
+
+async fn heartbeat_loop(
+    runtime: &ExecutorRuntime,
+    heartbeat_interval_secs: u64,
+) -> Result<(), String> {
+    register_once(runtime).await?;
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(heartbeat_interval_secs)).await;
+        let heartbeat = runtime
+            .heartbeat_with_grpc_endpoint()
+            .await
+            .map_err(|error| error.to_string())?;
+        println!(
+            "heartbeat response version={} lease_generation={} disposition={} message={}",
+            heartbeat.version(),
+            heartbeat.lease_generation(),
+            heartbeat.disposition(),
+            heartbeat.message().unwrap_or("")
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutorCliConfig {
     executor_id: String,
     host: String,
     slots: usize,
     coordinator_endpoint: String,
+    mode: ExecutorMode,
+    heartbeat_interval_secs: u64,
     help: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorMode {
+    DryRun,
+    RegisterOnce,
+    Connect,
 }
 
 impl ExecutorCliConfig {
@@ -66,6 +135,11 @@ impl ExecutorCliConfig {
                 .unwrap_or(1),
             coordinator_endpoint: env::var("KRISHIV_COORDINATOR_ENDPOINT")
                 .unwrap_or_else(|_| String::from("http://127.0.0.1:8080")),
+            mode: ExecutorMode::DryRun,
+            heartbeat_interval_secs: env::var("KRISHIV_HEARTBEAT_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10),
             help: false,
         };
         let mut args = args.into_iter();
@@ -82,6 +156,23 @@ impl ExecutorCliConfig {
                 }
                 "--coordinator" => {
                     config.coordinator_endpoint = next_arg(&mut args, "--coordinator")?;
+                }
+                "--register-once" => {
+                    config.set_mode(ExecutorMode::RegisterOnce)?;
+                }
+                "--connect" => {
+                    config.set_mode(ExecutorMode::Connect)?;
+                }
+                "--heartbeat-interval-secs" => {
+                    let value = next_arg(&mut args, "--heartbeat-interval-secs")?;
+                    config.heartbeat_interval_secs = value.parse().map_err(|_| {
+                        String::from("--heartbeat-interval-secs must be a positive integer")
+                    })?;
+                    if config.heartbeat_interval_secs == 0 {
+                        return Err(String::from(
+                            "--heartbeat-interval-secs must be greater than zero",
+                        ));
+                    }
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
@@ -101,6 +192,16 @@ impl ExecutorCliConfig {
         .map_err(|error| error.to_string())
     }
 
+    fn set_mode(&mut self, mode: ExecutorMode) -> Result<(), String> {
+        if self.mode != ExecutorMode::DryRun && self.mode != mode {
+            return Err(String::from(
+                "--register-once and --connect are mutually exclusive",
+            ));
+        }
+        self.mode = mode;
+        Ok(())
+    }
+
     fn help() -> &'static str {
         "Run the Krishiv R3.1 executor skeleton.\n\
          \n\
@@ -112,6 +213,9 @@ impl ExecutorCliConfig {
            --host <HOST>            Host or pod name, defaults to HOSTNAME or localhost\n\
            --slots <N>              Task slots, defaults to KRISHIV_TASK_SLOTS or 1\n\
            --coordinator <URL>      Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:8080\n\
+           --register-once          Register with the coordinator, send one heartbeat, then exit\n\
+           --connect                Register with the coordinator and continue heartbeating\n\
+           --heartbeat-interval-secs <N> Heartbeat interval for --connect, defaults to KRISHIV_HEARTBEAT_INTERVAL_SECS or 10\n\
            -h, --help               Show help\n"
     }
 }
@@ -124,7 +228,7 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::ExecutorCliConfig;
+    use super::{ExecutorCliConfig, ExecutorMode};
 
     #[test]
     fn parses_explicit_config() {
@@ -144,6 +248,7 @@ mod tests {
         assert_eq!(config.host, "pod-a");
         assert_eq!(config.slots, 2);
         assert_eq!(config.coordinator_endpoint, "http://coordinator");
+        assert_eq!(config.mode, ExecutorMode::DryRun);
     }
 
     #[test]
@@ -151,5 +256,29 @@ mod tests {
         let error = ExecutorCliConfig::parse([String::from("--wat")]).unwrap_err();
 
         assert!(error.contains("unknown option"));
+    }
+
+    #[test]
+    fn parses_network_modes() {
+        let register = ExecutorCliConfig::parse([String::from("--register-once")]).unwrap();
+        let connect = ExecutorCliConfig::parse([
+            String::from("--connect"),
+            String::from("--heartbeat-interval-secs"),
+            String::from("3"),
+        ])
+        .unwrap();
+
+        assert_eq!(register.mode, ExecutorMode::RegisterOnce);
+        assert_eq!(connect.mode, ExecutorMode::Connect);
+        assert_eq!(connect.heartbeat_interval_secs, 3);
+    }
+
+    #[test]
+    fn rejects_conflicting_network_modes() {
+        let error =
+            ExecutorCliConfig::parse([String::from("--connect"), String::from("--register-once")])
+                .unwrap_err();
+
+        assert!(error.contains("mutually exclusive"));
     }
 }

@@ -2,20 +2,25 @@
 
 //! R3.1 executor process skeleton.
 //!
-//! This crate owns executor-side process configuration and builds the first
-//! versioned coordinator/executor transport requests. The actual gRPC client,
-//! task runner loop, and DataFusion execution path land in later R3.1 slices.
+//! This crate owns executor-side process configuration, versioned
+//! coordinator/executor transport requests, and the first networked gRPC client
+//! path. The task runner loop and DataFusion execution path land in later R3.1
+//! slices.
 
 use std::error::Error;
 use std::fmt;
 
 use krishiv_proto::{
-    ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorId, ExecutorState, LeaseGeneration,
-    RegisterExecutorRequest, TransportVersion,
+    CoordinatorExecutorService, ExecutorDescriptor, ExecutorHeartbeatRequest,
+    ExecutorHeartbeatResponse, ExecutorId, ExecutorState, LeaseGeneration, RegisterExecutorRequest,
+    RegisterExecutorResponse, TransportVersion, wire,
 };
 
 /// Executor crate result alias.
 pub type ExecutorResult<T> = Result<T, ExecutorError>;
+
+/// Executor transport result alias.
+pub type ExecutorTransportResult<T> = Result<T, ExecutorTransportError>;
 
 /// Executor configuration or startup error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +44,53 @@ impl fmt::Display for ExecutorError {
 }
 
 impl Error for ExecutorError {}
+
+/// Network transport error raised by the executor gRPC client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutorTransportError {
+    /// The gRPC channel could not be created or used.
+    Transport { message: String },
+    /// The coordinator returned a gRPC status error.
+    Status { message: String },
+    /// A protobuf response could not be converted to a Krishiv contract.
+    Wire { message: String },
+}
+
+impl fmt::Display for ExecutorTransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport { message } => write!(f, "executor transport failed: {message}"),
+            Self::Status { message } => write!(f, "coordinator rejected transport call: {message}"),
+            Self::Wire { message } => write!(f, "invalid coordinator wire response: {message}"),
+        }
+    }
+}
+
+impl Error for ExecutorTransportError {}
+
+impl From<tonic::transport::Error> for ExecutorTransportError {
+    fn from(value: tonic::transport::Error) -> Self {
+        Self::Transport {
+            message: value.to_string(),
+        }
+    }
+}
+
+impl From<tonic::Status> for ExecutorTransportError {
+    fn from(value: tonic::Status) -> Self {
+        Self::Status {
+            message: value.to_string(),
+        }
+    }
+}
+
+impl From<wire::WireError> for ExecutorTransportError {
+    fn from(value: wire::WireError) -> Self {
+        Self::Wire {
+            message: value.to_string(),
+        }
+    }
+}
 
 /// R3.1 executor startup configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +186,20 @@ impl ExecutorRuntime {
         RegisterExecutorRequest::new(self.config.descriptor())
     }
 
+    /// Register this executor through a tonic-shaped coordinator service.
+    pub async fn register_with<S>(
+        &self,
+        service: &S,
+    ) -> Result<RegisterExecutorResponse, tonic::Status>
+    where
+        S: CoordinatorExecutorService,
+    {
+        service
+            .register_executor(tonic::Request::new(self.registration_request()))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
     /// Build an empty healthy heartbeat request for this executor.
     pub fn heartbeat_request(&self) -> ExecutorHeartbeatRequest {
         ExecutorHeartbeatRequest::new(
@@ -141,6 +207,74 @@ impl ExecutorRuntime {
             self.config.lease_generation,
             ExecutorState::Healthy,
         )
+    }
+
+    /// Send a heartbeat through a tonic-shaped coordinator service.
+    pub async fn heartbeat_with<S>(
+        &self,
+        service: &S,
+    ) -> Result<ExecutorHeartbeatResponse, tonic::Status>
+    where
+        S: CoordinatorExecutorService,
+    {
+        service
+            .executor_heartbeat(tonic::Request::new(self.heartbeat_request()))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Register this executor through a networked coordinator gRPC endpoint.
+    pub async fn register_with_grpc_endpoint(
+        &self,
+    ) -> ExecutorTransportResult<RegisterExecutorResponse> {
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .await?;
+        let request = wire::register_executor_request_to_wire(self.registration_request());
+        let response = client.register_executor(request).await?.into_inner();
+        Ok(wire::register_executor_response_from_wire(response)?)
+    }
+
+    /// Send one healthy heartbeat through a networked coordinator gRPC endpoint.
+    pub async fn heartbeat_with_grpc_endpoint(
+        &self,
+    ) -> ExecutorTransportResult<ExecutorHeartbeatResponse> {
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .await?;
+        let request = wire::executor_heartbeat_request_to_wire(self.heartbeat_request());
+        let response = client.executor_heartbeat(request).await?.into_inner();
+        Ok(wire::executor_heartbeat_response_from_wire(response)?)
+    }
+
+    /// Register once and immediately send one heartbeat over gRPC.
+    pub async fn register_and_heartbeat_once(
+        &self,
+    ) -> ExecutorTransportResult<(RegisterExecutorResponse, ExecutorHeartbeatResponse)> {
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .await?;
+
+        let registration = client
+            .register_executor(wire::register_executor_request_to_wire(
+                self.registration_request(),
+            ))
+            .await?
+            .into_inner();
+        let registration = wire::register_executor_response_from_wire(registration)?;
+
+        let heartbeat = client
+            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
+                self.heartbeat_request(),
+            ))
+            .await?
+            .into_inner();
+        let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat)?;
+
+        Ok((registration, heartbeat))
     }
 
     /// Human-readable startup summary for the binary.
@@ -157,9 +291,49 @@ impl ExecutorRuntime {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_proto::{ExecutorState, LeaseGeneration, TransportVersion};
+    use krishiv_proto::{
+        CoordinatorExecutorService, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
+        ExecutorState, LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse,
+        TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
+    };
 
     use super::{ExecutorConfig, ExecutorError, ExecutorRuntime};
+
+    struct AcceptingCoordinatorService;
+
+    #[tonic::async_trait]
+    impl CoordinatorExecutorService for AcceptingCoordinatorService {
+        async fn register_executor(
+            &self,
+            request: tonic::Request<RegisterExecutorRequest>,
+        ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+            let request = request.into_inner();
+            Ok(tonic::Response::new(RegisterExecutorResponse::new(
+                request.descriptor().executor_id().clone(),
+                LeaseGeneration::initial(),
+                TransportDisposition::Accepted,
+            )))
+        }
+
+        async fn executor_heartbeat(
+            &self,
+            request: tonic::Request<ExecutorHeartbeatRequest>,
+        ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ExecutorHeartbeatResponse::new(
+                request.into_inner().lease_generation(),
+                TransportDisposition::Accepted,
+            )))
+        }
+
+        async fn task_status(
+            &self,
+            _request: tonic::Request<TaskStatusRequest>,
+        ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+            Ok(tonic::Response::new(TaskStatusResponse::new(
+                TransportDisposition::Accepted,
+            )))
+        }
+    }
 
     #[test]
     fn config_rejects_invalid_values() {
@@ -195,5 +369,19 @@ mod tests {
         assert_eq!(heartbeat.state(), ExecutorState::Healthy);
         assert_eq!(heartbeat.lease_generation(), LeaseGeneration::initial());
         assert!(heartbeat.running_attempts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_registers_and_heartbeats_through_service_boundary() {
+        let runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-1", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let service = AcceptingCoordinatorService;
+
+        let registration = runtime.register_with(&service).await.unwrap();
+        let heartbeat = runtime.heartbeat_with(&service).await.unwrap();
+
+        assert_eq!(registration.disposition(), TransportDisposition::Accepted);
+        assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
     }
 }

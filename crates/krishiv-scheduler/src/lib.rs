@@ -2,19 +2,24 @@
 
 //! R2 in-process scheduler skeleton.
 //!
-//! This crate starts the distributed control-plane model without introducing
-//! Kubernetes clients or network transports. R2 keeps one active coordinator
-//! and replaceable executors; later slices can map these structs to services.
+//! This crate owns the distributed control-plane model without introducing
+//! Kubernetes clients. R2 keeps one active coordinator and replaceable
+//! executors; R3.1 maps coordinator/executor contracts to a networked gRPC
+//! service.
 
 use std::error::Error;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
-    CoordinatorId, CoordinatorState, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
-    ExecutorState, JobId, JobKind, JobSpec, JobState, StageId, StageSpec, StageState,
-    TaskAssignment, TaskId, TaskSpec, TaskState, TaskStatusUpdate,
+    CoordinatorExecutorService, CoordinatorId, CoordinatorState, ExecutorDescriptor,
+    ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
+    ExecutorState, JobId, JobKind, JobSpec, JobState, LeaseGeneration, RegisterExecutorRequest,
+    RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskId, TaskSpec,
+    TaskState, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
+    TransportVersion, wire,
 };
 
 /// Scheduler result alias.
@@ -140,6 +145,273 @@ impl SharedCoordinator {
     /// Borrow the coordinator for scheduler mutations.
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Coordinator>> {
         self.inner.write()
+    }
+}
+
+/// Tonic-shaped adapter that exposes coordinator/executor RPCs over a shared coordinator.
+#[derive(Debug, Clone)]
+pub struct CoordinatorExecutorTonicService {
+    coordinator: SharedCoordinator,
+}
+
+impl CoordinatorExecutorTonicService {
+    /// Create a coordinator/executor service adapter.
+    pub fn new(coordinator: SharedCoordinator) -> Self {
+        Self { coordinator }
+    }
+
+    /// Shared coordinator backing this adapter.
+    pub fn coordinator(&self) -> &SharedCoordinator {
+        &self.coordinator
+    }
+}
+
+#[tonic::async_trait]
+impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
+    async fn register_executor(
+        &self,
+        request: tonic::Request<RegisterExecutorRequest>,
+    ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+        let request = request.into_inner();
+        ensure_transport_version(request.version())?;
+
+        let descriptor = request.descriptor().clone();
+        let executor_id = descriptor.executor_id().clone();
+        let mut coordinator = self
+            .coordinator
+            .write()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+
+        let response = match coordinator.register_executor(descriptor) {
+            Ok(()) => RegisterExecutorResponse::new(
+                executor_id,
+                LeaseGeneration::initial(),
+                TransportDisposition::Accepted,
+            ),
+            Err(SchedulerError::DuplicateExecutor { executor_id }) => {
+                RegisterExecutorResponse::new(
+                    executor_id,
+                    LeaseGeneration::initial(),
+                    TransportDisposition::Duplicate,
+                )
+                .with_message("executor is already registered")
+            }
+            Err(error) => return Err(status_from_scheduler_error(error)),
+        };
+
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn executor_heartbeat(
+        &self,
+        request: tonic::Request<ExecutorHeartbeatRequest>,
+    ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+        let request = request.into_inner();
+        ensure_transport_version(request.version())?;
+
+        let heartbeat = ExecutorHeartbeat::new(request.executor_id().clone(), request.state())
+            .with_running_tasks(
+                request
+                    .running_attempts()
+                    .iter()
+                    .map(|attempt| attempt.task_id().clone())
+                    .collect(),
+            );
+        let mut coordinator = self
+            .coordinator
+            .write()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+
+        let response = match coordinator.executor_heartbeat(heartbeat) {
+            Ok(()) => ExecutorHeartbeatResponse::new(
+                request.lease_generation(),
+                TransportDisposition::Accepted,
+            ),
+            Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
+                request.lease_generation(),
+                TransportDisposition::UnknownExecutor,
+            )
+            .with_message("executor is not registered"),
+            Err(error) => return Err(status_from_scheduler_error(error)),
+        };
+
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn task_status(
+        &self,
+        request: tonic::Request<TaskStatusRequest>,
+    ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        let request = request.into_inner();
+        ensure_transport_version(request.version())?;
+
+        let mut update = TaskStatusUpdate::new(
+            request.job_id().clone(),
+            request.stage_id().clone(),
+            request.task_id().clone(),
+            request.executor_id().clone(),
+            request.state(),
+            request.attempt_id().as_u32(),
+        );
+        if let Some(message) = request.message() {
+            update = update.with_message(message);
+        }
+
+        let mut coordinator = self
+            .coordinator
+            .write()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+
+        let response = match coordinator.apply_task_update(update) {
+            Ok(()) => TaskStatusResponse::new(TransportDisposition::Accepted),
+            Err(SchedulerError::UnknownJob { .. }) => {
+                TaskStatusResponse::new(TransportDisposition::UnknownJob)
+                    .with_message("job is not registered")
+            }
+            Err(SchedulerError::UnknownTask { .. }) => {
+                TaskStatusResponse::new(TransportDisposition::UnknownTask)
+                    .with_message("task is not registered")
+            }
+            Err(error) => return Err(status_from_scheduler_error(error)),
+        };
+
+        Ok(tonic::Response::new(response))
+    }
+}
+
+/// Networked gRPC adapter for coordinator/executor transport calls.
+#[derive(Debug, Clone)]
+pub struct CoordinatorExecutorGrpcService {
+    inner: CoordinatorExecutorTonicService,
+}
+
+impl CoordinatorExecutorGrpcService {
+    /// Create a network service from a shared coordinator.
+    pub fn new(coordinator: SharedCoordinator) -> Self {
+        Self {
+            inner: CoordinatorExecutorTonicService::new(coordinator),
+        }
+    }
+
+    /// Shared coordinator backing this service.
+    pub fn coordinator(&self) -> &SharedCoordinator {
+        self.inner.coordinator()
+    }
+}
+
+#[tonic::async_trait]
+impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorExecutorGrpcService {
+    async fn register_executor(
+        &self,
+        request: tonic::Request<wire::v1::RegisterExecutorRequest>,
+    ) -> Result<tonic::Response<wire::v1::RegisterExecutorResponse>, tonic::Status> {
+        let request = wire::register_executor_request_from_wire(request.into_inner())
+            .map_err(status_from_wire_error)?;
+        let response = self
+            .inner
+            .register_executor(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        Ok(tonic::Response::new(
+            wire::register_executor_response_to_wire(response),
+        ))
+    }
+
+    async fn executor_heartbeat(
+        &self,
+        request: tonic::Request<wire::v1::ExecutorHeartbeatRequest>,
+    ) -> Result<tonic::Response<wire::v1::ExecutorHeartbeatResponse>, tonic::Status> {
+        let request = wire::executor_heartbeat_request_from_wire(request.into_inner())
+            .map_err(status_from_wire_error)?;
+        let response = self
+            .inner
+            .executor_heartbeat(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        Ok(tonic::Response::new(
+            wire::executor_heartbeat_response_to_wire(response),
+        ))
+    }
+
+    async fn task_status(
+        &self,
+        request: tonic::Request<wire::v1::TaskStatusRequest>,
+    ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+        let request = wire::task_status_request_from_wire(request.into_inner())
+            .map_err(status_from_wire_error)?;
+        let response = self
+            .inner
+            .task_status(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        Ok(tonic::Response::new(wire::task_status_response_to_wire(
+            response,
+        )))
+    }
+}
+
+/// Build the generated tonic server around the scheduler-backed gRPC adapter.
+pub fn coordinator_executor_grpc_server(
+    coordinator: SharedCoordinator,
+) -> wire::v1::coordinator_executor_server::CoordinatorExecutorServer<CoordinatorExecutorGrpcService>
+{
+    wire::v1::coordinator_executor_server::CoordinatorExecutorServer::new(
+        CoordinatorExecutorGrpcService::new(coordinator),
+    )
+}
+
+/// Serve the coordinator/executor gRPC API on a socket address.
+pub async fn serve_coordinator_executor_grpc(
+    addr: SocketAddr,
+    coordinator: SharedCoordinator,
+) -> Result<(), tonic::transport::Error> {
+    tonic::transport::Server::builder()
+        .add_service(coordinator_executor_grpc_server(coordinator))
+        .serve(addr)
+        .await
+}
+
+/// Serve the coordinator/executor gRPC API on an already-bound listener.
+pub async fn serve_coordinator_executor_grpc_with_listener(
+    listener: tokio::net::TcpListener,
+    coordinator: SharedCoordinator,
+) -> Result<(), tonic::transport::Error> {
+    tonic::transport::Server::builder()
+        .add_service(coordinator_executor_grpc_server(coordinator))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .await
+}
+
+fn ensure_transport_version(version: TransportVersion) -> Result<(), tonic::Status> {
+    if TransportVersion::CURRENT.is_compatible_with(version) {
+        Ok(())
+    } else {
+        Err(tonic::Status::invalid_argument(format!(
+            "unsupported coordinator/executor transport version {version}; current version is {}",
+            TransportVersion::CURRENT
+        )))
+    }
+}
+
+fn status_from_wire_error(error: wire::WireError) -> tonic::Status {
+    tonic::Status::invalid_argument(error.to_string())
+}
+
+fn status_from_scheduler_error(error: SchedulerError) -> tonic::Status {
+    match error {
+        SchedulerError::InactiveCoordinator { .. } => {
+            tonic::Status::failed_precondition(error.to_string())
+        }
+        SchedulerError::UnknownExecutor { .. }
+        | SchedulerError::UnknownJob { .. }
+        | SchedulerError::UnknownStage { .. }
+        | SchedulerError::UnknownTask { .. } => tonic::Status::not_found(error.to_string()),
+        SchedulerError::DuplicateExecutor { .. } | SchedulerError::DuplicateJob { .. } => {
+            tonic::Status::already_exists(error.to_string())
+        }
+        SchedulerError::NoExecutors
+        | SchedulerError::InvalidJob { .. }
+        | SchedulerError::InvalidPlan { .. } => tonic::Status::invalid_argument(error.to_string()),
     }
 }
 
@@ -1054,14 +1326,17 @@ fn plan_node_description(node: &PlanNode) -> String {
 mod tests {
     use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
-        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
-        JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec, TaskState,
-        TaskStatusUpdate,
+        AttemptId, CoordinatorExecutorService, CoordinatorId, ExecutorDescriptor,
+        ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorId, ExecutorState, JobId, JobKind,
+        JobSpec, JobState, LeaseGeneration, RegisterExecutorRequest, StageId, StageSpec,
+        TaskAttemptRef, TaskId, TaskSpec, TaskState, TaskStatusRequest, TaskStatusUpdate,
+        TransportDisposition, wire,
     };
 
     use super::{
-        Coordinator, CoordinatorConfig, ExecutorRegistry, SchedulerError, SharedCoordinator,
-        StaticScheduler, job_spec_from_logical_plan,
+        Coordinator, CoordinatorConfig, CoordinatorExecutorTonicService, ExecutorRegistry,
+        SchedulerError, SharedCoordinator, StaticScheduler, job_spec_from_logical_plan,
+        serve_coordinator_executor_grpc_with_listener,
     };
 
     #[test]
@@ -1143,6 +1418,234 @@ mod tests {
         assert_eq!(
             coordinator.executor_snapshots()[0].state(),
             ExecutorState::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn tonic_service_registers_executor_through_shared_coordinator() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+
+        let response = service
+            .register_executor(tonic::Request::new(RegisterExecutorRequest::new(
+                ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2),
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.disposition(), TransportDisposition::Accepted);
+        assert_eq!(response.lease_generation(), LeaseGeneration::initial());
+        let coordinator = shared.read().unwrap();
+        assert_eq!(coordinator.executor_snapshots().len(), 1);
+        assert_eq!(
+            coordinator.executor_snapshots()[0].executor_id(),
+            &executor_id
+        );
+    }
+
+    #[tokio::test]
+    async fn tonic_service_applies_executor_heartbeat_to_shared_coordinator() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let task_id = TaskId::try_new("task-1").unwrap();
+
+        service
+            .register_executor(tonic::Request::new(RegisterExecutorRequest::new(
+                ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2),
+            )))
+            .await
+            .unwrap();
+
+        let heartbeat = ExecutorHeartbeatRequest::new(
+            executor_id.clone(),
+            LeaseGeneration::initial(),
+            ExecutorState::Healthy,
+        )
+        .with_running_attempts(vec![TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            task_id.clone(),
+            AttemptId::initial(),
+        )]);
+        let response = service
+            .executor_heartbeat(tonic::Request::new(heartbeat))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.disposition(), TransportDisposition::Accepted);
+        let coordinator = shared.read().unwrap();
+        let executor = &coordinator.executor_snapshots()[0];
+        assert_eq!(executor.state(), ExecutorState::Healthy);
+        assert_eq!(executor.running_tasks(), &[task_id]);
+    }
+
+    #[tokio::test]
+    async fn tonic_service_reports_unknown_executor_heartbeat_as_domain_response() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared);
+
+        let response = service
+            .executor_heartbeat(tonic::Request::new(ExecutorHeartbeatRequest::new(
+                ExecutorId::try_new("missing-exec").unwrap(),
+                LeaseGeneration::initial(),
+                ExecutorState::Healthy,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            response.disposition(),
+            TransportDisposition::UnknownExecutor
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_service_registers_and_heartbeats_over_network() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping networked gRPC test because loopback sockets are denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind test gRPC listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            serve_coordinator_executor_grpc_with_listener(listener, server_shared)
+                .await
+                .unwrap();
+        });
+
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            format!("http://{addr}"),
+        )
+        .await
+        .unwrap();
+        let executor_id = ExecutorId::try_new("exec-network-1").unwrap();
+        let registration = client
+            .register_executor(wire::register_executor_request_to_wire(
+                RegisterExecutorRequest::new(ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-network",
+                    2,
+                )),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let registration = wire::register_executor_response_from_wire(registration).unwrap();
+
+        assert_eq!(registration.disposition(), TransportDisposition::Accepted);
+        assert_eq!(registration.executor_id(), &executor_id);
+
+        let heartbeat = client
+            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
+                ExecutorHeartbeatRequest::new(
+                    executor_id.clone(),
+                    LeaseGeneration::initial(),
+                    ExecutorState::Healthy,
+                ),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat).unwrap();
+
+        assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
+        {
+            let coordinator = shared.read().unwrap();
+            assert_eq!(coordinator.executor_snapshots().len(), 1);
+            assert_eq!(
+                coordinator.executor_snapshots()[0].state(),
+                ExecutorState::Healthy
+            );
+        }
+
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator.submit_job(job).unwrap();
+            coordinator.launch_assigned_tasks(&job_id).unwrap();
+        }
+
+        let task_status = client
+            .task_status(wire::task_status_request_to_wire(TaskStatusRequest::new(
+                TaskAttemptRef::new(job_id, stage_id, task_id, AttemptId::initial()),
+                executor_id,
+                LeaseGeneration::initial(),
+                TaskState::Succeeded,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        let task_status = wire::task_status_response_from_wire(task_status).unwrap();
+
+        assert_eq!(task_status.disposition(), TransportDisposition::Accepted);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn tonic_service_routes_task_status_updates() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+                .unwrap();
+            coordinator.submit_job(job).unwrap();
+            coordinator.launch_assigned_tasks(&job_id).unwrap();
+        }
+
+        let status = TaskStatusRequest::new(
+            TaskAttemptRef::new(job_id.clone(), stage_id, task_id, AttemptId::initial()),
+            executor_id,
+            LeaseGeneration::initial(),
+            TaskState::Succeeded,
+        );
+        let response = service
+            .task_status(tonic::Request::new(status))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.disposition(), TransportDisposition::Accepted);
+        assert_eq!(
+            shared
+                .read()
+                .unwrap()
+                .job_snapshot(&job_id)
+                .unwrap()
+                .state(),
+            JobState::Running
         );
     }
 

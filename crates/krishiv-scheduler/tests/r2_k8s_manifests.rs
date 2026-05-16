@@ -70,7 +70,10 @@ fn operator_manifest_runs_one_active_coordinator_runtime() {
             "serviceAccountName: krishiv-controller",
             "- krishiv-operator",
             "--status-addr",
+            "--executor-grpc-addr",
             "0.0.0.0:8080",
+            "0.0.0.0:9090",
+            "name: grpc",
             "readinessProbe:",
             "livenessProbe:",
             "KRISHIV_COORDINATOR_ID",
@@ -93,6 +96,7 @@ fn operator_manifest_watches_jobs_and_patches_status() {
             "--coordinator-id",
             "--bootstrap-executor-slots",
             "--status-addr",
+            "--executor-grpc-addr",
             "KRISHIV_COORDINATOR_ID",
             "KRISHIV_NAMESPACE",
         ],
@@ -110,6 +114,9 @@ fn coordinator_service_exposes_operator_owned_status_runtime() {
             "name: http",
             "port: 8080",
             "targetPort: http",
+            "name: grpc",
+            "port: 9090",
+            "targetPort: grpc",
         ],
     );
 }
@@ -123,9 +130,12 @@ fn executor_manifest_declares_replaceable_executors() {
             "name: krishiv-executor",
             "app.kubernetes.io/component: executor",
             "replicas: 2",
+            "krishiv-executor",
             "KRISHIV_EXECUTOR_ID",
             "KRISHIV_TASK_SLOTS",
-            "http://krishiv-coordinator.krishiv-system.svc:8080",
+            "http://krishiv-coordinator.krishiv-system.svc:9090",
+            "--connect",
+            "--heartbeat-interval-secs",
         ],
     );
 }

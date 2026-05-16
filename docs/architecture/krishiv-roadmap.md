@@ -276,8 +276,11 @@ Scope: distributed execution foundation and production I/O baseline. Split into 
 Checklist:
 
 - [x] Add `crates/krishiv-executor` binary crate.
-- [ ] Add `tonic` gRPC transport to `krishiv-proto`.
-- [ ] Implement executor registration, task assignment, and status update RPCs.
+- [x] Add `tonic` gRPC transport to `krishiv-proto`.
+- [x] Add tonic-shaped coordinator/executor service boundary in `krishiv-proto`.
+- [x] Implement executor registration, heartbeat, and task status over the in-process service adapter.
+- [x] Expose executor registration, heartbeat, and task status over a networked gRPC server/client.
+- [ ] Implement task assignment RPCs.
 - [x] Add versioned coordinator/executor transport contracts in `krishiv-proto`.
 - [x] Add task attempt IDs to R3.1 transport task assignments and status updates.
 - [ ] Reject stale or duplicate task status updates idempotently.

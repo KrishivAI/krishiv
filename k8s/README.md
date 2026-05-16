@@ -17,6 +17,10 @@ through the coordinator service:
 kubectl -n krishiv-system port-forward svc/krishiv-coordinator 8080:8080
 ```
 
+The same service also exposes the R3.1 coordinator/executor gRPC endpoint on
+port 9090. Executor pods run `krishiv-executor --connect` and use that endpoint
+for registration and heartbeats.
+
 For local `kind` smoke testing:
 
 ```bash
@@ -36,13 +40,13 @@ R2 limitations:
 - The operator deployment is intentionally `replicas: 1` and owns the active
   R2 coordinator scheduler in this release.
 - The `krishiv-coordinator` service exposes the operator's scheduler-backed
-  status API and Web UI on port 8080.
+  status API and Web UI on port 8080, plus the R3.1 coordinator/executor gRPC
+  API on port 9090.
 - `crates/krishiv-operator` includes the typed reconciliation foundation,
   first live Kubernetes watch/status-patch path, and shared in-process
-  coordinator runtime used by the status API.
-- Executor pods are still a R2 manifest/runtime placeholder; the operator uses
-  a bootstrap executor until the R3.1 `krishiv-executor` binary is wired to the
-  coordinator over gRPC.
+  coordinator runtime used by the status API and gRPC server.
+- Executor pods now connect to the coordinator gRPC endpoint for registration
+  and heartbeat, but task assignment and stage-local execution remain R3.1 work.
 - No HA leader election, leases, or fencing tokens are included in R2.
 - The `kind` smoke tests are opt-in because they require Docker, `kind`,
   `kubectl`, and a locally built or published image.

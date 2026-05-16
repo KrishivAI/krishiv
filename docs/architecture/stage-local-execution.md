@@ -58,6 +58,25 @@ R3.1 does not implement:
 
 ---
 
+## 3.1 Coordinator/Executor Transport
+
+R3.1 uses generated protobuf and tonic services for the coordinator/executor
+network boundary. `krishiv-proto` owns the versioned wire schema and converts it
+to Rust domain contracts; `krishiv-scheduler` owns the gRPC server adapter over
+the active shared coordinator; `krishiv-executor` owns the gRPC client path for
+registration and heartbeat.
+
+The first networked service is `CoordinatorExecutor`:
+
+- `RegisterExecutor`: executor announces id, host, slots, and transport version.
+- `ExecutorHeartbeat`: executor refreshes lease generation and reports running attempts.
+- `TaskStatus`: executor reports task attempt state back to the coordinator.
+
+Generated protobuf types should remain contained at the transport edge. Scheduler
+state continues to use Krishiv typed ids, attempts, leases, and lifecycle enums.
+
+---
+
 ## 4. Plan To Stage Mapping
 
 The planner turns a Krishiv plan into a stage graph. A stage is the largest piece of work that can run locally on an executor without requiring a distributed exchange inside the executor process.
@@ -334,7 +353,8 @@ These fields are basic stability signals, not the full R9 OpenTelemetry surface.
 
 - [x] `crates/krishiv-executor` exists.
 - [ ] `krishiv-executor` can register with the coordinator.
-- [ ] Coordinator and executor communicate through versioned gRPC messages.
+- [x] Coordinator and executor communicate through a tonic-shaped in-process service boundary for registration and heartbeat.
+- [ ] Coordinator and executor communicate through versioned networked gRPC messages.
 - [x] R3.1 transport contracts include `attempt_id` and `lease_generation`.
 - [ ] Scheduler task status updates are idempotent and reject stale attempts.
 - [ ] `MetadataStore` persists job, stage, task, attempt, lease, and event-log records.

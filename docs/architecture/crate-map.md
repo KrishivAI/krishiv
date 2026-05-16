@@ -16,10 +16,10 @@ while keeping public Krishiv APIs stable.
 | `krishiv-plan` | Krishiv logical/physical plan wrappers and DAG-level concepts | SQL parser details, physical operator execution |
 | `krishiv-exec` | Physical operator descriptors and future Arrow execution operators | User-facing API, distributed scheduling |
 | `krishiv-runtime` | Runtime traits, local backends, job/task status, execution backend boundary | SQL parsing, connector-specific guarantees, Kubernetes CRDs |
-| `krishiv-proto` | R2/R3.1 control-plane contracts: typed ids, lifecycle states, job/stage/task specs, executor heartbeats, task updates, transport versions, task attempts, and executor lease generations | Runtime scheduling decisions, Kubernetes clients, transport servers |
-| `krishiv-executor` | R3.1 executor binary skeleton, executor startup config, and construction of versioned registration/heartbeat requests | Scheduling policy, Kubernetes controllers, durable metadata, SQL planning |
-| `krishiv-operator` | R2 `KrishivJob` resource models, resource validation, scheduler job conversion, shared coordinator runtime, status reconciliation, live Kubernetes watch loop, status server wiring, and status subresource patching | Scheduling policy, durable metadata, SQL execution, HA leadership |
-| `krishiv-scheduler` | R2 active coordinator skeleton, shared coordinator handle, executor registry, static placement, Krishiv DAG-to-job conversion, task lifecycle updates, and job snapshots | SQL parsing, DataFusion execution, Kubernetes CRDs, durable metadata |
+| `krishiv-proto` | R2/R3.1 control-plane contracts: typed ids, lifecycle states, job/stage/task specs, executor heartbeats, task updates, transport versions, task attempts, executor lease generations, tonic-shaped service traits, generated protobuf service types, and domain/wire conversions | Runtime scheduling decisions, Kubernetes clients, concrete transport servers |
+| `krishiv-executor` | R3.1 executor binary skeleton, executor startup config, construction of versioned registration/heartbeat requests, tonic-shaped coordinator service calls, and networked gRPC client helpers | Scheduling policy, Kubernetes controllers, durable metadata, SQL planning |
+| `krishiv-operator` | R2/R3.1 `KrishivJob` resource models, resource validation, scheduler job conversion, shared coordinator runtime, status reconciliation, live Kubernetes watch loop, status server wiring, coordinator/executor gRPC server wiring, and status subresource patching | Scheduling policy, durable metadata, SQL execution, HA leadership |
+| `krishiv-scheduler` | R2/R3.1 active coordinator skeleton, shared coordinator handle, executor registry, static placement, Krishiv DAG-to-job conversion, tonic-shaped coordinator service adapter, networked coordinator/executor gRPC server, task lifecycle updates, and job snapshots | SQL parsing, DataFusion execution, Kubernetes CRDs, durable metadata |
 | `krishiv-ui` | R2 status HTTP API, health/readiness endpoints, and server-rendered Web UI over shared scheduler snapshots | Scheduling decisions, Kubernetes controllers, durable metadata, SQL execution |
 
 ## Dependency Direction
@@ -44,6 +44,7 @@ krishiv-exec
 
 krishiv-executor
   -> krishiv-proto
+  -> tonic
 
 krishiv-runtime
   -> krishiv-plan
@@ -58,6 +59,7 @@ krishiv-operator
 krishiv-scheduler
   -> krishiv-plan
   -> krishiv-proto
+  -> tonic
 
 krishiv-ui
   -> krishiv-proto
@@ -82,6 +84,6 @@ Future dependencies should preserve a simple rule: user-facing crates can depend
 
 ## Next Expected Slice
 
-The next implementation slice should wire the R3.1 transport contracts into a
-`tonic` coordinator/executor service boundary, then teach the scheduler to
-apply lease generations and task attempt ids when accepting status updates.
+The next implementation slice should teach the scheduler to apply lease
+generations and task attempt ids when accepting heartbeats and status updates,
+including stale-attempt rejection and duplicate-status idempotency.
