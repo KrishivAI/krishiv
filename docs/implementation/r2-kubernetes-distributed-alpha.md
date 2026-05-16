@@ -60,6 +60,7 @@ Out of scope:
 - [x] Add a status endpoint or basic Web UI for jobs, stages, tasks, and executors.
 - [x] Add `KrishivJob` operator reconciliation foundation.
 - [x] Add live Kubernetes watch/controller loop and status patch path.
+- [x] Add opt-in `kind` smoke test harness for batch and early streaming jobs.
 
 ## Runtime Deliverables
 
@@ -90,8 +91,8 @@ Out of scope:
 - [x] Operator reconciliation tests pass.
 - [x] Live operator adapter and status patch tests pass.
 - [x] Operator manifest validation tests pass.
-- [ ] Kubernetes `kind` smoke test submits one batch job.
-- [ ] Kubernetes `kind` smoke test submits one early streaming job.
+- [ ] Kubernetes `kind` smoke test submits one batch job with `KRISHIV_KIND_E2E=1`.
+- [ ] Kubernetes `kind` smoke test submits one early streaming job with `KRISHIV_KIND_E2E=1`.
 
 ## Acceptance Gate
 

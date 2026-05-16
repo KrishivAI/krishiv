@@ -8,6 +8,8 @@ const EXECUTOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/executor-
 const OPERATOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/operator-deployment.yaml");
 const RBAC: &str = include_str!("../../../k8s/manifests/rbac.yaml");
 const SAMPLE_JOB: &str = include_str!("../../../k8s/manifests/sample-krishivjob.yaml");
+const SAMPLE_STREAMING_JOB: &str =
+    include_str!("../../../k8s/manifests/sample-streaming-krishivjob.yaml");
 
 #[test]
 fn krishivjob_crd_declares_expected_api_shape() {
@@ -53,6 +55,7 @@ fn kustomization_references_all_r2_manifests() {
             "coordinator-service.yaml",
             "executor-deployment.yaml",
             "sample-krishivjob.yaml",
+            "sample-streaming-krishivjob.yaml",
         ],
     );
 }
@@ -138,6 +141,23 @@ fn sample_krishivjob_uses_v1alpha1_contract() {
             "mode: batch",
             "tasks: 2",
             "parallelism: 2",
+            "restartPolicy: Never",
+        ],
+    );
+}
+
+#[test]
+fn sample_streaming_krishivjob_uses_v1alpha1_contract() {
+    assert_contains_all(
+        SAMPLE_STREAMING_JOB,
+        &[
+            "apiVersion: krishiv.io/v1alpha1",
+            "kind: KrishivJob",
+            "name: sample-streaming",
+            "namespace: krishiv-system",
+            "mode: streaming",
+            "tasks: 1",
+            "parallelism: 1",
             "restartPolicy: Never",
         ],
     );

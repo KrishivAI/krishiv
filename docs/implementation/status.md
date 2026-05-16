@@ -90,6 +90,9 @@ streaming `KrishivJob` submissions.
 - Added the `krishiv-operator` binary entrypoint with namespace/all-namespace watching, selectors, coordinator id, and optional R2 bootstrap executor flags.
 - Added `k8s/manifests/operator-deployment.yaml` and included it in the R2 kustomization.
 - Added tests for dynamic object conversion, explicit API resource plural, status patch shape, operator CLI parsing, and operator manifest validation.
+- Added sample early streaming `KrishivJob` manifest and included it in the R2 kustomization.
+- Added Docker image build support for the R2 binaries with `Dockerfile` and `.dockerignore`.
+- Added opt-in `kind` smoke tests for batch and early streaming `KrishivJob` status reconciliation, gated by `KRISHIV_KIND_E2E=1`.
 
 ## In Progress
 
@@ -97,10 +100,9 @@ streaming `KrishivJob` submissions.
 
 ## Next Steps
 
-1. Add Kubernetes `kind` smoke tests for one batch `KrishivJob`.
-2. Add Kubernetes `kind` smoke tests for one early streaming `KrishivJob`.
-3. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
-4. Keep scheduling static and maintain exactly one active coordinator in R2.
+1. Run the opt-in `kind` smoke tests with a locally built image and mark the Kubernetes acceptance items once they pass in a real cluster.
+2. Wire the coordinator deployment to the status server shape once the runtime binary owns coordinator startup.
+3. Keep scheduling static and maintain exactly one active coordinator in R2.
 
 ## Known Blockers
 
@@ -125,6 +127,7 @@ streaming `KrishivJob` submissions.
 - `cargo test -p krishiv-scheduler --test r2_k8s_manifests` passed.
 - `cargo test -p krishiv-ui` passed.
 - `cargo test -p krishiv-operator` passed.
+- `cargo test -p krishiv-operator --test r2_kind_smoke` passed with the default skip path.
 - `cargo check -p krishiv-operator` passed.
 - `cargo test -p krishiv-cli` passed.
 - `cargo run -p krishiv-operator -- --help` passed.
@@ -147,4 +150,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r2-kubernetes-distributed-alpha.md`.
-4. Continue R2 by adding Kubernetes `kind` smoke tests around the live operator path, unless the user asks for another slice.
+4. Continue R2 by running `KRISHIV_KIND_E2E=1 KRISHIV_KIND_IMAGE=krishiv:dev cargo test -p krishiv-operator --test r2_kind_smoke` after building `docker build -t krishiv:dev .`, unless the user asks for another slice.

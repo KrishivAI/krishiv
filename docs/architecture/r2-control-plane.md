@@ -131,8 +131,14 @@ reconciliation behavior and the first live Kubernetes watch/status-patch path:
   finalizer cleanup and durable ownership are deferred.
 - `k8s/manifests/operator-deployment.yaml` adds one operator replica using the
   existing `krishiv-controller` service account and RBAC.
+- `crates/krishiv-operator/tests/r2_kind_smoke.rs` provides opt-in `kind`
+  smoke tests for batch and early streaming `KrishivJob` resources. These tests
+  are gated behind `KRISHIV_KIND_E2E=1` because they require Docker, `kind`,
+  `kubectl`, and a runtime image.
 
-The next controller slice should add `kind` smoke tests around this live path.
+The next controller slice should run the opt-in `kind` smoke tests in CI or a
+developer environment and use the results to decide whether the R2 Kubernetes
+acceptance gate can be marked complete.
 
 ## Limitations
 

@@ -10,6 +10,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `Cargo.toml` | Defines the Rust workspace, initial crate members, shared package metadata, and shared lint policy. |
 | `Cargo.lock` | Locks the current dependency graph, including Arrow/DataFusion for R1 local SQL. |
 | `.gitignore` | Ignores local build output such as `target/`. |
+| `.dockerignore` | Keeps local build and Git metadata out of the runtime image build context. |
+| `Dockerfile` | Builds the R2-compatible runtime image containing `krishiv`, `krishiv-ui`, and `krishiv-operator`. |
 | `AGENTS.md` | Repo-wide Codex instructions, architecture invariants, and resumability workflow. |
 
 ## Workspace Crates
@@ -75,6 +77,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `k8s/manifests/coordinator-service.yaml` | Defines the coordinator service ports. |
 | `k8s/manifests/executor-deployment.yaml` | Defines replaceable executor pods for R2 static scheduling. |
 | `k8s/manifests/sample-krishivjob.yaml` | Provides a sample v1alpha1 batch `KrishivJob`. |
+| `k8s/manifests/sample-streaming-krishivjob.yaml` | Provides a sample v1alpha1 early streaming `KrishivJob`. |
 
 ## Implementation Trackers
 
@@ -106,6 +109,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `tests/golden/r1-sql-parquet-aggregate.txt` | Golden output for a Parquet-backed projection/filter/aggregate/limit query. |
 | `crates/krishiv-scheduler/tests/r2_k8s_manifests.rs` | Validates the static R2 Kubernetes manifest shape offline. |
 | `crates/krishiv-operator/src/lib.rs` | Includes unit tests for `KrishivJob` validation, scheduler conversion, dynamic object parsing, status patch generation, waiting-for-executor behavior, submit/observe reconciliation, and status counters. |
+| `crates/krishiv-operator/tests/r2_kind_smoke.rs` | Provides opt-in `kind` smoke tests for batch and early streaming `KrishivJob` status reconciliation. |
 
 ## Codex Skill Source
 

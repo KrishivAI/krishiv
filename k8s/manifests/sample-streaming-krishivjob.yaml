@@ -1,0 +1,18 @@
+apiVersion: krishiv.io/v1alpha1
+kind: KrishivJob
+metadata:
+  name: sample-streaming
+  namespace: krishiv-system
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/part-of: krishiv
+spec:
+  mode: streaming
+  image: ghcr.io/krishiv/krishiv:dev
+  tasks: 1
+  parallelism: 1
+  restartPolicy: Never
+  args:
+    - stream
+    - --source
+    - memory
