@@ -80,11 +80,12 @@ The first executor-owned network service is `ExecutorTask`:
 - `AssignTask`: coordinator sends a versioned assignment containing job/stage/task ids, attempt id, executor id, lease generation, input partitions, a plan fragment, and an output contract.
 
 The initial R3.1 implementation stores received assignments in an in-memory
-executor inbox. The first runner skeleton consumes one assignment from that
-inbox, reports `Running`, validates placeholder fragment metadata, and reports
-terminal status back to `CoordinatorExecutor.TaskStatus`. The next slice
-replaces the placeholder execution step with the first real local DataFusion or
-Arrow batch fragment.
+executor inbox. The runner now consumes one assignment from that inbox, reports
+`Running`, executes narrow `sql:` plan fragments through the local
+Krishiv SQL/DataFusion seam, returns lightweight row/batch/column output
+metadata to the executor caller, and reports terminal status back to
+`CoordinatorExecutor.TaskStatus`. Non-SQL fragments still take the placeholder
+validation path until typed plan fragments and partition registration land.
 
 ---
 

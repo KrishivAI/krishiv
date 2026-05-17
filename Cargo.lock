@@ -2223,6 +2223,7 @@ version = "0.1.0"
 dependencies = [
  "krishiv-proto",
  "krishiv-scheduler",
+ "krishiv-sql",
  "tokio",
  "tokio-stream",
  "tonic",
