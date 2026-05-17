@@ -4,8 +4,8 @@
 //!
 //! This crate owns executor-side process configuration, versioned
 //! coordinator/executor transport requests, and the first networked gRPC client
-//! path. The minimal task runner skeleton lands here; the DataFusion execution
-//! path lands in a later R3.1 slice.
+//! path. The task runner executes the first narrow local SQL fragments through
+//! the Krishiv SQL/DataFusion seam and returns lightweight output metadata.
 
 use std::error::Error;
 use std::fmt;
@@ -282,16 +282,16 @@ impl ExecutorTaskRunner {
         let output = match self.execute_stage_fragment(&assignment).await {
             Ok(output) => output,
             Err(error) => {
-            let failed = self
-                .send_task_status(
-                    &assignment,
-                    TaskState::Failed,
-                    "executor failed assignment before DataFusion execution",
-                    coordinator,
-                )
-                .await?;
-            ensure_status_accepted_or_duplicate(failed.disposition(), TaskState::Failed)?;
-            return Err(tonic::Status::internal(error.to_string()));
+                let failed = self
+                    .send_task_status(
+                        &assignment,
+                        TaskState::Failed,
+                        "executor failed assignment before DataFusion execution",
+                        coordinator,
+                    )
+                    .await?;
+                ensure_status_accepted_or_duplicate(failed.disposition(), TaskState::Failed)?;
+                return Err(tonic::Status::internal(error.to_string()));
             }
         };
 
@@ -299,7 +299,7 @@ impl ExecutorTaskRunner {
             .send_task_status(
                 &assignment,
                 TaskState::Succeeded,
-                "executor completed placeholder stage-local fragment",
+                "executor completed stage-local fragment",
                 coordinator,
             )
             .await?;
@@ -330,22 +330,20 @@ impl ExecutorTaskRunner {
         }
 
         if let Some(query) = sql_query_from_fragment(fragment) {
-            let dataframe = SqlEngine::new()
-                .sql(query)
-                .await
-                .map_err(|error| ExecutorError::LocalExecution {
+            let dataframe = SqlEngine::new().sql(query).await.map_err(|error| {
+                ExecutorError::LocalExecution {
                     message: error.to_string(),
-                })?;
-            let batches = dataframe
-                .collect()
-                .await
-                .map_err(|error| ExecutorError::LocalExecution {
-                    message: error.to_string(),
-                })?;
+                }
+            })?;
+            let batches =
+                dataframe
+                    .collect()
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
             let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
-            let column_count = batches
-                .first()
-                .map_or(0, arrow_record_batch_column_count);
+            let column_count = batches.first().map_or(0, |batch| batch.num_columns());
             return Ok(ExecutorTaskOutput::sql(
                 row_count,
                 batches.len(),
@@ -391,10 +389,6 @@ fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
     let (_, query) = fragment.split_once("sql:")?;
     let query = query.trim();
     (!query.is_empty()).then_some(query)
-}
-
-fn arrow_record_batch_column_count(batch: &arrow::record_batch::RecordBatch) -> usize {
-    batch.num_columns()
 }
 
 fn ensure_status_accepted_or_duplicate(
@@ -773,11 +767,15 @@ mod tests {
         RegisterExecutorResponse, StageId, StageSpec, TaskAttemptRef, TaskId, TaskSpec,
         TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
     };
-    use krishiv_scheduler::{Coordinator, CoordinatorExecutorTonicService, SharedCoordinator};
+    use krishiv_scheduler::{
+        Coordinator, CoordinatorExecutorTonicService, SharedCoordinator,
+        serve_coordinator_executor_grpc_with_listener,
+    };
 
     use super::{
         ExecutorAssignmentInbox, ExecutorConfig, ExecutorError, ExecutorRuntime,
-        ExecutorTaskInboxService, ExecutorTaskRunner, serve_executor_task_grpc_with_listener,
+        ExecutorTaskInboxService, ExecutorTaskOutputKind, ExecutorTaskRunner,
+        serve_executor_task_grpc_with_listener,
     };
 
     struct AcceptingCoordinatorService;
@@ -813,6 +811,83 @@ mod tests {
             Ok(tonic::Response::new(TaskStatusResponse::new(
                 TransportDisposition::Accepted,
             )))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct NetworkCoordinatorService {
+        endpoint: String,
+    }
+
+    impl NetworkCoordinatorService {
+        fn new(endpoint: impl Into<String>) -> Self {
+            Self {
+                endpoint: endpoint.into(),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl CoordinatorExecutorService for NetworkCoordinatorService {
+        async fn register_executor(
+            &self,
+            request: tonic::Request<RegisterExecutorRequest>,
+        ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+            let mut client =
+                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+                    self.endpoint.clone(),
+                )
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            let response = client
+                .register_executor(wire::register_executor_request_to_wire(
+                    request.into_inner(),
+                ))
+                .await?
+                .into_inner();
+            let response = wire::register_executor_response_from_wire(response)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn executor_heartbeat(
+            &self,
+            request: tonic::Request<ExecutorHeartbeatRequest>,
+        ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+            let mut client =
+                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+                    self.endpoint.clone(),
+                )
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            let response = client
+                .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
+                    request.into_inner(),
+                ))
+                .await?
+                .into_inner();
+            let response = wire::executor_heartbeat_response_from_wire(response)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn task_status(
+            &self,
+            request: tonic::Request<TaskStatusRequest>,
+        ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+            let mut client =
+                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+                    self.endpoint.clone(),
+                )
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            let response = client
+                .task_status(wire::task_status_request_to_wire(request.into_inner()))
+                .await?
+                .into_inner();
+            let response = wire::task_status_response_from_wire(response)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok(tonic::Response::new(response))
         }
     }
 
@@ -962,6 +1037,10 @@ mod tests {
         let report = runner.run_next_with(&service).await.unwrap().unwrap();
 
         assert_eq!(report.assignment().job_id(), &job_id);
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 1);
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 1);
         assert!(matches!(
             report.running_disposition(),
             TransportDisposition::Accepted | TransportDisposition::Duplicate
@@ -976,6 +1055,123 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn select_one_assignment_flows_over_grpc_and_reports_output_metadata() {
+        let executor_id = ExecutorId::try_new("exec-network-runner-1").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-network-runner-1").unwrap(),
+        ));
+        let coordinator_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping coordinator gRPC test because loopback sockets are denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind coordinator gRPC listener: {error}"),
+        };
+        let coordinator_addr = coordinator_listener.local_addr().unwrap();
+        let coordinator_shared = shared.clone();
+        let coordinator_server = tokio::spawn(async move {
+            serve_coordinator_executor_grpc_with_listener(coordinator_listener, coordinator_shared)
+                .await
+                .unwrap();
+        });
+
+        let inbox = ExecutorAssignmentInbox::new();
+        let executor_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping executor task gRPC test because loopback sockets are denied");
+                coordinator_server.abort();
+                let _ = coordinator_server.await;
+                return;
+            }
+            Err(error) => panic!("failed to bind executor task gRPC listener: {error}"),
+        };
+        let executor_addr = executor_listener.local_addr().unwrap();
+        let executor_inbox = inbox.clone();
+        let executor_server = tokio::spawn(async move {
+            serve_executor_task_grpc_with_listener(executor_listener, executor_inbox)
+                .await
+                .unwrap();
+        });
+
+        let coordinator = NetworkCoordinatorService::new(format!("http://{coordinator_addr}"));
+        let registration = coordinator
+            .register_executor(tonic::Request::new(RegisterExecutorRequest::new(
+                krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-network-runner",
+                    1,
+                ),
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(registration.disposition(), TransportDisposition::Accepted);
+        let heartbeat = coordinator
+            .executor_heartbeat(tonic::Request::new(ExecutorHeartbeatRequest::new(
+                executor_id.clone(),
+                registration.lease_generation(),
+                ExecutorState::Healthy,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
+
+        let job_id = JobId::try_new("job-network-runner-1").unwrap();
+        let assignment = {
+            let mut scheduler = shared.write().unwrap();
+            scheduler
+                .submit_job(single_task_job(job_id.clone()))
+                .unwrap();
+            scheduler
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+                .remove(0)
+        };
+
+        let mut executor_client = wire::v1::executor_task_client::ExecutorTaskClient::connect(
+            format!("http://{executor_addr}"),
+        )
+        .await
+        .unwrap();
+        let assign_response = executor_client
+            .assign_task(wire::executor_task_assignment_to_wire(assignment))
+            .await
+            .unwrap()
+            .into_inner();
+        let assign_response = wire::task_status_response_from_wire(assign_response).unwrap();
+        assert_eq!(
+            assign_response.disposition(),
+            TransportDisposition::Accepted
+        );
+
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+        let report = runner.run_next_with(&coordinator).await.unwrap().unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 1);
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 1);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+        assert!(inbox.is_empty().unwrap());
+
+        let scheduler = shared.read().unwrap();
+        let snapshot = scheduler.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
+        assert_eq!(snapshot.succeeded_task_count(), 1);
+
+        executor_server.abort();
+        let _ = executor_server.await;
+        coordinator_server.abort();
+        let _ = coordinator_server.await;
     }
 
     fn demo_assignment(task_id: &str) -> ExecutorTaskAssignment {
@@ -999,10 +1195,7 @@ mod tests {
     fn single_task_job(job_id: JobId) -> JobSpec {
         JobSpec::new(job_id, "runner smoke", JobKind::Batch).with_stage(
             StageSpec::new(StageId::try_new("stage-1").unwrap(), "single stage").with_task(
-                TaskSpec::new(
-                    TaskId::try_new("task-1").unwrap(),
-                    "placeholder select 1 fragment",
-                ),
+                TaskSpec::new(TaskId::try_new("task-1").unwrap(), "sql: select 1 as value"),
             ),
         )
     }

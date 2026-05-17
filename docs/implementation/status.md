@@ -6,12 +6,14 @@ R3.1 Distributed Execution Foundation.
 
 ## Active Task
 
-The R3.1 executor now has a minimal stage-local task runner skeleton. It consumes
-one queued assignment from the executor inbox, reports `Running`, validates the
-placeholder fragment metadata, and reports terminal status back to the
-scheduler-backed coordinator service. The next active task is adding the first
-real local execution fragment (`SELECT 1` or an in-memory Arrow batch) without
-starting R3.2 connector certification.
+The R3.1 executor now has the first narrow stage-local SQL execution slice. It
+can receive a `sql:` task assignment through the executor inbox, report
+`Running`, execute a `SELECT 1`-style fragment through the Krishiv
+SQL/DataFusion seam, return lightweight row/batch/column output metadata to the
+runner caller, and report terminal status back to the scheduler-backed
+coordinator service. The next active task is extending this from literal SQL to
+assigned input partitions or a small Parquet scan without starting R3.2
+connector certification.
 
 ## Completed
 
@@ -131,6 +133,8 @@ starting R3.2 connector certification.
 - Added a minimal executor task runner skeleton that consumes one assignment, reports `Running`, validates placeholder fragment metadata, and reports terminal status.
 - Reviewed the pending deployment, shuffle, data-plane transport, and security architecture docs and folded their constraints into the active R3.1 handoff.
 - Aligned R4 shuffle docs around local executor disk as the default durability mode and object-store durability as opt-in.
+- Added the first narrow R3.1 executor SQL fragment execution path for `sql: SELECT 1`-style assignments, returning lightweight output metadata without Arrow payloads in control-plane Protobuf.
+- Added lifecycle coverage that sends a task assignment to an executor inbox over gRPC, executes the local SQL fragment, and reports status back to the scheduler-backed coordinator over gRPC.
 
 ## In Progress
 
@@ -138,9 +142,9 @@ starting R3.2 connector certification.
 
 ## Next Steps
 
-1. Add a narrow `SELECT 1` or in-memory Arrow batch execution path before Parquet connector certification work.
-2. Teach the runner to return or publish the first small result contract without putting Arrow batches into control-plane Protobuf messages.
-3. Add task-assignment lifecycle coverage that exercises assign → execute local fragment → status update through the real service boundaries.
+1. Extend the executor SQL fragment path from literal `SELECT 1` to assigned input partitions or a narrow local Parquet scan, still before connector certification work.
+2. Decide where coordinator-visible result metadata should be projected without putting Arrow batches into control-plane Protobuf messages.
+3. Keep adding task-assignment lifecycle coverage through real service boundaries as partition registration and scan fragments land.
 4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
 
 ## Known Blockers
@@ -188,6 +192,7 @@ starting R3.2 connector certification.
 - `cargo run -p krishiv-cli -- --help` passed.
 - `cargo run -p krishiv-cli -- explain --help` passed.
 - `find . -path './target' -prune -o -type f -print | sort` confirmed the bootstrap file inventory.
+- `cargo test -p krishiv-executor` passed after the first narrow executor SQL fragment execution path landed.
 - Placeholder scan across repo docs and crates returned no actionable markers.
 - `git diff --check` passed after the R3.1 Stage-Local Execution Model document update.
 - Placeholder scan across the updated R3.1/R4 roadmap and tracker docs returned no actionable markers.

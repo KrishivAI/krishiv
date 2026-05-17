@@ -121,6 +121,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Implement executor task runner loop: receive assignment, create local DataFusion `SessionContext`, register assigned input partitions, execute SQL query, report result and status back to coordinator.
 - [x] Add the first executor-side assignment receiver loop backed by an in-memory inbox.
 - [x] Add minimal executor task runner skeleton: consume one inbox assignment, report `Running`, validate placeholder fragment metadata, and report terminal status.
+- [x] Add first narrow local SQL fragment execution path for `sql: SELECT 1`-style assignments, returning lightweight output metadata without Arrow payloads in control-plane Protobuf.
 - [ ] Implement executor registration and deregistration on shutdown.
 - [ ] Implement graceful executor shutdown handler (SIGTERM → finish current RecordBatch → send `Deregister` RPC → exit).
 - [ ] Implement `CancelTask` handler on executor: finish current batch, do not start next, send `TaskCancelled` status to coordinator.
@@ -165,7 +166,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Operator restart during reconciliation does not duplicate scheduler jobs.
 - [ ] Basic stability metrics tests pass.
 - [ ] Typed plan operator enum tests pass with schema propagation.
-- [ ] End-to-end test: `SELECT 1` runs coordinator → executor via gRPC, result returned.
+- [x] End-to-end test: `SELECT 1` runs coordinator → executor via gRPC, result metadata returned.
 - [ ] End-to-end test: Parquet file scan runs on executor with DataFusion, result returned to coordinator.
 - [ ] Executor crash is detected by coordinator; task is reassigned to another executor.
 
