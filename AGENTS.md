@@ -1,6 +1,6 @@
-# Krishiv Codex Instructions
+# Krishiv – AI Agent Instructions
 
-These instructions apply to all work in this repository.
+These instructions apply to all work in this repository and are read by both Codex and Claude Code.
 
 ## Project Intent
 
@@ -55,6 +55,10 @@ Primary defaults:
 - Keep async boundaries clear; do not hide blocking work inside async tasks.
 - Prefer structured data models over stringly typed state.
 
-## Codex Skill Source
+## Skill Source
 
 The repo-local source for the Krishiv implementation skill is at [codex/skills/krishiv-engine/SKILL.md](codex/skills/krishiv-engine/SKILL.md). Use it as the task workflow guide when implementing roadmap features.
+
+Agent-specific interface configs live alongside the skill:
+- `codex/skills/krishiv-engine/agents/openai.yaml` — Codex
+- `codex/skills/krishiv-engine/agents/claude.yaml` — Claude Code
