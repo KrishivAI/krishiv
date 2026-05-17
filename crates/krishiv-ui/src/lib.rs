@@ -103,6 +103,7 @@ pub fn router(state: UiState) -> Router {
         .route("/", get(|| async { Redirect::temporary("/ui") }))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_detail))
         .route("/api/v1/executors", get(api_executors))
@@ -265,6 +266,31 @@ struct JobTemplate {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+/// Prometheus-format metrics endpoint (stub with hardcoded 0 values).
+async fn metrics() -> impl IntoResponse {
+    const BODY: &str = "\
+# HELP krishiv_jobs_total Total jobs submitted
+# TYPE krishiv_jobs_total counter
+krishiv_jobs_total 0
+# HELP krishiv_tasks_total Total tasks submitted
+# TYPE krishiv_tasks_total counter
+krishiv_tasks_total 0
+# HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
+# TYPE krishiv_shuffle_bytes_written_total counter
+krishiv_shuffle_bytes_written_total 0
+# HELP krishiv_shuffle_partitions_total Total shuffle partitions finalized
+# TYPE krishiv_shuffle_partitions_total counter
+krishiv_shuffle_partitions_total 0
+";
+    (
+        [(
+            CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        BODY,
+    )
 }
 
 async fn readyz(State(state): State<UiState>) -> Result<&'static str, UiError> {
@@ -751,6 +777,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_returns_ok_with_prometheus_body() {
+        let response = router(empty_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("krishiv_jobs_total"));
     }
 
     #[tokio::test]

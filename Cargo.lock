@@ -2221,8 +2221,10 @@ dependencies = [
 name = "krishiv-executor"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "krishiv-proto",
  "krishiv-scheduler",
+ "krishiv-sql",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2241,6 +2243,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "krishiv-optimizer"
+version = "0.1.0"
+dependencies = [
+ "krishiv-plan",
 ]
 
 [[package]]
@@ -2275,6 +2284,16 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "krishiv-shuffle"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "futures",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

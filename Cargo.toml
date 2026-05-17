@@ -4,11 +4,13 @@ members = [
     "crates/krishiv-cli",
     "crates/krishiv-executor",
     "crates/krishiv-exec",
+    "crates/krishiv-optimizer",
     "crates/krishiv-plan",
     "crates/krishiv-proto",
     "crates/krishiv-operator",
     "crates/krishiv-runtime",
     "crates/krishiv-scheduler",
+    "crates/krishiv-shuffle",
     "crates/krishiv-sql",
     "crates/krishiv-ui",
 ]
