@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow = { workspace = true }
 krishiv-plan = { path = "../krishiv-plan" }
 
 [lib]

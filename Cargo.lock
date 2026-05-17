@@ -2214,6 +2214,7 @@ dependencies = [
 name = "krishiv-exec"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "krishiv-plan",
 ]
 
@@ -2302,6 +2303,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "datafusion",
+ "krishiv-optimizer",
  "krishiv-plan",
  "tokio",
 ]

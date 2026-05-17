@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Shuffle store and hash partitioner for Krishiv R4.
+//! Shuffle store and hash partitioner for Krishiv.
 //!
-//! Provides local-disk shuffle write/read paths and an Arrow-based hash
-//! partitioner that splits a `RecordBatch` by a key column into N buckets.
+//! Provides local-disk shuffle write/read paths, an Arrow-based hash
+//! partitioner, compression codec metadata, and orphan artifact detection.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -145,6 +145,20 @@ impl From<std::io::Error> for ShuffleError {
 /// Convenience alias for `Result<T, ShuffleError>`.
 pub type ShuffleResult<T> = Result<T, ShuffleError>;
 
+// ── CompressionCodec ──────────────────────────────────────────────────────────
+
+/// Compression codec for shuffle partition data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionCodec {
+    /// No compression (default).
+    #[default]
+    None,
+    /// LZ4 frame compression (reserved for future implementation).
+    Lz4,
+    /// Zstandard compression (reserved for future implementation).
+    Zstd,
+}
+
 // ── LocalShuffleStore ─────────────────────────────────────────────────────────
 
 /// Local-disk shuffle store.
@@ -155,6 +169,7 @@ pub type ShuffleResult<T> = Result<T, ShuffleError>;
 #[derive(Debug, Clone)]
 pub struct LocalShuffleStore {
     base_dir: PathBuf,
+    compression: CompressionCodec,
 }
 
 impl LocalShuffleStore {
@@ -162,7 +177,20 @@ impl LocalShuffleStore {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            compression: CompressionCodec::None,
         }
+    }
+
+    /// Set the compression codec for this store.
+    #[must_use]
+    pub fn with_compression(mut self, codec: CompressionCodec) -> Self {
+        self.compression = codec;
+        self
+    }
+
+    /// Return the compression codec in use.
+    pub fn compression(&self) -> CompressionCodec {
+        self.compression
     }
 
     /// Write `data` to disk for the given partition.
@@ -215,6 +243,73 @@ impl LocalShuffleStore {
             Err(e) => Err(ShuffleError::Io(e.to_string())),
         }
     }
+}
+
+// ── Orphan detection ──────────────────────────────────────────────────────────
+
+/// Scan `base_dir` for `.ipc` files whose job directory is not in `active_job_ids`.
+///
+/// Returns a list of orphan file paths (absolute paths under `base_dir`).
+pub fn scan_orphans(
+    base_dir: &std::path::Path,
+    active_job_ids: &std::collections::HashSet<String>,
+) -> ShuffleResult<Vec<std::path::PathBuf>> {
+    if !base_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut orphans = Vec::new();
+
+    for entry in std::fs::read_dir(base_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let job_id = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if !active_job_ids.contains(&job_id) {
+            // Recursively collect all .ipc files in this job directory.
+            collect_ipc_files(&path, &mut orphans)?;
+        }
+    }
+
+    Ok(orphans)
+}
+
+/// Recursively collect all `.ipc` files under `dir`.
+fn collect_ipc_files(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+) -> ShuffleResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_ipc_files(&path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("ipc") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Delete all orphan artifacts found by `scan_orphans`.
+///
+/// Returns the number of files deleted.
+pub fn cleanup_orphans(
+    base_dir: &std::path::Path,
+    active_job_ids: &std::collections::HashSet<String>,
+) -> ShuffleResult<usize> {
+    let orphans = scan_orphans(base_dir, active_job_ids)?;
+    let count = orphans.len();
+    for path in &orphans {
+        std::fs::remove_file(path)?;
+    }
+    Ok(count)
 }
 
 // ── HashPartitioner ───────────────────────────────────────────────────────────
@@ -338,6 +433,7 @@ fn hash_str(value: &str, buckets: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashSet;
     use std::hash::{Hash, Hasher};
     use std::sync::Arc;
 
@@ -346,8 +442,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{
-        HashPartitioner, LocalShuffleStore, PartitionState, ShuffleError, ShufflePath,
-        ShuffleMetadata,
+        CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState, ShuffleError,
+        ShufflePath, ShuffleMetadata, cleanup_orphans, scan_orphans,
     };
 
     // ── ShufflePath ───────────────────────────────────────────────────────
@@ -482,6 +578,121 @@ mod tests {
         let store = LocalShuffleStore::new(dir.path());
         // Should not return an error.
         store.delete_job("nonexistent-job").await.unwrap();
+    }
+
+    // ── CompressionCodec ──────────────────────────────────────────────────
+
+    #[test]
+    fn compression_codec_default_is_none() {
+        assert_eq!(CompressionCodec::default(), CompressionCodec::None);
+    }
+
+    #[test]
+    fn local_store_default_compression_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path());
+        assert_eq!(store.compression(), CompressionCodec::None);
+    }
+
+    #[test]
+    fn local_store_with_compression_lz4() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
+        assert_eq!(store.compression(), CompressionCodec::Lz4);
+    }
+
+    // ── Orphan detection ──────────────────────────────────────────────────
+
+    fn write_ipc_file(base: &std::path::Path, job_id: &str, stage_id: &str, partition_id: u32) {
+        let dir = base.join(job_id).join(stage_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{partition_id}.ipc"));
+        std::fs::write(file, b"dummy").unwrap();
+    }
+
+    #[test]
+    fn scan_orphans_empty_base_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let active: HashSet<String> = HashSet::new();
+        let result = scan_orphans(dir.path(), &active).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_orphans_nonexistent_base_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist");
+        let active: HashSet<String> = HashSet::new();
+        let result = scan_orphans(&missing, &active).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_orphans_all_active_no_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ipc_file(dir.path(), "job1", "s0", 0);
+        write_ipc_file(dir.path(), "job1", "s0", 1);
+
+        let mut active: HashSet<String> = HashSet::new();
+        active.insert("job1".into());
+
+        let result = scan_orphans(dir.path(), &active).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_orphans_inactive_job_returns_ipc_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ipc_file(dir.path(), "dead_job", "s0", 0);
+        write_ipc_file(dir.path(), "dead_job", "s0", 1);
+
+        let active: HashSet<String> = HashSet::new();
+        let mut result = scan_orphans(dir.path(), &active).unwrap();
+        result.sort();
+
+        assert_eq!(result.len(), 2);
+        for path in &result {
+            assert!(
+                path.extension().and_then(|e| e.to_str()) == Some("ipc"),
+                "expected .ipc extension"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_orphans_mixed_active_and_inactive() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ipc_file(dir.path(), "active_job", "s0", 0);
+        write_ipc_file(dir.path(), "dead_job", "s0", 0);
+        write_ipc_file(dir.path(), "dead_job", "s1", 0);
+
+        let mut active: HashSet<String> = HashSet::new();
+        active.insert("active_job".into());
+
+        let result = scan_orphans(dir.path(), &active).unwrap();
+        assert_eq!(result.len(), 2);
+        // None of the orphans should be under active_job.
+        for path in &result {
+            assert!(
+                !path.to_string_lossy().contains("active_job"),
+                "active job files should not be orphans"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_orphans_deletes_files_and_returns_count() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ipc_file(dir.path(), "dead_job", "s0", 0);
+        write_ipc_file(dir.path(), "dead_job", "s0", 1);
+
+        let active: HashSet<String> = HashSet::new();
+        let count = cleanup_orphans(dir.path(), &active).unwrap();
+        assert_eq!(count, 2);
+
+        // Files should be gone.
+        let remaining = scan_orphans(dir.path(), &active).unwrap();
+        assert!(remaining.is_empty());
     }
 
     // ── HashPartitioner ───────────────────────────────────────────────────

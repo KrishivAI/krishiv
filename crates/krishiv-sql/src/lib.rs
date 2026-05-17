@@ -14,6 +14,7 @@ use arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 
+use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
 /// SQL result alias.
@@ -213,6 +214,38 @@ pub fn explain_sql(query: impl Into<String>) -> SqlResult<String> {
     Ok(plan.logical_plan().describe())
 }
 
+/// Explain a SQL query including optimizer rule decisions.
+///
+/// Runs the logical plan through `optimizer` and appends the optimizer
+/// summary to the plan description.
+pub fn explain_sql_optimized(
+    query: impl Into<String>,
+    optimizer: &Optimizer,
+) -> SqlResult<String> {
+    let plan = plan_sql(query)?;
+    let result = optimizer.optimize(plan.logical_plan().clone());
+    let mut output = result.plan.describe();
+    let optimizer_line = result.describe();
+    output.push('\n');
+    output.push_str(&optimizer_line);
+    Ok(output)
+}
+
+/// Explain a SQL query and append a cost estimate from the provided cost model.
+pub fn explain_sql_with_cost(
+    query: impl Into<String>,
+    cost_model: &dyn CostModel,
+) -> SqlResult<String> {
+    let plan = plan_sql(query)?;
+    let cost = cost_model.estimate(plan.logical_plan());
+    let mut output = plan.logical_plan().describe();
+    output.push_str(&format!(
+        "\ncost: cpu_nanos={}, memory_bytes={}, network_bytes={}",
+        cost.cpu_nanos, cost.memory_bytes, cost.network_bytes
+    ));
+    Ok(output)
+}
+
 /// Format Arrow batches for CLI and tests.
 pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
     Ok(pretty_format_batches(batches)
@@ -224,7 +257,10 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SqlEngine, SqlError, explain_sql, plan_sql};
+    use krishiv_optimizer::{Cost, CostModel, Optimizer};
+    use krishiv_plan::LogicalPlan;
+
+    use super::{SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql};
 
     #[test]
     fn rejects_empty_sql() {
@@ -244,6 +280,35 @@ mod tests {
         };
 
         assert!(explain.contains("logical plan: sql-query"));
+    }
+
+    #[test]
+    fn explain_sql_optimized_no_op_optimizer_includes_no_rules_message() {
+        let optimizer = Optimizer::new();
+        let output = explain_sql_optimized("select 1", &optimizer).unwrap();
+        assert!(
+            output.contains("optimizer: no rules applied"),
+            "output did not contain expected optimizer message: {output}"
+        );
+    }
+
+    #[test]
+    fn explain_sql_with_cost_includes_cost_line() {
+        struct ZeroCost;
+        impl CostModel for ZeroCost {
+            fn estimate(&self, _plan: &LogicalPlan) -> Cost {
+                Cost::default()
+            }
+        }
+
+        let output = explain_sql_with_cost("select 1", &ZeroCost).unwrap();
+        assert!(
+            output.contains("cost:"),
+            "output did not contain cost line: {output}"
+        );
+        assert!(output.contains("cpu_nanos=0"));
+        assert!(output.contains("memory_bytes=0"));
+        assert!(output.contains("network_bytes=0"));
     }
 
     #[tokio::test]
