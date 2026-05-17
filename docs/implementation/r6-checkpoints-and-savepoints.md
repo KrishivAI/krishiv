@@ -55,6 +55,8 @@ Out of scope:
 - [ ] Define checkpoint storage abstraction.
 - [ ] Define versioned savepoint metadata format.
 - [ ] Define metadata compatibility policy for future upgrades.
+- [ ] Define checkpoint integrity manifest (SHA-256 hash per file, stored alongside metadata).
+- [ ] Define corrupt checkpoint detection and fallback policy: validate manifest on restore; fall back to the most recent prior valid checkpoint; never restore from a corrupt checkpoint.
 - [ ] Define restore flow.
 - [ ] Define rescaling metadata model.
 - [ ] Define state schema evolution baseline.
@@ -76,11 +78,15 @@ Out of scope:
 - [ ] Implement checkpoint epoch creation.
 - [ ] Implement async incremental checkpoint metadata.
 - [ ] Implement checkpoint/savepoint metadata version compatibility checks.
+- [ ] Write SHA-256 integrity manifest alongside every checkpoint.
+- [ ] Validate checkpoint integrity manifest on restore; reject corrupt checkpoints.
+- [ ] Fall back to most recent prior valid checkpoint when current checkpoint is corrupt.
 - [ ] Coordinate source offsets with checkpoint epochs.
 - [ ] Coordinate state snapshots with checkpoint epochs.
 - [ ] Coordinate sink commit handles with checkpoint epochs.
 - [ ] Implement savepoint creation.
 - [ ] Implement savepoint restore.
+- [ ] Implement rolling upgrade protocol: coordinated savepoint → coordinator binary upgrade → restore streaming jobs → rolling executor binary upgrade. Document this as the supported upgrade path from R6 onwards.
 - [ ] Implement failed-checkpoint cleanup.
 - [ ] Implement Kafka transaction support where certified.
 - [ ] Add executor kill/restart recovery path.
@@ -93,23 +99,28 @@ Out of scope:
 - [ ] Checkpoint/savepoint metadata version compatibility tests pass.
 - [ ] Checkpoint storage tests pass.
 - [ ] Fencing token epoch transition tests pass (stale token rejected).
+- [ ] Checkpoint integrity manifest is written and validated on restore.
 - [ ] Source offset coordination tests pass.
 - [ ] State snapshot coordination tests pass.
 - [ ] Two-phase commit sink tests pass.
 - [ ] Savepoint restore tests pass.
+- [ ] Rolling upgrade test: streaming job survives coordinator binary upgrade via savepoint → upgrade → restore cycle without duplicate output.
 - [ ] Failed checkpoint cleanup tests pass.
 - [ ] State schema evolution baseline tests pass.
 - [ ] **Chaos test 1:** Kill the coordinator mid-checkpoint; restart; verify no duplicate output on the certified path.
 - [ ] **Chaos test 1a:** Restart the coordinator from durable checkpoint metadata and verify checkpoint ownership resumes safely.
 - [ ] **Chaos test 2:** Kill one executor mid-checkpoint; restart; verify no duplicate output on the certified path.
 - [ ] **Chaos test 3:** Kill the Kafka sink mid-write; restart; verify no duplicate records in S3/Parquet output.
+- [ ] **Chaos test 4:** Corrupt a checkpoint file in S3 (truncate it); verify restore falls back to the prior valid checkpoint and does not panic or produce incorrect output.
 
 ## Acceptance Gate
 
 R6 is complete when:
 
 - [ ] The certified triple (Kafka source + in-memory state + S3/Parquet sink) survives all three chaos tests without duplicate output.
+- [ ] Corrupt checkpoint is detected via manifest validation and fallback to prior valid checkpoint succeeds.
 - [ ] Savepoint restore resumes stateful execution.
+- [ ] Rolling upgrade test passes: streaming job survives coordinator upgrade via savepoint/restore cycle.
 - [ ] Failed checkpoints do not commit sink transactions.
 - [ ] Completed checkpoints can be listed and inspected.
 - [ ] Checkpoint/savepoint metadata versions are readable across supported upgrades.
@@ -125,3 +136,4 @@ R6 is complete when:
 | Checkpoints add high latency | Make checkpointing async and incremental by default |
 | Restore metadata becomes incompatible | Version checkpoint and savepoint metadata from the start |
 | Failed checkpoints leave partial sink output | Require two-phase commit sinks for certified exactly-once paths |
+| Corrupt checkpoint causes panic or incorrect restore | Write SHA-256 integrity manifest with every checkpoint; validate before restore; fall back to prior valid checkpoint |

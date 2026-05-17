@@ -64,7 +64,7 @@ R3.1 uses generated protobuf and tonic services for the coordinator/executor
 network boundary. `krishiv-proto` owns the versioned wire schema and converts it
 to Rust domain contracts; `krishiv-scheduler` owns the gRPC server adapter over
 the active shared coordinator; `krishiv-executor` owns the gRPC client path for
-registration and heartbeat.
+registration and heartbeat plus the executor-side task assignment receiver.
 
 The first networked service is `CoordinatorExecutor`:
 
@@ -74,6 +74,17 @@ The first networked service is `CoordinatorExecutor`:
 
 Generated protobuf types should remain contained at the transport edge. Scheduler
 state continues to use Krishiv typed ids, attempts, leases, and lifecycle enums.
+
+The first executor-owned network service is `ExecutorTask`:
+
+- `AssignTask`: coordinator sends a versioned assignment containing job/stage/task ids, attempt id, executor id, lease generation, input partitions, a plan fragment, and an output contract.
+
+The initial R3.1 implementation stores received assignments in an in-memory
+executor inbox. The first runner skeleton consumes one assignment from that
+inbox, reports `Running`, validates placeholder fragment metadata, and reports
+terminal status back to `CoordinatorExecutor.TaskStatus`. The next slice
+replaces the placeholder execution step with the first real local DataFusion or
+Arrow batch fragment.
 
 ---
 
@@ -352,11 +363,13 @@ These fields are basic stability signals, not the full R9 OpenTelemetry surface.
 ## 16. R3.1 Acceptance Checklist
 
 - [x] `crates/krishiv-executor` exists.
-- [ ] `krishiv-executor` can register with the coordinator.
+- [x] `krishiv-executor` can register with the coordinator.
 - [x] Coordinator and executor communicate through a tonic-shaped in-process service boundary for registration and heartbeat.
-- [ ] Coordinator and executor communicate through versioned networked gRPC messages.
+- [x] Coordinator and executor communicate through versioned networked gRPC messages.
 - [x] R3.1 transport contracts include `attempt_id` and `lease_generation`.
-- [ ] Scheduler task status updates are idempotent and reject stale attempts.
+- [x] Coordinator emits versioned task assignments and executor receives them through `ExecutorTask.AssignTask`.
+- [x] Executor task runner consumes one assignment and reports lifecycle status back to the coordinator.
+- [x] Scheduler task status updates are idempotent and reject stale attempts.
 - [ ] `MetadataStore` persists job, stage, task, attempt, lease, and event-log records.
 - [ ] Coordinator restart reconstructs scheduler state from `MetadataStore`.
 - [ ] Executor crash triggers lease expiry and task reassignment.

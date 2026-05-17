@@ -8,6 +8,10 @@ service CoordinatorExecutor {
   rpc TaskStatus(TaskStatusRequest) returns (TaskStatusResponse);
 }
 
+service ExecutorTask {
+  rpc AssignTask(ExecutorTaskAssignment) returns (TaskStatusResponse);
+}
+
 message TransportVersion {
   uint32 major = 1;
   uint32 minor = 2;
@@ -54,6 +58,33 @@ message ExecutorHeartbeatResponse {
   string message = 4;
 }
 
+message ExecutorTaskAssignment {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  string executor_id = 6;
+  uint64 lease_generation = 7;
+  repeated InputPartition input_partitions = 8;
+  PlanFragment plan_fragment = 9;
+  OutputContract output_contract = 10;
+}
+
+message InputPartition {
+  string partition_id = 1;
+  string description = 2;
+}
+
+message PlanFragment {
+  string description = 1;
+}
+
+message OutputContract {
+  OutputContractKind kind = 1;
+  string description = 2;
+}
+
 message TaskStatusRequest {
   TransportVersion version = 1;
   string job_id = 2;
@@ -90,6 +121,14 @@ enum TaskState {
   TASK_STATE_FAILED = 5;
   TASK_STATE_RETRYING = 6;
   TASK_STATE_CANCELLED = 7;
+}
+
+enum OutputContractKind {
+  OUTPUT_CONTRACT_KIND_UNSPECIFIED = 0;
+  OUTPUT_CONTRACT_KIND_INLINE_RECORD_BATCHES = 1;
+  OUTPUT_CONTRACT_KIND_LOCAL_FILE = 2;
+  OUTPUT_CONTRACT_KIND_SHUFFLE = 3;
+  OUTPUT_CONTRACT_KIND_SINK = 4;
 }
 
 enum TransportDisposition {

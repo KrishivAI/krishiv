@@ -7,8 +7,13 @@ license.workspace = true
 
 [dependencies]
 krishiv-proto = { path = "../krishiv-proto" }
+krishiv-sql = { path = "../krishiv-sql" }
 tokio = { workspace = true, features = ["time"] }
+tokio-stream.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+krishiv-scheduler = { path = "../krishiv-scheduler" }
 
 [[bin]]
 name = "krishiv-executor"

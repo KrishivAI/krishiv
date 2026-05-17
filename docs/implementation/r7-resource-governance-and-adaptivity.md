@@ -49,7 +49,8 @@ Deliver job queues, priorities, admission control, quotas, namespace isolation, 
 ### Architecture Deliverables
 
 - [ ] Add resource manager service.
-- [ ] Define `KrishivQueue` CRD.
+- [ ] Define `QueueManager` trait with `CrdQueueManager` (for Kubernetes mode) and `ConfigQueueManager` (for process mode).
+- [ ] Define `KrishivQueue` CRD (used by Kubernetes mode).
 - [ ] Define queue and priority model.
 - [ ] Define admission control policy model.
 - [ ] Define CPU and memory quota model.

@@ -140,6 +140,7 @@ Deliver Iceberg read/write beta and lakehouse catalog integration independently 
 - [ ] Define schema evolution safety rules.
 - [ ] Define partition evolution safety rules.
 - [ ] Define time travel query model.
+- [ ] Define Iceberg multi-writer concurrency model: concurrent Krishiv jobs writing to the same table use Iceberg optimistic concurrency control; the losing writer retries the snapshot commit with the updated table state. Document this behavior clearly — data files are not re-written, only the commit is retried.
 - [ ] Document beta compatibility policy for lakehouse APIs.
 
 ### API And Interface Deliverables
@@ -166,6 +167,7 @@ Deliver Iceberg read/write beta and lakehouse catalog integration independently 
 - [ ] Iceberg schema evolution tests pass.
 - [ ] Iceberg partition evolution tests pass.
 - [ ] Time travel queries return correct historical snapshots.
+- [ ] Multi-writer test: two concurrent Krishiv jobs writing to the same Iceberg table produce a consistent final snapshot without data loss or duplication.
 
 ### Acceptance Gate For R8.2
 
@@ -184,6 +186,7 @@ Deliver Iceberg read/write beta and lakehouse catalog integration independently 
 | Python UDF panic crashes a streaming executor | Batch UDFs only in R8.1; streaming UDFs deferred to post-GA subprocess model |
 | PyO3 version conflicts with other workspace crates | Pin PyO3 version in workspace dependencies; test with multiple Python minor versions |
 | Iceberg writes conflict with checkpoint semantics | Route write certification through R6 checkpoint/sink contracts |
+| Iceberg multi-writer conflicts cause data loss | Wire Iceberg optimistic concurrency retry through `krishiv-catalog`; test with two concurrent writers; never suppress a commit conflict silently |
 | Flight SQL becomes a separate query path | Route Flight SQL through the same session/planner/runtime APIs as CLI and Rust API |
 | Iceberg spec complexity causes scope expansion | Keep R8.2 Iceberg to read/write/snapshot/evolution only; defer compaction and Z-ordering to post-GA |
 | R8.1 delays block R8.2 | Treat R8.1 and R8.2 as independent; schedule in parallel where engineering capacity allows |

@@ -4,7 +4,7 @@
 
 Krishiv is a Rust-native hybrid compute framework for batch SQL, stateful streaming, and lakehouse pipelines. It combines Spark-style distributed SQL and adaptive batch execution with Flink-style event-time streaming, keyed state, checkpointing, and exactly-once-capable sink coordination.
 
-Krishiv uses one shared planning and runtime model across embedded, single-node, and Kubernetes deployments. The same logical plan, optimizer, physical operators, state abstractions, connector contracts, and checkpoint semantics must apply across all supported modes.
+Krishiv uses one shared planning and runtime model across embedded, single-node, and distributed deployments. The same logical plan, optimizer, physical operators, state abstractions, connector contracts, and checkpoint semantics must apply across all supported modes. Distributed mode supports two deployment targets: **Kubernetes** (primary — operator-managed, CRD-driven) and **bare metal / VM** (secondary — process-managed, static addresses).
 
 Primary product goals:
 
@@ -12,7 +12,7 @@ Primary product goals:
 - Support batch and streaming as first-class execution modes from the start.
 - Use Apache Arrow as the internal columnar data format.
 - Use DataFusion as the SQL, expression, and local execution foundation.
-- Support embedded and single-node execution in R1, then Kubernetes distributed execution in R2.
+- Support embedded and single-node execution in R1, then distributed execution in R2 on both Kubernetes and bare metal / VM targets.
 - Use a cell-based control-plane/data-plane architecture with exactly one active leader per job.
 - Prioritize Parquet, Kafka, and S3-compatible object storage first.
 - Defer Spark/Flink API compatibility until after the first 10 releases.
@@ -34,7 +34,7 @@ Physical Plan
 Batch operators | Streaming operators | Stateful operators | Lakehouse writers
         |
 Execution Backend
-Embedded | Single-node | Kubernetes distributed
+Embedded | Single-node | Distributed (Kubernetes or bare metal / VM)
         |
 Runtime Services
 Scheduler | Shuffle | State | Checkpoint | Governance | Observability
@@ -50,7 +50,8 @@ Parquet/S3 | Kafka/CDC | Iceberg/Delta | JDBC | Object sinks
 - Krishiv adds distributed scheduling, streaming semantics, state management, shuffle, checkpoints, connectors, Kubernetes operations, and governance.
 - Batch and streaming jobs are both represented as DAGs. Batch DAGs are bounded and terminate; streaming DAGs are unbounded and checkpointed by epoch.
 - Exactly-once is certified per source/sink/checkpoint combination. It is not promised globally.
-- Embedded, single-node, and Kubernetes modes must remain semantically aligned for every supported feature.
+- Embedded, single-node, and distributed modes must remain semantically aligned for every supported feature.
+- Distributed mode supports Kubernetes (primary) and bare metal / VM (secondary); K8s-specific features (operator, CRDs, HA leader election via K8s Lease API, NetworkPolicy) are not available on bare metal.
 
 ## Control Plane And Data Plane
 
@@ -139,9 +140,9 @@ krishiv/
     krishiv-metrics/      # OpenTelemetry, runtime events, cost metrics
     krishiv-python/       # PyO3 bindings
   k8s/
-    crds/
-    operator/
-    helm/
+    crds/                 # Kubernetes custom resource definitions
+    operator/             # Kubernetes operator manifests and packaging
+    helm/                 # Helm charts
   docs/
     architecture/
     rfcs/
@@ -161,6 +162,15 @@ krishiv/
     tpcds/
     nexmark/
 ```
+
+### Architectural Rule: Kubernetes Isolation
+
+**The core runtime must have zero knowledge of how it was deployed.**
+- Zero Kubernetes API calls (`kube` crate imports) are allowed in core runtime crates. Kubernetes API access is limited to `krishiv-operator`, Kubernetes packaging under `k8s/`, and narrowly scoped CLI submission/status paths.
+- The coordinator has no pod creation or deletion logic; that is strictly the operator's responsibility.
+- Features like MetadataStore, LeaderElection, and QueueManager must be hidden behind traits, with Kubernetes-specific implementations living in `krishiv-operator` or Kubernetes packaging under `k8s/`.
+
+This rule ensures that process-mode (bare metal) and future serverless targets (ECS Fargate, Azure Container Apps) remain first-class citizens without requiring core rewrites.
 
 ## Public Interfaces
 
@@ -228,16 +238,36 @@ Acceptance gate:
 - [ ] `krishiv explain` shows logical and physical plans.
 - [ ] Embedded and single-node execution produce the same result for supported features.
 
-### R2: Kubernetes Distributed Alpha
+### R2: Distributed Alpha
 
-Scope: first distributed runtime.
+Scope: first distributed runtime, supporting both Kubernetes and bare metal / VM deployment targets.
+
+**Distributed deployment targets:**
+
+| Target | How processes are managed | Job submission | K8s-specific features |
+|---|---|---|---|
+| **Kubernetes** (primary) | Operator creates coordinator + executor pods | `KrishivJob` CRD or `krishiv submit` | Operator, CRDs, NetworkPolicy, IRSA |
+| **Bare metal / VM** (secondary) | Start coordinator and executor binaries manually (systemd, supervisord, or shell) | `krishiv` CLI connects directly to coordinator address | None — use firewall rules for network isolation |
+
+Bare metal example:
+```bash
+# Machine A — start coordinator
+krishiv-coordinator --listen 0.0.0.0:7070 --data-dir ./meta
+
+# Machine B, C — start executors pointing at coordinator
+krishiv-executor --coordinator http://192.168.1.10:7070 --data-dir /var/shuffle
+
+# Any machine — submit and query
+krishiv sql --coordinator http://192.168.1.10:7070 "SELECT count(*) FROM ..."
+```
 
 Features:
 
 - Coordinator service skeleton.
 - Executor service skeleton.
 - Static scheduler.
-- Kubernetes `KrishivJob` CRD.
+- Kubernetes `KrishivJob` CRD (Kubernetes target only).
+- Bare metal static-address coordinator/executor startup.
 - Basic distributed DAG submission.
 - Basic Web UI for job status.
 
@@ -251,18 +281,20 @@ Checklist:
 - [ ] Implement static task placement.
 - [ ] Implement task lifecycle states: pending, running, succeeded, failed, retrying.
 - [ ] Implement stage-level retry.
-- [ ] Add `KrishivJob` CRD.
+- [ ] Add `KrishivJob` CRD (Kubernetes target).
 - [ ] Add basic Kubernetes manifests under `k8s/`.
-- [ ] Support distributed batch DAG submission.
+- [ ] Support coordinator and executor binary startup with `--coordinator <addr>` flag (bare metal target).
+- [ ] Support distributed batch DAG submission on both targets.
 - [ ] Support distributed streaming DAG submission with local-only state semantics.
 - [ ] Add basic Web UI for job status, task status, and executor health.
 - [ ] Keep one active coordinator only.
+- [ ] Document which features are Kubernetes-only vs available on both targets.
 
 Acceptance gate:
 
 - [ ] A simple distributed batch job can be submitted on Kubernetes.
-- [ ] A simple distributed streaming job can be submitted on Kubernetes.
-- [ ] Job/task status is visible through CLI or Web UI.
+- [ ] A simple distributed batch job can be submitted on bare metal (coordinator + executor started as plain binaries).
+- [ ] Job/task status is visible through CLI or Web UI on both targets.
 - [ ] Coordinator can retry failed tasks at stage level.
 
 ### R3: Connector Contracts
@@ -280,12 +312,14 @@ Checklist:
 - [x] Add tonic-shaped coordinator/executor service boundary in `krishiv-proto`.
 - [x] Implement executor registration, heartbeat, and task status over the in-process service adapter.
 - [x] Expose executor registration, heartbeat, and task status over a networked gRPC server/client.
-- [ ] Implement task assignment RPCs.
+- [x] Implement task assignment RPCs.
+- [x] Add first executor-side task assignment receiver.
+- [x] Add minimal executor task runner skeleton.
 - [x] Add versioned coordinator/executor transport contracts in `krishiv-proto`.
 - [x] Add task attempt IDs to R3.1 transport task assignments and status updates.
-- [ ] Reject stale or duplicate task status updates idempotently.
+- [x] Reject stale or duplicate task status updates idempotently.
 - [x] Add executor lease generation to R3.1 registration, heartbeat, task assignment, and task status contracts.
-- [ ] Define executor lease model with heartbeat generation and expiry.
+- [x] Define executor lease model with heartbeat generation and expiry.
 - [ ] Add durable job event log for job, stage, task, executor, and checkpoint events.
 - [ ] Add Kubernetes finalizer cleanup for `KrishivJob` delete/cancel paths.
 - [ ] Add basic scheduler/executor stability metrics: heartbeat age, retry count, task duration, failed assignments.
@@ -301,7 +335,7 @@ Acceptance gate for R3.1:
 - [ ] Real SQL query completes end-to-end over gRPC (coordinator → executor).
 - [ ] Executor crash is detected and task is reassigned.
 - [ ] Coordinator restart recovers job, task, attempt, lease, and event-log state.
-- [ ] Stale task attempts and duplicate status updates are rejected or ignored safely.
+- [x] Stale task attempts and duplicate status updates are rejected or ignored safely.
 - [ ] Operator restart during reconciliation does not create duplicate scheduler jobs.
 - [ ] Deleting a `KrishivJob` runs finalizer cleanup and leaves no active task assignments.
 - [x] Stage-Local Execution Model document is written.
@@ -781,7 +815,11 @@ Global acceptance rules:
 ## Assumptions
 
 - Krishiv starts as a greenfield Rust monorepo.
-- Kubernetes is the primary distributed production target.
+- **Distributed mode supports two deployment targets:**
+  - **Kubernetes** (primary): operator-managed, CRD-driven, NetworkPolicy, IRSA, HA leader election via K8s Lease API.
+  - **Bare metal / VM** (secondary): coordinator and executor binaries started as plain processes on any host with TCP connectivity; `krishiv` CLI connects directly to coordinator address. No K8s operator, no CRDs.
+- The core coordinator/executor runtime (gRPC transport, task assignment, heartbeat, ShuffleStore, MetadataStore) is identical on both targets. Kubernetes-specific features (operator, CRDs, NetworkPolicy, HA via K8s Lease) are unavailable on bare metal.
+- HA coordinator (R9) is Kubernetes-only in the first implementation. Bare metal HA requires external etcd and is deferred post-R9.
 - Embedded and single-node modes are supported for development, CI, edge workloads, and light production.
 - Iceberg is prioritized before Delta Lake.
 - Spark/Flink API compatibility is deferred beyond the first 10 releases.

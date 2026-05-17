@@ -10,9 +10,9 @@ R4 turns Krishiv's distributed batch execution from simple task distribution int
 
 In scope:
 
-- Independent shuffle service abstraction.
+- Independent shuffle service abstraction (`ShuffleStore` trait).
 - Shuffle writer and reader APIs.
-- Shuffle metadata model.
+- Shuffle metadata model (partition availability tracking).
 - Hash partitioning.
 - Compression and spill hooks.
 - Hash join, sort join, and broadcast join.
@@ -22,6 +22,7 @@ In scope:
 - Small-file split planning.
 - Skew detection baseline.
 - Shuffle garbage collection and orphan detection.
+- **Two shuffle durability modes:** `local` (default — local disk, no external dependency) and `object-store` (opt-in — upload to object store for crash resilience on long stages or preemptible nodes).
 
 Out of scope:
 
@@ -49,12 +50,15 @@ Out of scope:
 - [ ] Define skew detection rule interface.
 - [x] Write `docs/architecture/stage-local-execution.md`: coordinator partitions work into stages; each executor runs a full local DataFusion context for its assigned partitions; shuffle moves data between stages. No custom distributed physical operators needed.
 - [ ] Write `docs/architecture/streaming-execution-model.md` (if not already written as part of this release): continuous operator model, watermark protocol, state interaction contract, streaming job lifecycle. Must be approved before R5.1 begins.
-- [ ] Define shuffle service deployment mode for single-node and distributed execution.
-- [ ] Define shuffle writer API.
-- [ ] Define shuffle reader API.
-- [ ] Define shuffle metadata model.
+- [x] Write `docs/architecture/data-plane-transport.md`: decide Arrow Flight vs gRPC+Protobuf for shuffle and result data movement. **Decision: Arrow IPC for shuffle writes and Arrow Flight for shuffle reads/result transfer; vanilla gRPC+Protobuf remains for control plane only.** Rationale: gRPC+Protobuf requires full serialization round-trip for every RecordBatch; Arrow Flight transmits Arrow IPC frames directly, eliminating O(rows x columns) CPU overhead per partition.
+- [x] Write `docs/architecture/shuffle-deployment-model.md`: define the two-mode shuffle model. **Default (`local`): executors write partitions to local disk and serve reads over Arrow Flight from their own disk; no object store required.** **Optional (`object-store`): executors write to local disk then upload to object store; Stage N+1 reads from object store; executor can die after upload without forcing Stage N re-run.** True hybrid (local reads + object store fallback simultaneously) is not implemented.
+- [ ] Define shuffle service deployment mode for single-node and distributed execution per `docs/architecture/shuffle-deployment-model.md`.
+- [ ] Define shuffle writer API (local staging write → finalize to configured `ShuffleStore`).
+- [ ] Define shuffle reader API (Arrow Flight from executor local disk in `local` mode; Arrow Flight from object store in `object-store` mode).
+- [ ] Define shuffle metadata model (partition availability: Pending | Available | Failed, path, size_bytes).
 - [ ] Define shuffle garbage collection policy for completed, failed, and cancelled jobs.
 - [ ] Define orphan shuffle artifact detection model.
+- [ ] Define stage retry lineage policy: on downstream stage failure, retain upstream shuffle output and re-run only the failed stage (Option B); on upstream stage failure, discard partial shuffle output and re-run from source. Document this explicitly.
 - [ ] Define partitioning model.
 - [ ] Define spill boundary for memory-heavy operators.
 - [ ] Document shuffle recovery expectations.
@@ -68,15 +72,22 @@ Out of scope:
 - [ ] Add `EXPLAIN` output for optimizer rule decisions (which rules fired and why).
 - [ ] Add cost model output to `EXPLAIN` for CBO-selected plans.
 - [ ] Add job metrics for shuffle bytes, partitions, spills, and skew.
+- [ ] Expose Prometheus-compatible `/metrics` endpoint on coordinator (counters: `jobs_submitted_total`, `tasks_assigned_total`, `tasks_failed_total`, `shuffle_bytes_uploaded_total`, `shuffle_partitions_available_total`).
+- [ ] Expose Prometheus-compatible `/metrics` endpoint on executor (counters: `tasks_running`, `shuffle_bytes_written_total`, `spill_bytes_total`).
+- [ ] Expose `/healthz` and `/readyz` endpoints on coordinator and executor (standard Kubernetes liveness/readiness probes).
 
 ## Runtime Deliverables
 
 - [ ] Implement hash partitioning.
-- [ ] Implement shuffle write path.
-- [ ] Implement shuffle read path.
-- [ ] Implement shuffle cleanup for completed jobs.
+- [ ] Implement shuffle write path: write Arrow IPC frames to local staging file per partition.
+- [ ] Implement `local` shuffle finalization: atomically rename completed local staging file and mark partition Available in shuffle metadata.
+- [ ] Implement optional `object-store` partition upload: on partition complete, upload local file atomically to the configured object store and mark partition Available.
+- [ ] Implement shuffle read path: Arrow Flight server serving partition data from local executor disk in `local` mode and from object store in `object-store` mode.
+- [ ] Implement shuffle metadata store (partition availability tracking in coordinator MetadataStore).
+- [ ] Implement Stage N+1 wait: hold stage start until all required upstream partitions are Available in shuffle metadata.
+- [ ] Implement shuffle cleanup for completed jobs (delete local shuffle paths or object-store prefixes for completed stages).
 - [ ] Implement shuffle cleanup for failed and cancelled jobs.
-- [ ] Implement orphan shuffle artifact detection.
+- [ ] Implement orphan shuffle artifact detection (scan configured shuffle backend; delete artifacts without active job metadata after TTL).
 - [ ] Add compression hooks.
 - [ ] Add spill hooks.
 - [ ] Implement local pre-aggregation.
@@ -91,7 +102,8 @@ Out of scope:
 ## Test Checklist
 
 - [ ] Shuffle writer/reader unit tests pass.
-- [ ] Shuffle metadata tests pass.
+- [ ] Shuffle metadata tests pass (partition transitions: Pending → Available → cleaned).
+- [ ] Arrow Flight shuffle read returns correct Arrow RecordBatches from both local and object-store shuffle backends.
 - [ ] Distributed join correctness tests pass.
 - [ ] Distributed aggregation correctness tests pass.
 - [ ] Broadcast join tests pass.
@@ -100,6 +112,12 @@ Out of scope:
 - [ ] Small-file planning tests pass.
 - [ ] Skew simulation identifies hot partitions.
 - [ ] Shuffle orphan cleanup tests pass.
+- [ ] Stage retry lineage test: Stage 2 failure → Stage 2 retries reading same Stage 1 shuffle output (no Stage 1 re-run).
+- [ ] Stage failure lineage test: Stage 1 failure → full re-run from source (partial shuffle output discarded).
+- [ ] Executor crash in `local` mode: downstream stage detects lost partition owner and Stage N re-run recovers correctly.
+- [ ] Executor crash mid-upload in `object-store` mode: partition is not marked Available; Stage N re-run recovers correctly.
+- [ ] `/metrics` endpoint returns correct counters for coordinator and executor.
+- [ ] `/healthz` and `/readyz` return 200 after startup; `/readyz` returns 503 before executor registration is complete.
 - [ ] TPC-H smoke benchmark runs.
 
 ## Usable Product Gate
@@ -125,6 +143,11 @@ R4 is complete when:
 - [ ] Spill tests pass for memory-heavy operators.
 - [ ] Skew simulation detects at least one hot partition scenario.
 - [ ] Orphan shuffle data is detected and cleaned up deterministically.
+- [ ] Stage retry lineage policy is documented and both retry scenarios pass tests.
+- [ ] Executor crash mid-upload produces clean re-run without partial data reaching Stage N+1.
+- [ ] `/metrics` and `/healthz` endpoints are live on coordinator and executor.
+- [ ] `docs/architecture/data-plane-transport.md` is written and documents the Arrow Flight decision.
+- [ ] `docs/architecture/shuffle-deployment-model.md` is written and documents local default plus optional object-store durability.
 - [ ] `docs/architecture/streaming-execution-model.md` is written and approved.
 
 ## Risks And Mitigations
@@ -138,3 +161,6 @@ R4 is complete when:
 | Small-file planning becomes object-store-specific | Keep split planning generic and move provider behavior behind object-store adapters |
 | Optimizer rule ordering causes non-determinism | Define a fixed rule application order; log which rules fire for every plan |
 | Shuffle artifacts leak after retry/cancel | Add ownership metadata, orphan detection, and deterministic cleanup tests |
+| Object-store upload latency blocks Stage N+1 start | Implement parallel partition uploads; Stage N+1 waits only for its specific required partitions, not all partitions |
+| True hybrid shuffle is added prematurely | Do not implement simultaneous local plus object-store writes with fallback reads until benchmarks prove the complexity is needed |
+| Arrow Flight adds dependency complexity | Arrow Flight is already a dependency via DataFusion; use the same version; do not introduce a second Flight version |

@@ -24,6 +24,10 @@ In scope:
 - Basic scheduler/executor stability metrics.
 - Typed operator nodes in `krishiv-plan`.
 - Stage-Local Execution Model documentation.
+- **Two distributed deployment targets (R3.1 must support both):**
+  - **Kubernetes**: coordinator and executors run as pods managed by the operator; job submission via `KrishivJob` CRD.
+  - **Bare metal / VM**: coordinator and executor binaries started as plain OS processes on any host with TCP connectivity; job submission via `krishiv` CLI pointing at coordinator address directly.
+- **Architectural Rule:** Zero Kubernetes API calls (`kube` crate imports) in core runtime crates. Kubernetes API access is limited to `krishiv-operator`, Kubernetes packaging under `k8s/`, and narrowly scoped CLI submission/status paths. Kubernetes is a deployment plugin, not a scheduler dependency. The coordinator has no Kubernetes pod creation or deletion logic.
 - Connector traits (`Source`, `Sink`, `Offset`, `CommitHandle`).
 - Connector capability flags.
 - Parquet reader and writer.
@@ -67,24 +71,39 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Add tonic-shaped coordinator/executor service boundary in `krishiv-proto`.
 - [x] Add versioned coordinator/executor transport contracts in `krishiv-proto` for executor registration, heartbeat, task assignment, and task status updates.
 - [x] Add task attempt IDs to R3.1 transport task assignments and task status updates.
-- [ ] Define stale-attempt rejection and duplicate-status idempotency rules.
+- [x] Define stale-attempt rejection and duplicate-status idempotency rules.
 - [x] Add executor lease generation to R3.1 registration, heartbeat, task assignment, and task status contracts.
-- [ ] Define executor lease model with heartbeat generation and expiry.
+- [x] Define executor lease model with heartbeat generation and expiry.
 - [ ] Define durable job event log events: job submitted, stage planned, task assigned, task started, task succeeded, task failed, executor lost, job cancelled.
 - [ ] Define Kubernetes finalizer cleanup path for `KrishivJob` delete/cancel.
 - [ ] Define basic scheduler/executor stability metrics: heartbeat age, retry count, task duration, failed assignments.
-- [ ] Define `MetadataStore` trait in `krishiv-runtime` (in-memory implementation first).
+- [ ] Define `MetadataStore` trait in `krishiv-runtime` with multiple backends (`SqliteMetadataStore`, `KubernetesMetadataStore`, `InMemoryMetadataStore`).
+- [ ] **Decide and document durable MetadataStore backend before restart recovery tests can pass.** Config selects backend (`type = "kubernetes"` vs `type = "process"`).
+- [ ] Define `JobSubmitter` trait with `GrpcJobSubmitter` (process mode) and `KubernetesJobSubmitter` (k8s mode).
+- [ ] Define `LeaderElection` trait and add `SingleNodeElection` (no-op) for R3.1.
 - [ ] Plug `MetadataStore` into `Coordinator` for durable job/stage/task persistence.
 - [ ] Replace `PlanNode` string labels with a typed operator enum in `krishiv-plan`.
 - [ ] Add schema propagation through `LogicalPlan` nodes.
 - [ ] Add estimated cardinality fields to plan nodes for R4 CBO.
 - [x] Write `docs/architecture/stage-local-execution.md` documenting the Stage-Local Execution Model: coordinator assigns partitions, executor runs a full local DataFusion context for its partitions, shuffle moves data between stages. No custom distributed physical operators needed.
+- [ ] Define graceful executor shutdown protocol: SIGTERM → finish current RecordBatch → deregister via RPC → exit (before SIGKILL terminates the process).
+- [ ] Define executor deregistration RPC (fast path vs waiting for heartbeat timeout).
+- [ ] Define task lease token model: coordinator issues a monotonically increasing lease token per task assignment; shuffle/sink writes validate this token before committing, rejecting stale tokens from zombie executors.
+- [ ] Define extended executor heartbeat payload: `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` (used by R7 backpressure and R4 scheduler placement).
+- [ ] Define job cancellation protocol: coordinator sends `CancelTask` RPC to all assigned executors; executors finish current batch then stop; coordinator marks job `Stopped`, triggers shuffle cleanup, releases executor slots.
+- [ ] Add Kubernetes `terminationGracePeriodSeconds` to executor pod spec manifests consistent with graceful drain window.
+- [ ] Define task timeout model: `task_timeout_seconds` field in `TaskSpec`; executor kills a task that exceeds its timeout and reports `TaskFailed`; coordinator then reassigns according to `max_stage_retries`.
+- [ ] Define executor pod launch failure handling: operator monitors executor pod readiness; if a pod is not `Ready` within `executor_startup_timeout_seconds`, the operator deregisters the executor from the coordinator and triggers task reassignment (does not wait for heartbeat timeout).
+- [ ] Support `--coordinator <URL>` startup flag on `krishiv-coordinator` and `krishiv-executor` binaries for bare metal / VM deployment (no Kubernetes dependency).
+- [x] Document bare metal deployment model: which features are Kubernetes-only (operator, CRDs, NetworkPolicy, K8s HA leader election) vs available on both targets (all core runtime: gRPC, task assignment, heartbeat, ShuffleStore, MetadataStore, CLI).
+- [x] Write `docs/architecture/deployment-targets.md` covering both Kubernetes and bare metal deployment models, startup commands, and feature availability matrix.
+- [x] Write `docs/security/security-posture.md` (pre-R9 security posture: NetworkPolicy for Kubernetes, firewall rules for bare metal, per-component ServiceAccounts, no credentials in task specs, known limitations).
 
 ### API And Interface Deliverables
 
 - [x] Implement executor registration through the tonic-shaped service boundary (executor → coordinator).
 - [x] Expose executor registration through a networked gRPC server/client.
-- [ ] Implement task assignment RPC (coordinator → executor).
+- [x] Implement task assignment RPC (coordinator → executor).
 - [x] Implement task status update through the tonic-shaped service boundary (executor → coordinator).
 - [x] Expose task status updates through a networked gRPC server/client.
 - [x] Implement executor heartbeat through the tonic-shaped service boundary.
@@ -92,34 +111,55 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Include executor lease generation and task attempt ID in coordinator/executor transport contracts.
 - [ ] Add status API fields for executor lease age, task attempt, retry count, and last failure reason.
 - [ ] Add cancel/delete API path used by Kubernetes finalizers.
+- [ ] Add `CancelTask` RPC from coordinator to executor.
+- [ ] Add `Deregister` RPC from executor to coordinator (on graceful shutdown).
+- [ ] Extend heartbeat payload to include `memory_used_bytes`, `memory_limit_bytes`, `active_task_count`.
+- [ ] Store health snapshot per executor in `ExecutorRegistry` (used by scheduler for memory-aware placement).
 
 ### Runtime Deliverables
 
 - [ ] Implement executor task runner loop: receive assignment, create local DataFusion `SessionContext`, register assigned input partitions, execute SQL query, report result and status back to coordinator.
+- [x] Add the first executor-side assignment receiver loop backed by an in-memory inbox.
+- [x] Add minimal executor task runner skeleton: consume one inbox assignment, report `Running`, validate placeholder fragment metadata, and report terminal status.
 - [ ] Implement executor registration and deregistration on shutdown.
+- [ ] Implement graceful executor shutdown handler (SIGTERM → finish current RecordBatch → send `Deregister` RPC → exit).
+- [ ] Implement `CancelTask` handler on executor: finish current batch, do not start next, send `TaskCancelled` status to coordinator.
+- [ ] Implement coordinator `CancelJob`: send `CancelTask` to all assigned executors, wait for acknowledgements, mark job `Stopped`, trigger shuffle cleanup.
+- [ ] Implement task lease token issuance on assignment; validate token before any shuffle or sink write.
+- [ ] Implement stale lease token rejection in shuffle write path.
+- [ ] Implement memory-aware task placement: skip executors above configurable memory threshold when assigning new tasks.
+- [ ] Implement task timeout enforcement on executor: kill task and report `TaskFailed` when `task_timeout_seconds` is exceeded.
+- [ ] Implement operator-side executor pod launch failure detection: deregister executor if pod not `Ready` within `executor_startup_timeout_seconds`.
+- [ ] Implement Kubernetes NetworkPolicy manifest for pre-R9 security posture (restrict coordinator gRPC port to `krishiv` namespace).
 - [ ] Implement crash detection on coordinator side when executor heartbeat stops.
 - [ ] Implement task reassignment on executor crash.
 - [ ] Add in-memory `MetadataStore` implementation.
 - [ ] Persist job, stage, task, attempt, executor lease, and event-log records through `MetadataStore`.
 - [ ] Recover coordinator state from `MetadataStore` after process restart.
-- [ ] Reject stale task attempts and ignore duplicate status updates safely.
+- [x] Reject stale task attempts and ignore duplicate status updates safely.
 - [ ] Implement `KrishivJob` finalizer cleanup for cancelled/deleted resources.
 - [ ] Emit basic scheduler/executor stability metrics.
 
 ### Test Checklist
 
-- [ ] gRPC task assignment and status update round-trip tests pass.
+- [x] gRPC task assignment and status update round-trip tests pass.
 - [x] Versioned transport contract unit tests pass.
 - [x] Executor binary config and request-construction tests pass.
 - [x] Tonic service registration, heartbeat, and task status adapter tests pass.
 - [x] Networked registration, heartbeat, and task-status gRPC smoke test passes.
 - [x] Executor registers with coordinator and appears in executor registry.
-- [ ] Executor deregisters cleanly on shutdown.
+- [ ] Executor deregisters cleanly on shutdown via `Deregister` RPC (fast path, not heartbeat timeout).
+- [ ] Graceful shutdown test: SIGTERM to executor → current batch finishes → deregistration RPC sent → executor exits cleanly.
+- [ ] CancelJob test: all executor tasks acknowledge cancellation; job transitions to `Stopped`; no tasks remain running after acknowledgement.
+- [ ] Zombie executor test: network partition heals after task reassignment; stale lease token rejected by shuffle write path; only new-assignment output is committed.
+- [ ] Extended heartbeat test: memory and task-count fields are populated and stored in `ExecutorRegistry`.
+- [ ] Memory-aware placement test: coordinator skips executors above memory threshold when assigning tasks.
 - [ ] `MetadataStore` persistence tests pass.
 - [ ] Coordinator restart recovery tests pass.
-- [ ] Executor lease expiry tests pass.
-- [ ] Stale task attempt update tests pass.
-- [ ] Duplicate task status update idempotency tests pass.
+- [x] Executor lease expiry tests pass.
+- [x] Stale task attempt update tests pass.
+- [x] Duplicate task status update idempotency tests pass.
+- [x] Minimal executor task runner lifecycle test passes against the scheduler-backed coordinator service.
 - [ ] Durable job event log replay tests pass.
 - [ ] `KrishivJob` finalizer cleanup tests pass.
 - [ ] Operator restart during reconciliation does not duplicate scheduler jobs.
@@ -133,6 +173,9 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 
 - [ ] A real SQL query (`SELECT` over a local Parquet file) completes end-to-end: coordinator assigns the task over gRPC, executor runs it via DataFusion, result is returned to the coordinator.
 - [ ] Executor crash mid-task is detected and the task is reassigned without manual intervention.
+- [ ] Graceful executor shutdown completes within `terminationGracePeriodSeconds` without dropping in-flight task output.
+- [ ] `CancelJob` stops all executor tasks and transitions job to `Stopped` without orphaned tasks.
+- [ ] Stale lease tokens from a zombie executor are rejected by the shuffle write path.
 - [ ] Coordinator restart recovers job, stage, task, attempt, executor lease, and event-log state.
 - [ ] Stale task attempts and duplicate status updates cannot corrupt job state.
 - [ ] Deleting a `KrishivJob` runs finalizer cleanup and does not leave active assignments.
@@ -164,6 +207,7 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [ ] Define sink commit boundary.
 - [ ] Define connector capability flags.
 - [ ] Document connector guarantee vocabulary.
+- [ ] Define Kafka consumer group offset commit protocol: commit the consumer group offset only after the corresponding output batch is written to the sink (post-write commit). Document the reprocessing window that exists if the executor crashes between output write and offset commit.
 
 ### API And Interface Deliverables
 
@@ -186,6 +230,8 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [ ] Implement Kafka source.
 - [ ] Implement Kafka sink.
 - [ ] Add source offset tracking.
+- [ ] Implement Kafka consumer group offset commit after output write (post-write commit protocol).
+- [ ] Test: Kafka source reads from last committed consumer group offset after task reassignment.
 - [ ] Add at-least-once sink contract.
 - [ ] Surface connector capabilities in job metadata.
 - [ ] Write CDC design document under `docs/rfcs/`.
@@ -207,6 +253,7 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [ ] Parquet, Kafka, and S3 connectors pass certification tests running on real executors.
 - [ ] Every connector declares capability flags.
 - [ ] Source offsets are visible in job metadata or logs.
+- [ ] Kafka consumer group offset commit protocol is documented and tested: offset commits after output write, not before.
 - [ ] At-least-once sink behavior is documented.
 - [ ] CDC design is written and linked from the roadmap.
 - [ ] Kafka → Parquet pipeline runs end-to-end on real executors.
@@ -226,3 +273,6 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 | Executor binary scope grows too large | Scope to minimal task runner; defer resource isolation and advanced scheduling to R4-R7 |
 | gRPC transport adds schema churn | Version RPC messages from the first commit; never break existing fields |
 | Catalog abstraction is too narrow for R8 Iceberg | Define `CatalogProvider` generically; keep DataFusion-specific wiring behind an adapter |
+| Graceful shutdown window is too short | Set Kubernetes `terminationGracePeriodSeconds` generously; measure worst-case batch processing time in tests |
+| Task lease tokens add coordination overhead | Keep tokens as simple monotonic integers; no network round-trip needed for validation |
+| Job cancellation leaves orphaned shuffle data | Wire cancellation cleanup to the same shuffle GC path used on job completion |

@@ -6,10 +6,12 @@ R3.1 Distributed Execution Foundation.
 
 ## Active Task
 
-The R3.1 networked coordinator/executor gRPC path is complete for registration,
-heartbeat, and task-status updates. The next active task is scheduler-side
-attempt/lease validation: store executor lease generations, reject stale
-heartbeats/status updates, and make duplicate task status updates idempotent.
+The R3.1 executor now has a minimal stage-local task runner skeleton. It consumes
+one queued assignment from the executor inbox, reports `Running`, validates the
+placeholder fragment metadata, and reports terminal status back to the
+scheduler-backed coordinator service. The next active task is adding the first
+real local execution fragment (`SELECT 1` or an in-memory Arrow batch) without
+starting R3.2 connector certification.
 
 ## Completed
 
@@ -117,6 +119,18 @@ heartbeats/status updates, and make duplicate task status updates idempotent.
 - Wired the operator binary to optionally serve the coordinator/executor gRPC endpoint alongside the status API.
 - Updated Kubernetes manifests so the coordinator service exposes gRPC on port 9090 and executor pods connect with `krishiv-executor --connect`.
 - Added networked registration, heartbeat, and task-status smoke coverage.
+- Added executor lease generation storage to scheduler executor records.
+- Added stale executor lease rejection for heartbeats and task-status updates.
+- Added lease generation bumping when executors are marked lost or time out.
+- Added same-id executor re-registration after loss with the next valid lease generation.
+- Added stale task-attempt rejection and duplicate terminal task-status idempotency.
+- Mapped stale lease, stale attempt, duplicate status, and unknown executor outcomes to transport dispositions.
+- Added the `ExecutorTask.AssignTask` gRPC service and wire conversions for task assignments.
+- Added scheduler assignment emission with job/stage/task ids, attempt id, executor lease generation, input partitions, plan fragment, and output contract.
+- Added an executor-side assignment inbox and networked task receiver service.
+- Added a minimal executor task runner skeleton that consumes one assignment, reports `Running`, validates placeholder fragment metadata, and reports terminal status.
+- Reviewed the pending deployment, shuffle, data-plane transport, and security architecture docs and folded their constraints into the active R3.1 handoff.
+- Aligned R4 shuffle docs around local executor disk as the default durability mode and object-store durability as opt-in.
 
 ## In Progress
 
@@ -124,14 +138,22 @@ heartbeats/status updates, and make duplicate task status updates idempotent.
 
 ## Next Steps
 
-1. Teach the scheduler to store and validate `AttemptId` and `LeaseGeneration`, including stale-attempt and stale-lease rejection.
-2. Add duplicate task-status idempotency rules and tests.
-3. Add task assignment RPC from coordinator to executor.
+1. Add a narrow `SELECT 1` or in-memory Arrow batch execution path before Parquet connector certification work.
+2. Teach the runner to return or publish the first small result contract without putting Arrow batches into control-plane Protobuf messages.
+3. Add task-assignment lifecycle coverage that exercises assign → execute local fragment → status update through the real service boundaries.
 4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
 
 ## Known Blockers
 
 - R2 `kind` smoke validation is deferred because local Podman image build hit a TLS certificate trust issue while pulling the Rust base image.
+
+## Architectural Inputs To Preserve
+
+- Distributed mode has two targets: Kubernetes is primary, and bare metal / VM is secondary. Core runtime crates must remain deploy-target neutral; Kubernetes API access belongs in `krishiv-operator`, Kubernetes packaging under `k8s/`, and narrowly scoped CLI paths.
+- Control-plane traffic stays on tonic gRPC + Protobuf for registration, heartbeat, task assignment, task status, cancellation, and deregistration.
+- Bulk Arrow data must not be added to control-plane Protobuf messages. R4 uses Arrow IPC for shuffle writes and Arrow Flight for shuffle reads/query result transfer.
+- R4 shuffle defaults to local executor disk with optional object-store durability. Do not assume S3/object storage is required for distributed execution.
+- Pre-R9 coordinator/executor gRPC has no mTLS or application-level auth. Task specs must not contain credentials or secret values; shared Kubernetes deployments require namespace isolation, NetworkPolicy, and component-specific service accounts.
 
 ## Last Validation
 
@@ -197,6 +219,23 @@ heartbeats/status updates, and make duplicate task status updates idempotent.
 - `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:9090` passed and printed dry-run registration/heartbeat summaries.
 - `git diff --check` passed after the networked gRPC transport slice.
 - Stale network-placeholder scan across `crates`, `docs`, and `k8s` returned no matches.
+- `cargo test -p krishiv-scheduler --lib` passed after adding scheduler-side lease and attempt validation.
+- `cargo fmt --all --check` passed after the scheduler-side lease/attempt validation slice.
+- `cargo check --workspace` passed after the scheduler-side lease/attempt validation slice.
+- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-cli -p krishiv-ui -p krishiv-operator` passed after the scheduler-side lease/attempt validation slice.
+- `git diff --check` passed after the scheduler-side lease/attempt validation slice.
+- `cargo fmt --all --check` passed after the task-assignment RPC/receiver slice.
+- `cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after the task-assignment RPC/receiver slice.
+- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed, including the executor assignment gRPC loopback test.
+- `cargo check --workspace` passed after the task-assignment RPC/receiver slice.
+- `git diff --check` passed after the task-assignment RPC/receiver slice.
+- `git diff --check` passed after reconciling pending architecture/security roadmap docs.
+- Search for stale S3-default shuffle and old Kubernetes-isolation wording returned no matches in `docs/architecture`, `docs/implementation`, or `docs/security`.
+- `cargo check -p krishiv-executor` passed after the minimal task runner skeleton.
+- `cargo fmt --all --check` passed after the minimal task runner skeleton.
+- `cargo check --workspace` passed after the minimal task runner skeleton.
+- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after the minimal task runner skeleton.
+- `git diff --check` passed after the minimal task runner skeleton.
 
 ## Resume Instructions
 
@@ -205,4 +244,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Continue R3.1 by adding scheduler-side attempt and lease validation, then duplicate-status idempotency.
+4. Continue R3.1 by adding the first real local execution fragment (`SELECT 1` or in-memory Arrow batch) on top of the executor task runner skeleton.

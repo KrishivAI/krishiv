@@ -14,16 +14,26 @@ use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
-    CoordinatorExecutorService, CoordinatorId, CoordinatorState, ExecutorDescriptor,
+    AttemptId, CoordinatorExecutorService, CoordinatorId, CoordinatorState, ExecutorDescriptor,
     ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
-    ExecutorState, JobId, JobKind, JobSpec, JobState, LeaseGeneration, RegisterExecutorRequest,
-    RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskId, TaskSpec,
-    TaskState, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
-    TransportVersion, wire,
+    ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState,
+    LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
+    RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskAttemptRef,
+    TaskId, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate,
+    TransportDisposition, TransportVersion, wire,
 };
 
 /// Scheduler result alias.
 pub type SchedulerResult<T> = Result<T, SchedulerError>;
+
+/// Result of applying a task status update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskUpdateOutcome {
+    /// The update changed scheduler state.
+    Applied,
+    /// The update was already reflected in scheduler state.
+    Duplicate,
+}
 
 /// Coordinator behavior knobs for deterministic R2 scheduler tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +80,12 @@ pub enum SchedulerError {
     DuplicateExecutor { executor_id: ExecutorId },
     /// Executor was not found.
     UnknownExecutor { executor_id: ExecutorId },
+    /// Executor used an older or otherwise invalid lease generation.
+    StaleExecutorLease {
+        executor_id: ExecutorId,
+        expected: LeaseGeneration,
+        received: LeaseGeneration,
+    },
     /// No healthy executors are available for placement.
     NoExecutors,
     /// Job already exists.
@@ -80,6 +96,12 @@ pub enum SchedulerError {
     UnknownStage { stage_id: StageId },
     /// Task was not found.
     UnknownTask { task_id: TaskId },
+    /// Task status referenced an attempt that is no longer current.
+    StaleTaskAttempt {
+        task_id: TaskId,
+        expected: u32,
+        received: u32,
+    },
     /// Job submission was invalid.
     InvalidJob { message: String },
     /// Distributed DAG conversion failed.
@@ -100,11 +122,27 @@ impl fmt::Display for SchedulerError {
                 write!(f, "executor already registered: {executor_id}")
             }
             Self::UnknownExecutor { executor_id } => write!(f, "unknown executor: {executor_id}"),
+            Self::StaleExecutorLease {
+                executor_id,
+                expected,
+                received,
+            } => write!(
+                f,
+                "stale executor lease for {executor_id}: expected generation {expected}, received {received}"
+            ),
             Self::NoExecutors => f.write_str("no healthy executors are available"),
             Self::DuplicateJob { job_id } => write!(f, "job already exists: {job_id}"),
             Self::UnknownJob { job_id } => write!(f, "unknown job: {job_id}"),
             Self::UnknownStage { stage_id } => write!(f, "unknown stage: {stage_id}"),
             Self::UnknownTask { task_id } => write!(f, "unknown task: {task_id}"),
+            Self::StaleTaskAttempt {
+                task_id,
+                expected,
+                received,
+            } => write!(
+                f,
+                "stale task attempt for {task_id}: expected attempt {expected}, received {received}"
+            ),
             Self::InvalidJob { message } => write!(f, "invalid job: {message}"),
             Self::InvalidPlan { message } => write!(f, "invalid plan: {message}"),
         }
@@ -183,9 +221,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
 
         let response = match coordinator.register_executor(descriptor) {
-            Ok(()) => RegisterExecutorResponse::new(
+            Ok(lease_generation) => RegisterExecutorResponse::new(
                 executor_id,
-                LeaseGeneration::initial(),
+                lease_generation,
                 TransportDisposition::Accepted,
             ),
             Err(SchedulerError::DuplicateExecutor { executor_id }) => {
@@ -210,6 +248,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         ensure_transport_version(request.version())?;
 
         let heartbeat = ExecutorHeartbeat::new(request.executor_id().clone(), request.state())
+            .with_lease_generation(request.lease_generation())
             .with_running_tasks(
                 request
                     .running_attempts()
@@ -232,6 +271,10 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 TransportDisposition::UnknownExecutor,
             )
             .with_message("executor is not registered"),
+            Err(SchedulerError::StaleExecutorLease { expected, .. }) => {
+                ExecutorHeartbeatResponse::new(expected, TransportDisposition::StaleLease)
+                    .with_message("executor lease generation is stale")
+            }
             Err(error) => return Err(status_from_scheduler_error(error)),
         };
 
@@ -252,7 +295,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             request.executor_id().clone(),
             request.state(),
             request.attempt_id().as_u32(),
-        );
+        )
+        .with_lease_generation(request.lease_generation());
         if let Some(message) = request.message() {
             update = update.with_message(message);
         }
@@ -263,7 +307,13 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
 
         let response = match coordinator.apply_task_update(update) {
-            Ok(()) => TaskStatusResponse::new(TransportDisposition::Accepted),
+            Ok(TaskUpdateOutcome::Applied) => {
+                TaskStatusResponse::new(TransportDisposition::Accepted)
+            }
+            Ok(TaskUpdateOutcome::Duplicate) => {
+                TaskStatusResponse::new(TransportDisposition::Duplicate)
+                    .with_message("task status update was already applied")
+            }
             Err(SchedulerError::UnknownJob { .. }) => {
                 TaskStatusResponse::new(TransportDisposition::UnknownJob)
                     .with_message("job is not registered")
@@ -271,6 +321,18 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             Err(SchedulerError::UnknownTask { .. }) => {
                 TaskStatusResponse::new(TransportDisposition::UnknownTask)
                     .with_message("task is not registered")
+            }
+            Err(SchedulerError::UnknownExecutor { .. }) => {
+                TaskStatusResponse::new(TransportDisposition::UnknownExecutor)
+                    .with_message("executor is not registered")
+            }
+            Err(SchedulerError::StaleExecutorLease { .. }) => {
+                TaskStatusResponse::new(TransportDisposition::StaleLease)
+                    .with_message("executor lease generation is stale")
+            }
+            Err(SchedulerError::StaleTaskAttempt { .. }) => {
+                TaskStatusResponse::new(TransportDisposition::StaleAttempt)
+                    .with_message("task attempt is stale")
             }
             Err(error) => return Err(status_from_scheduler_error(error)),
         };
@@ -402,6 +464,9 @@ fn status_from_scheduler_error(error: SchedulerError) -> tonic::Status {
         SchedulerError::InactiveCoordinator { .. } => {
             tonic::Status::failed_precondition(error.to_string())
         }
+        SchedulerError::StaleExecutorLease { .. } | SchedulerError::StaleTaskAttempt { .. } => {
+            tonic::Status::failed_precondition(error.to_string())
+        }
         SchedulerError::UnknownExecutor { .. }
         | SchedulerError::UnknownJob { .. }
         | SchedulerError::UnknownStage { .. }
@@ -464,7 +529,10 @@ impl Coordinator {
     }
 
     /// Register an executor with the active coordinator.
-    pub fn register_executor(&mut self, descriptor: ExecutorDescriptor) -> SchedulerResult<()> {
+    pub fn register_executor(
+        &mut self,
+        descriptor: ExecutorDescriptor,
+    ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
         self.executors.register(descriptor)
     }
@@ -526,13 +594,29 @@ impl Coordinator {
 
     /// Launch all assigned tasks for a job.
     pub fn launch_assigned_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
+        self.launch_assigned_task_assignments(job_id)
+            .map(|assignments| assignments.len())
+    }
+
+    /// Launch all assigned tasks for a job and return executor transport assignments.
+    pub fn launch_assigned_task_assignments(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         self.ensure_active()?;
-        self.find_job_mut(job_id)?.launch_assigned_tasks()
+        let executor_leases = self.executors.assignment_leases();
+        self.find_job_mut(job_id)?
+            .launch_assigned_task_assignments(&executor_leases)
     }
 
     /// Apply a task update from an executor.
-    pub fn apply_task_update(&mut self, update: TaskStatusUpdate) -> SchedulerResult<()> {
+    pub fn apply_task_update(
+        &mut self,
+        update: TaskStatusUpdate,
+    ) -> SchedulerResult<TaskUpdateOutcome> {
         self.ensure_active()?;
+        self.executors
+            .validate_lease(update.executor_id(), update.lease_generation())?;
         self.find_job_mut(update.job_id())?
             .apply_task_update(update)
     }
@@ -622,50 +706,63 @@ impl ExecutorRegistry {
     }
 
     /// Register an executor.
-    pub fn register(&mut self, descriptor: ExecutorDescriptor) -> SchedulerResult<()> {
-        if self
+    pub fn register(&mut self, descriptor: ExecutorDescriptor) -> SchedulerResult<LeaseGeneration> {
+        if let Some(executor) = self
             .executors
             .iter()
-            .any(|executor| executor.executor_id() == descriptor.executor_id())
+            .find(|executor| executor.executor_id() == descriptor.executor_id())
         {
-            return Err(SchedulerError::DuplicateExecutor {
-                executor_id: descriptor.executor_id().clone(),
-            });
+            if executor.state().can_accept_work() || executor.state() == ExecutorState::Draining {
+                return Err(SchedulerError::DuplicateExecutor {
+                    executor_id: descriptor.executor_id().clone(),
+                });
+            }
         }
 
-        self.executors
-            .push(ExecutorRecord::new(descriptor, self.current_tick));
-        Ok(())
+        if let Some(executor) = self
+            .executors
+            .iter_mut()
+            .find(|executor| executor.executor_id() == descriptor.executor_id())
+        {
+            executor.descriptor = descriptor;
+            executor.state = ExecutorState::Registered;
+            executor.running_tasks.clear();
+            executor.last_heartbeat_tick = self.current_tick;
+            return Ok(executor.lease_generation);
+        }
+
+        let lease_generation = LeaseGeneration::initial();
+        self.executors.push(ExecutorRecord::new(
+            descriptor,
+            self.current_tick,
+            lease_generation,
+        ));
+        Ok(lease_generation)
     }
 
     /// Apply a heartbeat.
     pub fn heartbeat(&mut self, heartbeat: ExecutorHeartbeat) -> SchedulerResult<()> {
-        let executor = self
-            .executors
-            .iter_mut()
-            .find(|executor| executor.executor_id() == heartbeat.executor_id())
-            .ok_or_else(|| SchedulerError::UnknownExecutor {
-                executor_id: heartbeat.executor_id().clone(),
-            })?;
+        let current_tick = self.current_tick;
+        let executor = self.find_executor_mut(heartbeat.executor_id())?;
+        validate_executor_lease(
+            heartbeat.executor_id(),
+            executor.lease_generation(),
+            heartbeat.lease_generation(),
+        )?;
 
         executor.state = heartbeat.state();
         executor.running_tasks = heartbeat.running_tasks().to_vec();
-        executor.last_heartbeat_tick = self.current_tick;
+        executor.last_heartbeat_tick = current_tick;
         Ok(())
     }
 
     /// Mark an executor lost.
     pub fn mark_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
-        let executor = self
-            .executors
-            .iter_mut()
-            .find(|executor| executor.executor_id() == executor_id)
-            .ok_or_else(|| SchedulerError::UnknownExecutor {
-                executor_id: executor_id.clone(),
-            })?;
+        let executor = self.find_executor_mut(executor_id)?;
 
         executor.state = ExecutorState::Lost;
         executor.running_tasks.clear();
+        executor.lease_generation = executor.lease_generation.next();
         Ok(())
     }
 
@@ -683,6 +780,7 @@ impl ExecutorRegistry {
             {
                 executor.state = ExecutorState::Lost;
                 executor.running_tasks.clear();
+                executor.lease_generation = executor.lease_generation.next();
                 lost.push(executor.executor_id().clone());
             }
         }
@@ -700,6 +798,24 @@ impl ExecutorRegistry {
         self.current_tick
     }
 
+    /// Validate an executor lease generation and return the current generation.
+    pub fn validate_lease(
+        &self,
+        executor_id: &ExecutorId,
+        lease_generation: LeaseGeneration,
+    ) -> SchedulerResult<LeaseGeneration> {
+        let executor = self.find_executor(executor_id)?;
+        validate_executor_lease(executor_id, executor.lease_generation(), lease_generation)?;
+        Ok(executor.lease_generation())
+    }
+
+    fn assignment_leases(&self) -> Vec<(ExecutorId, LeaseGeneration)> {
+        self.executors
+            .iter()
+            .map(|executor| (executor.executor_id().clone(), executor.lease_generation()))
+            .collect()
+    }
+
     fn schedulable_executors(&self) -> Vec<ExecutorDescriptor> {
         self.executors
             .iter()
@@ -709,21 +825,64 @@ impl ExecutorRegistry {
             .map(|executor| executor.descriptor().clone())
             .collect()
     }
+
+    fn find_executor(&self, executor_id: &ExecutorId) -> SchedulerResult<&ExecutorRecord> {
+        self.executors
+            .iter()
+            .find(|executor| executor.executor_id() == executor_id)
+            .ok_or_else(|| SchedulerError::UnknownExecutor {
+                executor_id: executor_id.clone(),
+            })
+    }
+
+    fn find_executor_mut(
+        &mut self,
+        executor_id: &ExecutorId,
+    ) -> SchedulerResult<&mut ExecutorRecord> {
+        self.executors
+            .iter_mut()
+            .find(|executor| executor.executor_id() == executor_id)
+            .ok_or_else(|| SchedulerError::UnknownExecutor {
+                executor_id: executor_id.clone(),
+            })
+    }
+}
+
+fn validate_executor_lease(
+    executor_id: &ExecutorId,
+    expected: LeaseGeneration,
+    received: LeaseGeneration,
+) -> SchedulerResult<()> {
+    if received == expected {
+        Ok(())
+    } else {
+        Err(SchedulerError::StaleExecutorLease {
+            executor_id: executor_id.clone(),
+            expected,
+            received,
+        })
+    }
 }
 
 /// Executor registry record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorRecord {
     descriptor: ExecutorDescriptor,
+    lease_generation: LeaseGeneration,
     state: ExecutorState,
     running_tasks: Vec<TaskId>,
     last_heartbeat_tick: u64,
 }
 
 impl ExecutorRecord {
-    fn new(descriptor: ExecutorDescriptor, last_heartbeat_tick: u64) -> Self {
+    fn new(
+        descriptor: ExecutorDescriptor,
+        last_heartbeat_tick: u64,
+        lease_generation: LeaseGeneration,
+    ) -> Self {
         Self {
             descriptor,
+            lease_generation,
             state: ExecutorState::Registered,
             running_tasks: Vec::new(),
             last_heartbeat_tick,
@@ -743,6 +902,11 @@ impl ExecutorRecord {
     /// Executor state.
     pub fn state(&self) -> ExecutorState {
         self.state
+    }
+
+    /// Current lease generation for this executor.
+    pub fn lease_generation(&self) -> LeaseGeneration {
+        self.lease_generation
     }
 
     /// Running task ids last reported by heartbeat.
@@ -839,15 +1003,62 @@ impl JobRecord {
         }
     }
 
-    fn launch_assigned_tasks(&mut self) -> SchedulerResult<usize> {
-        let mut launched = 0;
+    fn launch_assigned_task_assignments(
+        &mut self,
+        executor_leases: &[(ExecutorId, LeaseGeneration)],
+    ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
+        let mut assignments = Vec::new();
         self.state = JobState::Running;
         for stage in &mut self.stages {
+            let stage_id = stage.stage_id().clone();
             for task in &mut stage.tasks {
                 if task.state == TaskState::Assigned {
+                    let executor_id = task.assigned_executor.clone().ok_or_else(|| {
+                        SchedulerError::InvalidJob {
+                            message: format!(
+                                "task {} is assigned without an executor",
+                                task.task_id()
+                            ),
+                        }
+                    })?;
+                    let lease_generation = executor_leases
+                        .iter()
+                        .find_map(|(known_executor, lease_generation)| {
+                            (known_executor == &executor_id).then_some(*lease_generation)
+                        })
+                        .ok_or_else(|| SchedulerError::UnknownExecutor {
+                            executor_id: executor_id.clone(),
+                        })?;
+
                     task.state = TaskState::Running;
                     task.attempt = task.attempt.saturating_add(1);
-                    launched += 1;
+                    let attempt_id = AttemptId::try_new(task.attempt).map_err(|error| {
+                        SchedulerError::InvalidJob {
+                            message: error.to_string(),
+                        }
+                    })?;
+                    let task_description = task.spec.description().to_owned();
+                    assignments.push(
+                        ExecutorTaskAssignment::new(
+                            TaskAttemptRef::new(
+                                self.spec.job_id().clone(),
+                                stage_id.clone(),
+                                task.task_id().clone(),
+                                attempt_id,
+                            ),
+                            executor_id,
+                            lease_generation,
+                            PlanFragment::new(task_description.clone()),
+                            OutputContract::new(
+                                OutputContractKind::InlineRecordBatches,
+                                format!("inline result for {}", task.task_id()),
+                            ),
+                        )
+                        .with_input_partitions(vec![InputPartition::new(
+                            task.task_id().as_str(),
+                            task_description,
+                        )]),
+                    );
                 }
             }
             if stage
@@ -858,10 +1069,13 @@ impl JobRecord {
                 stage.state = StageState::Running;
             }
         }
-        Ok(launched)
+        Ok(assignments)
     }
 
-    fn apply_task_update(&mut self, update: TaskStatusUpdate) -> SchedulerResult<()> {
+    fn apply_task_update(
+        &mut self,
+        update: TaskStatusUpdate,
+    ) -> SchedulerResult<TaskUpdateOutcome> {
         let stage = self
             .stages
             .iter_mut()
@@ -870,9 +1084,9 @@ impl JobRecord {
                 stage_id: update.stage_id().clone(),
             })?;
 
-        stage.apply_task_update(update, self.max_stage_retries)?;
+        let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
         self.refresh_state();
-        Ok(())
+        Ok(outcome)
     }
 
     fn refresh_state(&mut self) {
@@ -981,7 +1195,7 @@ impl StageRecord {
         &mut self,
         update: TaskStatusUpdate,
         max_stage_retries: u32,
-    ) -> SchedulerResult<()> {
+    ) -> SchedulerResult<TaskUpdateOutcome> {
         let task = self
             .tasks
             .iter_mut()
@@ -990,15 +1204,17 @@ impl StageRecord {
                 task_id: update.task_id().clone(),
             })?;
 
-        task.state = update.state();
-        task.assigned_executor = Some(update.executor_id().clone());
-        task.attempt = update.attempt();
+        let outcome = task.apply_status_update(&update)?;
+        if outcome == TaskUpdateOutcome::Duplicate {
+            return Ok(outcome);
+        }
+
         if update.state() == TaskState::Failed && self.retry_count < max_stage_retries {
             self.retry_stage();
-            return Ok(());
+            return Ok(TaskUpdateOutcome::Applied);
         }
         self.refresh_state();
-        Ok(())
+        Ok(TaskUpdateOutcome::Applied)
     }
 
     fn retry_stage(&mut self) {
@@ -1092,6 +1308,54 @@ impl TaskRecord {
     /// Current attempt number.
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    fn apply_status_update(
+        &mut self,
+        update: &TaskStatusUpdate,
+    ) -> SchedulerResult<TaskUpdateOutcome> {
+        if update.attempt() != self.attempt {
+            return Err(SchedulerError::StaleTaskAttempt {
+                task_id: self.task_id().clone(),
+                expected: self.attempt,
+                received: update.attempt(),
+            });
+        }
+
+        if self.attempt == 0 {
+            return Err(SchedulerError::StaleTaskAttempt {
+                task_id: self.task_id().clone(),
+                expected: self.attempt,
+                received: update.attempt(),
+            });
+        }
+
+        if self.assigned_executor.as_ref() != Some(update.executor_id()) {
+            return Err(SchedulerError::StaleTaskAttempt {
+                task_id: self.task_id().clone(),
+                expected: self.attempt,
+                received: update.attempt(),
+            });
+        }
+
+        if self.state == update.state() {
+            return Ok(TaskUpdateOutcome::Duplicate);
+        }
+
+        if self.state.is_terminal()
+            || (self.state != TaskState::Running && update.state() != TaskState::Running)
+        {
+            return Err(SchedulerError::StaleTaskAttempt {
+                task_id: self.task_id().clone(),
+                expected: self.attempt,
+                received: update.attempt(),
+            });
+        }
+
+        self.state = update.state();
+        self.assigned_executor = Some(update.executor_id().clone());
+        self.attempt = update.attempt();
+        Ok(TaskUpdateOutcome::Applied)
     }
 
     fn snapshot(&self) -> TaskSnapshot {
@@ -1335,8 +1599,8 @@ mod tests {
 
     use super::{
         Coordinator, CoordinatorConfig, CoordinatorExecutorTonicService, ExecutorRegistry,
-        SchedulerError, SharedCoordinator, StaticScheduler, job_spec_from_logical_plan,
-        serve_coordinator_executor_grpc_with_listener,
+        SchedulerError, SharedCoordinator, StaticScheduler, TaskUpdateOutcome,
+        job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
 
     #[test]
@@ -1393,6 +1657,54 @@ mod tests {
             coordinator.executor_snapshots()[0].state(),
             ExecutorState::Lost
         );
+    }
+
+    #[test]
+    fn stale_lease_heartbeat_is_rejected_after_executor_loss() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let lease_generation = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+            .unwrap();
+
+        coordinator.mark_executor_lost(&executor_id).unwrap();
+        let current_generation = coordinator.executor_snapshots()[0].lease_generation();
+        let error = coordinator
+            .executor_heartbeat(
+                ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+                    .with_lease_generation(lease_generation),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SchedulerError::StaleExecutorLease {
+                expected,
+                received,
+                ..
+            } if expected == current_generation && received == lease_generation
+        ));
+    }
+
+    #[test]
+    fn lost_executor_can_reregister_with_next_lease_generation() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let initial_generation = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+            .unwrap();
+
+        coordinator.mark_executor_lost(&executor_id).unwrap();
+        let next_generation = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-b", 2))
+            .unwrap();
+
+        assert_eq!(next_generation, initial_generation.next());
+        let executor = &coordinator.executor_snapshots()[0];
+        assert_eq!(executor.state(), ExecutorState::Registered);
+        assert_eq!(executor.descriptor().host(), "pod-b");
+        assert_eq!(executor.descriptor().slots(), 2);
+        assert_eq!(executor.lease_generation(), next_generation);
     }
 
     #[test]
@@ -1507,6 +1819,39 @@ mod tests {
         assert_eq!(
             response.disposition(),
             TransportDisposition::UnknownExecutor
+        );
+    }
+
+    #[tokio::test]
+    async fn tonic_service_reports_stale_lease_heartbeat_as_domain_response() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+                .unwrap();
+            coordinator.mark_executor_lost(&executor_id).unwrap();
+        }
+
+        let response = service
+            .executor_heartbeat(tonic::Request::new(ExecutorHeartbeatRequest::new(
+                executor_id,
+                LeaseGeneration::initial(),
+                ExecutorState::Healthy,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.disposition(), TransportDisposition::StaleLease);
+        assert_eq!(
+            response.lease_generation(),
+            LeaseGeneration::initial().next()
         );
     }
 
@@ -1646,6 +1991,212 @@ mod tests {
                 .unwrap()
                 .state(),
             JobState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn tonic_service_reports_duplicate_task_status_as_domain_response() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+        let ids = TaskAttemptRef::new(
+            job_id.clone(),
+            stage_id.clone(),
+            task_id.clone(),
+            AttemptId::initial(),
+        );
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+                .unwrap();
+            coordinator.submit_job(job).unwrap();
+            coordinator.launch_assigned_tasks(&job_id).unwrap();
+        }
+
+        let accepted = service
+            .task_status(tonic::Request::new(TaskStatusRequest::new(
+                ids.clone(),
+                executor_id.clone(),
+                LeaseGeneration::initial(),
+                TaskState::Succeeded,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        let duplicate = service
+            .task_status(tonic::Request::new(TaskStatusRequest::new(
+                ids,
+                executor_id,
+                LeaseGeneration::initial(),
+                TaskState::Succeeded,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(accepted.disposition(), TransportDisposition::Accepted);
+        assert_eq!(duplicate.disposition(), TransportDisposition::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn tonic_service_reports_stale_task_attempt_as_domain_response() {
+        let shared = SharedCoordinator::new(Coordinator::active_with_config(
+            CoordinatorId::try_new("coord-1").unwrap(),
+            CoordinatorConfig::new(1, 3),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+                .unwrap();
+            coordinator.submit_job(job).unwrap();
+            coordinator.launch_assigned_tasks(&job_id).unwrap();
+            coordinator
+                .apply_task_update(TaskStatusUpdate::new(
+                    job_id.clone(),
+                    stage_id.clone(),
+                    task_id.clone(),
+                    executor_id.clone(),
+                    TaskState::Failed,
+                    1,
+                ))
+                .unwrap();
+            coordinator.launch_assigned_tasks(&job_id).unwrap();
+        }
+
+        let response = service
+            .task_status(tonic::Request::new(TaskStatusRequest::new(
+                TaskAttemptRef::new(job_id, stage_id, task_id, AttemptId::initial()),
+                executor_id,
+                LeaseGeneration::initial(),
+                TaskState::Succeeded,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.disposition(), TransportDisposition::StaleAttempt);
+    }
+
+    #[test]
+    fn coordinator_rejects_task_status_with_stale_executor_lease() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+        let stale_generation = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+        coordinator.mark_executor_lost(&executor_id).unwrap();
+
+        let error = coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id,
+                    stage_id,
+                    task_id,
+                    executor_id,
+                    TaskState::Succeeded,
+                    1,
+                )
+                .with_lease_generation(stale_generation),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SchedulerError::StaleExecutorLease { .. }));
+    }
+
+    #[test]
+    fn duplicate_terminal_task_status_is_idempotent() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        let update = TaskStatusUpdate::new(
+            job_id.clone(),
+            stage_id,
+            task_id,
+            executor_id,
+            TaskState::Succeeded,
+            1,
+        );
+        assert_eq!(
+            coordinator.apply_task_update(update.clone()).unwrap(),
+            TaskUpdateOutcome::Applied
+        );
+        assert_eq!(
+            coordinator.apply_task_update(update).unwrap(),
+            TaskUpdateOutcome::Duplicate
+        );
+        assert_eq!(
+            coordinator
+                .job_snapshot(&job_id)
+                .unwrap()
+                .succeeded_task_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn coordinator_launch_returns_executor_task_assignments_with_attempt_and_lease() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let lease_generation = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+
+        coordinator.submit_job(job).unwrap();
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].job_id(), &job_id);
+        assert_eq!(assignments[0].executor_id(), &executor_id);
+        assert_eq!(assignments[0].attempt_id(), AttemptId::initial());
+        assert_eq!(assignments[0].lease_generation(), lease_generation);
+        assert_eq!(
+            assignments[0].output_contract().kind(),
+            krishiv_proto::OutputContractKind::InlineRecordBatches
+        );
+        assert!(!assignments[0].input_partitions().is_empty());
+        assert!(
+            coordinator
+                .job_snapshot(&job_id)
+                .unwrap()
+                .running_task_count()
+                > 0
         );
     }
 

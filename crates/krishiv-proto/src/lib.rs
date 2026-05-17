@@ -555,6 +555,7 @@ impl ExecutorDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorHeartbeat {
     executor_id: ExecutorId,
+    lease_generation: LeaseGeneration,
     state: ExecutorState,
     running_tasks: Vec<TaskId>,
 }
@@ -564,9 +565,17 @@ impl ExecutorHeartbeat {
     pub fn new(executor_id: ExecutorId, state: ExecutorState) -> Self {
         Self {
             executor_id,
+            lease_generation: LeaseGeneration::initial(),
             state,
             running_tasks: Vec::new(),
         }
+    }
+
+    /// Attach the executor lease generation used for this heartbeat.
+    #[must_use]
+    pub fn with_lease_generation(mut self, lease_generation: LeaseGeneration) -> Self {
+        self.lease_generation = lease_generation;
+        self
     }
 
     /// Attach currently running task ids.
@@ -579,6 +588,11 @@ impl ExecutorHeartbeat {
     /// Executor id.
     pub fn executor_id(&self) -> &ExecutorId {
         &self.executor_id
+    }
+
+    /// Executor lease generation.
+    pub fn lease_generation(&self) -> LeaseGeneration {
+        self.lease_generation
     }
 
     /// Reported executor state.
@@ -626,6 +640,7 @@ pub struct TaskStatusUpdate {
     stage_id: StageId,
     task_id: TaskId,
     executor_id: ExecutorId,
+    lease_generation: LeaseGeneration,
     state: TaskState,
     attempt: u32,
     message: Option<String>,
@@ -646,10 +661,18 @@ impl TaskStatusUpdate {
             stage_id,
             task_id,
             executor_id,
+            lease_generation: LeaseGeneration::initial(),
             state,
             attempt,
             message: None,
         }
+    }
+
+    /// Attach the executor lease generation used for this status update.
+    #[must_use]
+    pub fn with_lease_generation(mut self, lease_generation: LeaseGeneration) -> Self {
+        self.lease_generation = lease_generation;
+        self
     }
 
     /// Attach a human-readable status message.
@@ -677,6 +700,11 @@ impl TaskStatusUpdate {
     /// Executor id.
     pub fn executor_id(&self) -> &ExecutorId {
         &self.executor_id
+    }
+
+    /// Executor lease generation.
+    pub fn lease_generation(&self) -> LeaseGeneration {
+        self.lease_generation
     }
 
     /// Reported task state.
@@ -1136,6 +1164,13 @@ impl ExecutorTaskAssignment {
         self
     }
 
+    /// Override the transport version when mapping from a wire assignment.
+    #[must_use]
+    pub fn with_version(mut self, version: TransportVersion) -> Self {
+        self.version = version;
+        self
+    }
+
     /// Transport version.
     pub fn version(&self) -> TransportVersion {
         self.version
@@ -1373,7 +1408,8 @@ pub mod wire {
 
     use super::{
         AttemptId, ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
-        ExecutorId, ExecutorState, JobId, LeaseGeneration, RegisterExecutorRequest,
+        ExecutorId, ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, LeaseGeneration,
+        OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
         RegisterExecutorResponse, StageId, TaskAttemptRef, TaskId, TaskState, TaskStatusRequest,
         TaskStatusResponse, TransportDisposition, TransportVersion,
     };
@@ -1529,6 +1565,63 @@ pub mod wire {
         Ok(response)
     }
 
+    /// Convert a domain executor task assignment to protobuf.
+    pub fn executor_task_assignment_to_wire(
+        value: ExecutorTaskAssignment,
+    ) -> v1::ExecutorTaskAssignment {
+        v1::ExecutorTaskAssignment {
+            version: Some(transport_version_to_wire(value.version())),
+            job_id: value.job_id().as_str().to_owned(),
+            stage_id: value.stage_id().as_str().to_owned(),
+            task_id: value.task_id().as_str().to_owned(),
+            attempt_id: value.attempt_id().as_u32(),
+            executor_id: value.executor_id().as_str().to_owned(),
+            lease_generation: value.lease_generation().as_u64(),
+            input_partitions: value
+                .input_partitions()
+                .iter()
+                .map(input_partition_to_wire)
+                .collect(),
+            plan_fragment: Some(plan_fragment_to_wire(value.plan_fragment())),
+            output_contract: Some(output_contract_to_wire(value.output_contract())),
+        }
+    }
+
+    /// Convert a protobuf executor task assignment to the domain contract.
+    pub fn executor_task_assignment_from_wire(
+        value: v1::ExecutorTaskAssignment,
+    ) -> WireResult<ExecutorTaskAssignment> {
+        let version = transport_version_from_wire(required(value.version, "version")?)?;
+        let ids = TaskAttemptRef::new(
+            JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+            StageId::try_new(value.stage_id).map_err(WireError::from_id)?,
+            TaskId::try_new(value.task_id).map_err(WireError::from_id)?,
+            AttemptId::try_new(value.attempt_id).map_err(WireError::from_id)?,
+        );
+        let executor_id = ExecutorId::try_new(value.executor_id).map_err(WireError::from_id)?;
+        let lease_generation =
+            LeaseGeneration::try_new(value.lease_generation).map_err(WireError::from_id)?;
+        let input_partitions = value
+            .input_partitions
+            .into_iter()
+            .map(input_partition_from_wire)
+            .collect::<WireResult<Vec<_>>>()?;
+        let plan_fragment =
+            plan_fragment_from_wire(required(value.plan_fragment, "plan_fragment")?)?;
+        let output_contract =
+            output_contract_from_wire(required(value.output_contract, "output_contract")?)?;
+
+        Ok(ExecutorTaskAssignment::new(
+            ids,
+            executor_id,
+            lease_generation,
+            plan_fragment,
+            output_contract,
+        )
+        .with_version(version)
+        .with_input_partitions(input_partitions))
+    }
+
     /// Convert a domain task status request to protobuf.
     pub fn task_status_request_to_wire(value: TaskStatusRequest) -> v1::TaskStatusRequest {
         v1::TaskStatusRequest {
@@ -1652,6 +1745,52 @@ pub mod wire {
         ))
     }
 
+    fn input_partition_to_wire(value: &InputPartition) -> v1::InputPartition {
+        v1::InputPartition {
+            partition_id: value.partition_id().to_owned(),
+            description: value.description().to_owned(),
+        }
+    }
+
+    fn input_partition_from_wire(value: v1::InputPartition) -> WireResult<InputPartition> {
+        if value.partition_id.trim().is_empty() {
+            return Err(WireError::new("input partition id cannot be empty"));
+        }
+        Ok(InputPartition::new(value.partition_id, value.description))
+    }
+
+    fn plan_fragment_to_wire(value: &PlanFragment) -> v1::PlanFragment {
+        v1::PlanFragment {
+            description: value.description().to_owned(),
+        }
+    }
+
+    fn plan_fragment_from_wire(value: v1::PlanFragment) -> WireResult<PlanFragment> {
+        if value.description.trim().is_empty() {
+            return Err(WireError::new("plan fragment description cannot be empty"));
+        }
+        Ok(PlanFragment::new(value.description))
+    }
+
+    fn output_contract_to_wire(value: &OutputContract) -> v1::OutputContract {
+        v1::OutputContract {
+            kind: output_contract_kind_to_wire(value.kind()) as i32,
+            description: value.description().to_owned(),
+        }
+    }
+
+    fn output_contract_from_wire(value: v1::OutputContract) -> WireResult<OutputContract> {
+        if value.description.trim().is_empty() {
+            return Err(WireError::new(
+                "output contract description cannot be empty",
+            ));
+        }
+        Ok(OutputContract::new(
+            output_contract_kind_from_wire(value.kind)?,
+            value.description,
+        ))
+    }
+
     fn executor_state_to_wire(value: ExecutorState) -> v1::ExecutorState {
         match value {
             ExecutorState::Registered => v1::ExecutorState::Registered,
@@ -1701,6 +1840,31 @@ pub mod wire {
             v1::TaskState::Failed => Ok(TaskState::Failed),
             v1::TaskState::Retrying => Ok(TaskState::Retrying),
             v1::TaskState::Cancelled => Ok(TaskState::Cancelled),
+        }
+    }
+
+    fn output_contract_kind_to_wire(value: OutputContractKind) -> v1::OutputContractKind {
+        match value {
+            OutputContractKind::InlineRecordBatches => v1::OutputContractKind::InlineRecordBatches,
+            OutputContractKind::LocalFile => v1::OutputContractKind::LocalFile,
+            OutputContractKind::Shuffle => v1::OutputContractKind::Shuffle,
+            OutputContractKind::Sink => v1::OutputContractKind::Sink,
+        }
+    }
+
+    fn output_contract_kind_from_wire(value: i32) -> WireResult<OutputContractKind> {
+        match v1::OutputContractKind::try_from(value)
+            .map_err(|_| WireError::new(format!("unknown output contract kind value {value}")))?
+        {
+            v1::OutputContractKind::Unspecified => {
+                Err(WireError::new("output contract kind cannot be unspecified"))
+            }
+            v1::OutputContractKind::InlineRecordBatches => {
+                Ok(OutputContractKind::InlineRecordBatches)
+            }
+            v1::OutputContractKind::LocalFile => Ok(OutputContractKind::LocalFile),
+            v1::OutputContractKind::Shuffle => Ok(OutputContractKind::Shuffle),
+            v1::OutputContractKind::Sink => Ok(OutputContractKind::Sink),
         }
     }
 
@@ -1859,6 +2023,29 @@ mod tests {
             assignment.output_contract().kind(),
             OutputContractKind::InlineRecordBatches
         );
+    }
+
+    #[test]
+    fn executor_task_assignment_round_trips_through_wire_contract() {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let assignment = ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("scan parquet"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "return result"),
+        )
+        .with_input_partitions(vec![InputPartition::new("part-1", "first file split")]);
+
+        let wire = super::wire::executor_task_assignment_to_wire(assignment.clone());
+        let round_trip = super::wire::executor_task_assignment_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip, assignment);
     }
 
     #[test]

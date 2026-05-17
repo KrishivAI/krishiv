@@ -28,7 +28,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-cli/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
 | `crates/krishiv-cli/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |
 | `crates/krishiv-executor/Cargo.toml` | Defines the R3.1 executor crate and `krishiv-executor` binary target. |
-| `crates/krishiv-executor/src/lib.rs` | Owns executor startup configuration, the minimal runtime facade, construction of versioned registration/heartbeat requests, tonic-shaped coordinator service calls, and the networked gRPC client path. |
+| `crates/krishiv-executor/src/lib.rs` | Owns executor startup configuration, the minimal runtime facade, construction of versioned registration/heartbeat requests, tonic-shaped coordinator service calls, the networked gRPC client path, the executor-side task assignment receiver, and the first task runner skeleton. |
 | `crates/krishiv-executor/src/main.rs` | Runs the R3.1 executor CLI in dry-run, one-shot registration, or heartbeat-loop mode. |
 | `crates/krishiv-sql/Cargo.toml` | Defines the SQL seam crate and Arrow/DataFusion dependencies. |
 | `crates/krishiv-sql/src/lib.rs` | Owns DataFusion session integration, Parquet registration, SQL collect, and explain formatting. |
@@ -36,8 +36,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-plan/src/lib.rs` | Owns `ExecutionKind`, `PlanNode`, `LogicalPlan`, and `PhysicalPlan`. |
 | `crates/krishiv-proto/Cargo.toml` | Defines the R2/R3.1 control-plane contract crate and protobuf generation dependencies. |
 | `crates/krishiv-proto/build.rs` | Generates tonic/prost Rust code from the R3.1 coordinator/executor protobuf schema. |
-| `crates/krishiv-proto/proto/krishiv/transport/v1/coordinator_executor.proto` | Defines the versioned coordinator/executor gRPC service and protobuf wire messages. |
-| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, R2 RPC-style message structs, R3.1 versioned coordinator/executor transport contracts, tonic-shaped service traits, generated protobuf modules, and domain/wire conversions. |
+| `crates/krishiv-proto/proto/krishiv/transport/v1/coordinator_executor.proto` | Defines the versioned coordinator/executor and executor task-assignment gRPC services and protobuf wire messages. |
+| `crates/krishiv-proto/src/lib.rs` | Owns typed coordinator/job/stage/task/executor ids, lifecycle states, R2 RPC-style message structs, R3.1 versioned coordinator/executor transport contracts, executor task-assignment contracts, tonic-shaped service traits, generated protobuf modules, and domain/wire conversions. |
 | `crates/krishiv-operator/Cargo.toml` | Defines the R2 operator crate and its scheduler/proto/UI/serde dependencies. |
 | `crates/krishiv-operator/src/lib.rs` | Owns typed `KrishivJob` resource models, scheduler job conversion, shared coordinator runtime, in-process reconciliation, live Kubernetes watch adapter, and status patching. |
 | `crates/krishiv-operator/src/main.rs` | Runs the live R2/R3.1 Kubernetes operator controller loop with optional scheduler-backed status server and coordinator/executor gRPC server. |
@@ -46,7 +46,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `crates/krishiv-runtime/Cargo.toml` | Defines the runtime crate. |
 | `crates/krishiv-runtime/src/lib.rs` | Owns runtime traits, local backend acceptance, job/task status, and local job registry. |
 | `crates/krishiv-scheduler/Cargo.toml` | Defines the R2 scheduler crate and its plan/proto dependencies. |
-| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, shared coordinator handle, executor registry, static placement, Krishiv DAG routing, tonic-shaped coordinator service adapter, networked coordinator/executor gRPC server, retry/timeout behavior, and task lifecycle updates. |
+| `crates/krishiv-scheduler/src/lib.rs` | Owns the active coordinator skeleton, shared coordinator handle, executor registry, executor lease validation, static placement, Krishiv DAG routing, tonic-shaped coordinator service adapter, networked coordinator/executor gRPC server, task assignment emission, stale-attempt/idempotent task status handling, retry/timeout behavior, and task lifecycle updates. |
 | `crates/krishiv-ui/Cargo.toml` | Defines the R2 status API/Web UI crate and its `axum`, `askama`, scheduler, and proto dependencies. |
 | `crates/krishiv-ui/src/lib.rs` | Owns the R2 status router, JSON API models, HTML rendering, health/readiness endpoints, shared-coordinator integration, and deterministic demo state. |
 | `crates/krishiv-ui/src/main.rs` | Runs the standalone R2 status server with optional demo data for local UI development. |
@@ -59,6 +59,9 @@ meant for humans and Codex sessions resuming implementation work.
 |---|---|
 | `docs/architecture/krishiv-roadmap.md` | Canonical 10-release roadmap and high-level architecture. |
 | `docs/architecture/crate-map.md` | Explains crate ownership and dependency direction. |
+| `docs/architecture/deployment-targets.md` | Defines Kubernetes and bare metal / VM distributed deployment targets and feature availability. |
+| `docs/architecture/data-plane-transport.md` | Defines the control-plane/data-plane split and the Arrow IPC/Flight transport decisions for shuffle and query result movement. |
+| `docs/architecture/shuffle-deployment-model.md` | Defines R4 shuffle durability modes: local default and optional object-store durability. |
 | `docs/architecture/r1-bootstrap.md` | Explains what the bootstrap and local execution slices deliver, what remains stubbed, and streaming limitations. |
 | `docs/architecture/r2-control-plane.md` | Explains the R2 coordinator/executor skeleton, static scheduling, and deferred distributed features. |
 | `docs/architecture/stage-local-execution.md` | Defines the R3.1 coordinator/executor stage-local execution contract, task attempts, leases, metadata recovery, and handoff boundaries for shuffle, streaming, and checkpoints. |
@@ -66,6 +69,7 @@ meant for humans and Codex sessions resuming implementation work.
 | `docs/architecture/file-guide.md` | This file; explains each current project file. |
 | `docs/engineering/standards.md` | Rust, async, testing, error handling, and documentation standards. |
 | `docs/engineering/codex-workflow.md` | Rate-limit and session-resumability workflow for Codex. |
+| `docs/security/security-posture.md` | Defines pre-R9 security controls and limitations for coordinator/executor gRPC. |
 | `docs/releases/r1-foundation-alpha.md` | R1 alpha release notes, features, limitations, example commands, and validation commands. |
 | `docs/sql-compatibility/r1.md` | R1 SQL compatibility baseline, supported surfaces, and known limitations. |
 
