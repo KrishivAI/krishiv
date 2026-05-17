@@ -4,12 +4,14 @@ package krishiv.transport.v1;
 
 service CoordinatorExecutor {
   rpc RegisterExecutor(RegisterExecutorRequest) returns (RegisterExecutorResponse);
+  rpc DeregisterExecutor(DeregisterExecutorRequest) returns (DeregisterExecutorResponse);
   rpc ExecutorHeartbeat(ExecutorHeartbeatRequest) returns (ExecutorHeartbeatResponse);
   rpc TaskStatus(TaskStatusRequest) returns (TaskStatusResponse);
 }
 
 service ExecutorTask {
   rpc AssignTask(ExecutorTaskAssignment) returns (TaskStatusResponse);
+  rpc CancelTask(TaskCancellationRequest) returns (TaskStatusResponse);
 }
 
 message TransportVersion {
@@ -21,6 +23,7 @@ message ExecutorDescriptor {
   string executor_id = 1;
   string host = 2;
   uint64 slots = 3;
+  string task_endpoint = 4;
 }
 
 message RegisterExecutorRequest {
@@ -29,6 +32,21 @@ message RegisterExecutorRequest {
 }
 
 message RegisterExecutorResponse {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  TransportDisposition disposition = 4;
+  string message = 5;
+}
+
+message DeregisterExecutorRequest {
+  TransportVersion version = 1;
+  string executor_id = 2;
+  uint64 lease_generation = 3;
+  string reason = 4;
+}
+
+message DeregisterExecutorResponse {
   TransportVersion version = 1;
   string executor_id = 2;
   uint64 lease_generation = 3;
@@ -95,6 +113,23 @@ message TaskStatusRequest {
   uint64 lease_generation = 7;
   TaskState state = 8;
   string message = 9;
+  TaskOutputMetadata output_metadata = 10;
+}
+
+message TaskOutputMetadata {
+  string output_kind = 1;
+  uint64 row_count = 2;
+  uint64 batch_count = 3;
+  uint64 column_count = 4;
+}
+
+message TaskCancellationRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string stage_id = 3;
+  string task_id = 4;
+  uint32 attempt_id = 5;
+  string reason = 6;
 }
 
 message TaskStatusResponse {

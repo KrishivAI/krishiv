@@ -7,16 +7,19 @@
 //! path. The task runner executes the first narrow local SQL fragments through
 //! the Krishiv SQL/DataFusion seam and returns lightweight output metadata.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use krishiv_proto::{
-    CoordinatorExecutorService, ExecutorDescriptor, ExecutorHeartbeatRequest,
-    ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-    ExecutorTaskService, LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse,
-    TaskAttemptRef, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    CoordinatorExecutorService, DeregisterExecutorRequest, DeregisterExecutorResponse,
+    ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
+    ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, LeaseGeneration,
+    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
+    TaskOutputMetadata, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
     TransportVersion, wire,
 };
 use krishiv_sql::SqlEngine;
@@ -95,6 +98,17 @@ impl ExecutorAssignmentInbox {
         }
     }
 
+    /// Cancel and remove queued assignments for a task id.
+    pub fn cancel_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
+        let mut assignments = self
+            .assignments
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+        let before = assignments.len();
+        assignments.retain(|assignment| assignment.task_id() != task_id);
+        Ok(assignments.len() != before)
+    }
+
     /// Snapshot all received assignments.
     pub fn assignments(&self) -> ExecutorResult<Vec<ExecutorTaskAssignment>> {
         Ok(self
@@ -116,6 +130,68 @@ impl ExecutorAssignmentInbox {
     /// Whether the inbox is empty.
     pub fn is_empty(&self) -> ExecutorResult<bool> {
         Ok(self.len()? == 0)
+    }
+}
+
+const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalParquetPartition {
+    table_name: String,
+    path: PathBuf,
+}
+
+impl LocalParquetPartition {
+    fn parse(partition: &krishiv_proto::InputPartition) -> ExecutorResult<Self> {
+        let descriptor = partition.description().trim();
+        let payload = descriptor.strip_prefix(LOCAL_PARQUET_PARTITION_PREFIX).ok_or_else(|| {
+            ExecutorError::InvalidAssignment {
+                message: format!(
+                    "input partition {} must use local-parquet:<table>:<path> for SQL fragments with assigned inputs",
+                    partition.partition_id()
+                ),
+            }
+        })?;
+        let (table_name, path) =
+            payload
+                .split_once(':')
+                .ok_or_else(|| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "input partition {} must use local-parquet:<table>:<path>",
+                        partition.partition_id()
+                    ),
+                })?;
+        let table_name = table_name.trim();
+        let path = path.trim();
+        if table_name.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "input partition {} has an empty local Parquet table name",
+                    partition.partition_id()
+                ),
+            });
+        }
+        if path.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "input partition {} has an empty local Parquet path",
+                    partition.partition_id()
+                ),
+            });
+        }
+
+        Ok(Self {
+            table_name: table_name.to_owned(),
+            path: PathBuf::from(path),
+        })
+    }
+
+    fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -211,6 +287,16 @@ impl ExecutorTaskOutput {
     pub fn column_count(&self) -> usize {
         self.column_count
     }
+
+    /// Convert to coordinator-visible lightweight metadata.
+    pub fn to_task_output_metadata(&self) -> TaskOutputMetadata {
+        TaskOutputMetadata::new(
+            self.kind.as_str(),
+            self.row_count as u64,
+            self.batch_count as u64,
+            self.column_count as u64,
+        )
+    }
 }
 
 /// Local executor output kind.
@@ -220,6 +306,15 @@ pub enum ExecutorTaskOutputKind {
     Sql,
     /// Placeholder path for non-SQL fragments while R3.1 is still bootstrapping.
     Placeholder,
+}
+
+impl ExecutorTaskOutputKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::Placeholder => "placeholder",
+        }
+    }
 }
 
 /// Minimal R3.1 stage-local task runner skeleton.
@@ -275,6 +370,7 @@ impl ExecutorTaskRunner {
                 TaskState::Running,
                 "executor accepted assignment",
                 coordinator,
+                None,
             )
             .await?;
         ensure_status_accepted_or_duplicate(running.disposition(), TaskState::Running)?;
@@ -288,6 +384,7 @@ impl ExecutorTaskRunner {
                         TaskState::Failed,
                         "executor failed assignment before DataFusion execution",
                         coordinator,
+                        None,
                     )
                     .await?;
                 ensure_status_accepted_or_duplicate(failed.disposition(), TaskState::Failed)?;
@@ -301,6 +398,7 @@ impl ExecutorTaskRunner {
                 TaskState::Succeeded,
                 "executor completed stage-local fragment",
                 coordinator,
+                Some(output.to_task_output_metadata()),
             )
             .await?;
         ensure_status_accepted_or_duplicate(terminal.disposition(), TaskState::Succeeded)?;
@@ -330,11 +428,23 @@ impl ExecutorTaskRunner {
         }
 
         if let Some(query) = sql_query_from_fragment(fragment) {
-            let dataframe = SqlEngine::new().sql(query).await.map_err(|error| {
-                ExecutorError::LocalExecution {
-                    message: error.to_string(),
-                }
-            })?;
+            let engine = SqlEngine::new();
+            for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
+                engine
+                    .register_parquet(partition.table_name(), partition.path())
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
+            }
+
+            let dataframe =
+                engine
+                    .sql(query)
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
             let batches =
                 dataframe
                     .collect()
@@ -360,6 +470,7 @@ impl ExecutorTaskRunner {
         state: TaskState,
         message: &'static str,
         coordinator: &S,
+        output_metadata: Option<TaskOutputMetadata>,
     ) -> Result<TaskStatusResponse, tonic::Status>
     where
         S: CoordinatorExecutorService,
@@ -370,19 +481,51 @@ impl ExecutorTaskRunner {
             assignment.task_id().clone(),
             assignment.attempt_id(),
         );
-        let request = TaskStatusRequest::new(
+        let mut request = TaskStatusRequest::new(
             ids,
             assignment.executor_id().clone(),
             assignment.lease_generation(),
             state,
         )
         .with_message(message);
+        if let Some(output_metadata) = output_metadata {
+            request = request.with_output_metadata(output_metadata);
+        }
 
         coordinator
             .task_status(tonic::Request::new(request))
             .await
             .map(tonic::Response::into_inner)
     }
+}
+
+fn parse_local_parquet_partitions(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<LocalParquetPartition>> {
+    if !partitions.iter().any(|partition| {
+        partition
+            .description()
+            .trim()
+            .starts_with(LOCAL_PARQUET_PARTITION_PREFIX)
+    }) {
+        return Ok(Vec::new());
+    }
+
+    let mut table_names = BTreeSet::new();
+    let mut parsed = Vec::with_capacity(partitions.len());
+    for partition in partitions {
+        let local_partition = LocalParquetPartition::parse(partition)?;
+        if !table_names.insert(local_partition.table_name().to_owned()) {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "duplicate local Parquet table name {} in assigned input partitions",
+                    local_partition.table_name()
+                ),
+            });
+        }
+        parsed.push(local_partition);
+    }
+    Ok(parsed)
 }
 
 fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
@@ -443,6 +586,31 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             TransportDisposition::Accepted,
         )))
     }
+
+    async fn cancel_task(
+        &self,
+        request: tonic::Request<TaskCancellationRequest>,
+    ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        let request = request.into_inner();
+        if !TransportVersion::CURRENT.is_compatible_with(request.version()) {
+            return Err(tonic::Status::invalid_argument(format!(
+                "unsupported executor task transport version {}; current version is {}",
+                request.version(),
+                TransportVersion::CURRENT
+            )));
+        }
+        let removed = self
+            .inbox
+            .cancel_task(request.task_id())
+            .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        let response = if removed {
+            TaskStatusResponse::new(TransportDisposition::Accepted)
+        } else {
+            TaskStatusResponse::new(TransportDisposition::UnknownTask)
+                .with_message("task is not queued on this executor")
+        };
+        Ok(tonic::Response::new(response))
+    }
 }
 
 /// Networked gRPC adapter for executor-side task assignment calls.
@@ -476,6 +644,22 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
         let response = self
             .inner
             .assign_task(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        Ok(tonic::Response::new(wire::task_status_response_to_wire(
+            response,
+        )))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: tonic::Request<wire::v1::TaskCancellationRequest>,
+    ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+        let request = wire::task_cancellation_request_from_wire(request.into_inner())
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .inner
+            .cancel_task(tonic::Request::new(request))
             .await?
             .into_inner();
         Ok(tonic::Response::new(wire::task_status_response_to_wire(
@@ -668,6 +852,29 @@ impl ExecutorRuntime {
             .map(tonic::Response::into_inner)
     }
 
+    /// Build a deregistration request for this executor.
+    pub fn deregistration_request(&self) -> DeregisterExecutorRequest {
+        DeregisterExecutorRequest::new(
+            self.config.executor_id.clone(),
+            self.config.lease_generation,
+        )
+        .with_reason("executor graceful shutdown")
+    }
+
+    /// Deregister this executor through a tonic-shaped coordinator service.
+    pub async fn deregister_with<S>(
+        &self,
+        service: &S,
+    ) -> Result<DeregisterExecutorResponse, tonic::Status>
+    where
+        S: CoordinatorExecutorService,
+    {
+        service
+            .deregister_executor(tonic::Request::new(self.deregistration_request()))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
     /// Build an empty healthy heartbeat request for this executor.
     pub fn heartbeat_request(&self) -> ExecutorHeartbeatRequest {
         ExecutorHeartbeatRequest::new(
@@ -702,6 +909,19 @@ impl ExecutorRuntime {
         let request = wire::register_executor_request_to_wire(self.registration_request());
         let response = client.register_executor(request).await?.into_inner();
         Ok(wire::register_executor_response_from_wire(response)?)
+    }
+
+    /// Deregister this executor through a networked coordinator gRPC endpoint.
+    pub async fn deregister_with_grpc_endpoint(
+        &self,
+    ) -> ExecutorTransportResult<DeregisterExecutorResponse> {
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .await?;
+        let request = wire::deregister_executor_request_to_wire(self.deregistration_request());
+        let response = client.deregister_executor(request).await?.into_inner();
+        Ok(wire::deregister_executor_response_from_wire(response)?)
     }
 
     /// Send one healthy heartbeat through a networked coordinator gRPC endpoint.
@@ -759,13 +979,23 @@ impl ExecutorRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use tempfile::tempdir;
+
     use krishiv_proto::{
-        AttemptId, CoordinatorExecutorService, CoordinatorId, ExecutorHeartbeatRequest,
-        ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-        ExecutorTaskService, InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
-        OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-        RegisterExecutorResponse, StageId, StageSpec, TaskAttemptRef, TaskId, TaskSpec,
-        TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
+        AttemptId, CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
+        DeregisterExecutorResponse, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
+        ExecutorId, ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartition,
+        JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract, OutputContractKind,
+        PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, StageId, StageSpec,
+        TaskAttemptRef, TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest,
+        TaskStatusResponse, TransportDisposition, TransportVersion, wire,
     };
     use krishiv_scheduler::{
         Coordinator, CoordinatorExecutorTonicService, SharedCoordinator,
@@ -790,6 +1020,18 @@ mod tests {
             Ok(tonic::Response::new(RegisterExecutorResponse::new(
                 request.descriptor().executor_id().clone(),
                 LeaseGeneration::initial(),
+                TransportDisposition::Accepted,
+            )))
+        }
+
+        async fn deregister_executor(
+            &self,
+            request: tonic::Request<DeregisterExecutorRequest>,
+        ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+            let request = request.into_inner();
+            Ok(tonic::Response::new(DeregisterExecutorResponse::new(
+                request.executor_id().clone(),
+                request.lease_generation(),
                 TransportDisposition::Accepted,
             )))
         }
@@ -846,6 +1088,27 @@ mod tests {
                 .await?
                 .into_inner();
             let response = wire::register_executor_response_from_wire(response)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok(tonic::Response::new(response))
+        }
+
+        async fn deregister_executor(
+            &self,
+            request: tonic::Request<DeregisterExecutorRequest>,
+        ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+            let mut client =
+                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+                    self.endpoint.clone(),
+                )
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            let response = client
+                .deregister_executor(wire::deregister_executor_request_to_wire(
+                    request.into_inner(),
+                ))
+                .await?
+                .into_inner();
+            let response = wire::deregister_executor_response_from_wire(response)
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
             Ok(tonic::Response::new(response))
         }
@@ -1055,6 +1318,139 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let metadata = detail.stages()[0].tasks()[0].output_metadata().unwrap();
+        assert_eq!(metadata.output_kind(), "sql");
+        assert_eq!(metadata.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_deregisters_through_service_boundary() {
+        let runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-1", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let response = runtime
+            .deregister_with(&AcceptingCoordinatorService)
+            .await
+            .unwrap();
+
+        assert_eq!(response.executor_id(), runtime.config().executor_id());
+        assert_eq!(response.disposition(), TransportDisposition::Accepted);
+    }
+
+    #[tokio::test]
+    async fn task_inbox_service_cancels_queued_assignment() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let service = ExecutorTaskInboxService::new(inbox.clone());
+        let assignment = demo_assignment("task-cancel-1");
+        let cancel = TaskCancellationRequest::new(TaskAttemptRef::new(
+            assignment.job_id().clone(),
+            assignment.stage_id().clone(),
+            assignment.task_id().clone(),
+            assignment.attempt_id(),
+        ));
+
+        service
+            .assign_task(tonic::Request::new(assignment))
+            .await
+            .unwrap();
+        let response = service
+            .cancel_task(tonic::Request::new(cancel))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.disposition(), TransportDisposition::Accepted);
+        assert!(inbox.is_empty().unwrap());
+    }
+
+    #[test]
+    fn local_parquet_partition_descriptors_are_validated() {
+        let partition = InputPartition::new("part-1", "local-parquet:people:/tmp/people.parquet");
+        let parsed = super::parse_local_parquet_partitions(&[partition]).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].table_name(), "people");
+        assert_eq!(
+            parsed[0].path(),
+            std::path::Path::new("/tmp/people.parquet")
+        );
+
+        let duplicate = super::parse_local_parquet_partitions(&[
+            InputPartition::new("part-1", "local-parquet:people:/tmp/people-1.parquet"),
+            InputPartition::new("part-2", "local-parquet:people:/tmp/people-2.parquet"),
+        ])
+        .unwrap_err();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate local Parquet table name")
+        );
+
+        let malformed = super::parse_local_parquet_partitions(&[
+            InputPartition::new("part-1", "local-parquet:people:/tmp/people.parquet"),
+            InputPartition::new("part-2", "not-a-local-parquet-descriptor"),
+        ])
+        .unwrap_err();
+        assert!(
+            malformed
+                .to_string()
+                .contains("local-parquet:<table>:<path>")
+        );
+    }
+
+    #[tokio::test]
+    async fn task_runner_executes_local_parquet_partition_sql() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+
+        let executor_id = ExecutorId::try_new("exec-parquet-runner-1").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-parquet-runner-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-parquet-runner-1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-parquet-runner",
+                    1,
+                ))
+                .unwrap();
+            coordinator
+                .submit_job(parquet_scan_job(job_id.clone()))
+                .unwrap();
+            let launched = coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+                .remove(0);
+            inbox
+                .push(local_parquet_assignment(launched, &parquet_path))
+                .unwrap();
+        }
+
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+        let report = runner.run_next_with(&service).await.unwrap().unwrap();
+
+        assert_eq!(report.assignment().job_id(), &job_id);
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 2);
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 2);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+        assert!(inbox.is_empty().unwrap());
+
+        let coordinator = shared.read().unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
+        assert_eq!(snapshot.succeeded_task_count(), 1);
     }
 
     #[tokio::test]
@@ -1174,6 +1570,128 @@ mod tests {
         let _ = coordinator_server.await;
     }
 
+    #[tokio::test]
+    async fn local_parquet_assignment_flows_over_grpc_and_reports_output_metadata() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+
+        let executor_id = ExecutorId::try_new("exec-network-parquet-runner-1").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-network-parquet-runner-1").unwrap(),
+        ));
+        let coordinator_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping coordinator gRPC test because loopback sockets are denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind coordinator gRPC listener: {error}"),
+        };
+        let coordinator_addr = coordinator_listener.local_addr().unwrap();
+        let coordinator_shared = shared.clone();
+        let coordinator_server = tokio::spawn(async move {
+            serve_coordinator_executor_grpc_with_listener(coordinator_listener, coordinator_shared)
+                .await
+                .unwrap();
+        });
+
+        let inbox = ExecutorAssignmentInbox::new();
+        let executor_listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping executor task gRPC test because loopback sockets are denied");
+                coordinator_server.abort();
+                let _ = coordinator_server.await;
+                return;
+            }
+            Err(error) => panic!("failed to bind executor task gRPC listener: {error}"),
+        };
+        let executor_addr = executor_listener.local_addr().unwrap();
+        let executor_inbox = inbox.clone();
+        let executor_server = tokio::spawn(async move {
+            serve_executor_task_grpc_with_listener(executor_listener, executor_inbox)
+                .await
+                .unwrap();
+        });
+
+        let coordinator = NetworkCoordinatorService::new(format!("http://{coordinator_addr}"));
+        let registration = coordinator
+            .register_executor(tonic::Request::new(RegisterExecutorRequest::new(
+                krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-network-parquet-runner",
+                    1,
+                ),
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(registration.disposition(), TransportDisposition::Accepted);
+        let heartbeat = coordinator
+            .executor_heartbeat(tonic::Request::new(ExecutorHeartbeatRequest::new(
+                executor_id.clone(),
+                registration.lease_generation(),
+                ExecutorState::Healthy,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
+
+        let job_id = JobId::try_new("job-network-parquet-runner-1").unwrap();
+        let assignment = {
+            let mut scheduler = shared.write().unwrap();
+            scheduler
+                .submit_job(parquet_scan_job(job_id.clone()))
+                .unwrap();
+            let launched = scheduler
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+                .remove(0);
+            local_parquet_assignment(launched, &parquet_path)
+        };
+
+        let mut executor_client = wire::v1::executor_task_client::ExecutorTaskClient::connect(
+            format!("http://{executor_addr}"),
+        )
+        .await
+        .unwrap();
+        let assign_response = executor_client
+            .assign_task(wire::executor_task_assignment_to_wire(assignment))
+            .await
+            .unwrap()
+            .into_inner();
+        let assign_response = wire::task_status_response_from_wire(assign_response).unwrap();
+        assert_eq!(
+            assign_response.disposition(),
+            TransportDisposition::Accepted
+        );
+
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+        let report = runner.run_next_with(&coordinator).await.unwrap().unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 2);
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 2);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+        assert!(inbox.is_empty().unwrap());
+
+        let scheduler = shared.read().unwrap();
+        let snapshot = scheduler.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
+        assert_eq!(snapshot.succeeded_task_count(), 1);
+
+        executor_server.abort();
+        let _ = executor_server.await;
+        coordinator_server.abort();
+        let _ = coordinator_server.await;
+    }
+
     fn demo_assignment(task_id: &str) -> ExecutorTaskAssignment {
         let ids = TaskAttemptRef::new(
             JobId::try_new("job-1").unwrap(),
@@ -1198,5 +1716,63 @@ mod tests {
                 TaskSpec::new(TaskId::try_new("task-1").unwrap(), "sql: select 1 as value"),
             ),
         )
+    }
+
+    fn parquet_scan_job(job_id: JobId) -> JobSpec {
+        JobSpec::new(job_id, "parquet runner smoke", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "single stage").with_task(
+                TaskSpec::new(
+                    TaskId::try_new("task-1").unwrap(),
+                    "sql: select id, name from people where id > 1 order by id",
+                ),
+            ),
+        )
+    }
+
+    fn local_parquet_assignment(
+        launched: ExecutorTaskAssignment,
+        parquet_path: &std::path::Path,
+    ) -> ExecutorTaskAssignment {
+        ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                launched.job_id().clone(),
+                launched.stage_id().clone(),
+                launched.task_id().clone(),
+                launched.attempt_id(),
+            ),
+            launched.executor_id().clone(),
+            launched.lease_generation(),
+            PlanFragment::new("sql: select id, name from people where id > 1 order by id"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline result"),
+        )
+        .with_input_partitions(vec![InputPartition::new(
+            "people-part-1",
+            format!("local-parquet:people:{}", parquet_path.display()),
+        )])
+    }
+
+    fn write_people_parquet(path: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["ada", "grace", "katherine"])),
+            ],
+        )
+        .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
+        let file = File::create(path)
+            .unwrap_or_else(|error| panic!("unexpected parquet file error: {error}"));
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .unwrap_or_else(|error| panic!("unexpected parquet writer error: {error}"));
+        writer
+            .write(&batch)
+            .unwrap_or_else(|error| panic!("unexpected parquet write error: {error}"));
+        writer
+            .close()
+            .unwrap_or_else(|error| panic!("unexpected parquet close error: {error}"));
     }
 }

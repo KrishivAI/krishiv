@@ -85,7 +85,15 @@ executor inbox. The runner now consumes one assignment from that inbox, reports
 Krishiv SQL/DataFusion seam, returns lightweight row/batch/column output
 metadata to the executor caller, and reports terminal status back to
 `CoordinatorExecutor.TaskStatus`. Non-SQL fragments still take the placeholder
-validation path until typed plan fragments and partition registration land.
+validation path until typed plan fragments land.
+
+For the R3.1 bootstrap Parquet proof only, an input partition description may
+use `local-parquet:<table>:<path>`. This descriptor tells the executor to
+register the local Parquet file at `<path>` as `<table>` in the assignment-local
+DataFusion context before running the `sql:` fragment. This is intentionally not
+the R3.2 connector contract: it has no catalog, object-store, offset, sink, or
+certification semantics and exists only to prove stage-local SQL over assigned
+inputs before connector certification starts.
 
 ---
 
