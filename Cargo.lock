@@ -2225,6 +2225,8 @@ dependencies = [
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-sql",
+ "parquet",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

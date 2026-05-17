@@ -6,14 +6,16 @@ R3.1 Distributed Execution Foundation.
 
 ## Active Task
 
-The R3.1 executor now has the first narrow stage-local SQL execution slice. It
-can receive a `sql:` task assignment through the executor inbox, report
-`Running`, execute a `SELECT 1`-style fragment through the Krishiv
+The R3.1 executor now has a stage-local SQL execution slice over assigned input
+metadata. It can receive a `sql:` task assignment through the executor inbox or
+networked `ExecutorTask.AssignTask`, report `Running`, execute literal SQL or
+bootstrap `local-parquet:<table>:<path>` input partitions through the Krishiv
 SQL/DataFusion seam, return lightweight row/batch/column output metadata to the
 runner caller, and report terminal status back to the scheduler-backed
-coordinator service. The next active task is extending this from literal SQL to
-assigned input partitions or a small Parquet scan without starting R3.2
-connector certification.
+coordinator service or networked coordinator gRPC endpoint. The next active task
+is continuing R3.1 reliability work — graceful deregistration, cancellation,
+metadata persistence, restart recovery, and stability metrics — before starting
+R3.2 connector certification.
 
 ## Completed
 
@@ -135,6 +137,8 @@ connector certification.
 - Aligned R4 shuffle docs around local executor disk as the default durability mode and object-store durability as opt-in.
 - Added the first narrow R3.1 executor SQL fragment execution path for `sql: SELECT 1`-style assignments, returning lightweight output metadata without Arrow payloads in control-plane Protobuf.
 - Added lifecycle coverage that sends a task assignment to an executor inbox over gRPC, executes the local SQL fragment, and reports status back to the scheduler-backed coordinator over gRPC.
+- Added bootstrap R3.1 `local-parquet:<table>:<path>` input partition registration for executor-local `sql:` fragments without starting R3.2 connector certification.
+- Added executor tests for local Parquet partition descriptor validation, scheduler-backed Parquet scan execution, and networked assignment/status Parquet scan execution with row/batch/column output metadata.
 
 ## In Progress
 
@@ -142,9 +146,9 @@ connector certification.
 
 ## Next Steps
 
-1. Extend the executor SQL fragment path from literal `SELECT 1` to assigned input partitions or a narrow local Parquet scan, still before connector certification work.
-2. Decide where coordinator-visible result metadata should be projected without putting Arrow batches into control-plane Protobuf messages.
-3. Keep adding task-assignment lifecycle coverage through real service boundaries as partition registration and scan fragments land.
+1. Decide where coordinator-visible result metadata should be projected without putting Arrow batches into control-plane Protobuf messages.
+2. Continue R3.1 reliability work: graceful executor deregistration, cancellation, metadata persistence, restart recovery, and stability metrics.
+3. Add the coordinator-owned task-assignment client path once the scheduler is ready to push assignments directly instead of tests invoking `ExecutorTask.AssignTask`.
 4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
 
 ## Known Blockers
@@ -218,6 +222,11 @@ connector certification.
 - `cargo check --workspace` passed after adding protobuf generation and tonic transport dependencies.
 - `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-operator` passed.
 - `cargo test -p krishiv-executor` passed after the executor heartbeat-loop polish.
+- `cargo fmt --all --check` passed after adding bootstrap local Parquet partition execution.
+- `cargo check -p krishiv-executor` passed after adding bootstrap local Parquet partition execution.
+- `cargo test -p krishiv-executor` passed after adding descriptor validation plus scheduler-backed and networked local Parquet scan coverage.
+- `cargo check --workspace` passed after the R3.1 local Parquet executor slice.
+- `git diff --check` passed after the R3.1 local Parquet executor slice.
 - `cargo check --workspace` passed again after final code/doc updates.
 - `cargo run -p krishiv-executor -- --help` passed and listed `--register-once`, `--connect`, and `--heartbeat-interval-secs`.
 - `cargo run -p krishiv-operator -- --help` passed and listed `--executor-grpc-addr`.
@@ -249,4 +258,4 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Continue R3.1 by adding the first real local execution fragment (`SELECT 1` or in-memory Arrow batch) on top of the executor task runner skeleton.
+4. Continue R3.1 by deciding coordinator-visible output metadata projection, adding coordinator-owned task-assignment pushes, and continuing graceful deregistration/cancellation/recovery work before R3.2 connector certification.
