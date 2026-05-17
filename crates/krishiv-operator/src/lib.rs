@@ -195,18 +195,13 @@ impl From<KrishivJobMode> for JobKind {
 }
 
 /// Kubernetes restart policy accepted by the R2 CRD.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RestartPolicy {
     /// Do not restart failed pods.
+    #[default]
     Never,
     /// Restart on failure.
     OnFailure,
-}
-
-impl Default for RestartPolicy {
-    fn default() -> Self {
-        Self::Never
-    }
 }
 
 /// Desired `KrishivJob` spec.
@@ -673,10 +668,11 @@ pub struct KrishivJobReconciler {
 }
 
 fn watcher_config(config: &KubernetesControllerConfig) -> watcher::Config {
-    let mut watcher_config = watcher::Config::default();
-    watcher_config.label_selector = config.label_selector.clone();
-    watcher_config.field_selector = config.field_selector.clone();
-    watcher_config
+    watcher::Config {
+        label_selector: config.label_selector.clone(),
+        field_selector: config.field_selector.clone(),
+        ..Default::default()
+    }
 }
 
 fn register_bootstrap_executor(
