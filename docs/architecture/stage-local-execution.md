@@ -68,9 +68,10 @@ registration and heartbeat plus the executor-side task assignment receiver.
 
 The first networked service is `CoordinatorExecutor`:
 
-- `RegisterExecutor`: executor announces id, host, slots, and transport version.
+- `RegisterExecutor`: executor announces id, host, slots, optional task endpoint, and transport version.
+- `DeregisterExecutor`: executor leaves through the graceful fast path without waiting for heartbeat timeout.
 - `ExecutorHeartbeat`: executor refreshes lease generation and reports running attempts.
-- `TaskStatus`: executor reports task attempt state back to the coordinator.
+- `TaskStatus`: executor reports task attempt state and lightweight output metadata back to the coordinator.
 
 Generated protobuf types should remain contained at the transport edge. Scheduler
 state continues to use Krishiv typed ids, attempts, leases, and lifecycle enums.
@@ -78,14 +79,23 @@ state continues to use Krishiv typed ids, attempts, leases, and lifecycle enums.
 The first executor-owned network service is `ExecutorTask`:
 
 - `AssignTask`: coordinator sends a versioned assignment containing job/stage/task ids, attempt id, executor id, lease generation, input partitions, a plan fragment, and an output contract.
+- `CancelTask`: coordinator asks an executor not to start queued work for a task attempt; in-flight batch drain semantics continue to harden in later R3.1 slices.
 
 The initial R3.1 implementation stores received assignments in an in-memory
 executor inbox. The runner now consumes one assignment from that inbox, reports
 `Running`, executes narrow `sql:` plan fragments through the local
 Krishiv SQL/DataFusion seam, returns lightweight row/batch/column output
-metadata to the executor caller, and reports terminal status back to
-`CoordinatorExecutor.TaskStatus`. Non-SQL fragments still take the placeholder
-validation path until typed plan fragments and partition registration land.
+metadata to the executor caller, and reports terminal status plus the same
+metadata back to `CoordinatorExecutor.TaskStatus`. Non-SQL fragments still take the placeholder
+validation path until typed plan fragments land.
+
+For the R3.1 bootstrap Parquet proof only, an input partition description may
+use `local-parquet:<table>:<path>`. This descriptor tells the executor to
+register the local Parquet file at `<path>` as `<table>` in the assignment-local
+DataFusion context before running the `sql:` fragment. This is intentionally not
+the R3.2 connector contract: it has no catalog, object-store, offset, sink, or
+certification semantics and exists only to prove stage-local SQL over assigned
+inputs before connector certification starts.
 
 ---
 

@@ -523,6 +523,7 @@ pub struct ExecutorDescriptor {
     executor_id: ExecutorId,
     host: String,
     slots: usize,
+    task_endpoint: Option<String>,
 }
 
 impl ExecutorDescriptor {
@@ -532,7 +533,18 @@ impl ExecutorDescriptor {
             executor_id,
             host: host.into(),
             slots,
+            task_endpoint: None,
         }
+    }
+
+    /// Attach the executor-owned task assignment endpoint.
+    #[must_use]
+    pub fn with_task_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        if !endpoint.trim().is_empty() {
+            self.task_endpoint = Some(endpoint);
+        }
+        self
     }
 
     /// Executor id.
@@ -548,6 +560,178 @@ impl ExecutorDescriptor {
     /// Advertised task slots.
     pub fn slots(&self) -> usize {
         self.slots
+    }
+
+    /// Optional executor-owned task assignment endpoint.
+    pub fn task_endpoint(&self) -> Option<&str> {
+        self.task_endpoint.as_deref()
+    }
+}
+
+/// Output metadata reported by an executor without carrying Arrow payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOutputMetadata {
+    output_kind: String,
+    row_count: u64,
+    batch_count: u64,
+    column_count: u64,
+}
+
+impl TaskOutputMetadata {
+    /// Create task output metadata.
+    pub fn new(
+        output_kind: impl Into<String>,
+        row_count: u64,
+        batch_count: u64,
+        column_count: u64,
+    ) -> Self {
+        Self {
+            output_kind: output_kind.into(),
+            row_count,
+            batch_count,
+            column_count,
+        }
+    }
+
+    /// Output kind label.
+    pub fn output_kind(&self) -> &str {
+        &self.output_kind
+    }
+
+    /// Number of rows produced.
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// Number of record batches produced.
+    pub fn batch_count(&self) -> u64 {
+        self.batch_count
+    }
+
+    /// Number of columns produced.
+    pub fn column_count(&self) -> u64 {
+        self.column_count
+    }
+}
+
+/// Versioned executor deregistration request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeregisterExecutorRequest {
+    version: TransportVersion,
+    executor_id: ExecutorId,
+    lease_generation: LeaseGeneration,
+    reason: Option<String>,
+}
+
+impl DeregisterExecutorRequest {
+    /// Create a deregistration request using the current transport version.
+    pub fn new(executor_id: ExecutorId, lease_generation: LeaseGeneration) -> Self {
+        Self {
+            version: TransportVersion::CURRENT,
+            executor_id,
+            lease_generation,
+            reason: None,
+        }
+    }
+
+    /// Override transport version.
+    #[must_use]
+    pub fn with_version(mut self, version: TransportVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Attach a reason.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Transport version.
+    pub fn version(&self) -> TransportVersion {
+        self.version
+    }
+
+    /// Executor id.
+    pub fn executor_id(&self) -> &ExecutorId {
+        &self.executor_id
+    }
+
+    /// Executor lease generation.
+    pub fn lease_generation(&self) -> LeaseGeneration {
+        self.lease_generation
+    }
+
+    /// Optional reason.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+/// Versioned executor deregistration response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeregisterExecutorResponse {
+    version: TransportVersion,
+    executor_id: ExecutorId,
+    lease_generation: LeaseGeneration,
+    disposition: TransportDisposition,
+    message: Option<String>,
+}
+
+impl DeregisterExecutorResponse {
+    /// Create a deregistration response using the current transport version.
+    pub fn new(
+        executor_id: ExecutorId,
+        lease_generation: LeaseGeneration,
+        disposition: TransportDisposition,
+    ) -> Self {
+        Self {
+            version: TransportVersion::CURRENT,
+            executor_id,
+            lease_generation,
+            disposition,
+            message: None,
+        }
+    }
+
+    /// Override transport version.
+    #[must_use]
+    pub fn with_version(mut self, version: TransportVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Attach response message.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Transport version.
+    pub fn version(&self) -> TransportVersion {
+        self.version
+    }
+
+    /// Executor id.
+    pub fn executor_id(&self) -> &ExecutorId {
+        &self.executor_id
+    }
+
+    /// Current executor lease generation.
+    pub fn lease_generation(&self) -> LeaseGeneration {
+        self.lease_generation
+    }
+
+    /// Response disposition.
+    pub fn disposition(&self) -> TransportDisposition {
+        self.disposition
+    }
+
+    /// Optional response message.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 }
 
@@ -644,6 +828,7 @@ pub struct TaskStatusUpdate {
     state: TaskState,
     attempt: u32,
     message: Option<String>,
+    output_metadata: Option<TaskOutputMetadata>,
 }
 
 impl TaskStatusUpdate {
@@ -665,6 +850,7 @@ impl TaskStatusUpdate {
             state,
             attempt,
             message: None,
+            output_metadata: None,
         }
     }
 
@@ -679,6 +865,13 @@ impl TaskStatusUpdate {
     #[must_use]
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
+        self
+    }
+
+    /// Attach lightweight task output metadata.
+    #[must_use]
+    pub fn with_output_metadata(mut self, output_metadata: TaskOutputMetadata) -> Self {
+        self.output_metadata = Some(output_metadata);
         self
     }
 
@@ -720,6 +913,11 @@ impl TaskStatusUpdate {
     /// Optional status message.
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// Optional lightweight task output metadata.
+    pub fn output_metadata(&self) -> Option<&TaskOutputMetadata> {
+        self.output_metadata.as_ref()
     }
 }
 
@@ -1234,6 +1432,7 @@ pub struct TaskStatusRequest {
     lease_generation: LeaseGeneration,
     state: TaskState,
     message: Option<String>,
+    output_metadata: Option<TaskOutputMetadata>,
 }
 
 impl TaskStatusRequest {
@@ -1254,6 +1453,7 @@ impl TaskStatusRequest {
             lease_generation,
             state,
             message: None,
+            output_metadata: None,
         }
     }
 
@@ -1268,6 +1468,13 @@ impl TaskStatusRequest {
     #[must_use]
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
+        self
+    }
+
+    /// Attach lightweight output metadata for successful task completion.
+    #[must_use]
+    pub fn with_output_metadata(mut self, output_metadata: TaskOutputMetadata) -> Self {
+        self.output_metadata = Some(output_metadata);
         self
     }
 
@@ -1314,6 +1521,80 @@ impl TaskStatusRequest {
     /// Optional status message.
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// Optional lightweight output metadata.
+    pub fn output_metadata(&self) -> Option<&TaskOutputMetadata> {
+        self.output_metadata.as_ref()
+    }
+}
+
+/// Versioned task cancellation request sent to an executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCancellationRequest {
+    version: TransportVersion,
+    job_id: JobId,
+    stage_id: StageId,
+    task_id: TaskId,
+    attempt_id: AttemptId,
+    reason: Option<String>,
+}
+
+impl TaskCancellationRequest {
+    /// Create a task cancellation request.
+    pub fn new(ids: TaskAttemptRef) -> Self {
+        Self {
+            version: TransportVersion::CURRENT,
+            job_id: ids.job_id,
+            stage_id: ids.stage_id,
+            task_id: ids.task_id,
+            attempt_id: ids.attempt_id,
+            reason: None,
+        }
+    }
+
+    /// Override transport version.
+    #[must_use]
+    pub fn with_version(mut self, version: TransportVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Attach cancellation reason.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Transport version.
+    pub fn version(&self) -> TransportVersion {
+        self.version
+    }
+
+    /// Job id.
+    pub fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Stage id.
+    pub fn stage_id(&self) -> &StageId {
+        &self.stage_id
+    }
+
+    /// Task id.
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// Attempt id.
+    pub fn attempt_id(&self) -> AttemptId {
+        self.attempt_id
+    }
+
+    /// Optional reason.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }
 
@@ -1378,6 +1659,12 @@ pub trait CoordinatorExecutorService: Send + Sync + 'static {
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status>;
 
+    /// Deregister an executor from the active coordinator.
+    async fn deregister_executor(
+        &self,
+        request: tonic::Request<DeregisterExecutorRequest>,
+    ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status>;
+
     /// Apply an executor heartbeat to the active coordinator.
     async fn executor_heartbeat(
         &self,
@@ -1399,6 +1686,12 @@ pub trait ExecutorTaskService: Send + Sync + 'static {
         &self,
         request: tonic::Request<ExecutorTaskAssignment>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status>;
+
+    /// Cancel work on an executor.
+    async fn cancel_task(
+        &self,
+        request: tonic::Request<TaskCancellationRequest>,
+    ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status>;
 }
 
 /// Generated protobuf contracts and conversions for the network transport.
@@ -1407,11 +1700,12 @@ pub mod wire {
     use std::fmt;
 
     use super::{
-        AttemptId, ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
-        ExecutorId, ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, LeaseGeneration,
-        OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-        RegisterExecutorResponse, StageId, TaskAttemptRef, TaskId, TaskState, TaskStatusRequest,
-        TaskStatusResponse, TransportDisposition, TransportVersion,
+        AttemptId, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
+        ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
+        ExecutorTaskAssignment, InputPartition, JobId, LeaseGeneration, OutputContract,
+        OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
+        StageId, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskState,
+        TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
     };
 
     /// Generated protobuf and tonic service types for `krishiv.transport.v1`.
@@ -1491,6 +1785,65 @@ pub mod wire {
         let disposition = transport_disposition_from_wire(value.disposition)?;
         let mut response =
             RegisterExecutorResponse::new(executor_id, lease_generation, disposition)
+                .with_version(version);
+        if !value.message.is_empty() {
+            response = response.with_message(value.message);
+        }
+        Ok(response)
+    }
+
+    /// Convert a domain deregistration request to protobuf.
+    pub fn deregister_executor_request_to_wire(
+        value: DeregisterExecutorRequest,
+    ) -> v1::DeregisterExecutorRequest {
+        v1::DeregisterExecutorRequest {
+            version: Some(transport_version_to_wire(value.version())),
+            executor_id: value.executor_id().as_str().to_owned(),
+            lease_generation: value.lease_generation().as_u64(),
+            reason: value.reason().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// Convert a protobuf deregistration request to the domain contract.
+    pub fn deregister_executor_request_from_wire(
+        value: v1::DeregisterExecutorRequest,
+    ) -> WireResult<DeregisterExecutorRequest> {
+        let version = transport_version_from_wire(required(value.version, "version")?)?;
+        let executor_id = ExecutorId::try_new(value.executor_id).map_err(WireError::from_id)?;
+        let lease_generation =
+            LeaseGeneration::try_new(value.lease_generation).map_err(WireError::from_id)?;
+        let mut request =
+            DeregisterExecutorRequest::new(executor_id, lease_generation).with_version(version);
+        if !value.reason.is_empty() {
+            request = request.with_reason(value.reason);
+        }
+        Ok(request)
+    }
+
+    /// Convert a domain deregistration response to protobuf.
+    pub fn deregister_executor_response_to_wire(
+        value: DeregisterExecutorResponse,
+    ) -> v1::DeregisterExecutorResponse {
+        v1::DeregisterExecutorResponse {
+            version: Some(transport_version_to_wire(value.version())),
+            executor_id: value.executor_id().as_str().to_owned(),
+            lease_generation: value.lease_generation().as_u64(),
+            disposition: transport_disposition_to_wire(value.disposition()) as i32,
+            message: value.message().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// Convert a protobuf deregistration response to the domain contract.
+    pub fn deregister_executor_response_from_wire(
+        value: v1::DeregisterExecutorResponse,
+    ) -> WireResult<DeregisterExecutorResponse> {
+        let version = transport_version_from_wire(required(value.version, "version")?)?;
+        let executor_id = ExecutorId::try_new(value.executor_id).map_err(WireError::from_id)?;
+        let lease_generation =
+            LeaseGeneration::try_new(value.lease_generation).map_err(WireError::from_id)?;
+        let disposition = transport_disposition_from_wire(value.disposition)?;
+        let mut response =
+            DeregisterExecutorResponse::new(executor_id, lease_generation, disposition)
                 .with_version(version);
         if !value.message.is_empty() {
             response = response.with_message(value.message);
@@ -1634,6 +1987,7 @@ pub mod wire {
             lease_generation: value.lease_generation().as_u64(),
             state: task_state_to_wire(value.state()) as i32,
             message: value.message().unwrap_or_default().to_owned(),
+            output_metadata: value.output_metadata().map(task_output_metadata_to_wire),
         }
     }
 
@@ -1656,6 +2010,42 @@ pub mod wire {
             TaskStatusRequest::new(ids, executor_id, lease_generation, state).with_version(version);
         if !value.message.is_empty() {
             request = request.with_message(value.message);
+        }
+        if let Some(output_metadata) = value.output_metadata {
+            request =
+                request.with_output_metadata(task_output_metadata_from_wire(output_metadata)?);
+        }
+        Ok(request)
+    }
+
+    /// Convert a domain task cancellation request to protobuf.
+    pub fn task_cancellation_request_to_wire(
+        value: TaskCancellationRequest,
+    ) -> v1::TaskCancellationRequest {
+        v1::TaskCancellationRequest {
+            version: Some(transport_version_to_wire(value.version())),
+            job_id: value.job_id().as_str().to_owned(),
+            stage_id: value.stage_id().as_str().to_owned(),
+            task_id: value.task_id().as_str().to_owned(),
+            attempt_id: value.attempt_id().as_u32(),
+            reason: value.reason().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// Convert a protobuf task cancellation request to the domain contract.
+    pub fn task_cancellation_request_from_wire(
+        value: v1::TaskCancellationRequest,
+    ) -> WireResult<TaskCancellationRequest> {
+        let version = transport_version_from_wire(required(value.version, "version")?)?;
+        let ids = TaskAttemptRef::new(
+            JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+            StageId::try_new(value.stage_id).map_err(WireError::from_id)?,
+            TaskId::try_new(value.task_id).map_err(WireError::from_id)?,
+            AttemptId::try_new(value.attempt_id).map_err(WireError::from_id)?,
+        );
+        let mut request = TaskCancellationRequest::new(ids).with_version(version);
+        if !value.reason.is_empty() {
+            request = request.with_reason(value.reason);
         }
         Ok(request)
     }
@@ -1680,6 +2070,29 @@ pub mod wire {
             response = response.with_message(value.message);
         }
         Ok(response)
+    }
+
+    fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMetadata {
+        v1::TaskOutputMetadata {
+            output_kind: value.output_kind().to_owned(),
+            row_count: value.row_count(),
+            batch_count: value.batch_count(),
+            column_count: value.column_count(),
+        }
+    }
+
+    fn task_output_metadata_from_wire(
+        value: v1::TaskOutputMetadata,
+    ) -> WireResult<TaskOutputMetadata> {
+        if value.output_kind.trim().is_empty() {
+            return Err(WireError::new("task output metadata kind cannot be empty"));
+        }
+        Ok(TaskOutputMetadata::new(
+            value.output_kind,
+            value.row_count,
+            value.batch_count,
+            value.column_count,
+        ))
     }
 
     fn required<T>(value: Option<T>, field: &'static str) -> WireResult<T> {
@@ -1710,6 +2123,7 @@ pub mod wire {
             executor_id: value.executor_id().as_str().to_owned(),
             host: value.host().to_owned(),
             slots: value.slots() as u64,
+            task_endpoint: value.task_endpoint().unwrap_or_default().to_owned(),
         }
     }
 
@@ -1720,11 +2134,15 @@ pub mod wire {
             .slots
             .try_into()
             .map_err(|_| WireError::new("executor slots value is too large"))?;
-        Ok(ExecutorDescriptor::new(
+        let mut descriptor = ExecutorDescriptor::new(
             ExecutorId::try_new(value.executor_id).map_err(WireError::from_id)?,
             value.host,
             slots,
-        ))
+        );
+        if !value.task_endpoint.is_empty() {
+            descriptor = descriptor.with_task_endpoint(value.task_endpoint);
+        }
+        Ok(descriptor)
     }
 
     fn task_attempt_ref_to_wire(value: &TaskAttemptRef) -> v1::TaskAttemptRef {
@@ -1909,10 +2327,11 @@ pub mod wire {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttemptId, ExecutorHeartbeatRequest, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-        InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
-        OutputContractKind, PlanFragment, RegisterExecutorRequest, StageId, StageSpec,
-        TaskAttemptRef, TaskId, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
+        AttemptId, DeregisterExecutorRequest, ExecutorDescriptor, ExecutorHeartbeatRequest,
+        ExecutorId, ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec,
+        JobState, LeaseGeneration, OutputContract, OutputContractKind, PlanFragment,
+        RegisterExecutorRequest, StageId, StageSpec, TaskAttemptRef, TaskCancellationRequest,
+        TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
         TransportDisposition, TransportVersion,
     };
 
@@ -2046,6 +2465,76 @@ mod tests {
         let round_trip = super::wire::executor_task_assignment_from_wire(wire).unwrap();
 
         assert_eq!(round_trip, assignment);
+    }
+
+    #[test]
+    fn registration_descriptor_round_trips_task_endpoint() {
+        let descriptor =
+            ExecutorDescriptor::new(ExecutorId::try_new("exec-1").unwrap(), "pod-a", 2)
+                .with_task_endpoint("http://127.0.0.1:9091");
+        let request = RegisterExecutorRequest::new(descriptor.clone());
+
+        let wire = super::wire::register_executor_request_to_wire(request);
+        let round_trip = super::wire::register_executor_request_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip.descriptor(), &descriptor);
+        assert_eq!(
+            round_trip.descriptor().task_endpoint(),
+            Some("http://127.0.0.1:9091")
+        );
+    }
+
+    #[test]
+    fn deregistration_round_trips_through_wire_contract() {
+        let request = DeregisterExecutorRequest::new(
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::try_new(7).unwrap(),
+        )
+        .with_reason("shutdown");
+
+        let wire = super::wire::deregister_executor_request_to_wire(request.clone());
+        let round_trip = super::wire::deregister_executor_request_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip, request);
+    }
+
+    #[test]
+    fn task_status_output_metadata_round_trips_through_wire_contract() {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let request = TaskStatusRequest::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            TaskState::Succeeded,
+        )
+        .with_output_metadata(TaskOutputMetadata::new("sql", 2, 1, 2));
+
+        let wire = super::wire::task_status_request_to_wire(request.clone());
+        let round_trip = super::wire::task_status_request_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip, request);
+        assert_eq!(round_trip.output_metadata().unwrap().row_count(), 2);
+    }
+
+    #[test]
+    fn task_cancellation_round_trips_through_wire_contract() {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let request = TaskCancellationRequest::new(ids).with_reason("user requested cancel");
+
+        let wire = super::wire::task_cancellation_request_to_wire(request.clone());
+        let round_trip = super::wire::task_cancellation_request_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip, request);
     }
 
     #[test]

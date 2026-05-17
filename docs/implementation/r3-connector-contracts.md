@@ -76,7 +76,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Define executor lease model with heartbeat generation and expiry.
 - [ ] Define durable job event log events: job submitted, stage planned, task assigned, task started, task succeeded, task failed, executor lost, job cancelled.
 - [ ] Define Kubernetes finalizer cleanup path for `KrishivJob` delete/cancel.
-- [ ] Define basic scheduler/executor stability metrics: heartbeat age, retry count, task duration, failed assignments.
+- [x] Define basic scheduler/executor stability metrics: heartbeat age, retry count, running task count, failed assignments.
 - [ ] Define `MetadataStore` trait in `krishiv-runtime` with multiple backends (`SqliteMetadataStore`, `KubernetesMetadataStore`, `InMemoryMetadataStore`).
 - [ ] **Decide and document durable MetadataStore backend before restart recovery tests can pass.** Config selects backend (`type = "kubernetes"` vs `type = "process"`).
 - [ ] Define `JobSubmitter` trait with `GrpcJobSubmitter` (process mode) and `KubernetesJobSubmitter` (k8s mode).
@@ -87,10 +87,10 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Add estimated cardinality fields to plan nodes for R4 CBO.
 - [x] Write `docs/architecture/stage-local-execution.md` documenting the Stage-Local Execution Model: coordinator assigns partitions, executor runs a full local DataFusion context for its partitions, shuffle moves data between stages. No custom distributed physical operators needed.
 - [ ] Define graceful executor shutdown protocol: SIGTERM → finish current RecordBatch → deregister via RPC → exit (before SIGKILL terminates the process).
-- [ ] Define executor deregistration RPC (fast path vs waiting for heartbeat timeout).
+- [x] Define executor deregistration RPC (fast path vs waiting for heartbeat timeout).
 - [ ] Define task lease token model: coordinator issues a monotonically increasing lease token per task assignment; shuffle/sink writes validate this token before committing, rejecting stale tokens from zombie executors.
 - [ ] Define extended executor heartbeat payload: `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` (used by R7 backpressure and R4 scheduler placement).
-- [ ] Define job cancellation protocol: coordinator sends `CancelTask` RPC to all assigned executors; executors finish current batch then stop; coordinator marks job `Stopped`, triggers shuffle cleanup, releases executor slots.
+- [x] Define initial job cancellation protocol: coordinator can cancel active scheduler state and executor task inboxes accept `CancelTask`; full executor in-flight drain and shuffle cleanup remain future R3.1 work.
 - [ ] Add Kubernetes `terminationGracePeriodSeconds` to executor pod spec manifests consistent with graceful drain window.
 - [ ] Define task timeout model: `task_timeout_seconds` field in `TaskSpec`; executor kills a task that exceeds its timeout and reports `TaskFailed`; coordinator then reassigns according to `max_stage_retries`.
 - [ ] Define executor pod launch failure handling: operator monitors executor pod readiness; if a pod is not `Ready` within `executor_startup_timeout_seconds`, the operator deregisters the executor from the coordinator and triggers task reassignment (does not wait for heartbeat timeout).
@@ -109,10 +109,10 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Implement executor heartbeat through the tonic-shaped service boundary.
 - [x] Expose executor heartbeat through a networked gRPC server/client.
 - [x] Include executor lease generation and task attempt ID in coordinator/executor transport contracts.
-- [ ] Add status API fields for executor lease age, task attempt, retry count, and last failure reason.
+- [x] Add scheduler snapshot/metrics fields for executor heartbeat age, task attempt, retry count, running task count, failed assignment count, and task output metadata; status API projection can consume these fields in a later UI slice.
 - [ ] Add cancel/delete API path used by Kubernetes finalizers.
-- [ ] Add `CancelTask` RPC from coordinator to executor.
-- [ ] Add `Deregister` RPC from executor to coordinator (on graceful shutdown).
+- [x] Add `CancelTask` RPC from coordinator to executor.
+- [x] Add `Deregister` RPC from executor to coordinator (on graceful shutdown).
 - [ ] Extend heartbeat payload to include `memory_used_bytes`, `memory_limit_bytes`, `active_task_count`.
 - [ ] Store health snapshot per executor in `ExecutorRegistry` (used by scheduler for memory-aware placement).
 
@@ -122,10 +122,13 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Add the first executor-side assignment receiver loop backed by an in-memory inbox.
 - [x] Add minimal executor task runner skeleton: consume one inbox assignment, report `Running`, validate placeholder fragment metadata, and report terminal status.
 - [x] Add first narrow local SQL fragment execution path for `sql: SELECT 1`-style assignments, returning lightweight output metadata without Arrow payloads in control-plane Protobuf.
-- [ ] Implement executor registration and deregistration on shutdown.
+- [x] Add R3.1 bootstrap `local-parquet:<table>:<path>` input partition registration for executor-local `sql:` fragments, without starting R3.2 connector certification.
+- [x] Project executor row/batch/column output metadata through task status and coordinator task snapshots without Arrow payloads in control-plane Protobuf.
+- [x] Add coordinator-owned task assignment push to executor-owned task endpoints.
+- [x] Implement executor registration and deregistration service/client helpers; OS signal-driven shutdown remains open.
 - [ ] Implement graceful executor shutdown handler (SIGTERM → finish current RecordBatch → send `Deregister` RPC → exit).
-- [ ] Implement `CancelTask` handler on executor: finish current batch, do not start next, send `TaskCancelled` status to coordinator.
-- [ ] Implement coordinator `CancelJob`: send `CancelTask` to all assigned executors, wait for acknowledgements, mark job `Stopped`, trigger shuffle cleanup.
+- [x] Implement initial `CancelTask` handler on executor inbox: queued work is removed and no next batch starts; in-flight batch drain and coordinator status acknowledgement remain open.
+- [x] Implement initial coordinator `CancelJob` state transition to `Cancelled`; network fan-out acknowledgements and shuffle cleanup remain open.
 - [ ] Implement task lease token issuance on assignment; validate token before any shuffle or sink write.
 - [ ] Implement stale lease token rejection in shuffle write path.
 - [ ] Implement memory-aware task placement: skip executors above configurable memory threshold when assigning new tasks.
@@ -139,7 +142,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Recover coordinator state from `MetadataStore` after process restart.
 - [x] Reject stale task attempts and ignore duplicate status updates safely.
 - [ ] Implement `KrishivJob` finalizer cleanup for cancelled/deleted resources.
-- [ ] Emit basic scheduler/executor stability metrics.
+- [x] Emit basic scheduler/executor stability metrics.
 
 ### Test Checklist
 
@@ -149,9 +152,9 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Tonic service registration, heartbeat, and task status adapter tests pass.
 - [x] Networked registration, heartbeat, and task-status gRPC smoke test passes.
 - [x] Executor registers with coordinator and appears in executor registry.
-- [ ] Executor deregisters cleanly on shutdown via `Deregister` RPC (fast path, not heartbeat timeout).
+- [x] Executor deregisters cleanly via `Deregister` RPC/service helper (fast path, not heartbeat timeout).
 - [ ] Graceful shutdown test: SIGTERM to executor → current batch finishes → deregistration RPC sent → executor exits cleanly.
-- [ ] CancelJob test: all executor tasks acknowledge cancellation; job transitions to `Stopped`; no tasks remain running after acknowledgement.
+- [x] Initial CancelJob test: scheduler job transitions to `Cancelled` and no tasks remain running. Full executor acknowledgement fan-out remains open.
 - [ ] Zombie executor test: network partition heals after task reassignment; stale lease token rejected by shuffle write path; only new-assignment output is committed.
 - [ ] Extended heartbeat test: memory and task-count fields are populated and stored in `ExecutorRegistry`.
 - [ ] Memory-aware placement test: coordinator skips executors above memory threshold when assigning tasks.
@@ -164,10 +167,12 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Durable job event log replay tests pass.
 - [ ] `KrishivJob` finalizer cleanup tests pass.
 - [ ] Operator restart during reconciliation does not duplicate scheduler jobs.
-- [ ] Basic stability metrics tests pass.
+- [x] Basic stability metrics tests pass.
 - [ ] Typed plan operator enum tests pass with schema propagation.
 - [x] End-to-end test: `SELECT 1` runs coordinator → executor via gRPC, result metadata returned.
-- [ ] End-to-end test: Parquet file scan runs on executor with DataFusion, result returned to coordinator.
+- [x] End-to-end test: Parquet file scan runs on executor with DataFusion through the networked assignment/status path, with result metadata returned to the runner caller and task status accepted by the coordinator.
+- [x] Coordinator-visible task output metadata tests pass.
+- [x] Coordinator-owned assignment push test passes.
 - [ ] Executor crash is detected by coordinator; task is reassigned to another executor.
 
 ### Acceptance Gate For R3.1

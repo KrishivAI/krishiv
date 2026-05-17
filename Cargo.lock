@@ -2221,9 +2221,12 @@ dependencies = [
 name = "krishiv-executor"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-sql",
+ "parquet",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
