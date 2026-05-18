@@ -10,6 +10,7 @@
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
@@ -23,6 +24,7 @@ use krishiv_proto::{
     TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
     TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
 };
+use serde::{Deserialize, Serialize};
 
 /// Scheduler result alias.
 pub type SchedulerResult<T> = Result<T, SchedulerError>;
@@ -669,10 +671,12 @@ impl Coordinator {
         self.executors.heartbeat(heartbeat)
     }
 
-    /// Mark an executor lost, which is the R2 timeout skeleton.
+    /// Mark an executor lost and release its running task assignments for retry.
     pub fn mark_executor_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.ensure_active()?;
-        self.executors.mark_lost(executor_id)
+        self.executors.mark_lost(executor_id)?;
+        self.reset_running_tasks_for_lost_executor(executor_id);
+        Ok(())
     }
 
     /// Advance the deterministic heartbeat clock and mark timed-out executors lost.
@@ -683,30 +687,7 @@ impl Coordinator {
         self.ensure_active()?;
         let lost = self.executors.advance_clock(ticks);
         for lost_id in &lost {
-            for job in &mut self.jobs {
-                let mut job_affected = false;
-                for stage in &mut job.stages {
-                    let mut stage_affected = false;
-                    for task in &mut stage.tasks {
-                        if task.state == TaskState::Running
-                            && task.assigned_executor.as_ref() == Some(lost_id)
-                        {
-                            // Keep the assignment for the next launch attempt; the
-                            // attempt counter is not bumped here — it will be bumped
-                            // when `launch_assigned_task_assignments` is called next.
-                            task.state = TaskState::Assigned;
-                            stage_affected = true;
-                            job_affected = true;
-                        }
-                    }
-                    if stage_affected {
-                        stage.refresh_state();
-                    }
-                }
-                if job_affected {
-                    job.refresh_state();
-                }
-            }
+            self.reset_running_tasks_for_lost_executor(lost_id);
         }
         Ok(lost)
     }
@@ -941,6 +922,33 @@ impl Coordinator {
     /// Snapshot all known executors.
     pub fn executor_snapshots(&self) -> Vec<ExecutorRecord> {
         self.executors.list().to_vec()
+    }
+
+    fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
+        for job in &mut self.jobs {
+            let mut job_affected = false;
+            for stage in &mut job.stages {
+                let mut stage_affected = false;
+                for task in &mut stage.tasks {
+                    if task.state == TaskState::Running
+                        && task.assigned_executor.as_ref() == Some(lost_id)
+                    {
+                        // Keep the assignment for the next launch attempt; the
+                        // attempt counter is not bumped here — it will be bumped
+                        // when `launch_assigned_task_assignments` is called next.
+                        task.state = TaskState::Assigned;
+                        stage_affected = true;
+                        job_affected = true;
+                    }
+                }
+                if stage_affected {
+                    stage.refresh_state();
+                }
+            }
+            if job_affected {
+                job.refresh_state();
+            }
+        }
     }
 
     fn ensure_active(&self) -> SchedulerResult<()> {
@@ -2142,8 +2150,10 @@ pub enum EventLogEvent {
 
 /// Durable store for coordinator restart-recovery state and the event log.
 ///
-/// `InMemoryMetadataStore` is the only R3.1 backend. `SqliteMetadataStore` and
-/// `KubernetesMetadataStore` are deferred to later releases.
+/// `InMemoryMetadataStore` is used for tests and single-process deployments.
+/// `JsonFileMetadataStore` is the R3.1 durable local backend for bare-metal / VM
+/// recovery tests. `SqliteMetadataStore` and `KubernetesMetadataStore` are
+/// deferred to later releases.
 pub trait MetadataStore: Send + Sync {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
     fn events(&self) -> &[EventLogEvent];
@@ -2179,6 +2189,690 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
+    }
+}
+
+const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
+
+/// JSON-file metadata store for durable local coordinator recovery.
+#[derive(Debug)]
+pub struct JsonFileMetadataStore {
+    path: PathBuf,
+    events: Vec<EventLogEvent>,
+    jobs: Vec<JobRecord>,
+}
+
+impl JsonFileMetadataStore {
+    /// Open or create a JSON-file metadata store at `path`.
+    pub fn open(path: impl AsRef<Path>) -> SchedulerResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        if path.exists() {
+            let bytes = std::fs::read(&path).map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to read metadata store '{}': {error}",
+                    path.display()
+                ),
+            })?;
+            if bytes.is_empty() {
+                return Ok(Self {
+                    path,
+                    events: Vec::new(),
+                    jobs: Vec::new(),
+                });
+            }
+            let persisted: PersistedMetadata =
+                serde_json::from_slice(&bytes).map_err(|error| SchedulerError::InvalidJob {
+                    message: format!(
+                        "failed to decode metadata store '{}': {error}",
+                        path.display()
+                    ),
+                })?;
+            persisted.validate_schema_version()?;
+            Ok(Self {
+                path,
+                events: persisted
+                    .events
+                    .into_iter()
+                    .map(EventLogEvent::try_from)
+                    .collect::<SchedulerResult<Vec<_>>>()?,
+                jobs: persisted
+                    .jobs
+                    .into_iter()
+                    .map(JobRecord::try_from)
+                    .collect::<SchedulerResult<Vec<_>>>()?,
+            })
+        } else {
+            let store = Self {
+                path,
+                events: Vec::new(),
+                jobs: Vec::new(),
+            };
+            store.persist()?;
+            Ok(store)
+        }
+    }
+
+    fn persist(&self) -> SchedulerResult<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to create metadata store dir '{}': {error}",
+                    parent.display()
+                ),
+            })?;
+        }
+        let persisted = PersistedMetadata {
+            schema_version: JSON_METADATA_SCHEMA_VERSION,
+            store_kind: String::from("krishiv.scheduler.metadata"),
+            events: self.events.iter().map(PersistedEvent::from).collect(),
+            jobs: self.jobs.iter().map(PersistedJobRecord::from).collect(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
+                message: format!("failed to encode metadata store: {error}"),
+            })?;
+        std::fs::write(&self.path, bytes).map_err(|error| SchedulerError::Transport {
+            message: format!(
+                "failed to write metadata store '{}': {error}",
+                self.path.display()
+            ),
+        })
+    }
+}
+
+impl MetadataStore for JsonFileMetadataStore {
+    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        self.events.push(event);
+        self.persist()
+    }
+
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
+
+    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
+            *existing = record.clone();
+        } else {
+            self.jobs.push(record.clone());
+        }
+        self.persist()
+    }
+
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedMetadata {
+    #[serde(default = "default_json_metadata_schema_version")]
+    schema_version: u32,
+    #[serde(default = "default_json_metadata_store_kind")]
+    store_kind: String,
+    events: Vec<PersistedEvent>,
+    jobs: Vec<PersistedJobRecord>,
+}
+
+impl PersistedMetadata {
+    fn validate_schema_version(&self) -> SchedulerResult<()> {
+        if self.schema_version > JSON_METADATA_SCHEMA_VERSION {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "metadata store schema version {} is newer than supported version {}",
+                    self.schema_version, JSON_METADATA_SCHEMA_VERSION
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn default_json_metadata_schema_version() -> u32 {
+    JSON_METADATA_SCHEMA_VERSION
+}
+
+fn default_json_metadata_store_kind() -> String {
+    String::from("krishiv.scheduler.metadata")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedEvent {
+    JobSubmitted {
+        job_id: String,
+    },
+    StagePlanned {
+        job_id: String,
+        stage_id: String,
+    },
+    TaskAssigned {
+        job_id: String,
+        stage_id: String,
+        task_id: String,
+        executor_id: String,
+    },
+    TaskStarted {
+        job_id: String,
+        stage_id: String,
+        task_id: String,
+        attempt: u32,
+    },
+    TaskSucceeded {
+        job_id: String,
+        stage_id: String,
+        task_id: String,
+        attempt: u32,
+    },
+    TaskFailed {
+        job_id: String,
+        stage_id: String,
+        task_id: String,
+        attempt: u32,
+        reason: String,
+    },
+    ExecutorLost {
+        executor_id: String,
+    },
+    JobCancelled {
+        job_id: String,
+    },
+}
+
+impl From<&EventLogEvent> for PersistedEvent {
+    fn from(value: &EventLogEvent) -> Self {
+        match value {
+            EventLogEvent::JobSubmitted { job_id } => Self::JobSubmitted {
+                job_id: job_id.to_string(),
+            },
+            EventLogEvent::StagePlanned { job_id, stage_id } => Self::StagePlanned {
+                job_id: job_id.to_string(),
+                stage_id: stage_id.to_string(),
+            },
+            EventLogEvent::TaskAssigned {
+                job_id,
+                stage_id,
+                task_id,
+                executor_id,
+            } => Self::TaskAssigned {
+                job_id: job_id.to_string(),
+                stage_id: stage_id.to_string(),
+                task_id: task_id.to_string(),
+                executor_id: executor_id.to_string(),
+            },
+            EventLogEvent::TaskStarted {
+                job_id,
+                stage_id,
+                task_id,
+                attempt,
+            } => Self::TaskStarted {
+                job_id: job_id.to_string(),
+                stage_id: stage_id.to_string(),
+                task_id: task_id.to_string(),
+                attempt: attempt.as_u32(),
+            },
+            EventLogEvent::TaskSucceeded {
+                job_id,
+                stage_id,
+                task_id,
+                attempt,
+            } => Self::TaskSucceeded {
+                job_id: job_id.to_string(),
+                stage_id: stage_id.to_string(),
+                task_id: task_id.to_string(),
+                attempt: attempt.as_u32(),
+            },
+            EventLogEvent::TaskFailed {
+                job_id,
+                stage_id,
+                task_id,
+                attempt,
+                reason,
+            } => Self::TaskFailed {
+                job_id: job_id.to_string(),
+                stage_id: stage_id.to_string(),
+                task_id: task_id.to_string(),
+                attempt: attempt.as_u32(),
+                reason: reason.clone(),
+            },
+            EventLogEvent::ExecutorLost { executor_id } => Self::ExecutorLost {
+                executor_id: executor_id.to_string(),
+            },
+            EventLogEvent::JobCancelled { job_id } => Self::JobCancelled {
+                job_id: job_id.to_string(),
+            },
+        }
+    }
+}
+
+impl TryFrom<PersistedEvent> for EventLogEvent {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedEvent) -> SchedulerResult<Self> {
+        Ok(match value {
+            PersistedEvent::JobSubmitted { job_id } => Self::JobSubmitted {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+            },
+            PersistedEvent::StagePlanned { job_id, stage_id } => Self::StagePlanned {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+                stage_id: StageId::try_new(stage_id).map_err(invalid_metadata_id)?,
+            },
+            PersistedEvent::TaskAssigned {
+                job_id,
+                stage_id,
+                task_id,
+                executor_id,
+            } => Self::TaskAssigned {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+                stage_id: StageId::try_new(stage_id).map_err(invalid_metadata_id)?,
+                task_id: TaskId::try_new(task_id).map_err(invalid_metadata_id)?,
+                executor_id: ExecutorId::try_new(executor_id).map_err(invalid_metadata_id)?,
+            },
+            PersistedEvent::TaskStarted {
+                job_id,
+                stage_id,
+                task_id,
+                attempt,
+            } => Self::TaskStarted {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+                stage_id: StageId::try_new(stage_id).map_err(invalid_metadata_id)?,
+                task_id: TaskId::try_new(task_id).map_err(invalid_metadata_id)?,
+                attempt: AttemptId::try_new(attempt).map_err(invalid_metadata_id)?,
+            },
+            PersistedEvent::TaskSucceeded {
+                job_id,
+                stage_id,
+                task_id,
+                attempt,
+            } => Self::TaskSucceeded {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+                stage_id: StageId::try_new(stage_id).map_err(invalid_metadata_id)?,
+                task_id: TaskId::try_new(task_id).map_err(invalid_metadata_id)?,
+                attempt: AttemptId::try_new(attempt).map_err(invalid_metadata_id)?,
+            },
+            PersistedEvent::TaskFailed {
+                job_id,
+                stage_id,
+                task_id,
+                attempt,
+                reason,
+            } => Self::TaskFailed {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+                stage_id: StageId::try_new(stage_id).map_err(invalid_metadata_id)?,
+                task_id: TaskId::try_new(task_id).map_err(invalid_metadata_id)?,
+                attempt: AttemptId::try_new(attempt).map_err(invalid_metadata_id)?,
+                reason,
+            },
+            PersistedEvent::ExecutorLost { executor_id } => Self::ExecutorLost {
+                executor_id: ExecutorId::try_new(executor_id).map_err(invalid_metadata_id)?,
+            },
+            PersistedEvent::JobCancelled { job_id } => Self::JobCancelled {
+                job_id: JobId::try_new(job_id).map_err(invalid_metadata_id)?,
+            },
+        })
+    }
+}
+
+fn invalid_metadata_id(error: krishiv_proto::IdError) -> SchedulerError {
+    SchedulerError::InvalidJob {
+        message: format!("invalid persisted metadata id: {error}"),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedJobRecord {
+    spec: PersistedJobSpec,
+    state: String,
+    max_stage_retries: u32,
+    stages: Vec<PersistedStageRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedStageRecord {
+    spec: PersistedStageSpec,
+    state: String,
+    retry_count: u32,
+    tasks: Vec<PersistedTaskRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTaskRecord {
+    spec: PersistedTaskSpec,
+    state: String,
+    assigned_executor: Option<String>,
+    attempt: u32,
+    output_metadata: Option<PersistedTaskOutputMetadata>,
+    last_failure_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedJobSpec {
+    job_id: String,
+    name: String,
+    kind: String,
+    stages: Vec<PersistedStageSpec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedStageSpec {
+    stage_id: String,
+    name: String,
+    tasks: Vec<PersistedTaskSpec>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTaskSpec {
+    task_id: String,
+    description: String,
+    task_timeout_secs: Option<u64>,
+    source_capabilities: Option<PersistedConnectorCapabilities>,
+    sink_capabilities: Option<PersistedConnectorCapabilities>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedConnectorCapabilities {
+    bounded: bool,
+    unbounded: bool,
+    rewindable: bool,
+    transactional: bool,
+    idempotent: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTaskOutputMetadata {
+    output_kind: String,
+    row_count: u64,
+    batch_count: u64,
+    column_count: u64,
+}
+
+impl From<&JobRecord> for PersistedJobRecord {
+    fn from(value: &JobRecord) -> Self {
+        Self {
+            spec: PersistedJobSpec::from(&value.spec),
+            state: value.state.to_string(),
+            max_stage_retries: value.max_stage_retries,
+            stages: value
+                .stages
+                .iter()
+                .map(PersistedStageRecord::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistedJobRecord> for JobRecord {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedJobRecord) -> SchedulerResult<Self> {
+        Ok(Self {
+            spec: JobSpec::try_from(value.spec)?,
+            state: parse_job_state(&value.state)?,
+            max_stage_retries: value.max_stage_retries,
+            stages: value
+                .stages
+                .into_iter()
+                .map(StageRecord::try_from)
+                .collect::<SchedulerResult<Vec<_>>>()?,
+        })
+    }
+}
+
+impl From<&StageRecord> for PersistedStageRecord {
+    fn from(value: &StageRecord) -> Self {
+        Self {
+            spec: PersistedStageSpec::from(&value.spec),
+            state: value.state.to_string(),
+            retry_count: value.retry_count,
+            tasks: value.tasks.iter().map(PersistedTaskRecord::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistedStageRecord> for StageRecord {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedStageRecord) -> SchedulerResult<Self> {
+        Ok(Self {
+            spec: StageSpec::try_from(value.spec)?,
+            state: parse_stage_state(&value.state)?,
+            retry_count: value.retry_count,
+            tasks: value
+                .tasks
+                .into_iter()
+                .map(TaskRecord::try_from)
+                .collect::<SchedulerResult<Vec<_>>>()?,
+        })
+    }
+}
+
+impl From<&TaskRecord> for PersistedTaskRecord {
+    fn from(value: &TaskRecord) -> Self {
+        Self {
+            spec: PersistedTaskSpec::from(&value.spec),
+            state: value.state.to_string(),
+            assigned_executor: value.assigned_executor.as_ref().map(ToString::to_string),
+            attempt: value.attempt,
+            output_metadata: value
+                .output_metadata
+                .as_ref()
+                .map(PersistedTaskOutputMetadata::from),
+            last_failure_reason: value.last_failure_reason.clone(),
+        }
+    }
+}
+
+impl TryFrom<PersistedTaskRecord> for TaskRecord {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedTaskRecord) -> SchedulerResult<Self> {
+        Ok(Self {
+            spec: TaskSpec::try_from(value.spec)?,
+            state: parse_task_state(&value.state)?,
+            assigned_executor: value
+                .assigned_executor
+                .map(ExecutorId::try_new)
+                .transpose()
+                .map_err(invalid_metadata_id)?,
+            attempt: value.attempt,
+            output_metadata: value.output_metadata.map(TaskOutputMetadata::from),
+            last_failure_reason: value.last_failure_reason,
+        })
+    }
+}
+
+impl From<&JobSpec> for PersistedJobSpec {
+    fn from(value: &JobSpec) -> Self {
+        Self {
+            job_id: value.job_id().to_string(),
+            name: value.name().to_owned(),
+            kind: value.kind().to_string(),
+            stages: value
+                .stages()
+                .iter()
+                .map(PersistedStageSpec::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistedJobSpec> for JobSpec {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedJobSpec) -> SchedulerResult<Self> {
+        let mut spec = JobSpec::new(
+            JobId::try_new(value.job_id).map_err(invalid_metadata_id)?,
+            value.name,
+            parse_job_kind(&value.kind)?,
+        );
+        for stage in value.stages {
+            spec = spec.with_stage(StageSpec::try_from(stage)?);
+        }
+        Ok(spec)
+    }
+}
+
+impl From<&StageSpec> for PersistedStageSpec {
+    fn from(value: &StageSpec) -> Self {
+        Self {
+            stage_id: value.stage_id().to_string(),
+            name: value.name().to_owned(),
+            tasks: value.tasks().iter().map(PersistedTaskSpec::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistedStageSpec> for StageSpec {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedStageSpec) -> SchedulerResult<Self> {
+        let mut spec = StageSpec::new(
+            StageId::try_new(value.stage_id).map_err(invalid_metadata_id)?,
+            value.name,
+        );
+        for task in value.tasks {
+            spec = spec.with_task(TaskSpec::try_from(task)?);
+        }
+        Ok(spec)
+    }
+}
+
+impl From<&TaskSpec> for PersistedTaskSpec {
+    fn from(value: &TaskSpec) -> Self {
+        Self {
+            task_id: value.task_id().to_string(),
+            description: value.description().to_owned(),
+            task_timeout_secs: value.task_timeout_secs(),
+            source_capabilities: value
+                .source_capabilities
+                .as_ref()
+                .map(PersistedConnectorCapabilities::from),
+            sink_capabilities: value
+                .sink_capabilities
+                .as_ref()
+                .map(PersistedConnectorCapabilities::from),
+        }
+    }
+}
+
+impl TryFrom<PersistedTaskSpec> for TaskSpec {
+    type Error = SchedulerError;
+
+    fn try_from(value: PersistedTaskSpec) -> SchedulerResult<Self> {
+        let mut spec = TaskSpec::new(
+            TaskId::try_new(value.task_id).map_err(invalid_metadata_id)?,
+            value.description,
+        );
+        if let Some(secs) = value.task_timeout_secs {
+            spec = spec.with_task_timeout_secs(secs);
+        }
+        if let Some(caps) = value.source_capabilities {
+            spec = spec.with_source_capabilities(ConnectorCapabilityFlags::from(caps));
+        }
+        if let Some(caps) = value.sink_capabilities {
+            spec = spec.with_sink_capabilities(ConnectorCapabilityFlags::from(caps));
+        }
+        Ok(spec)
+    }
+}
+
+impl From<&ConnectorCapabilityFlags> for PersistedConnectorCapabilities {
+    fn from(value: &ConnectorCapabilityFlags) -> Self {
+        Self {
+            bounded: value.bounded,
+            unbounded: value.unbounded,
+            rewindable: value.rewindable,
+            transactional: value.transactional,
+            idempotent: value.idempotent,
+        }
+    }
+}
+
+impl From<PersistedConnectorCapabilities> for ConnectorCapabilityFlags {
+    fn from(value: PersistedConnectorCapabilities) -> Self {
+        Self {
+            bounded: value.bounded,
+            unbounded: value.unbounded,
+            rewindable: value.rewindable,
+            transactional: value.transactional,
+            idempotent: value.idempotent,
+        }
+    }
+}
+
+impl From<&TaskOutputMetadata> for PersistedTaskOutputMetadata {
+    fn from(value: &TaskOutputMetadata) -> Self {
+        Self {
+            output_kind: value.output_kind().to_owned(),
+            row_count: value.row_count(),
+            batch_count: value.batch_count(),
+            column_count: value.column_count(),
+        }
+    }
+}
+
+impl From<PersistedTaskOutputMetadata> for TaskOutputMetadata {
+    fn from(value: PersistedTaskOutputMetadata) -> Self {
+        Self::new(
+            value.output_kind,
+            value.row_count,
+            value.batch_count,
+            value.column_count,
+        )
+    }
+}
+
+fn parse_job_kind(value: &str) -> SchedulerResult<JobKind> {
+    match value {
+        "batch" => Ok(JobKind::Batch),
+        "streaming" => Ok(JobKind::Streaming),
+        other => Err(SchedulerError::InvalidJob {
+            message: format!("unknown persisted job kind: {other}"),
+        }),
+    }
+}
+
+fn parse_job_state(value: &str) -> SchedulerResult<JobState> {
+    match value {
+        "accepted" => Ok(JobState::Accepted),
+        "planning" => Ok(JobState::Planning),
+        "running" => Ok(JobState::Running),
+        "succeeded" => Ok(JobState::Succeeded),
+        "failed" => Ok(JobState::Failed),
+        "cancelled" => Ok(JobState::Cancelled),
+        other => Err(SchedulerError::InvalidJob {
+            message: format!("unknown persisted job state: {other}"),
+        }),
+    }
+}
+
+fn parse_stage_state(value: &str) -> SchedulerResult<StageState> {
+    match value {
+        "pending" => Ok(StageState::Pending),
+        "scheduling" => Ok(StageState::Scheduling),
+        "running" => Ok(StageState::Running),
+        "succeeded" => Ok(StageState::Succeeded),
+        "failed" => Ok(StageState::Failed),
+        "retrying" => Ok(StageState::Retrying),
+        "cancelled" => Ok(StageState::Cancelled),
+        other => Err(SchedulerError::InvalidJob {
+            message: format!("unknown persisted stage state: {other}"),
+        }),
+    }
+}
+
+fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
+    match value {
+        "pending" => Ok(TaskState::Pending),
+        "assigned" => Ok(TaskState::Assigned),
+        "running" => Ok(TaskState::Running),
+        "succeeded" => Ok(TaskState::Succeeded),
+        "failed" => Ok(TaskState::Failed),
+        "retrying" => Ok(TaskState::Retrying),
+        "cancelled" => Ok(TaskState::Cancelled),
+        other => Err(SchedulerError::InvalidJob {
+            message: format!("unknown persisted task state: {other}"),
+        }),
     }
 }
 
@@ -2224,9 +2918,10 @@ mod tests {
 
     use super::{
         Coordinator, CoordinatorConfig, CoordinatorExecutorTonicService, EventLogEvent,
-        ExecutorRegistry, InMemoryMetadataStore, LeaderElection, MetadataStore, SchedulerError,
-        SharedCoordinator, SingleNodeElection, StaticScheduler, TaskUpdateOutcome,
-        job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
+        ExecutorRegistry, InMemoryMetadataStore, JsonFileMetadataStore, LeaderElection,
+        MetadataStore, SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler,
+        TaskUpdateOutcome, job_spec_from_logical_plan,
+        serve_coordinator_executor_grpc_with_listener,
     };
 
     #[derive(Debug, Clone, Default)]
@@ -3594,6 +4289,68 @@ mod tests {
 
         let snap = c2.job_snapshot(&job_id).unwrap();
         assert_eq!(snap.job_id(), &job_id);
+    }
+
+    #[test]
+    fn json_file_metadata_store_recovers_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        let job_id = JobId::try_new("job-json-recover").unwrap();
+
+        {
+            let store = JsonFileMetadataStore::open(&path).unwrap();
+            let mut coordinator =
+                Coordinator::active(CoordinatorId::try_new("coord-json-1").unwrap())
+                    .with_store(store);
+            let executor_id = ExecutorId::try_new("exec-json-1").unwrap();
+            coordinator
+                .register_executor(ExecutorDescriptor::new(executor_id, "pod-json", 1))
+                .unwrap();
+            coordinator
+                .submit_job(
+                    JobSpec::new(job_id.clone(), "json recovery", JobKind::Batch).with_stage(
+                        StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
+                            TaskSpec::new(TaskId::try_new("task-1").unwrap(), "sql: select 1"),
+                        ),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let raw_json = std::fs::read_to_string(&path).unwrap();
+        let metadata_json: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(metadata_json["schema_version"], 1);
+        assert_eq!(metadata_json["store_kind"], "krishiv.scheduler.metadata");
+
+        let reopened = JsonFileMetadataStore::open(&path).unwrap();
+        assert_eq!(reopened.events().len(), 1);
+        let mut recovered = Coordinator::active(CoordinatorId::try_new("coord-json-2").unwrap());
+        recovered.recover_from_store(&reopened).unwrap();
+        let snapshot = recovered.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.task_count(), 1);
+        assert_eq!(snapshot.assigned_task_count(), 1);
+    }
+
+    #[test]
+    fn json_file_metadata_store_rejects_newer_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-metadata.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "schema_version": 999,
+              "store_kind": "krishiv.scheduler.metadata",
+              "events": [],
+              "jobs": []
+            }"#,
+        )
+        .unwrap();
+
+        let err = JsonFileMetadataStore::open(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("schema version 999"),
+            "expected newer schema version error, got {err}"
+        );
     }
 
     // --- Slice 3: Executor crash detection + task reassignment ---

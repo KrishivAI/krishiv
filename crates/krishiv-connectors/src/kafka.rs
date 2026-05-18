@@ -10,7 +10,8 @@ use std::any::Any;
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    ConnectorCapabilities, ConnectorConfig, ConnectorError, ConnectorResult, Sink, Source,
+    ConnectorCapabilities, ConnectorConfig, ConnectorError, ConnectorResult, OffsetCommitter, Sink,
+    Source,
 };
 
 // ---------------------------------------------------------------------------
@@ -203,6 +204,103 @@ impl Sink for KafkaSink {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory Kafka test harness
+// ---------------------------------------------------------------------------
+
+/// Deterministic in-memory Kafka-like source used by executor and connector
+/// certification tests until the real broker-backed runtime is added.
+///
+/// The source emits pre-built Arrow batches in order. `current_offset()` returns
+/// the next offset to commit after the most recent successful read, mirroring
+/// Kafka's convention that committed offsets point to the next message to read.
+pub struct InMemoryKafkaSource {
+    topic: String,
+    partition: i32,
+    next_offset: i64,
+    batches: Vec<RecordBatch>,
+    cursor: usize,
+}
+
+impl InMemoryKafkaSource {
+    /// Create a deterministic source from Arrow batches and a starting offset.
+    pub fn new(
+        topic: impl Into<String>,
+        partition: i32,
+        start_offset: i64,
+        batches: Vec<RecordBatch>,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            partition,
+            next_offset: start_offset,
+            batches,
+            cursor: 0,
+        }
+    }
+
+    /// Return the next Kafka-style offset to commit/read from.
+    pub fn next_offset(&self) -> KafkaOffset {
+        KafkaOffset {
+            topic: self.topic.clone(),
+            partition: self.partition,
+            offset: self.next_offset,
+        }
+    }
+}
+
+impl Source for InMemoryKafkaSource {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new()
+            .with_bounded()
+            .with_rewindable()
+    }
+
+    async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        if self.cursor >= self.batches.len() {
+            return Ok(None);
+        }
+        let batch = self.batches[self.cursor].clone();
+        self.cursor += 1;
+        self.next_offset += batch.num_rows() as i64;
+        Ok(Some(batch))
+    }
+
+    fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+        Some(Box::new(self.next_offset()))
+    }
+}
+
+/// In-memory commit log for Kafka offsets.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryKafkaOffsetCommitter {
+    committed: Vec<KafkaOffset>,
+}
+
+impl InMemoryKafkaOffsetCommitter {
+    /// Create an empty commit log.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// All offsets committed so far, in commit order.
+    pub fn committed_offsets(&self) -> &[KafkaOffset] {
+        &self.committed
+    }
+
+    /// Last committed offset, if any.
+    pub fn last_committed_offset(&self) -> Option<&KafkaOffset> {
+        self.committed.last()
+    }
+}
+
+impl OffsetCommitter<KafkaOffset> for InMemoryKafkaOffsetCommitter {
+    async fn commit_offset(&mut self, offset: KafkaOffset) -> ConnectorResult<()> {
+        self.committed.push(offset);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -340,5 +438,60 @@ mod tests {
             ConnectorError::Unsupported { .. } => {}
             other => panic!("expected Unsupported, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn in_memory_kafka_source_advances_current_offset_after_read() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let mut source = InMemoryKafkaSource::new("events", 2, 10, vec![batch]);
+
+        let read = source.read_batch().await.unwrap().unwrap();
+        assert_eq!(read.num_rows(), 3);
+        let offset = source
+            .current_offset()
+            .unwrap()
+            .downcast::<KafkaOffset>()
+            .unwrap();
+        assert_eq!(
+            *offset,
+            KafkaOffset {
+                topic: "events".into(),
+                partition: 2,
+                offset: 13,
+            }
+        );
+        assert!(source.read_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_kafka_offset_committer_records_commits_in_order() {
+        use crate::OffsetCommitter;
+
+        let mut committer = InMemoryKafkaOffsetCommitter::new();
+        committer
+            .commit_offset(KafkaOffset {
+                topic: "events".into(),
+                partition: 0,
+                offset: 1,
+            })
+            .await
+            .unwrap();
+        committer
+            .commit_offset(KafkaOffset {
+                topic: "events".into(),
+                partition: 0,
+                offset: 4,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(committer.committed_offsets().len(), 2);
+        assert_eq!(committer.last_committed_offset().unwrap().offset, 4);
     }
 }
