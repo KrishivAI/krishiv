@@ -41,7 +41,10 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| format!("failed to bind HTTP addr {addr}: {e}"))?;
-        println!("Krishiv executor HTTP listening on {}", listener.local_addr().unwrap());
+        println!(
+            "Krishiv executor HTTP listening on {}",
+            listener.local_addr().unwrap()
+        );
         tokio::spawn(async move {
             let router = executor_http_router();
             let _ = axum::serve(listener, router).await;
@@ -69,7 +72,10 @@ async fn executor_metrics() -> impl IntoResponse {
 krishiv_executor_up 1
 "
     .to_owned();
-    ([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], body)
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
@@ -216,11 +222,10 @@ impl ExecutorCliConfig {
                 }
                 "--http-addr" => {
                     let value = next_arg(&mut args, "--http-addr")?;
-                    config.http_addr = Some(
-                        value
-                            .parse()
-                            .map_err(|_| format!("invalid socket address for --http-addr: {value}"))?,
-                    );
+                    config.http_addr =
+                        Some(value.parse().map_err(|_| {
+                            format!("invalid socket address for --http-addr: {value}")
+                        })?);
                 }
                 "--heartbeat-interval-secs" => {
                     let value = next_arg(&mut args, "--heartbeat-interval-secs")?;

@@ -792,11 +792,7 @@ impl Coordinator {
                 .iter()
                 .map(JobRecord::shuffle_partitions_available_count)
                 .sum(),
-            shuffle_bytes_written: self
-                .jobs
-                .iter()
-                .map(JobRecord::shuffle_bytes_written)
-                .sum(),
+            shuffle_bytes_written: self.jobs.iter().map(JobRecord::shuffle_bytes_written).sum(),
         }
     }
 
@@ -917,9 +913,7 @@ impl Coordinator {
         let job_id = update.job_id().clone();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
         if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
-            if record.state().is_terminal()
-                && !self.gc_ready_jobs.contains(&job_id)
-            {
+            if record.state().is_terminal() && !self.gc_ready_jobs.contains(&job_id) {
                 self.gc_ready_jobs.push(job_id.clone());
             }
             if let Some(store) = &self.store {

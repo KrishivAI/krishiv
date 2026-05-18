@@ -27,8 +27,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use krishiv_proto::{CoordinatorId, CoordinatorState};
 use krishiv_scheduler::{
-    Coordinator, SharedCoordinator, StabilityMetrics,
-    serve_coordinator_executor_grpc_with_listener,
+    Coordinator, SharedCoordinator, StabilityMetrics, serve_coordinator_executor_grpc_with_listener,
 };
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
@@ -51,7 +50,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(shuffle_dir) = &config.shuffle_dir {
         let store: Arc<LocalDiskShuffleStore> =
             Arc::new(LocalDiskShuffleStore::new(shuffle_dir).map_err(|e| {
-                format!("failed to open shuffle store at '{}': {e}", shuffle_dir.display())
+                format!(
+                    "failed to open shuffle store at '{}': {e}",
+                    shuffle_dir.display()
+                )
             })?);
         let gc_coordinator = coordinator.clone();
         tokio::spawn(async move {
@@ -160,7 +162,10 @@ krishiv_shuffle_bytes_written_total {shuffle_bytes}
         shuffle_partitions = m.shuffle_partitions_available,
         shuffle_bytes = m.shuffle_bytes_written,
     );
-    ([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], body)
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,11 +211,10 @@ impl CoordinatorCliConfig {
                 }
                 "--http-addr" => {
                     let value = next_arg(&mut args, "--http-addr")?;
-                    config.http_addr = Some(
-                        value
-                            .parse()
-                            .map_err(|_| format!("invalid socket address for --http-addr: {value}"))?,
-                    );
+                    config.http_addr =
+                        Some(value.parse().map_err(|_| {
+                            format!("invalid socket address for --http-addr: {value}")
+                        })?);
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => {

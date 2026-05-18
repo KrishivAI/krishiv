@@ -1533,7 +1533,9 @@ impl InputPartitionDescriptor {
                 partition_id,
                 ..
             } => {
-                format!("shuffle-flight:{table_name}:{flight_endpoint}:{upstream_stage_id}:{partition_id}")
+                format!(
+                    "shuffle-flight:{table_name}:{flight_endpoint}:{upstream_stage_id}:{partition_id}"
+                )
             }
         }
     }
@@ -2791,7 +2793,10 @@ pub mod wire {
             }
             v1::InputPartitionDescriptorKind::ShuffleFlight => {
                 require_non_empty(&value.table_name, "shuffle flight table name")?;
-                require_non_empty(&value.shuffle_upstream_stage_id, "shuffle upstream stage id")?;
+                require_non_empty(
+                    &value.shuffle_upstream_stage_id,
+                    "shuffle upstream stage id",
+                )?;
                 Ok(InputPartitionDescriptor::ShuffleFlight {
                     table_name: value.table_name,
                     flight_endpoint: value.shuffle_flight_endpoint,

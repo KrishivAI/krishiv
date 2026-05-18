@@ -315,7 +315,9 @@ impl SmallFilePlanner {
     /// group is at most `target_bytes + max_single_file_bytes`.
     pub fn plan(&self, files: &[FileStats]) -> SplitPlanAdvice {
         if files.is_empty() {
-            return SplitPlanAdvice { task_groups: Vec::new() };
+            return SplitPlanAdvice {
+                task_groups: Vec::new(),
+            };
         }
 
         let mut groups: Vec<Vec<String>> = Vec::new();
@@ -334,7 +336,9 @@ impl SmallFilePlanner {
             groups.push(current);
         }
 
-        SplitPlanAdvice { task_groups: groups }
+        SplitPlanAdvice {
+            task_groups: groups,
+        }
     }
 }
 
@@ -593,7 +597,10 @@ mod tests {
     use super::{FileStats, SmallFilePlanner};
 
     fn make_file(path: &str, size_bytes: u64) -> FileStats {
-        FileStats { path: path.to_owned(), size_bytes }
+        FileStats {
+            path: path.to_owned(),
+            size_bytes,
+        }
     }
 
     #[test]

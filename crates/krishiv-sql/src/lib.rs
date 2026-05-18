@@ -247,7 +247,13 @@ impl SqlDataFrame {
             }
         }
 
-        Ok((batches, SqlExecutionStats { output_rows, cpu_nanos }))
+        Ok((
+            batches,
+            SqlExecutionStats {
+                output_rows,
+                cpu_nanos,
+            },
+        ))
     }
 }
 
