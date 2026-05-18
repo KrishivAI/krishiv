@@ -6,16 +6,14 @@ R3.1 Distributed Execution Foundation.
 
 ## Active Task
 
-The R3.1 executor now has a stage-local SQL execution slice over assigned input
-metadata. It can receive a `sql:` task assignment through the executor inbox or
-networked `ExecutorTask.AssignTask`, report `Running`, execute literal SQL or
-bootstrap `local-parquet:<table>:<path>` input partitions through the Krishiv
-SQL/DataFusion seam, return lightweight row/batch/column output metadata to the
-runner caller, and report terminal status back to the scheduler-backed
-coordinator service or networked coordinator gRPC endpoint. The next active task
-is continuing R3.1 reliability work — graceful deregistration, cancellation,
-metadata persistence, restart recovery, and stability metrics — before starting
-R3.2 connector certification.
+R3.1 reliability work is substantially complete. The main open items before the
+R3.1 acceptance gate are:
+1. Dedicated `Deregister` RPC (currently best-effort `Draining` heartbeat).
+2. `KrishivJob` delete/cancel API path that calls `cancel_job` before stripping the finalizer.
+3. Task lease token model (token issuance + stale-token rejection in shuffle write path; deferred until R4 shuffle exists).
+4. Stage-Local Execution Model document review/approval.
+
+After those items R3.1 acceptance gate passes and R3.2 connector certification can start.
 
 ## Completed
 
@@ -153,6 +151,12 @@ R3.2 connector certification.
 - Added `has_finalizer` and `is_being_deleted` helpers to `ObjectMeta`.
 - Added `FinalizerAdded` and `FinalizerRemoved` variants to `ReconcileAction`.
 - Wired finalizer lifecycle logic at the top of `KrishivJobReconciler::reconcile`.
+- Added `Coordinator::with_store` builder; wired `MetadataStore` write-through into `submit_job` and `apply_task_update` (Slice 1).
+- `advance_heartbeat_clock` now resets Running tasks on lost executors to `Assigned` for automatic reassignment (Slice 3).
+- Added `Coordinator::push_cancel_job` async method that sends `CancelTask` gRPC to all executors owning running tasks (Slice 4).
+- Added `NodeOp` typed operator enum, `PlanSchema`/`SchemaField`/`FieldType` types, and optional `op`/`output_schema` fields to `PlanNode` in `krishiv-plan` (Slice 5).
+- Added `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` to `ExecutorHeartbeatRequest` and `ExecutorHeartbeat`; stored as `ExecutorHealthSnapshot` per `ExecutorRecord`; memory-aware placement skips over-threshold executors (Slice 6).
+- Added `operator_restart_does_not_duplicate_scheduler_jobs` test confirming idempotent reconciliation (Slice 7).
 
 ## In Progress
 
@@ -160,12 +164,12 @@ R3.2 connector certification.
 
 ## Next Steps
 
-1. Decide where coordinator-visible result metadata should be projected without putting Arrow batches into control-plane Protobuf messages.
-2. Continue R3.1 reliability work: graceful executor deregistration, cancellation, metadata persistence, restart recovery, and stability metrics.
-3. Add the coordinator-owned task-assignment client path once the scheduler is ready to push assignments directly instead of tests invoking `ExecutorTask.AssignTask`.
-4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
-5. Wire `MetadataStore` write-through into `Coordinator::submit_job` and task status update paths so jobs survive restarts automatically.
-6. Add a dedicated `Deregister` RPC to replace the best-effort `Draining` heartbeat used for graceful shutdown.
+1. Add dedicated `Deregister` RPC to replace best-effort `Draining` heartbeat (currently sufficient for R3.1 but tracked as deferred).
+2. Wire `cancel_job` call into the `KrishivJobReconciler` delete path (before finalizer is stripped) so no active assignments remain after a Kubernetes delete.
+3. Define task lease token model: issue a monotonically increasing token per task assignment; validate in shuffle write path (shuffle does not exist yet — defer to R4).
+4. Get Stage-Local Execution Model document reviewed and approved.
+5. Once the 4 items above are done, verify all R3.1 acceptance gate criteria and open R3.2 connector certification work.
+6. R3.2 (connectors) cannot start until R3.1 acceptance gate passes.
 
 ## Known Blockers
 
@@ -181,6 +185,9 @@ R3.2 connector certification.
 
 ## Last Validation
 
+- `cargo fmt --all --check` passed (branch `claude/analyze-codebase-recommendations-5vvXH`).
+- `cargo check --workspace` passed.
+- `cargo test --workspace` passed — 0 failures across all crates.
 - `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py codex/skills/krishiv-engine` passed.
 - `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/gopal/.agents/skills/krishiv-engine` passed.
 - `find docs/implementation -maxdepth 1 -type f -print | sort` shows R1-R10 trackers, README, and status files.
@@ -283,7 +290,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Continue R3.1 by deciding coordinator-visible output metadata projection, adding coordinator-owned task-assignment pushes, and continuing graceful deregistration/cancellation/recovery work before R3.2 connector certification.
+4. Implement the next R3.1 item: dedicated `Deregister` RPC, or `KrishivJob` delete cancel path, whichever is smaller. Keep to one durable checkpoint.
 
 For a new Claude Code session:
 
@@ -293,4 +300,4 @@ Start with `/krishiv-engine resume`, then:
 2. Read `CLAUDE.md`.
 3. Read this file.
 4. Read `docs/implementation/r3-connector-contracts.md`.
-5. Continue the same R3.1 task slice from repository state; do not rely on Codex-only or Claude-only chat history.
+5. Continue from the Next Steps list above; do not rely on Codex-only or Claude-only chat history.
