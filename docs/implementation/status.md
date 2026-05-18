@@ -14,7 +14,7 @@ SQL/DataFusion seam, return lightweight row/batch/column output metadata to the
 runner caller, and report terminal status back to the scheduler-backed
 coordinator service or networked coordinator gRPC endpoint. The next active task
 is continuing R3.1 reliability work — graceful deregistration, cancellation,
-metadata persistence and restart recovery — with the basic stability metrics slice now aligned against the R3 tracker — before starting
+metadata persistence, restart recovery, and stability metrics — before starting
 R3.2 connector certification.
 
 ## Completed
@@ -153,7 +153,6 @@ R3.2 connector certification.
 - Added `has_finalizer` and `is_being_deleted` helpers to `ObjectMeta`.
 - Added `FinalizerAdded` and `FinalizerRemoved` variants to `ReconcileAction`.
 - Wired finalizer lifecycle logic at the top of `KrishivJobReconciler::reconcile`.
-- Reviewed R3.1 scheduler/exec/optimizer progress crate by crate against the implementation tracker; fixed the missing task-duration stability metric, removed stale test/clippy warnings, and marked the R3.1 basic stability metrics tracker items complete.
 
 ## In Progress
 
@@ -161,11 +160,12 @@ R3.2 connector certification.
 
 ## Next Steps
 
-1. Continue R3.1 reliability work: graceful executor deregistration, cancellation, metadata persistence, and restart recovery.
-2. Add the coordinator-owned task-assignment client path once the scheduler is ready to push assignments directly instead of tests invoking `ExecutorTask.AssignTask`.
-3. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
-4. Wire `MetadataStore` write-through into `Coordinator::submit_job` and task status update paths so jobs survive restarts automatically.
-5. Add a dedicated `Deregister` RPC to replace the best-effort `Draining` heartbeat used for graceful shutdown.
+1. Decide where coordinator-visible result metadata should be projected without putting Arrow batches into control-plane Protobuf messages.
+2. Continue R3.1 reliability work: graceful executor deregistration, cancellation, metadata persistence, restart recovery, and stability metrics.
+3. Add the coordinator-owned task-assignment client path once the scheduler is ready to push assignments directly instead of tests invoking `ExecutorTask.AssignTask`.
+4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
+5. Wire `MetadataStore` write-through into `Coordinator::submit_job` and task status update paths so jobs survive restarts automatically.
+6. Add a dedicated `Deregister` RPC to replace the best-effort `Draining` heartbeat used for graceful shutdown.
 
 ## Known Blockers
 
@@ -181,11 +181,6 @@ R3.2 connector certification.
 
 ## Last Validation
 
-- `cargo test -p krishiv-scheduler` passed after adding task-duration stability metrics.
-- `cargo fmt --all --check` passed after the crate-by-crate warning and metrics alignment review.
-- `cargo clippy --workspace --all-targets -- -D warnings` passed after fixing async-lock/test lint issues and stale test warnings.
-- `cargo test --workspace` passed after the crate-by-crate warning and metrics alignment review.
-- `git diff --check` passed after the crate-by-crate warning and metrics alignment review.
 - `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py codex/skills/krishiv-engine` passed.
 - `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/gopal/.agents/skills/krishiv-engine` passed.
 - `find docs/implementation -maxdepth 1 -type f -print | sort` shows R1-R10 trackers, README, and status files.
@@ -288,7 +283,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Continue R3.1 by adding coordinator-owned task-assignment pushes and continuing graceful deregistration/cancellation/recovery work before R3.2 connector certification.
+4. Continue R3.1 by deciding coordinator-visible output metadata projection, adding coordinator-owned task-assignment pushes, and continuing graceful deregistration/cancellation/recovery work before R3.2 connector certification.
 
 For a new Claude Code session:
 
