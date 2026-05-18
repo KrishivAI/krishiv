@@ -10,3 +10,4 @@ resources:
   - executor-deployment.yaml
   - sample-krishivjob.yaml
   - sample-streaming-krishivjob.yaml
+  - network-policy.yaml

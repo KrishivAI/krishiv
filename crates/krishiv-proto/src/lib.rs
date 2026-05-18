@@ -495,6 +495,7 @@ impl StageSpec {
 pub struct TaskSpec {
     task_id: TaskId,
     description: String,
+    task_timeout_secs: Option<u64>,
 }
 
 impl TaskSpec {
@@ -503,7 +504,15 @@ impl TaskSpec {
         Self {
             task_id,
             description: description.into(),
+            task_timeout_secs: None,
         }
+    }
+
+    /// Attach a per-task execution timeout.
+    #[must_use]
+    pub fn with_task_timeout_secs(mut self, secs: u64) -> Self {
+        self.task_timeout_secs = Some(secs);
+        self
     }
 
     /// Task id.
@@ -514,6 +523,11 @@ impl TaskSpec {
     /// Human-readable task description.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Per-task execution timeout in seconds, if set.
+    pub fn task_timeout_secs(&self) -> Option<u64> {
+        self.task_timeout_secs
     }
 }
 
@@ -1414,6 +1428,7 @@ pub struct ExecutorTaskAssignment {
     input_partitions: Vec<InputPartition>,
     plan_fragment: PlanFragment,
     output_contract: OutputContract,
+    task_timeout_secs: Option<u64>,
 }
 
 impl ExecutorTaskAssignment {
@@ -1436,7 +1451,15 @@ impl ExecutorTaskAssignment {
             input_partitions: Vec::new(),
             plan_fragment,
             output_contract,
+            task_timeout_secs: None,
         }
+    }
+
+    /// Attach a per-task execution timeout.
+    #[must_use]
+    pub fn with_task_timeout_secs(mut self, secs: u64) -> Self {
+        self.task_timeout_secs = Some(secs);
+        self
     }
 
     /// Attach input partitions.
@@ -1501,6 +1524,11 @@ impl ExecutorTaskAssignment {
     /// Output contract.
     pub fn output_contract(&self) -> &OutputContract {
         &self.output_contract
+    }
+
+    /// Per-task execution timeout in seconds, if set.
+    pub fn task_timeout_secs(&self) -> Option<u64> {
+        self.task_timeout_secs
     }
 }
 
@@ -2021,6 +2049,7 @@ pub mod wire {
                 .collect(),
             plan_fragment: Some(plan_fragment_to_wire(value.plan_fragment())),
             output_contract: Some(output_contract_to_wire(value.output_contract())),
+            task_timeout_secs: value.task_timeout_secs().unwrap_or(0),
         }
     }
 
@@ -2048,7 +2077,7 @@ pub mod wire {
         let output_contract =
             output_contract_from_wire(required(value.output_contract, "output_contract")?)?;
 
-        Ok(ExecutorTaskAssignment::new(
+        let mut assignment = ExecutorTaskAssignment::new(
             ids,
             executor_id,
             lease_generation,
@@ -2056,7 +2085,11 @@ pub mod wire {
             output_contract,
         )
         .with_version(version)
-        .with_input_partitions(input_partitions))
+        .with_input_partitions(input_partitions);
+        if value.task_timeout_secs > 0 {
+            assignment = assignment.with_task_timeout_secs(value.task_timeout_secs);
+        }
+        Ok(assignment)
     }
 
     /// Convert a domain task status request to protobuf.

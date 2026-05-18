@@ -1404,27 +1404,30 @@ impl JobRecord {
                         }
                     })?;
                     let task_description = task.spec.description().to_owned();
-                    assignments.push(
-                        ExecutorTaskAssignment::new(
-                            TaskAttemptRef::new(
-                                self.spec.job_id().clone(),
-                                stage_id.clone(),
-                                task.task_id().clone(),
-                                attempt_id,
-                            ),
-                            executor_id,
-                            lease_generation,
-                            PlanFragment::new(task_description.clone()),
-                            OutputContract::new(
-                                OutputContractKind::InlineRecordBatches,
-                                format!("inline result for {}", task.task_id()),
-                            ),
-                        )
-                        .with_input_partitions(vec![InputPartition::new(
-                            task.task_id().as_str(),
-                            task_description,
-                        )]),
-                    );
+                    let task_timeout_secs = task.spec.task_timeout_secs();
+                    let mut assignment = ExecutorTaskAssignment::new(
+                        TaskAttemptRef::new(
+                            self.spec.job_id().clone(),
+                            stage_id.clone(),
+                            task.task_id().clone(),
+                            attempt_id,
+                        ),
+                        executor_id,
+                        lease_generation,
+                        PlanFragment::new(task_description.clone()),
+                        OutputContract::new(
+                            OutputContractKind::InlineRecordBatches,
+                            format!("inline result for {}", task.task_id()),
+                        ),
+                    )
+                    .with_input_partitions(vec![InputPartition::new(
+                        task.task_id().as_str(),
+                        task_description,
+                    )]);
+                    if let Some(secs) = task_timeout_secs {
+                        assignment = assignment.with_task_timeout_secs(secs);
+                    }
+                    assignments.push(assignment);
                 }
             }
             if stage
@@ -1684,6 +1687,7 @@ pub struct TaskRecord {
     assigned_executor: Option<ExecutorId>,
     attempt: u32,
     output_metadata: Option<TaskOutputMetadata>,
+    last_failure_reason: Option<String>,
 }
 
 impl TaskRecord {
@@ -1694,6 +1698,7 @@ impl TaskRecord {
             assigned_executor: None,
             attempt: 0,
             output_metadata: None,
+            last_failure_reason: None,
         }
     }
 
@@ -1720,6 +1725,11 @@ impl TaskRecord {
     /// Last reported output metadata.
     pub fn output_metadata(&self) -> Option<&TaskOutputMetadata> {
         self.output_metadata.as_ref()
+    }
+
+    /// Last failure reason reported by the executor, if any.
+    pub fn last_failure_reason(&self) -> Option<&str> {
+        self.last_failure_reason.as_deref()
     }
 
     fn cancel(&mut self) {
@@ -1774,6 +1784,9 @@ impl TaskRecord {
         if let Some(output_metadata) = update.output_metadata() {
             self.output_metadata = Some(output_metadata.clone());
         }
+        if self.state == TaskState::Failed {
+            self.last_failure_reason = update.message().map(ToOwned::to_owned);
+        }
         Ok(TaskUpdateOutcome::Applied)
     }
 
@@ -1784,6 +1797,7 @@ impl TaskRecord {
             assigned_executor: self.assigned_executor.clone(),
             attempt: self.attempt,
             output_metadata: self.output_metadata.clone(),
+            last_failure_reason: self.last_failure_reason.clone(),
         }
     }
 }
@@ -1913,6 +1927,7 @@ pub struct TaskSnapshot {
     assigned_executor: Option<ExecutorId>,
     attempt: u32,
     output_metadata: Option<TaskOutputMetadata>,
+    last_failure_reason: Option<String>,
 }
 
 impl TaskSnapshot {
@@ -1939,6 +1954,11 @@ impl TaskSnapshot {
     /// Last reported output metadata.
     pub fn output_metadata(&self) -> Option<&TaskOutputMetadata> {
         self.output_metadata.as_ref()
+    }
+
+    /// Last failure reason reported by the executor, if any.
+    pub fn last_failure_reason(&self) -> Option<&str> {
+        self.last_failure_reason.as_deref()
     }
 }
 
@@ -2179,11 +2199,11 @@ mod tests {
 
     use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
-        AttemptId, CoordinatorExecutorService, CoordinatorId, ExecutorDescriptor,
-        ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorId, ExecutorState, JobId, JobKind,
-        JobSpec, JobState, LeaseGeneration, RegisterExecutorRequest, StageId, StageSpec,
-        TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
-        TaskStatusResponse, TaskStatusUpdate, TransportDisposition, wire,
+        AttemptId, CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
+        ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorId, ExecutorState,
+        JobId, JobKind, JobSpec, JobState, LeaseGeneration, RegisterExecutorRequest, StageId,
+        StageSpec, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
+        TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition, wire,
     };
 
     use super::{
@@ -2737,6 +2757,82 @@ mod tests {
         let task_status = wire::task_status_response_from_wire(task_status).unwrap();
 
         assert_eq!(task_status.disposition(), TransportDisposition::Accepted);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn grpc_deregister_transitions_executor_to_removed() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-deregister").unwrap(),
+        ));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping networked gRPC test because loopback sockets are denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind test gRPC listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            serve_coordinator_executor_grpc_with_listener(listener, server_shared)
+                .await
+                .unwrap();
+        });
+
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            format!("http://{addr}"),
+        )
+        .await
+        .unwrap();
+
+        let executor_id = ExecutorId::try_new("exec-dereg-1").unwrap();
+        let register_resp = client
+            .register_executor(wire::register_executor_request_to_wire(
+                RegisterExecutorRequest::new(ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-dereg",
+                    1,
+                )),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let register_resp = wire::register_executor_response_from_wire(register_resp).unwrap();
+        assert_eq!(register_resp.disposition(), TransportDisposition::Accepted);
+
+        let lease_generation = {
+            let coordinator = shared.read().unwrap();
+            coordinator
+                .executor_snapshots()
+                .into_iter()
+                .find(|s| s.executor_id() == &executor_id)
+                .expect("executor should be registered")
+                .lease_generation()
+        };
+
+        let dereg_resp = client
+            .deregister_executor(wire::deregister_executor_request_to_wire(
+                DeregisterExecutorRequest::new(executor_id.clone(), lease_generation),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let dereg_resp = wire::deregister_executor_response_from_wire(dereg_resp).unwrap();
+        assert_eq!(dereg_resp.disposition(), TransportDisposition::Accepted);
+
+        {
+            let coordinator = shared.read().unwrap();
+            let snapshot = coordinator
+                .executor_snapshots()
+                .into_iter()
+                .find(|s| s.executor_id() == &executor_id)
+                .expect("executor should still be in registry after deregister");
+            assert_eq!(snapshot.state(), ExecutorState::Removed);
+        }
 
         server.abort();
         let _ = server.await;

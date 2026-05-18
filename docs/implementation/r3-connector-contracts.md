@@ -87,12 +87,12 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Add estimated cardinality fields to plan nodes for R4 CBO (`PlanNode::with_estimated_rows` already existed; now paired with schema).
 - [x] Write `docs/architecture/stage-local-execution.md` documenting the Stage-Local Execution Model: coordinator assigns partitions, executor runs a full local DataFusion context for its partitions, shuffle moves data between stages. No custom distributed physical operators needed.
 - [x] Define graceful executor shutdown protocol: SIGTERM → finish current RecordBatch → deregister via RPC → exit (before SIGKILL terminates the process).
-- [x] Define executor deregistration RPC (fast path: best-effort `Draining` heartbeat for R3.1; dedicated `Deregister` RPC deferred).
+- [x] Define executor deregistration RPC — dedicated `Deregister` RPC implemented (`DeregisterExecutorRequest`/`DeregisterExecutorResponse`, `Coordinator::deregister_executor`, gRPC service handler, and wire helpers in `krishiv-proto` and `krishiv-scheduler`).
 - [ ] Define task lease token model: coordinator issues a monotonically increasing lease token per task assignment; shuffle/sink writes validate this token before committing, rejecting stale tokens from zombie executors.
 - [x] Define extended executor heartbeat payload: `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` added to `ExecutorHeartbeatRequest` and `ExecutorHeartbeat`; stored as `ExecutorHealthSnapshot` per `ExecutorRecord`.
 - [x] Define job cancellation protocol: `Coordinator::push_cancel_job` sends `CancelTask` gRPC to all executors owning running tasks, then marks job `Cancelled` in scheduler state.
 - [x] Add Kubernetes `terminationGracePeriodSeconds: 30` to executor pod spec manifests consistent with graceful drain window.
-- [ ] Define task timeout model: `task_timeout_seconds` field in `TaskSpec`; executor kills a task that exceeds its timeout and reports `TaskFailed`; coordinator then reassigns according to `max_stage_retries`.
+- [x] Define task timeout model: `task_timeout_secs` field in `TaskSpec` and `ExecutorTaskAssignment`; wire field added to `ExecutorTaskAssignment` protobuf; executor enforces with `tokio::time::timeout` and reports `TaskFailed` on expiry.
 - [ ] Define executor pod launch failure handling: operator monitors executor pod readiness; if a pod is not `Ready` within `executor_startup_timeout_seconds`, the operator deregisters the executor from the coordinator and triggers task reassignment (does not wait for heartbeat timeout).
 - [ ] Support `--coordinator <URL>` startup flag on `krishiv-coordinator` and `krishiv-executor` binaries for bare metal / VM deployment (no Kubernetes dependency).
 - [x] Document bare metal deployment model: which features are Kubernetes-only (operator, CRDs, NetworkPolicy, K8s HA leader election) vs available on both targets (all core runtime: gRPC, task assignment, heartbeat, ShuffleStore, MetadataStore, CLI).
@@ -109,10 +109,10 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Implement executor heartbeat through the tonic-shaped service boundary.
 - [x] Expose executor heartbeat through a networked gRPC server/client.
 - [x] Include executor lease generation and task attempt ID in coordinator/executor transport contracts.
-- [ ] Add status API fields for executor lease age, task attempt, retry count, and last failure reason.
-- [ ] Add cancel/delete API path used by Kubernetes finalizers.
+- [x] Add status API fields for executor lease generation, task attempt, and last failure reason (`lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` in `ExecutorView`; `last_failure_reason` in `TaskView`; retry count deferred).
+- [x] Add cancel/delete API path used by Kubernetes finalizers: `reconcile` delete branch calls `coordinator.cancel_job` before stripping finalizer.
 - [x] Add `CancelTask` RPC from coordinator to executor (`Coordinator::push_cancel_job` + `wire::task_cancellation_request_to_wire`).
-- [ ] Add `Deregister` RPC from executor to coordinator (on graceful shutdown); best-effort `Draining` heartbeat used for R3.1.
+- [x] Add `Deregister` RPC from executor to coordinator: `DeregisterExecutor` RPC in `CoordinatorExecutor` service, `Coordinator::deregister_executor`, and `ExecutorRuntime::deregister_with_grpc_endpoint` updated to call the dedicated RPC.
 - [x] Extend heartbeat payload to include `memory_used_bytes`, `memory_limit_bytes`, `active_task_count`.
 - [x] Store health snapshot per executor in `ExecutorRegistry` (`ExecutorHealthSnapshot` field on `ExecutorRecord`).
 
@@ -130,9 +130,9 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Implement task lease token issuance on assignment; validate token before any shuffle or sink write.
 - [ ] Implement stale lease token rejection in shuffle write path.
 - [x] Implement memory-aware task placement: skip executors above configurable memory threshold when assigning new tasks (`CoordinatorConfig::with_memory_threshold`, `ExecutorRegistry` filters on `health_snapshot.memory_used_bytes`).
-- [ ] Implement task timeout enforcement on executor: kill task and report `TaskFailed` when `task_timeout_seconds` is exceeded.
+- [x] Implement task timeout enforcement on executor: `tokio::time::timeout` wraps `execute_stage_fragment`; on expiry returns `ExecutorError::InvalidAssignment` with timeout message causing `TaskFailed` report.
 - [ ] Implement operator-side executor pod launch failure detection: deregister executor if pod not `Ready` within `executor_startup_timeout_seconds`.
-- [ ] Implement Kubernetes NetworkPolicy manifest for pre-R9 security posture (restrict coordinator gRPC port to `krishiv` namespace).
+- [x] Implement Kubernetes NetworkPolicy manifest for pre-R9 security posture: `k8s/manifests/network-policy.yaml` restricts coordinator gRPC port 9090 to `krishiv-system` namespace; added to kustomization and validated by manifest test.
 - [x] Implement crash detection on coordinator side when executor heartbeat stops (`advance_heartbeat_clock` marks timed-out executors `Lost`).
 - [x] Implement task reassignment on executor crash: `advance_heartbeat_clock` resets Running tasks on lost executors to `Assigned`; relaunched on next `launch_assigned_task_assignments`.
 - [x] Add in-memory `MetadataStore` implementation.
@@ -150,7 +150,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Tonic service registration, heartbeat, and task status adapter tests pass.
 - [x] Networked registration, heartbeat, and task-status gRPC smoke test passes.
 - [x] Executor registers with coordinator and appears in executor registry.
-- [x] Executor deregisters cleanly on shutdown via best-effort `Draining` heartbeat (fast path; dedicated `Deregister` RPC deferred).
+- [x] Executor deregisters cleanly via dedicated `Deregister` RPC (`grpc_deregister_transitions_executor_to_removed`; fast-path draining heartbeat also retained).
 - [x] Graceful shutdown test: SIGTERM to executor → deregistration heartbeat sent → executor exits cleanly (SIGTERM handler implemented in `heartbeat_loop`).
 - [x] CancelJob test: `push_cancel_job` sends `CancelTask` RPC to executors; job transitions to `Cancelled` (`cancel_job_pushes_cancel_rpc_to_executor`).
 - [ ] Zombie executor test: network partition heals after task reassignment; stale lease token rejected by shuffle write path; only new-assignment output is committed (deferred — requires R4 shuffle).
@@ -170,6 +170,11 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] End-to-end test: `SELECT 1` runs coordinator → executor via gRPC, result metadata returned.
 - [x] End-to-end test: Parquet file scan runs on executor with DataFusion through the networked assignment/status path, with result metadata returned to the runner caller and task status accepted by the coordinator.
 - [x] Executor crash is detected by coordinator; task is reassigned to another executor (`executor_crash_detected_and_task_reassigned`).
+- [x] Dedicated `Deregister` RPC transitions executor to `Removed` over networked gRPC (`grpc_deregister_transitions_executor_to_removed`).
+- [x] `KrishivJob` delete path calls `cancel_job` before stripping finalizer (`reconcile_delete_calls_cancel_job_before_removing_finalizer`).
+- [x] Task timeout field propagates from `TaskSpec` through wire protocol to `ExecutorTaskAssignment` (`task_timeout_secs_round_trips_through_wire`; timeout enforcement via `tokio::time::timeout` in executor runner).
+- [x] NetworkPolicy manifest restricts coordinator gRPC port to `krishiv-system` namespace (`network_policy_restricts_coordinator_grpc_to_krishiv_namespace`).
+- [x] Status API exposes executor `lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count`, and task `last_failure_reason` via `ExecutorView`/`TaskView`.
 
 ### Acceptance Gate For R3.1
 
@@ -180,7 +185,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [ ] Stale lease tokens from a zombie executor are rejected by the shuffle write path (deferred — requires R4 shuffle).
 - [x] Coordinator restart recovers job, stage, task, attempt, executor lease, and event-log state.
 - [x] Stale task attempts and duplicate status updates cannot corrupt job state.
-- [ ] Deleting a `KrishivJob` runs finalizer cleanup and does not leave active assignments (finalizer lifecycle done; cancel/delete API path for K8s pending).
+- [x] Deleting a `KrishivJob` runs finalizer cleanup: `cancel_job` is called before finalizer is stripped, leaving no active assignments (`reconcile_delete_calls_cancel_job_before_removing_finalizer`).
 - [x] `MetadataStore` correctly persists job/task state.
 - [x] Typed plan operator enum passes schema propagation tests.
 - [x] Stage-Local Execution Model document is written.

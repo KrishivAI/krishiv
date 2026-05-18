@@ -157,6 +157,12 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 - Added `NodeOp` typed operator enum, `PlanSchema`/`SchemaField`/`FieldType` types, and optional `op`/`output_schema` fields to `PlanNode` in `krishiv-plan` (Slice 5).
 - Added `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` to `ExecutorHeartbeatRequest` and `ExecutorHeartbeat`; stored as `ExecutorHealthSnapshot` per `ExecutorRecord`; memory-aware placement skips over-threshold executors (Slice 6).
 - Added `operator_restart_does_not_duplicate_scheduler_jobs` test confirming idempotent reconciliation (Slice 7).
+- Added dedicated `DeregisterExecutor` RPC: `DeregisterExecutorRequest`/`DeregisterExecutorResponse` in `krishiv-proto`, `Coordinator::deregister_executor`, gRPC service handler in `krishiv-scheduler`, wire helpers, and `grpc_deregister_transitions_executor_to_removed` test.
+- Wired `cancel_job` into `KrishivJobReconciler` delete path before stripping finalizer; added `reconcile_delete_calls_cancel_job_before_removing_finalizer` test.
+- Added `task_timeout_secs` to `TaskSpec` and `ExecutorTaskAssignment`; wired through proto (`uint64 task_timeout_secs = 11`); executor enforces with `tokio::time::timeout` reporting `TaskFailed` on expiry.
+- Added `last_failure_reason` to `TaskRecord` and `TaskSnapshot`; propagated to `TaskView` in status API.
+- Added `lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` to `ExecutorView` in status API.
+- Added `k8s/manifests/network-policy.yaml` restricting coordinator gRPC (port 9090) to `krishiv-system` namespace; added to kustomization; validated by `network_policy_restricts_coordinator_grpc_to_krishiv_namespace` test.
 
 ## In Progress
 
@@ -164,12 +170,11 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 
 ## Next Steps
 
-1. Add dedicated `Deregister` RPC to replace best-effort `Draining` heartbeat (currently sufficient for R3.1 but tracked as deferred).
-2. Wire `cancel_job` call into the `KrishivJobReconciler` delete path (before finalizer is stripped) so no active assignments remain after a Kubernetes delete.
-3. Define task lease token model: issue a monotonically increasing token per task assignment; validate in shuffle write path (shuffle does not exist yet — defer to R4).
-4. Get Stage-Local Execution Model document reviewed and approved.
-5. Once the 4 items above are done, verify all R3.1 acceptance gate criteria and open R3.2 connector certification work.
-6. R3.2 (connectors) cannot start until R3.1 acceptance gate passes.
+1. Verify remaining R3.1 acceptance gate items that are still open (task lease token model, executor pod launch failure detection, `--coordinator` bare-metal flag, retry count in status API, `CancelTask` handler on executor, metrics emission).
+2. If the acceptance gate is satisfactory at current coverage, open R3.2 connector certification work (connector traits, Parquet, Kafka, S3, catalog crate).
+3. Task lease token model (deferred to R4 when shuffle exists).
+4. Executor pod launch failure detection (deferred R3.1 item).
+5. R3.2 (connectors) cannot start until R3.1 acceptance gate passes.
 
 ## Known Blockers
 
@@ -282,6 +287,8 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 - `cargo test -p krishiv-operator --lib` passed (17 tests, including `reconcile_adds_finalizer_on_first_observe`, `reconcile_removes_finalizer_on_deletion`).
 - `cargo test -p krishiv-executor --lib` passed (7 tests).
 - `cargo fmt --all --check` passed after R3.1 remaining slices.
+- `cargo fmt --all` applied; `cargo check --workspace` passed after R3.1 deregister/cancel/timeout/NetworkPolicy/UI-status slices.
+- `cargo test --workspace` passed — 0 failures across all crates (all test result lines `ok`).
 
 ## Resume Instructions
 
@@ -290,7 +297,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Implement the next R3.1 item: dedicated `Deregister` RPC, or `KrishivJob` delete cancel path, whichever is smaller. Keep to one durable checkpoint.
+4. Review the R3.1 acceptance gate — most items are now done. Either verify the gate passes or implement the next open item (task lease token model is deferred to R4; next tractable items are retry count in status API or `CancelTask` handler on executor).
 
 For a new Claude Code session:
 

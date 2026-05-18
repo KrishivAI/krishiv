@@ -218,6 +218,8 @@ pub struct TaskView {
     pub assigned_executor: String,
     /// Current attempt number.
     pub attempt: u32,
+    /// Last failure reason reported by the executor, if any.
+    pub last_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -234,6 +236,14 @@ pub struct ExecutorView {
     pub running_tasks: Vec<String>,
     /// Last deterministic scheduler heartbeat tick.
     pub last_heartbeat_tick: u64,
+    /// Current lease generation.
+    pub lease_generation: u64,
+    /// Memory used in bytes as reported by the last heartbeat, if any.
+    pub memory_used_bytes: Option<u64>,
+    /// Memory limit in bytes as reported by the last heartbeat, if any.
+    pub memory_limit_bytes: Option<u64>,
+    /// Active task count as reported by the last heartbeat, if any.
+    pub active_task_count: Option<u32>,
 }
 
 #[derive(Template)]
@@ -426,6 +436,7 @@ impl JobDetailView {
                                 .map(ToString::to_string)
                                 .unwrap_or_else(|| String::from("-")),
                             attempt: task.attempt(),
+                            last_failure_reason: task.last_failure_reason().map(ToOwned::to_owned),
                         })
                         .collect(),
                 })
@@ -436,6 +447,7 @@ impl JobDetailView {
 
 impl ExecutorView {
     fn from_record(record: &ExecutorRecord) -> Self {
+        let health = record.health_snapshot();
         Self {
             executor_id: record.executor_id().to_string(),
             state: record.state().to_string(),
@@ -447,6 +459,10 @@ impl ExecutorView {
                 .map(ToString::to_string)
                 .collect(),
             last_heartbeat_tick: record.last_heartbeat_tick(),
+            lease_generation: record.lease_generation().as_u64(),
+            memory_used_bytes: health.and_then(|h| h.memory_used_bytes),
+            memory_limit_bytes: health.and_then(|h| h.memory_limit_bytes),
+            active_task_count: health.and_then(|h| h.active_task_count),
         }
     }
 }

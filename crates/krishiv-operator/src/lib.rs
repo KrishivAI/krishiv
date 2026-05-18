@@ -735,8 +735,11 @@ impl KrishivJobReconciler {
             // Resource is being deleted — cancel the scheduler job if it exists and
             // signal that the finalizer should be stripped so Kubernetes can proceed.
             let job_id = scheduler_job_id(resource)?;
-            let _ = coordinator.job_snapshot(&job_id); // best-effort: ignore unknown job
-            let status = accepted_waiting_for_executors(resource, &self.coordinator_id);
+            let _ = coordinator.cancel_job(&job_id); // best-effort: ignore unknown job
+            let status = match coordinator.job_snapshot(&job_id) {
+                Ok(snapshot) => status_from_snapshot(resource, &self.coordinator_id, &snapshot),
+                Err(_) => accepted_waiting_for_executors(resource, &self.coordinator_id),
+            };
             return Ok(ReconcileOutcome {
                 action: ReconcileAction::FinalizerRemoved,
                 status,
@@ -937,8 +940,8 @@ fn accepted_waiting_for_executors(
 #[cfg(test)]
 mod tests {
     use krishiv_proto::{
-        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, TaskState,
-        TaskStatusUpdate,
+        CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
+        JobState, TaskState, TaskStatusUpdate,
     };
 
     use super::{
@@ -1260,6 +1263,35 @@ mod tests {
         let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
 
         assert_eq!(outcome.action(), ReconcileAction::FinalizerRemoved);
+    }
+
+    #[test]
+    fn reconcile_delete_calls_cancel_job_before_removing_finalizer() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = demo_coordinator(coordinator_id, 2).unwrap();
+
+        // Submit the job so there is a live scheduler job to cancel.
+        reconciler
+            .reconcile(&mut coordinator, &sample_resource())
+            .unwrap();
+
+        // Confirm job was submitted and is not yet cancelled.
+        let job_id = JobId::try_new("krishiv-system.sample-batch").unwrap();
+        let snapshot_before = coordinator.job_snapshot(&job_id).unwrap();
+        assert_ne!(snapshot_before.state(), JobState::Cancelled);
+
+        // Simulate the resource being deleted.
+        let mut resource = sample_resource();
+        resource.metadata.deletion_timestamp = Some(String::from("2026-05-18T00:00:00Z"));
+
+        let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
+
+        assert_eq!(outcome.action(), ReconcileAction::FinalizerRemoved);
+
+        // After reconcile on deletion the scheduler job must be cancelled.
+        let snapshot_after = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot_after.state(), JobState::Cancelled);
     }
 
     // --- Slice 7: Operator restart idempotency ---

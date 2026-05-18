@@ -375,7 +375,23 @@ impl ExecutorTaskRunner {
             .await?;
         ensure_status_accepted_or_duplicate(running.disposition(), TaskState::Running)?;
 
-        let output = match self.execute_stage_fragment(&assignment).await {
+        let execute_result = if let Some(timeout_secs) = assignment.task_timeout_secs() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                self.execute_stage_fragment(&assignment),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
+                    message: format!("task timed out after {} seconds", timeout_secs),
+                }),
+            }
+        } else {
+            self.execute_stage_fragment(&assignment).await
+        };
+
+        let output = match execute_result {
             Ok(output) => output,
             Err(error) => {
                 let failed = self
