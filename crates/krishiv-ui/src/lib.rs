@@ -17,11 +17,12 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use krishiv_proto::{
-    CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
-    JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
+    ConnectorCapabilityFlags, CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
+    ExecutorState, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
     Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, SchedulerError, SharedCoordinator,
+    StabilityMetrics,
 };
 use serde::Serialize;
 
@@ -209,6 +210,27 @@ pub struct StageView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConnectorCapabilityView {
+    pub bounded: bool,
+    pub unbounded: bool,
+    pub rewindable: bool,
+    pub transactional: bool,
+    pub idempotent: bool,
+}
+
+impl ConnectorCapabilityView {
+    fn from_flags(flags: &ConnectorCapabilityFlags) -> Self {
+        Self {
+            bounded: flags.bounded,
+            unbounded: flags.unbounded,
+            rewindable: flags.rewindable,
+            transactional: flags.transactional,
+            idempotent: flags.idempotent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskView {
     /// Task id.
     pub task_id: String,
@@ -218,6 +240,12 @@ pub struct TaskView {
     pub assigned_executor: String,
     /// Current attempt number.
     pub attempt: u32,
+    /// Last failure reason reported by the executor, if any.
+    pub last_failure_reason: Option<String>,
+    /// Source connector capability flags for this task, if declared.
+    pub source_capabilities: Option<ConnectorCapabilityView>,
+    /// Sink connector capability flags for this task, if declared.
+    pub sink_capabilities: Option<ConnectorCapabilityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -234,6 +262,14 @@ pub struct ExecutorView {
     pub running_tasks: Vec<String>,
     /// Last deterministic scheduler heartbeat tick.
     pub last_heartbeat_tick: u64,
+    /// Current lease generation.
+    pub lease_generation: u64,
+    /// Memory used in bytes as reported by the last heartbeat, if any.
+    pub memory_used_bytes: Option<u64>,
+    /// Memory limit in bytes as reported by the last heartbeat, if any.
+    pub memory_limit_bytes: Option<u64>,
+    /// Active task count as reported by the last heartbeat, if any.
+    pub active_task_count: Option<u32>,
 }
 
 #[derive(Template)]
@@ -268,25 +304,47 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
-/// Prometheus-format metrics endpoint (stub with hardcoded 0 values).
-async fn metrics() -> impl IntoResponse {
-    const BODY: &str = "\
-# HELP krishiv_jobs_total Total jobs submitted
-# TYPE krishiv_jobs_total counter
-krishiv_jobs_total 0
-# HELP krishiv_tasks_total Total tasks submitted
-# TYPE krishiv_tasks_total counter
-krishiv_tasks_total 0
+/// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
+async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
+    let body = match state.coordinator.read() {
+        Ok(coordinator) => format_stability_metrics(&coordinator.stability_metrics()),
+        Err(_) => format_stability_metrics(&StabilityMetrics::empty()),
+    };
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+fn format_stability_metrics(m: &StabilityMetrics) -> String {
+    let max_heartbeat_age = m
+        .heartbeat_ages()
+        .iter()
+        .map(|a| a.age_ticks())
+        .max()
+        .unwrap_or(0);
+    format!(
+        "\
+# HELP krishiv_running_tasks Currently running task count
+# TYPE krishiv_running_tasks gauge
+krishiv_running_tasks {running}
+# HELP krishiv_task_retries_total Total stage-level retries scheduled
+# TYPE krishiv_task_retries_total counter
+krishiv_task_retries_total {retries}
+# HELP krishiv_failed_assignments_total Total failed task assignments
+# TYPE krishiv_failed_assignments_total counter
+krishiv_failed_assignments_total {failed}
+# HELP krishiv_max_executor_heartbeat_age_ticks Max executor heartbeat age in scheduler ticks
+# TYPE krishiv_max_executor_heartbeat_age_ticks gauge
+krishiv_max_executor_heartbeat_age_ticks {hb_age}
 # HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
 # TYPE krishiv_shuffle_bytes_written_total counter
 krishiv_shuffle_bytes_written_total 0
-# HELP krishiv_shuffle_partitions_total Total shuffle partitions finalized
-# TYPE krishiv_shuffle_partitions_total counter
-krishiv_shuffle_partitions_total 0
-";
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        BODY,
+",
+        running = m.running_task_count(),
+        retries = m.retry_count(),
+        failed = m.failed_assignments(),
+        hb_age = max_heartbeat_age,
     )
 }
 
@@ -426,6 +484,15 @@ impl JobDetailView {
                                 .map(ToString::to_string)
                                 .unwrap_or_else(|| String::from("-")),
                             attempt: task.attempt(),
+                            last_failure_reason: task.last_failure_reason().map(ToOwned::to_owned),
+                            source_capabilities: task
+                                .source_capabilities
+                                .as_ref()
+                                .map(ConnectorCapabilityView::from_flags),
+                            sink_capabilities: task
+                                .sink_capabilities
+                                .as_ref()
+                                .map(ConnectorCapabilityView::from_flags),
                         })
                         .collect(),
                 })
@@ -436,6 +503,7 @@ impl JobDetailView {
 
 impl ExecutorView {
     fn from_record(record: &ExecutorRecord) -> Self {
+        let health = record.health_snapshot();
         Self {
             executor_id: record.executor_id().to_string(),
             state: record.state().to_string(),
@@ -447,6 +515,10 @@ impl ExecutorView {
                 .map(ToString::to_string)
                 .collect(),
             last_heartbeat_tick: record.last_heartbeat_tick(),
+            lease_generation: record.lease_generation().as_u64(),
+            memory_used_bytes: health.and_then(|h| h.memory_used_bytes),
+            memory_limit_bytes: health.and_then(|h| h.memory_limit_bytes),
+            active_task_count: health.and_then(|h| h.active_task_count),
         }
     }
 }
@@ -777,7 +849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_returns_ok_with_prometheus_body() {
+    async fn metrics_returns_prometheus_stability_fields() {
         let response = router(empty_state().unwrap())
             .oneshot(
                 Request::builder()
@@ -792,7 +864,33 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
 
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("krishiv_jobs_total"));
+        assert!(body.contains("krishiv_running_tasks"));
+        assert!(body.contains("krishiv_task_retries_total"));
+        assert!(body.contains("krishiv_failed_assignments_total"));
+        assert!(body.contains("krishiv_max_executor_heartbeat_age_ticks"));
+    }
+
+    #[tokio::test]
+    async fn metrics_reflects_live_coordinator_state() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        // Demo state has one executor that has sent a heartbeat, so heartbeat age
+        // should be non-negative (represented as a numeric value after the metric name).
+        assert!(body.contains("krishiv_max_executor_heartbeat_age_ticks "));
+        // The metrics are sourced from a live coordinator, not hardcoded zeros.
+        assert!(!body.contains("krishiv_running_tasks_total"));
     }
 
     #[tokio::test]

@@ -490,11 +490,26 @@ impl StageSpec {
     }
 }
 
+/// Connector capability flags surfaced in task metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConnectorCapabilityFlags {
+    pub bounded: bool,
+    pub unbounded: bool,
+    pub rewindable: bool,
+    pub transactional: bool,
+    pub idempotent: bool,
+}
+
 /// Task contract inside a stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     task_id: TaskId,
     description: String,
+    task_timeout_secs: Option<u64>,
+    /// Capability flags declared by the source connector for this task, if known.
+    pub source_capabilities: Option<ConnectorCapabilityFlags>,
+    /// Capability flags declared by the sink connector for this task, if known.
+    pub sink_capabilities: Option<ConnectorCapabilityFlags>,
 }
 
 impl TaskSpec {
@@ -503,7 +518,31 @@ impl TaskSpec {
         Self {
             task_id,
             description: description.into(),
+            task_timeout_secs: None,
+            source_capabilities: None,
+            sink_capabilities: None,
         }
+    }
+
+    /// Attach a per-task execution timeout.
+    #[must_use]
+    pub fn with_task_timeout_secs(mut self, secs: u64) -> Self {
+        self.task_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Attach source connector capability flags.
+    #[must_use]
+    pub fn with_source_capabilities(mut self, caps: ConnectorCapabilityFlags) -> Self {
+        self.source_capabilities = Some(caps);
+        self
+    }
+
+    /// Attach sink connector capability flags.
+    #[must_use]
+    pub fn with_sink_capabilities(mut self, caps: ConnectorCapabilityFlags) -> Self {
+        self.sink_capabilities = Some(caps);
+        self
     }
 
     /// Task id.
@@ -514,6 +553,11 @@ impl TaskSpec {
     /// Human-readable task description.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Per-task execution timeout in seconds, if set.
+    pub fn task_timeout_secs(&self) -> Option<u64> {
+        self.task_timeout_secs
     }
 }
 
@@ -1414,6 +1458,7 @@ pub struct ExecutorTaskAssignment {
     input_partitions: Vec<InputPartition>,
     plan_fragment: PlanFragment,
     output_contract: OutputContract,
+    task_timeout_secs: Option<u64>,
 }
 
 impl ExecutorTaskAssignment {
@@ -1436,7 +1481,15 @@ impl ExecutorTaskAssignment {
             input_partitions: Vec::new(),
             plan_fragment,
             output_contract,
+            task_timeout_secs: None,
         }
+    }
+
+    /// Attach a per-task execution timeout.
+    #[must_use]
+    pub fn with_task_timeout_secs(mut self, secs: u64) -> Self {
+        self.task_timeout_secs = Some(secs);
+        self
     }
 
     /// Attach input partitions.
@@ -1501,6 +1554,11 @@ impl ExecutorTaskAssignment {
     /// Output contract.
     pub fn output_contract(&self) -> &OutputContract {
         &self.output_contract
+    }
+
+    /// Per-task execution timeout in seconds, if set.
+    pub fn task_timeout_secs(&self) -> Option<u64> {
+        self.task_timeout_secs
     }
 }
 
@@ -2021,6 +2079,7 @@ pub mod wire {
                 .collect(),
             plan_fragment: Some(plan_fragment_to_wire(value.plan_fragment())),
             output_contract: Some(output_contract_to_wire(value.output_contract())),
+            task_timeout_secs: value.task_timeout_secs().unwrap_or(0),
         }
     }
 
@@ -2048,7 +2107,7 @@ pub mod wire {
         let output_contract =
             output_contract_from_wire(required(value.output_contract, "output_contract")?)?;
 
-        Ok(ExecutorTaskAssignment::new(
+        let mut assignment = ExecutorTaskAssignment::new(
             ids,
             executor_id,
             lease_generation,
@@ -2056,7 +2115,11 @@ pub mod wire {
             output_contract,
         )
         .with_version(version)
-        .with_input_partitions(input_partitions))
+        .with_input_partitions(input_partitions);
+        if value.task_timeout_secs > 0 {
+            assignment = assignment.with_task_timeout_secs(value.task_timeout_secs);
+        }
+        Ok(assignment)
     }
 
     /// Convert a domain task status request to protobuf.
@@ -2411,12 +2474,12 @@ pub mod wire {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttemptId, DeregisterExecutorRequest, ExecutorDescriptor, ExecutorHeartbeatRequest,
-        ExecutorId, ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec,
-        JobState, LeaseGeneration, OutputContract, OutputContractKind, PlanFragment,
-        RegisterExecutorRequest, StageId, StageSpec, TaskAttemptRef, TaskCancellationRequest,
-        TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
-        TransportDisposition, TransportVersion,
+        AttemptId, ConnectorCapabilityFlags, DeregisterExecutorRequest, ExecutorDescriptor,
+        ExecutorHeartbeatRequest, ExecutorId, ExecutorState, ExecutorTaskAssignment,
+        InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
+        OutputContractKind, PlanFragment, RegisterExecutorRequest, StageId, StageSpec,
+        TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
+        TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
     };
 
     #[test]
@@ -2434,6 +2497,35 @@ mod tests {
         assert_eq!(error.reason(), "must be greater than zero");
         assert_eq!(AttemptId::initial().next().as_u32(), 2);
         assert_eq!(LeaseGeneration::initial().next().as_u64(), 2);
+    }
+
+    #[test]
+    fn connector_capability_flags_default_all_false() {
+        let flags = ConnectorCapabilityFlags::default();
+        assert!(!flags.bounded);
+        assert!(!flags.unbounded);
+        assert!(!flags.rewindable);
+        assert!(!flags.transactional);
+        assert!(!flags.idempotent);
+    }
+
+    #[test]
+    fn task_spec_with_connector_capabilities() {
+        let source_caps = ConnectorCapabilityFlags {
+            bounded: true,
+            rewindable: true,
+            ..Default::default()
+        };
+        let sink_caps = ConnectorCapabilityFlags {
+            idempotent: true,
+            bounded: true,
+            ..Default::default()
+        };
+        let task = TaskSpec::new(TaskId::try_new("task-caps-1").unwrap(), "parquet scan")
+            .with_source_capabilities(source_caps.clone())
+            .with_sink_capabilities(sink_caps.clone());
+        assert_eq!(task.source_capabilities.as_ref(), Some(&source_caps));
+        assert_eq!(task.sink_capabilities.as_ref(), Some(&sink_caps));
     }
 
     #[test]

@@ -2199,6 +2199,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-catalog"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+]
+
+[[package]]
 name = "krishiv-cli"
 version = "0.1.0"
 dependencies = [
@@ -2208,6 +2217,19 @@ dependencies = [
  "krishiv-scheduler",
  "parquet",
  "tempfile",
+]
+
+[[package]]
+name = "krishiv-connectors"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "krishiv-proto",
+ "object_store",
+ "parquet",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2223,6 +2245,7 @@ name = "krishiv-executor"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "krishiv-connectors",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-sql",
@@ -2294,7 +2317,9 @@ name = "krishiv-shuffle"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
  "futures",
+ "parquet",
  "tempfile",
  "tokio",
 ]

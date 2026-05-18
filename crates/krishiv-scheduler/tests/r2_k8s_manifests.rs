@@ -2,6 +2,7 @@
 
 const CRD: &str = include_str!("../../../k8s/crds/krishivjobs.yaml");
 const KUSTOMIZATION: &str = include_str!("../../../k8s/manifests/kustomization.yaml");
+const NETWORK_POLICY: &str = include_str!("../../../k8s/manifests/network-policy.yaml");
 const COORDINATOR_SERVICE: &str = include_str!("../../../k8s/manifests/coordinator-service.yaml");
 const EXECUTOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/executor-deployment.yaml");
 const OPERATOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/operator-deployment.yaml");
@@ -54,6 +55,23 @@ fn kustomization_references_all_r2_manifests() {
             "executor-deployment.yaml",
             "sample-krishivjob.yaml",
             "sample-streaming-krishivjob.yaml",
+            "network-policy.yaml",
+        ],
+    );
+}
+
+#[test]
+fn network_policy_restricts_coordinator_grpc_to_krishiv_namespace() {
+    assert_contains_all(
+        NETWORK_POLICY,
+        &[
+            "kind: NetworkPolicy",
+            "name: krishiv-coordinator-grpc",
+            "namespace: krishiv-system",
+            "app.kubernetes.io/component: operator",
+            "Ingress",
+            "kubernetes.io/metadata.name: krishiv-system",
+            "port: 9090",
         ],
     );
 }

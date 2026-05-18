@@ -87,6 +87,7 @@ message ExecutorTaskAssignment {
   repeated InputPartition input_partitions = 8;
   PlanFragment plan_fragment = 9;
   OutputContract output_contract = 10;
+  uint64 task_timeout_secs = 11;
 }
 
 message InputPartition {

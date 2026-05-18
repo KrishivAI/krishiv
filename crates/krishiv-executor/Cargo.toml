@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-sql = { path = "../krishiv-sql" }
 tokio = { workspace = true, features = ["time", "signal"] }

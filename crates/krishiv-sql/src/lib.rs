@@ -129,6 +129,39 @@ impl SqlEngine {
         Ok(SqlDataFrame::new("parquet-read", dataframe))
     }
 
+    /// Register an in-memory table from Arrow record batches.
+    ///
+    /// The schema is inferred from the first batch. An empty `batches` slice
+    /// registers a table with no rows using the provided schema if the batches
+    /// are non-empty, or is a no-op if empty.
+    pub async fn register_record_batches(
+        &self,
+        table_name: impl AsRef<str>,
+        batches: Vec<RecordBatch>,
+    ) -> SqlResult<()> {
+        use std::sync::Arc;
+        let table_name = table_name.as_ref();
+        if table_name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let schema = batches[0].schema();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![batches]).map_err(|e| {
+                SqlError::DataFusion {
+                    message: e.to_string(),
+                }
+            })?;
+        self.context
+            .register_table(table_name, Arc::new(mem_table))
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        Ok(())
+    }
+
     /// Plan a SQL query with DataFusion.
     pub async fn sql(&self, query: impl AsRef<str>) -> SqlResult<SqlDataFrame> {
         let query = query.as_ref();

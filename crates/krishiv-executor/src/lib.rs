@@ -68,6 +68,7 @@ impl Error for ExecutorError {}
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<Vec<ExecutorTaskAssignment>>>,
+    cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
 }
 
 impl ExecutorAssignmentInbox {
@@ -99,6 +100,9 @@ impl ExecutorAssignmentInbox {
     }
 
     /// Cancel and remove queued assignments for a task id.
+    ///
+    /// Also marks the task id as cancelled so the runner can skip execution even
+    /// if the task has already been popped from the queue.
     pub fn cancel_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
         let mut assignments = self
             .assignments
@@ -106,7 +110,31 @@ impl ExecutorAssignmentInbox {
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
         let before = assignments.len();
         assignments.retain(|assignment| assignment.task_id() != task_id);
-        Ok(assignments.len() != before)
+        let removed = assignments.len() != before;
+        drop(assignments);
+        self.cancelled_tasks
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .insert(task_id.clone());
+        Ok(removed)
+    }
+
+    /// Whether a task id has been cancelled.
+    pub fn is_task_cancelled(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
+        Ok(self
+            .cancelled_tasks
+            .read()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .contains(task_id))
+    }
+
+    /// Remove a task id from the cancelled set after the runner has handled it.
+    pub fn clear_cancelled_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<()> {
+        self.cancelled_tasks
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .remove(task_id);
+        Ok(())
     }
 
     /// Snapshot all received assignments.
@@ -134,6 +162,7 @@ impl ExecutorAssignmentInbox {
 }
 
 const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
+const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalParquetPartition {
@@ -268,6 +297,15 @@ impl ExecutorTaskOutput {
         }
     }
 
+    fn cancelled() -> Self {
+        Self {
+            kind: ExecutorTaskOutputKind::Cancelled,
+            row_count: 0,
+            batch_count: 0,
+            column_count: 0,
+        }
+    }
+
     /// Output kind.
     pub fn kind(&self) -> ExecutorTaskOutputKind {
         self.kind
@@ -306,6 +344,8 @@ pub enum ExecutorTaskOutputKind {
     Sql,
     /// Placeholder path for non-SQL fragments while R3.1 is still bootstrapping.
     Placeholder,
+    /// Task was cancelled before execution started.
+    Cancelled,
 }
 
 impl ExecutorTaskOutputKind {
@@ -313,6 +353,7 @@ impl ExecutorTaskOutputKind {
         match self {
             Self::Sql => "sql",
             Self::Placeholder => "placeholder",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -375,7 +416,48 @@ impl ExecutorTaskRunner {
             .await?;
         ensure_status_accepted_or_duplicate(running.disposition(), TaskState::Running)?;
 
-        let output = match self.execute_stage_fragment(&assignment).await {
+        // If a CancelTask RPC arrived while this task was queued, finish here
+        // instead of starting execution.
+        if self
+            .inbox
+            .is_task_cancelled(assignment.task_id())
+            .map_err(|error| tonic::Status::internal(error.to_string()))?
+        {
+            let _ = self.inbox.clear_cancelled_task(assignment.task_id());
+            let cancelled = self
+                .send_task_status(
+                    &assignment,
+                    TaskState::Cancelled,
+                    "task cancelled by coordinator request",
+                    coordinator,
+                    None,
+                )
+                .await?;
+            return Ok(ExecutorTaskRunReport::new(
+                assignment,
+                ExecutorTaskOutput::cancelled(),
+                running.disposition(),
+                cancelled.disposition(),
+            ));
+        }
+
+        let execute_result = if let Some(timeout_secs) = assignment.task_timeout_secs() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                self.execute_stage_fragment(&assignment),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
+                    message: format!("task timed out after {} seconds", timeout_secs),
+                }),
+            }
+        } else {
+            self.execute_stage_fragment(&assignment).await
+        };
+
+        let output = match execute_result {
             Ok(output) => output,
             Err(error) => {
                 let failed = self
@@ -432,6 +514,16 @@ impl ExecutorTaskRunner {
             for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
                 engine
                     .register_parquet(partition.table_name(), partition.path())
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
+            }
+            for (table_name, batches) in
+                read_connector_parquet_partitions(assignment.input_partitions()).await?
+            {
+                engine
+                    .register_record_batches(&table_name, batches)
                     .await
                     .map_err(|error| ExecutorError::LocalExecution {
                         message: error.to_string(),
@@ -526,6 +618,59 @@ fn parse_local_parquet_partitions(
         parsed.push(local_partition);
     }
     Ok(parsed)
+}
+
+/// Read all batches from `connector-parquet:<path>` input partitions via `ParquetSource`.
+///
+/// Returns a list of `(table_name, batches)` pairs — one per `connector-parquet:` partition.
+/// The table name is derived from the path's filename stem (without extension).
+/// Partitions that do not start with the `connector-parquet:` prefix are skipped.
+async fn read_connector_parquet_partitions(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    use krishiv_connectors::{Source, parquet::ParquetSource};
+
+    let mut result = Vec::new();
+    for partition in partitions {
+        let desc = partition.description().trim();
+        let path_str = match desc.strip_prefix(CONNECTOR_PARQUET_PARTITION_PREFIX) {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if path_str.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "input partition {} has an empty path in connector-parquet descriptor",
+                    partition.partition_id()
+                ),
+            });
+        }
+        let path = std::path::Path::new(path_str);
+        // Derive a table name from the filename stem.
+        let table_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("connector_table")
+            .to_owned();
+
+        let mut source = ParquetSource::open(path).map_err(|e| ExecutorError::LocalExecution {
+            message: format!("connector-parquet open failed for '{path_str}': {e}"),
+        })?;
+        let mut batches = Vec::new();
+        loop {
+            match source
+                .read_batch()
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("connector-parquet read failed: {e}"),
+                })? {
+                Some(batch) => batches.push(batch),
+                None => break,
+            }
+        }
+        result.push((table_name, batches));
+    }
+    Ok(result)
 }
 
 fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
@@ -1205,6 +1350,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-dereg-exec").unwrap(),
+        ));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping gRPC deregister test because loopback sockets are denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind test gRPC listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            serve_coordinator_executor_grpc_with_listener(listener, server_shared)
+                .await
+                .unwrap();
+        });
+
+        let runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-dereg-test", "pod-dereg", 1, format!("http://{addr}"))
+                .unwrap(),
+        );
+
+        runtime.register_with_grpc_endpoint().await.unwrap();
+        let dereg = runtime.deregister_with_grpc_endpoint().await.unwrap();
+        assert_eq!(dereg.disposition(), TransportDisposition::Accepted);
+
+        {
+            let coordinator = shared.read().unwrap();
+            let snapshot = coordinator
+                .executor_snapshots()
+                .into_iter()
+                .find(|s| s.executor_id().as_str() == "exec-dereg-test")
+                .expect("executor should still be in registry after deregister");
+            assert_eq!(snapshot.state(), ExecutorState::Removed);
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn task_runner_reports_cancelled_when_inbox_cancel_received() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-cancel").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-cancel-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        );
+
+        inbox.cancel_task(assignment.task_id()).unwrap();
+        assert!(inbox.is_task_cancelled(assignment.task_id()).unwrap());
+
+        let service = AcceptingCoordinatorService;
+        let report = runner
+            .run_assignment_with(assignment, &service)
+            .await
+            .unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Cancelled);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+    }
+
+    #[tokio::test]
     async fn task_inbox_service_accepts_assignment() {
         let inbox = ExecutorAssignmentInbox::new();
         let service = ExecutorTaskInboxService::new(inbox.clone());
@@ -1778,5 +2001,76 @@ mod tests {
         writer
             .close()
             .unwrap_or_else(|error| panic!("unexpected parquet close error: {error}"));
+    }
+
+    #[tokio::test]
+    async fn executor_runs_parquet_task_via_connector_source() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+
+        let executor_id = ExecutorId::try_new("exec-connector-1").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-connector-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-connector-1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-connector",
+                    1,
+                ))
+                .unwrap();
+            coordinator
+                .submit_job(parquet_scan_job(job_id.clone()))
+                .unwrap();
+            let launched = coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+                .remove(0);
+
+            // Use connector-parquet: prefix instead of local-parquet:
+            let assignment = ExecutorTaskAssignment::new(
+                TaskAttemptRef::new(
+                    launched.job_id().clone(),
+                    launched.stage_id().clone(),
+                    launched.task_id().clone(),
+                    launched.attempt_id(),
+                ),
+                launched.executor_id().clone(),
+                launched.lease_generation(),
+                PlanFragment::new("sql: select id, name from people where id > 1 order by id"),
+                OutputContract::new(OutputContractKind::InlineRecordBatches, "inline result"),
+            )
+            .with_input_partitions(vec![InputPartition::new(
+                "people-connector-part-1",
+                format!("connector-parquet:{}", parquet_path.display()),
+            )]);
+            inbox.push(assignment).unwrap();
+        }
+
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+        let report = runner.run_next_with(&service).await.unwrap().unwrap();
+
+        assert_eq!(report.assignment().job_id(), &job_id);
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 2, "expected 2 rows (id > 1)");
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 2);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+        assert!(inbox.is_empty().unwrap());
+
+        let coordinator = shared.read().unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
+        assert_eq!(snapshot.succeeded_task_count(), 1);
     }
 }
