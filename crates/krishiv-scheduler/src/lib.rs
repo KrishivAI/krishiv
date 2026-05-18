@@ -671,10 +671,12 @@ impl Coordinator {
         self.executors.heartbeat(heartbeat)
     }
 
-    /// Mark an executor lost, which is the R2 timeout skeleton.
+    /// Mark an executor lost and release its running task assignments for retry.
     pub fn mark_executor_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.ensure_active()?;
-        self.executors.mark_lost(executor_id)
+        self.executors.mark_lost(executor_id)?;
+        self.reset_running_tasks_for_lost_executor(executor_id);
+        Ok(())
     }
 
     /// Advance the deterministic heartbeat clock and mark timed-out executors lost.
@@ -685,30 +687,7 @@ impl Coordinator {
         self.ensure_active()?;
         let lost = self.executors.advance_clock(ticks);
         for lost_id in &lost {
-            for job in &mut self.jobs {
-                let mut job_affected = false;
-                for stage in &mut job.stages {
-                    let mut stage_affected = false;
-                    for task in &mut stage.tasks {
-                        if task.state == TaskState::Running
-                            && task.assigned_executor.as_ref() == Some(lost_id)
-                        {
-                            // Keep the assignment for the next launch attempt; the
-                            // attempt counter is not bumped here — it will be bumped
-                            // when `launch_assigned_task_assignments` is called next.
-                            task.state = TaskState::Assigned;
-                            stage_affected = true;
-                            job_affected = true;
-                        }
-                    }
-                    if stage_affected {
-                        stage.refresh_state();
-                    }
-                }
-                if job_affected {
-                    job.refresh_state();
-                }
-            }
+            self.reset_running_tasks_for_lost_executor(lost_id);
         }
         Ok(lost)
     }
@@ -943,6 +922,33 @@ impl Coordinator {
     /// Snapshot all known executors.
     pub fn executor_snapshots(&self) -> Vec<ExecutorRecord> {
         self.executors.list().to_vec()
+    }
+
+    fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
+        for job in &mut self.jobs {
+            let mut job_affected = false;
+            for stage in &mut job.stages {
+                let mut stage_affected = false;
+                for task in &mut stage.tasks {
+                    if task.state == TaskState::Running
+                        && task.assigned_executor.as_ref() == Some(lost_id)
+                    {
+                        // Keep the assignment for the next launch attempt; the
+                        // attempt counter is not bumped here — it will be bumped
+                        // when `launch_assigned_task_assignments` is called next.
+                        task.state = TaskState::Assigned;
+                        stage_affected = true;
+                        job_affected = true;
+                    }
+                }
+                if stage_affected {
+                    stage.refresh_state();
+                }
+            }
+            if job_affected {
+                job.refresh_state();
+            }
+        }
     }
 
     fn ensure_active(&self) -> SchedulerResult<()> {

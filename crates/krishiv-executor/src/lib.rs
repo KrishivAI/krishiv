@@ -2681,14 +2681,15 @@ mod tests {
         };
 
         store
-            .write_partition(
-                partition.clone(),
-                fresh_assignment.lease_generation().as_u64(),
-            )
+            .register_partition_lease(id.clone(), fresh_assignment.lease_generation().as_u64())
             .await
             .unwrap();
+
         let err = store
-            .write_partition(partition, stale_assignment.lease_generation().as_u64())
+            .write_partition(
+                partition.clone(),
+                stale_assignment.lease_generation().as_u64(),
+            )
             .await
             .unwrap_err();
 
@@ -2699,6 +2700,12 @@ mod tests {
             }
             other => panic!("expected StaleLeaseToken, got {other}"),
         }
+        assert!(store.read_partition(&id).await.unwrap().is_none());
+
+        store
+            .write_partition(partition, fresh_assignment.lease_generation().as_u64())
+            .await
+            .unwrap();
         let stored = store.read_partition(&id).await.unwrap().unwrap();
         assert_eq!(stored.batches[0].num_rows(), 1);
     }

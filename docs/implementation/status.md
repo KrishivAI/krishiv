@@ -6,12 +6,14 @@ R3 hardening active / R4 Bootstrap.
 
 ## Active Task
 
-R3 hardening slices in progress/complete: Kafka post-write offset commit protocol, deterministic Kafka-compatible source/committer harness, Kafka → Parquet execution on the real executor runner, task lease generation → shuffle stale-token rejection proof, object-store Parquet executor source/sink path, durable JSON-file metadata store, and operator executor pod launch failure detection.
+R3 hardening slices complete: Kafka post-write offset commit protocol, deterministic Kafka-compatible source/committer harness, Kafka → Parquet execution on the real executor runner, task lease generation → exact shuffle stale-token rejection proof, object-store Parquet executor source/sink path, durable JSON-file metadata store, and operator executor pod launch failure detection that marks associated executors lost and requeues running tasks.
 Remaining follow-up:
 1. Live external Kafka broker feature/integration test (requires selecting a Kafka client/runtime feature; current R3 path uses deterministic in-memory Kafka-compatible harness).
+2. Full distributed zombie-executor network-partition shuffle e2e is carried into R4, because it depends on the R4 shuffle implementation beyond the R3 lease-token foundation.
 
 ## Completed
 
+- Hardened R3 practical remaining slices: exact shuffle lease registration/rejection before commit, operator pod-launch failure executor fencing/requeue, R3 tracker reconciliation.
 - Created `docs/architecture/krishiv-roadmap.md`.
 - Created `AGENTS.md`.
 - Created `docs/engineering/standards.md`.
@@ -305,13 +307,14 @@ Remaining follow-up:
 - **R4 Bootstrap Slice F**: `ShuffleStore` trait, `InMemoryShuffleStore`, and `LocalDiskShuffleStore` added to `krishiv-shuffle` with lease-token zombie-executor rejection; `parquet` and `bytes` deps added to `krishiv-shuffle/Cargo.toml`; 8 new tokio async tests pass.
 
 - **R3 closure slices (previous session)**: Added `PostWriteOffsetCommitProtocol` and `OffsetCommitter` to enforce write → flush → offset commit ordering; added deterministic in-memory Kafka-compatible source and commit log; added executor Kafka → Parquet pipeline support using `ParquetSink`; added real-runner tests for the pipeline and connector-Parquet path; added assignment lease-generation → shuffle stale-token rejection proof.
-- **R3 hardening slices (this session)**: Added object-store Parquet source/sink execution descriptors on the real executor runner, `JsonFileMetadataStore` for durable local metadata/event-log recovery, and operator-side executor pod launch failure detection/status reporting.
+- **R3 hardening slices (previous session)**: Added object-store Parquet source/sink execution descriptors on the real executor runner, `JsonFileMetadataStore` for durable local metadata/event-log recovery, and operator-side executor pod launch failure detection/status reporting.
+- **R3 practical remaining slices (this session)**: Hardened `ShuffleStore` with registered exact lease-token validation before commit, extended the zombie-executor proof so stale writes cannot win before fresh output commits, and made operator pod-launch failure handling mark associated executors lost/requeue running tasks.
 
-## Last Validation (R3 closure slices, branch current)
+## Last Validation (R3 practical remaining slices, branch current)
 
 - `cargo fmt --all --check` passed.
 - `cargo check --workspace` passed.
-- `cargo test -p krishiv-executor -p krishiv-scheduler -p krishiv-operator` passed — 20 executor lib tests, 4 executor bin tests, 21 operator lib tests, 5 operator bin tests, 2 operator kind-smoke tests, 43 scheduler lib tests, 5 coordinator bin tests, 10 scheduler manifest tests, and doc tests.
+- `cargo test -p krishiv-shuffle -p krishiv-operator -p krishiv-scheduler -p krishiv-executor` passed — executor 20 lib/4 bin tests, operator 23 lib/5 bin/2 kind-smoke tests, scheduler 43 lib/5 coordinator-bin/10 manifest tests, shuffle 37 lib tests, and doc tests.
 - `cargo test --workspace` passed — 0 failures across all crates.
 
 ## Resume Instructions

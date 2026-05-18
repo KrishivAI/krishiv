@@ -494,6 +494,18 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// Implementations must be `Send + Sync` so they can be shared across async
 /// task boundaries inside the executor runtime.
 pub trait ShuffleStore: Send + Sync {
+    /// Register the currently valid assignment lease token for a partition.
+    ///
+    /// Executors should call this when a task assignment is launched so a
+    /// zombie attempt cannot win a race by writing before the replacement
+    /// attempt commits data. Subsequent writes for the partition must present
+    /// exactly this token until a newer assignment registers a replacement.
+    fn register_partition_lease(
+        &self,
+        id: PartitionId,
+        lease_token: u64,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
     /// Write a partition. `lease_token` must match the current assignment
     /// token for this partition; stale tokens are rejected.
     fn write_partition(
@@ -520,8 +532,10 @@ pub trait ShuffleStore: Send + Sync {
 /// not need to survive process restarts.
 #[derive(Default)]
 pub struct InMemoryShuffleStore {
-    // key: (job_id, stage_id, partition) → (lease_token, ShufflePartition)
-    partitions: Arc<RwLock<BTreeMap<(String, String, u32), (u64, ShufflePartition)>>>,
+    // key: (job_id, stage_id, partition) → latest accepted partition
+    partitions: Arc<RwLock<BTreeMap<(String, String, u32), ShufflePartition>>>,
+    // key: (job_id, stage_id, partition) → current assignment lease token
+    lease_tokens: Arc<RwLock<BTreeMap<(String, String, u32), u64>>>,
 }
 
 impl InMemoryShuffleStore {
@@ -531,6 +545,21 @@ impl InMemoryShuffleStore {
 }
 
 impl ShuffleStore for InMemoryShuffleStore {
+    async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
+        let key = (id.job_id, id.stage_id, id.partition);
+        let mut leases = self.lease_tokens.write().unwrap();
+        if let Some(&expected) = leases.get(&key) {
+            if lease_token < expected {
+                return Err(StoreError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
+            }
+        }
+        leases.insert(key, lease_token);
+        Ok(())
+    }
+
     async fn write_partition(
         &self,
         partition: ShufflePartition,
@@ -541,29 +570,40 @@ impl ShuffleStore for InMemoryShuffleStore {
             partition.id.stage_id.clone(),
             partition.id.partition,
         );
-        let mut guard = self.partitions.write().unwrap();
-        // If an existing entry has a HIGHER lease token, reject the write (stale).
-        if let Some((existing_token, _)) = guard.get(&key) {
-            if lease_token < *existing_token {
-                return Err(StoreError::StaleLeaseToken {
-                    expected: *existing_token,
-                    actual: lease_token,
-                });
+        {
+            let mut leases = self.lease_tokens.write().unwrap();
+            if let Some(&expected) = leases.get(&key) {
+                if lease_token != expected {
+                    return Err(StoreError::StaleLeaseToken {
+                        expected,
+                        actual: lease_token,
+                    });
+                }
+            } else {
+                // Compatibility path for direct single-attempt writes: the first
+                // writer establishes the expected token for this partition.
+                leases.insert(key.clone(), lease_token);
             }
         }
-        guard.insert(key, (lease_token, partition));
+        self.partitions.write().unwrap().insert(key, partition);
         Ok(())
     }
 
     async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
         let guard = self.partitions.read().unwrap();
-        Ok(guard.get(&key).map(|(_, p)| p.clone()))
+        Ok(guard.get(&key).cloned())
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
-        let mut guard = self.partitions.write().unwrap();
-        guard.retain(|(jid, _, _), _| jid != job_id);
+        self.partitions
+            .write()
+            .unwrap()
+            .retain(|(jid, _, _), _| jid != job_id);
+        self.lease_tokens
+            .write()
+            .unwrap()
+            .retain(|(jid, _, _), _| jid != job_id);
         Ok(())
     }
 }
@@ -605,6 +645,21 @@ impl LocalDiskShuffleStore {
 }
 
 impl ShuffleStore for LocalDiskShuffleStore {
+    async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
+        let key = (id.job_id, id.stage_id, id.partition);
+        let mut leases = self.lease_tokens.write().unwrap();
+        if let Some(&expected) = leases.get(&key) {
+            if lease_token < expected {
+                return Err(StoreError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
+            }
+        }
+        leases.insert(key, lease_token);
+        Ok(())
+    }
+
     async fn write_partition(
         &self,
         partition: ShufflePartition,
@@ -621,15 +676,18 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // Validate/update the lease token.
         {
             let mut tokens = self.lease_tokens.write().unwrap();
-            if let Some(&existing) = tokens.get(&key) {
-                if lease_token < existing {
+            if let Some(&expected) = tokens.get(&key) {
+                if lease_token != expected {
                     return Err(StoreError::StaleLeaseToken {
-                        expected: existing,
+                        expected,
                         actual: lease_token,
                     });
                 }
+            } else {
+                // Compatibility path for direct single-attempt writes: the first
+                // writer establishes the expected token for this partition.
+                tokens.insert(key, lease_token);
             }
-            tokens.insert(key, lease_token);
         }
 
         let path = self.partition_path(&partition.id);
@@ -1187,6 +1245,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_registered_fresh_lease_rejects_stale_registration() {
+        let store = InMemoryShuffleStore::new();
+        let id = make_store_partition("job-zombie-register", "s0", 0).id;
+
+        store.register_partition_lease(id.clone(), 8).await.unwrap();
+        let err = store.register_partition_lease(id, 7).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 8,
+                    actual: 7
+                }
+            ),
+            "expected StaleLeaseToken(expected=8, actual=7), got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_registered_fresh_lease_rejects_stale_write_before_commit() {
+        let store = InMemoryShuffleStore::new();
+        let partition = make_store_partition("job-zombie", "s0", 0);
+        let id = partition.id.clone();
+
+        store.register_partition_lease(id.clone(), 8).await.unwrap();
+
+        let err = store
+            .write_partition(partition.clone(), 7)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 8,
+                    actual: 7
+                }
+            ),
+            "expected StaleLeaseToken(expected=8, actual=7), got {err}"
+        );
+        assert!(store.read_partition(&id).await.unwrap().is_none());
+
+        store.write_partition(partition, 8).await.unwrap();
+        assert!(store.read_partition(&id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn local_disk_shuffle_write_and_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
@@ -1230,5 +1336,61 @@ mod tests {
             ),
             "expected StaleLeaseToken(expected=10, actual=7), got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_disk_registered_fresh_lease_rejects_stale_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let id = make_store_partition("job-disk-zombie-register", "s0", 0).id;
+
+        store
+            .register_partition_lease(id.clone(), 11)
+            .await
+            .unwrap();
+        let err = store.register_partition_lease(id, 10).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 11,
+                    actual: 10
+                }
+            ),
+            "expected StaleLeaseToken(expected=11, actual=10), got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_disk_registered_fresh_lease_rejects_stale_write_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let partition = make_store_partition("job-disk-zombie", "s0", 0);
+        let id = partition.id.clone();
+
+        store
+            .register_partition_lease(id.clone(), 11)
+            .await
+            .unwrap();
+
+        let err = store
+            .write_partition(partition.clone(), 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 11,
+                    actual: 10
+                }
+            ),
+            "expected StaleLeaseToken(expected=11, actual=10), got {err}"
+        );
+        assert!(store.read_partition(&id).await.unwrap().is_none());
+
+        store.write_partition(partition, 11).await.unwrap();
+        assert!(store.read_partition(&id).await.unwrap().is_some());
     }
 }
