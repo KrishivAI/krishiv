@@ -330,12 +330,12 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 - **R3 practical remaining slices (previous session)**: Hardened `ShuffleStore` with registered exact lease-token validation before commit, extended the zombie-executor proof so stale writes cannot win before fresh output commits, and made operator pod-launch failure handling mark associated executors lost/requeue running tasks.
 - **R1–R3 architecture remediation (this session)**: Added typed task input/output descriptors and wire round trips while keeping legacy string compatibility; migrated executor connector/object/Kafka tests to typed descriptors; added JSON metadata `schema_version`/`store_kind` envelope validation; reconciled R1/R2 roadmap checklist state; documented the R1–R3 architecture review and reconciled the already-approved streaming execution model in the roadmap.
 
-## Last Validation (R4 TPC-H correctness gate, branch `claude/analyze-r3-plan-r4-0QYyr`)
+## Last Validation (post-R4 bug sweep, branch `claude/analyze-r3-plan-r4-0QYyr`)
 
-- `cargo fmt --all` applied; `cargo fmt --check` passed.
-- `cargo check --workspace` passed (clean, no warnings on non-dead-code items).
-- `cargo test --workspace` passed — 297 tests, 0 failures across all crates and doc tests.
-- Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3), `e328e89` (TPC-H correctness gate).
+- `cargo fmt --all` applied.
+- `cargo build --workspace` passed (clean, 0 errors).
+- `cargo test --workspace` passed — 0 failures across all crates and doc tests.
+- Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3), `e328e89` (TPC-H correctness gate), `1492fac` (fmt), `bea4f03` (post-R4 bug sweep).
 - Branch pushed to remote: `origin/claude/analyze-r3-plan-r4-0QYyr`.
 
 ### Bug fixes in TPC-H commit (`e328e89`)
@@ -353,6 +353,19 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
   `Utf8View` (not `Utf8`) for string columns read from Parquet. Added
   `Utf8View` branch to `HashPartitioner` so the Q1 key column `l_returnflag`
   partitions correctly.
+
+### Bug fixes in post-R4 sweep commit (`bea4f03`)
+
+- **`validate_job` missing upstream stage check**: A `StageSpec` declaring
+  `upstream_stage_ids` referencing a stage not in the same `JobSpec` would
+  silently deadlock that stage forever. `validate_job` now rejects such specs
+  with `SchedulerError::InvalidJob`. Two new tests cover the accept/reject paths.
+- **`submit_job` save-before-push fragility**: `s.save_job(self.jobs.last().unwrap())`
+  was called after `self.jobs.push(record)`, making the borrow fragile if the
+  Vec ever reallocated with the record moved. Reordered: store first, push after.
+- **`HashPartitioner` LargeUtf8 gap**: Added `DataType::LargeUtf8` branch
+  alongside `Utf8` and `Utf8View` to complete coverage for all Arrow string variants
+  used in shuffle key columns.
 
 ## Resume Instructions
 
