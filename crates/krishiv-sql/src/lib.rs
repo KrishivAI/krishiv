@@ -218,10 +218,7 @@ pub fn explain_sql(query: impl Into<String>) -> SqlResult<String> {
 ///
 /// Runs the logical plan through `optimizer` and appends the optimizer
 /// summary to the plan description.
-pub fn explain_sql_optimized(
-    query: impl Into<String>,
-    optimizer: &Optimizer,
-) -> SqlResult<String> {
+pub fn explain_sql_optimized(query: impl Into<String>, optimizer: &Optimizer) -> SqlResult<String> {
     let plan = plan_sql(query)?;
     let result = optimizer.optimize(plan.logical_plan().clone());
     let mut output = result.plan.describe();
@@ -260,7 +257,9 @@ mod tests {
     use krishiv_optimizer::{Cost, CostModel, Optimizer};
     use krishiv_plan::LogicalPlan;
 
-    use super::{SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql};
+    use super::{
+        SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
+    };
 
     #[test]
     fn rejects_empty_sql() {

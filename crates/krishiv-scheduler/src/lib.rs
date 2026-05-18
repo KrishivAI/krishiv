@@ -689,8 +689,9 @@ impl Coordinator {
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         self.ensure_active()?;
         let executor_leases = self.executors.assignment_leases();
+        let current_tick = self.executors.current_tick();
         self.find_job_mut(job_id)?
-            .launch_assigned_task_assignments(&executor_leases)
+            .launch_assigned_task_assignments(&executor_leases, current_tick)
     }
 
     /// Cancel a job and mark non-terminal stages/tasks cancelled.
@@ -702,11 +703,17 @@ impl Coordinator {
 
     /// Basic scheduler/executor stability metrics.
     pub fn stability_metrics(&self) -> StabilityMetrics {
+        let current_tick = self.executors.current_tick();
         StabilityMetrics {
             heartbeat_ages: self.executors.heartbeat_ages(),
             failed_assignments: self.jobs.iter().map(JobRecord::failed_task_count).sum(),
             retry_count: self.jobs.iter().map(JobRecord::retry_count).sum(),
             running_task_count: self.jobs.iter().map(JobRecord::running_task_count).sum(),
+            task_durations: self
+                .jobs
+                .iter()
+                .flat_map(|job| job.task_duration_metrics(current_tick))
+                .collect(),
         }
     }
 
@@ -766,8 +773,9 @@ impl Coordinator {
         self.ensure_active()?;
         self.executors
             .validate_lease(update.executor_id(), update.lease_generation())?;
+        let current_tick = self.executors.current_tick();
         self.find_job_mut(update.job_id())?
-            .apply_task_update(update)
+            .apply_task_update(update, current_tick)
     }
 
     /// Snapshot one job.
@@ -1181,6 +1189,7 @@ impl JobRecord {
     fn launch_assigned_task_assignments(
         &mut self,
         executor_leases: &[(ExecutorId, LeaseGeneration)],
+        current_tick: u64,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
@@ -1207,6 +1216,8 @@ impl JobRecord {
 
                     task.state = TaskState::Running;
                     task.attempt = task.attempt.saturating_add(1);
+                    task.started_tick = Some(current_tick);
+                    task.last_attempt_duration_ticks = None;
                     let attempt_id = AttemptId::try_new(task.attempt).map_err(|error| {
                         SchedulerError::InvalidJob {
                             message: error.to_string(),
@@ -1250,6 +1261,7 @@ impl JobRecord {
     fn apply_task_update(
         &mut self,
         update: TaskStatusUpdate,
+        current_tick: u64,
     ) -> SchedulerResult<TaskUpdateOutcome> {
         let stage = self
             .stages
@@ -1259,7 +1271,7 @@ impl JobRecord {
                 stage_id: update.stage_id().clone(),
             })?;
 
-        let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
+        let outcome = stage.apply_task_update(update, self.max_stage_retries, current_tick)?;
         self.refresh_state();
         Ok(outcome)
     }
@@ -1310,6 +1322,17 @@ impl JobRecord {
         } else {
             self.state = JobState::Running;
         }
+    }
+
+    fn task_duration_metrics(&self, current_tick: u64) -> Vec<TaskDurationMetric> {
+        self.stages
+            .iter()
+            .flat_map(|stage| {
+                stage.tasks().iter().filter_map(|task| {
+                    task.duration_metric(self.job_id(), stage.stage_id(), current_tick)
+                })
+            })
+            .collect()
     }
 
     fn snapshot(&self) -> JobSnapshot {
@@ -1400,6 +1423,7 @@ impl StageRecord {
         &mut self,
         update: TaskStatusUpdate,
         max_stage_retries: u32,
+        current_tick: u64,
     ) -> SchedulerResult<TaskUpdateOutcome> {
         let task = self
             .tasks
@@ -1409,7 +1433,7 @@ impl StageRecord {
                 task_id: update.task_id().clone(),
             })?;
 
-        let outcome = task.apply_status_update(&update)?;
+        let outcome = task.apply_status_update(&update, current_tick)?;
         if outcome == TaskUpdateOutcome::Duplicate {
             return Ok(outcome);
         }
@@ -1493,6 +1517,8 @@ pub struct TaskRecord {
     assigned_executor: Option<ExecutorId>,
     attempt: u32,
     output_metadata: Option<TaskOutputMetadata>,
+    started_tick: Option<u64>,
+    last_attempt_duration_ticks: Option<u64>,
 }
 
 impl TaskRecord {
@@ -1503,6 +1529,8 @@ impl TaskRecord {
             assigned_executor: None,
             attempt: 0,
             output_metadata: None,
+            started_tick: None,
+            last_attempt_duration_ticks: None,
         }
     }
 
@@ -1538,6 +1566,7 @@ impl TaskRecord {
     fn apply_status_update(
         &mut self,
         update: &TaskStatusUpdate,
+        current_tick: u64,
     ) -> SchedulerResult<TaskUpdateOutcome> {
         if update.attempt() != self.attempt {
             return Err(SchedulerError::StaleTaskAttempt {
@@ -1580,10 +1609,39 @@ impl TaskRecord {
         self.state = update.state();
         self.assigned_executor = Some(update.executor_id().clone());
         self.attempt = update.attempt();
+        if self.state.is_terminal() {
+            let started_tick = self.started_tick.unwrap_or(current_tick);
+            self.last_attempt_duration_ticks = Some(current_tick.saturating_sub(started_tick));
+        }
         if let Some(output_metadata) = update.output_metadata() {
             self.output_metadata = Some(output_metadata.clone());
         }
         Ok(TaskUpdateOutcome::Applied)
+    }
+
+    fn duration_metric(
+        &self,
+        job_id: &JobId,
+        stage_id: &StageId,
+        current_tick: u64,
+    ) -> Option<TaskDurationMetric> {
+        if self.attempt == 0 {
+            return None;
+        }
+
+        let duration_ticks = self.last_attempt_duration_ticks.or_else(|| {
+            self.started_tick
+                .map(|started_tick| current_tick.saturating_sub(started_tick))
+        })?;
+
+        Some(TaskDurationMetric {
+            job_id: job_id.clone(),
+            stage_id: stage_id.clone(),
+            task_id: self.task_id().clone(),
+            attempt: self.attempt,
+            state: self.state,
+            duration_ticks,
+        })
     }
 
     fn snapshot(&self) -> TaskSnapshot {
@@ -1770,6 +1828,49 @@ impl ExecutorHeartbeatAge {
     }
 }
 
+/// Duration for one task attempt in deterministic scheduler ticks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDurationMetric {
+    job_id: JobId,
+    stage_id: StageId,
+    task_id: TaskId,
+    attempt: u32,
+    state: TaskState,
+    duration_ticks: u64,
+}
+
+impl TaskDurationMetric {
+    /// Job id.
+    pub fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Stage id.
+    pub fn stage_id(&self) -> &StageId {
+        &self.stage_id
+    }
+
+    /// Task id.
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
+    }
+
+    /// Attempt number.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Current task state for this duration sample.
+    pub fn state(&self) -> TaskState {
+        self.state
+    }
+
+    /// Attempt duration in deterministic scheduler ticks.
+    pub fn duration_ticks(&self) -> u64 {
+        self.duration_ticks
+    }
+}
+
 /// Basic R3.1 scheduler/executor stability metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StabilityMetrics {
@@ -1777,6 +1878,7 @@ pub struct StabilityMetrics {
     retry_count: usize,
     running_task_count: usize,
     failed_assignments: usize,
+    task_durations: Vec<TaskDurationMetric>,
 }
 
 impl StabilityMetrics {
@@ -1798,6 +1900,11 @@ impl StabilityMetrics {
     /// Failed assignment count.
     pub fn failed_assignments(&self) -> usize {
         self.failed_assignments
+    }
+
+    /// Per-task attempt durations in deterministic scheduler ticks.
+    pub fn task_durations(&self) -> &[TaskDurationMetric] {
+        &self.task_durations
     }
 }
 
@@ -2240,7 +2347,7 @@ mod tests {
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
         let job_id = JobId::try_new("job-metrics").unwrap();
         let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
-        coordinator
+        let lease_generation = coordinator
             .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
             .unwrap();
         coordinator
@@ -2259,6 +2366,30 @@ mod tests {
         assert_eq!(metrics.heartbeat_ages()[0].executor_id(), &executor_id);
         assert_eq!(metrics.heartbeat_ages()[0].age_ticks(), 1);
         assert_eq!(metrics.running_task_count(), 1);
+        assert_eq!(metrics.task_durations().len(), 1);
+        assert_eq!(metrics.task_durations()[0].job_id(), &job_id);
+        assert_eq!(metrics.task_durations()[0].attempt(), 1);
+        assert_eq!(metrics.task_durations()[0].state(), TaskState::Running);
+        assert_eq!(metrics.task_durations()[0].duration_ticks(), 1);
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    StageId::try_new("stage-1").unwrap(),
+                    TaskId::try_new("task-1").unwrap(),
+                    executor_id,
+                    TaskState::Succeeded,
+                    1,
+                )
+                .with_lease_generation(lease_generation),
+            )
+            .unwrap();
+
+        let metrics = coordinator.stability_metrics();
+        assert_eq!(metrics.running_task_count(), 0);
+        assert_eq!(metrics.task_durations()[0].state(), TaskState::Succeeded);
+        assert_eq!(metrics.task_durations()[0].duration_ticks(), 1);
     }
 
     #[test]
@@ -3152,7 +3283,7 @@ mod tests {
 
     #[test]
     fn single_node_election_is_always_leader() {
-        let election = SingleNodeElection::default();
+        let election = SingleNodeElection;
         assert!(election.is_leader());
     }
 

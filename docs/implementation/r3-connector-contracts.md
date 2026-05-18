@@ -76,7 +76,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Define executor lease model with heartbeat generation and expiry.
 - [x] Define durable job event log events: job submitted, stage planned, task assigned, task started, task succeeded, task failed, executor lost, job cancelled.
 - [x] Define Kubernetes finalizer cleanup path for `KrishivJob` delete/cancel.
-- [ ] Define basic scheduler/executor stability metrics: heartbeat age, retry count, task duration, failed assignments.
+- [x] Define basic scheduler/executor stability metrics: heartbeat age, retry count, task duration, failed assignments.
 - [x] Define `MetadataStore` trait in `krishiv-scheduler` with `InMemoryMetadataStore` backend (`SqliteMetadataStore` and `KubernetesMetadataStore` deferred).
 - [x] **Decide and document durable MetadataStore backend before restart recovery tests can pass.** `InMemoryMetadataStore` for R3.1 single-process deployments; Sqlite and Kubernetes backends deferred.
 - [x] Define `JobSubmitter` trait (`GrpcJobSubmitter` and `KubernetesJobSubmitter` implementations deferred).
@@ -140,7 +140,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Recover coordinator state from `MetadataStore` after process restart (`recover_from_store` on `Coordinator`).
 - [x] Reject stale task attempts and ignore duplicate status updates safely.
 - [x] Implement `KrishivJob` finalizer lifecycle: add finalizer on first observe, remove on deletion after cleanup.
-- [ ] Emit basic scheduler/executor stability metrics.
+- [x] Emit basic scheduler/executor stability metrics.
 
 ### Test Checklist
 
@@ -165,7 +165,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Durable job event log round-trip tests pass (`in_memory_metadata_store_round_trips`).
 - [x] `KrishivJob` finalizer add/remove tests pass (`reconcile_adds_finalizer_on_first_observe`, `reconcile_removes_finalizer_on_deletion`).
 - [ ] Operator restart during reconciliation does not duplicate scheduler jobs.
-- [ ] Basic stability metrics tests pass.
+- [x] Basic stability metrics tests pass.
 - [ ] Typed plan operator enum tests pass with schema propagation.
 - [x] End-to-end test: `SELECT 1` runs coordinator → executor via gRPC, result metadata returned.
 - [x] End-to-end test: Parquet file scan runs on executor with DataFusion through the networked assignment/status path, with result metadata returned to the runner caller and task status accepted by the coordinator.

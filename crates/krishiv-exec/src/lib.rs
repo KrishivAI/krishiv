@@ -212,7 +212,14 @@ impl HashJoin {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        build_join_batch(left, right, &self.right_key, &left_indices, &right_indices, out_schema)
+        build_join_batch(
+            left,
+            right,
+            &self.right_key,
+            &left_indices,
+            &right_indices,
+            out_schema,
+        )
     }
 }
 
@@ -290,7 +297,14 @@ impl BuiltBroadcastJoin {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        build_join_batch(probe, &self.broadcast, &self.join_key, &left_indices, &right_indices, out_schema)
+        build_join_batch(
+            probe,
+            &self.broadcast,
+            &self.join_key,
+            &left_indices,
+            &right_indices,
+            out_schema,
+        )
     }
 }
 
@@ -298,11 +312,7 @@ impl BuiltBroadcastJoin {
 
 /// Build the output schema for a join: all left fields + right fields minus the
 /// right join key column.
-fn join_output_schema(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    right_key: &str,
-) -> Arc<Schema> {
+fn join_output_schema(left: &RecordBatch, right: &RecordBatch, right_key: &str) -> Arc<Schema> {
     let mut fields: Vec<Field> = left
         .schema()
         .fields()
@@ -455,7 +465,10 @@ pub struct LocalAggregator {
 impl LocalAggregator {
     /// Create a new `LocalAggregator`.
     pub fn new(group_by: Vec<String>, agg_exprs: Vec<AggExpr>) -> Self {
-        Self { group_by, agg_exprs }
+        Self {
+            group_by,
+            agg_exprs,
+        }
     }
 
     /// Group `batch` by `group_by` columns and compute aggregates.
@@ -596,9 +609,14 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::{AggExpr, AggFunction, ExecError, HashJoin, BroadcastJoin, LocalAggregator};
+    use super::{AggExpr, AggFunction, BroadcastJoin, ExecError, HashJoin, LocalAggregator};
 
-    fn make_int32_batch(key_name: &str, keys: Vec<i32>, val_name: &str, vals: Vec<i32>) -> RecordBatch {
+    fn make_int32_batch(
+        key_name: &str,
+        keys: Vec<i32>,
+        val_name: &str,
+        vals: Vec<i32>,
+    ) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new(key_name, DataType::Int32, false),
             Field::new(val_name, DataType::Int32, false),
@@ -609,9 +627,11 @@ mod tests {
     }
 
     fn make_int32_keyed_batch(key_name: &str, keys: Vec<i32>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(key_name, DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            key_name,
+            DataType::Int32,
+            false,
+        )]));
         let k = Arc::new(Int32Array::from(keys));
         RecordBatch::try_new(schema, vec![k]).unwrap()
     }
@@ -636,9 +656,21 @@ mod tests {
         assert_eq!(result.schema().field(1).name(), "val");
         assert_eq!(result.schema().field(2).name(), "rval");
 
-        let ids = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let vals = result.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-        let rvals = result.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let rvals = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
 
         // Collect (id, val, rval) pairs.
         let mut rows: Vec<(i32, i32, i32)> = (0..result.num_rows())
@@ -671,11 +703,7 @@ mod tests {
         let result = join.join(&left, &right).unwrap();
 
         let schema = result.schema();
-        let field_names: Vec<&str> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         // right_id should NOT be in the output.
         assert!(!field_names.contains(&"right_id"));
         assert!(field_names.contains(&"left_id"));
@@ -692,12 +720,12 @@ mod tests {
         let id_col = Arc::new(arrow::array::Float64Array::from(vec![1.0f64]));
         let val_col = Arc::new(Int32Array::from(vec![10i32]));
         let left = RecordBatch::try_new(schema.clone(), vec![id_col, val_col]).unwrap();
-        let right = make_int32_batch("id", vec![1], "rval", vec![100]);
-
         // Build a right batch with Float64 key too.
-        let right_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Float64, false),
-        ]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Float64,
+            false,
+        )]));
         let right_id = Arc::new(arrow::array::Float64Array::from(vec![1.0f64]));
         let right_f64 = RecordBatch::try_new(right_schema, vec![right_id]).unwrap();
 
@@ -777,10 +805,7 @@ mod tests {
     #[test]
     fn local_agg_count_per_group() {
         // grp: a,a,b,b,b  → count(*): a=2, b=3
-        let batch = make_agg_batch(
-            vec!["a", "a", "b", "b", "b"],
-            vec![1, 2, 3, 4, 5],
-        );
+        let batch = make_agg_batch(vec!["a", "a", "b", "b", "b"], vec![1, 2, 3, 4, 5]);
         let agg = LocalAggregator::new(
             vec!["grp".into()],
             vec![AggExpr {
@@ -793,8 +818,16 @@ mod tests {
         assert_eq!(result.num_rows(), 2);
 
         // Sorted by key: a then b.
-        let grp = result.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let cnt = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let grp = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let cnt = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
 
         let rows: Vec<(&str, i64)> = (0..result.num_rows())
             .map(|i| (grp.value(i), cnt.value(i)))
@@ -819,8 +852,16 @@ mod tests {
         let result = agg.aggregate(&batch).unwrap();
         assert_eq!(result.num_rows(), 2);
 
-        let grp = result.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let total = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let grp = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let total = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
 
         let rows: Vec<(&str, i64)> = (0..result.num_rows())
             .map(|i| (grp.value(i), total.value(i)))
@@ -852,9 +893,21 @@ mod tests {
         let result = agg.aggregate(&batch).unwrap();
         assert_eq!(result.num_rows(), 2);
 
-        let grp = result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let min_v = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let max_v = result.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let grp = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let min_v = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let max_v = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
 
         let mut rows: Vec<(i32, i64, i64)> = (0..result.num_rows())
             .map(|i| (grp.value(i), min_v.value(i), max_v.value(i)))
@@ -867,10 +920,7 @@ mod tests {
 
     #[test]
     fn local_agg_single_group_produces_one_row() {
-        let batch = make_agg_batch(
-            vec!["x", "x", "x"],
-            vec![1, 2, 3],
-        );
+        let batch = make_agg_batch(vec!["x", "x", "x"], vec![1, 2, 3]);
         let agg = LocalAggregator::new(
             vec!["grp".into()],
             vec![AggExpr {
@@ -881,16 +931,17 @@ mod tests {
         );
         let result = agg.aggregate(&batch).unwrap();
         assert_eq!(result.num_rows(), 1);
-        let cnt = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cnt = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(cnt.value(0), 3);
     }
 
     #[test]
     fn local_agg_one_row_per_unique_key() {
-        let batch = make_agg_batch(
-            vec!["a", "b", "c", "a", "b"],
-            vec![1, 2, 3, 4, 5],
-        );
+        let batch = make_agg_batch(vec!["a", "b", "c", "a", "b"], vec![1, 2, 3, 4, 5]);
         let agg = LocalAggregator::new(
             vec!["grp".into()],
             vec![AggExpr {

@@ -226,7 +226,9 @@ pub struct CoalesceRule {
 impl CoalesceRule {
     /// Create a new `CoalesceRule` with the given minimum partition byte threshold.
     pub fn new(min_partition_bytes: u64) -> Self {
-        Self { min_partition_bytes }
+        Self {
+            min_partition_bytes,
+        }
     }
 
     /// Compute coalesce advice from per-partition stats, without modifying the plan.
@@ -436,7 +438,7 @@ mod tests {
 
     // ── ThresholdSkewRule ─────────────────────────────────────────────────
 
-    use super::{CoalesceAdvice, CoalesceRule, SkewRule, ThresholdSkewRule};
+    use super::{CoalesceRule, SkewRule, ThresholdSkewRule};
 
     fn make_stats_with_rows(input_rows: &[u64]) -> Vec<RuntimeStats> {
         input_rows
@@ -513,10 +515,7 @@ mod tests {
         let stats = make_stats_with_memory(&[100, 200, 5000, 300]);
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&stats);
-        assert_eq!(
-            advice.groups,
-            vec![vec![0, 1], vec![2], vec![3]]
-        );
+        assert_eq!(advice.groups, vec![vec![0, 1], vec![2], vec![3]]);
     }
 
     #[test]
