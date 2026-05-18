@@ -1,4 +1,7 @@
 interface:
   display_name: "Krishiv Engine"
   short_description: "Build Krishiv engine features consistently"
-  default_prompt: "Use $krishiv-engine to implement the next Krishiv roadmap task."
+  default_prompt: "/krishiv-engine implement the next Krishiv roadmap task."
+  resume_prompt: "/krishiv-engine resume. Read AGENTS.md, CLAUDE.md, and docs/implementation/status.md, then continue the next recommended task. Keep the work to one durable checkpoint and update status.md before stopping."
+  rate_limit_strategy: "Use .claude/skills/krishiv-engine/SKILL.md plus docs/engineering/codex-workflow.md: keep work small, update docs/implementation/status.md before stopping, and resume from repo state rather than chat history."
+  supported_agent: "Claude Code"

@@ -38,13 +38,15 @@ cargo check --workspace
 
 ## Skill Usage
 
-Invoke the Krishiv Engine skill in Claude Code with:
+Claude Code can use project skills that live under `.claude/skills/<skill-name>/SKILL.md`. This repository provides a Claude Code discovery shim at [`.claude/skills/krishiv-engine/SKILL.md`](.claude/skills/krishiv-engine/SKILL.md).
+
+Invoke it in Claude Code with:
 
 ```
-Use $krishiv-engine to implement the next Krishiv roadmap task.
+/krishiv-engine implement the next Krishiv roadmap task
 ```
 
-The skill source is at [`codex/skills/krishiv-engine/SKILL.md`](codex/skills/krishiv-engine/SKILL.md).
+The Claude Code skill shim points to the canonical shared skill source at [`codex/skills/krishiv-engine/SKILL.md`](codex/skills/krishiv-engine/SKILL.md), which remains the source of truth for both Codex and Claude Code. If Claude Code cannot auto-load project skills in a given environment, ask it to read `.claude/skills/krishiv-engine/SKILL.md` and then follow the canonical skill file.
 
 ## Crate Map
 
@@ -72,7 +74,24 @@ Dependency direction is strictly one-way. See [`docs/architecture/crate-map.md`]
 | [`docs/implementation/status.md`](docs/implementation/status.md) | Current phase, active task, blockers |
 | [`docs/implementation/README.md`](docs/implementation/README.md) | Release tracker index |
 | [`docs/engineering/standards.md`](docs/engineering/standards.md) | Rust, async, testing, crate-boundary standards |
-| [`docs/engineering/codex-workflow.md`](docs/engineering/codex-workflow.md) | Session workflow and rate-limit strategy |
+| [`docs/engineering/codex-workflow.md`](docs/engineering/codex-workflow.md) | Shared Codex/Claude Code session workflow, rate-limit strategy, and resume protocol |
+
+## Rate Limits And Session Resume
+
+Claude Code should use the shared agent workflow in [`docs/engineering/codex-workflow.md`](docs/engineering/codex-workflow.md) for rate-limit-safe work units and cross-agent handoffs.
+
+When a Claude Code session is interrupted or rate-limited:
+
+1. Resume the previous Claude Code session when available.
+2. Re-read `AGENTS.md`, this file, and `docs/implementation/status.md` before editing.
+3. Continue only the next durable checkpoint recorded in `status.md`.
+4. Update `status.md` with completed work, partial work, blockers, validation, and the next command before stopping again.
+
+Safe resume prompt:
+
+```text
+/krishiv-engine resume. Read AGENTS.md, CLAUDE.md, and docs/implementation/status.md, then continue the next recommended task. Keep the work to one durable checkpoint and update status.md before stopping.
+```
 
 ## End-Of-Session Checklist
 
