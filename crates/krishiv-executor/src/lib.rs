@@ -20,8 +20,8 @@ use krishiv_proto::{
     ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartitionDescriptor,
     LeaseGeneration, OutputContract, OutputContractDescriptor, RegisterExecutorRequest,
     RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef, TaskCancellationRequest,
-    TaskOutputMetadata, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
-    TransportVersion, wire,
+    TaskOutputMetadata, TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse,
+    TransportDisposition, TransportVersion, wire,
 };
 use krishiv_sql::SqlEngine;
 
@@ -170,6 +170,11 @@ const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
 const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
 const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
 const SHUFFLE_WRITE_PREFIX: &str = "shuffle-write:";
+/// Fragment prefix for local pre-aggregation stages.
+/// These fragments use `pre-agg:sql:<query>` format and route through the
+/// existing SQL execution path via `sql_query_from_fragment`.
+#[allow(dead_code)]
+pub const PRE_AGG_FRAGMENT_PREFIX: &str = "pre-agg:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalParquetPartition {
@@ -286,6 +291,7 @@ pub struct ExecutorTaskOutput {
     batch_count: usize,
     column_count: usize,
     shuffle_partitions: Vec<krishiv_proto::ShufflePartitionOutput>,
+    runtime_stats: Option<TaskRuntimeStats>,
 }
 
 impl ExecutorTaskOutput {
@@ -296,6 +302,7 @@ impl ExecutorTaskOutput {
             batch_count,
             column_count,
             shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -306,6 +313,7 @@ impl ExecutorTaskOutput {
             batch_count,
             column_count,
             shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -316,6 +324,7 @@ impl ExecutorTaskOutput {
             batch_count: 0,
             column_count: 0,
             shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -326,6 +335,7 @@ impl ExecutorTaskOutput {
             batch_count: 0,
             column_count: 0,
             shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -336,7 +346,13 @@ impl ExecutorTaskOutput {
             batch_count: partitions.len(),
             column_count: 0,
             shuffle_partitions: partitions,
+            runtime_stats: None,
         }
+    }
+
+    fn with_runtime_stats(mut self, stats: TaskRuntimeStats) -> Self {
+        self.runtime_stats = Some(stats);
+        self
     }
 
     /// Output kind.
@@ -361,17 +377,19 @@ impl ExecutorTaskOutput {
 
     /// Convert to coordinator-visible lightweight metadata.
     pub fn to_task_output_metadata(&self) -> TaskOutputMetadata {
-        let meta = TaskOutputMetadata::new(
+        let mut meta = TaskOutputMetadata::new(
             self.kind.as_str(),
             self.row_count as u64,
             self.batch_count as u64,
             self.column_count as u64,
         );
-        if self.shuffle_partitions.is_empty() {
-            meta
-        } else {
-            meta.with_shuffle_partitions(self.shuffle_partitions.clone())
+        if !self.shuffle_partitions.is_empty() {
+            meta = meta.with_shuffle_partitions(self.shuffle_partitions.clone());
         }
+        if let Some(stats) = &self.runtime_stats {
+            meta = meta.with_runtime_stats(stats.clone());
+        }
+        meta
     }
 
     /// Shuffle partition outputs produced by this task (empty for non-shuffle tasks).
@@ -648,9 +666,9 @@ impl ExecutorTaskRunner {
                     .map_err(|error| ExecutorError::LocalExecution {
                         message: error.to_string(),
                     })?;
-            let batches =
+            let (batches, sql_stats) =
                 dataframe
-                    .collect()
+                    .collect_with_stats()
                     .await
                     .map_err(|error| ExecutorError::LocalExecution {
                         message: error.to_string(),
@@ -666,11 +684,15 @@ impl ExecutorTaskRunner {
             }
             let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
             let column_count = batches.first().map_or(0, |batch| batch.num_columns());
-            return Ok(ExecutorTaskOutput::sql(
-                row_count,
-                batches.len(),
-                column_count,
-            ));
+            let runtime_stats = TaskRuntimeStats {
+                input_rows: 0,
+                output_rows: sql_stats.output_rows,
+                cpu_nanos: sql_stats.cpu_nanos,
+                memory_bytes: 0,
+                spill_bytes: 0,
+            };
+            return Ok(ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
+                .with_runtime_stats(runtime_stats));
         }
 
         Ok(ExecutorTaskOutput::placeholder())
