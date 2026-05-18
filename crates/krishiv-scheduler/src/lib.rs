@@ -7,6 +7,7 @@
 //! executors; R3.1 maps coordinator/executor contracts to a networked gRPC
 //! service.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
@@ -20,10 +21,12 @@ use krishiv_proto::{
     ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
     ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState,
     LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskAttemptRef,
-    TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
-    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
+    RegisterExecutorResponse, ShufflePartitionOutput, StageId, StageSpec, StageState,
+    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec,
+    TaskState, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
+    TransportVersion, wire,
 };
+use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 use serde::{Deserialize, Serialize};
 
 /// Scheduler result alias.
@@ -180,6 +183,9 @@ pub struct Coordinator {
     executors: ExecutorRegistry,
     jobs: Vec<JobRecord>,
     store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
+    /// Jobs that have just reached a terminal state and need shuffle GC.
+    /// Drained by the coordinator binary's tick loop.
+    gc_ready_jobs: Vec<JobId>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -601,6 +607,7 @@ impl Coordinator {
             ),
             jobs: Vec::new(),
             store: None,
+            gc_ready_jobs: Vec::new(),
         }
     }
 
@@ -628,6 +635,7 @@ impl Coordinator {
             ),
             jobs: Vec::new(),
             store: None,
+            gc_ready_jobs: Vec::new(),
         }
     }
 
@@ -766,6 +774,9 @@ impl Coordinator {
     pub fn cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
         self.ensure_active()?;
         self.find_job_mut(job_id)?.cancel();
+        if !self.gc_ready_jobs.contains(job_id) {
+            self.gc_ready_jobs.push(job_id.clone());
+        }
         Ok(())
     }
 
@@ -776,6 +787,16 @@ impl Coordinator {
             failed_assignments: self.jobs.iter().map(JobRecord::failed_task_count).sum(),
             retry_count: self.jobs.iter().map(JobRecord::retry_count).sum(),
             running_task_count: self.jobs.iter().map(JobRecord::running_task_count).sum(),
+            shuffle_partitions_available: self
+                .jobs
+                .iter()
+                .map(JobRecord::shuffle_partitions_available_count)
+                .sum(),
+            shuffle_bytes_written: self
+                .jobs
+                .iter()
+                .map(JobRecord::shuffle_bytes_written)
+                .sum(),
         }
     }
 
@@ -895,13 +916,26 @@ impl Coordinator {
             .validate_lease(update.executor_id(), update.lease_generation())?;
         let job_id = update.job_id().clone();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
-        if let Some(store) = &self.store {
-            if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
+        if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
+            if record.state().is_terminal()
+                && !self.gc_ready_jobs.contains(&job_id)
+            {
+                self.gc_ready_jobs.push(job_id.clone());
+            }
+            if let Some(store) = &self.store {
                 let mut s = store.lock().unwrap();
                 s.save_job(record).ok();
             }
         }
         Ok(outcome)
+    }
+
+    /// Drain the list of jobs that have reached a terminal state and need shuffle GC.
+    ///
+    /// The coordinator binary's tick loop should call this, then asynchronously
+    /// delete partitions for each returned job id via the shuffle store.
+    pub fn take_gc_ready_jobs(&mut self) -> Vec<JobId> {
+        std::mem::take(&mut self.gc_ready_jobs)
     }
 
     /// Snapshot one job.
@@ -1328,6 +1362,9 @@ pub struct JobRecord {
     state: JobState,
     max_stage_retries: u32,
     stages: Vec<StageRecord>,
+    /// Shuffle partition availability metadata per producing stage.
+    /// Updated when tasks report ShufflePartitionOutput in TaskOutputMetadata.
+    shuffle_output: HashMap<StageId, ShuffleMetadata>,
 }
 
 impl JobRecord {
@@ -1343,6 +1380,7 @@ impl JobRecord {
             state: JobState::Accepted,
             max_stage_retries,
             stages,
+            shuffle_output: HashMap::new(),
         }
     }
 
@@ -1383,8 +1421,29 @@ impl JobRecord {
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
+
+        // Collect the set of stage ids whose shuffle output is fully available.
+        // A stage's output is available when all tasks in it have Succeeded.
+        let succeeded_stage_ids: Vec<StageId> = self
+            .stages
+            .iter()
+            .filter(|s| s.state == StageState::Succeeded)
+            .map(|s| s.stage_id().clone())
+            .collect();
+
         for stage in &mut self.stages {
             let stage_id = stage.stage_id().clone();
+
+            // Skip stages whose upstream shuffle dependencies are not yet complete.
+            let upstream_ready = stage
+                .spec
+                .upstream_stage_ids()
+                .iter()
+                .all(|up| succeeded_stage_ids.contains(up));
+            if !upstream_ready {
+                continue;
+            }
+
             for task in &mut stage.tasks {
                 if task.state == TaskState::Assigned {
                     let executor_id = task.assigned_executor.clone().ok_or_else(|| {
@@ -1453,15 +1512,38 @@ impl JobRecord {
         &mut self,
         update: TaskStatusUpdate,
     ) -> SchedulerResult<TaskUpdateOutcome> {
+        let stage_id = update.stage_id().clone();
+        let shuffle_partitions: Vec<ShufflePartitionOutput> = update
+            .output_metadata()
+            .map(|m| m.shuffle_partitions().to_vec())
+            .unwrap_or_default();
+
         let stage = self
             .stages
             .iter_mut()
-            .find(|stage| stage.stage_id() == update.stage_id())
+            .find(|stage| stage.stage_id() == &stage_id)
             .ok_or_else(|| SchedulerError::UnknownStage {
-                stage_id: update.stage_id().clone(),
+                stage_id: stage_id.clone(),
             })?;
 
         let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
+
+        // If the task succeeded with shuffle output, record partition availability.
+        if !shuffle_partitions.is_empty() {
+            let meta = self
+                .shuffle_output
+                .entry(stage_id.clone())
+                .or_insert_with(ShuffleMetadata::new);
+            for p in &shuffle_partitions {
+                let path = ShufflePath {
+                    job_id: self.spec.job_id().as_str().to_owned(),
+                    stage_id: stage_id.as_str().to_owned(),
+                    partition_id: p.partition_id,
+                };
+                meta.mark_available(&path);
+            }
+        }
+
         self.refresh_state();
         Ok(outcome)
     }
@@ -1550,6 +1632,26 @@ impl JobRecord {
             job: self.snapshot(),
             stages: self.stages.iter().map(StageRecord::snapshot).collect(),
         }
+    }
+
+    /// Total number of shuffle partitions marked Available across all stages.
+    pub fn shuffle_partitions_available_count(&self) -> usize {
+        self.shuffle_output
+            .values()
+            .map(ShuffleMetadata::available_count)
+            .sum()
+    }
+
+    /// Total shuffle bytes written across all stages (sum of partition size_bytes
+    /// as recorded by executor TaskOutputMetadata).
+    pub fn shuffle_bytes_written(&self) -> u64 {
+        self.stages
+            .iter()
+            .flat_map(StageRecord::tasks)
+            .filter_map(|t| t.output_metadata.as_ref())
+            .flat_map(|m| m.shuffle_partitions())
+            .map(|p| p.size_bytes)
+            .sum()
     }
 }
 
@@ -2002,6 +2104,10 @@ pub struct StabilityMetrics {
     retry_count: usize,
     running_task_count: usize,
     failed_assignments: usize,
+    /// Total shuffle partitions currently marked Available across all active jobs.
+    pub shuffle_partitions_available: usize,
+    /// Total shuffle bytes written across all active jobs.
+    pub shuffle_bytes_written: u64,
 }
 
 impl StabilityMetrics {
@@ -2012,6 +2118,8 @@ impl StabilityMetrics {
             retry_count: 0,
             running_task_count: 0,
             failed_assignments: 0,
+            shuffle_partitions_available: 0,
+            shuffle_bytes_written: 0,
         }
     }
 
@@ -2614,6 +2722,9 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
                 .into_iter()
                 .map(StageRecord::try_from)
                 .collect::<SchedulerResult<Vec<_>>>()?,
+            // Shuffle output metadata is not persisted; it is rebuilt from
+            // executor task status updates after coordinator restart.
+            shuffle_output: HashMap::new(),
         })
     }
 }

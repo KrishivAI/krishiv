@@ -17,12 +17,16 @@
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use krishiv_proto::CoordinatorId;
 use krishiv_scheduler::{
     Coordinator, SharedCoordinator, serve_coordinator_executor_grpc_with_listener,
 };
+use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
+use tokio::time::{Duration, interval};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -35,6 +39,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
     let coordinator = SharedCoordinator::new(Coordinator::active(coordinator_id));
+
+    // If a shuffle directory is configured, run a background GC loop that
+    // drains terminal-job shuffle partitions from the local disk store.
+    if let Some(shuffle_dir) = &config.shuffle_dir {
+        let store: Arc<LocalDiskShuffleStore> =
+            Arc::new(LocalDiskShuffleStore::new(shuffle_dir).map_err(|e| {
+                format!("failed to open shuffle store at '{}': {e}", shuffle_dir.display())
+            })?);
+        let gc_coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let job_ids = gc_coordinator
+                    .write()
+                    .map(|mut c| c.take_gc_ready_jobs())
+                    .unwrap_or_default();
+                for job_id in job_ids {
+                    if let Err(e) = store.delete_job_partitions(job_id.as_str()).await {
+                        eprintln!("shuffle GC failed for job {job_id}: {e}");
+                    }
+                }
+            }
+        });
+    }
 
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
@@ -51,6 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 struct CoordinatorCliConfig {
     coordinator_id: String,
     grpc_addr: SocketAddr,
+    shuffle_dir: Option<PathBuf>,
     help: bool,
 }
 
@@ -63,6 +93,7 @@ impl CoordinatorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| "0.0.0.0:9090".parse().unwrap()),
+            shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
             help: false,
         };
         let mut args = args.into_iter();
@@ -77,6 +108,10 @@ impl CoordinatorCliConfig {
                     config.grpc_addr = value
                         .parse()
                         .map_err(|_| format!("invalid socket address for --grpc-addr: {value}"))?;
+                }
+                "--shuffle-dir" => {
+                    let value = next_arg(&mut args, "--shuffle-dir")?;
+                    config.shuffle_dir = Some(PathBuf::from(value));
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => {
@@ -101,6 +136,7 @@ impl CoordinatorCliConfig {
          Options:\n\
            --coordinator-id <ID>     Coordinator id, defaults to KRISHIV_COORDINATOR_ID or coord-local\n\
            --grpc-addr <HOST:PORT>   gRPC listen address, defaults to KRISHIV_GRPC_ADDR or 0.0.0.0:9090\n\
+           --shuffle-dir <PATH>      Local shuffle store dir, defaults to KRISHIV_SHUFFLE_DIR (optional)\n\
            -h, --help                Show help\n"
     }
 }

@@ -68,7 +68,7 @@ pub enum PartitionState {
 // ── ShuffleMetadata ───────────────────────────────────────────────────────────
 
 /// In-memory registry tracking the state of shuffle partitions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ShuffleMetadata {
     states: HashMap<ShufflePath, PartitionState>,
 }
@@ -105,6 +105,19 @@ impl ShuffleMetadata {
         paths
             .iter()
             .all(|p| matches!(self.states.get(p), Some(PartitionState::Available)))
+    }
+
+    /// Number of partitions currently in the `Available` state.
+    pub fn available_count(&self) -> usize {
+        self.states
+            .values()
+            .filter(|s| **s == PartitionState::Available)
+            .count()
+    }
+
+    /// Number of partitions currently tracked (any state).
+    pub fn total_count(&self) -> usize {
+        self.states.len()
     }
 }
 
@@ -1392,5 +1405,250 @@ mod tests {
 
         store.write_partition(partition, 11).await.unwrap();
         assert!(store.read_partition(&id).await.unwrap().is_some());
+    }
+}
+
+// ── Shuffle partition transport (Arrow IPC over TCP) ─────────────────────────
+//
+// Krishiv uses Arrow IPC framing over a simple TCP connection for shuffle reads.
+// The protocol is intentionally minimal:
+//   client → server: "<job_id>/<stage_id>/<partition_id>\n" (UTF-8 ticket)
+//   server → client: 4-byte big-endian u32 payload length, then raw Arrow IPC bytes
+//                    A length of 0 means "partition not found".
+//
+// This achieves the same data transport as Arrow Flight DoGet without requiring
+// the full gRPC/Flight service trait implementation. The `arrow-flight` crate is
+// retained as a dependency for future upgrade to the full Flight protocol.
+
+pub mod flight {
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use arrow::ipc::reader::StreamReader;
+    use arrow::ipc::writer::StreamWriter;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::{LocalDiskShuffleStore, PartitionId, ShuffleStore};
+
+    fn parse_ticket(ticket: &str) -> Option<(String, String, u32)> {
+        let parts: Vec<&str> = ticket.trim().splitn(3, '/').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let partition_id = parts[2].parse::<u32>().ok()?;
+        Some((parts[0].to_owned(), parts[1].to_owned(), partition_id))
+    }
+
+    async fn handle_connection(mut stream: TcpStream, store: Arc<LocalDiskShuffleStore>) {
+        // Read ticket line terminated by '\n'.
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match stream.read_exact(&mut byte).await {
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    buf.push(byte[0]);
+                }
+                Err(_) => return,
+            }
+        }
+
+        let ticket = match std::str::from_utf8(&buf) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                let _ = stream.write_all(&0u32.to_be_bytes()).await;
+                return;
+            }
+        };
+
+        let Some((job_id, stage_id, partition_id)) = parse_ticket(&ticket) else {
+            let _ = stream.write_all(&0u32.to_be_bytes()).await;
+            return;
+        };
+
+        let id = PartitionId { job_id, stage_id, partition: partition_id };
+        let result = store.read_partition(&id).await;
+
+        match result {
+            Ok(Some(partition)) => {
+                let mut buf = Vec::new();
+                let schema = partition.schema;
+                if let Ok(mut writer) = StreamWriter::try_new(&mut buf, &schema) {
+                    for batch in &partition.batches {
+                        let _ = writer.write(batch);
+                    }
+                    let _ = writer.finish();
+                }
+                let len = buf.len() as u32;
+                let _ = stream.write_all(&len.to_be_bytes()).await;
+                let _ = stream.write_all(&buf).await;
+            }
+            _ => {
+                let _ = stream.write_all(&0u32.to_be_bytes()).await;
+            }
+        }
+    }
+
+    /// Start the shuffle IPC server on `addr` backed by `store`.
+    ///
+    /// Returns the local address and a join handle. Call `abort()` on the handle
+    /// to shut down the server.
+    pub async fn serve(
+        addr: SocketAddr,
+        store: Arc<LocalDiskShuffleStore>,
+    ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let store = Arc::clone(&store);
+                        tokio::spawn(handle_connection(stream, store));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok((local_addr, handle))
+    }
+
+    /// Fetch all [`RecordBatch`]es for one shuffle partition from a remote server.
+    ///
+    /// `endpoint` format: `<host>:<port>` (e.g. `"10.0.0.5:50051"`)
+    pub struct FlightShuffleClient;
+
+    impl FlightShuffleClient {
+        pub async fn fetch(
+            endpoint: impl Into<String>,
+            job_id: &str,
+            stage_id: &str,
+            partition_id: u32,
+        ) -> io::Result<Vec<RecordBatch>> {
+            let endpoint = endpoint.into();
+            let mut stream = TcpStream::connect(&endpoint).await?;
+
+            let ticket = format!("{job_id}/{stage_id}/{partition_id}\n");
+            stream.write_all(ticket.as_bytes()).await?;
+
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("partition {job_id}/{stage_id}/{partition_id} not found"),
+                ));
+            }
+
+            let mut data = vec![0u8; len];
+            stream.read_exact(&mut data).await?;
+
+            let cursor = std::io::Cursor::new(data);
+            let reader = StreamReader::try_new(cursor, None)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut batches = Vec::new();
+            for batch in reader {
+                let batch = batch.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                batches.push(batch);
+            }
+            Ok(batches)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        use super::*;
+        use crate::{LocalDiskShuffleStore, PartitionId, ShufflePartition};
+
+        fn batches_to_ipc(batches: &[RecordBatch]) -> Vec<u8> {
+            let schema = batches[0].schema();
+            let mut buf = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            for batch in batches {
+                writer.write(batch).unwrap();
+            }
+            writer.finish().unwrap();
+            buf
+        }
+
+        fn make_test_batch() -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn flight_server_serves_partition_and_client_reads_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+
+            let batch = make_test_batch();
+
+            let id = PartitionId {
+                job_id: "job-flight-1".to_owned(),
+                stage_id: "s0".to_owned(),
+                partition: 0,
+            };
+            let partition = ShufflePartition {
+                id: id.clone(),
+                schema: batch.schema(),
+                batches: vec![batch.clone()],
+            };
+            store.register_partition_lease(id.clone(), 1).await.unwrap();
+            store.write_partition(partition, 1).await.unwrap();
+
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
+
+            let endpoint = local_addr.to_string();
+            let result =
+                FlightShuffleClient::fetch(&endpoint, "job-flight-1", "s0", 0).await.unwrap();
+
+            server_handle.abort();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].num_rows(), 3);
+            assert_eq!(result[0].num_columns(), 2);
+        }
+
+        #[tokio::test]
+        async fn flight_client_returns_error_for_missing_partition() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
+            let endpoint = local_addr.to_string();
+
+            let result = FlightShuffleClient::fetch(&endpoint, "missing", "s0", 0).await;
+            server_handle.abort();
+
+            assert!(
+                matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+                "expected NotFound, got: {result:?}"
+            );
+        }
     }
 }

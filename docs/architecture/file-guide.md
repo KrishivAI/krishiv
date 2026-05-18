@@ -62,6 +62,8 @@ meant for humans and Codex sessions resuming implementation work.
 | `docs/architecture/deployment-targets.md` | Defines Kubernetes and bare metal / VM distributed deployment targets and feature availability. |
 | `docs/architecture/data-plane-transport.md` | Defines the control-plane/data-plane split and the Arrow IPC/Flight transport decisions for shuffle and query result movement. |
 | `docs/architecture/shuffle-deployment-model.md` | Defines R4 shuffle durability modes: local default and optional object-store durability. |
+| `docs/architecture/shuffle-retry-lineage.md` | Defines R4 stage retry lineage policy: Option B (downstream failure retains upstream shuffle; upstream failure discards partial output and re-runs from source). |
+| `docs/architecture/shuffle-recovery-expectations.md` | Defines per-failure-point recovery expectations for local and object-store shuffle modes; documents coordinator metadata as the authoritative availability gate. |
 | `docs/architecture/r1-bootstrap.md` | Explains what the bootstrap and local execution slices deliver, what remains stubbed, and streaming limitations. |
 | `docs/architecture/r2-control-plane.md` | Explains the R2 coordinator/executor skeleton, static scheduling, and deferred distributed features. |
 | `docs/architecture/stage-local-execution.md` | Defines the R3.1 coordinator/executor stage-local execution contract, task attempts, leases, metadata recovery, and handoff boundaries for shuffle, streaming, and checkpoints. |

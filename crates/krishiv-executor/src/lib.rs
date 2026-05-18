@@ -19,8 +19,9 @@ use krishiv_proto::{
     ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
     ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartitionDescriptor,
     LeaseGeneration, OutputContract, OutputContractDescriptor, RegisterExecutorRequest,
-    RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest, TaskOutputMetadata,
-    TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
+    RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef, TaskCancellationRequest,
+    TaskOutputMetadata, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    TransportVersion, wire,
 };
 use krishiv_sql::SqlEngine;
 
@@ -168,6 +169,7 @@ const OBJECT_PARQUET_SINK_PREFIX: &str = "object-parquet-sink:";
 const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
 const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
 const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
+const SHUFFLE_WRITE_PREFIX: &str = "shuffle-write:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalParquetPartition {
@@ -283,6 +285,7 @@ pub struct ExecutorTaskOutput {
     row_count: usize,
     batch_count: usize,
     column_count: usize,
+    shuffle_partitions: Vec<krishiv_proto::ShufflePartitionOutput>,
 }
 
 impl ExecutorTaskOutput {
@@ -292,6 +295,7 @@ impl ExecutorTaskOutput {
             row_count,
             batch_count,
             column_count,
+            shuffle_partitions: Vec::new(),
         }
     }
 
@@ -301,6 +305,7 @@ impl ExecutorTaskOutput {
             row_count,
             batch_count,
             column_count,
+            shuffle_partitions: Vec::new(),
         }
     }
 
@@ -310,6 +315,7 @@ impl ExecutorTaskOutput {
             row_count: 0,
             batch_count: 0,
             column_count: 0,
+            shuffle_partitions: Vec::new(),
         }
     }
 
@@ -319,6 +325,17 @@ impl ExecutorTaskOutput {
             row_count: 0,
             batch_count: 0,
             column_count: 0,
+            shuffle_partitions: Vec::new(),
+        }
+    }
+
+    fn shuffle_write(row_count: usize, partitions: Vec<krishiv_proto::ShufflePartitionOutput>) -> Self {
+        Self {
+            kind: ExecutorTaskOutputKind::ShuffleWrite,
+            row_count,
+            batch_count: partitions.len(),
+            column_count: 0,
+            shuffle_partitions: partitions,
         }
     }
 
@@ -344,12 +361,22 @@ impl ExecutorTaskOutput {
 
     /// Convert to coordinator-visible lightweight metadata.
     pub fn to_task_output_metadata(&self) -> TaskOutputMetadata {
-        TaskOutputMetadata::new(
+        let meta = TaskOutputMetadata::new(
             self.kind.as_str(),
             self.row_count as u64,
             self.batch_count as u64,
             self.column_count as u64,
-        )
+        );
+        if self.shuffle_partitions.is_empty() {
+            meta
+        } else {
+            meta.with_shuffle_partitions(self.shuffle_partitions.clone())
+        }
+    }
+
+    /// Shuffle partition outputs produced by this task (empty for non-shuffle tasks).
+    pub fn shuffle_partitions(&self) -> &[krishiv_proto::ShufflePartitionOutput] {
+        &self.shuffle_partitions
     }
 }
 
@@ -364,6 +391,8 @@ pub enum ExecutorTaskOutputKind {
     Placeholder,
     /// Task was cancelled before execution started.
     Cancelled,
+    /// Shuffle write: hash-partitioned batches written to the local shuffle store.
+    ShuffleWrite,
 }
 
 impl ExecutorTaskOutputKind {
@@ -373,7 +402,27 @@ impl ExecutorTaskOutputKind {
             Self::ConnectorPipeline => "connector_pipeline",
             Self::Placeholder => "placeholder",
             Self::Cancelled => "cancelled",
+            Self::ShuffleWrite => "shuffle_write",
         }
+    }
+}
+
+/// Shuffle store context held by the task runner.
+///
+/// When present, `shuffle-write:` fragments can write hash-partitioned output to
+/// the local store and report `ShufflePartitionOutput` back to the coordinator.
+#[derive(Clone)]
+pub struct ShuffleContext {
+    pub store: std::sync::Arc<krishiv_shuffle::LocalDiskShuffleStore>,
+    /// `<host>:<port>` of this executor's Arrow IPC flight server.
+    pub flight_endpoint: String,
+}
+
+impl fmt::Debug for ShuffleContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShuffleContext")
+            .field("flight_endpoint", &self.flight_endpoint)
+            .finish()
     }
 }
 
@@ -381,12 +430,19 @@ impl ExecutorTaskOutputKind {
 #[derive(Debug, Clone)]
 pub struct ExecutorTaskRunner {
     inbox: ExecutorAssignmentInbox,
+    shuffle: Option<ShuffleContext>,
 }
 
 impl ExecutorTaskRunner {
     /// Create a runner over an executor assignment inbox.
     pub fn new(inbox: ExecutorAssignmentInbox) -> Self {
-        Self { inbox }
+        Self { inbox, shuffle: None }
+    }
+
+    /// Attach a shuffle context so this runner can handle `shuffle-write:` fragments.
+    pub fn with_shuffle(mut self, ctx: ShuffleContext) -> Self {
+        self.shuffle = Some(ctx);
+        self
     }
 
     /// Assignment inbox consumed by this runner.
@@ -532,6 +588,18 @@ impl ExecutorTaskRunner {
             return execute_kafka_to_parquet_pipeline(assignment).await;
         }
 
+        if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
+            if let Some(ctx) = &self.shuffle {
+                return execute_shuffle_write_fragment(assignment, shuffle_spec, ctx).await;
+            } else {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: String::from(
+                        "shuffle-write fragment requires a shuffle context but none is configured",
+                    ),
+                });
+            }
+        }
+
         if let Some(query) = sql_query_from_fragment(fragment) {
             let engine = SqlEngine::new();
             for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
@@ -554,6 +622,16 @@ impl ExecutorTaskRunner {
             }
             for (table_name, batches) in
                 read_object_parquet_partitions(assignment.input_partitions()).await?
+            {
+                engine
+                    .register_record_batches(&table_name, batches)
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
+            }
+            for (table_name, batches) in
+                read_shuffle_flight_partitions(assignment.input_partitions()).await?
             {
                 engine
                     .register_record_batches(&table_name, batches)
@@ -875,6 +953,201 @@ fn parse_object_parquet_descriptor(
         PathBuf::from(base_dir),
         object_path.to_owned(),
     ))
+}
+
+/// Fetch all `shuffle-flight:` input partitions via Arrow IPC over TCP and return
+/// `(table_name, batches)` pairs ready for registration with the SQL engine.
+async fn read_shuffle_flight_partitions(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    use krishiv_shuffle::flight::FlightShuffleClient;
+
+    let mut result = Vec::new();
+    for partition in partitions {
+        let (table_name, flight_endpoint, job_id, upstream_stage_id, partition_id) =
+            match partition.descriptor() {
+                Some(InputPartitionDescriptor::ShuffleFlight {
+                    table_name,
+                    flight_endpoint,
+                    job_id,
+                    upstream_stage_id,
+                    partition_id,
+                }) => (
+                    table_name.clone(),
+                    flight_endpoint.clone(),
+                    job_id.clone(),
+                    upstream_stage_id.clone(),
+                    *partition_id,
+                ),
+                Some(_) | None => continue,
+            };
+
+        let batches = FlightShuffleClient::fetch(
+            &flight_endpoint,
+            &job_id,
+            &upstream_stage_id,
+            partition_id,
+        )
+        .await
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: format!(
+                "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
+                 stage={upstream_stage_id} partition={partition_id}): {e}"
+            ),
+        })?;
+        result.push((table_name, batches));
+    }
+    Ok(result)
+}
+
+/// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.
+///
+/// Runs the stage SQL, hash-partitions the result, writes each bucket to the
+/// local shuffle store, and returns `ShufflePartitionOutput` records to be
+/// forwarded to the coordinator via `TaskOutputMetadata`.
+async fn execute_shuffle_write_fragment(
+    assignment: &ExecutorTaskAssignment,
+    spec: &str,
+    ctx: &ShuffleContext,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
+
+    // Parse "hash:<key_column>:<num_partitions>"
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "hash" {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "shuffle-write spec must be 'hash:<key_column>:<num_partitions>', got '{spec}'"
+            ),
+        });
+    }
+    let key_column = parts[1].trim();
+    let num_partitions: u32 = parts[2].trim().parse().map_err(|_| {
+        ExecutorError::InvalidAssignment {
+            message: format!("shuffle-write num_partitions is not a valid u32: '{}'", parts[2]),
+        }
+    })?;
+    if key_column.is_empty() || num_partitions == 0 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from("shuffle-write key_column and num_partitions must be non-empty"),
+        });
+    }
+
+    // Find the SQL query embedded in the input partitions or output contract.
+    // By convention, the first local-parquet input provides the data; the fragment
+    // description has already been stripped of "shuffle-write:"; the SQL sub-query
+    // is encoded in the output contract description.
+    let query = assignment
+        .output_contract()
+        .description()
+        .trim()
+        .strip_prefix("sql:")
+        .map(str::trim)
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: String::from(
+                "shuffle-write output contract must start with 'sql:' followed by the query",
+            ),
+        })?;
+
+    let engine = SqlEngine::new();
+    for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
+        engine
+            .register_parquet(partition.table_name(), partition.path())
+            .await
+            .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+    }
+    for (table_name, batches) in
+        read_connector_parquet_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+    }
+    for (table_name, batches) in
+        read_object_parquet_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+    }
+    for (table_name, batches) in
+        read_shuffle_flight_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+    }
+
+    let dataframe = engine
+        .sql(query)
+        .await
+        .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+    let batches = dataframe
+        .collect()
+        .await
+        .map_err(|e| ExecutorError::LocalExecution { message: e.to_string() })?;
+
+    let partitioner = HashPartitioner::new(key_column, num_partitions);
+    let job_id = assignment.job_id().as_str();
+    let stage_id = assignment.stage_id().as_str();
+    let lease_token = assignment.lease_generation().as_u64();
+
+    // Pre-register all partition leases for this assignment.
+    for p in 0..num_partitions {
+        let id = PartitionId {
+            job_id: job_id.to_owned(),
+            stage_id: stage_id.to_owned(),
+            partition: p,
+        };
+        ctx.store
+            .register_partition_lease(id, lease_token)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("shuffle lease registration failed: {e}"),
+            })?;
+    }
+
+    let mut total_rows: usize = 0;
+    let mut outputs: Vec<ShufflePartitionOutput> = Vec::with_capacity(num_partitions as usize);
+
+    for batch in &batches {
+        total_rows += batch.num_rows();
+        let buckets = partitioner.partition(batch).map_err(|e| ExecutorError::LocalExecution {
+            message: format!("hash partition failed: {e}"),
+        })?;
+
+        for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
+            let p = bucket_idx as u32;
+            let id = PartitionId {
+                job_id: job_id.to_owned(),
+                stage_id: stage_id.to_owned(),
+                partition: p,
+            };
+            let size_bytes = (bucket_batch.get_array_memory_size()) as u64;
+            let schema = bucket_batch.schema();
+            let partition = ShufflePartition {
+                id,
+                schema,
+                batches: vec![bucket_batch],
+            };
+            ctx.store
+                .write_partition(partition, lease_token)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("shuffle write failed for partition {p}: {e}"),
+                })?;
+            outputs.push(ShufflePartitionOutput::new(
+                p,
+                size_bytes,
+                ctx.flight_endpoint.clone(),
+            ));
+        }
+    }
+
+    Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs))
 }
 
 async fn execute_kafka_to_parquet_pipeline(
