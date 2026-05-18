@@ -1261,4 +1261,38 @@ mod tests {
 
         assert_eq!(outcome.action(), ReconcileAction::FinalizerRemoved);
     }
+
+    // --- Slice 7: Operator restart idempotency ---
+
+    #[test]
+    fn operator_restart_does_not_duplicate_scheduler_jobs() {
+        let coordinator_id = CoordinatorId::try_new("coord-idem").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = demo_coordinator(coordinator_id, 2).unwrap();
+
+        // Resource without a finalizer: first reconcile returns FinalizerAdded.
+        let mut resource = sample_resource();
+        resource.metadata.finalizers.clear();
+
+        let outcome1 = reconciler.reconcile(&mut coordinator, &resource).unwrap();
+        assert_eq!(outcome1.action(), ReconcileAction::FinalizerAdded);
+        // No scheduler job created yet.
+        assert_eq!(coordinator.job_snapshots().len(), 0);
+
+        // Second reconcile with the finalizer present: returns Submitted.
+        let resource_with_finalizer = sample_resource(); // has the finalizer
+        let outcome2 = reconciler
+            .reconcile(&mut coordinator, &resource_with_finalizer)
+            .unwrap();
+        assert_eq!(outcome2.action(), ReconcileAction::Submitted);
+        assert_eq!(coordinator.job_snapshots().len(), 1);
+
+        // Third reconcile: job already exists, returns Observed — NOT a duplicate submit.
+        let outcome3 = reconciler
+            .reconcile(&mut coordinator, &resource_with_finalizer)
+            .unwrap();
+        assert_eq!(outcome3.action(), ReconcileAction::Observed);
+        // Still exactly 1 scheduler job — no duplication.
+        assert_eq!(coordinator.job_snapshots().len(), 1);
+    }
 }
