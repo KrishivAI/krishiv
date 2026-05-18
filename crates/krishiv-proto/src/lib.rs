@@ -742,6 +742,9 @@ pub struct ExecutorHeartbeat {
     lease_generation: LeaseGeneration,
     state: ExecutorState,
     running_tasks: Vec<TaskId>,
+    memory_used_bytes: Option<u64>,
+    memory_limit_bytes: Option<u64>,
+    active_task_count: Option<u32>,
 }
 
 impl ExecutorHeartbeat {
@@ -752,6 +755,9 @@ impl ExecutorHeartbeat {
             lease_generation: LeaseGeneration::initial(),
             state,
             running_tasks: Vec::new(),
+            memory_used_bytes: None,
+            memory_limit_bytes: None,
+            active_task_count: None,
         }
     }
 
@@ -766,6 +772,27 @@ impl ExecutorHeartbeat {
     #[must_use]
     pub fn with_running_tasks(mut self, running_tasks: Vec<TaskId>) -> Self {
         self.running_tasks = running_tasks;
+        self
+    }
+
+    /// Attach memory used bytes.
+    #[must_use]
+    pub fn with_memory_used_bytes(mut self, bytes: u64) -> Self {
+        self.memory_used_bytes = Some(bytes);
+        self
+    }
+
+    /// Attach memory limit bytes.
+    #[must_use]
+    pub fn with_memory_limit_bytes(mut self, bytes: u64) -> Self {
+        self.memory_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// Attach active task count.
+    #[must_use]
+    pub fn with_active_task_count(mut self, count: u32) -> Self {
+        self.active_task_count = Some(count);
         self
     }
 
@@ -787,6 +814,21 @@ impl ExecutorHeartbeat {
     /// Running task ids.
     pub fn running_tasks(&self) -> &[TaskId] {
         &self.running_tasks
+    }
+
+    /// Memory used bytes reported by executor.
+    pub fn memory_used_bytes(&self) -> Option<u64> {
+        self.memory_used_bytes
+    }
+
+    /// Memory limit bytes reported by executor.
+    pub fn memory_limit_bytes(&self) -> Option<u64> {
+        self.memory_limit_bytes
+    }
+
+    /// Active task count reported by executor.
+    pub fn active_task_count(&self) -> Option<u32> {
+        self.active_task_count
     }
 }
 
@@ -1106,6 +1148,9 @@ pub struct ExecutorHeartbeatRequest {
     lease_generation: LeaseGeneration,
     state: ExecutorState,
     running_attempts: Vec<TaskAttemptRef>,
+    memory_used_bytes: Option<u64>,
+    memory_limit_bytes: Option<u64>,
+    active_task_count: Option<u32>,
 }
 
 impl ExecutorHeartbeatRequest {
@@ -1121,6 +1166,9 @@ impl ExecutorHeartbeatRequest {
             lease_generation,
             state,
             running_attempts: Vec::new(),
+            memory_used_bytes: None,
+            memory_limit_bytes: None,
+            active_task_count: None,
         }
     }
 
@@ -1135,6 +1183,27 @@ impl ExecutorHeartbeatRequest {
     #[must_use]
     pub fn with_running_attempts(mut self, running_attempts: Vec<TaskAttemptRef>) -> Self {
         self.running_attempts = running_attempts;
+        self
+    }
+
+    /// Attach memory used bytes.
+    #[must_use]
+    pub fn with_memory_used_bytes(mut self, bytes: u64) -> Self {
+        self.memory_used_bytes = Some(bytes);
+        self
+    }
+
+    /// Attach memory limit bytes.
+    #[must_use]
+    pub fn with_memory_limit_bytes(mut self, bytes: u64) -> Self {
+        self.memory_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// Attach active task count.
+    #[must_use]
+    pub fn with_active_task_count(mut self, count: u32) -> Self {
+        self.active_task_count = Some(count);
         self
     }
 
@@ -1161,6 +1230,21 @@ impl ExecutorHeartbeatRequest {
     /// Running task attempts.
     pub fn running_attempts(&self) -> &[TaskAttemptRef] {
         &self.running_attempts
+    }
+
+    /// Memory used bytes.
+    pub fn memory_used_bytes(&self) -> Option<u64> {
+        self.memory_used_bytes
+    }
+
+    /// Memory limit bytes.
+    pub fn memory_limit_bytes(&self) -> Option<u64> {
+        self.memory_limit_bytes
+    }
+
+    /// Active task count.
+    pub fn active_task_count(&self) -> Option<u32> {
+        self.active_task_count
     }
 }
 

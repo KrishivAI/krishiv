@@ -8,6 +8,114 @@
 
 use std::fmt;
 
+/// Data type for a plan schema field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldType {
+    Boolean,
+    Int32,
+    Int64,
+    Float64,
+    Utf8,
+    Binary,
+    Timestamp,
+}
+
+/// One field in a plan schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaField {
+    name: String,
+    field_type: FieldType,
+    nullable: bool,
+}
+
+impl SchemaField {
+    /// Create a non-nullable schema field.
+    pub fn new(name: impl Into<String>, field_type: FieldType) -> Self {
+        Self {
+            name: name.into(),
+            field_type,
+            nullable: false,
+        }
+    }
+
+    /// Set nullability.
+    #[must_use]
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
+    /// Field name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Field type.
+    pub fn field_type(&self) -> &FieldType {
+        &self.field_type
+    }
+
+    /// Whether this field is nullable.
+    pub fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+/// Output schema for a plan node.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanSchema {
+    fields: Vec<SchemaField>,
+}
+
+impl PlanSchema {
+    /// Create a schema from a list of fields.
+    pub fn new(fields: Vec<SchemaField>) -> Self {
+        Self { fields }
+    }
+
+    /// Schema fields.
+    pub fn fields(&self) -> &[SchemaField] {
+        &self.fields
+    }
+
+    /// Whether this schema has no fields.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+/// Join variant used in `NodeOp::Join`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
+}
+
+/// Typed operator classification for a plan node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeOp {
+    /// Table or file scan.
+    Scan { table: String },
+    /// Row filter.
+    Filter,
+    /// Column projection.
+    Project { columns: Vec<String> },
+    /// Aggregation with optional group keys.
+    Aggregate { group_keys: Vec<String> },
+    /// Join of two inputs.
+    Join { join_type: JoinType },
+    /// Data exchange / shuffle between partitions.
+    Exchange { partitioning: Partitioning },
+    /// Output sink.
+    Sink { format: String },
+    /// Operator not covered by the above variants.
+    Other { description: String },
+}
+
 /// Whether a plan represents bounded batch work or unbounded streaming work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionKind {
@@ -73,6 +181,10 @@ pub struct PlanNode {
     broadcast_eligible: bool,
     /// Estimated output row count, if known.
     estimated_rows: Option<u64>,
+    /// Typed operator classification.
+    op: Option<NodeOp>,
+    /// Output schema produced by this node.
+    output_schema: PlanSchema,
 }
 
 impl PlanNode {
@@ -86,6 +198,8 @@ impl PlanNode {
             partitioning: Partitioning::Unpartitioned,
             broadcast_eligible: false,
             estimated_rows: None,
+            op: None,
+            output_schema: PlanSchema::default(),
         }
     }
 
@@ -114,6 +228,20 @@ impl PlanNode {
     #[must_use]
     pub fn with_estimated_rows(mut self, estimated_rows: Option<u64>) -> Self {
         self.estimated_rows = estimated_rows;
+        self
+    }
+
+    /// Set the typed operator classification for this node.
+    #[must_use]
+    pub fn with_op(mut self, op: NodeOp) -> Self {
+        self.op = Some(op);
+        self
+    }
+
+    /// Set the output schema for this node.
+    #[must_use]
+    pub fn with_output_schema(mut self, schema: PlanSchema) -> Self {
+        self.output_schema = schema;
         self
     }
 
@@ -150,6 +278,16 @@ impl PlanNode {
     /// Estimated output row count.
     pub fn estimated_rows(&self) -> Option<u64> {
         self.estimated_rows
+    }
+
+    /// Typed operator classification, if set.
+    pub fn op(&self) -> Option<&NodeOp> {
+        self.op.as_ref()
+    }
+
+    /// Output schema for this node.
+    pub fn output_schema(&self) -> &PlanSchema {
+        &self.output_schema
     }
 }
 
@@ -282,7 +420,10 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionKind, LogicalPlan, Partitioning, PhysicalPlan, PlanNode};
+    use super::{
+        ExecutionKind, FieldType, JoinType, LogicalPlan, NodeOp, Partitioning, PhysicalPlan,
+        PlanNode, PlanSchema, SchemaField,
+    };
 
     #[test]
     fn describes_logical_plan_with_nodes() {
@@ -384,6 +525,76 @@ mod tests {
 
         let desc = plan.describe();
         assert!(desc.contains("broadcast"));
+    }
+
+    #[test]
+    fn plan_node_with_typed_op() {
+        let node =
+            PlanNode::new("scan", "scan parquet", ExecutionKind::Batch).with_op(NodeOp::Scan {
+                table: String::from("orders"),
+            });
+        assert!(matches!(node.op(), Some(NodeOp::Scan { table }) if table == "orders"));
+    }
+
+    #[test]
+    fn plan_node_schema_propagation() {
+        let schema = PlanSchema::new(vec![
+            SchemaField::new("id", FieldType::Int64),
+            SchemaField::new("name", FieldType::Utf8).with_nullable(true),
+        ]);
+        let node = PlanNode::new("proj", "project", ExecutionKind::Batch)
+            .with_op(NodeOp::Project {
+                columns: vec![String::from("id"), String::from("name")],
+            })
+            .with_output_schema(schema);
+        assert_eq!(node.output_schema().fields().len(), 2);
+        assert_eq!(node.output_schema().fields()[0].name(), "id");
+        assert_eq!(
+            node.output_schema().fields()[0].field_type(),
+            &FieldType::Int64
+        );
+        assert!(!node.output_schema().fields()[0].nullable());
+        assert!(node.output_schema().fields()[1].nullable());
+    }
+
+    #[test]
+    fn plan_schema_empty_by_default() {
+        let node = PlanNode::new("n1", "label", ExecutionKind::Batch);
+        assert!(node.output_schema().is_empty());
+    }
+
+    #[test]
+    fn node_op_variants_round_trip() {
+        let ops: Vec<NodeOp> = vec![
+            NodeOp::Scan {
+                table: String::from("t1"),
+            },
+            NodeOp::Filter,
+            NodeOp::Project {
+                columns: vec![String::from("a")],
+            },
+            NodeOp::Aggregate {
+                group_keys: vec![String::from("region")],
+            },
+            NodeOp::Join {
+                join_type: JoinType::Inner,
+            },
+            NodeOp::Exchange {
+                partitioning: Partitioning::Broadcast,
+            },
+            NodeOp::Sink {
+                format: String::from("parquet"),
+            },
+            NodeOp::Other {
+                description: String::from("custom"),
+            },
+        ];
+        for op in &ops {
+            let cloned = op.clone();
+            assert_eq!(&cloned, op);
+            // Verify Debug works.
+            let _ = format!("{cloned:?}");
+        }
     }
 
     #[test]

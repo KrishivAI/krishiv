@@ -430,8 +430,8 @@ fn hash_str(value: &str, buckets: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
     use std::collections::HashSet;
+    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::sync::Arc;
 
@@ -441,7 +441,7 @@ mod tests {
 
     use super::{
         CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState, ShuffleError,
-        ShufflePath, ShuffleMetadata, cleanup_orphans, scan_orphans,
+        ShuffleMetadata, ShufflePath, cleanup_orphans, scan_orphans,
     };
 
     // ── ShufflePath ───────────────────────────────────────────────────────

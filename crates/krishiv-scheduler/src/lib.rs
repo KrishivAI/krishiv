@@ -10,7 +10,7 @@
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
@@ -20,8 +20,8 @@ use krishiv_proto::{
     ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
     OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
     RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskAttemptRef,
-    TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
-    TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
+    TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
+    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
 };
 
 /// Scheduler result alias.
@@ -41,6 +41,7 @@ pub enum TaskUpdateOutcome {
 pub struct CoordinatorConfig {
     max_stage_retries: u32,
     heartbeat_timeout_ticks: u64,
+    memory_threshold_bytes: Option<u64>,
 }
 
 impl CoordinatorConfig {
@@ -49,7 +50,15 @@ impl CoordinatorConfig {
         Self {
             max_stage_retries,
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
+            memory_threshold_bytes: None,
         }
+    }
+
+    /// Set the memory threshold above which executors are skipped for placement.
+    #[must_use]
+    pub fn with_memory_threshold(mut self, bytes: u64) -> Self {
+        self.memory_threshold_bytes = Some(bytes);
+        self
     }
 
     /// Maximum number of stage-level retries after an executor reports failure.
@@ -60,6 +69,11 @@ impl CoordinatorConfig {
     /// Number of scheduler ticks an executor can miss before it is marked lost.
     pub fn heartbeat_timeout_ticks(&self) -> u64 {
         self.heartbeat_timeout_ticks
+    }
+
+    /// Memory threshold above which executors are skipped for placement.
+    pub fn memory_threshold_bytes(&self) -> Option<u64> {
+        self.memory_threshold_bytes
     }
 }
 
@@ -156,13 +170,27 @@ impl fmt::Display for SchedulerError {
 impl Error for SchedulerError {}
 
 /// R2 coordinator skeleton.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Coordinator {
     coordinator_id: CoordinatorId,
     state: CoordinatorState,
     config: CoordinatorConfig,
     executors: ExecutorRegistry,
     jobs: Vec<JobRecord>,
+    store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
+}
+
+impl fmt::Debug for Coordinator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Coordinator")
+            .field("coordinator_id", &self.coordinator_id)
+            .field("state", &self.state)
+            .field("config", &self.config)
+            .field("executors", &self.executors)
+            .field("jobs", &self.jobs)
+            .field("store", &self.store.as_ref().map(|_| "<store>"))
+            .finish()
+    }
 }
 
 /// Shared handle to the active coordinator owned by an R2 runtime process.
@@ -291,7 +319,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
-        let heartbeat = ExecutorHeartbeat::new(request.executor_id().clone(), request.state())
+        let mut heartbeat = ExecutorHeartbeat::new(request.executor_id().clone(), request.state())
             .with_lease_generation(request.lease_generation())
             .with_running_tasks(
                 request
@@ -300,6 +328,15 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                     .map(|attempt| attempt.task_id().clone())
                     .collect(),
             );
+        if let Some(bytes) = request.memory_used_bytes() {
+            heartbeat = heartbeat.with_memory_used_bytes(bytes);
+        }
+        if let Some(bytes) = request.memory_limit_bytes() {
+            heartbeat = heartbeat.with_memory_limit_bytes(bytes);
+        }
+        if let Some(count) = request.active_task_count() {
+            heartbeat = heartbeat.with_active_task_count(count);
+        }
         let mut coordinator = self
             .coordinator
             .write()
@@ -556,9 +593,20 @@ impl Coordinator {
             coordinator_id,
             state: CoordinatorState::Active,
             config,
-            executors: ExecutorRegistry::new(config.heartbeat_timeout_ticks()),
+            executors: ExecutorRegistry::new(
+                config.heartbeat_timeout_ticks(),
+                config.memory_threshold_bytes(),
+            ),
             jobs: Vec::new(),
+            store: None,
         }
+    }
+
+    /// Attach a metadata store to this coordinator (builder).
+    #[must_use]
+    pub fn with_store(mut self, store: impl MetadataStore + 'static) -> Self {
+        self.store = Some(Arc::new(Mutex::new(store)));
+        self
     }
 
     /// Create a standby R2 coordinator.
@@ -572,8 +620,12 @@ impl Coordinator {
             coordinator_id,
             state: CoordinatorState::Standby,
             config,
-            executors: ExecutorRegistry::new(config.heartbeat_timeout_ticks()),
+            executors: ExecutorRegistry::new(
+                config.heartbeat_timeout_ticks(),
+                config.memory_threshold_bytes(),
+            ),
             jobs: Vec::new(),
+            store: None,
         }
     }
 
@@ -624,9 +676,36 @@ impl Coordinator {
     }
 
     /// Advance the deterministic heartbeat clock and mark timed-out executors lost.
+    ///
+    /// Tasks previously assigned to lost executors are reset to `Assigned` so they
+    /// will be relaunched on the next `launch_assigned_task_assignments` call.
     pub fn advance_heartbeat_clock(&mut self, ticks: u64) -> SchedulerResult<Vec<ExecutorId>> {
         self.ensure_active()?;
-        Ok(self.executors.advance_clock(ticks))
+        let lost = self.executors.advance_clock(ticks);
+        for lost_id in &lost {
+            for job in &mut self.jobs {
+                let mut job_affected = false;
+                for stage in &mut job.stages {
+                    let mut stage_affected = false;
+                    for task in &mut stage.tasks {
+                        if task.state == TaskState::Running
+                            && task.assigned_executor.as_ref() == Some(lost_id)
+                        {
+                            task.state = TaskState::Assigned;
+                            stage_affected = true;
+                            job_affected = true;
+                        }
+                    }
+                    if stage_affected {
+                        stage.refresh_state();
+                    }
+                }
+                if job_affected {
+                    job.refresh_state();
+                }
+            }
+        }
+        Ok(lost)
     }
 
     /// Restore job state from a `MetadataStore` after coordinator restart.
@@ -652,9 +731,15 @@ impl Coordinator {
 
         let executors = self.executors.schedulable_executors();
         let assignments = StaticScheduler::place(&spec, &executors)?;
+        let job_id = spec.job_id().clone();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
         self.jobs.push(record);
+        if let Some(store) = &self.store {
+            let mut s = store.lock().unwrap();
+            s.save_job(self.jobs.last().unwrap()).ok();
+            s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
+        }
         Ok(())
     }
 
@@ -758,6 +843,64 @@ impl Coordinator {
         Ok(responses)
     }
 
+    /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
+    ///
+    /// Partial RPC failures are logged but are not fatal for R3.1 — the
+    /// scheduler-side cancel is always applied.
+    pub async fn push_cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
+        // Collect (endpoint, TaskCancellationRequest) for each running task.
+        let mut targets: Vec<(String, TaskCancellationRequest)> = Vec::new();
+        {
+            let job = self.find_job(job_id)?;
+            for stage in job.stages() {
+                for task in stage.tasks() {
+                    if task.state() == TaskState::Running {
+                        if let Some(executor_id) = task.assigned_executor() {
+                            if let Ok(record) = self.executors.find_executor(executor_id) {
+                                if let Some(endpoint) = record.descriptor().task_endpoint() {
+                                    let attempt_id =
+                                        AttemptId::try_new(task.attempt()).map_err(|e| {
+                                            SchedulerError::InvalidJob {
+                                                message: e.to_string(),
+                                            }
+                                        })?;
+                                    let req = TaskCancellationRequest::new(TaskAttemptRef::new(
+                                        job_id.clone(),
+                                        stage.stage_id().clone(),
+                                        task.task_id().clone(),
+                                        attempt_id,
+                                    ))
+                                    .with_reason("job cancelled");
+                                    targets.push((endpoint.to_owned(), req));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cancel the job in scheduler state first.
+        self.cancel_job(job_id)?;
+
+        // Push cancel RPCs — partial failures are non-fatal.
+        for (endpoint, req) in targets {
+            match wire::v1::executor_task_client::ExecutorTaskClient::connect(endpoint.clone())
+                .await
+            {
+                Ok(mut client) => {
+                    let _ = client
+                        .cancel_task(wire::task_cancellation_request_to_wire(req))
+                        .await;
+                }
+                Err(err) => {
+                    eprintln!("push_cancel_job: failed to connect to {endpoint}: {err}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a task update from an executor.
     pub fn apply_task_update(
         &mut self,
@@ -766,8 +909,15 @@ impl Coordinator {
         self.ensure_active()?;
         self.executors
             .validate_lease(update.executor_id(), update.lease_generation())?;
-        self.find_job_mut(update.job_id())?
-            .apply_task_update(update)
+        let job_id = update.job_id().clone();
+        let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
+        if let Some(store) = &self.store {
+            if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
+                let mut s = store.lock().unwrap();
+                s.save_job(record).ok();
+            }
+        }
+        Ok(outcome)
     }
 
     /// Snapshot one job.
@@ -830,27 +980,40 @@ pub fn job_spec_from_physical_plan(job_id: JobId, plan: &PhysicalPlan) -> Schedu
     job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes())
 }
 
+/// Memory and task load snapshot from an executor heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorHealthSnapshot {
+    /// Memory used, as reported by the executor.
+    pub memory_used_bytes: Option<u64>,
+    /// Memory limit, as reported by the executor.
+    pub memory_limit_bytes: Option<u64>,
+    /// Active task count, as reported by the executor.
+    pub active_task_count: Option<u32>,
+}
+
 /// Executor registry skeleton.
 #[derive(Debug, Clone)]
 pub struct ExecutorRegistry {
     executors: Vec<ExecutorRecord>,
     current_tick: u64,
     heartbeat_timeout_ticks: u64,
+    memory_threshold_bytes: Option<u64>,
 }
 
 impl Default for ExecutorRegistry {
     fn default() -> Self {
-        Self::new(CoordinatorConfig::default().heartbeat_timeout_ticks())
+        Self::new(CoordinatorConfig::default().heartbeat_timeout_ticks(), None)
     }
 }
 
 impl ExecutorRegistry {
     /// Create an executor registry with deterministic heartbeat timeout ticks.
-    pub fn new(heartbeat_timeout_ticks: u64) -> Self {
+    pub fn new(heartbeat_timeout_ticks: u64, memory_threshold_bytes: Option<u64>) -> Self {
         Self {
             executors: Vec::new(),
             current_tick: 0,
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
+            memory_threshold_bytes,
         }
     }
 
@@ -877,6 +1040,7 @@ impl ExecutorRegistry {
             executor.state = ExecutorState::Registered;
             executor.running_tasks.clear();
             executor.last_heartbeat_tick = self.current_tick;
+            executor.health_snapshot = None;
             return Ok(executor.lease_generation);
         }
 
@@ -902,6 +1066,11 @@ impl ExecutorRegistry {
         executor.state = heartbeat.state();
         executor.running_tasks = heartbeat.running_tasks().to_vec();
         executor.last_heartbeat_tick = current_tick;
+        executor.health_snapshot = Some(ExecutorHealthSnapshot {
+            memory_used_bytes: heartbeat.memory_used_bytes(),
+            memory_limit_bytes: heartbeat.memory_limit_bytes(),
+            active_task_count: heartbeat.active_task_count(),
+        });
         Ok(())
     }
 
@@ -995,7 +1164,19 @@ impl ExecutorRegistry {
         self.executors
             .iter()
             .filter(|executor| {
-                executor.state().can_accept_work() && executor.descriptor().slots() > 0
+                if !executor.state().can_accept_work() || executor.descriptor().slots() == 0 {
+                    return false;
+                }
+                if let Some(threshold) = self.memory_threshold_bytes {
+                    if let Some(snapshot) = &executor.health_snapshot {
+                        if let Some(used) = snapshot.memory_used_bytes {
+                            if used >= threshold {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
             })
             .map(|executor| executor.descriptor().clone())
             .collect()
@@ -1047,6 +1228,7 @@ pub struct ExecutorRecord {
     state: ExecutorState,
     running_tasks: Vec<TaskId>,
     last_heartbeat_tick: u64,
+    health_snapshot: Option<ExecutorHealthSnapshot>,
 }
 
 impl ExecutorRecord {
@@ -1061,6 +1243,7 @@ impl ExecutorRecord {
             state: ExecutorState::Registered,
             running_tasks: Vec::new(),
             last_heartbeat_tick,
+            health_snapshot: None,
         }
     }
 
@@ -1092,6 +1275,11 @@ impl ExecutorRecord {
     /// Last deterministic heartbeat tick.
     pub fn last_heartbeat_tick(&self) -> u64 {
         self.last_heartbeat_tick
+    }
+
+    /// Most recent health snapshot from the executor heartbeat, if any.
+    pub fn health_snapshot(&self) -> Option<&ExecutorHealthSnapshot> {
+        self.health_snapshot.as_ref()
     }
 }
 
