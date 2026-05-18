@@ -1559,10 +1559,12 @@ mod tests {
         );
         assert!(inbox.is_empty().unwrap());
 
-        let scheduler = shared.read().unwrap();
-        let snapshot = scheduler.job_snapshot(&job_id).unwrap();
-        assert_eq!(snapshot.state(), JobState::Succeeded);
-        assert_eq!(snapshot.succeeded_task_count(), 1);
+        {
+            let scheduler = shared.read().unwrap();
+            let snapshot = scheduler.job_snapshot(&job_id).unwrap();
+            assert_eq!(snapshot.state(), JobState::Succeeded);
+            assert_eq!(snapshot.succeeded_task_count(), 1);
+        }
 
         executor_server.abort();
         let _ = executor_server.await;
@@ -1681,10 +1683,12 @@ mod tests {
         );
         assert!(inbox.is_empty().unwrap());
 
-        let scheduler = shared.read().unwrap();
-        let snapshot = scheduler.job_snapshot(&job_id).unwrap();
-        assert_eq!(snapshot.state(), JobState::Succeeded);
-        assert_eq!(snapshot.succeeded_task_count(), 1);
+        {
+            let scheduler = shared.read().unwrap();
+            let snapshot = scheduler.job_snapshot(&job_id).unwrap();
+            assert_eq!(snapshot.state(), JobState::Succeeded);
+            assert_eq!(snapshot.succeeded_task_count(), 1);
+        }
 
         executor_server.abort();
         let _ = executor_server.await;

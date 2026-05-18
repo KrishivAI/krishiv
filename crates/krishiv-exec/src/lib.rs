@@ -720,8 +720,6 @@ mod tests {
         let id_col = Arc::new(arrow::array::Float64Array::from(vec![1.0f64]));
         let val_col = Arc::new(Int32Array::from(vec![10i32]));
         let left = RecordBatch::try_new(schema.clone(), vec![id_col, val_col]).unwrap();
-        let right = make_int32_batch("id", vec![1], "rval", vec![100]);
-
         // Build a right batch with Float64 key too.
         let right_schema = Arc::new(Schema::new(vec![Field::new(
             "id",

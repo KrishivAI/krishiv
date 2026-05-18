@@ -438,7 +438,7 @@ mod tests {
 
     // ── ThresholdSkewRule ─────────────────────────────────────────────────
 
-    use super::{CoalesceAdvice, CoalesceRule, SkewRule, ThresholdSkewRule};
+    use super::{CoalesceRule, SkewRule, ThresholdSkewRule};
 
     fn make_stats_with_rows(input_rows: &[u64]) -> Vec<RuntimeStats> {
         input_rows
