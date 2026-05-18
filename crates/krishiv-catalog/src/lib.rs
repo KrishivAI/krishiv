@@ -425,6 +425,182 @@ impl CatalogProvider for InMemoryCatalog {
 }
 
 // ---------------------------------------------------------------------------
+// DataFusion catalog bridge
+// ---------------------------------------------------------------------------
+
+/// DataFusion integration: wraps [`InMemoryCatalog`] as DataFusion catalog
+/// and schema providers so that Krishiv catalog tables can be used directly
+/// inside a DataFusion [`SessionContext`].
+///
+/// [`SessionContext`]: datafusion::prelude::SessionContext
+pub mod datafusion_bridge {
+    use std::any::Any;
+    use std::borrow::Cow;
+    use std::fmt;
+    use std::sync::{Arc, RwLock};
+
+    use arrow::datatypes::SchemaRef;
+    use datafusion::catalog::{CatalogProvider, SchemaProvider};
+    use datafusion::datasource::TableType;
+    use datafusion::error::Result as DfResult;
+    use datafusion::logical_expr::Expr;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    // Bring in the Session trait used by TableProvider::scan in DataFusion 48.
+    use datafusion::catalog::Session;
+
+    /// Bridges a Krishiv [`InMemoryCatalog`] into a DataFusion
+    /// [`CatalogProvider`].
+    ///
+    /// The bridge exposes a single schema named `"public"` that mirrors
+    /// the tables registered in the underlying [`InMemoryCatalog`].
+    ///
+    /// [`InMemoryCatalog`]: crate::InMemoryCatalog
+    pub struct DataFusionCatalogBridge {
+        catalog: Arc<RwLock<crate::InMemoryCatalog>>,
+        schema_name: String,
+    }
+
+    impl DataFusionCatalogBridge {
+        /// Create a bridge from an [`InMemoryCatalog`] shared reference.
+        ///
+        /// [`InMemoryCatalog`]: crate::InMemoryCatalog
+        pub fn new(catalog: Arc<RwLock<crate::InMemoryCatalog>>) -> Self {
+            Self {
+                catalog,
+                schema_name: "public".to_string(),
+            }
+        }
+    }
+
+    impl fmt::Debug for DataFusionCatalogBridge {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DataFusionCatalogBridge")
+                .field("schema_name", &self.schema_name)
+                .finish()
+        }
+    }
+
+    impl CatalogProvider for DataFusionCatalogBridge {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema_names(&self) -> Vec<String> {
+            vec![self.schema_name.clone()]
+        }
+
+        fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+            if name == self.schema_name {
+                Some(Arc::new(DataFusionSchemaBridge {
+                    catalog: self.catalog.clone(),
+                }))
+            } else {
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+
+    struct DataFusionSchemaBridge {
+        catalog: Arc<RwLock<crate::InMemoryCatalog>>,
+    }
+
+    impl fmt::Debug for DataFusionSchemaBridge {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DataFusionSchemaBridge").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SchemaProvider for DataFusionSchemaBridge {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn table_names(&self) -> Vec<String> {
+            let catalog = self.catalog.read().expect("catalog read lock poisoned");
+            use crate::CatalogProvider as KrishivCatalogProvider;
+            catalog.list_tables()
+        }
+
+        async fn table(
+            &self,
+            name: &str,
+        ) -> DfResult<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
+            let catalog = self.catalog.read().expect("catalog read lock poisoned");
+            use crate::CatalogProvider as KrishivCatalogProvider;
+            match catalog.get_table(name) {
+                Ok(table_provider) => {
+                    let arrow_schema = Arc::new(table_provider.schema().to_arrow_schema());
+                    let bridge = DataFusionTableBridge {
+                        name: name.to_string(),
+                        arrow_schema,
+                    };
+                    Ok(Some(Arc::new(bridge)))
+                }
+                Err(_) => Ok(None),
+            }
+        }
+
+        fn table_exist(&self, name: &str) -> bool {
+            let catalog = self.catalog.read().expect("catalog read lock poisoned");
+            use crate::CatalogProvider as KrishivCatalogProvider;
+            catalog.get_table(name).is_ok()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct DataFusionTableBridge {
+        name: String,
+        arrow_schema: SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl datafusion::datasource::TableProvider for DataFusionTableBridge {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.arrow_schema.clone()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        fn get_table_definition(&self) -> Option<&str> {
+            None
+        }
+
+        fn get_logical_plan(&self) -> Option<Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+            None
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DfResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(EmptyExec::new(self.arrow_schema.clone())))
+        }
+    }
+
+    impl fmt::Display for DataFusionTableBridge {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "DataFusionTableBridge({})", self.name)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -490,5 +666,46 @@ mod tests {
         let name_field = arrow_schema.field_with_name("name").unwrap();
         assert_eq!(name_field.data_type(), &arrow::datatypes::DataType::Utf8);
         assert!(name_field.is_nullable());
+    }
+
+    // -----------------------------------------------------------------------
+    // DataFusion bridge tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn datafusion_bridge_schema_names_returns_public() {
+        use datafusion::catalog::CatalogProvider as DfCatalogProvider;
+
+        let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
+        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let names = bridge.schema_names();
+        assert_eq!(names, vec!["public"]);
+    }
+
+    #[test]
+    fn datafusion_bridge_table_exist() {
+        let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
+        {
+            let mut cat = catalog.write().unwrap();
+            cat.register_table(TableMetadata::new("orders", make_schema()))
+                .unwrap();
+        }
+        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let schema_provider = {
+            use datafusion::catalog::CatalogProvider as DfCatalogProvider;
+            bridge.schema("public").unwrap()
+        };
+        assert!(schema_provider.table_exist("orders"));
+        assert!(!schema_provider.table_exist("nonexistent"));
+    }
+
+    #[test]
+    fn datafusion_bridge_unknown_schema_returns_none() {
+        use datafusion::catalog::CatalogProvider as DfCatalogProvider;
+
+        let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
+        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let result = bridge.schema("nonexistent");
+        assert!(result.is_none());
     }
 }

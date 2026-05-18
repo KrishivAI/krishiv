@@ -26,6 +26,9 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 arrow = { version = "55.1.0", features = ["prettyprint"] }
+async-trait = "0.1"
+bytes = "1"
+object_store = "0.12"
 askama = "0.12"
 axum = "0.8"
 datafusion = "48.0.1"

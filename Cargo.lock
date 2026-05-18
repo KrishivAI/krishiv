@@ -2203,6 +2203,7 @@ name = "krishiv-catalog"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "datafusion",
 ]
 
@@ -2223,7 +2224,9 @@ name = "krishiv-connectors"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
  "krishiv-proto",
+ "object_store",
  "parquet",
  "tempfile",
  "tokio",

@@ -10,7 +10,9 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub mod kafka;
 pub mod parquet;
+pub mod s3;
 
 // ---------------------------------------------------------------------------
 // Error and Result
@@ -301,6 +303,53 @@ impl CertificationSuite {
         }
         Ok(())
     }
+
+    /// Drain a bounded source and verify it returns `None` on exhaustion.
+    ///
+    /// Returns [`ConnectorError::Unsupported`] if the source is not bounded.
+    /// Returns [`ConnectorError::Unsupported`] if the source does not exhaust
+    /// within 100,000 batches (guards against infinite sources that
+    /// misreport bounded capability).
+    pub async fn run_bounded_exhaustion_test(source: &mut impl Source) -> ConnectorResult<()> {
+        if !source.capabilities().is_bounded() {
+            return Err(ConnectorError::Unsupported {
+                message: "exhaustion test requires a bounded source".into(),
+            });
+        }
+        let mut count = 0usize;
+        loop {
+            match source.read_batch().await? {
+                Some(_) => count += 1,
+                None => break,
+            }
+            if count > 100_000 {
+                return Err(ConnectorError::Unsupported {
+                    message: "source did not exhaust after 100_000 batches".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Write `batches` to `sink`, flush it, and verify the sink declared
+    /// idempotent.
+    ///
+    /// Returns [`ConnectorError::Unsupported`] if the sink is not idempotent.
+    pub async fn run_idempotent_sink_test(
+        sink: &mut impl Sink,
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> ConnectorResult<()> {
+        if !sink.capabilities().is_idempotent() {
+            return Err(ConnectorError::Unsupported {
+                message: "idempotent sink test requires idempotent capability".into(),
+            });
+        }
+        for batch in batches {
+            sink.write_batch(batch.clone()).await?;
+        }
+        sink.flush().await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +443,74 @@ mod tests {
         let result = CertificationSuite::run_source_capabilities_test(&source);
         assert!(result.is_err());
         match result.unwrap_err() {
+            ConnectorError::Unsupported { .. } => {}
+            other => panic!("expected Unsupported, got: {other}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CertificationSuite: bounded exhaustion test
+    // -----------------------------------------------------------------------
+
+    struct ThreeBatchSource {
+        count: usize,
+    }
+
+    impl Source for ThreeBatchSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new().with_bounded()
+        }
+
+        async fn read_batch(
+            &mut self,
+        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
+            if self.count < 3 {
+                self.count += 1;
+                Ok(Some(arrow::record_batch::RecordBatch::new_empty(
+                    std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+            None
+        }
+    }
+
+    struct UnboundedSource;
+
+    impl Source for UnboundedSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new().with_unbounded()
+        }
+
+        async fn read_batch(
+            &mut self,
+        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
+            Ok(None)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn certification_exhaustion_test_passes_for_bounded_source() {
+        let mut source = ThreeBatchSource { count: 0 };
+        let result = CertificationSuite::run_bounded_exhaustion_test(&mut source).await;
+        assert!(result.is_ok(), "bounded source exhaustion test should pass");
+    }
+
+    #[tokio::test]
+    async fn certification_exhaustion_test_rejects_unbounded_source() {
+        let mut source = UnboundedSource;
+        let err = CertificationSuite::run_bounded_exhaustion_test(&mut source)
+            .await
+            .unwrap_err();
+        match err {
             ConnectorError::Unsupported { .. } => {}
             other => panic!("expected Unsupported, got: {other}"),
         }
