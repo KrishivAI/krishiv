@@ -109,6 +109,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Implement executor heartbeat through the tonic-shaped service boundary.
 - [x] Expose executor heartbeat through a networked gRPC server/client.
 - [x] Include executor lease generation and task attempt ID in coordinator/executor transport contracts.
+- [x] Add typed task input/output descriptors to coordinator/executor transport contracts, keeping legacy string descriptions as compatibility fallbacks.
 - [x] Add status API fields for executor lease generation, task attempt, and last failure reason (`lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` in `ExecutorView`; `last_failure_reason` in `TaskView`; retry count deferred).
 - [x] Add cancel/delete API path used by Kubernetes finalizers: `reconcile` delete branch calls `coordinator.cancel_job` before stripping finalizer.
 - [x] Add `CancelTask` RPC from coordinator to executor (`Coordinator::push_cancel_job` + `wire::task_cancellation_request_to_wire`).
@@ -137,6 +138,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Implement task reassignment on executor crash: `advance_heartbeat_clock` resets Running tasks on lost executors to `Assigned`; relaunched on next `launch_assigned_task_assignments`.
 - [x] Add in-memory `MetadataStore` implementation.
 - [x] Persist job, stage, task, attempt, executor lease, and event-log records through `MetadataStore` (`Coordinator::with_store` write-through in `submit_job` and `apply_task_update`).
+- [x] Add JSON metadata schema envelope (`schema_version`, `store_kind`) with future-version rejection.
 - [x] Recover coordinator state from `MetadataStore` after process restart (`recover_from_store` on `Coordinator`).
 - [x] Reject stale task attempts and ignore duplicate status updates safely.
 - [x] Implement `KrishivJob` finalizer lifecycle: add finalizer on first observe, remove on deletion after cleanup.
@@ -147,6 +149,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] gRPC task assignment and status update round-trip tests pass.
 - [x] Versioned transport contract unit tests pass.
 - [x] Executor binary config and request-construction tests pass.
+- [x] Typed task input/output descriptor wire round-trip tests pass (`typed_executor_task_assignment_round_trips_through_wire_contract`).
 - [x] Tonic service registration, heartbeat, and task status adapter tests pass.
 - [x] Networked registration, heartbeat, and task-status gRPC smoke test passes.
 - [x] Executor registers with coordinator and appears in executor registry.
@@ -158,6 +161,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Memory-aware placement test: coordinator skips executors above memory threshold when assigning tasks (`memory_aware_placement_skips_overloaded_executor`).
 - [x] `MetadataStore` persistence tests pass (`metadata_store_persists_job_on_submit`, `metadata_store_persists_task_state_on_update`).
 - [x] Coordinator restart recovery tests pass (`coordinator_recovers_submitted_job_from_store`).
+- [x] Versioned JSON metadata envelope tests pass (`json_file_metadata_store_rejects_newer_schema_version`).
 - [x] Executor lease expiry tests pass.
 - [x] Stale task attempt update tests pass.
 - [x] Duplicate task status update idempotency tests pass.
@@ -252,7 +256,7 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [x] Connector trait unit tests pass (9 tests in `krishiv-connectors`).
 - [x] Parquet read/write certification tests pass (`parquet_sink_writes_and_source_reads_back`, `parquet_source_returns_none_when_exhausted`).
 - [x] S3 read/write certification tests pass (`s3_sink_writes_and_source_reads_back`, `s3_source_capabilities`, `s3_sink_capabilities`).
-- [x] S3-compatible object-store source/sink path runs on the real executor runner (`executor_reads_object_parquet_source_and_writes_object_sink`).
+- [x] S3-compatible object-store source/sink path runs on the real executor runner with typed task I/O descriptors (`executor_reads_object_parquet_source_and_writes_object_sink`).
 - [x] Kafka source/sink certification tests pass for supported semantics (7 Kafka tests; unsupported stub behaviour verified).
 - [x] Offset serialization tests pass (`kafka_offset_encode_decode_roundtrip`).
 - [x] Connector config validation tests pass (`connector_config_required_returns_error_when_missing`, `connector_config_required_returns_value_when_present`).
@@ -264,7 +268,7 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [x] Connector capability flags surfaced in `TaskSpec` proto + scheduler snapshot + UI view (`task_spec_with_connector_capabilities`, `connector_capability_flags_default_all_false`).
 - [x] Executor wires `connector-parquet:` prefix through `ParquetSource` (`executor_runs_parquet_task_via_connector_source`).
 - [x] Shuffle store trait + `InMemoryShuffleStore` + `LocalDiskShuffleStore` with lease-token validation (8 new tests in `krishiv-shuffle`).
-- [x] End-to-end test: Kafka → Parquet pipeline runs on the real executor runner with the deterministic in-memory Kafka-compatible harness (`executor_runs_kafka_to_parquet_pipeline_on_real_runner`); live broker test deferred until Kafka runtime feature selection.
+- [x] End-to-end test: Kafka → Parquet pipeline runs on the real executor runner with typed deterministic in-memory Kafka-compatible descriptors (`executor_runs_kafka_to_parquet_pipeline_on_real_runner`); live broker test deferred until Kafka runtime feature selection.
 
 ### Acceptance Gate For R3.2
 

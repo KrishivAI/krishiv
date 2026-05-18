@@ -17,10 +17,10 @@ use std::sync::{Arc, RwLock};
 use krishiv_proto::{
     CoordinatorExecutorService, DeregisterExecutorRequest, DeregisterExecutorResponse,
     ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
-    ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, LeaseGeneration,
-    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
-    TaskOutputMetadata, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
-    TransportVersion, wire,
+    ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartitionDescriptor,
+    LeaseGeneration, OutputContract, OutputContractDescriptor, RegisterExecutorRequest,
+    RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest, TaskOutputMetadata,
+    TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
 };
 use krishiv_sql::SqlEngine;
 
@@ -176,25 +176,27 @@ struct LocalParquetPartition {
 }
 
 impl LocalParquetPartition {
-    fn parse(partition: &krishiv_proto::InputPartition) -> ExecutorResult<Self> {
-        let descriptor = partition.description().trim();
-        let payload = descriptor.strip_prefix(LOCAL_PARQUET_PARTITION_PREFIX).ok_or_else(|| {
-            ExecutorError::InvalidAssignment {
-                message: format!(
-                    "input partition {} must use local-parquet:<table>:<path> for SQL fragments with assigned inputs",
-                    partition.partition_id()
-                ),
+    fn parse(partition: &krishiv_proto::InputPartition) -> ExecutorResult<Option<Self>> {
+        let (table_name, path) = match partition.descriptor() {
+            Some(InputPartitionDescriptor::LocalParquet { table_name, path }) => {
+                (table_name.as_str(), path.as_str())
             }
-        })?;
-        let (table_name, path) =
-            payload
-                .split_once(':')
-                .ok_or_else(|| ExecutorError::InvalidAssignment {
-                    message: format!(
-                        "input partition {} must use local-parquet:<table>:<path>",
-                        partition.partition_id()
-                    ),
-                })?;
+            Some(_) => return Ok(None),
+            None => {
+                let descriptor = partition.description().trim();
+                let Some(payload) = descriptor.strip_prefix(LOCAL_PARQUET_PARTITION_PREFIX) else {
+                    return Ok(None);
+                };
+                payload
+                    .split_once(':')
+                    .ok_or_else(|| ExecutorError::InvalidAssignment {
+                        message: format!(
+                            "input partition {} must use local-parquet:<table>:<path>",
+                            partition.partition_id()
+                        ),
+                    })?
+            }
+        };
         let table_name = table_name.trim();
         let path = path.trim();
         if table_name.is_empty() {
@@ -214,10 +216,10 @@ impl LocalParquetPartition {
             });
         }
 
-        Ok(Self {
+        Ok(Some(Self {
             table_name: table_name.to_owned(),
             path: PathBuf::from(path),
-        })
+        }))
     }
 
     fn table_name(&self) -> &str {
@@ -582,8 +584,7 @@ impl ExecutorTaskRunner {
                     .trim()
                     .starts_with(OBJECT_PARQUET_SINK_PREFIX)
             {
-                write_object_parquet_sink(assignment.output_contract().description(), &batches)
-                    .await?;
+                write_object_parquet_sink(assignment.output_contract(), &batches).await?;
             }
             let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
             let column_count = batches.first().map_or(0, |batch| batch.num_columns());
@@ -635,19 +636,12 @@ impl ExecutorTaskRunner {
 fn parse_local_parquet_partitions(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<Vec<LocalParquetPartition>> {
-    if !partitions.iter().any(|partition| {
-        partition
-            .description()
-            .trim()
-            .starts_with(LOCAL_PARQUET_PARTITION_PREFIX)
-    }) {
-        return Ok(Vec::new());
-    }
-
     let mut table_names = BTreeSet::new();
-    let mut parsed = Vec::with_capacity(partitions.len());
+    let mut parsed = Vec::new();
     for partition in partitions {
-        let local_partition = LocalParquetPartition::parse(partition)?;
+        let Some(local_partition) = LocalParquetPartition::parse(partition)? else {
+            continue;
+        };
         if !table_names.insert(local_partition.table_name().to_owned()) {
             return Err(ExecutorError::InvalidAssignment {
                 message: format!(
@@ -673,10 +667,18 @@ async fn read_connector_parquet_partitions(
 
     let mut result = Vec::new();
     for partition in partitions {
-        let desc = partition.description().trim();
-        let path_str = match desc.strip_prefix(CONNECTOR_PARQUET_PARTITION_PREFIX) {
-            Some(p) => p.trim(),
-            None => continue,
+        let (path_str, explicit_table_name) = match partition.descriptor() {
+            Some(InputPartitionDescriptor::ConnectorParquet { table_name, path }) => {
+                (path.as_str(), table_name.as_deref())
+            }
+            Some(_) => continue,
+            None => {
+                let desc = partition.description().trim();
+                match desc.strip_prefix(CONNECTOR_PARQUET_PARTITION_PREFIX) {
+                    Some(p) => (p.trim(), None),
+                    None => continue,
+                }
+            }
         };
         if path_str.is_empty() {
             return Err(ExecutorError::InvalidAssignment {
@@ -687,12 +689,15 @@ async fn read_connector_parquet_partitions(
             });
         }
         let path = std::path::Path::new(path_str);
-        // Derive a table name from the filename stem.
-        let table_name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("connector_table")
-            .to_owned();
+        // Derive a table name from the filename stem unless the typed descriptor supplied one.
+        let table_name = explicit_table_name
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("connector_table")
+                    .to_owned()
+            });
 
         let mut source = ParquetSource::open(path).map_err(|e| ExecutorError::LocalExecution {
             message: format!("connector-parquet open failed for '{path_str}': {e}"),
@@ -730,15 +735,29 @@ async fn read_object_parquet_partitions(
 
     let mut result = Vec::new();
     for partition in partitions {
-        let desc = partition.description().trim();
-        let Some(payload) = desc.strip_prefix(OBJECT_PARQUET_PARTITION_PREFIX) else {
-            continue;
+        let (table_name, base_dir, object_path) = match partition.descriptor() {
+            Some(InputPartitionDescriptor::ObjectParquet {
+                table_name,
+                base_dir,
+                object_path,
+            }) => (
+                table_name.clone(),
+                PathBuf::from(base_dir),
+                object_path.clone(),
+            ),
+            Some(_) => continue,
+            None => {
+                let desc = partition.description().trim();
+                let Some(payload) = desc.strip_prefix(OBJECT_PARQUET_PARTITION_PREFIX) else {
+                    continue;
+                };
+                parse_object_parquet_descriptor(
+                    partition.partition_id(),
+                    payload,
+                    "object-parquet:<table>:<base_dir>:<object_path>",
+                )?
+            }
         };
-        let (table_name, base_dir, object_path) = parse_object_parquet_descriptor(
-            partition.partition_id(),
-            payload,
-            "object-parquet:<table>:<base_dir>:<object_path>",
-        )?;
         let store = Arc::new(
             LocalFileSystem::new_with_prefix(&base_dir).map_err(|error| {
                 ExecutorError::LocalExecution {
@@ -771,7 +790,7 @@ async fn read_object_parquet_partitions(
 }
 
 async fn write_object_parquet_sink(
-    description: &str,
+    contract: &OutputContract,
     batches: &[arrow::record_batch::RecordBatch],
 ) -> ExecutorResult<()> {
     use std::sync::Arc;
@@ -780,22 +799,30 @@ async fn write_object_parquet_sink(
     use object_store::local::LocalFileSystem;
     use object_store::path::Path as ObjectPath;
 
-    let payload = description
-        .trim()
-        .strip_prefix(OBJECT_PARQUET_SINK_PREFIX)
-        .ok_or_else(|| ExecutorError::InvalidAssignment {
-            message: format!(
-                "object sink must use {OBJECT_PARQUET_SINK_PREFIX}<base_dir>:<object_path>"
-            ),
-        })?;
-    let (base_dir, object_path) =
-        payload
-            .split_once(':')
-            .ok_or_else(|| ExecutorError::InvalidAssignment {
-                message: format!(
-                    "object sink must use {OBJECT_PARQUET_SINK_PREFIX}<base_dir>:<object_path>"
-                ),
-            })?;
+    let (base_dir, object_path) = match contract.descriptor() {
+        Some(OutputContractDescriptor::ObjectParquetSink {
+            base_dir,
+            object_path,
+        }) => (base_dir.as_str(), object_path.as_str()),
+        _ => {
+            let payload = contract
+                .description()
+                .trim()
+                .strip_prefix(OBJECT_PARQUET_SINK_PREFIX)
+                .ok_or_else(|| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "object sink must use {OBJECT_PARQUET_SINK_PREFIX}<base_dir>:<object_path>"
+                    ),
+                })?;
+            payload
+                .split_once(':')
+                .ok_or_else(|| ExecutorError::InvalidAssignment {
+                    message: format!(
+                        "object sink must use {OBJECT_PARQUET_SINK_PREFIX}<base_dir>:<object_path>"
+                    ),
+                })?
+        }
+    };
     let base_dir = base_dir.trim();
     let object_path = object_path.trim();
     if base_dir.is_empty() || object_path.is_empty() {
@@ -861,7 +888,7 @@ async fn execute_kafka_to_parquet_pipeline(
 
     let (topic, partition, start_offset, batch) =
         parse_memory_kafka_partition(assignment.input_partitions())?;
-    let sink_path = parse_parquet_sink_path(assignment.output_contract().description())?;
+    let sink_path = parse_parquet_sink_path(assignment.output_contract())?;
     let mut source = InMemoryKafkaSource::new(topic, partition, start_offset, vec![batch]);
     let mut sink =
         ParquetSink::create(&sink_path).map_err(|error| ExecutorError::LocalExecution {
@@ -914,16 +941,20 @@ async fn execute_kafka_to_parquet_pipeline(
     ))
 }
 
-fn parse_parquet_sink_path(description: &str) -> ExecutorResult<PathBuf> {
-    let path = description
-        .trim()
-        .strip_prefix(PARQUET_SINK_PREFIX)
-        .ok_or_else(|| ExecutorError::InvalidAssignment {
-            message: format!(
-                "Kafka-to-Parquet output contract must use {PARQUET_SINK_PREFIX}<path>"
-            ),
-        })?
-        .trim();
+fn parse_parquet_sink_path(contract: &OutputContract) -> ExecutorResult<PathBuf> {
+    let path = match contract.descriptor() {
+        Some(OutputContractDescriptor::ParquetSink { path }) => path.as_str(),
+        _ => contract
+            .description()
+            .trim()
+            .strip_prefix(PARQUET_SINK_PREFIX)
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "Kafka-to-Parquet output contract must use {PARQUET_SINK_PREFIX}<path>"
+                ),
+            })?,
+    }
+    .trim();
     if path.is_empty() {
         return Err(ExecutorError::InvalidAssignment {
             message: String::from("Kafka-to-Parquet output path cannot be empty"),
@@ -942,6 +973,51 @@ fn parse_memory_kafka_partition(
 
     let mut parsed = None;
     for partition in partitions {
+        if let Some(descriptor) = partition.descriptor() {
+            let InputPartitionDescriptor::MemoryKafka {
+                topic,
+                partition: kafka_partition,
+                start_offset,
+                records,
+            } = descriptor
+            else {
+                continue;
+            };
+            if parsed.is_some() {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: String::from(
+                        "Kafka-to-Parquet pipeline accepts exactly one memory-kafka partition",
+                    ),
+                });
+            }
+            if topic.trim().is_empty() || records.is_empty() {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: String::from("typed memory-kafka topic and records cannot be empty"),
+                });
+            }
+            let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+            let values = records
+                .iter()
+                .map(|record| record.value.as_str())
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("failed to build typed memory-kafka record batch: {error}"),
+            })?;
+            parsed = Some((topic.clone(), *kafka_partition, *start_offset, batch));
+            continue;
+        }
+
         let desc = partition.description().trim();
         let Some(payload) = desc.strip_prefix(MEMORY_KAFKA_PARTITION_PREFIX) else {
             continue;
@@ -1498,7 +1574,8 @@ mod tests {
         AttemptId, CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
         DeregisterExecutorResponse, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse,
         ExecutorId, ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartition,
-        JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract, OutputContractKind,
+        InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
+        MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind,
         PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, StageId, StageSpec,
         TaskAttemptRef, TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest,
         TaskStatusResponse, TransportDisposition, TransportVersion, wire,
@@ -1970,10 +2047,17 @@ mod tests {
                 .contains("duplicate local Parquet table name")
         );
 
-        let malformed = super::parse_local_parquet_partitions(&[
+        let non_local = super::parse_local_parquet_partitions(&[
             InputPartition::new("part-1", "local-parquet:people:/tmp/people.parquet"),
             InputPartition::new("part-2", "not-a-local-parquet-descriptor"),
         ])
+        .unwrap();
+        assert_eq!(non_local.len(), 1);
+
+        let malformed = super::parse_local_parquet_partitions(&[InputPartition::new(
+            "part-1",
+            "local-parquet:people",
+        )])
         .unwrap_err();
         assert!(
             malformed
@@ -2395,7 +2479,7 @@ mod tests {
                 .unwrap()
                 .remove(0);
 
-            // Use connector-parquet: prefix instead of local-parquet:
+            // Use typed connector Parquet partition instead of legacy string parsing.
             let assignment = ExecutorTaskAssignment::new(
                 TaskAttemptRef::new(
                     launched.job_id().clone(),
@@ -2408,9 +2492,12 @@ mod tests {
                 PlanFragment::new("sql: select id, name from people where id > 1 order by id"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "inline result"),
             )
-            .with_input_partitions(vec![InputPartition::new(
+            .with_input_partitions(vec![InputPartition::typed(
                 "people-connector-part-1",
-                format!("connector-parquet:{}", parquet_path.display()),
+                InputPartitionDescriptor::ConnectorParquet {
+                    table_name: Some(String::from("people")),
+                    path: parquet_path.display().to_string(),
+                },
             )]);
             inbox.push(assignment).unwrap();
         }
@@ -2482,20 +2569,21 @@ mod tests {
                 launched.executor_id().clone(),
                 launched.lease_generation(),
                 PlanFragment::new("sql: select id, name from people where id > 1 order by id"),
-                OutputContract::new(
+                OutputContract::typed(
                     OutputContractKind::Sink,
-                    format!(
-                        "object-parquet-sink:{}:output/filtered.parquet",
-                        object_root.display()
-                    ),
+                    OutputContractDescriptor::ObjectParquetSink {
+                        base_dir: object_root.display().to_string(),
+                        object_path: String::from("output/filtered.parquet"),
+                    },
                 ),
             )
-            .with_input_partitions(vec![InputPartition::new(
+            .with_input_partitions(vec![InputPartition::typed(
                 "people-object-part-1",
-                format!(
-                    "object-parquet:people:{}:input/people.parquet",
-                    object_root.display()
-                ),
+                InputPartitionDescriptor::ObjectParquet {
+                    table_name: String::from("people"),
+                    base_dir: object_root.display().to_string(),
+                    object_path: String::from("input/people.parquet"),
+                },
             )]);
             inbox.push(assignment).unwrap();
         }
@@ -2560,14 +2648,25 @@ mod tests {
                 launched.executor_id().clone(),
                 launched.lease_generation(),
                 PlanFragment::new(super::KAFKA_TO_PARQUET_FRAGMENT),
-                OutputContract::new(
+                OutputContract::typed(
                     OutputContractKind::Sink,
-                    format!("parquet-sink:{}", output_path.display()),
+                    OutputContractDescriptor::ParquetSink {
+                        path: output_path.display().to_string(),
+                    },
                 ),
             )
-            .with_input_partitions(vec![InputPartition::new(
+            .with_input_partitions(vec![InputPartition::typed(
                 "events-partition-0",
-                "memory-kafka:events:0:5:1=created,2=updated,3=deleted",
+                InputPartitionDescriptor::MemoryKafka {
+                    topic: String::from("events"),
+                    partition: 0,
+                    start_offset: 5,
+                    records: vec![
+                        MemoryKafkaRecord::new(1, "created"),
+                        MemoryKafkaRecord::new(2, "updated"),
+                        MemoryKafkaRecord::new(3, "deleted"),
+                    ],
+                },
             )]);
             inbox.push(assignment).unwrap();
         }

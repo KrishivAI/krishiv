@@ -1347,20 +1347,113 @@ impl ExecutorHeartbeatResponse {
     }
 }
 
+/// Typed connector/runtime input descriptor for one executor partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputPartitionDescriptor {
+    /// Local Parquet file registered directly with DataFusion.
+    LocalParquet { table_name: String, path: String },
+    /// Parquet file read through the connector boundary.
+    ConnectorParquet {
+        table_name: Option<String>,
+        path: String,
+    },
+    /// Object-store Parquet input using the R3 deterministic local-object backend.
+    ObjectParquet {
+        table_name: String,
+        base_dir: String,
+        object_path: String,
+    },
+    /// Deterministic Kafka-compatible in-memory records for connector certification.
+    MemoryKafka {
+        topic: String,
+        partition: i32,
+        start_offset: i64,
+        records: Vec<MemoryKafkaRecord>,
+    },
+}
+
+impl InputPartitionDescriptor {
+    /// Build a legacy-compatible human-readable descriptor string.
+    pub fn legacy_description(&self) -> String {
+        match self {
+            Self::LocalParquet { table_name, path } => {
+                format!("local-parquet:{table_name}:{path}")
+            }
+            Self::ConnectorParquet { path, .. } => format!("connector-parquet:{path}"),
+            Self::ObjectParquet {
+                table_name,
+                base_dir,
+                object_path,
+            } => format!("object-parquet:{table_name}:{base_dir}:{object_path}"),
+            Self::MemoryKafka {
+                topic,
+                partition,
+                start_offset,
+                records,
+            } => {
+                let records = records
+                    .iter()
+                    .map(|record| format!("{}={}", record.id, record.value))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("memory-kafka:{topic}:{partition}:{start_offset}:{records}")
+            }
+        }
+    }
+}
+
+/// One deterministic in-memory Kafka record used by typed R3 test descriptors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryKafkaRecord {
+    /// Synthetic record id.
+    pub id: i64,
+    /// Synthetic record value.
+    pub value: String,
+}
+
+impl MemoryKafkaRecord {
+    /// Create a memory Kafka test record.
+    pub fn new(id: i64, value: impl Into<String>) -> Self {
+        Self {
+            id,
+            value: value.into(),
+        }
+    }
+}
+
 /// Descriptor for one input partition assigned to an executor task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputPartition {
     partition_id: String,
     description: String,
+    descriptor: Option<InputPartitionDescriptor>,
 }
 
 impl InputPartition {
-    /// Create an input partition descriptor.
+    /// Create a legacy string input partition descriptor.
     pub fn new(partition_id: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             partition_id: partition_id.into(),
             description: description.into(),
+            descriptor: None,
         }
+    }
+
+    /// Create a typed input partition descriptor while retaining a legacy description.
+    pub fn typed(partition_id: impl Into<String>, descriptor: InputPartitionDescriptor) -> Self {
+        Self {
+            partition_id: partition_id.into(),
+            description: descriptor.legacy_description(),
+            descriptor: Some(descriptor),
+        }
+    }
+
+    /// Attach or replace the typed descriptor.
+    #[must_use]
+    pub fn with_descriptor(mut self, descriptor: InputPartitionDescriptor) -> Self {
+        self.description = descriptor.legacy_description();
+        self.descriptor = Some(descriptor);
+        self
     }
 
     /// Partition id.
@@ -1368,9 +1461,14 @@ impl InputPartition {
         &self.partition_id
     }
 
-    /// Human-readable partition description.
+    /// Human-readable fallback partition description.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Typed descriptor, when supplied by the scheduler/control plane.
+    pub fn descriptor(&self) -> Option<&InputPartitionDescriptor> {
+        self.descriptor.as_ref()
     }
 }
 
@@ -1418,20 +1516,73 @@ impl fmt::Display for OutputContractKind {
     }
 }
 
+/// Typed output destination descriptor for executor task output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputContractDescriptor {
+    /// Return bounded record batches via task metadata/control-plane test path.
+    InlineRecordBatches,
+    /// Write to a local file path.
+    LocalFile { path: String },
+    /// Write to a shuffle partition.
+    Shuffle { partition: String },
+    /// Write Parquet through the object-store connector boundary.
+    ObjectParquetSink {
+        base_dir: String,
+        object_path: String,
+    },
+    /// Write Parquet to a local path through the connector sink.
+    ParquetSink { path: String },
+}
+
+impl OutputContractDescriptor {
+    /// Build a legacy-compatible human-readable output descriptor.
+    pub fn legacy_description(&self) -> String {
+        match self {
+            Self::InlineRecordBatches => String::from("inline result"),
+            Self::LocalFile { path } => path.clone(),
+            Self::Shuffle { partition } => partition.clone(),
+            Self::ObjectParquetSink {
+                base_dir,
+                object_path,
+            } => format!("object-parquet-sink:{base_dir}:{object_path}"),
+            Self::ParquetSink { path } => format!("parquet-sink:{path}"),
+        }
+    }
+}
+
 /// Output contract for an executor task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputContract {
     kind: OutputContractKind,
     description: String,
+    descriptor: Option<OutputContractDescriptor>,
 }
 
 impl OutputContract {
-    /// Create an output contract.
+    /// Create a legacy string output contract.
     pub fn new(kind: OutputContractKind, description: impl Into<String>) -> Self {
         Self {
             kind,
             description: description.into(),
+            descriptor: None,
         }
+    }
+
+    /// Create a typed output contract while retaining a legacy description.
+    pub fn typed(kind: OutputContractKind, descriptor: OutputContractDescriptor) -> Self {
+        Self {
+            kind,
+            description: descriptor.legacy_description(),
+            descriptor: Some(descriptor),
+        }
+    }
+
+    /// Attach or replace the typed descriptor.
+    #[must_use]
+    pub fn with_descriptor(mut self, descriptor: OutputContractDescriptor) -> Self {
+        self.description = descriptor.legacy_description();
+        self.descriptor = Some(descriptor);
+        self
     }
 
     /// Output kind.
@@ -1439,9 +1590,14 @@ impl OutputContract {
         self.kind
     }
 
-    /// Human-readable output description.
+    /// Human-readable fallback output description.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Typed output destination descriptor, when supplied.
+    pub fn descriptor(&self) -> Option<&OutputContractDescriptor> {
+        self.descriptor.as_ref()
     }
 }
 
@@ -1844,10 +2000,11 @@ pub mod wire {
     use super::{
         AttemptId, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
         ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-        ExecutorTaskAssignment, InputPartition, JobId, LeaseGeneration, OutputContract,
-        OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-        StageId, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskState,
-        TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
+        ExecutorTaskAssignment, InputPartition, InputPartitionDescriptor, JobId, LeaseGeneration,
+        MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind,
+        PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, StageId, TaskAttemptRef,
+        TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskState, TaskStatusRequest,
+        TaskStatusResponse, TransportDisposition, TransportVersion,
     };
 
     /// Generated protobuf and tonic service types for `krishiv.transport.v1`.
@@ -2314,6 +2471,7 @@ pub mod wire {
         v1::InputPartition {
             partition_id: value.partition_id().to_owned(),
             description: value.description().to_owned(),
+            descriptor: value.descriptor().map(input_partition_descriptor_to_wire),
         }
     }
 
@@ -2321,7 +2479,119 @@ pub mod wire {
         if value.partition_id.trim().is_empty() {
             return Err(WireError::new("input partition id cannot be empty"));
         }
-        Ok(InputPartition::new(value.partition_id, value.description))
+        let partition = InputPartition::new(value.partition_id, value.description);
+        match value.descriptor {
+            Some(descriptor) => {
+                Ok(partition.with_descriptor(input_partition_descriptor_from_wire(descriptor)?))
+            }
+            None => Ok(partition),
+        }
+    }
+
+    fn input_partition_descriptor_to_wire(
+        value: &InputPartitionDescriptor,
+    ) -> v1::InputPartitionDescriptor {
+        match value {
+            InputPartitionDescriptor::LocalParquet { table_name, path } => {
+                v1::InputPartitionDescriptor {
+                    kind: v1::InputPartitionDescriptorKind::LocalParquet as i32,
+                    table_name: table_name.clone(),
+                    path: path.clone(),
+                    ..Default::default()
+                }
+            }
+            InputPartitionDescriptor::ConnectorParquet { table_name, path } => {
+                v1::InputPartitionDescriptor {
+                    kind: v1::InputPartitionDescriptorKind::ConnectorParquet as i32,
+                    table_name: table_name.clone().unwrap_or_default(),
+                    path: path.clone(),
+                    ..Default::default()
+                }
+            }
+            InputPartitionDescriptor::ObjectParquet {
+                table_name,
+                base_dir,
+                object_path,
+            } => v1::InputPartitionDescriptor {
+                kind: v1::InputPartitionDescriptorKind::ObjectParquet as i32,
+                table_name: table_name.clone(),
+                object_base_dir: base_dir.clone(),
+                object_path: object_path.clone(),
+                ..Default::default()
+            },
+            InputPartitionDescriptor::MemoryKafka {
+                topic,
+                partition,
+                start_offset,
+                records,
+            } => v1::InputPartitionDescriptor {
+                kind: v1::InputPartitionDescriptorKind::MemoryKafka as i32,
+                kafka_topic: topic.clone(),
+                kafka_partition: *partition,
+                kafka_start_offset: *start_offset,
+                memory_kafka_records: records
+                    .iter()
+                    .map(|record| v1::MemoryKafkaRecord {
+                        id: record.id,
+                        value: record.value.clone(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn input_partition_descriptor_from_wire(
+        value: v1::InputPartitionDescriptor,
+    ) -> WireResult<InputPartitionDescriptor> {
+        match v1::InputPartitionDescriptorKind::try_from(value.kind)
+            .unwrap_or(v1::InputPartitionDescriptorKind::Unspecified)
+        {
+            v1::InputPartitionDescriptorKind::Unspecified => Err(WireError::new(
+                "input partition descriptor kind must be specified",
+            )),
+            v1::InputPartitionDescriptorKind::LocalParquet => {
+                require_non_empty(&value.table_name, "local parquet table name")?;
+                require_non_empty(&value.path, "local parquet path")?;
+                Ok(InputPartitionDescriptor::LocalParquet {
+                    table_name: value.table_name,
+                    path: value.path,
+                })
+            }
+            v1::InputPartitionDescriptorKind::ConnectorParquet => {
+                require_non_empty(&value.path, "connector parquet path")?;
+                Ok(InputPartitionDescriptor::ConnectorParquet {
+                    table_name: non_empty_string(value.table_name),
+                    path: value.path,
+                })
+            }
+            v1::InputPartitionDescriptorKind::ObjectParquet => {
+                require_non_empty(&value.table_name, "object parquet table name")?;
+                require_non_empty(&value.object_base_dir, "object parquet base dir")?;
+                require_non_empty(&value.object_path, "object parquet path")?;
+                Ok(InputPartitionDescriptor::ObjectParquet {
+                    table_name: value.table_name,
+                    base_dir: value.object_base_dir,
+                    object_path: value.object_path,
+                })
+            }
+            v1::InputPartitionDescriptorKind::MemoryKafka => {
+                require_non_empty(&value.kafka_topic, "memory kafka topic")?;
+                if value.memory_kafka_records.is_empty() {
+                    return Err(WireError::new("memory kafka records cannot be empty"));
+                }
+                Ok(InputPartitionDescriptor::MemoryKafka {
+                    topic: value.kafka_topic,
+                    partition: value.kafka_partition,
+                    start_offset: value.kafka_start_offset,
+                    records: value
+                        .memory_kafka_records
+                        .into_iter()
+                        .map(|record| MemoryKafkaRecord::new(record.id, record.value))
+                        .collect(),
+                })
+            }
+        }
     }
 
     fn plan_fragment_to_wire(value: &PlanFragment) -> v1::PlanFragment {
@@ -2341,6 +2611,7 @@ pub mod wire {
         v1::OutputContract {
             kind: output_contract_kind_to_wire(value.kind()) as i32,
             description: value.description().to_owned(),
+            descriptor: value.descriptor().map(output_contract_descriptor_to_wire),
         }
     }
 
@@ -2350,10 +2621,104 @@ pub mod wire {
                 "output contract description cannot be empty",
             ));
         }
-        Ok(OutputContract::new(
+        let contract = OutputContract::new(
             output_contract_kind_from_wire(value.kind)?,
             value.description,
-        ))
+        );
+        match value.descriptor {
+            Some(descriptor) => {
+                Ok(contract.with_descriptor(output_contract_descriptor_from_wire(descriptor)?))
+            }
+            None => Ok(contract),
+        }
+    }
+
+    fn output_contract_descriptor_to_wire(
+        value: &OutputContractDescriptor,
+    ) -> v1::OutputContractDescriptor {
+        match value {
+            OutputContractDescriptor::InlineRecordBatches => v1::OutputContractDescriptor {
+                kind: v1::OutputContractDescriptorKind::InlineRecordBatches as i32,
+                ..Default::default()
+            },
+            OutputContractDescriptor::LocalFile { path } => v1::OutputContractDescriptor {
+                kind: v1::OutputContractDescriptorKind::LocalFile as i32,
+                path: path.clone(),
+                ..Default::default()
+            },
+            OutputContractDescriptor::Shuffle { partition } => v1::OutputContractDescriptor {
+                kind: v1::OutputContractDescriptorKind::Shuffle as i32,
+                shuffle_partition: partition.clone(),
+                ..Default::default()
+            },
+            OutputContractDescriptor::ObjectParquetSink {
+                base_dir,
+                object_path,
+            } => v1::OutputContractDescriptor {
+                kind: v1::OutputContractDescriptorKind::ObjectParquetSink as i32,
+                object_base_dir: base_dir.clone(),
+                object_path: object_path.clone(),
+                ..Default::default()
+            },
+            OutputContractDescriptor::ParquetSink { path } => v1::OutputContractDescriptor {
+                kind: v1::OutputContractDescriptorKind::ParquetSink as i32,
+                path: path.clone(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn output_contract_descriptor_from_wire(
+        value: v1::OutputContractDescriptor,
+    ) -> WireResult<OutputContractDescriptor> {
+        match v1::OutputContractDescriptorKind::try_from(value.kind)
+            .unwrap_or(v1::OutputContractDescriptorKind::Unspecified)
+        {
+            v1::OutputContractDescriptorKind::Unspecified => Err(WireError::new(
+                "output contract descriptor kind must be specified",
+            )),
+            v1::OutputContractDescriptorKind::InlineRecordBatches => {
+                Ok(OutputContractDescriptor::InlineRecordBatches)
+            }
+            v1::OutputContractDescriptorKind::LocalFile => {
+                require_non_empty(&value.path, "local file output path")?;
+                Ok(OutputContractDescriptor::LocalFile { path: value.path })
+            }
+            v1::OutputContractDescriptorKind::Shuffle => {
+                require_non_empty(&value.shuffle_partition, "shuffle output partition")?;
+                Ok(OutputContractDescriptor::Shuffle {
+                    partition: value.shuffle_partition,
+                })
+            }
+            v1::OutputContractDescriptorKind::ObjectParquetSink => {
+                require_non_empty(&value.object_base_dir, "object parquet sink base dir")?;
+                require_non_empty(&value.object_path, "object parquet sink path")?;
+                Ok(OutputContractDescriptor::ObjectParquetSink {
+                    base_dir: value.object_base_dir,
+                    object_path: value.object_path,
+                })
+            }
+            v1::OutputContractDescriptorKind::ParquetSink => {
+                require_non_empty(&value.path, "parquet sink path")?;
+                Ok(OutputContractDescriptor::ParquetSink { path: value.path })
+            }
+        }
+    }
+
+    fn require_non_empty(value: &str, field: &'static str) -> WireResult<()> {
+        if value.trim().is_empty() {
+            Err(WireError::new(format!("{field} cannot be empty")))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn non_empty_string(value: String) -> Option<String> {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     fn executor_state_to_wire(value: ExecutorState) -> v1::ExecutorState {
@@ -2476,7 +2841,8 @@ mod tests {
     use super::{
         AttemptId, ConnectorCapabilityFlags, DeregisterExecutorRequest, ExecutorDescriptor,
         ExecutorHeartbeatRequest, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-        InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
+        InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState,
+        LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
         OutputContractKind, PlanFragment, RegisterExecutorRequest, StageId, StageSpec,
         TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
         TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
@@ -2641,6 +3007,50 @@ mod tests {
         let round_trip = super::wire::executor_task_assignment_from_wire(wire).unwrap();
 
         assert_eq!(round_trip, assignment);
+    }
+
+    #[test]
+    fn typed_executor_task_assignment_round_trips_through_wire_contract() {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-typed").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let assignment = ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("connector-pipeline:kafka-to-parquet"),
+            OutputContract::typed(
+                OutputContractKind::Sink,
+                OutputContractDescriptor::ParquetSink {
+                    path: String::from("/tmp/out.parquet"),
+                },
+            ),
+        )
+        .with_input_partitions(vec![InputPartition::typed(
+            "part-1",
+            InputPartitionDescriptor::MemoryKafka {
+                topic: String::from("events"),
+                partition: 0,
+                start_offset: 42,
+                records: vec![MemoryKafkaRecord::new(7, "seven")],
+            },
+        )]);
+
+        let wire = super::wire::executor_task_assignment_to_wire(assignment.clone());
+        let round_trip = super::wire::executor_task_assignment_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip, assignment);
+        assert!(matches!(
+            round_trip.input_partitions()[0].descriptor(),
+            Some(InputPartitionDescriptor::MemoryKafka { topic, .. }) if topic == "events"
+        ));
+        assert!(matches!(
+            round_trip.output_contract().descriptor(),
+            Some(OutputContractDescriptor::ParquetSink { path }) if path == "/tmp/out.parquet"
+        ));
     }
 
     #[test]

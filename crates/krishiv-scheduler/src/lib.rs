@@ -2192,6 +2192,8 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 }
 
+const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
+
 /// JSON-file metadata store for durable local coordinator recovery.
 #[derive(Debug)]
 pub struct JsonFileMetadataStore {
@@ -2225,6 +2227,7 @@ impl JsonFileMetadataStore {
                         path.display()
                     ),
                 })?;
+            persisted.validate_schema_version()?;
             Ok(Self {
                 path,
                 events: persisted
@@ -2259,6 +2262,8 @@ impl JsonFileMetadataStore {
             })?;
         }
         let persisted = PersistedMetadata {
+            schema_version: JSON_METADATA_SCHEMA_VERSION,
+            store_kind: String::from("krishiv.scheduler.metadata"),
             events: self.events.iter().map(PersistedEvent::from).collect(),
             jobs: self.jobs.iter().map(PersistedJobRecord::from).collect(),
         };
@@ -2301,8 +2306,34 @@ impl MetadataStore for JsonFileMetadataStore {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedMetadata {
+    #[serde(default = "default_json_metadata_schema_version")]
+    schema_version: u32,
+    #[serde(default = "default_json_metadata_store_kind")]
+    store_kind: String,
     events: Vec<PersistedEvent>,
     jobs: Vec<PersistedJobRecord>,
+}
+
+impl PersistedMetadata {
+    fn validate_schema_version(&self) -> SchedulerResult<()> {
+        if self.schema_version > JSON_METADATA_SCHEMA_VERSION {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "metadata store schema version {} is newer than supported version {}",
+                    self.schema_version, JSON_METADATA_SCHEMA_VERSION
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn default_json_metadata_schema_version() -> u32 {
+    JSON_METADATA_SCHEMA_VERSION
+}
+
+fn default_json_metadata_store_kind() -> String {
+    String::from("krishiv.scheduler.metadata")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4286,6 +4317,11 @@ mod tests {
                 .unwrap();
         }
 
+        let raw_json = std::fs::read_to_string(&path).unwrap();
+        let metadata_json: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(metadata_json["schema_version"], 1);
+        assert_eq!(metadata_json["store_kind"], "krishiv.scheduler.metadata");
+
         let reopened = JsonFileMetadataStore::open(&path).unwrap();
         assert_eq!(reopened.events().len(), 1);
         let mut recovered = Coordinator::active(CoordinatorId::try_new("coord-json-2").unwrap());
@@ -4293,6 +4329,28 @@ mod tests {
         let snapshot = recovered.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.task_count(), 1);
         assert_eq!(snapshot.assigned_task_count(), 1);
+    }
+
+    #[test]
+    fn json_file_metadata_store_rejects_newer_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future-metadata.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "schema_version": 999,
+              "store_kind": "krishiv.scheduler.metadata",
+              "events": [],
+              "jobs": []
+            }"#,
+        )
+        .unwrap();
+
+        let err = JsonFileMetadataStore::open(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("schema version 999"),
+            "expected newer schema version error, got {err}"
+        );
     }
 
     // --- Slice 3: Executor crash detection + task reassignment ---

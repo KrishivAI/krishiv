@@ -215,28 +215,28 @@ Features:
 
 Checklist:
 
-- [ ] Create Rust workspace and core crate layout.
-- [ ] Add `krishiv-api`, `krishiv-cli`, `krishiv-sql`, `krishiv-plan`, `krishiv-exec`, and `krishiv-runtime`.
-- [ ] Implement embedded `Session`, `DataFrame`, and `Stream` API skeletons.
-- [ ] Add single-node CLI binary.
-- [ ] Implement `krishiv sql` for local SQL execution.
-- [ ] Implement `krishiv explain` for logical and physical plan display.
-- [ ] Implement `krishiv jobs` for local job listing.
-- [ ] Integrate Arrow and DataFusion for local SQL over Parquet.
-- [ ] Add local memory stream source for bounded and unbounded test streams.
-- [ ] Define `ExecutionMode` with `Embedded`, `SingleNode`, and future `Distributed`.
-- [ ] Document baseline SQL compatibility in `docs/sql-compatibility/`.
-- [ ] Add SQL golden tests.
-- [ ] Add embedded/single-node parity tests.
-- [ ] Add example: `examples/embedded/`.
-- [ ] Add example: `examples/batch-sql/`.
+- [x] Create Rust workspace and core crate layout.
+- [x] Add `krishiv-api`, `krishiv-cli`, `krishiv-sql`, `krishiv-plan`, `krishiv-exec`, and `krishiv-runtime`.
+- [x] Implement embedded `Session`, `DataFrame`, and `Stream` API skeletons.
+- [x] Add single-node CLI binary.
+- [x] Implement `krishiv sql` for local SQL execution.
+- [x] Implement `krishiv explain` for logical and physical plan display.
+- [x] Implement `krishiv jobs` for local job listing.
+- [x] Integrate Arrow and DataFusion for local SQL over Parquet.
+- [x] Add local memory stream source for bounded and unbounded test streams.
+- [x] Define `ExecutionMode` with `Embedded`, `SingleNode`, and future `Distributed`.
+- [x] Document baseline SQL compatibility in `docs/sql-compatibility/`.
+- [x] Add SQL golden tests.
+- [x] Add embedded/single-node parity tests.
+- [x] Add example: `examples/embedded/`.
+- [x] Add example: `examples/batch-sql/`.
 
 Acceptance gate:
 
-- [ ] A user can run a local SQL query over Parquet.
-- [ ] A user can run a simple in-memory stream pipeline.
-- [ ] `krishiv explain` shows logical and physical plans.
-- [ ] Embedded and single-node execution produce the same result for supported features.
+- [x] A user can run a local SQL query over Parquet.
+- [x] A user can run a simple in-memory stream pipeline.
+- [x] `krishiv explain` shows logical and physical plans.
+- [x] Embedded and single-node execution produce the same result for supported features.
 
 ### R2: Distributed Alpha
 
@@ -273,29 +273,29 @@ Features:
 
 Checklist:
 
-- [ ] Add `krishiv-scheduler` crate.
-- [ ] Add `krishiv-proto` crate for control-plane RPC contracts.
-- [ ] Define coordinator service lifecycle.
-- [ ] Define executor service lifecycle.
-- [ ] Implement task registration and executor heartbeat.
-- [ ] Implement static task placement.
-- [ ] Implement task lifecycle states: pending, running, succeeded, failed, retrying.
-- [ ] Implement stage-level retry.
-- [ ] Add `KrishivJob` CRD (Kubernetes target).
-- [ ] Add basic Kubernetes manifests under `k8s/`.
-- [ ] Support coordinator and executor binary startup with `--coordinator <addr>` flag (bare metal target).
-- [ ] Support distributed batch DAG submission on both targets.
-- [ ] Support distributed streaming DAG submission with local-only state semantics.
-- [ ] Add basic Web UI for job status, task status, and executor health.
-- [ ] Keep one active coordinator only.
-- [ ] Document which features are Kubernetes-only vs available on both targets.
+- [x] Add `krishiv-scheduler` crate.
+- [x] Add `krishiv-proto` crate for control-plane RPC contracts.
+- [x] Define coordinator service lifecycle.
+- [x] Define executor service lifecycle.
+- [x] Implement task registration and executor heartbeat.
+- [x] Implement static task placement.
+- [x] Implement task lifecycle states: pending, running, succeeded, failed, retrying.
+- [x] Implement stage-level retry.
+- [x] Add `KrishivJob` CRD (Kubernetes target).
+- [x] Add basic Kubernetes manifests under `k8s/`.
+- [x] Support coordinator and executor binary startup with `--coordinator <addr>` flag (bare metal target).
+- [x] Support distributed batch DAG submission on both targets.
+- [x] Support distributed streaming DAG submission with local-only state semantics.
+- [x] Add basic Web UI for job status, task status, and executor health.
+- [x] Keep one active coordinator only.
+- [x] Document which features are Kubernetes-only vs available on both targets.
 
 Acceptance gate:
 
-- [ ] A simple distributed batch job can be submitted on Kubernetes.
-- [ ] A simple distributed batch job can be submitted on bare metal (coordinator + executor started as plain binaries).
-- [ ] Job/task status is visible through CLI or Web UI on both targets.
-- [ ] Coordinator can retry failed tasks at stage level.
+- [x] A simple distributed batch job can be submitted on Kubernetes.
+- [x] A simple distributed batch job can be submitted on bare metal (coordinator + executor started as plain binaries).
+- [x] Job/task status is visible through CLI or Web UI on both targets.
+- [x] Coordinator can retry failed tasks at stage level.
 
 ### R3: Connector Contracts
 
@@ -395,7 +395,7 @@ Features:
 Checklist:
 
 - [x] Add `docs/architecture/stage-local-execution.md` (Stage-Local Execution Model).
-- [ ] Add `docs/architecture/streaming-execution-model.md` (continuous operator model, watermark protocol, state interaction, streaming job lifecycle — must be approved before R5.1 starts).
+- [x] Add `docs/architecture/streaming-execution-model.md` (continuous operator model, watermark protocol, state interaction, streaming job lifecycle — approved before R5.1 starts).
 - [ ] Add `krishiv-shuffle` crate.
 - [ ] Add `krishiv-optimizer` crate.
 - [ ] Define optimizer rule trait, CBO cost model, AQE rewrite rule, stream planning rule, and skew detection rule interfaces in `krishiv-optimizer`.
@@ -427,7 +427,7 @@ Acceptance gate:
 - [ ] Skew simulation identifies hot partitions.
 - [ ] Shuffle metadata remains recoverable after executor failure.
 - [ ] Orphan shuffle data is detected and cleaned up deterministically.
-- [ ] `docs/architecture/streaming-execution-model.md` is written and approved.
+- [x] `docs/architecture/streaming-execution-model.md` is written and approved.
 
 ### R5: Stateful Streaming Core
 
