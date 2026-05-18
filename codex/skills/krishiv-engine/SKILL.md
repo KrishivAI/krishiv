@@ -19,7 +19,14 @@ Before changing code for Krishiv, read the smallest relevant set of project docs
 - `docs/implementation/README.md` for the release tracker index.
 - `docs/implementation/r1-foundation-alpha.md` for R1 tasks.
 - `docs/engineering/standards.md` for Rust, async, testing, and crate-boundary standards.
-- `docs/engineering/codex-workflow.md` when resuming after interruption, rate limits, or context loss.
+- `docs/engineering/codex-workflow.md` when Codex or Claude Code is resuming after interruption, rate limits, or context loss.
+
+## Agent Interface Support
+
+- Codex uses `AGENTS.md`, this skill, and `codex/skills/krishiv-engine/agents/openai.yaml`.
+- Claude Code uses `CLAUDE.md`, the project skill shim at `.claude/skills/krishiv-engine/SKILL.md`, this canonical skill, and `codex/skills/krishiv-engine/agents/claude.yaml`.
+- Both agents must use `docs/implementation/status.md` as the durable handoff file for rate-limit recovery, context resets, and cross-agent session resumes.
+- Keep resume prompts and rate-limit guidance semantically aligned across the two interface config files and the `.claude/skills/krishiv-engine/SKILL.md` shim.
 
 ## Workflow
 

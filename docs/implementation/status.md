@@ -26,6 +26,8 @@ R3.2 connector certification.
 - Created repo-local `codex/skills/krishiv-engine/SKILL.md`.
 - Installed the `krishiv-engine` skill globally under `/Users/gopal/.agents/skills/krishiv-engine`.
 - Added Codex rate-limit and resumability workflow documentation.
+- Expanded the agent workflow so Codex and Claude Code share rate-limit, resume, and cross-agent handoff protocols.
+- Added a Claude Code project-skill shim under `.claude/skills/krishiv-engine/SKILL.md` so Claude can use the existing canonical Krishiv skill through `/krishiv-engine`.
 - Synced the updated `krishiv-engine` resume protocol into the global skill install.
 - Added `docs/implementation/README.md` as the implementation tracker index.
 - Added implementation trackers for R2 through R10.
@@ -250,6 +252,11 @@ R3.2 connector certification.
 - `cargo check --workspace` passed after the minimal task runner skeleton.
 - `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after the minimal task runner skeleton.
 - `git diff --check` passed after the minimal task runner skeleton.
+- `git diff --check` passed after the shared Codex/Claude Code agent workflow update.
+- `python3 - <<'PY' ...` verified both agent interface YAML files include display, default prompt, resume prompt, rate-limit strategy, and supported-agent metadata.
+- `rg -n "Codex|Claude Code|rate-limit|resume|status.md" ...` confirmed the shared workflow, skill, Claude entrypoint, interface configs, and status handoff all reference the rate-limit/resume paths.
+- `git diff --check` passed after adding the Claude Code project-skill shim and correcting Claude skill invocation docs.
+- `test -f .claude/skills/krishiv-engine/SKILL.md && rg -n "/krishiv-engine|codex/skills/krishiv-engine/SKILL.md|Claude Code" .claude/skills/krishiv-engine/SKILL.md CLAUDE.md docs/engineering/codex-workflow.md codex/skills/krishiv-engine/SKILL.md codex/skills/krishiv-engine/agents/claude.yaml` confirmed Claude Code project-skill discovery and canonical-skill references.
 
 ## Resume Instructions
 
@@ -259,3 +266,13 @@ For a new Codex session:
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
 4. Continue R3.1 by deciding coordinator-visible output metadata projection, adding coordinator-owned task-assignment pushes, and continuing graceful deregistration/cancellation/recovery work before R3.2 connector certification.
+
+For a new Claude Code session:
+
+Start with `/krishiv-engine resume`, then:
+
+1. Read `AGENTS.md`.
+2. Read `CLAUDE.md`.
+3. Read this file.
+4. Read `docs/implementation/r3-connector-contracts.md`.
+5. Continue the same R3.1 task slice from repository state; do not rely on Codex-only or Claude-only chat history.
