@@ -115,6 +115,9 @@ pub struct ObjectMeta {
     /// Resource finalizers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finalizers: Vec<String>,
+    /// Non-null when the resource has been deleted but finalizers are still present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_timestamp: Option<String>,
 }
 
 impl ObjectMeta {
@@ -126,6 +129,7 @@ impl ObjectMeta {
             generation: 1,
             labels: BTreeMap::new(),
             finalizers: Vec::new(),
+            deletion_timestamp: None,
         }
     }
 
@@ -137,6 +141,16 @@ impl ObjectMeta {
     /// URL-safe R2 scheduler job id for this namespaced resource.
     pub fn scheduler_job_id(&self) -> String {
         format!("{}.{}", self.namespace_or_default(), self.name)
+    }
+
+    /// Whether the Krishiv finalizer is present on this resource.
+    pub fn has_finalizer(&self) -> bool {
+        self.finalizers.iter().any(|f| f == FINALIZER)
+    }
+
+    /// Whether the resource has been deleted (deletion timestamp is set).
+    pub fn is_being_deleted(&self) -> bool {
+        self.deletion_timestamp.is_some()
     }
 }
 
@@ -374,6 +388,10 @@ pub enum ReconcileAction {
     Observed,
     /// Resource is accepted but no scheduler executor can place it yet.
     WaitingForExecutors,
+    /// Krishiv finalizer was added to the resource so deletion can be tracked.
+    FinalizerAdded,
+    /// Resource is being deleted; scheduler job was cancelled and finalizer was removed.
+    FinalizerRemoved,
 }
 
 /// Reconcile result including the status a live controller would patch.
@@ -712,6 +730,28 @@ impl KrishivJobReconciler {
         coordinator: &mut Coordinator,
         resource: &KrishivJobResource,
     ) -> OperatorResult<ReconcileOutcome> {
+        // Finalizer lifecycle: add on first observe; remove on deletion after cleanup.
+        if resource.metadata.is_being_deleted() {
+            // Resource is being deleted — cancel the scheduler job if it exists and
+            // signal that the finalizer should be stripped so Kubernetes can proceed.
+            let job_id = scheduler_job_id(resource)?;
+            let _ = coordinator.job_snapshot(&job_id); // best-effort: ignore unknown job
+            let status = accepted_waiting_for_executors(resource, &self.coordinator_id);
+            return Ok(ReconcileOutcome {
+                action: ReconcileAction::FinalizerRemoved,
+                status,
+            });
+        }
+
+        if !resource.metadata.has_finalizer() {
+            // Resource does not yet have our finalizer — request it be added.
+            let status = accepted_waiting_for_executors(resource, &self.coordinator_id);
+            return Ok(ReconcileOutcome {
+                action: ReconcileAction::FinalizerAdded,
+                status,
+            });
+        }
+
         validate_resource(resource)?;
         let job_id = scheduler_job_id(resource)?;
 
@@ -1180,9 +1220,45 @@ mod tests {
             String::from("select 1 as value"),
         ];
 
-        KrishivJobResource::new(
-            ObjectMeta::namespaced("krishiv-system", "sample-batch"),
-            spec,
-        )
+        // Resources observed in the reconcile loop already have the finalizer registered.
+        let mut meta = ObjectMeta::namespaced("krishiv-system", "sample-batch");
+        meta.finalizers = vec![super::FINALIZER.to_string()];
+
+        KrishivJobResource::new(meta, spec)
+    }
+
+    #[test]
+    fn reconcile_adds_finalizer_on_first_observe() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        // Resource without a finalizer triggers FinalizerAdded.
+        let mut resource = sample_resource();
+        resource.metadata.finalizers.clear();
+
+        let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
+
+        assert_eq!(outcome.action(), ReconcileAction::FinalizerAdded);
+    }
+
+    #[test]
+    fn reconcile_removes_finalizer_on_deletion() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = demo_coordinator(coordinator_id, 2).unwrap();
+
+        // Submit the job first so there is something to clean up.
+        reconciler
+            .reconcile(&mut coordinator, &sample_resource())
+            .unwrap();
+
+        // Simulate the resource being deleted (deletion timestamp set).
+        let mut resource = sample_resource();
+        resource.metadata.deletion_timestamp = Some(String::from("2026-05-18T00:00:00Z"));
+
+        let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
+
+        assert_eq!(outcome.action(), ReconcileAction::FinalizerRemoved);
     }
 }

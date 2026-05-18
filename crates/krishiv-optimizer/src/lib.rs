@@ -286,8 +286,11 @@ mod tests {
     }
 
     fn plan_with_node() -> LogicalPlan {
-        LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(PlanNode::new("scan", "scan t", ExecutionKind::Batch))
+        LogicalPlan::new("test", ExecutionKind::Batch).with_node(PlanNode::new(
+            "scan",
+            "scan t",
+            ExecutionKind::Batch,
+        ))
     }
 
     // ── no-rules optimizer ────────────────────────────────────────────────

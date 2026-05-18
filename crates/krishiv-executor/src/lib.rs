@@ -965,6 +965,25 @@ impl ExecutorRuntime {
         Ok((registration, heartbeat))
     }
 
+    /// Send a final `Draining` heartbeat to signal graceful shutdown.
+    ///
+    /// A dedicated `Deregister` RPC is deferred; this best-effort heartbeat
+    /// lets the coordinator stop assigning new tasks promptly instead of waiting
+    /// for the heartbeat timeout window to expire.
+    pub async fn deregister_with_grpc_endpoint(&self) -> ExecutorTransportResult<()> {
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .await?;
+        let request = wire::executor_heartbeat_request_to_wire(ExecutorHeartbeatRequest::new(
+            self.config.executor_id.clone(),
+            self.config.lease_generation,
+            ExecutorState::Draining,
+        ));
+        client.executor_heartbeat(request).await?;
+        Ok(())
+    }
+
     /// Human-readable startup summary for the binary.
     pub fn startup_summary(&self) -> String {
         format!(

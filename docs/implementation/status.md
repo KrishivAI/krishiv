@@ -141,6 +141,18 @@ R3.2 connector certification.
 - Added lifecycle coverage that sends a task assignment to an executor inbox over gRPC, executes the local SQL fragment, and reports status back to the scheduler-backed coordinator over gRPC.
 - Added bootstrap R3.1 `local-parquet:<table>:<path>` input partition registration for executor-local `sql:` fragments without starting R3.2 connector certification.
 - Added executor tests for local Parquet partition descriptor validation, scheduler-backed Parquet scan execution, and networked assignment/status Parquet scan execution with row/batch/column output metadata.
+- Added `EventLogEvent` enum (JobSubmitted, StagePlanned, TaskAssigned, TaskStarted, TaskSucceeded, TaskFailed, ExecutorLost, JobCancelled) to `krishiv-scheduler`.
+- Added `MetadataStore` trait + `InMemoryMetadataStore` to `krishiv-scheduler`.
+- Added `LeaderElection` trait + `SingleNodeElection` (no-op) to `krishiv-scheduler`.
+- Added `JobSubmitter` trait to `krishiv-scheduler`.
+- Added `Coordinator::recover_from_store` for restart recovery from a `MetadataStore`.
+- Added `ExecutorRuntime::deregister_with_grpc_endpoint` (best-effort `Draining` heartbeat) to `krishiv-executor`.
+- Added SIGTERM handler to executor `heartbeat_loop`: on signal, sends deregistration heartbeat and exits cleanly.
+- Added `terminationGracePeriodSeconds: 30` to `k8s/manifests/executor-deployment.yaml`.
+- Added `deletion_timestamp` field to `ObjectMeta` in `krishiv-operator`.
+- Added `has_finalizer` and `is_being_deleted` helpers to `ObjectMeta`.
+- Added `FinalizerAdded` and `FinalizerRemoved` variants to `ReconcileAction`.
+- Wired finalizer lifecycle logic at the top of `KrishivJobReconciler::reconcile`.
 
 ## In Progress
 
@@ -152,6 +164,8 @@ R3.2 connector certification.
 2. Continue R3.1 reliability work: graceful executor deregistration, cancellation, metadata persistence, restart recovery, and stability metrics.
 3. Add the coordinator-owned task-assignment client path once the scheduler is ready to push assignments directly instead of tests invoking `ExecutorTask.AssignTask`.
 4. R3.2 (connectors) cannot start until R3.1 acceptance gate passes — enforce this sequencing strictly.
+5. Wire `MetadataStore` write-through into `Coordinator::submit_job` and task status update paths so jobs survive restarts automatically.
+6. Add a dedicated `Deregister` RPC to replace the best-effort `Draining` heartbeat used for graceful shutdown.
 
 ## Known Blockers
 
@@ -257,6 +271,10 @@ R3.2 connector certification.
 - `rg -n "Codex|Claude Code|rate-limit|resume|status.md" ...` confirmed the shared workflow, skill, Claude entrypoint, interface configs, and status handoff all reference the rate-limit/resume paths.
 - `git diff --check` passed after adding the Claude Code project-skill shim and correcting Claude skill invocation docs.
 - `test -f .claude/skills/krishiv-engine/SKILL.md && rg -n "/krishiv-engine|codex/skills/krishiv-engine/SKILL.md|Claude Code" .claude/skills/krishiv-engine/SKILL.md CLAUDE.md docs/engineering/codex-workflow.md codex/skills/krishiv-engine/SKILL.md codex/skills/krishiv-engine/agents/claude.yaml` confirmed Claude Code project-skill discovery and canonical-skill references.
+- `cargo test -p krishiv-scheduler --lib` passed (32 tests, including `in_memory_metadata_store_round_trips`, `single_node_election_is_always_leader`, `coordinator_recovers_jobs_from_store`).
+- `cargo test -p krishiv-operator --lib` passed (17 tests, including `reconcile_adds_finalizer_on_first_observe`, `reconcile_removes_finalizer_on_deletion`).
+- `cargo test -p krishiv-executor --lib` passed (7 tests).
+- `cargo fmt --all --check` passed after R3.1 remaining slices.
 
 ## Resume Instructions
 
