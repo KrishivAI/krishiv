@@ -5,15 +5,17 @@
 //! Provides local-disk shuffle write/read paths, an Arrow-based hash
 //! partitioner, compression codec metadata, and orphan artifact detection.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use arrow::array::{Int32Array, Int64Array, StringArray, UInt32Array};
 use arrow::compute::take;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 // ── ShufflePath ───────────────────────────────────────────────────────────────
@@ -426,6 +428,288 @@ fn hash_str(value: &str, buckets: u32) -> u32 {
     (hasher.finish() % buckets as u64) as u32
 }
 
+// ── ShuffleStore trait + implementations ──────────────────────────────────────
+
+/// Identifies a shuffle partition uniquely within a job.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PartitionId {
+    pub job_id: String,
+    pub stage_id: String,
+    pub partition: u32,
+}
+
+/// A single shuffle partition: schema + ordered record batches.
+#[derive(Debug, Clone)]
+pub struct ShufflePartition {
+    pub id: PartitionId,
+    pub schema: SchemaRef,
+    pub batches: Vec<RecordBatch>,
+}
+
+/// Errors produced by shuffle store operations.
+///
+/// Note: The existing [`ShuffleError`] type is retained for the local-disk
+/// byte-level store.  This error type is used by the [`ShuffleStore`] trait.
+#[derive(Debug)]
+pub enum StoreError {
+    /// Partition data not found (may have been GC'd or not yet written).
+    PartitionNotFound {
+        job_id: String,
+        stage_id: String,
+        partition: u32,
+    },
+    /// I/O error reading or writing partition data.
+    Io { message: String },
+    /// A stale lease token was used; the write was rejected.
+    StaleLeaseToken { expected: u64, actual: u64 },
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PartitionNotFound {
+                job_id,
+                stage_id,
+                partition,
+            } => write!(
+                f,
+                "shuffle partition not found: {job_id}/{stage_id}/{partition}"
+            ),
+            Self::Io { message } => write!(f, "shuffle store I/O error: {message}"),
+            Self::StaleLeaseToken { expected, actual } => write!(
+                f,
+                "stale shuffle lease token: expected {expected}, actual {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// Convenience result alias for [`ShuffleStore`] operations.
+pub type StoreResult<T> = Result<T, StoreError>;
+
+/// An async shuffle store that persists inter-stage partition data.
+///
+/// Implementations must be `Send + Sync` so they can be shared across async
+/// task boundaries inside the executor runtime.
+pub trait ShuffleStore: Send + Sync {
+    /// Write a partition. `lease_token` must match the current assignment
+    /// token for this partition; stale tokens are rejected.
+    fn write_partition(
+        &self,
+        partition: ShufflePartition,
+        lease_token: u64,
+    ) -> impl Future<Output = StoreResult<()>> + Send;
+
+    /// Read a partition. Returns `None` if not yet written.
+    fn read_partition(
+        &self,
+        id: &PartitionId,
+    ) -> impl Future<Output = StoreResult<Option<ShufflePartition>>> + Send;
+
+    /// Delete all partitions for a job (called on job completion or cancellation).
+    fn delete_job_partitions(&self, job_id: &str) -> impl Future<Output = StoreResult<()>> + Send;
+}
+
+// ── InMemoryShuffleStore ──────────────────────────────────────────────────────
+
+/// An in-memory shuffle store backed by a `BTreeMap` under an `RwLock`.
+///
+/// Used for testing and single-node deployments where shuffle data does
+/// not need to survive process restarts.
+#[derive(Default)]
+pub struct InMemoryShuffleStore {
+    // key: (job_id, stage_id, partition) → (lease_token, ShufflePartition)
+    partitions: Arc<RwLock<BTreeMap<(String, String, u32), (u64, ShufflePartition)>>>,
+}
+
+impl InMemoryShuffleStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ShuffleStore for InMemoryShuffleStore {
+    async fn write_partition(
+        &self,
+        partition: ShufflePartition,
+        lease_token: u64,
+    ) -> StoreResult<()> {
+        let key = (
+            partition.id.job_id.clone(),
+            partition.id.stage_id.clone(),
+            partition.id.partition,
+        );
+        let mut guard = self.partitions.write().unwrap();
+        // If an existing entry has a HIGHER lease token, reject the write (stale).
+        if let Some((existing_token, _)) = guard.get(&key) {
+            if lease_token < *existing_token {
+                return Err(StoreError::StaleLeaseToken {
+                    expected: *existing_token,
+                    actual: lease_token,
+                });
+            }
+        }
+        guard.insert(key, (lease_token, partition));
+        Ok(())
+    }
+
+    async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        let guard = self.partitions.read().unwrap();
+        Ok(guard.get(&key).map(|(_, p)| p.clone()))
+    }
+
+    async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
+        let mut guard = self.partitions.write().unwrap();
+        guard.retain(|(jid, _, _), _| jid != job_id);
+        Ok(())
+    }
+}
+
+// ── LocalDiskShuffleStore ─────────────────────────────────────────────────────
+
+/// A local-disk shuffle store that serialises partitions to Parquet files.
+///
+/// Each partition is written to `{base_dir}/{job_id}/{stage_id}/{partition}.parquet`.
+/// Lease tokens are tracked in memory; they survive the process only as long as
+/// the store object is alive.
+pub struct LocalDiskShuffleStore {
+    base_dir: PathBuf,
+    lease_tokens: Arc<RwLock<BTreeMap<(String, String, u32), u64>>>,
+}
+
+impl LocalDiskShuffleStore {
+    /// Create a new store rooted at `base_dir`, creating the directory if needed.
+    pub fn new(base_dir: impl AsRef<Path>) -> StoreResult<Self> {
+        let base_dir = base_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&base_dir).map_err(|e| StoreError::Io {
+            message: format!(
+                "failed to create shuffle base dir '{}': {e}",
+                base_dir.display()
+            ),
+        })?;
+        Ok(Self {
+            base_dir,
+            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+        })
+    }
+
+    fn partition_path(&self, id: &PartitionId) -> PathBuf {
+        self.base_dir
+            .join(&id.job_id)
+            .join(&id.stage_id)
+            .join(format!("{}.parquet", id.partition))
+    }
+}
+
+impl ShuffleStore for LocalDiskShuffleStore {
+    async fn write_partition(
+        &self,
+        partition: ShufflePartition,
+        lease_token: u64,
+    ) -> StoreResult<()> {
+        use parquet::arrow::ArrowWriter;
+
+        let key = (
+            partition.id.job_id.clone(),
+            partition.id.stage_id.clone(),
+            partition.id.partition,
+        );
+
+        // Validate/update the lease token.
+        {
+            let mut tokens = self.lease_tokens.write().unwrap();
+            if let Some(&existing) = tokens.get(&key) {
+                if lease_token < existing {
+                    return Err(StoreError::StaleLeaseToken {
+                        expected: existing,
+                        actual: lease_token,
+                    });
+                }
+            }
+            tokens.insert(key, lease_token);
+        }
+
+        let path = self.partition_path(&partition.id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::Io {
+                message: format!("failed to create partition dir: {e}"),
+            })?;
+        }
+
+        let file = std::fs::File::create(&path).map_err(|e| StoreError::Io {
+            message: format!("failed to create partition file '{}': {e}", path.display()),
+        })?;
+
+        let schema = partition.schema.clone();
+        let mut writer = ArrowWriter::try_new(file, schema, None).map_err(|e| StoreError::Io {
+            message: format!("failed to create Parquet writer: {e}"),
+        })?;
+
+        for batch in &partition.batches {
+            writer.write(batch).map_err(|e| StoreError::Io {
+                message: format!("failed to write Parquet batch: {e}"),
+            })?;
+        }
+        writer.close().map_err(|e| StoreError::Io {
+            message: format!("failed to close Parquet writer: {e}"),
+        })?;
+        Ok(())
+    }
+
+    async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let path = self.partition_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = File::open(&path).map_err(|e| StoreError::Io {
+            message: format!("failed to open partition file '{}': {e}", path.display()),
+        })?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| StoreError::Io {
+                message: format!("failed to build Parquet reader: {e}"),
+            })?;
+        let schema = builder.schema().clone();
+        let reader = builder.build().map_err(|e| StoreError::Io {
+            message: format!("failed to build Parquet batch reader: {e}"),
+        })?;
+        let mut batches = Vec::new();
+        for result in reader {
+            let batch = result.map_err(|e| StoreError::Io {
+                message: format!("error reading Parquet batch: {e}"),
+            })?;
+            batches.push(batch);
+        }
+        Ok(Some(ShufflePartition {
+            id: id.clone(),
+            schema,
+            batches,
+        }))
+    }
+
+    async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
+        let dir = self.base_dir.join(job_id);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(StoreError::Io {
+                    message: format!("failed to delete job partitions: {e}"),
+                });
+            }
+        }
+        // Clean up in-memory lease tokens for this job.
+        let mut tokens = self.lease_tokens.write().unwrap();
+        tokens.retain(|(jid, _, _), _| jid != job_id);
+        Ok(())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -804,5 +1088,147 @@ mod tests {
         let partitions = partitioner.partition(&batch).unwrap();
         assert_eq!(partitions.len(), 3);
         assert!(partitions.iter().all(|p| p.num_rows() == 0));
+    }
+
+    // ── ShuffleStore tests ────────────────────────────────────────────────
+
+    use super::{
+        InMemoryShuffleStore, LocalDiskShuffleStore, PartitionId, ShufflePartition, ShuffleStore,
+        StoreError,
+    };
+
+    fn make_store_partition(job_id: &str, stage_id: &str, partition: u32) -> ShufflePartition {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        ShufflePartition {
+            id: PartitionId {
+                job_id: job_id.to_owned(),
+                stage_id: stage_id.to_owned(),
+                partition,
+            },
+            schema,
+            batches: vec![batch],
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_shuffle_write_and_read_roundtrip() {
+        let store = InMemoryShuffleStore::new();
+        let partition = make_store_partition("job-1", "stage-1", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+        let read_back = store.read_partition(&id).await.unwrap();
+        assert!(read_back.is_some());
+        let read_back = read_back.unwrap();
+        assert_eq!(read_back.batches[0].num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn in_memory_shuffle_read_missing_returns_none() {
+        let store = InMemoryShuffleStore::new();
+        let id = PartitionId {
+            job_id: "ghost-job".to_owned(),
+            stage_id: "s0".to_owned(),
+            partition: 0,
+        };
+        let result = store.read_partition(&id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_shuffle_delete_job_partitions() {
+        let store = InMemoryShuffleStore::new();
+        let p0 = make_store_partition("job-del", "s0", 0);
+        let p1 = make_store_partition("job-del", "s0", 1);
+        let id0 = p0.id.clone();
+        let id1 = p1.id.clone();
+        store.write_partition(p0, 1).await.unwrap();
+        store.write_partition(p1, 1).await.unwrap();
+
+        store.delete_job_partitions("job-del").await.unwrap();
+
+        assert!(store.read_partition(&id0).await.unwrap().is_none());
+        assert!(store.read_partition(&id1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_shuffle_stale_lease_token_rejected() {
+        let store = InMemoryShuffleStore::new();
+        let partition = make_store_partition("job-stale", "s0", 0);
+        // Write with token=5.
+        store.write_partition(partition.clone(), 5).await.unwrap();
+        // Try to overwrite with a lower token — should be rejected.
+        let err = store.write_partition(partition, 3).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 5,
+                    actual: 3
+                }
+            ),
+            "expected StaleLeaseToken(expected=5, actual=3), got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_shuffle_equal_lease_token_overwrites() {
+        let store = InMemoryShuffleStore::new();
+        let partition = make_store_partition("job-eq", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition.clone(), 2).await.unwrap();
+        // Same token is allowed — overwrites with the new data.
+        store.write_partition(partition, 2).await.unwrap();
+        assert!(store.read_partition(&id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn local_disk_shuffle_write_and_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let partition = make_store_partition("job-disk-1", "stage-1", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+        let read_back = store.read_partition(&id).await.unwrap();
+        assert!(read_back.is_some());
+        let read_back = read_back.unwrap();
+        assert_eq!(read_back.batches[0].num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn local_disk_shuffle_delete_job_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let p0 = make_store_partition("job-disk-del", "s0", 0);
+        let id0 = p0.id.clone();
+        store.write_partition(p0, 1).await.unwrap();
+
+        store.delete_job_partitions("job-disk-del").await.unwrap();
+
+        // The file should be gone so read returns None.
+        assert!(store.read_partition(&id0).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_disk_shuffle_stale_token_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let partition = make_store_partition("job-disk-stale", "s0", 0);
+        store.write_partition(partition.clone(), 10).await.unwrap();
+        let err = store.write_partition(partition, 7).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 10,
+                    actual: 7
+                }
+            ),
+            "expected StaleLeaseToken(expected=10, actual=7), got {err}"
+        );
     }
 }

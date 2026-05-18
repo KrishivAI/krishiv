@@ -10,8 +10,11 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+bytes = { workspace = true }
+parquet = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

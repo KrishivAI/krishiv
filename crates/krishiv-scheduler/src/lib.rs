@@ -14,11 +14,11 @@ use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuar
 
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
-    AttemptId, CoordinatorExecutorService, CoordinatorId, CoordinatorState,
-    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat,
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-    ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
-    OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
+    AttemptId, ConnectorCapabilityFlags, CoordinatorExecutorService, CoordinatorId,
+    CoordinatorState, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
+    ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
+    ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState,
+    LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
     RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskAttemptRef,
     TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
     TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
@@ -1798,6 +1798,8 @@ impl TaskRecord {
             attempt: self.attempt,
             output_metadata: self.output_metadata.clone(),
             last_failure_reason: self.last_failure_reason.clone(),
+            source_capabilities: self.spec.source_capabilities.clone(),
+            sink_capabilities: self.spec.sink_capabilities.clone(),
         }
     }
 }
@@ -1928,6 +1930,10 @@ pub struct TaskSnapshot {
     attempt: u32,
     output_metadata: Option<TaskOutputMetadata>,
     last_failure_reason: Option<String>,
+    /// Capability flags declared by the source connector for this task, if known.
+    pub source_capabilities: Option<ConnectorCapabilityFlags>,
+    /// Capability flags declared by the sink connector for this task, if known.
+    pub sink_capabilities: Option<ConnectorCapabilityFlags>,
 }
 
 impl TaskSnapshot {

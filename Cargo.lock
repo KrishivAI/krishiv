@@ -2245,6 +2245,7 @@ name = "krishiv-executor"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "krishiv-connectors",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-sql",
@@ -2316,7 +2317,9 @@ name = "krishiv-shuffle"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
  "futures",
+ "parquet",
  "tempfile",
  "tokio",
 ]

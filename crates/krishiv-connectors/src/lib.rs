@@ -263,6 +263,50 @@ impl ConnectorConfig {
 }
 
 // ---------------------------------------------------------------------------
+// ParquetOffset
+// ---------------------------------------------------------------------------
+
+/// Cursor into a Parquet-backed source: index of the next batch to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParquetOffset {
+    pub batch_index: usize,
+}
+
+impl Offset for ParquetOffset {
+    fn encode(&self) -> Vec<u8> {
+        (self.batch_index as u64).to_le_bytes().to_vec()
+    }
+
+    fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
+        if bytes.len() < 8 {
+            return Err(ConnectorError::Io {
+                message: "ParquetOffset decode: expected 8 bytes".into(),
+            });
+        }
+        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        Ok(Self {
+            batch_index: n as usize,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AtLeastOnceSinkContract
+// ---------------------------------------------------------------------------
+
+/// Documents the at-least-once sink delivery contract.
+///
+/// A sink operating under at-least-once semantics guarantees:
+/// - Every input batch is written to the downstream store at least once.
+/// - On executor reassignment or crash-recovery, batches that were written
+///   but not yet acknowledged may be replayed. Idempotent sinks (`is_idempotent()`)
+///   handle replays safely. Non-idempotent sinks may produce duplicates.
+/// - `flush()` must be called and awaited before an offset is committed to
+///   the source. Committing the source offset before `flush()` completes risks
+///   data loss on crash.
+pub struct AtLeastOnceSinkContract;
+
+// ---------------------------------------------------------------------------
 // CertificationSuite
 // ---------------------------------------------------------------------------
 
@@ -328,6 +372,23 @@ impl CertificationSuite {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Encode then decode `offset` and assert the round-trip produces an equal value.
+    ///
+    /// `O` must implement both `Offset` and `PartialEq + std::fmt::Debug` so the
+    /// assertion can produce a useful failure message.
+    pub fn run_offset_round_trip_test<O>(offset: O) -> ConnectorResult<()>
+    where
+        O: Offset + PartialEq + std::fmt::Debug,
+    {
+        let encoded = offset.encode();
+        let decoded = O::decode(&encoded)?;
+        assert_eq!(
+            offset, decoded,
+            "offset round-trip failed: encoded then decoded value differs from original"
+        );
         Ok(())
     }
 
@@ -502,6 +563,29 @@ mod tests {
         let mut source = ThreeBatchSource { count: 0 };
         let result = CertificationSuite::run_bounded_exhaustion_test(&mut source).await;
         assert!(result.is_ok(), "bounded source exhaustion test should pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // ParquetOffset + AtLeastOnceSinkContract + CertificationSuite offset test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parquet_offset_encode_decode_roundtrip() {
+        let original = ParquetOffset { batch_index: 42 };
+        let encoded = original.encode();
+        let decoded = ParquetOffset::decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn at_least_once_contract_exists() {
+        let _ = AtLeastOnceSinkContract;
+    }
+
+    #[test]
+    fn certification_offset_round_trip_passes_for_parquet_offset() {
+        let offset = ParquetOffset { batch_index: 7 };
+        CertificationSuite::run_offset_round_trip_test(offset).unwrap();
     }
 
     #[tokio::test]

@@ -2,18 +2,16 @@
 
 ## Current Phase
 
-R3.1 Distributed Execution Foundation.
+R3.2 Connector Contracts (active) / R4 Bootstrap.
 
 ## Active Task
 
-R3.1 reliability work is substantially complete. The main open items before the
-R3.1 acceptance gate are:
-1. Dedicated `Deregister` RPC (currently best-effort `Draining` heartbeat).
-2. `KrishivJob` delete/cancel API path that calls `cancel_job` before stripping the finalizer.
-3. Task lease token model (token issuance + stale-token rejection in shuffle write path; deferred until R4 shuffle exists).
-4. Stage-Local Execution Model document review/approval.
-
-After those items R3.1 acceptance gate passes and R3.2 connector certification can start.
+R3.2 closure slices A–D completed; R4 bootstrap slices E–F completed.
+Remaining R3.2 open items before the acceptance gate:
+1. Kafka consumer group offset commit after output write (post-write commit protocol).
+2. Kafka → Parquet end-to-end pipeline on real executors.
+3. Task lease token issuance + stale-token rejection in shuffle write path (R4 shuffle).
+4. Operator-side executor pod launch failure detection (deferred stretch item).
 
 ## Completed
 
@@ -175,12 +173,10 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 
 ## Next Steps
 
-1. Task lease token model: deferred to R4 when shuffle write path exists.
-2. Executor pod launch failure detection: deferred R3.1 stretch item.
-3. Schema registry abstraction (R3.2 open item).
-4. CDC design document under `docs/rfcs/`.
-5. At-least-once sink contract documentation.
-6. Kafka → Parquet end-to-end pipeline on real executors (R3.2 acceptance gate).
+1. Kafka consumer group offset commit after output write: implement + test post-write commit protocol.
+2. Kafka → Parquet end-to-end pipeline on real executors (R3.2 acceptance gate).
+3. Task lease token model: deferred to R4 when full shuffle write path exists (`InMemoryShuffleStore` + `LocalDiskShuffleStore` foundation is in `krishiv-shuffle`).
+4. Executor pod launch failure detection: deferred R3.1 stretch item.
 
 ## Known Blockers
 
@@ -306,6 +302,21 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 - R3.2 Slices 4–7: S3 connector (`s3.rs`), Kafka stubs (`kafka.rs`), DataFusion catalog bridge (`datafusion_bridge` module in `krishiv-catalog`), and expanded `CertificationSuite` (`run_bounded_exhaustion_test`, `run_idempotent_sink_test`) implemented.
 - `object_store = "0.12"`, `bytes = "1"`, `async-trait = "0.1"` added to workspace dependencies.
 - `cargo fmt --all` applied; `cargo check --workspace` passed; `cargo test -p krishiv-catalog -p krishiv-connectors` passed — 28 tests, 0 failures.
+- **R3.2 Slice A**: At-least-once sink contract (`AtLeastOnceSinkContract` doc struct), `ParquetOffset` implementing `Offset` with encode/decode, `CertificationSuite::run_offset_round_trip_test`, and 3 new tests added to `krishiv-connectors`. `ParquetSource::current_offset()` returns typed `ParquetOffset`.
+- **R3.2 Slice B**: CDC design document written at `docs/rfcs/cdc-design.md` covering log-based/poll-based capture, `_cdc_op/_cdc_ts_ms/_cdc_lsn/_cdc_table` column model, offset model for PostgreSQL/MySQL/poll-based, Krishiv integration points, and R3 limitations.
+- **R3.2 Slice C**: `SchemaRegistry` trait and `InMemorySchemaRegistry` backed by `BTreeMap` added to `krishiv-catalog`; 3 new tests pass.
+- **R3.2 Slice D**: `ConnectorCapabilityFlags` struct added to `krishiv-proto`; `TaskSpec` extended with `source_capabilities`/`sink_capabilities` builder methods; `TaskSnapshot` in `krishiv-scheduler` propagates fields; `ConnectorCapabilityView` added to `krishiv-ui` `TaskView`.
+- **R4 Bootstrap Slice E**: `register_record_batches()` added to `SqlEngine` in `krishiv-sql`; `krishiv-connectors` dep added to `krishiv-executor`; `CONNECTOR_PARQUET_PARTITION_PREFIX` + `read_connector_parquet_partitions()` wired into `execute_stage_fragment()`; new test `executor_runs_parquet_task_via_connector_source` passes.
+- **R4 Bootstrap Slice F**: `ShuffleStore` trait, `InMemoryShuffleStore`, and `LocalDiskShuffleStore` added to `krishiv-shuffle` with lease-token zombie-executor rejection; `parquet` and `bytes` deps added to `krishiv-shuffle/Cargo.toml`; 8 new tokio async tests pass.
+
+## Last Validation (R3.2 A–D + R4 E–F, branch claude/analyze-recommend-slices-Ai5GY)
+
+- `cargo fmt --all` applied; 5 files reformatted (`krishiv-proto`, `krishiv-connectors`, `krishiv-executor`, `krishiv-shuffle`, `krishiv-sql`).
+- `cargo check --workspace` passed — 0 errors.
+- `cargo test -p krishiv-connectors` passed — 24 tests, 0 failures (3 new Slice A tests included).
+- `cargo test -p krishiv-catalog` passed — 10 tests, 0 failures (3 new SchemaRegistry tests included).
+- `cargo test -p krishiv-executor` passed — 16 tests, 0 failures (1 new connector-parquet test included).
+- `cargo test -p krishiv-shuffle` passed — 33 tests, 0 failures (8 new ShuffleStore tests included).
 
 ## Resume Instructions
 
@@ -314,7 +325,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. R3.2 Slices 1–3 are done. Continue with Slices 4–7 (S3, Kafka, DataFusion adapter, certification test kit).
+4. R3.2 Slices A–D and R4 bootstrap Slices E–F are done. Continue with Kafka post-write offset commit protocol and Kafka → Parquet end-to-end pipeline.
 
 For a new Claude Code session:
 

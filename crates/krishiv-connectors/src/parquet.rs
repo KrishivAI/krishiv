@@ -91,7 +91,9 @@ impl Source for ParquetSource {
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-        Some(Box::new(self.cursor))
+        Some(Box::new(crate::ParquetOffset {
+            batch_index: self.cursor,
+        }))
     }
 }
 

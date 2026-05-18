@@ -17,8 +17,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use krishiv_proto::{
-    CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
-    JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
+    ConnectorCapabilityFlags, CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
+    ExecutorState, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
     Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, SchedulerError, SharedCoordinator,
@@ -210,6 +210,27 @@ pub struct StageView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConnectorCapabilityView {
+    pub bounded: bool,
+    pub unbounded: bool,
+    pub rewindable: bool,
+    pub transactional: bool,
+    pub idempotent: bool,
+}
+
+impl ConnectorCapabilityView {
+    fn from_flags(flags: &ConnectorCapabilityFlags) -> Self {
+        Self {
+            bounded: flags.bounded,
+            unbounded: flags.unbounded,
+            rewindable: flags.rewindable,
+            transactional: flags.transactional,
+            idempotent: flags.idempotent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskView {
     /// Task id.
     pub task_id: String,
@@ -221,6 +242,10 @@ pub struct TaskView {
     pub attempt: u32,
     /// Last failure reason reported by the executor, if any.
     pub last_failure_reason: Option<String>,
+    /// Source connector capability flags for this task, if declared.
+    pub source_capabilities: Option<ConnectorCapabilityView>,
+    /// Sink connector capability flags for this task, if declared.
+    pub sink_capabilities: Option<ConnectorCapabilityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -460,6 +485,14 @@ impl JobDetailView {
                                 .unwrap_or_else(|| String::from("-")),
                             attempt: task.attempt(),
                             last_failure_reason: task.last_failure_reason().map(ToOwned::to_owned),
+                            source_capabilities: task
+                                .source_capabilities
+                                .as_ref()
+                                .map(ConnectorCapabilityView::from_flags),
+                            sink_capabilities: task
+                                .sink_capabilities
+                                .as_ref()
+                                .map(ConnectorCapabilityView::from_flags),
                         })
                         .collect(),
                 })

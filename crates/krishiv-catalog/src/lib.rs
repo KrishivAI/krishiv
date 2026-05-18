@@ -425,6 +425,54 @@ impl CatalogProvider for InMemoryCatalog {
 }
 
 // ---------------------------------------------------------------------------
+// SchemaRegistry
+// ---------------------------------------------------------------------------
+
+/// A registry that maps logical schema names to [`TableSchema`] definitions.
+///
+/// Used by connectors (e.g., Kafka Avro/Protobuf topics) to resolve the
+/// Arrow schema for a data stream at runtime without hard-coding field lists.
+pub trait SchemaRegistry: Send + Sync {
+    /// Look up a schema by name.
+    fn get_schema(&self, name: &str) -> CatalogResult<TableSchema>;
+    /// Register a schema under a name, replacing any existing entry.
+    fn register_schema(&mut self, name: impl Into<String>, schema: TableSchema);
+    /// Return all registered schema names.
+    fn schema_names(&self) -> Vec<String>;
+}
+
+/// An in-memory [`SchemaRegistry`] backed by a sorted map.
+#[derive(Debug, Default)]
+pub struct InMemorySchemaRegistry {
+    schemas: BTreeMap<String, TableSchema>,
+}
+
+impl InMemorySchemaRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SchemaRegistry for InMemorySchemaRegistry {
+    fn get_schema(&self, name: &str) -> CatalogResult<TableSchema> {
+        self.schemas
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CatalogError::SchemaNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    fn register_schema(&mut self, name: impl Into<String>, schema: TableSchema) {
+        self.schemas.insert(name.into(), schema);
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        self.schemas.keys().cloned().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DataFusion catalog bridge
 // ---------------------------------------------------------------------------
 
@@ -666,6 +714,40 @@ mod tests {
         let name_field = arrow_schema.field_with_name("name").unwrap();
         assert_eq!(name_field.data_type(), &arrow::datatypes::DataType::Utf8);
         assert!(name_field.is_nullable());
+    }
+
+    // -----------------------------------------------------------------------
+    // SchemaRegistry tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schema_registry_registers_and_retrieves() {
+        let mut registry = InMemorySchemaRegistry::new();
+        registry.register_schema("events", make_schema());
+        let schema = registry.get_schema("events").unwrap();
+        assert_eq!(schema.field_count(), 2);
+    }
+
+    #[test]
+    fn schema_registry_returns_error_for_missing() {
+        let registry = InMemorySchemaRegistry::new();
+        let err = registry.get_schema("nonexistent").unwrap_err();
+        match err {
+            CatalogError::SchemaNotFound { name } => {
+                assert_eq!(name, "nonexistent");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn schema_registry_lists_names() {
+        let mut registry = InMemorySchemaRegistry::new();
+        registry.register_schema("orders", make_schema());
+        registry.register_schema("users", make_schema());
+        let mut names = registry.schema_names();
+        names.sort();
+        assert_eq!(names, vec!["orders", "users"]);
     }
 
     // -----------------------------------------------------------------------
