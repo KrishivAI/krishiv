@@ -285,10 +285,7 @@ krishiv_shuffle_bytes_written_total 0
 krishiv_shuffle_partitions_total 0
 ";
     (
-        [(
-            CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         BODY,
     )
 }

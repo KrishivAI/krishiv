@@ -629,6 +629,16 @@ impl Coordinator {
         Ok(self.executors.advance_clock(ticks))
     }
 
+    /// Restore job state from a `MetadataStore` after coordinator restart.
+    pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
+        for record in store.jobs() {
+            if !self.jobs.iter().any(|j| j.job_id() == record.job_id()) {
+                self.jobs.push(record.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Submit a job and statically assign its tasks.
     pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<()> {
         self.ensure_active()?;
@@ -1861,6 +1871,117 @@ fn plan_node_description(node: &PlanNode) -> String {
     }
 }
 
+/// Events written to the durable job event log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventLogEvent {
+    /// A new job was accepted by the coordinator.
+    JobSubmitted { job_id: JobId },
+    /// Stage task graph was determined by the planner.
+    StagePlanned { job_id: JobId, stage_id: StageId },
+    /// A task was placed on an executor.
+    TaskAssigned {
+        job_id: JobId,
+        stage_id: StageId,
+        task_id: TaskId,
+        executor_id: ExecutorId,
+    },
+    /// Executor reported a task as started (Running state).
+    TaskStarted {
+        job_id: JobId,
+        stage_id: StageId,
+        task_id: TaskId,
+        attempt: AttemptId,
+    },
+    /// Executor reported a task as completed.
+    TaskSucceeded {
+        job_id: JobId,
+        stage_id: StageId,
+        task_id: TaskId,
+        attempt: AttemptId,
+    },
+    /// Executor reported a task as failed or the coordinator timed it out.
+    TaskFailed {
+        job_id: JobId,
+        stage_id: StageId,
+        task_id: TaskId,
+        attempt: AttemptId,
+        reason: String,
+    },
+    /// Executor missed heartbeats and was marked lost.
+    ExecutorLost { executor_id: ExecutorId },
+    /// Job was cancelled by an operator or user request.
+    JobCancelled { job_id: JobId },
+}
+
+/// Durable store for coordinator restart-recovery state and the event log.
+///
+/// `InMemoryMetadataStore` is the only R3.1 backend. `SqliteMetadataStore` and
+/// `KubernetesMetadataStore` are deferred to later releases.
+pub trait MetadataStore: Send + Sync {
+    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
+    fn events(&self) -> &[EventLogEvent];
+    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()>;
+    fn jobs(&self) -> &[JobRecord];
+}
+
+/// In-memory metadata store for tests and single-process deployments.
+#[derive(Debug, Default)]
+pub struct InMemoryMetadataStore {
+    events: Vec<EventLogEvent>,
+    jobs: Vec<JobRecord>,
+}
+
+impl MetadataStore for InMemoryMetadataStore {
+    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
+
+    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
+            *existing = record.clone();
+        } else {
+            self.jobs.push(record.clone());
+        }
+        Ok(())
+    }
+
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
+}
+
+/// Leader election interface for single-coordinator and HA deployments.
+///
+/// `SingleNodeElection` is the only R3.1 implementation. HA election backed by
+/// an etcd or Kubernetes lease is deferred to R6.
+pub trait LeaderElection: Send + Sync {
+    fn is_leader(&self) -> bool;
+}
+
+/// No-op leader election that always reports this node as the leader.
+#[derive(Debug, Default)]
+pub struct SingleNodeElection;
+
+impl LeaderElection for SingleNodeElection {
+    fn is_leader(&self) -> bool {
+        true
+    }
+}
+
+/// Job submission interface supporting both gRPC (process mode) and Kubernetes
+/// CRD (operator mode) submission paths.
+///
+/// `GrpcJobSubmitter` and `KubernetesJobSubmitter` are deferred; the trait is
+/// defined here so callers can depend on the abstraction immediately.
+pub trait JobSubmitter: Send + Sync {
+    fn submit(&self, spec: &JobSpec) -> SchedulerResult<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1875,8 +1996,9 @@ mod tests {
     };
 
     use super::{
-        Coordinator, CoordinatorConfig, CoordinatorExecutorTonicService, ExecutorRegistry,
-        SchedulerError, SharedCoordinator, StaticScheduler, TaskUpdateOutcome,
+        Coordinator, CoordinatorConfig, CoordinatorExecutorTonicService, EventLogEvent,
+        ExecutorRegistry, InMemoryMetadataStore, LeaderElection, MetadataStore, SchedulerError,
+        SharedCoordinator, SingleNodeElection, StaticScheduler, TaskUpdateOutcome,
         job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
 
@@ -2995,5 +3117,64 @@ mod tests {
             StageSpec::new(StageId::try_new("stage-1").unwrap(), "scan")
                 .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "scan a")),
         )
+    }
+
+    #[test]
+    fn in_memory_metadata_store_round_trips() {
+        let coord_id = CoordinatorId::try_new("coord-1").unwrap();
+        let job_id = JobId::try_new("job-1").unwrap();
+        let mut store = InMemoryMetadataStore::default();
+
+        let event = EventLogEvent::JobSubmitted {
+            job_id: job_id.clone(),
+        };
+        store.append_event(event.clone()).unwrap();
+        assert_eq!(store.events().len(), 1);
+        assert_eq!(store.events()[0], event);
+
+        let mut coordinator = Coordinator::active(coord_id);
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                2,
+            ))
+            .unwrap();
+        coordinator.submit_job(demo_job()).unwrap();
+        store.save_job(&coordinator.jobs[0]).unwrap();
+        assert_eq!(store.jobs().len(), 1);
+        assert_eq!(store.jobs()[0].job_id(), &job_id);
+
+        // Overwrite with the same record is idempotent.
+        store.save_job(&coordinator.jobs[0]).unwrap();
+        assert_eq!(store.jobs().len(), 1);
+    }
+
+    #[test]
+    fn single_node_election_is_always_leader() {
+        let election = SingleNodeElection::default();
+        assert!(election.is_leader());
+    }
+
+    #[test]
+    fn coordinator_recovers_jobs_from_store() {
+        let coord_id = CoordinatorId::try_new("coord-1").unwrap();
+        let job_id = JobId::try_new("job-1").unwrap();
+        let mut store = InMemoryMetadataStore::default();
+
+        let mut prev = Coordinator::active(coord_id.clone());
+        prev.register_executor(ExecutorDescriptor::new(
+            ExecutorId::try_new("exec-1").unwrap(),
+            "pod-a",
+            2,
+        ))
+        .unwrap();
+        prev.submit_job(demo_job()).unwrap();
+        store.save_job(&prev.jobs[0]).unwrap();
+
+        let mut coordinator = Coordinator::active(coord_id);
+        coordinator.recover_from_store(&store).unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Running);
     }
 }

@@ -5,6 +5,7 @@ use std::process;
 use std::time::Duration;
 
 use krishiv_executor::{ExecutorConfig, ExecutorRuntime};
+use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
 async fn main() {
@@ -89,19 +90,29 @@ async fn heartbeat_loop(
 ) -> Result<(), String> {
     register_once(runtime).await?;
 
+    let mut sigterm = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
+
     loop {
-        tokio::time::sleep(Duration::from_secs(heartbeat_interval_secs)).await;
-        let heartbeat = runtime
-            .heartbeat_with_grpc_endpoint()
-            .await
-            .map_err(|error| error.to_string())?;
-        println!(
-            "heartbeat response version={} lease_generation={} disposition={} message={}",
-            heartbeat.version(),
-            heartbeat.lease_generation(),
-            heartbeat.disposition(),
-            heartbeat.message().unwrap_or("")
-        );
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(heartbeat_interval_secs)) => {
+                let heartbeat = runtime
+                    .heartbeat_with_grpc_endpoint()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "heartbeat response version={} lease_generation={} disposition={} message={}",
+                    heartbeat.version(),
+                    heartbeat.lease_generation(),
+                    heartbeat.disposition(),
+                    heartbeat.message().unwrap_or("")
+                );
+            }
+            _ = sigterm.recv() => {
+                println!("SIGTERM received — deregistering and shutting down");
+                let _ = runtime.deregister_with_grpc_endpoint().await;
+                return Ok(());
+            }
+        }
     }
 }
 

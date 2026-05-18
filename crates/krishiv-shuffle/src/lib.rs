@@ -5,8 +5,8 @@
 //! Provides local-disk shuffle write/read paths, an Arrow-based hash
 //! partitioner, compression codec metadata, and orphan artifact detection.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,12 +32,18 @@ pub struct ShufflePath {
 impl ShufflePath {
     /// Returns the staging path: `{job_id}/{stage_id}/{partition_id}.tmp`
     pub fn staging_name(&self) -> String {
-        format!("{}/{}/{}.tmp", self.job_id, self.stage_id, self.partition_id)
+        format!(
+            "{}/{}/{}.tmp",
+            self.job_id, self.stage_id, self.partition_id
+        )
     }
 
     /// Returns the final path: `{job_id}/{stage_id}/{partition_id}.ipc`
     pub fn final_name(&self) -> String {
-        format!("{}/{}/{}.ipc", self.job_id, self.stage_id, self.partition_id)
+        format!(
+            "{}/{}/{}.ipc",
+            self.job_id, self.stage_id, self.partition_id
+        )
     }
 }
 
@@ -78,8 +84,7 @@ impl ShuffleMetadata {
 
     /// Record that a partition is fully written and available.
     pub fn mark_available(&mut self, path: &ShufflePath) {
-        self.states
-            .insert(path.clone(), PartitionState::Available);
+        self.states.insert(path.clone(), PartitionState::Available);
     }
 
     /// Record that a partition write failed with the given reason.
@@ -95,9 +100,9 @@ impl ShuffleMetadata {
 
     /// Return `true` only when every path in the slice is `Available`.
     pub fn all_available(&self, paths: &[ShufflePath]) -> bool {
-        paths.iter().all(|p| {
-            matches!(self.states.get(p), Some(PartitionState::Available))
-        })
+        paths
+            .iter()
+            .all(|p| matches!(self.states.get(p), Some(PartitionState::Available)))
     }
 }
 
@@ -198,11 +203,7 @@ impl LocalShuffleStore {
     /// 1. Creates `{base_dir}/{staging_name}` (including parent dirs).
     /// 2. Writes `data`.
     /// 3. Atomically renames staging path → final path.
-    pub async fn write_partition(
-        &self,
-        path: &ShufflePath,
-        data: &[u8],
-    ) -> ShuffleResult<()> {
+    pub async fn write_partition(&self, path: &ShufflePath, data: &[u8]) -> ShuffleResult<()> {
         let staging = self.base_dir.join(path.staging_name());
         let final_path = self.base_dir.join(path.final_name());
 
@@ -382,9 +383,7 @@ impl HashPartitioner {
                 }
             }
             other => {
-                return Err(ShuffleError::Io(format!(
-                    "unsupported key type: {other}"
-                )));
+                return Err(ShuffleError::Io(format!("unsupported key type: {other}")));
             }
         }
 
@@ -403,9 +402,8 @@ impl HashPartitioner {
                             .map_err(|e| ShuffleError::Io(e.to_string()))
                     })
                     .collect::<ShuffleResult<_>>()?;
-                let partition_batch =
-                    RecordBatch::try_new(schema.clone(), columns)
-                        .map_err(|e| ShuffleError::Io(e.to_string()))?;
+                let partition_batch = RecordBatch::try_new(schema.clone(), columns)
+                    .map_err(|e| ShuffleError::Io(e.to_string()))?;
                 result.push(partition_batch);
             }
         }
@@ -704,11 +702,7 @@ mod tests {
     }
 
     fn make_utf8_batch(values: Vec<&str>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "key",
-            DataType::Utf8,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
         let arr = Arc::new(StringArray::from(values));
         RecordBatch::try_new(schema, vec![arr]).unwrap()
     }
@@ -742,7 +736,10 @@ mod tests {
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             let found = (0..arr.len()).any(|i| arr.value(i) == v);
-            assert!(found, "value {v} not found in expected bucket {expected_bucket}");
+            assert!(
+                found,
+                "value {v} not found in expected bucket {expected_bucket}"
+            );
         }
     }
 
@@ -774,7 +771,10 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .unwrap();
             let found = (0..arr.len()).any(|i| arr.value(i) == v);
-            assert!(found, "value {v} not found in expected bucket {expected_bucket}");
+            assert!(
+                found,
+                "value {v} not found in expected bucket {expected_bucket}"
+            );
         }
     }
 
