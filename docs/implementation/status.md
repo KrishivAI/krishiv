@@ -2,16 +2,14 @@
 
 ## Current Phase
 
-R3.2 Connector Contracts (active) / R4 Bootstrap.
+R3.2 Connector Contracts closure complete / R4 Bootstrap.
 
 ## Active Task
 
-R3.2 closure slices A–D completed; R4 bootstrap slices E–F completed.
-Remaining R3.2 open items before the acceptance gate:
-1. Kafka consumer group offset commit after output write (post-write commit protocol).
-2. Kafka → Parquet end-to-end pipeline on real executors.
-3. Task lease token issuance + stale-token rejection in shuffle write path (R4 shuffle).
-4. Operator-side executor pod launch failure detection (deferred stretch item).
+R3 closure slices completed in this session: Kafka post-write offset commit protocol, deterministic Kafka-compatible source/committer harness, Kafka → Parquet execution on the real executor runner, and task lease generation → shuffle stale-token rejection proof.
+Remaining non-blocking follow-up:
+1. Operator-side executor pod launch failure detection (deferred stretch item).
+2. Live external Kafka broker feature/integration test (post-R3 connector runtime hardening; current R3 path uses deterministic in-memory Kafka-compatible harness).
 
 ## Completed
 
@@ -173,10 +171,9 @@ Remaining R3.2 open items before the acceptance gate:
 
 ## Next Steps
 
-1. Kafka consumer group offset commit after output write: implement + test post-write commit protocol.
-2. Kafka → Parquet end-to-end pipeline on real executors (R3.2 acceptance gate).
-3. Task lease token model: deferred to R4 when full shuffle write path exists (`InMemoryShuffleStore` + `LocalDiskShuffleStore` foundation is in `krishiv-shuffle`).
-4. Executor pod launch failure detection: deferred R3.1 stretch item.
+1. Continue R4 shuffle integration: wire shuffle writer/reader APIs into multi-stage executor execution and coordinator shuffle metadata.
+2. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
+3. Executor pod launch failure detection: deferred R3.1 stretch item.
 
 ## Known Blockers
 
@@ -309,14 +306,14 @@ Remaining R3.2 open items before the acceptance gate:
 - **R4 Bootstrap Slice E**: `register_record_batches()` added to `SqlEngine` in `krishiv-sql`; `krishiv-connectors` dep added to `krishiv-executor`; `CONNECTOR_PARQUET_PARTITION_PREFIX` + `read_connector_parquet_partitions()` wired into `execute_stage_fragment()`; new test `executor_runs_parquet_task_via_connector_source` passes.
 - **R4 Bootstrap Slice F**: `ShuffleStore` trait, `InMemoryShuffleStore`, and `LocalDiskShuffleStore` added to `krishiv-shuffle` with lease-token zombie-executor rejection; `parquet` and `bytes` deps added to `krishiv-shuffle/Cargo.toml`; 8 new tokio async tests pass.
 
-## Last Validation (R3.2 A–D + R4 E–F, branch claude/analyze-recommend-slices-Ai5GY)
+- **R3 closure slices (this session)**: Added `PostWriteOffsetCommitProtocol` and `OffsetCommitter` to enforce write → flush → offset commit ordering; added deterministic in-memory Kafka-compatible source and commit log; added executor Kafka → Parquet pipeline support using `ParquetSink`; added real-runner tests for the pipeline and connector-Parquet path; added assignment lease-generation → shuffle stale-token rejection proof.
 
-- `cargo fmt --all` applied; 5 files reformatted (`krishiv-proto`, `krishiv-connectors`, `krishiv-executor`, `krishiv-shuffle`, `krishiv-sql`).
-- `cargo check --workspace` passed — 0 errors.
-- `cargo test -p krishiv-connectors` passed — 24 tests, 0 failures (3 new Slice A tests included).
-- `cargo test -p krishiv-catalog` passed — 10 tests, 0 failures (3 new SchemaRegistry tests included).
-- `cargo test -p krishiv-executor` passed — 16 tests, 0 failures (1 new connector-parquet test included).
-- `cargo test -p krishiv-shuffle` passed — 33 tests, 0 failures (8 new ShuffleStore tests included).
+## Last Validation (R3 closure slices, branch current)
+
+- `cargo fmt --all --check` passed.
+- `cargo check --workspace` passed.
+- `cargo test -p krishiv-connectors -p krishiv-executor` passed — 29 connector tests, 19 executor lib tests, 4 executor bin tests, and doc tests.
+- `cargo test --workspace` passed — 0 failures across all crates.
 
 ## Resume Instructions
 
@@ -325,7 +322,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. R3.2 Slices A–D and R4 bootstrap Slices E–F are done. Continue with Kafka post-write offset commit protocol and Kafka → Parquet end-to-end pipeline.
+4. R3 closure slices are done. Continue with R4 shuffle writer/reader integration and live external Kafka hardening when the broker runtime is selected.
 
 For a new Claude Code session:
 

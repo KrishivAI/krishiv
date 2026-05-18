@@ -168,6 +168,21 @@ pub trait CommitHandle {
 }
 
 // ---------------------------------------------------------------------------
+// OffsetCommitter
+// ---------------------------------------------------------------------------
+
+/// Commits a source offset after downstream output is durable.
+///
+/// This is intentionally separate from [`Source`] so executors can keep source
+/// reads, sink writes, and offset commits ordered explicitly.  For at-least-once
+/// delivery, callers must commit offsets only after the corresponding sink
+/// output has been written and flushed.
+pub trait OffsetCommitter<O: Offset> {
+    /// Persist `offset` as consumed.
+    fn commit_offset(&mut self, offset: O) -> impl Future<Output = ConnectorResult<()>> + Send;
+}
+
+// ---------------------------------------------------------------------------
 // Source
 // ---------------------------------------------------------------------------
 
@@ -306,6 +321,40 @@ impl Offset for ParquetOffset {
 ///   data loss on crash.
 pub struct AtLeastOnceSinkContract;
 
+/// Drives the R3.2 post-write offset commit protocol.
+///
+/// The protocol order is:
+///
+/// 1. write the output batch to the sink,
+/// 2. flush the sink so the output is durable,
+/// 3. commit the source offset.
+///
+/// If either the write or flush fails, the offset is not committed.  This keeps
+/// reassignment/replay at-least-once: a task may write duplicate output to a
+/// non-idempotent sink, but it does not acknowledge data that was not durably
+/// written.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PostWriteOffsetCommitProtocol;
+
+impl PostWriteOffsetCommitProtocol {
+    /// Write `batch`, flush `sink`, and then commit `offset`.
+    pub async fn write_flush_commit<S, C, O>(
+        sink: &mut S,
+        committer: &mut C,
+        batch: arrow::record_batch::RecordBatch,
+        offset: O,
+    ) -> ConnectorResult<()>
+    where
+        S: Sink,
+        C: OffsetCommitter<O>,
+        O: Offset,
+    {
+        sink.write_batch(batch).await?;
+        sink.flush().await?;
+        committer.commit_offset(offset).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CertificationSuite
 // ---------------------------------------------------------------------------
@@ -426,6 +475,10 @@ use std::future::Future;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
 
     // -----------------------------------------------------------------------
     // ConnectorCapabilities builder
@@ -598,5 +651,145 @@ mod tests {
             ConnectorError::Unsupported { .. } => {}
             other => panic!("expected Unsupported, got: {other}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PostWriteOffsetCommitProtocol
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestOffset(u64);
+
+    impl Offset for TestOffset {
+        fn encode(&self) -> Vec<u8> {
+            self.0.to_be_bytes().to_vec()
+        }
+
+        fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
+            if bytes.len() != 8 {
+                return Err(ConnectorError::Config {
+                    message: format!("expected 8 offset bytes, got {}", bytes.len()),
+                });
+            }
+            let mut value = [0u8; 8];
+            value.copy_from_slice(bytes);
+            Ok(Self(u64::from_be_bytes(value)))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCommitter {
+        committed: Vec<TestOffset>,
+    }
+
+    impl OffsetCommitter<TestOffset> for RecordingCommitter {
+        async fn commit_offset(&mut self, offset: TestOffset) -> ConnectorResult<()> {
+            self.committed.push(offset);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Vec<&'static str>,
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Sink for RecordingSink {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new().with_idempotent()
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: arrow::record_batch::RecordBatch,
+        ) -> ConnectorResult<()> {
+            self.events.push("write");
+            if self.fail_write {
+                return Err(ConnectorError::Io {
+                    message: "injected write failure".into(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> ConnectorResult<()> {
+            self.events.push("flush");
+            if self.fail_flush {
+                return Err(ConnectorError::Io {
+                    message: "injected flush failure".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn one_row_batch() -> arrow::record_batch::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_write_protocol_commits_after_write_and_flush() {
+        let mut sink = RecordingSink::default();
+        let mut committer = RecordingCommitter::default();
+
+        PostWriteOffsetCommitProtocol::write_flush_commit(
+            &mut sink,
+            &mut committer,
+            one_row_batch(),
+            TestOffset(9),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sink.events, vec!["write", "flush"]);
+        assert_eq!(committer.committed, vec![TestOffset(9)]);
+    }
+
+    #[tokio::test]
+    async fn post_write_protocol_does_not_commit_when_write_fails() {
+        let mut sink = RecordingSink {
+            fail_write: true,
+            ..RecordingSink::default()
+        };
+        let mut committer = RecordingCommitter::default();
+
+        let err = PostWriteOffsetCommitProtocol::write_flush_commit(
+            &mut sink,
+            &mut committer,
+            one_row_batch(),
+            TestOffset(9),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectorError::Io { .. }));
+        assert_eq!(sink.events, vec!["write"]);
+        assert!(committer.committed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_write_protocol_does_not_commit_when_flush_fails() {
+        let mut sink = RecordingSink {
+            fail_flush: true,
+            ..RecordingSink::default()
+        };
+        let mut committer = RecordingCommitter::default();
+
+        let err = PostWriteOffsetCommitProtocol::write_flush_commit(
+            &mut sink,
+            &mut committer,
+            one_row_batch(),
+            TestOffset(9),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectorError::Io { .. }));
+        assert_eq!(sink.events, vec!["write", "flush"]);
+        assert!(committer.committed.is_empty());
     }
 }

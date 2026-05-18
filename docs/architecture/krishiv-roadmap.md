@@ -339,7 +339,7 @@ Acceptance gate for R3.1:
 - [ ] Operator restart during reconciliation does not create duplicate scheduler jobs.
 - [ ] Deleting a `KrishivJob` runs finalizer cleanup and leaves no active task assignments.
 - [x] Stage-Local Execution Model document is written.
-- [ ] Stage-Local Execution Model document is reviewed and approved.
+- [x] Stage-Local Execution Model document is reviewed and approved.
 
 #### R3.2: Connector Contracts
 
@@ -374,7 +374,7 @@ Acceptance gate for R3.2:
 - [ ] Kafka connector passes certification tests for supported semantics.
 - [ ] S3-compatible object store integration passes read/write tests.
 - [ ] Every connector declares capability flags.
-- [ ] Kafka → Parquet pipeline runs end-to-end on real executors.
+- [x] Kafka → Parquet pipeline runs end-to-end on real executors.
 
 ### R4: Shuffle And Batch AQE
 

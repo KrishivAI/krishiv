@@ -163,6 +163,9 @@ impl ExecutorAssignmentInbox {
 
 const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
 const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
+const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
+const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
+const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalParquetPartition {
@@ -288,6 +291,15 @@ impl ExecutorTaskOutput {
         }
     }
 
+    fn connector_pipeline(row_count: usize, batch_count: usize, column_count: usize) -> Self {
+        Self {
+            kind: ExecutorTaskOutputKind::ConnectorPipeline,
+            row_count,
+            batch_count,
+            column_count,
+        }
+    }
+
     fn placeholder() -> Self {
         Self {
             kind: ExecutorTaskOutputKind::Placeholder,
@@ -342,6 +354,8 @@ impl ExecutorTaskOutput {
 pub enum ExecutorTaskOutputKind {
     /// Real SQL fragment executed through the Krishiv SQL/DataFusion seam.
     Sql,
+    /// Connector-to-connector pipeline executed by the task runner.
+    ConnectorPipeline,
     /// Placeholder path for non-SQL fragments while R3.1 is still bootstrapping.
     Placeholder,
     /// Task was cancelled before execution started.
@@ -352,6 +366,7 @@ impl ExecutorTaskOutputKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Sql => "sql",
+            Self::ConnectorPipeline => "connector_pipeline",
             Self::Placeholder => "placeholder",
             Self::Cancelled => "cancelled",
         }
@@ -507,6 +522,10 @@ impl ExecutorTaskRunner {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from("output contract description cannot be empty"),
             });
+        }
+
+        if fragment == KAFKA_TO_PARQUET_FRAGMENT {
+            return execute_kafka_to_parquet_pipeline(assignment).await;
         }
 
         if let Some(query) = sql_query_from_fragment(fragment) {
@@ -671,6 +690,190 @@ async fn read_connector_parquet_partitions(
         result.push((table_name, batches));
     }
     Ok(result)
+}
+
+async fn execute_kafka_to_parquet_pipeline(
+    assignment: &ExecutorTaskAssignment,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_connectors::kafka::{
+        InMemoryKafkaOffsetCommitter, InMemoryKafkaSource, KafkaOffset,
+    };
+    use krishiv_connectors::parquet::ParquetSink;
+    use krishiv_connectors::{PostWriteOffsetCommitProtocol, Source};
+
+    let (topic, partition, start_offset, batch) =
+        parse_memory_kafka_partition(assignment.input_partitions())?;
+    let sink_path = parse_parquet_sink_path(assignment.output_contract().description())?;
+    let mut source = InMemoryKafkaSource::new(topic, partition, start_offset, vec![batch]);
+    let mut sink =
+        ParquetSink::create(&sink_path).map_err(|error| ExecutorError::LocalExecution {
+            message: format!(
+                "parquet sink create failed for '{}': {error}",
+                sink_path.display()
+            ),
+        })?;
+    let mut committer = InMemoryKafkaOffsetCommitter::new();
+
+    let mut row_count = 0usize;
+    let mut batch_count = 0usize;
+    let mut column_count = 0usize;
+    while let Some(batch) =
+        source
+            .read_batch()
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("memory Kafka source read failed: {error}"),
+            })?
+    {
+        row_count += batch.num_rows();
+        batch_count += 1;
+        column_count = batch.num_columns();
+        let offset = source
+            .current_offset()
+            .and_then(|offset| offset.downcast::<KafkaOffset>().ok())
+            .map(|offset| *offset)
+            .ok_or_else(|| ExecutorError::LocalExecution {
+                message: String::from("memory Kafka source did not expose a KafkaOffset"),
+            })?;
+
+        PostWriteOffsetCommitProtocol::write_flush_commit(&mut sink, &mut committer, batch, offset)
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("Kafka-to-Parquet post-write commit failed: {error}"),
+            })?;
+    }
+
+    if committer.committed_offsets().is_empty() && row_count > 0 {
+        return Err(ExecutorError::LocalExecution {
+            message: String::from("Kafka-to-Parquet pipeline wrote rows without committing offset"),
+        });
+    }
+
+    Ok(ExecutorTaskOutput::connector_pipeline(
+        row_count,
+        batch_count,
+        column_count,
+    ))
+}
+
+fn parse_parquet_sink_path(description: &str) -> ExecutorResult<PathBuf> {
+    let path = description
+        .trim()
+        .strip_prefix(PARQUET_SINK_PREFIX)
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: format!(
+                "Kafka-to-Parquet output contract must use {PARQUET_SINK_PREFIX}<path>"
+            ),
+        })?
+        .trim();
+    if path.is_empty() {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from("Kafka-to-Parquet output path cannot be empty"),
+        });
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn parse_memory_kafka_partition(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<(String, i32, i64, arrow::record_batch::RecordBatch)> {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let mut parsed = None;
+    for partition in partitions {
+        let desc = partition.description().trim();
+        let Some(payload) = desc.strip_prefix(MEMORY_KAFKA_PARTITION_PREFIX) else {
+            continue;
+        };
+        if parsed.is_some() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: String::from(
+                    "Kafka-to-Parquet pipeline accepts exactly one memory-kafka partition",
+                ),
+            });
+        }
+        let parts: Vec<&str> = payload.splitn(4, ':').collect();
+        if parts.len() != 4 {
+            return Err(ExecutorError::InvalidAssignment {
+                message: format!(
+                    "input partition {} must use memory-kafka:<topic>:<partition>:<start_offset>:<id=value,...>",
+                    partition.partition_id()
+                ),
+            });
+        }
+        let topic = parts[0].trim();
+        if topic.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: String::from("memory-kafka topic cannot be empty"),
+            });
+        }
+        let kafka_partition =
+            parts[1]
+                .trim()
+                .parse::<i32>()
+                .map_err(|error| ExecutorError::InvalidAssignment {
+                    message: format!("invalid memory-kafka partition id: {error}"),
+                })?;
+        let start_offset =
+            parts[2]
+                .trim()
+                .parse::<i64>()
+                .map_err(|error| ExecutorError::InvalidAssignment {
+                    message: format!("invalid memory-kafka start offset: {error}"),
+                })?;
+        let records = parts[3].trim();
+        if records.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: String::from("memory-kafka records cannot be empty"),
+            });
+        }
+
+        let mut ids = Vec::new();
+        let mut values = Vec::new();
+        for record in records.split(',') {
+            let (id, value) =
+                record
+                    .trim()
+                    .split_once('=')
+                    .ok_or_else(|| ExecutorError::InvalidAssignment {
+                        message: format!(
+                            "invalid memory-kafka record '{record}', expected id=value"
+                        ),
+                    })?;
+            ids.push(id.trim().parse::<i64>().map_err(|error| {
+                ExecutorError::InvalidAssignment {
+                    message: format!("invalid memory-kafka record id '{id}': {error}"),
+                }
+            })?);
+            values.push(value.trim().to_owned());
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let value_refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(value_refs)),
+            ],
+        )
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("failed to build memory-kafka record batch: {error}"),
+        })?;
+        parsed = Some((topic.to_owned(), kafka_partition, start_offset, batch));
+    }
+
+    parsed.ok_or_else(|| ExecutorError::InvalidAssignment {
+        message: format!(
+            "Kafka-to-Parquet pipeline requires one {MEMORY_KAFKA_PARTITION_PREFIX}<topic>:<partition>:<start_offset>:<records> input partition"
+        ),
+    })
 }
 
 fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
@@ -2072,5 +2275,191 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_runs_kafka_to_parquet_pipeline_on_real_runner() {
+        use krishiv_connectors::Source;
+        use krishiv_connectors::parquet::ParquetSource;
+
+        let temp = tempdir().unwrap();
+        let output_path = temp.path().join("events.parquet");
+
+        let executor_id = ExecutorId::try_new("exec-kafka-pipeline-1").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-kafka-pipeline-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-kafka-pipeline-1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-kafka-pipeline",
+                    1,
+                ))
+                .unwrap();
+            coordinator
+                .submit_job(single_task_job(job_id.clone()))
+                .unwrap();
+            let launched = coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+                .remove(0);
+
+            let assignment = ExecutorTaskAssignment::new(
+                TaskAttemptRef::new(
+                    launched.job_id().clone(),
+                    launched.stage_id().clone(),
+                    launched.task_id().clone(),
+                    launched.attempt_id(),
+                ),
+                launched.executor_id().clone(),
+                launched.lease_generation(),
+                PlanFragment::new(super::KAFKA_TO_PARQUET_FRAGMENT),
+                OutputContract::new(
+                    OutputContractKind::Sink,
+                    format!("parquet-sink:{}", output_path.display()),
+                ),
+            )
+            .with_input_partitions(vec![InputPartition::new(
+                "events-partition-0",
+                "memory-kafka:events:0:5:1=created,2=updated,3=deleted",
+            )]);
+            inbox.push(assignment).unwrap();
+        }
+
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+        let report = runner.run_next_with(&service).await.unwrap().unwrap();
+
+        assert_eq!(report.assignment().job_id(), &job_id);
+        assert_eq!(
+            report.output().kind(),
+            ExecutorTaskOutputKind::ConnectorPipeline
+        );
+        assert_eq!(report.output().row_count(), 3);
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 2);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+
+        let mut source = ParquetSource::open(&output_path).unwrap();
+        let batch = source.read_batch().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+        assert!(source.read_batch().await.unwrap().is_none());
+
+        let coordinator = shared.read().unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
+        assert_eq!(snapshot.succeeded_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_rejects_kafka_to_parquet_without_parquet_sink_contract() {
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-bad-pipeline").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-bad-pipeline").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(super::KAFKA_TO_PARQUET_FRAGMENT),
+            OutputContract::new(OutputContractKind::Sink, "inline result"),
+        )
+        .with_input_partitions(vec![InputPartition::new(
+            "events-partition-0",
+            "memory-kafka:events:0:0:1=created",
+        )]);
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let err = runner
+            .execute_stage_fragment(&assignment)
+            .await
+            .unwrap_err();
+        match err {
+            ExecutorError::InvalidAssignment { message } => {
+                assert!(message.contains("parquet-sink:"));
+            }
+            other => panic!("expected InvalidAssignment, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assignment_lease_generation_rejects_stale_shuffle_write() {
+        use krishiv_shuffle::{
+            InMemoryShuffleStore, PartitionId, ShufflePartition, ShuffleStore, StoreError,
+        };
+
+        let stale_assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-shuffle-lease").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-zombie").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::Shuffle, "shuffle partition"),
+        );
+        let fresh_assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                stale_assignment.job_id().clone(),
+                stale_assignment.stage_id().clone(),
+                stale_assignment.task_id().clone(),
+                stale_assignment.attempt_id().next(),
+            ),
+            ExecutorId::try_new("exec-replacement").unwrap(),
+            stale_assignment.lease_generation().next(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::Shuffle, "shuffle partition"),
+        );
+
+        let store = InMemoryShuffleStore::new();
+        let id = PartitionId {
+            job_id: fresh_assignment.job_id().to_string(),
+            stage_id: fresh_assignment.stage_id().to_string(),
+            partition: 0,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let partition = ShufflePartition {
+            id: id.clone(),
+            schema,
+            batches: vec![batch],
+        };
+
+        store
+            .write_partition(
+                partition.clone(),
+                fresh_assignment.lease_generation().as_u64(),
+            )
+            .await
+            .unwrap();
+        let err = store
+            .write_partition(partition, stale_assignment.lease_generation().as_u64())
+            .await
+            .unwrap_err();
+
+        match err {
+            StoreError::StaleLeaseToken { expected, actual } => {
+                assert_eq!(expected, fresh_assignment.lease_generation().as_u64());
+                assert_eq!(actual, stale_assignment.lease_generation().as_u64());
+            }
+            other => panic!("expected StaleLeaseToken, got {other}"),
+        }
+        let stored = store.read_partition(&id).await.unwrap().unwrap();
+        assert_eq!(stored.batches[0].num_rows(), 1);
     }
 }

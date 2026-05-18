@@ -17,6 +17,7 @@ tonic.workspace = true
 [dev-dependencies]
 arrow.workspace = true
 krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-shuffle = { path = "../krishiv-shuffle" }
 parquet.workspace = true
 tempfile.workspace = true
 
