@@ -13,7 +13,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Int32Array, Int64Array, StringArray, StringViewArray, UInt32Array};
+use arrow::array::{
+    Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray, UInt32Array,
+};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -402,6 +404,16 @@ impl HashPartitioner {
                     .as_any()
                     .downcast_ref::<StringViewArray>()
                     .expect("data type is Utf8View");
+                for row in 0..num_rows {
+                    let bucket = hash_str(arr.value(row), self.buckets);
+                    bucket_indices[bucket as usize].push(row as u32);
+                }
+            }
+            DataType::LargeUtf8 => {
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("data type is LargeUtf8");
                 for row in 0..num_rows {
                     let bucket = hash_str(arr.value(row), self.buckets);
                     bucket_indices[bucket as usize].push(row as u32);

@@ -726,12 +726,12 @@ impl Coordinator {
         let job_id = spec.job_id().clone();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
-        self.jobs.push(record);
         if let Some(store) = &self.store {
             let mut s = store.lock().unwrap();
-            s.save_job(self.jobs.last().unwrap()).ok();
+            s.save_job(&record).ok();
             s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
         }
+        self.jobs.push(record);
         Ok(())
     }
 
@@ -2148,6 +2148,21 @@ fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
         return Err(SchedulerError::InvalidJob {
             message: String::from("each stage must contain at least one task"),
         });
+    }
+    let stage_ids: std::collections::HashSet<&StageId> =
+        spec.stages().iter().map(|s| s.stage_id()).collect();
+    for stage in spec.stages() {
+        for upstream_id in stage.upstream_stage_ids() {
+            if !stage_ids.contains(upstream_id) {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "stage {} declares upstream dependency on unknown stage {}",
+                        stage.stage_id(),
+                        upstream_id
+                    ),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -4220,6 +4235,53 @@ mod tests {
             StageSpec::new(StageId::try_new("stage-1").unwrap(), "scan")
                 .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "scan a")),
         )
+    }
+
+    #[test]
+    fn validate_job_rejects_unknown_upstream_stage() {
+        let job_id = JobId::try_new("job-1").unwrap();
+        let spec = JobSpec::new(job_id, "bad upstream", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage1")
+                .with_upstream_stage(StageId::try_new("ghost-stage").unwrap())
+                .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+        );
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                1,
+            ))
+            .unwrap();
+        let result = coordinator.submit_job(spec);
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidJob { .. })),
+            "expected InvalidJob, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_job_accepts_valid_upstream_stage() {
+        let job_id = JobId::try_new("job-2").unwrap();
+        let spec = JobSpec::new(job_id, "good upstream", JobKind::Batch)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "producer")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+            )
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-2").unwrap(), "consumer")
+                    .with_upstream_stage(StageId::try_new("stage-1").unwrap())
+                    .with_task(TaskSpec::new(TaskId::try_new("task-2").unwrap(), "t2")),
+            );
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-2").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                2,
+            ))
+            .unwrap();
+        assert!(coordinator.submit_job(spec).is_ok());
     }
 
     #[test]
