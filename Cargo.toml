@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/krishiv-api",
+    "crates/krishiv-catalog",
     "crates/krishiv-cli",
+    "crates/krishiv-connectors",
     "crates/krishiv-executor",
     "crates/krishiv-exec",
     "crates/krishiv-optimizer",

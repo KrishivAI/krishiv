@@ -175,10 +175,12 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 
 ## Next Steps
 
-1. Verify R3.1 acceptance gate — all primary items are now done. Remaining deferred items: task lease token model (R4), executor pod launch failure detection (R3.1 stretch), retry count in status API (minor).
-2. Open R3.2 connector certification work: connector traits (`Source`, `Sink`, `Offset`, `CommitHandle`), `krishiv-catalog` crate, Parquet reader/writer, Kafka source/sink, S3 object store reads/writes.
-3. Task lease token model: deferred to R4 when shuffle write path exists.
-4. Executor pod launch failure detection: deferred R3.1 stretch item.
+1. R3.2 Slice 4 — S3-compatible object-store reads/writes (unpartitioned): add `krishiv-connectors/src/s3.rs` with `S3Source` and `S3Sink` using `object_store` crate.
+2. R3.2 Slice 5 — Kafka source/sink stubs: add `krishiv-connectors/src/kafka.rs`; `KafkaSource` with consumer-group offset tracking; `KafkaSink` with post-write offset commit protocol; capability flags: unbounded + transactional.
+3. R3.2 Slice 6 — DataFusion catalog adapter: `InMemoryCatalog` → `datafusion::catalog::CatalogProvider` bridge in `krishiv-catalog`.
+4. R3.2 Slice 7 — Connector certification test kit: expand `CertificationSuite` with round-trip, exhaustion, rewind, and at-least-once write tests.
+5. Task lease token model: deferred to R4 when shuffle write path exists.
+6. Executor pod launch failure detection: deferred R3.1 stretch item.
 
 ## Known Blockers
 
@@ -296,6 +298,8 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 - `cargo run -p krishiv-scheduler --bin krishiv-coordinator -- --help` passed and listed `--coordinator-id` and `--grpc-addr`.
 - `cargo fmt --all` applied; `cargo check --workspace` passed after A–D slices.
 - `cargo test --workspace` passed — 0 failures (executor: 10 tests; ui: 8 tests; scheduler: 42 tests).
+- R3.2 Slices 1–3: `crates/krishiv-connectors` (connector traits + Parquet reader/writer, 9 tests) and `crates/krishiv-catalog` (catalog types + InMemoryCatalog, 4 tests) created.
+- `cargo fmt --all` applied; `cargo check --workspace` passed; `cargo test -p krishiv-catalog -p krishiv-connectors` passed — 13 tests, 0 failures.
 
 ## Resume Instructions
 
@@ -304,7 +308,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. R3.1 is substantially complete. Start R3.2 by adding `crates/krishiv-connectors` with `Source`, `Sink`, `Offset`, `CommitHandle` trait stubs and `ConnectorCapabilities`.
+4. R3.2 Slices 1–3 are done. Continue with Slices 4–7 (S3, Kafka, DataFusion adapter, certification test kit).
 
 For a new Claude Code session:
 
