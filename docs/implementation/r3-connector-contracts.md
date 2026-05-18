@@ -94,7 +94,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Add Kubernetes `terminationGracePeriodSeconds: 30` to executor pod spec manifests consistent with graceful drain window.
 - [x] Define task timeout model: `task_timeout_secs` field in `TaskSpec` and `ExecutorTaskAssignment`; wire field added to `ExecutorTaskAssignment` protobuf; executor enforces with `tokio::time::timeout` and reports `TaskFailed` on expiry.
 - [ ] Define executor pod launch failure handling: operator monitors executor pod readiness; if a pod is not `Ready` within `executor_startup_timeout_seconds`, the operator deregisters the executor from the coordinator and triggers task reassignment (does not wait for heartbeat timeout).
-- [ ] Support `--coordinator <URL>` startup flag on `krishiv-coordinator` and `krishiv-executor` binaries for bare metal / VM deployment (no Kubernetes dependency).
+- [x] Support `--coordinator <URL>` flag on `krishiv-executor` and add standalone `krishiv-coordinator` binary to `krishiv-scheduler` (`--coordinator-id`, `--grpc-addr`) for bare-metal / VM deployments without Kubernetes.
 - [x] Document bare metal deployment model: which features are Kubernetes-only (operator, CRDs, NetworkPolicy, K8s HA leader election) vs available on both targets (all core runtime: gRPC, task assignment, heartbeat, ShuffleStore, MetadataStore, CLI).
 - [x] Write `docs/architecture/deployment-targets.md` covering both Kubernetes and bare metal deployment models, startup commands, and feature availability matrix.
 - [x] Write `docs/security/security-posture.md` (pre-R9 security posture: NetworkPolicy for Kubernetes, firewall rules for bare metal, per-component ServiceAccounts, no credentials in task specs, known limitations).
@@ -123,9 +123,9 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Add minimal executor task runner skeleton: consume one inbox assignment, report `Running`, validate placeholder fragment metadata, and report terminal status.
 - [x] Add first narrow local SQL fragment execution path for `sql: SELECT 1`-style assignments, returning lightweight output metadata without Arrow payloads in control-plane Protobuf.
 - [x] Add R3.1 bootstrap `local-parquet:<table>:<path>` input partition registration for executor-local `sql:` fragments, without starting R3.2 connector certification.
-- [ ] Implement executor registration and deregistration on shutdown.
-- [ ] Implement graceful executor shutdown handler (SIGTERM → finish current RecordBatch → send `Deregister` RPC → exit).
-- [ ] Implement `CancelTask` handler on executor: finish current batch, do not start next, send `TaskCancelled` status to coordinator.
+- [x] Implement executor deregistration on shutdown: SIGTERM handler calls `deregister_with_grpc_endpoint` (dedicated Deregister RPC) and exits cleanly.
+- [x] Implement graceful executor shutdown handler: SIGTERM → `deregister_with_grpc_endpoint` → exit (current DataFusion batch completes naturally before shutdown).
+- [x] Implement `CancelTask` handler on executor: `cancel_task` marks task in `cancelled_tasks` set; runner checks after `Running` status, skips execution, sends `TaskCancelled` to coordinator.
 - [x] Implement coordinator `CancelJob`: `push_cancel_job` sends `CancelTask` gRPC to all assigned executors and marks job `Cancelled` (shuffle cleanup deferred to R4).
 - [ ] Implement task lease token issuance on assignment; validate token before any shuffle or sink write.
 - [ ] Implement stale lease token rejection in shuffle write path.
@@ -140,7 +140,7 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] Recover coordinator state from `MetadataStore` after process restart (`recover_from_store` on `Coordinator`).
 - [x] Reject stale task attempts and ignore duplicate status updates safely.
 - [x] Implement `KrishivJob` finalizer lifecycle: add finalizer on first observe, remove on deletion after cleanup.
-- [ ] Emit basic scheduler/executor stability metrics.
+- [x] Emit basic scheduler/executor stability metrics: `/metrics` endpoint serves live `StabilityMetrics` (running tasks, retries, failed assignments, max heartbeat age) in Prometheus text format.
 
 ### Test Checklist
 
@@ -171,10 +171,14 @@ Build the real executor binary, wire transport, durable metadata store, typed pl
 - [x] End-to-end test: Parquet file scan runs on executor with DataFusion through the networked assignment/status path, with result metadata returned to the runner caller and task status accepted by the coordinator.
 - [x] Executor crash is detected by coordinator; task is reassigned to another executor (`executor_crash_detected_and_task_reassigned`).
 - [x] Dedicated `Deregister` RPC transitions executor to `Removed` over networked gRPC (`grpc_deregister_transitions_executor_to_removed`).
+- [x] `ExecutorRuntime::deregister_with_grpc_endpoint` calls the dedicated Deregister RPC over a real gRPC connection, transitioning executor to `Removed` (`deregister_via_grpc_endpoint_transitions_executor_to_removed`).
 - [x] `KrishivJob` delete path calls `cancel_job` before stripping finalizer (`reconcile_delete_calls_cancel_job_before_removing_finalizer`).
-- [x] Task timeout field propagates from `TaskSpec` through wire protocol to `ExecutorTaskAssignment` (`task_timeout_secs_round_trips_through_wire`; timeout enforcement via `tokio::time::timeout` in executor runner).
+- [x] Task timeout field propagates from `TaskSpec` through wire protocol to `ExecutorTaskAssignment`; timeout enforcement via `tokio::time::timeout` in executor runner.
 - [x] NetworkPolicy manifest restricts coordinator gRPC port to `krishiv-system` namespace (`network_policy_restricts_coordinator_grpc_to_krishiv_namespace`).
 - [x] Status API exposes executor `lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count`, and task `last_failure_reason` via `ExecutorView`/`TaskView`.
+- [x] `CancelTask` inbox marks task as cancelled; executor runner sends `TaskCancelled` and skips execution (`task_runner_reports_cancelled_when_inbox_cancel_received`).
+- [x] `/metrics` serves live `StabilityMetrics` in Prometheus format (`metrics_returns_prometheus_stability_fields`, `metrics_reflects_live_coordinator_state`).
+- [x] `krishiv-coordinator` binary CLI parses defaults, explicit flags, and rejects invalid input (`parses_defaults`, `parses_explicit_flags`, `rejects_unknown_flag`, `rejects_invalid_grpc_addr`).
 
 ### Acceptance Gate For R3.1
 

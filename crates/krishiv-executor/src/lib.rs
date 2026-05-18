@@ -68,6 +68,7 @@ impl Error for ExecutorError {}
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<Vec<ExecutorTaskAssignment>>>,
+    cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
 }
 
 impl ExecutorAssignmentInbox {
@@ -99,6 +100,9 @@ impl ExecutorAssignmentInbox {
     }
 
     /// Cancel and remove queued assignments for a task id.
+    ///
+    /// Also marks the task id as cancelled so the runner can skip execution even
+    /// if the task has already been popped from the queue.
     pub fn cancel_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
         let mut assignments = self
             .assignments
@@ -106,7 +110,31 @@ impl ExecutorAssignmentInbox {
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
         let before = assignments.len();
         assignments.retain(|assignment| assignment.task_id() != task_id);
-        Ok(assignments.len() != before)
+        let removed = assignments.len() != before;
+        drop(assignments);
+        self.cancelled_tasks
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .insert(task_id.clone());
+        Ok(removed)
+    }
+
+    /// Whether a task id has been cancelled.
+    pub fn is_task_cancelled(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
+        Ok(self
+            .cancelled_tasks
+            .read()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .contains(task_id))
+    }
+
+    /// Remove a task id from the cancelled set after the runner has handled it.
+    pub fn clear_cancelled_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<()> {
+        self.cancelled_tasks
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .remove(task_id);
+        Ok(())
     }
 
     /// Snapshot all received assignments.
@@ -268,6 +296,15 @@ impl ExecutorTaskOutput {
         }
     }
 
+    fn cancelled() -> Self {
+        Self {
+            kind: ExecutorTaskOutputKind::Cancelled,
+            row_count: 0,
+            batch_count: 0,
+            column_count: 0,
+        }
+    }
+
     /// Output kind.
     pub fn kind(&self) -> ExecutorTaskOutputKind {
         self.kind
@@ -306,6 +343,8 @@ pub enum ExecutorTaskOutputKind {
     Sql,
     /// Placeholder path for non-SQL fragments while R3.1 is still bootstrapping.
     Placeholder,
+    /// Task was cancelled before execution started.
+    Cancelled,
 }
 
 impl ExecutorTaskOutputKind {
@@ -313,6 +352,7 @@ impl ExecutorTaskOutputKind {
         match self {
             Self::Sql => "sql",
             Self::Placeholder => "placeholder",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -374,6 +414,31 @@ impl ExecutorTaskRunner {
             )
             .await?;
         ensure_status_accepted_or_duplicate(running.disposition(), TaskState::Running)?;
+
+        // If a CancelTask RPC arrived while this task was queued, finish here
+        // instead of starting execution.
+        if self
+            .inbox
+            .is_task_cancelled(assignment.task_id())
+            .map_err(|error| tonic::Status::internal(error.to_string()))?
+        {
+            let _ = self.inbox.clear_cancelled_task(assignment.task_id());
+            let cancelled = self
+                .send_task_status(
+                    &assignment,
+                    TaskState::Cancelled,
+                    "task cancelled by coordinator request",
+                    coordinator,
+                    None,
+                )
+                .await?;
+            return Ok(ExecutorTaskRunReport::new(
+                assignment,
+                ExecutorTaskOutput::cancelled(),
+                running.disposition(),
+                cancelled.disposition(),
+            ));
+        }
 
         let execute_result = if let Some(timeout_secs) = assignment.task_timeout_secs() {
             match tokio::time::timeout(
@@ -1218,6 +1283,84 @@ mod tests {
 
         assert_eq!(registration.disposition(), TransportDisposition::Accepted);
         assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
+    }
+
+    #[tokio::test]
+    async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-dereg-exec").unwrap(),
+        ));
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping gRPC deregister test because loopback sockets are denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind test gRPC listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server_shared = shared.clone();
+        let server = tokio::spawn(async move {
+            serve_coordinator_executor_grpc_with_listener(listener, server_shared)
+                .await
+                .unwrap();
+        });
+
+        let runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-dereg-test", "pod-dereg", 1, format!("http://{addr}"))
+                .unwrap(),
+        );
+
+        runtime.register_with_grpc_endpoint().await.unwrap();
+        let dereg = runtime.deregister_with_grpc_endpoint().await.unwrap();
+        assert_eq!(dereg.disposition(), TransportDisposition::Accepted);
+
+        {
+            let coordinator = shared.read().unwrap();
+            let snapshot = coordinator
+                .executor_snapshots()
+                .into_iter()
+                .find(|s| s.executor_id().as_str() == "exec-dereg-test")
+                .expect("executor should still be in registry after deregister");
+            assert_eq!(snapshot.state(), ExecutorState::Removed);
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn task_runner_reports_cancelled_when_inbox_cancel_received() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-cancel").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-cancel-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        );
+
+        inbox.cancel_task(assignment.task_id()).unwrap();
+        assert!(inbox.is_task_cancelled(assignment.task_id()).unwrap());
+
+        let service = AcceptingCoordinatorService;
+        let report = runner
+            .run_assignment_with(assignment, &service)
+            .await
+            .unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Cancelled);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
     }
 
     #[tokio::test]

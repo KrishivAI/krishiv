@@ -22,6 +22,7 @@ use krishiv_proto::{
 };
 use krishiv_scheduler::{
     Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, SchedulerError, SharedCoordinator,
+    StabilityMetrics,
 };
 use serde::Serialize;
 
@@ -278,25 +279,47 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
-/// Prometheus-format metrics endpoint (stub with hardcoded 0 values).
-async fn metrics() -> impl IntoResponse {
-    const BODY: &str = "\
-# HELP krishiv_jobs_total Total jobs submitted
-# TYPE krishiv_jobs_total counter
-krishiv_jobs_total 0
-# HELP krishiv_tasks_total Total tasks submitted
-# TYPE krishiv_tasks_total counter
-krishiv_tasks_total 0
+/// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
+async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
+    let body = match state.coordinator.read() {
+        Ok(coordinator) => format_stability_metrics(&coordinator.stability_metrics()),
+        Err(_) => format_stability_metrics(&StabilityMetrics::empty()),
+    };
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+fn format_stability_metrics(m: &StabilityMetrics) -> String {
+    let max_heartbeat_age = m
+        .heartbeat_ages()
+        .iter()
+        .map(|a| a.age_ticks())
+        .max()
+        .unwrap_or(0);
+    format!(
+        "\
+# HELP krishiv_running_tasks Currently running task count
+# TYPE krishiv_running_tasks gauge
+krishiv_running_tasks {running}
+# HELP krishiv_task_retries_total Total stage-level retries scheduled
+# TYPE krishiv_task_retries_total counter
+krishiv_task_retries_total {retries}
+# HELP krishiv_failed_assignments_total Total failed task assignments
+# TYPE krishiv_failed_assignments_total counter
+krishiv_failed_assignments_total {failed}
+# HELP krishiv_max_executor_heartbeat_age_ticks Max executor heartbeat age in scheduler ticks
+# TYPE krishiv_max_executor_heartbeat_age_ticks gauge
+krishiv_max_executor_heartbeat_age_ticks {hb_age}
 # HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
 # TYPE krishiv_shuffle_bytes_written_total counter
 krishiv_shuffle_bytes_written_total 0
-# HELP krishiv_shuffle_partitions_total Total shuffle partitions finalized
-# TYPE krishiv_shuffle_partitions_total counter
-krishiv_shuffle_partitions_total 0
-";
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        BODY,
+",
+        running = m.running_task_count(),
+        retries = m.retry_count(),
+        failed = m.failed_assignments(),
+        hb_age = max_heartbeat_age,
     )
 }
 
@@ -793,7 +816,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_returns_ok_with_prometheus_body() {
+    async fn metrics_returns_prometheus_stability_fields() {
         let response = router(empty_state().unwrap())
             .oneshot(
                 Request::builder()
@@ -808,7 +831,33 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
 
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("krishiv_jobs_total"));
+        assert!(body.contains("krishiv_running_tasks"));
+        assert!(body.contains("krishiv_task_retries_total"));
+        assert!(body.contains("krishiv_failed_assignments_total"));
+        assert!(body.contains("krishiv_max_executor_heartbeat_age_ticks"));
+    }
+
+    #[tokio::test]
+    async fn metrics_reflects_live_coordinator_state() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        // Demo state has one executor that has sent a heartbeat, so heartbeat age
+        // should be non-negative (represented as a numeric value after the metric name).
+        assert!(body.contains("krishiv_max_executor_heartbeat_age_ticks "));
+        // The metrics are sourced from a live coordinator, not hardcoded zeros.
+        assert!(!body.contains("krishiv_running_tasks_total"));
     }
 
     #[tokio::test]

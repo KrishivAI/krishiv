@@ -15,5 +15,9 @@ tonic.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "krishiv-coordinator"
+path = "src/bin/krishiv_coordinator.rs"
+
 [lints]
 workspace = true

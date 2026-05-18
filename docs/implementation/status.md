@@ -163,6 +163,11 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 - Added `last_failure_reason` to `TaskRecord` and `TaskSnapshot`; propagated to `TaskView` in status API.
 - Added `lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` to `ExecutorView` in status API.
 - Added `k8s/manifests/network-policy.yaml` restricting coordinator gRPC (port 9090) to `krishiv-system` namespace; added to kustomization; validated by `network_policy_restricts_coordinator_grpc_to_krishiv_namespace` test.
+- Wired `ExecutorRuntime::deregister_with_grpc_endpoint` to call the real `DeregisterExecutor` gRPC RPC; SIGTERM handler in `heartbeat_loop` calls this path; added `deregister_via_grpc_endpoint_transitions_executor_to_removed` test.
+- Added `CancelTask` running-task handler: `cancel_task` now marks tasks in a `cancelled_tasks` set; runner checks after `Running` status and sends `TaskCancelled` instead of executing; added `task_runner_reports_cancelled_when_inbox_cancel_received` test.
+- Wired live `StabilityMetrics` to `/metrics` endpoint in `krishiv-ui`; replaces hardcoded zeros with running task count, retry count, failed assignments, and max heartbeat age in Prometheus text format.
+- Added `StabilityMetrics::empty()` constructor for lock-unavailable fallback.
+- Added standalone `krishiv-coordinator` binary to `krishiv-scheduler` (`--coordinator-id`, `--grpc-addr`, `--help`); starts gRPC server for bare-metal / VM deployments without Kubernetes; 5 CLI tests pass.
 
 ## In Progress
 
@@ -170,11 +175,10 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 
 ## Next Steps
 
-1. Verify remaining R3.1 acceptance gate items that are still open (task lease token model, executor pod launch failure detection, `--coordinator` bare-metal flag, retry count in status API, `CancelTask` handler on executor, metrics emission).
-2. If the acceptance gate is satisfactory at current coverage, open R3.2 connector certification work (connector traits, Parquet, Kafka, S3, catalog crate).
-3. Task lease token model (deferred to R4 when shuffle exists).
-4. Executor pod launch failure detection (deferred R3.1 item).
-5. R3.2 (connectors) cannot start until R3.1 acceptance gate passes.
+1. Verify R3.1 acceptance gate — all primary items are now done. Remaining deferred items: task lease token model (R4), executor pod launch failure detection (R3.1 stretch), retry count in status API (minor).
+2. Open R3.2 connector certification work: connector traits (`Source`, `Sink`, `Offset`, `CommitHandle`), `krishiv-catalog` crate, Parquet reader/writer, Kafka source/sink, S3 object store reads/writes.
+3. Task lease token model: deferred to R4 when shuffle write path exists.
+4. Executor pod launch failure detection: deferred R3.1 stretch item.
 
 ## Known Blockers
 
@@ -289,6 +293,9 @@ After those items R3.1 acceptance gate passes and R3.2 connector certification c
 - `cargo fmt --all --check` passed after R3.1 remaining slices.
 - `cargo fmt --all` applied; `cargo check --workspace` passed after R3.1 deregister/cancel/timeout/NetworkPolicy/UI-status slices.
 - `cargo test --workspace` passed — 0 failures across all crates (all test result lines `ok`).
+- `cargo run -p krishiv-scheduler --bin krishiv-coordinator -- --help` passed and listed `--coordinator-id` and `--grpc-addr`.
+- `cargo fmt --all` applied; `cargo check --workspace` passed after A–D slices.
+- `cargo test --workspace` passed — 0 failures (executor: 10 tests; ui: 8 tests; scheduler: 42 tests).
 
 ## Resume Instructions
 
@@ -297,7 +304,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. Review the R3.1 acceptance gate — most items are now done. Either verify the gate passes or implement the next open item (task lease token model is deferred to R4; next tractable items are retry count in status API or `CancelTask` handler on executor).
+4. R3.1 is substantially complete. Start R3.2 by adding `crates/krishiv-connectors` with `Source`, `Sink`, `Offset`, `CommitHandle` trait stubs and `ConnectorCapabilities`.
 
 For a new Claude Code session:
 

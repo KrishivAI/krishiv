@@ -1991,6 +1991,16 @@ pub struct StabilityMetrics {
 }
 
 impl StabilityMetrics {
+    /// Zero-valued metrics for use when the coordinator lock is unavailable.
+    pub fn empty() -> Self {
+        Self {
+            heartbeat_ages: Vec::new(),
+            retry_count: 0,
+            running_task_count: 0,
+            failed_assignments: 0,
+        }
+    }
+
     /// Heartbeat age per executor.
     pub fn heartbeat_ages(&self) -> &[ExecutorHeartbeatAge] {
         &self.heartbeat_ages
