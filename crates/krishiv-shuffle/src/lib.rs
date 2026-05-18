@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Int32Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{Int32Array, Int64Array, StringArray, StringViewArray, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -392,6 +392,16 @@ impl HashPartitioner {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("data type is Utf8");
+                for row in 0..num_rows {
+                    let bucket = hash_str(arr.value(row), self.buckets);
+                    bucket_indices[bucket as usize].push(row as u32);
+                }
+            }
+            DataType::Utf8View => {
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .expect("data type is Utf8View");
                 for row in 0..num_rows {
                     let bucket = hash_str(arr.value(row), self.buckets);
                     bucket_indices[bucket as usize].push(row as u32);
@@ -797,10 +807,7 @@ pub struct ObjectStoreShuffleStore {
 
 impl ObjectStoreShuffleStore {
     /// Create a new store backed by `store` rooted at `prefix`.
-    pub fn new(
-        store: Arc<dyn object_store::ObjectStore>,
-        prefix: impl Into<String>,
-    ) -> Self {
+    pub fn new(store: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
         let prefix_str = prefix.into();
         let prefix = if prefix_str.is_empty() {
             object_store::path::Path::default()
@@ -848,17 +855,25 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             use arrow::ipc::writer::StreamWriter;
 
             let mut buf = Vec::new();
-            let mut writer = StreamWriter::try_new(&mut buf, &partition.schema)
-                .map_err(|e| StoreError::Io { message: e.to_string() })?;
+            let mut writer =
+                StreamWriter::try_new(&mut buf, &partition.schema).map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
             for batch in &partition.batches {
-                writer.write(batch).map_err(|e| StoreError::Io { message: e.to_string() })?;
+                writer.write(batch).map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
             }
-            writer.finish().map_err(|e| StoreError::Io { message: e.to_string() })?;
+            writer.finish().map_err(|e| StoreError::Io {
+                message: e.to_string(),
+            })?;
 
             store
                 .put(&path, bytes::Bytes::from(buf).into())
                 .await
-                .map_err(|e| StoreError::Io { message: e.to_string() })?;
+                .map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
             Ok(())
         }
     }
@@ -876,32 +891,39 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             let result = store.get(&path).await;
             match result {
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                Err(e) => return Err(StoreError::Io { message: e.to_string() }),
+                Err(e) => {
+                    return Err(StoreError::Io {
+                        message: e.to_string(),
+                    });
+                }
                 Ok(obj) => {
-                    let data = obj
-                        .bytes()
-                        .await
-                        .map_err(|e| StoreError::Io { message: e.to_string() })?;
+                    let data = obj.bytes().await.map_err(|e| StoreError::Io {
+                        message: e.to_string(),
+                    })?;
                     let cursor = std::io::Cursor::new(data.as_ref());
-                    let mut reader = StreamReader::try_new(cursor, None)
-                        .map_err(|e| StoreError::Io { message: e.to_string() })?;
+                    let mut reader =
+                        StreamReader::try_new(cursor, None).map_err(|e| StoreError::Io {
+                            message: e.to_string(),
+                        })?;
                     let schema = reader.schema();
                     let mut batches = Vec::new();
                     for batch_result in &mut reader {
-                        let batch =
-                            batch_result.map_err(|e| StoreError::Io { message: e.to_string() })?;
+                        let batch = batch_result.map_err(|e| StoreError::Io {
+                            message: e.to_string(),
+                        })?;
                         batches.push(batch);
                     }
-                    Ok(Some(ShufflePartition { id, schema, batches }))
+                    Ok(Some(ShufflePartition {
+                        id,
+                        schema,
+                        batches,
+                    }))
                 }
             }
         }
     }
 
-    fn delete_job_partitions(
-        &self,
-        job_id: &str,
-    ) -> impl Future<Output = StoreResult<()>> + Send {
+    fn delete_job_partitions(&self, job_id: &str) -> impl Future<Output = StoreResult<()>> + Send {
         use futures::TryStreamExt;
 
         let store = Arc::clone(&self.store);
@@ -1555,7 +1577,11 @@ mod tests {
     use crate::ObjectStoreShuffleStore;
     use object_store::memory::InMemory;
 
-    fn make_object_store_partition(job_id: &str, stage_id: &str, partition: u32) -> ShufflePartition {
+    fn make_object_store_partition(
+        job_id: &str,
+        stage_id: &str,
+        partition: u32,
+    ) -> ShufflePartition {
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int32, false),
         ]));
@@ -1593,7 +1619,11 @@ mod tests {
     async fn object_store_shuffle_read_missing_returns_none() {
         let inner = Arc::new(InMemory::new());
         let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
-        let id = PartitionId { job_id: "missing".into(), stage_id: "s0".into(), partition: 0 };
+        let id = PartitionId {
+            job_id: "missing".into(),
+            stage_id: "s0".into(),
+            partition: 0,
+        };
         let result = store.read_partition(&id).await.unwrap();
         assert!(result.is_none());
     }
@@ -1603,13 +1633,27 @@ mod tests {
         let inner = Arc::new(InMemory::new());
         let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
 
-        store.write_partition(make_object_store_partition("job-del-os", "s0", 0), 0).await.unwrap();
-        store.write_partition(make_object_store_partition("job-del-os", "s0", 1), 0).await.unwrap();
+        store
+            .write_partition(make_object_store_partition("job-del-os", "s0", 0), 0)
+            .await
+            .unwrap();
+        store
+            .write_partition(make_object_store_partition("job-del-os", "s0", 1), 0)
+            .await
+            .unwrap();
 
         store.delete_job_partitions("job-del-os").await.unwrap();
 
-        let id0 = PartitionId { job_id: "job-del-os".into(), stage_id: "s0".into(), partition: 0 };
-        let id1 = PartitionId { job_id: "job-del-os".into(), stage_id: "s0".into(), partition: 1 };
+        let id0 = PartitionId {
+            job_id: "job-del-os".into(),
+            stage_id: "s0".into(),
+            partition: 0,
+        };
+        let id1 = PartitionId {
+            job_id: "job-del-os".into(),
+            stage_id: "s0".into(),
+            partition: 1,
+        };
         assert!(store.read_partition(&id0).await.unwrap().is_none());
         assert!(store.read_partition(&id1).await.unwrap().is_none());
     }
@@ -1678,7 +1722,11 @@ pub mod flight {
             return;
         };
 
-        let id = PartitionId { job_id, stage_id, partition: partition_id };
+        let id = PartitionId {
+            job_id,
+            stage_id,
+            partition: partition_id,
+        };
         let result = store.read_partition(&id).await;
 
         match result {
@@ -1831,8 +1879,9 @@ pub mod flight {
             let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
 
             let endpoint = local_addr.to_string();
-            let result =
-                FlightShuffleClient::fetch(&endpoint, "job-flight-1", "s0", 0).await.unwrap();
+            let result = FlightShuffleClient::fetch(&endpoint, "job-flight-1", "s0", 0)
+                .await
+                .unwrap();
 
             server_handle.abort();
             assert_eq!(result.len(), 1);
