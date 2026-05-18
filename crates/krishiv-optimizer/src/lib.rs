@@ -275,6 +275,69 @@ impl AqeRule for CoalesceRule {
     }
 }
 
+// ── SmallFilePlanner ──────────────────────────────────────────────────────────
+
+/// Per-file metadata used by [`SmallFilePlanner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStats {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+/// Advice produced by [`SmallFilePlanner`]: a list of scan groups where each
+/// group of file paths should be handled by a single executor task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlanAdvice {
+    /// Each inner `Vec` is one task's worth of files.
+    pub task_groups: Vec<Vec<String>>,
+}
+
+/// Plans scan parallelism for a set of files.
+///
+/// When individual files are smaller than `target_bytes`, multiple files are
+/// grouped into a single task so each task processes roughly `target_bytes` of
+/// data. Files larger than `target_bytes` each get their own task (splitting
+/// within a file is not yet supported).
+pub struct SmallFilePlanner {
+    target_bytes: u64,
+}
+
+impl SmallFilePlanner {
+    /// Create a planner with the given target bytes per task.
+    pub fn new(target_bytes: u64) -> Self {
+        Self { target_bytes }
+    }
+
+    /// Produce a scan plan for the given file list.
+    ///
+    /// Files are grouped greedily: accumulate until the next file would push the
+    /// group over `target_bytes`, then start a new group. This ensures each
+    /// group is at most `target_bytes + max_single_file_bytes`.
+    pub fn plan(&self, files: &[FileStats]) -> SplitPlanAdvice {
+        if files.is_empty() {
+            return SplitPlanAdvice { task_groups: Vec::new() };
+        }
+
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        let mut current_bytes: u64 = 0;
+
+        for file in files {
+            if !current.is_empty() && current_bytes + file.size_bytes > self.target_bytes {
+                groups.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current.push(file.path.clone());
+            current_bytes += file.size_bytes;
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        SplitPlanAdvice { task_groups: groups }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -523,5 +586,74 @@ mod tests {
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&[]);
         assert_eq!(advice.groups, Vec::<Vec<usize>>::new());
+    }
+
+    // ── SmallFilePlanner ──────────────────────────────────────────────────
+
+    use super::{FileStats, SmallFilePlanner};
+
+    fn make_file(path: &str, size_bytes: u64) -> FileStats {
+        FileStats { path: path.to_owned(), size_bytes }
+    }
+
+    #[test]
+    fn small_file_planner_groups_small_files() {
+        let files = vec![
+            make_file("a.parquet", 100),
+            make_file("b.parquet", 100),
+            make_file("c.parquet", 100),
+        ];
+        let planner = SmallFilePlanner::new(250);
+        let advice = planner.plan(&files);
+        assert_eq!(
+            advice.task_groups,
+            vec![
+                vec!["a.parquet".to_owned(), "b.parquet".to_owned()],
+                vec!["c.parquet".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn small_file_planner_each_large_file_own_task() {
+        let files = vec![
+            make_file("big1.parquet", 1000),
+            make_file("big2.parquet", 2000),
+        ];
+        let planner = SmallFilePlanner::new(500);
+        let advice = planner.plan(&files);
+        assert_eq!(
+            advice.task_groups,
+            vec![
+                vec!["big1.parquet".to_owned()],
+                vec!["big2.parquet".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn small_file_planner_empty_input() {
+        let planner = SmallFilePlanner::new(1000);
+        let advice = planner.plan(&[]);
+        assert_eq!(advice.task_groups, Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn small_file_planner_all_fit_in_one_task() {
+        let files = vec![
+            make_file("x.parquet", 50),
+            make_file("y.parquet", 50),
+            make_file("z.parquet", 50),
+        ];
+        let planner = SmallFilePlanner::new(1000);
+        let advice = planner.plan(&files);
+        assert_eq!(
+            advice.task_groups,
+            vec![vec![
+                "x.parquet".to_owned(),
+                "y.parquet".to_owned(),
+                "z.parquet".to_owned()
+            ]]
+        );
     }
 }

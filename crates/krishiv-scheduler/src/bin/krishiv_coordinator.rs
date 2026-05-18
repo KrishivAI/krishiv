@@ -20,9 +20,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use krishiv_proto::CoordinatorId;
+use axum::Router;
+use axum::extract::State;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use krishiv_proto::{CoordinatorId, CoordinatorState};
 use krishiv_scheduler::{
-    Coordinator, SharedCoordinator, serve_coordinator_executor_grpc_with_listener,
+    Coordinator, SharedCoordinator, StabilityMetrics,
+    serve_coordinator_executor_grpc_with_listener,
 };
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
@@ -65,6 +71,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
+    // Start optional HTTP health/metrics server.
+    if let Some(http_addr) = config.http_addr {
+        let http_coordinator = coordinator.clone();
+        let http_listener = TcpListener::bind(http_addr).await?;
+        println!(
+            "Krishiv coordinator {} HTTP listening on {}",
+            config.coordinator_id,
+            http_listener.local_addr()?
+        );
+        tokio::spawn(async move {
+            let router = coordinator_http_router(http_coordinator);
+            let _ = axum::serve(http_listener, router).await;
+        });
+    }
+
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
         "Krishiv coordinator {} gRPC listening on {}",
@@ -76,10 +97,77 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .with_state(coordinator)
+}
+
+async fn readyz(
+    State(coordinator): State<SharedCoordinator>,
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
+    match coordinator.read() {
+        Ok(c) if c.state() == CoordinatorState::Active => Ok("ready\n"),
+        Ok(_) => Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "coordinator is not active\n".to_owned(),
+        )),
+        Err(_) => Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "coordinator lock poisoned\n".to_owned(),
+        )),
+    }
+}
+
+async fn metrics(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
+    let m = coordinator
+        .read()
+        .map(|c| c.stability_metrics())
+        .unwrap_or_else(|_| StabilityMetrics::empty());
+    let max_hb_age = m
+        .heartbeat_ages()
+        .iter()
+        .map(|a| a.age_ticks())
+        .max()
+        .unwrap_or(0);
+    let body = format!(
+        "\
+# HELP krishiv_running_tasks Currently running task count
+# TYPE krishiv_running_tasks gauge
+krishiv_running_tasks {running}
+# HELP krishiv_task_retries_total Total stage-level retries scheduled
+# TYPE krishiv_task_retries_total counter
+krishiv_task_retries_total {retries}
+# HELP krishiv_failed_assignments_total Total failed task assignments
+# TYPE krishiv_failed_assignments_total counter
+krishiv_failed_assignments_total {failed}
+# HELP krishiv_max_executor_heartbeat_age_ticks Max executor heartbeat age in scheduler ticks
+# TYPE krishiv_max_executor_heartbeat_age_ticks gauge
+krishiv_max_executor_heartbeat_age_ticks {hb_age}
+# HELP krishiv_shuffle_partitions_available Shuffle partitions available across active jobs
+# TYPE krishiv_shuffle_partitions_available gauge
+krishiv_shuffle_partitions_available {shuffle_partitions}
+# HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
+# TYPE krishiv_shuffle_bytes_written_total counter
+krishiv_shuffle_bytes_written_total {shuffle_bytes}
+",
+        running = m.running_task_count(),
+        retries = m.retry_count(),
+        failed = m.failed_assignments(),
+        hb_age = max_hb_age,
+        shuffle_partitions = m.shuffle_partitions_available,
+        shuffle_bytes = m.shuffle_bytes_written,
+    );
+    ([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], body)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CoordinatorCliConfig {
     coordinator_id: String,
     grpc_addr: SocketAddr,
+    http_addr: Option<SocketAddr>,
     shuffle_dir: Option<PathBuf>,
     help: bool,
 }
@@ -93,6 +181,9 @@ impl CoordinatorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| "0.0.0.0:9090".parse().unwrap()),
+            http_addr: env::var("KRISHIV_HTTP_ADDR")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
             help: false,
         };
@@ -112,6 +203,14 @@ impl CoordinatorCliConfig {
                 "--shuffle-dir" => {
                     let value = next_arg(&mut args, "--shuffle-dir")?;
                     config.shuffle_dir = Some(PathBuf::from(value));
+                }
+                "--http-addr" => {
+                    let value = next_arg(&mut args, "--http-addr")?;
+                    config.http_addr = Some(
+                        value
+                            .parse()
+                            .map_err(|_| format!("invalid socket address for --http-addr: {value}"))?,
+                    );
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => {
@@ -136,6 +235,7 @@ impl CoordinatorCliConfig {
          Options:\n\
            --coordinator-id <ID>     Coordinator id, defaults to KRISHIV_COORDINATOR_ID or coord-local\n\
            --grpc-addr <HOST:PORT>   gRPC listen address, defaults to KRISHIV_GRPC_ADDR or 0.0.0.0:9090\n\
+           --http-addr <HOST:PORT>   HTTP listen address for /healthz /readyz /metrics (optional)\n\
            --shuffle-dir <PATH>      Local shuffle store dir, defaults to KRISHIV_SHUFFLE_DIR (optional)\n\
            -h, --help                Show help\n"
     }

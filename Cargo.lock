@@ -2335,6 +2335,7 @@ name = "krishiv-executor"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "axum 0.8.9",
  "krishiv-connectors",
  "krishiv-proto",
  "krishiv-scheduler",
@@ -2397,6 +2398,7 @@ dependencies = [
 name = "krishiv-scheduler"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
@@ -2416,6 +2418,7 @@ dependencies = [
  "arrow-flight",
  "bytes",
  "futures",
+ "object_store",
  "parquet",
  "tempfile",
  "tokio",
