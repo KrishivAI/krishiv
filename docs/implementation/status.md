@@ -186,14 +186,13 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None (R4 all tiers committed to branch `claude/analyze-r3-plan-r4-0QYyr`).
+- None (R4 TPC-H correctness gate committed to branch `claude/analyze-r3-plan-r4-0QYyr`).
 
 ## Next Steps
 
-1. R4 TPC-H SF10 correctness gate: write a multi-stage end-to-end test that runs a TPC-H Q1/Q3 style query through the full shuffle pipeline.
-2. R4 AQE coalesce: wire `CoalesceRule` results into coordinator stage scheduling to merge small shuffle output partitions.
-3. R5 prep: checkpoint-barrier/watermark protocol design review.
-4. Live external Kafka broker integration (opt-in, blocked on Kafka client selection).
+1. R4 AQE coalesce: wire `CoalesceRule` results into coordinator stage scheduling to merge small shuffle output partitions.
+2. R5 prep: checkpoint-barrier/watermark protocol design review.
+3. Live external Kafka broker integration (opt-in, blocked on Kafka client selection).
 
 ## Known Blockers
 
@@ -331,12 +330,29 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 - **R3 practical remaining slices (previous session)**: Hardened `ShuffleStore` with registered exact lease-token validation before commit, extended the zombie-executor proof so stale writes cannot win before fresh output commits, and made operator pod-launch failure handling mark associated executors lost/requeue running tasks.
 - **R1–R3 architecture remediation (this session)**: Added typed task input/output descriptors and wire round trips while keeping legacy string compatibility; migrated executor connector/object/Kafka tests to typed descriptors; added JSON metadata `schema_version`/`store_kind` envelope validation; reconciled R1/R2 roadmap checklist state; documented the R1–R3 architecture review and reconciled the already-approved streaming execution model in the roadmap.
 
-## Last Validation (R4 full implementation, branch `claude/analyze-r3-plan-r4-0QYyr`)
+## Last Validation (R4 TPC-H correctness gate, branch `claude/analyze-r3-plan-r4-0QYyr`)
 
+- `cargo fmt --all` applied; `cargo fmt --check` passed.
 - `cargo check --workspace` passed (clean, no warnings on non-dead-code items).
-- `cargo test --workspace` passed — 270 tests, 0 failures across all crates and doc tests.
-- Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3).
+- `cargo test --workspace` passed — 297 tests, 0 failures across all crates and doc tests.
+- Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3), `e328e89` (TPC-H correctness gate).
 - Branch pushed to remote: `origin/claude/analyze-r3-plan-r4-0QYyr`.
+
+### Bug fixes in TPC-H commit (`e328e89`)
+
+- **`execute_shuffle_write_fragment` overwrite bug**: The loop wrote each
+  partition once per source batch, so all but the last batch's rows were
+  silently discarded for each partition. Fixed by accumulating per-bucket
+  batches across all source batches and writing each partition exactly once.
+- **`read_shuffle_flight_partitions` duplicate table name**: Multiple shuffle
+  partitions for the same logical table caused a DataFusion `register_table`
+  error on the second registration. Fixed by merging batches by table name
+  before returning (multi-partition shuffle of the same table is now
+  transparent to the SQL layer).
+- **`HashPartitioner` Utf8View gap**: DataFusion 48 / Arrow 55 returns
+  `Utf8View` (not `Utf8`) for string columns read from Parquet. Added
+  `Utf8View` branch to `HashPartitioner` so the Q1 key column `l_returnflag`
+  partitions correctly.
 
 ## Resume Instructions
 
