@@ -2250,6 +2250,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-shuffle",
  "krishiv-sql",
+ "object_store",
  "parquet",
  "tempfile",
  "tokio",
@@ -2308,6 +2309,9 @@ version = "0.1.0"
 dependencies = [
  "krishiv-plan",
  "krishiv-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

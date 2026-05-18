@@ -163,6 +163,8 @@ impl ExecutorAssignmentInbox {
 
 const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
 const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
+const OBJECT_PARQUET_PARTITION_PREFIX: &str = "object-parquet:";
+const OBJECT_PARQUET_SINK_PREFIX: &str = "object-parquet-sink:";
 const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
 const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
 const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
@@ -548,6 +550,16 @@ impl ExecutorTaskRunner {
                         message: error.to_string(),
                     })?;
             }
+            for (table_name, batches) in
+                read_object_parquet_partitions(assignment.input_partitions()).await?
+            {
+                engine
+                    .register_record_batches(&table_name, batches)
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
+            }
 
             let dataframe =
                 engine
@@ -563,6 +575,16 @@ impl ExecutorTaskRunner {
                     .map_err(|error| ExecutorError::LocalExecution {
                         message: error.to_string(),
                     })?;
+            if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
+                && assignment
+                    .output_contract()
+                    .description()
+                    .trim()
+                    .starts_with(OBJECT_PARQUET_SINK_PREFIX)
+            {
+                write_object_parquet_sink(assignment.output_contract().description(), &batches)
+                    .await?;
+            }
             let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
             let column_count = batches.first().map_or(0, |batch| batch.num_columns());
             return Ok(ExecutorTaskOutput::sql(
@@ -690,6 +712,142 @@ async fn read_connector_parquet_partitions(
         result.push((table_name, batches));
     }
     Ok(result)
+}
+
+/// Read all batches from `object-parquet:<table>:<base_dir>:<object_path>` partitions.
+///
+/// This is the deterministic S3-compatible executor path for R3: tests use
+/// `object_store::local::LocalFileSystem`, while production object-store
+/// credentials and provider-specific URLs remain behind the connector boundary.
+async fn read_object_parquet_partitions(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    use std::sync::Arc;
+
+    use krishiv_connectors::{Source, s3::S3Source};
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjectPath;
+
+    let mut result = Vec::new();
+    for partition in partitions {
+        let desc = partition.description().trim();
+        let Some(payload) = desc.strip_prefix(OBJECT_PARQUET_PARTITION_PREFIX) else {
+            continue;
+        };
+        let (table_name, base_dir, object_path) = parse_object_parquet_descriptor(
+            partition.partition_id(),
+            payload,
+            "object-parquet:<table>:<base_dir>:<object_path>",
+        )?;
+        let store = Arc::new(
+            LocalFileSystem::new_with_prefix(&base_dir).map_err(|error| {
+                ExecutorError::LocalExecution {
+                    message: format!(
+                        "failed to open object store prefix '{}': {error}",
+                        base_dir.display()
+                    ),
+                }
+            })?,
+        );
+        let mut source = S3Source::open(store, ObjectPath::from(object_path.clone()))
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("object-parquet open failed for '{object_path}': {error}"),
+            })?;
+        let mut batches = Vec::new();
+        while let Some(batch) =
+            source
+                .read_batch()
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("object-parquet read failed: {error}"),
+                })?
+        {
+            batches.push(batch);
+        }
+        result.push((table_name, batches));
+    }
+    Ok(result)
+}
+
+async fn write_object_parquet_sink(
+    description: &str,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> ExecutorResult<()> {
+    use std::sync::Arc;
+
+    use krishiv_connectors::{Sink, s3::S3Sink};
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path as ObjectPath;
+
+    let payload = description
+        .trim()
+        .strip_prefix(OBJECT_PARQUET_SINK_PREFIX)
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: format!(
+                "object sink must use {OBJECT_PARQUET_SINK_PREFIX}<base_dir>:<object_path>"
+            ),
+        })?;
+    let (base_dir, object_path) =
+        payload
+            .split_once(':')
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "object sink must use {OBJECT_PARQUET_SINK_PREFIX}<base_dir>:<object_path>"
+                ),
+            })?;
+    let base_dir = base_dir.trim();
+    let object_path = object_path.trim();
+    if base_dir.is_empty() || object_path.is_empty() {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from("object sink base_dir and object_path cannot be empty"),
+        });
+    }
+
+    let store = Arc::new(LocalFileSystem::new_with_prefix(base_dir).map_err(|error| {
+        ExecutorError::LocalExecution {
+            message: format!("failed to open object store prefix '{base_dir}': {error}"),
+        }
+    })?);
+    let mut sink = S3Sink::new(store, ObjectPath::from(object_path));
+    for batch in batches {
+        sink.write_batch(batch.clone())
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("object-parquet sink write failed: {error}"),
+            })?;
+    }
+    sink.flush()
+        .await
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("object-parquet sink flush failed: {error}"),
+        })
+}
+
+fn parse_object_parquet_descriptor(
+    partition_id: &str,
+    payload: &str,
+    expected: &str,
+) -> ExecutorResult<(String, PathBuf, String)> {
+    let parts: Vec<&str> = payload.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!("input partition {partition_id} must use {expected}"),
+        });
+    }
+    let table_name = parts[0].trim();
+    let base_dir = parts[1].trim();
+    let object_path = parts[2].trim();
+    if table_name.is_empty() || base_dir.is_empty() || object_path.is_empty() {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!("input partition {partition_id} has an empty object-parquet field"),
+        });
+    }
+    Ok((
+        table_name.to_owned(),
+        PathBuf::from(base_dir),
+        object_path.to_owned(),
+    ))
 }
 
 async fn execute_kafka_to_parquet_pipeline(
@@ -2275,6 +2433,88 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_reads_object_parquet_source_and_writes_object_sink() {
+        use krishiv_connectors::Source;
+        use krishiv_connectors::parquet::ParquetSource;
+
+        let temp = tempdir().unwrap();
+        let object_root = temp.path().join("object-store");
+        std::fs::create_dir_all(&object_root).unwrap();
+        let input_path = object_root.join("input/people.parquet");
+        std::fs::create_dir_all(input_path.parent().unwrap()).unwrap();
+        write_people_parquet(&input_path);
+
+        let executor_id = ExecutorId::try_new("exec-object-1").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-object-1").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+        let inbox = ExecutorAssignmentInbox::new();
+        let job_id = JobId::try_new("job-object-1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-object",
+                    1,
+                ))
+                .unwrap();
+            coordinator
+                .submit_job(parquet_scan_job(job_id.clone()))
+                .unwrap();
+            let launched = coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+                .remove(0);
+
+            let assignment = ExecutorTaskAssignment::new(
+                TaskAttemptRef::new(
+                    launched.job_id().clone(),
+                    launched.stage_id().clone(),
+                    launched.task_id().clone(),
+                    launched.attempt_id(),
+                ),
+                launched.executor_id().clone(),
+                launched.lease_generation(),
+                PlanFragment::new("sql: select id, name from people where id > 1 order by id"),
+                OutputContract::new(
+                    OutputContractKind::Sink,
+                    format!(
+                        "object-parquet-sink:{}:output/filtered.parquet",
+                        object_root.display()
+                    ),
+                ),
+            )
+            .with_input_partitions(vec![InputPartition::new(
+                "people-object-part-1",
+                format!(
+                    "object-parquet:people:{}:input/people.parquet",
+                    object_root.display()
+                ),
+            )]);
+            inbox.push(assignment).unwrap();
+        }
+
+        let runner = ExecutorTaskRunner::new(inbox.clone());
+        let report = runner.run_next_with(&service).await.unwrap().unwrap();
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 2);
+        assert_eq!(report.output().column_count(), 2);
+
+        let output_path = object_root.join("output/filtered.parquet");
+        let mut source = ParquetSource::open(&output_path).unwrap();
+        let batch = source.read_batch().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert!(source.read_batch().await.unwrap().is_none());
+
+        let coordinator = shared.read().unwrap();
+        let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snapshot.state(), JobState::Succeeded);
     }
 
     #[tokio::test]

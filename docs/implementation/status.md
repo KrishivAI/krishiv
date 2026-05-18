@@ -2,14 +2,13 @@
 
 ## Current Phase
 
-R3.2 Connector Contracts closure complete / R4 Bootstrap.
+R3 hardening active / R4 Bootstrap.
 
 ## Active Task
 
-R3 closure slices completed in this session: Kafka post-write offset commit protocol, deterministic Kafka-compatible source/committer harness, Kafka → Parquet execution on the real executor runner, and task lease generation → shuffle stale-token rejection proof.
-Remaining non-blocking follow-up:
-1. Operator-side executor pod launch failure detection (deferred stretch item).
-2. Live external Kafka broker feature/integration test (post-R3 connector runtime hardening; current R3 path uses deterministic in-memory Kafka-compatible harness).
+R3 hardening slices in progress/complete: Kafka post-write offset commit protocol, deterministic Kafka-compatible source/committer harness, Kafka → Parquet execution on the real executor runner, task lease generation → shuffle stale-token rejection proof, object-store Parquet executor source/sink path, durable JSON-file metadata store, and operator executor pod launch failure detection.
+Remaining follow-up:
+1. Live external Kafka broker feature/integration test (requires selecting a Kafka client/runtime feature; current R3 path uses deterministic in-memory Kafka-compatible harness).
 
 ## Completed
 
@@ -171,9 +170,8 @@ Remaining non-blocking follow-up:
 
 ## Next Steps
 
-1. Continue R4 shuffle integration: wire shuffle writer/reader APIs into multi-stage executor execution and coordinator shuffle metadata.
-2. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
-3. Executor pod launch failure detection: deferred R3.1 stretch item.
+1. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
+2. Continue R4 shuffle integration: wire shuffle writer/reader APIs into multi-stage executor execution and coordinator shuffle metadata.
 
 ## Known Blockers
 
@@ -306,13 +304,14 @@ Remaining non-blocking follow-up:
 - **R4 Bootstrap Slice E**: `register_record_batches()` added to `SqlEngine` in `krishiv-sql`; `krishiv-connectors` dep added to `krishiv-executor`; `CONNECTOR_PARQUET_PARTITION_PREFIX` + `read_connector_parquet_partitions()` wired into `execute_stage_fragment()`; new test `executor_runs_parquet_task_via_connector_source` passes.
 - **R4 Bootstrap Slice F**: `ShuffleStore` trait, `InMemoryShuffleStore`, and `LocalDiskShuffleStore` added to `krishiv-shuffle` with lease-token zombie-executor rejection; `parquet` and `bytes` deps added to `krishiv-shuffle/Cargo.toml`; 8 new tokio async tests pass.
 
-- **R3 closure slices (this session)**: Added `PostWriteOffsetCommitProtocol` and `OffsetCommitter` to enforce write → flush → offset commit ordering; added deterministic in-memory Kafka-compatible source and commit log; added executor Kafka → Parquet pipeline support using `ParquetSink`; added real-runner tests for the pipeline and connector-Parquet path; added assignment lease-generation → shuffle stale-token rejection proof.
+- **R3 closure slices (previous session)**: Added `PostWriteOffsetCommitProtocol` and `OffsetCommitter` to enforce write → flush → offset commit ordering; added deterministic in-memory Kafka-compatible source and commit log; added executor Kafka → Parquet pipeline support using `ParquetSink`; added real-runner tests for the pipeline and connector-Parquet path; added assignment lease-generation → shuffle stale-token rejection proof.
+- **R3 hardening slices (this session)**: Added object-store Parquet source/sink execution descriptors on the real executor runner, `JsonFileMetadataStore` for durable local metadata/event-log recovery, and operator-side executor pod launch failure detection/status reporting.
 
 ## Last Validation (R3 closure slices, branch current)
 
 - `cargo fmt --all --check` passed.
 - `cargo check --workspace` passed.
-- `cargo test -p krishiv-connectors -p krishiv-executor` passed — 29 connector tests, 19 executor lib tests, 4 executor bin tests, and doc tests.
+- `cargo test -p krishiv-executor -p krishiv-scheduler -p krishiv-operator` passed — 20 executor lib tests, 4 executor bin tests, 21 operator lib tests, 5 operator bin tests, 2 operator kind-smoke tests, 43 scheduler lib tests, 5 coordinator bin tests, 10 scheduler manifest tests, and doc tests.
 - `cargo test --workspace` passed — 0 failures across all crates.
 
 ## Resume Instructions
@@ -322,7 +321,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r3-connector-contracts.md`.
-4. R3 closure slices are done. Continue with R4 shuffle writer/reader integration and live external Kafka hardening when the broker runtime is selected.
+4. R3 hardening slices are done except live external Kafka broker integration. Continue with Kafka runtime selection or R4 shuffle writer/reader integration.
 
 For a new Claude Code session:
 

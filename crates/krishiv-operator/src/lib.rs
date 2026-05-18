@@ -392,6 +392,8 @@ pub enum ReconcileAction {
     FinalizerAdded,
     /// Resource is being deleted; scheduler job was cancelled and finalizer was removed.
     FinalizerRemoved,
+    /// Executor pod launch failed before the scheduler could run the job.
+    ExecutorPodLaunchFailed,
 }
 
 /// Reconcile result including the status a live controller would patch.
@@ -410,6 +412,24 @@ impl ReconcileOutcome {
     /// Status to write to the `KrishivJob/status` subresource.
     pub fn status(&self) -> &KrishivJobStatus {
         &self.status
+    }
+}
+
+/// Classified executor pod launch failure detected by the operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorPodLaunchFailure {
+    /// Machine-readable reason, suitable for a status condition.
+    pub reason: String,
+    /// Human-readable message from pod status/container waiting state.
+    pub message: String,
+}
+
+impl ExecutorPodLaunchFailure {
+    fn new(reason: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            message: message.into(),
+        }
     }
 }
 
@@ -730,6 +750,16 @@ impl KrishivJobReconciler {
         coordinator: &mut Coordinator,
         resource: &KrishivJobResource,
     ) -> OperatorResult<ReconcileOutcome> {
+        self.reconcile_with_executor_pod_failure(coordinator, resource, None)
+    }
+
+    /// Reconcile one `KrishivJob` while considering observed executor pod launch failures.
+    pub fn reconcile_with_executor_pod_failure(
+        &self,
+        coordinator: &mut Coordinator,
+        resource: &KrishivJobResource,
+        pod_failure: Option<ExecutorPodLaunchFailure>,
+    ) -> OperatorResult<ReconcileOutcome> {
         // Finalizer lifecycle: add on first observe; remove on deletion after cleanup.
         if resource.metadata.is_being_deleted() {
             // Resource is being deleted — cancel the scheduler job if it exists and
@@ -743,6 +773,13 @@ impl KrishivJobReconciler {
             return Ok(ReconcileOutcome {
                 action: ReconcileAction::FinalizerRemoved,
                 status,
+            });
+        }
+
+        if let Some(failure) = pod_failure {
+            return Ok(ReconcileOutcome {
+                action: ReconcileAction::ExecutorPodLaunchFailed,
+                status: executor_pod_launch_failed_status(resource, &self.coordinator_id, failure),
             });
         }
 
@@ -937,6 +974,83 @@ fn accepted_waiting_for_executors(
     }
 }
 
+fn executor_pod_launch_failed_status(
+    resource: &KrishivJobResource,
+    coordinator_id: &CoordinatorId,
+    failure: ExecutorPodLaunchFailure,
+) -> KrishivJobStatus {
+    KrishivJobStatus {
+        phase: KrishivJobPhase::Failed,
+        coordinator: Some(coordinator_id.to_string()),
+        observed_generation: resource.metadata.generation,
+        stages: 0,
+        tasks: TaskStatusCounters::default(),
+        conditions: vec![JobCondition::new(
+            "ExecutorPodReady",
+            ConditionStatus::False,
+            failure.reason,
+            failure.message,
+        )],
+    }
+}
+
+/// Detect executor pod launch failures from a Kubernetes Pod-like JSON status object.
+///
+/// The live controller can feed this helper with pod objects selected for a
+/// `KrishivJob`. Tests use JSON fixtures so detection remains deterministic
+/// without a Kubernetes API server.
+pub fn detect_executor_pod_launch_failure(pod: &Value) -> Option<ExecutorPodLaunchFailure> {
+    let status = pod.get("status")?;
+    let phase = status.get("phase").and_then(Value::as_str);
+    let reason = status.get("reason").and_then(Value::as_str);
+    let message = status.get("message").and_then(Value::as_str);
+    if phase == Some("Failed") {
+        return Some(ExecutorPodLaunchFailure::new(
+            reason.unwrap_or("PodFailed"),
+            message.unwrap_or("executor pod failed before task launch"),
+        ));
+    }
+    if reason == Some("Unschedulable") {
+        return Some(ExecutorPodLaunchFailure::new(
+            "Unschedulable",
+            message.unwrap_or("executor pod is unschedulable"),
+        ));
+    }
+
+    for status in status
+        .get("containerStatuses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let waiting = status.get("state").and_then(|state| state.get("waiting"));
+        if let Some(waiting) = waiting {
+            let reason = waiting
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("ContainerWaiting");
+            if matches!(
+                reason,
+                "ImagePullBackOff"
+                    | "ErrImagePull"
+                    | "CrashLoopBackOff"
+                    | "CreateContainerConfigError"
+                    | "CreateContainerError"
+            ) {
+                return Some(ExecutorPodLaunchFailure::new(
+                    reason,
+                    waiting
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("executor container failed to launch"),
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use krishiv_proto::{
@@ -945,9 +1059,10 @@ mod tests {
     };
 
     use super::{
-        BootstrapExecutor, ConditionStatus, KrishivJobMode, KrishivJobPhase, KrishivJobReconciler,
-        KrishivJobResource, KrishivJobSpec, KubernetesControllerConfig,
-        KubernetesControllerRuntime, ObjectMeta, OperatorError, ReconcileAction, demo_coordinator,
+        BootstrapExecutor, ConditionStatus, ExecutorPodLaunchFailure, KrishivJobMode,
+        KrishivJobPhase, KrishivJobReconciler, KrishivJobResource, KrishivJobSpec,
+        KubernetesControllerConfig, KubernetesControllerRuntime, ObjectMeta, OperatorError,
+        ReconcileAction, demo_coordinator, detect_executor_pod_launch_failure,
         job_spec_from_resource, krishivjob_api_resource, resource_from_dynamic_object,
         status_patch,
     };
@@ -1326,5 +1441,57 @@ mod tests {
         assert_eq!(outcome3.action(), ReconcileAction::Observed);
         // Still exactly 1 scheduler job — no duplication.
         assert_eq!(coordinator.job_snapshots().len(), 1);
+    }
+
+    #[test]
+    fn detects_executor_image_pull_failure_from_pod_status() {
+        let pod = json!({
+            "status": {
+                "phase": "Pending",
+                "containerStatuses": [{
+                    "name": "executor",
+                    "state": {
+                        "waiting": {
+                            "reason": "ImagePullBackOff",
+                            "message": "failed to pull image"
+                        }
+                    }
+                }]
+            }
+        });
+
+        let failure = detect_executor_pod_launch_failure(&pod).unwrap();
+
+        assert_eq!(failure.reason, "ImagePullBackOff");
+        assert!(failure.message.contains("failed to pull"));
+    }
+
+    #[test]
+    fn reconcile_reports_executor_pod_launch_failure_status() {
+        let coordinator_id = CoordinatorId::try_new("coord-pod-fail").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let outcome = reconciler
+            .reconcile_with_executor_pod_failure(
+                &mut coordinator,
+                &sample_resource(),
+                Some(ExecutorPodLaunchFailure::new(
+                    "Unschedulable",
+                    "0/3 nodes are available",
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.action(), ReconcileAction::ExecutorPodLaunchFailed);
+        assert_eq!(outcome.status().phase, KrishivJobPhase::Failed);
+        assert_eq!(
+            outcome.status().conditions[0].condition_type,
+            "ExecutorPodReady"
+        );
+        assert_eq!(
+            outcome.status().conditions[0].reason.as_deref(),
+            Some("Unschedulable")
+        );
     }
 }

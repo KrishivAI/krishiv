@@ -252,6 +252,7 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [x] Connector trait unit tests pass (9 tests in `krishiv-connectors`).
 - [x] Parquet read/write certification tests pass (`parquet_sink_writes_and_source_reads_back`, `parquet_source_returns_none_when_exhausted`).
 - [x] S3 read/write certification tests pass (`s3_sink_writes_and_source_reads_back`, `s3_source_capabilities`, `s3_sink_capabilities`).
+- [x] S3-compatible object-store source/sink path runs on the real executor runner (`executor_reads_object_parquet_source_and_writes_object_sink`).
 - [x] Kafka source/sink certification tests pass for supported semantics (7 Kafka tests; unsupported stub behaviour verified).
 - [x] Offset serialization tests pass (`kafka_offset_encode_decode_roundtrip`).
 - [x] Connector config validation tests pass (`connector_config_required_returns_error_when_missing`, `connector_config_required_returns_value_when_present`).
@@ -263,17 +264,17 @@ Define connector semantics and certify the first source/sink integrations (Parqu
 - [x] Connector capability flags surfaced in `TaskSpec` proto + scheduler snapshot + UI view (`task_spec_with_connector_capabilities`, `connector_capability_flags_default_all_false`).
 - [x] Executor wires `connector-parquet:` prefix through `ParquetSource` (`executor_runs_parquet_task_via_connector_source`).
 - [x] Shuffle store trait + `InMemoryShuffleStore` + `LocalDiskShuffleStore` with lease-token validation (8 new tests in `krishiv-shuffle`).
-- [x] End-to-end test: Kafka → Parquet pipeline runs on the real executor runner with the deterministic in-memory Kafka-compatible harness (`executor_runs_kafka_to_parquet_pipeline_on_real_runner`).
+- [x] End-to-end test: Kafka → Parquet pipeline runs on the real executor runner with the deterministic in-memory Kafka-compatible harness (`executor_runs_kafka_to_parquet_pipeline_on_real_runner`); live broker test deferred until Kafka runtime feature selection.
 
 ### Acceptance Gate For R3.2
 
-- [x] Parquet and Kafka-compatible connector paths pass certification-style tests on the real executor runner; S3 connector certification remains covered by the object-store contract tests until object-store executor descriptors land in R4.
+- [x] Parquet, Kafka-compatible, and S3-compatible object-store connector paths pass certification-style tests on the real executor runner (`executor_runs_parquet_task_via_connector_source`, `executor_runs_kafka_to_parquet_pipeline_on_real_runner`, `executor_reads_object_parquet_source_and_writes_object_sink`).
 - [x] Every connector declares capability flags.
 - [x] Source offsets are tracked and exposed via `current_offset()` on `ParquetSource`.
 - [x] Kafka consumer group offset commit protocol is documented and tested: offset commits after output write, not before.
 - [x] At-least-once sink behavior is documented (`AtLeastOnceSinkContract` doc struct + CDC RFC).
 - [x] CDC design is written at `docs/rfcs/cdc-design.md`.
-- [x] Kafka → Parquet pipeline runs end-to-end on the real executor runner using the deterministic in-memory Kafka-compatible source and `ParquetSink`.
+- [x] Kafka → Parquet pipeline runs end-to-end on the real executor runner using the deterministic in-memory Kafka-compatible source and `ParquetSink`; live broker certification is tracked as post-R3 runtime hardening.
 
 ---
 
