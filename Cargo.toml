@@ -18,6 +18,8 @@ members = [
     "crates/krishiv-state",
     "crates/krishiv-udf",
     "crates/krishiv-ui",
+    "crates/krishiv-python",
+    "crates/krishiv-lakehouse",
 ]
 resolver = "3"
 

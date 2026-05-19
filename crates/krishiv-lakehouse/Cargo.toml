@@ -1,0 +1,22 @@
+[package]
+name = "krishiv-lakehouse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+iceberg = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
