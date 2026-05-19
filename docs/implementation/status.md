@@ -276,11 +276,11 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None. R5.1 acceptance gate fully closed. Ready for R5.2.
+- None. R5 complete and code quality sweep done. Ready for R6.
 
 ## Next Steps
 
-1. **R5.2**: Begin with RocksDB `StateBackend` impl (behind `spawn_blocking` isolation boundary), then sliding/session windows, multi-source watermarks, and state TTL. Gate: R5.1 all acceptance criteria now met.
+1. **R6**: Checkpoints and Savepoints — durable checkpoint coordination, exactly-once Kafka sink, versioned checkpoint metadata, savepoint write/restore.
 2. **Live Kafka E2E** (optional R6 hardening): wire `rdkafka` behind `kafka-runtime` Cargo feature + Redpanda Docker Compose once R6 connector certification begins.
 
 ## Known Blockers
@@ -440,6 +440,13 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 - **`StreamingAqeGuard` and `AqeOptimizer`**: Added to `krishiv-optimizer`; `AqeOptimizer::guarded_rules` are skipped for streaming plans; 3 new optimizer tests pass.
 - **`StreamingTaskState` proto type**: Added to `krishiv-proto` with `task_id`, `watermark_ms`, `source_offset`; attached to `ExecutorHeartbeat` via `streaming_task_states` field.
 - **Architecture docs**: `docs/architecture/checkpoint-protocol.md` and `docs/architecture/keyed-distribution-stability.md` written and committed.
+
+## Last Validation (R5 complete + code quality sweep, branch `claude/plan-r5-implementation-NXiWo`)
+
+- `cargo clippy --workspace -- -D warnings`: 0 errors.
+- `cargo test --workspace`: 0 failures across all crates.
+- Fixes applied: `SlidingWindowOperator::build_output_batch` now delegates to shared `build_window_record_batch` helper (same as `TumblingWindowOperator`); executor parquet-read loop converted from `loop/match` to `while let`; scheduler `or_insert_with(ShuffleMetadata::new)` → `or_default()`; shuffle crate: type aliases for complex types, `async fn` conversion, `while let` loop, IPC serialization bug, 256 MiB client read guard; executor: silent watermark downcast failure → propagated error; dead constant removed.
+- Commit: `f3c8eb7`.
 
 ## Last Validation (R5.1 complete, branch `claude/plan-r5-implementation-NXiWo`)
 
