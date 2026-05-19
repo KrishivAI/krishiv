@@ -183,7 +183,93 @@ What stays the same:
 
 ---
 
-## 6. Key Invariants
+## 6. R5.1 Streaming Re-Attach Protocol
+
+### 6.1 Problem
+
+When the coordinator process restarts while streaming tasks are running on executors, two outcomes are possible:
+
+1. **Stale re-submit (wrong):** The coordinator treats the job as lost and submits it again from scratch, causing duplicate processing and inconsistent output.
+2. **Re-attach (correct):** The coordinator recovers the job record from durable state and waits for running executors to re-register. No events are re-processed from before the last committed offset.
+
+R5.1 implements the re-attach path. Durable checkpoints (which enable crash recovery with guaranteed at-least-once from a known offset) are R6.
+
+### 6.2 Re-Attach Sequence
+
+```
+1. Coordinator restarts. recover_from_store() loads job records into memory.
+   - Grace period starts: streaming executors are not evicted for
+     streaming_reattach_grace_ticks heartbeat periods.
+
+2. Executor detects coordinator unavailability (gRPC call fails).
+   - Executor continues running the operator loop; does not stop.
+
+3. Executor re-registers with the coordinator.
+   - Registration uses the same executor ID and reports the same task IDs
+     that were running before the coordinator restart.
+
+4. Executor sends a first heartbeat carrying StreamingTaskState:
+   - task_id: the task that was running
+   - watermark_ms: current event-time watermark
+   - source_offset: last committed Kafka offset (connector-specific encoding)
+
+5. Coordinator applies the streaming task states to the in-memory task records:
+   - Updates task.last_watermark_ms and task.last_source_offset.
+   - Does NOT submit a new job; does NOT reset task state.
+
+6. Job remains in Running state. Coordinator resumes normal operation.
+```
+
+### 6.3 Streaming Task State In Heartbeats
+
+`ExecutorHeartbeatRequest.streaming_task_states` carries per-task state for the re-attach protocol. Executors populate this on their first heartbeat after a coordinator restart. Subsequent heartbeats may also carry it for live watermark tracking.
+
+The coordinator calls `Coordinator::executor_heartbeat` which:
+1. Updates the executor registry (lease validation, state, memory metrics).
+2. For each `StreamingTaskState` in the heartbeat, calls `apply_streaming_task_state` to update the matching `TaskRecord`.
+
+### 6.4 Re-Attach Limitations In R5.1
+
+- **No exactly-once guarantee.** On coordinator restart, the executor continues processing from wherever it is. Events between the last committed offset and the coordinator restart may be re-processed if the executor also restarts.
+- **No durable offset storage.** `last_source_offset` in `TaskRecord` is in-memory. If both coordinator and executor restart simultaneously, the source offset is lost and processing resumes from the beginning or last Kafka consumer group commit.
+- **No multi-coordinator failover.** R5.1 is single-coordinator. HA coordinator failover is R9.
+
+Exactly-once with durable checkpoints is R6.
+
+---
+
+## 7. Clock Skew And Late Event Policy
+
+### 7.1 Policy
+
+Krishiv trusts the `event_time` field in source records as-is. The system does not adjust event timestamps for producer clock skew.
+
+A late event is an event with `event_time_ms < current_watermark_ms` (the watermark established by the **previous** batch of events — not the watermark the current event itself would advance). Late events are dropped without error in R5.1.
+
+### 7.2 `prev_watermark_ms` Semantics
+
+In `TumblingWindowOperator`:
+
+- `prev_watermark_ms` tracks the watermark value **from the end of the previous `process_batch` call**.
+- When processing a new batch, events are considered late if `event_time_ms < prev_watermark_ms`.
+- This means events in the **current** batch are never considered late relative to the watermark they themselves advance — only relative to the watermark established by prior batches.
+- After accumulating all non-late events, `prev_watermark_ms` is updated to `new_watermark_ms`.
+
+This matches Apache Flink's behavior: a record advancing the watermark to T is not late relative to T.
+
+### 7.3 `allowed_lateness` As Clock Skew Tolerance
+
+The `WatermarkSpec::fixed_lag_ms` parameter is the primary mechanism for tolerating moderate producer clock skew:
+
+- Watermark = `max(event_time_seen) - lag_ms`
+- A `lag_ms` of 5000 means events arriving up to 5 seconds behind the maximum observed event time are still considered on-time.
+- Clock skew larger than `lag_ms` will cause late events to be dropped.
+
+Operators are responsible for choosing an appropriate `lag_ms` for their source's expected clock skew distribution.
+
+---
+
+## 8. Key Invariants
 
 | Invariant | Enforcement |
 |---|---|
@@ -195,7 +281,7 @@ What stays the same:
 
 ---
 
-## 7. Out Of Scope For This Document
+## 9. Out Of Scope For This Document
 
 | Topic | Reference |
 |---|---|

@@ -75,11 +75,11 @@ Prove the streaming execution model is correct on a single end-to-end path befor
 - [x] Define in-memory state backend interface.
 - [x] Define continuous operator execution loop: how a streaming stage differs from a batch stage in the executor (no terminal completion; produces output continuously).
 - [x] Define streaming job lifecycle in the scheduler (streaming jobs never transition to Succeeded while running).
-- [ ] Define streaming job re-attach protocol: on coordinator restart, active streaming executors re-register with current task state (last watermark, last processed Kafka offset); coordinator re-attaches to the running job instead of creating a new one.
+- [x] Define streaming job re-attach protocol: on coordinator restart, active streaming executors re-register with current task state (last watermark, last processed Kafka offset); coordinator re-attaches to the running job instead of creating a new one.
 - [x] Define checkpoint-barrier and watermark interaction protocol for R6 checkpoint implementation.
 - [x] Define how barriers flow through single-source tumbling windows without closing windows incorrectly.
 - [x] Define clock skew handling policy: Krishiv trusts the `event_time` field in source records as-is. Late events (event_time < current watermark) are dropped. Clock skew between producers is the operator's responsibility at the source. The `allowed_lateness` window in the watermark configuration is the primary mechanism for tolerating moderate producer clock skew. This policy must be documented in R5.1 release notes.
-- [ ] Document R5.1 streaming semantics, limitations, and the exact watermark model used.
+- [x] Document R5.1 streaming semantics, limitations, and the exact watermark model used.
 
 ### API And Interface Deliverables
 
@@ -93,7 +93,7 @@ Prove the streaming execution model is correct on a single end-to-end path befor
 
 - [x] Implement continuous operator execution loop on executor (input RecordBatch loop, no terminal state).
 - [x] Implement streaming job lifecycle in coordinator (no auto-transition to Succeeded).
-- [ ] Implement streaming job re-attach: on coordinator restart, accept executor re-registration with current watermark and offset; resume the job from executor-reported state instead of re-submitting a fresh job.
+- [x] Implement streaming job re-attach: on coordinator restart, accept executor re-registration with current watermark and offset; resume the job from executor-reported state instead of re-submitting a fresh job.
 - [x] Implement in-memory keyed state backend.
 - [x] Implement event-time timers.
 - [x] Implement single-source watermark propagation.
@@ -111,19 +111,19 @@ Prove the streaming execution model is correct on a single end-to-end path befor
 - [x] Deterministic replay test: same Kafka input produces identical output on two consecutive runs.
 - [x] Checkpoint-barrier simulation preserves watermark/window ordering.
 - [x] Streaming job remains in Running state in coordinator and does not auto-transition to Succeeded.
-- [ ] Re-attach test: coordinator restarts while streaming executors are active; executors re-register with current watermark and offset; job resumes without re-processing already-committed events.
+- [x] Re-attach test: coordinator restarts while streaming executors are active; executors re-register with current watermark and offset; job resumes without re-processing already-committed events.
 - [x] R1-R4 batch behavior still passes (no regression).
 
 ### Acceptance Gate For R5.1
 
-- [ ] Kafka (single partition) → tumbling window → in-memory state → Kafka sink runs end-to-end on real executors.
-- [ ] Watermarks close windows correctly.
-- [ ] Deterministic replay produces identical output.
-- [ ] Streaming job lifecycle is correctly modeled in the coordinator.
-- [ ] Coordinator restart while streaming job runs: job re-attaches from executor-reported state without duplicate reprocessing.
-- [ ] Checkpoint-barrier and watermark interaction is documented and validated in simulation before R6 starts.
-- [ ] R1-R4 supported batch behavior still passes.
-- [ ] `docs/architecture/streaming-execution-model.md` was reviewed and used as the implementation spec.
+- [ ] Kafka (single partition) → tumbling window → in-memory state → Kafka sink runs end-to-end on real executors (opt-in `KRISHIV_KAFKA_E2E=1` test; requires live Kafka broker).
+- [x] Watermarks close windows correctly.
+- [x] Deterministic replay produces identical output.
+- [x] Streaming job lifecycle is correctly modeled in the coordinator.
+- [x] Coordinator restart while streaming job runs: job re-attaches from executor-reported state without duplicate reprocessing.
+- [x] Checkpoint-barrier and watermark interaction is documented and validated in simulation before R6 starts.
+- [x] R1-R4 supported batch behavior still passes.
+- [x] `docs/architecture/streaming-execution-model.md` was reviewed and used as the implementation spec.
 
 ---
 

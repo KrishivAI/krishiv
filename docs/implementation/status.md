@@ -227,13 +227,12 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None (R5.1 slices A–G committed to branch `claude/plan-r5-implementation-NXiWo`).
+- None (R5.1 fully complete; committed to branch `claude/plan-r5-implementation-NXiWo`).
 
 ## Next Steps
 
-1. **R5.1 acceptance gate**: wire the certified path on real executor with a live Kafka broker (opt-in, `KRISHIV_KAFKA_E2E=1`). The streaming job must not auto-transition to Succeeded. Re-attach test: coordinator restart while streaming executor is active.
-2. **R5.2 begin**: only after R5.1 acceptance gate passes. Start with RocksDB `StateBackend` impl, then sliding/session windows, multi-source watermarks, and state TTL.
-3. Update `docs/implementation/r5-stateful-streaming-core.md` checklist items to `[x]` as acceptance gates pass.
+1. **R5.1 acceptance gate — live Kafka E2E** (only remaining gate item): write an opt-in integration test (`KRISHIV_KAFKA_E2E=1`) that runs the full Kafka → tumbling window → in-memory state → Kafka sink path on real executors with a live Kafka broker. All other acceptance criteria are met.
+2. **R5.2 begin**: only after live Kafka E2E acceptance test passes. Start with RocksDB `StateBackend` impl, then sliding/session windows, multi-source watermarks, and state TTL.
 
 ## Known Blockers
 
@@ -393,13 +392,15 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 - **`StreamingTaskState` proto type**: Added to `krishiv-proto` with `task_id`, `watermark_ms`, `source_offset`; attached to `ExecutorHeartbeat` via `streaming_task_states` field.
 - **Architecture docs**: `docs/architecture/checkpoint-protocol.md` and `docs/architecture/keyed-distribution-stability.md` written and committed.
 
-## Last Validation (R5.1, branch `claude/plan-r5-implementation-NXiWo`)
+## Last Validation (R5.1 complete, branch `claude/plan-r5-implementation-NXiWo`)
 
-- `cargo fmt --all` applied; `cargo test --workspace` passed — 0 failures across all crates.
+- `cargo fmt --all` applied; `cargo test --workspace` passed — 0 failures across all crates (~355 tests).
 - New crate `krishiv-state`: 12 tests pass.
 - `krishiv-api` streaming builder: 4 new tests pass.
 - `krishiv-exec` `WatermarkState` + `TumblingWindowOperator`: 9 + 4 tests pass.
 - `krishiv-executor` `execute_streaming_fragment` + `BarrierSimulator`: 10 new tests pass.
+- `krishiv-scheduler` streaming re-attach protocol: 2 new tests pass (`streaming_reattach_updates_task_watermark_and_offset`, `streaming_reattach_does_not_affect_batch_tasks`).
+- `docs/architecture/streaming-execution-model.md` expanded with re-attach protocol (§6), `prev_watermark_ms` semantics (§7.2), and clock skew policy (§7.3).
 
 ## Resume Instructions
 

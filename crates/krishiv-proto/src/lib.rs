@@ -1350,6 +1350,11 @@ pub struct ExecutorHeartbeatRequest {
     memory_used_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
     active_task_count: Option<u32>,
+    /// Per-task streaming state for the re-attach protocol.
+    /// Populated on the first heartbeat after a coordinator restart by executors
+    /// that have running streaming tasks, so the coordinator can resume tracking
+    /// watermark and offset without re-running the job from scratch.
+    streaming_task_states: Vec<StreamingTaskState>,
 }
 
 impl ExecutorHeartbeatRequest {
@@ -1368,6 +1373,7 @@ impl ExecutorHeartbeatRequest {
             memory_used_bytes: None,
             memory_limit_bytes: None,
             active_task_count: None,
+            streaming_task_states: Vec::new(),
         }
     }
 
@@ -1403,6 +1409,13 @@ impl ExecutorHeartbeatRequest {
     #[must_use]
     pub fn with_active_task_count(mut self, count: u32) -> Self {
         self.active_task_count = Some(count);
+        self
+    }
+
+    /// Attach streaming task states for the re-attach protocol.
+    #[must_use]
+    pub fn with_streaming_task_states(mut self, states: Vec<StreamingTaskState>) -> Self {
+        self.streaming_task_states = states;
         self
     }
 
@@ -1444,6 +1457,11 @@ impl ExecutorHeartbeatRequest {
     /// Active task count.
     pub fn active_task_count(&self) -> Option<u32> {
         self.active_task_count
+    }
+
+    /// Per-task streaming state for the re-attach protocol.
+    pub fn streaming_task_states(&self) -> &[StreamingTaskState] {
+        &self.streaming_task_states
     }
 }
 
