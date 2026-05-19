@@ -2459,6 +2459,14 @@ name = "krishiv-state"
 version = "0.1.0"
 
 [[package]]
+name = "krishiv-udf"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+]
+
+[[package]]
 name = "krishiv-ui"
 version = "0.1.0"
 dependencies = [

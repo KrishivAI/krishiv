@@ -16,6 +16,7 @@ members = [
     "crates/krishiv-shuffle",
     "crates/krishiv-sql",
     "crates/krishiv-state",
+    "crates/krishiv-udf",
     "crates/krishiv-ui",
 ]
 resolver = "3"
@@ -29,6 +30,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arrow = { version = "55.1.0", features = ["prettyprint"] }
 arrow-flight = { version = "55.1.0", features = ["flight-sql-experimental"] }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+iceberg = "0.9"
 async-trait = "0.1"
 bytes = "1"
 object_store = "0.12"

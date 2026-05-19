@@ -1094,6 +1094,33 @@ pub struct HeartbeatThrottleCommand {
     pub rows_per_second: Option<u64>,
 }
 
+// ── Distributed tracing carrier ──────────────────────────────────────────────
+
+/// W3C Trace Context carrier for distributed tracing (R8 wiring).
+///
+/// Populated by callers that have an active OpenTelemetry span. Receivers
+/// forward this into their active span as a remote parent. When absent,
+/// no tracing context is propagated.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TraceContext {
+    /// W3C `traceparent` header value (e.g. "00-<trace-id>-<span-id>-01").
+    pub traceparent: String,
+    /// W3C `tracestate` header value (vendor-specific key=value pairs).
+    pub tracestate: String,
+}
+
+impl TraceContext {
+    /// Create a trace context with the given traceparent.
+    pub fn new(traceparent: impl Into<String>) -> Self {
+        Self { traceparent: traceparent.into(), tracestate: String::new() }
+    }
+
+    /// Whether this context carries a real trace (non-empty traceparent).
+    pub fn is_active(&self) -> bool {
+        !self.traceparent.is_empty()
+    }
+}
+
 // ── Per-task streaming state ──────────────────────────────────────────────────
 
 /// Per-task streaming state reported by an executor during heartbeat.
@@ -1424,6 +1451,7 @@ impl fmt::Display for TransportDisposition {
 pub struct RegisterExecutorRequest {
     version: TransportVersion,
     descriptor: ExecutorDescriptor,
+    trace_context: Option<TraceContext>,
 }
 
 impl RegisterExecutorRequest {
@@ -1432,6 +1460,7 @@ impl RegisterExecutorRequest {
         Self {
             version: TransportVersion::CURRENT,
             descriptor,
+            trace_context: None,
         }
     }
 
@@ -1439,6 +1468,13 @@ impl RegisterExecutorRequest {
     #[must_use]
     pub fn with_version(mut self, version: TransportVersion) -> Self {
         self.version = version;
+        self
+    }
+
+    /// Attach a W3C trace context for distributed tracing (R8 wiring).
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
+        self.trace_context = Some(ctx);
         self
     }
 
@@ -1450,6 +1486,11 @@ impl RegisterExecutorRequest {
     /// Executor descriptor.
     pub fn descriptor(&self) -> &ExecutorDescriptor {
         &self.descriptor
+    }
+
+    /// W3C trace context, if provided by the caller.
+    pub fn trace_context(&self) -> Option<&TraceContext> {
+        self.trace_context.as_ref()
     }
 }
 
@@ -1580,6 +1621,8 @@ pub struct ExecutorHeartbeatRequest {
     /// Populated by streaming executors whenever the tracker has entries whose
     /// heat score exceeds the reporting threshold (default 5%).
     hot_key_reports: Vec<HeartbeatHotKeyReport>,
+    /// W3C trace context for distributed tracing (R8 wiring).
+    trace_context: Option<TraceContext>,
 }
 
 impl ExecutorHeartbeatRequest {
@@ -1600,6 +1643,7 @@ impl ExecutorHeartbeatRequest {
             active_task_count: None,
             streaming_task_states: Vec::new(),
             hot_key_reports: Vec::new(),
+            trace_context: None,
         }
     }
 
@@ -1608,6 +1652,18 @@ impl ExecutorHeartbeatRequest {
     pub fn with_version(mut self, version: TransportVersion) -> Self {
         self.version = version;
         self
+    }
+
+    /// Attach a W3C trace context for distributed tracing (R8 wiring).
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
+        self.trace_context = Some(ctx);
+        self
+    }
+
+    /// W3C trace context, if provided by the caller.
+    pub fn trace_context(&self) -> Option<&TraceContext> {
+        self.trace_context.as_ref()
     }
 
     /// Attach running attempts.
@@ -1712,6 +1768,8 @@ pub struct ExecutorHeartbeatResponse {
     message: Option<String>,
     /// Throttle commands the executor must forward to its source operators.
     throttle_commands: Vec<HeartbeatThrottleCommand>,
+    /// W3C trace context for distributed tracing (R8 wiring).
+    trace_context: Option<TraceContext>,
 }
 
 impl ExecutorHeartbeatResponse {
@@ -1723,6 +1781,7 @@ impl ExecutorHeartbeatResponse {
             disposition,
             message: None,
             throttle_commands: Vec::new(),
+            trace_context: None,
         }
     }
 
@@ -1770,6 +1829,18 @@ impl ExecutorHeartbeatResponse {
     /// Optional response message.
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// Attach a W3C trace context for distributed tracing (R8 wiring).
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
+        self.trace_context = Some(ctx);
+        self
+    }
+
+    /// W3C trace context, if provided by the coordinator.
+    pub fn trace_context(&self) -> Option<&TraceContext> {
+        self.trace_context.as_ref()
     }
 }
 
@@ -2069,6 +2140,8 @@ pub struct ExecutorTaskAssignment {
     plan_fragment: PlanFragment,
     output_contract: OutputContract,
     task_timeout_secs: Option<u64>,
+    /// W3C trace context for distributed tracing (R8 wiring).
+    trace_context: Option<TraceContext>,
 }
 
 impl ExecutorTaskAssignment {
@@ -2092,6 +2165,7 @@ impl ExecutorTaskAssignment {
             plan_fragment,
             output_contract,
             task_timeout_secs: None,
+            trace_context: None,
         }
     }
 
@@ -2170,6 +2244,18 @@ impl ExecutorTaskAssignment {
     pub fn task_timeout_secs(&self) -> Option<u64> {
         self.task_timeout_secs
     }
+
+    /// Attach a W3C trace context for distributed tracing (R8 wiring).
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
+        self.trace_context = Some(ctx);
+        self
+    }
+
+    /// W3C trace context, if provided by the scheduler.
+    pub fn trace_context(&self) -> Option<&TraceContext> {
+        self.trace_context.as_ref()
+    }
 }
 
 /// Versioned task status update sent from executor to coordinator.
@@ -2185,6 +2271,8 @@ pub struct TaskStatusRequest {
     state: TaskState,
     message: Option<String>,
     output_metadata: Option<TaskOutputMetadata>,
+    /// W3C trace context for distributed tracing (R8 wiring).
+    trace_context: Option<TraceContext>,
 }
 
 impl TaskStatusRequest {
@@ -2206,6 +2294,7 @@ impl TaskStatusRequest {
             state,
             message: None,
             output_metadata: None,
+            trace_context: None,
         }
     }
 
@@ -2278,6 +2367,18 @@ impl TaskStatusRequest {
     /// Optional lightweight output metadata.
     pub fn output_metadata(&self) -> Option<&TaskOutputMetadata> {
         self.output_metadata.as_ref()
+    }
+
+    /// Attach a W3C trace context for distributed tracing (R8 wiring).
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
+        self.trace_context = Some(ctx);
+        self
+    }
+
+    /// W3C trace context, if provided by the caller.
+    pub fn trace_context(&self) -> Option<&TraceContext> {
+        self.trace_context.as_ref()
     }
 }
 
@@ -2356,6 +2457,8 @@ pub struct TaskStatusResponse {
     version: TransportVersion,
     disposition: TransportDisposition,
     message: Option<String>,
+    /// W3C trace context for distributed tracing (R8 wiring).
+    trace_context: Option<TraceContext>,
 }
 
 impl TaskStatusResponse {
@@ -2365,6 +2468,7 @@ impl TaskStatusResponse {
             version: TransportVersion::CURRENT,
             disposition,
             message: None,
+            trace_context: None,
         }
     }
 
@@ -2395,6 +2499,18 @@ impl TaskStatusResponse {
     /// Optional response message.
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    /// Attach a W3C trace context for distributed tracing (R8 wiring).
+    #[must_use]
+    pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
+        self.trace_context = Some(ctx);
+        self
+    }
+
+    /// W3C trace context, if provided by the coordinator.
+    pub fn trace_context(&self) -> Option<&TraceContext> {
+        self.trace_context.as_ref()
     }
 }
 
@@ -3698,5 +3814,28 @@ mod tests {
     #[test]
     fn fencing_token_ordering() {
         assert!(FencingToken::initial() < FencingToken::initial().next());
+    }
+
+    #[test]
+    fn trace_context_is_active_when_non_empty() {
+        let ctx = super::TraceContext::new("00-abc-def-01");
+        assert!(ctx.is_active());
+    }
+
+    #[test]
+    fn trace_context_inactive_by_default() {
+        let ctx = super::TraceContext::default();
+        assert!(!ctx.is_active());
+    }
+
+    #[test]
+    fn executor_heartbeat_request_carries_trace_context() {
+        let req = ExecutorHeartbeatRequest::new(
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            ExecutorState::Healthy,
+        )
+        .with_trace_context(super::TraceContext::new("00-trace-01-span-01-01"));
+        assert!(req.trace_context().unwrap().is_active());
     }
 }
