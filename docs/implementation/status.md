@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-R4 Shuffle and Batch AQE — Tier 1 + Tier 2 + Tier 3 complete.
+R4 Shuffle and Batch AQE — Tier 1 + Tier 2 + Tier 3 complete. Pre-R5 hardening complete. R5.1 stateful streaming core is unblocked.
 
 ## Active Task
 
@@ -190,9 +190,10 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## Next Steps
 
-1. R4 AQE coalesce: wire `CoalesceRule` results into coordinator stage scheduling to merge small shuffle output partitions.
-2. R5 prep: checkpoint-barrier/watermark protocol design review.
-3. Live external Kafka broker integration (opt-in, blocked on Kafka client selection).
+1. Begin R5.1: implement `crates/krishiv-state` with keyed state API and in-memory backend.
+2. Add `key_by`, event-time timestamp assignment, watermark, and tumbling-window APIs to `krishiv-api`.
+3. Implement continuous operator execution loop in `execute_streaming_fragment` (replace `StreamingNotImplemented` stub).
+4. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
 
 ## Known Blockers
 
@@ -338,34 +339,19 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 - Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3), `e328e89` (TPC-H correctness gate), `1492fac` (fmt), `bea4f03` (post-R4 bug sweep).
 - Branch pushed to remote: `origin/claude/analyze-r3-plan-r4-0QYyr`.
 
-### Bug fixes in TPC-H commit (`e328e89`)
+## Last Validation (Pre-R5 hardening, branch `claude/analyze-r3-plan-r4-0QYyr`)
 
-- **`execute_shuffle_write_fragment` overwrite bug**: The loop wrote each
-  partition once per source batch, so all but the last batch's rows were
-  silently discarded for each partition. Fixed by accumulating per-bucket
-  batches across all source batches and writing each partition exactly once.
-- **`read_shuffle_flight_partitions` duplicate table name**: Multiple shuffle
-  partitions for the same logical table caused a DataFusion `register_table`
-  error on the second registration. Fixed by merging batches by table name
-  before returning (multi-partition shuffle of the same table is now
-  transparent to the SQL layer).
-- **`HashPartitioner` Utf8View gap**: DataFusion 48 / Arrow 55 returns
-  `Utf8View` (not `Utf8`) for string columns read from Parquet. Added
-  `Utf8View` branch to `HashPartitioner` so the Q1 key column `l_returnflag`
-  partitions correctly.
+- `cargo fmt --all` applied.
+- `cargo test --workspace` passed — 0 failures (scheduler: 48 lib tests including 4 new streaming tests; all other crates clean).
 
-### Bug fixes in post-R4 sweep commit (`bea4f03`)
+## Pre-R5 Hardening Summary
 
-- **`validate_job` missing upstream stage check**: A `StageSpec` declaring
-  `upstream_stage_ids` referencing a stage not in the same `JobSpec` would
-  silently deadlock that stage forever. `validate_job` now rejects such specs
-  with `SchedulerError::InvalidJob`. Two new tests cover the accept/reject paths.
-- **`submit_job` save-before-push fragility**: `s.save_job(self.jobs.last().unwrap())`
-  was called after `self.jobs.push(record)`, making the borrow fragile if the
-  Vec ever reallocated with the record moved. Reordered: store first, push after.
-- **`HashPartitioner` LargeUtf8 gap**: Added `DataType::LargeUtf8` branch
-  alongside `Utf8` and `Utf8View` to complete coverage for all Arrow string variants
-  used in shuffle key columns.
+- **`refresh_state()` streaming guard**: `JobRecord::refresh_state()` in `krishiv-scheduler` now guards `JobKind::Streaming` jobs from ever transitioning to `JobState::Succeeded`. Tests: `streaming_job_does_not_succeed_when_all_stages_succeed` and `batch_job_succeeds_when_all_stages_succeed` both pass.
+- **Streaming re-attach protocol**: `CoordinatorConfig::streaming_reattach_grace_ticks` (default 5), `Coordinator::recovering` flag, and grace-period eviction guard added to `advance_heartbeat_clock`. `recover_from_store` now sets `ticks_since_restart = 0` and `recovering = true`. Tests: `streaming_executor_not_evicted_within_grace_period` and `streaming_executor_evicted_after_grace_period` both pass.
+- **Executor `ExecutionModel` dispatch**: `ExecutionModel` enum (`Batch` / `Streaming`) added to `krishiv-executor`; dispatch on `stream:` fragment prefix; `execute_stage_fragment` renamed to `execute_batch_fragment`; `execute_streaming_fragment` stub added returning `StreamingNotImplemented`. 6 new executor tests pass.
+- **`StreamingAqeGuard` and `AqeOptimizer`**: Added to `krishiv-optimizer`; `AqeOptimizer::guarded_rules` are skipped for streaming plans; 3 new optimizer tests pass.
+- **`StreamingTaskState` proto type**: Added to `krishiv-proto` with `task_id`, `watermark_ms`, `source_offset`; attached to `ExecutorHeartbeat` via `streaming_task_states` field.
+- **Architecture docs**: `docs/architecture/checkpoint-protocol.md` and `docs/architecture/keyed-distribution-stability.md` written and committed.
 
 ## Resume Instructions
 
@@ -373,8 +359,8 @@ For a new Codex session:
 
 1. Read `AGENTS.md`.
 2. Read this file.
-3. Read `docs/implementation/r4-shuffle-and-batch-aqe.md`.
-4. R4 Tiers 1–3 are complete. Continue with TPC-H SF10 correctness gate or R5 checkpoint-barrier protocol design.
+3. Read `docs/implementation/r5-stateful-streaming-core.md`.
+4. Pre-R5 hardening is complete. Begin R5.1 with `crates/krishiv-state` keyed state API.
 
 For a new Claude Code session:
 
@@ -383,4 +369,5 @@ Start with `/krishiv-engine resume`, then:
 1. Read `AGENTS.md`.
 2. Read `CLAUDE.md`.
 3. Read this file.
-4. Continue from the Next Steps list above; do not rely on Codex-only or Claude-only chat history.
+4. Read `docs/implementation/r5-stateful-streaming-core.md`.
+5. Continue from the Next Steps list above; do not rely on Codex-only or Claude-only chat history.

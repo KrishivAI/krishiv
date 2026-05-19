@@ -46,6 +46,9 @@ pub enum ExecutorError {
     InvalidAssignment { message: String },
     /// Local stage fragment execution failed.
     LocalExecution { message: String },
+    /// A streaming task fragment was submitted but the streaming runner is not
+    /// yet implemented.  This becomes a real runner in R5.
+    StreamingNotImplemented,
 }
 
 impl fmt::Display for ExecutorError {
@@ -59,11 +62,56 @@ impl fmt::Display for ExecutorError {
             Self::LocalExecution { message } => {
                 write!(f, "local stage fragment execution failed: {message}")
             }
+            Self::StreamingNotImplemented => f.write_str(
+                "streaming task runner not yet implemented; available in R5 \
+                 (fragment must not use the 'stream:' prefix until R5.1)",
+            ),
         }
     }
 }
 
 impl Error for ExecutorError {}
+
+// ── ExecutionModel ────────────────────────────────────────────────────────────
+
+/// Execution model inferred from a plan fragment description.
+///
+/// This is the central dispatch point that separates batch-terminal execution
+/// (R1–R4) from streaming-continuous execution (R5+).  Every call site that
+/// would otherwise string-match on the fragment prefix should use this enum.
+///
+/// **Batch**: the runner executes the fragment, collects output, and reports
+/// `TaskState::Succeeded` or `TaskState::Failed`.  The task has a finite
+/// lifetime. Optional `task_timeout_secs` applies.
+///
+/// **Streaming**: the runner enters a continuous operator loop and never reports
+/// `Succeeded` while the job is running.  The task terminates only on an
+/// explicit `Stop` signal from the coordinator or on a fatal error.
+/// `task_timeout_secs` is *ignored* for streaming tasks because the duration
+/// is unbounded by design.  R5.1 provides the first real streaming runner;
+/// until then, submitting a `stream:` fragment returns
+/// `ExecutorError::StreamingNotImplemented`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionModel {
+    /// Task runs to completion and returns terminal output.
+    Batch,
+    /// Task runs an unbounded loop until a `Stop` signal or fatal error.
+    Streaming,
+}
+
+impl ExecutionModel {
+    /// Infer the execution model from the plan fragment description.
+    ///
+    /// All `stream:` prefixed fragments use the streaming model.
+    /// Everything else is treated as batch (existing behaviour is preserved).
+    pub fn from_fragment(fragment: &str) -> Self {
+        if fragment.starts_with("stream:") {
+            Self::Streaming
+        } else {
+            Self::Batch
+        }
+    }
+}
 
 /// In-memory receiver queue for task assignments delivered to an executor.
 #[derive(Debug, Clone, Default)]
@@ -540,20 +588,36 @@ impl ExecutorTaskRunner {
             ));
         }
 
-        let execute_result = if let Some(timeout_secs) = assignment.task_timeout_secs() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                self.execute_stage_fragment(&assignment),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
-                    message: format!("task timed out after {} seconds", timeout_secs),
-                }),
+        let model = ExecutionModel::from_fragment(assignment.plan_fragment().description().trim());
+
+        let execute_result = match model {
+            ExecutionModel::Batch => {
+                // Batch tasks respect task_timeout_secs: they are expected to
+                // complete in bounded time.
+                if let Some(timeout_secs) = assignment.task_timeout_secs() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        self.execute_batch_fragment(&assignment),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
+                            message: format!("task timed out after {} seconds", timeout_secs),
+                        }),
+                    }
+                } else {
+                    self.execute_batch_fragment(&assignment).await
+                }
             }
-        } else {
-            self.execute_stage_fragment(&assignment).await
+            ExecutionModel::Streaming => {
+                // Streaming tasks run an unbounded loop; task_timeout_secs is
+                // intentionally ignored.  The real continuous operator loop
+                // arrives in R5.1; until then return a clear not-implemented
+                // error so R5 can replace this branch without touching call
+                // sites.
+                self.execute_streaming_fragment(&assignment).await
+            }
         };
 
         let output = match execute_result {
@@ -592,7 +656,12 @@ impl ExecutorTaskRunner {
         ))
     }
 
-    async fn execute_stage_fragment(
+    /// Execute a batch (terminal) stage fragment.
+    ///
+    /// All R1–R4 fragment kinds route through here.  The function collects
+    /// output and returns it so the caller can report `TaskState::Succeeded`.
+    /// This is always called with `ExecutionModel::Batch`.
+    async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
     ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -702,6 +771,25 @@ impl ExecutorTaskRunner {
         }
 
         Ok(ExecutorTaskOutput::placeholder())
+    }
+
+    /// Execute a streaming (continuous) stage fragment.
+    ///
+    /// R5.1 replaces this stub with the real watermark-driven operator loop.
+    /// Until then, any `stream:` fragment is rejected immediately so that
+    /// R5 work is self-contained in this single method body.
+    ///
+    /// **Contract for R5.1 implementors**: this method must:
+    /// - Run a continuous `loop { receive_batch → advance_watermark → process → flush_windows → send_output }`
+    /// - Respond to a cancellation token by draining in-flight batches and returning `Ok(ExecutorTaskOutput::stopped())`
+    /// - Never return `Ok(...)` with a terminal-succeeded semantics while the job is still running
+    /// - Report heartbeat updates to the coordinator inside the loop (not via the return path)
+    #[allow(clippy::unused_async)]
+    async fn execute_streaming_fragment(
+        &self,
+        _assignment: &ExecutorTaskAssignment,
+    ) -> ExecutorResult<ExecutorTaskOutput> {
+        Err(ExecutorError::StreamingNotImplemented)
     }
 
     async fn send_task_status<S>(
@@ -1925,6 +2013,8 @@ mod tests {
         TaskAttemptRef, TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest,
         TaskStatusResponse, TransportDisposition, TransportVersion, wire,
     };
+
+    use super::ExecutionModel;
     use krishiv_scheduler::{
         Coordinator, CoordinatorExecutorTonicService, SharedCoordinator,
         serve_coordinator_executor_grpc_with_listener,
@@ -3064,7 +3154,7 @@ mod tests {
         )]);
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
         let err = runner
-            .execute_stage_fragment(&assignment)
+            .execute_batch_fragment(&assignment)
             .await
             .unwrap_err();
         match err {
@@ -3470,5 +3560,77 @@ mod tests {
         }
 
         flight_handle.abort();
+    }
+
+    // ── ExecutionModel dispatch ───────────────────────────────────────────
+
+    #[test]
+    fn execution_model_batch_for_sql_fragment() {
+        assert_eq!(
+            ExecutionModel::from_fragment("sql: SELECT 1"),
+            ExecutionModel::Batch
+        );
+    }
+
+    #[test]
+    fn execution_model_batch_for_shuffle_write() {
+        assert_eq!(
+            ExecutionModel::from_fragment("shuffle-write:hash:key:4"),
+            ExecutionModel::Batch
+        );
+    }
+
+    #[test]
+    fn execution_model_batch_for_kafka_pipeline() {
+        assert_eq!(
+            ExecutionModel::from_fragment("kafka-to-parquet"),
+            ExecutionModel::Batch
+        );
+    }
+
+    #[test]
+    fn execution_model_streaming_for_stream_prefix() {
+        assert_eq!(
+            ExecutionModel::from_fragment("stream:tumbling-window:key:60s"),
+            ExecutionModel::Streaming
+        );
+    }
+
+    #[test]
+    fn execution_model_streaming_exact_prefix() {
+        // Any fragment starting with "stream:" is streaming regardless of suffix.
+        assert_eq!(
+            ExecutionModel::from_fragment("stream:"),
+            ExecutionModel::Streaming
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_fragment_returns_not_implemented() {
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let assignment = ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("stream:tumbling-window:key:60s"),
+            OutputContract::new(
+                krishiv_proto::OutputContractKind::InlineRecordBatches,
+                "streaming output",
+            ),
+        );
+        let err = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, super::ExecutorError::StreamingNotImplemented),
+            "expected StreamingNotImplemented, got {err}"
+        );
     }
 }

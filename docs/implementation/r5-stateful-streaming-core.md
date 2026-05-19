@@ -48,6 +48,9 @@ Out of scope:
 - R3.2 Kafka source/sink contracts exist.
 - R4 partitioning model can support keyed distribution.
 - `docs/architecture/streaming-execution-model.md` is written and approved (R4 deliverable; R5.1 must not start until this document exists).
+- `docs/architecture/checkpoint-protocol.md` is written and reviewed (R5.1 pre-condition; NOT an R6 deliverable).
+- `TaskRunner` enum dispatch separating batch and streaming execution paths exists in `krishiv-executor`.
+- `JobRecord::refresh_state()` in `krishiv-scheduler` guards streaming jobs from transitioning to `JobState::Succeeded`.
 
 ---
 
@@ -61,6 +64,9 @@ Prove the streaming execution model is correct on a single end-to-end path befor
 
 ### Architecture Deliverables
 
+- [ ] Add `TaskRunner` trait (or equivalent enum dispatch) to `krishiv-executor` separating batch-terminal execution from streaming-continuous execution. R5.1 streaming operators MUST use the streaming runner; R1–R4 batch operators MUST continue to use the batch runner unchanged.
+- [ ] Write `docs/architecture/checkpoint-protocol.md` covering aligned checkpoint barrier model, barrier/watermark ordering invariants, and R5.1 simulation requirements. Must exist and be reviewed before R5.1 streaming window implementation starts.
+- [ ] Define keyed-distribution stability contract per `docs/architecture/keyed-distribution-stability.md`: `key_by(column)` guarantees same-key → same task for the job lifetime; AQE coalescing is disabled for streaming stages.
 - [ ] Add `crates/krishiv-state`.
 - [ ] Define keyed state API (read, write, clear per key).
 - [ ] Define state namespace model.
@@ -191,3 +197,5 @@ Generalize the proven R5.1 streaming model to multiple window types, RocksDB, mu
 | State inspection mutates or corrupts live state | Keep inspection read-only and metadata-focused; add mutation-detection assertion in tests |
 | Streaming APIs overfit the R5.1 example | Keep public APIs minimal; document beta semantics; design `key_by`/window API to generalize to R5.2 window types |
 | R5.1 acceptance gate takes too long | Do not relax the gate; adjust R5.2 start date instead |
+| Streaming jobs auto-transition to Succeeded when tasks complete | `refresh_state()` streaming guard must be applied and tested before R5.1 streaming task dispatch is wired |
+| AQE coalescing invalidates streaming keyed state | `StreamingAqeGuard` rule in optimizer pipeline must skip AQE coalescing for streaming plans |

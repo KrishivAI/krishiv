@@ -890,6 +890,34 @@ impl DeregisterExecutorResponse {
     }
 }
 
+/// Per-task streaming state reported by an executor during heartbeat.
+///
+/// Used by the streaming re-attach protocol: when a coordinator restarts while
+/// streaming tasks are running, executors include this in their first heartbeat
+/// so the coordinator can resume the job at the right watermark and source offset
+/// instead of re-running from scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingTaskState {
+    /// Task this state belongs to.
+    pub task_id: TaskId,
+    /// Current event-time watermark in milliseconds since epoch.
+    pub watermark_ms: u64,
+    /// Last committed source offset for this task's input partition.
+    /// Encoded as a byte string whose interpretation is connector-specific.
+    pub source_offset: Vec<u8>,
+}
+
+impl StreamingTaskState {
+    /// Create a streaming task state report.
+    pub fn new(task_id: TaskId, watermark_ms: u64, source_offset: Vec<u8>) -> Self {
+        Self {
+            task_id,
+            watermark_ms,
+            source_offset,
+        }
+    }
+}
+
 /// Executor heartbeat contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorHeartbeat {
@@ -900,6 +928,9 @@ pub struct ExecutorHeartbeat {
     memory_used_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
     active_task_count: Option<u32>,
+    /// Per-task streaming state for the re-attach protocol.
+    /// Empty for batch tasks and executors that have no streaming tasks.
+    streaming_task_states: Vec<StreamingTaskState>,
 }
 
 impl ExecutorHeartbeat {
@@ -913,6 +944,7 @@ impl ExecutorHeartbeat {
             memory_used_bytes: None,
             memory_limit_bytes: None,
             active_task_count: None,
+            streaming_task_states: Vec::new(),
         }
     }
 
@@ -984,6 +1016,18 @@ impl ExecutorHeartbeat {
     /// Active task count reported by executor.
     pub fn active_task_count(&self) -> Option<u32> {
         self.active_task_count
+    }
+
+    /// Attach streaming task states for the re-attach protocol.
+    #[must_use]
+    pub fn with_streaming_task_states(mut self, states: Vec<StreamingTaskState>) -> Self {
+        self.streaming_task_states = states;
+        self
+    }
+
+    /// Per-task streaming state reported by this executor.
+    pub fn streaming_task_states(&self) -> &[StreamingTaskState] {
+        &self.streaming_task_states
     }
 }
 
