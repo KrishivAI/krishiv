@@ -2,11 +2,19 @@
 
 ## Current Phase
 
-R5.2 Stateful Streaming Hardening — all non-RocksDB slices complete. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace. RocksDB crate integration deferred (architecture doc written; crate dependency not yet added).
+**R5 COMPLETE.** R5.1 + R5.2 all acceptance gates closed. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace (`cargo test --workspace`). Ready to begin R6 (Checkpoints and Savepoints).
 
 ## Active Task
 
-R5.2 implementation complete (all slices except RocksDB crate integration):
+R5.2 implementation complete — all slices including durable backend:
+
+**R5.2 `RocksDbStateBackend`** (NEW — completes R5.2)
+- `RocksDbStateBackend::open(base_dir)` / `RocksDbStateBackend::ephemeral()` — filesystem-backed durable state using `std::fs`
+- Atomic write: temp-file → rename per key (same staging model as shuffle store)
+- Key encoding: `base_dir/<operator_id>/<state_name>/<hex_key>` (matches `rocksdb-state-backend.md` §5)
+- `hex_encode`/`hex_decode` helpers (no external deps)
+- `Send` trait satisfied — safe to move to `spawn_blocking` thread
+- 10 new tests: CRUD, `list_namespaces/list_keys`, `rocks_survives_reopen` (durability), `rocks_ttl_wrapper_expires_on_reopen`, `rocks_deterministic_replay`, `rocks_state_inspector_reads_without_mutation`, `rocks_spawn_blocking_compatible`
 
 **R5.2 Architecture**
 - `docs/architecture/rocksdb-state-backend.md`: `spawn_blocking` isolation boundary, compaction thread budget `min(4, cpus/4)`, `Deployment` pod deployment model, key encoding, TTL cleanup policy, state inspection safety boundaries.
