@@ -21,8 +21,8 @@ use krishiv_proto::{
     ExecutorState, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
-    Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, SchedulerError, SharedCoordinator,
-    StabilityMetrics,
+    Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, NamespaceQuotaSnapshot,
+    ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
 };
 use serde::Serialize;
 
@@ -112,6 +112,7 @@ pub fn router(state: UiState) -> Router {
             get(api_job_checkpoints),
         )
         .route("/api/v1/executors", get(api_executors))
+        .route("/api/v1/queues", get(api_queues))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
         .route("/assets/krishiv.css", get(stylesheet))
@@ -180,6 +181,58 @@ pub struct JobCheckpointsResponse {
     pub latest_epoch: Option<u64>,
 }
 
+/// R7.1 resource usage view — mirrors `ResourceUsage` for JSON serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceUsageView {
+    /// Total CPU nanoseconds consumed by completed tasks.
+    pub cpu_nanos: u64,
+    /// Peak memory bytes observed across completed tasks.
+    pub memory_peak_bytes: u64,
+    /// Number of completed tasks that reported stats.
+    pub task_count: u32,
+}
+
+impl ResourceUsageView {
+    fn from_usage(u: &ResourceUsage) -> Self {
+        Self {
+            cpu_nanos: u.cpu_nanos,
+            memory_peak_bytes: u.memory_peak_bytes,
+            task_count: u.task_count,
+        }
+    }
+}
+
+/// R7.1 namespace quota view for `GET /api/v1/queues`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamespaceQuotaView {
+    /// Namespace identifier (`null` = default namespace).
+    pub namespace_id: Option<String>,
+    /// CPU nanoseconds currently reserved by active jobs.
+    pub cpu_nanos_reserved: u64,
+    /// Memory bytes currently reserved by active jobs.
+    pub memory_bytes_reserved: u64,
+    /// Number of active (non-terminal) jobs in this namespace.
+    pub active_job_count: usize,
+}
+
+impl NamespaceQuotaView {
+    fn from_snapshot(snap: &NamespaceQuotaSnapshot) -> Self {
+        Self {
+            namespace_id: snap.namespace_id.clone(),
+            cpu_nanos_reserved: snap.cpu_nanos_reserved,
+            memory_bytes_reserved: snap.memory_bytes_reserved,
+            active_job_count: snap.active_job_count,
+        }
+    }
+}
+
+/// Response for `GET /api/v1/queues`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueuesResponse {
+    /// Per-namespace quota snapshot (default namespace first, then alphabetical).
+    pub namespaces: Vec<NamespaceQuotaView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobSummaryView {
     /// Job id.
@@ -200,6 +253,12 @@ pub struct JobSummaryView {
     pub succeeded_task_count: usize,
     /// Failed task count.
     pub failed_task_count: usize,
+    /// Scheduling priority (0 = lowest, 255 = highest).
+    pub priority: u8,
+    /// Governance namespace, if set.
+    pub namespace_id: Option<String>,
+    /// Accumulated resource consumption from completed tasks.
+    pub resource_usage: ResourceUsageView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -391,6 +450,47 @@ async fn api_executors(State(state): State<UiState>) -> Result<Json<ExecutorsRes
     }))
 }
 
+async fn api_queues(State(state): State<UiState>) -> Result<Json<QueuesResponse>, UiError> {
+    let coordinator = state
+        .coordinator
+        .read()
+        .map_err(|_| UiError::LockPoisoned)?;
+
+    // Collect all distinct namespaces from active jobs plus the default namespace.
+    let mut namespaces: Vec<Option<String>> = coordinator
+        .job_snapshots()
+        .iter()
+        .filter(|j| !j.state().is_terminal())
+        .map(|j| j.namespace_id().map(str::to_owned))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Ensure the default namespace is always present.
+    if !namespaces.contains(&None) {
+        namespaces.push(None);
+    }
+    // Sort: default namespace first, then alphabetical.
+    namespaces.sort_by(|a, b| match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, _) => std::cmp::Ordering::Less,
+        (_, None) => std::cmp::Ordering::Greater,
+        (Some(a), Some(b)) => a.cmp(b),
+    });
+
+    let quota_views = namespaces
+        .iter()
+        .map(|ns| {
+            let snap = coordinator.namespace_quota_snapshot(ns.as_deref());
+            NamespaceQuotaView::from_snapshot(&snap)
+        })
+        .collect();
+
+    Ok(Json(QueuesResponse {
+        namespaces: quota_views,
+    }))
+}
+
 async fn api_job_checkpoints(
     State(state): State<UiState>,
     Path(job_id_str): Path<String>,
@@ -494,6 +594,9 @@ impl JobSummaryView {
             running_task_count: snapshot.running_task_count(),
             succeeded_task_count: snapshot.succeeded_task_count(),
             failed_task_count: snapshot.failed_task_count(),
+            priority: snapshot.priority(),
+            namespace_id: snapshot.namespace_id().map(str::to_owned),
+            resource_usage: ResourceUsageView::from_usage(snapshot.resource_usage()),
         }
     }
 }
@@ -982,5 +1085,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── R7.1 quota / queue API tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn api_queues_returns_default_namespace() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queues")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let namespaces = parsed["namespaces"].as_array().unwrap();
+        assert!(
+            !namespaces.is_empty(),
+            "must include at least default namespace"
+        );
+        // Default namespace has null namespace_id.
+        assert_eq!(namespaces[0]["namespace_id"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn api_jobs_includes_priority_and_resource_usage() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let job = &parsed["jobs"][0];
+        assert!(job["priority"].is_number(), "priority must be a number");
+        assert!(
+            job["resource_usage"].is_object(),
+            "resource_usage must be an object"
+        );
+        assert!(
+            job["resource_usage"]["cpu_nanos"].is_number(),
+            "resource_usage.cpu_nanos must be present"
+        );
     }
 }

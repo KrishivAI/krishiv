@@ -2539,8 +2539,8 @@ mod tests {
         JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
         OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
         StageId, StageSpec, StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId,
-        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
-        TransportVersion, wire,
+        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
+        wire,
     };
 
     use super::ExecutionModel;

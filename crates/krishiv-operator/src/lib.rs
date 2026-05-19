@@ -16,7 +16,10 @@ use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
     JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec,
 };
-use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError, SharedCoordinator};
+use krishiv_scheduler::{
+    Coordinator, JobSnapshot, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, ResourceUsage,
+    SchedulerError, SharedCoordinator, SubmitOutcome,
+};
 use kube::Client;
 use kube::api::{Api, Patch, PatchParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
@@ -1093,6 +1096,153 @@ fn with_optional_executor_id(
     }
 }
 
+// ── R7.1: KrishivQueue CRD and CrdQueueManager ───────────────────────────────
+
+/// Kind string for the `KrishivQueue` CRD.
+pub const QUEUE_KIND: &str = "KrishivQueue";
+
+/// `KrishivQueue` Kubernetes resource spec.
+///
+/// Defines quota limits for a governance namespace.  The
+/// `CrdQueueManager` reads live `KrishivQueue` objects to derive the
+/// `QuotaPolicy` applied to each namespace at admission time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KrishivQueueSpec {
+    /// Governance namespace name.  Must match `JobSpec::namespace_id`.
+    pub namespace: String,
+    /// Maximum CPU nanoseconds reserved simultaneously (`None` = unlimited).
+    #[serde(default)]
+    pub cpu_nanos_limit: Option<u64>,
+    /// Maximum memory bytes reserved simultaneously (`None` = unlimited).
+    #[serde(default)]
+    pub memory_bytes_limit: Option<u64>,
+    /// Maximum concurrent active jobs (`None` = unlimited).
+    #[serde(default)]
+    pub max_concurrent_jobs: Option<usize>,
+    /// Scheduling priority band (0 = lowest, 255 = highest; default 128).
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+}
+
+fn default_priority() -> u8 {
+    128
+}
+
+/// Status subresource for a `KrishivQueue`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KrishivQueueStatus {
+    /// Number of active jobs currently admitted to this namespace.
+    #[serde(default)]
+    pub active_job_count: usize,
+    /// CPU nanoseconds currently reserved in this namespace.
+    #[serde(default)]
+    pub cpu_nanos_reserved: u64,
+    /// Memory bytes currently reserved in this namespace.
+    #[serde(default)]
+    pub memory_bytes_reserved: u64,
+}
+
+/// Typed `KrishivQueue` Kubernetes resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KrishivQueue {
+    pub spec: KrishivQueueSpec,
+    #[serde(default)]
+    pub status: KrishivQueueStatus,
+}
+
+impl KrishivQueue {
+    /// Derive a `QuotaPolicy` from this queue's spec.
+    pub fn quota_policy(&self) -> QuotaPolicy {
+        QuotaPolicy {
+            cpu_nanos_limit: self.spec.cpu_nanos_limit,
+            memory_bytes_limit: self.spec.memory_bytes_limit,
+            max_concurrent_jobs: self.spec.max_concurrent_jobs,
+        }
+    }
+}
+
+/// Kubernetes CRD-backed queue manager.
+///
+/// Built from a snapshot of `KrishivQueue` CRD objects read from the API
+/// server.  In production the operator refreshes this at each reconcile loop;
+/// the `QueueManager` trait itself is stateless.
+///
+/// Lives in `krishiv-operator` so it is the only crate allowed to call
+/// Kubernetes APIs (Kubernetes isolation rule).
+#[derive(Debug)]
+pub struct CrdQueueManager {
+    /// Policy per namespace derived from `KrishivQueue` CRD objects.
+    namespace_policies: std::collections::HashMap<String, QuotaPolicy>,
+    /// Default policy for namespaces without a `KrishivQueue` object.
+    default_policy: QuotaPolicy,
+}
+
+impl CrdQueueManager {
+    /// Build from a list of `KrishivQueue` resources.
+    pub fn from_queues(queues: impl IntoIterator<Item = KrishivQueue>) -> Self {
+        let namespace_policies = queues
+            .into_iter()
+            .map(|q| (q.spec.namespace.clone(), q.quota_policy()))
+            .collect();
+        Self {
+            namespace_policies,
+            default_policy: QuotaPolicy::default(),
+        }
+    }
+
+    /// Build with an explicit default policy applied to unmatched namespaces.
+    pub fn with_default(
+        queues: impl IntoIterator<Item = KrishivQueue>,
+        default_policy: QuotaPolicy,
+    ) -> Self {
+        let mut mgr = Self::from_queues(queues);
+        mgr.default_policy = default_policy;
+        mgr
+    }
+}
+
+impl QueueManager for CrdQueueManager {
+    fn admit(
+        &self,
+        spec: &krishiv_proto::JobSpec,
+        quota: &NamespaceQuotaSnapshot,
+    ) -> SubmitOutcome {
+        let policy = spec
+            .namespace_id()
+            .and_then(|ns| self.namespace_policies.get(ns))
+            .unwrap_or(&self.default_policy);
+
+        if let Some(limit) = policy.max_concurrent_jobs {
+            if quota.active_job_count >= limit {
+                return SubmitOutcome::Queued {
+                    position: quota.active_job_count.saturating_sub(limit),
+                };
+            }
+        }
+        if let Some(limit) = policy.cpu_nanos_limit {
+            if quota
+                .cpu_nanos_reserved
+                .saturating_add(spec.cpu_limit_nanos().unwrap_or(0))
+                > limit
+            {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        if let Some(limit) = policy.memory_bytes_limit {
+            if quota
+                .memory_bytes_reserved
+                .saturating_add(spec.memory_limit_bytes().unwrap_or(0))
+                > limit
+            {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        SubmitOutcome::Accepted
+    }
+
+    fn on_job_complete(&self, _job_id: &krishiv_proto::JobId, _usage: &ResourceUsage) {}
+}
+
 #[cfg(test)]
 mod tests {
     use krishiv_proto::{
@@ -1626,5 +1776,78 @@ mod tests {
         );
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
         assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Assigned);
+    }
+
+    // ── R7.1 CrdQueueManager tests ───────────────────────────────────────────
+
+    use super::{CrdQueueManager, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus};
+    use krishiv_scheduler::{NamespaceQuotaSnapshot, QueueManager, SubmitOutcome};
+
+    fn make_queue(namespace: &str, max_jobs: usize) -> KrishivQueue {
+        KrishivQueue {
+            spec: KrishivQueueSpec {
+                namespace: namespace.to_owned(),
+                cpu_nanos_limit: None,
+                memory_bytes_limit: None,
+                max_concurrent_jobs: Some(max_jobs),
+                priority: 128,
+            },
+            status: KrishivQueueStatus::default(),
+        }
+    }
+
+    #[test]
+    fn crd_queue_manager_admits_within_limit() {
+        let mgr = CrdQueueManager::from_queues([make_queue("team-a", 3)]);
+        let spec = JobId::try_new("j").unwrap();
+        let job_spec = krishiv_proto::JobSpec::new(spec, "test", krishiv_proto::JobKind::Batch)
+            .with_namespace("team-a");
+        let quota = NamespaceQuotaSnapshot {
+            namespace_id: Some("team-a".to_owned()),
+            active_job_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(mgr.admit(&job_spec, &quota), SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn crd_queue_manager_queues_when_namespace_limit_reached() {
+        let mgr = CrdQueueManager::from_queues([make_queue("team-b", 1)]);
+        let job_spec = krishiv_proto::JobSpec::new(
+            JobId::try_new("j2").unwrap(),
+            "test",
+            krishiv_proto::JobKind::Batch,
+        )
+        .with_namespace("team-b");
+        let quota = NamespaceQuotaSnapshot {
+            namespace_id: Some("team-b".to_owned()),
+            active_job_count: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            mgr.admit(&job_spec, &quota),
+            SubmitOutcome::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn crd_queue_manager_admits_unknown_namespace_with_default_policy() {
+        let mgr = CrdQueueManager::from_queues([make_queue("team-c", 1)]);
+        let job_spec = krishiv_proto::JobSpec::new(
+            JobId::try_new("j3").unwrap(),
+            "test",
+            krishiv_proto::JobKind::Batch,
+        );
+        // No namespace set — default policy has no limits.
+        let quota = NamespaceQuotaSnapshot::default();
+        assert_eq!(mgr.admit(&job_spec, &quota), SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn krishiv_queue_derives_correct_quota_policy() {
+        let q = make_queue("eng", 5);
+        let policy = q.quota_policy();
+        assert_eq!(policy.max_concurrent_jobs, Some(5));
+        assert!(policy.cpu_nanos_limit.is_none());
     }
 }

@@ -435,6 +435,14 @@ pub struct JobSpec {
     checkpoint_interval_ms: Option<u64>,
     /// Storage path for checkpoint data. `None` means checkpointing is disabled.
     checkpoint_storage_path: Option<String>,
+    /// Scheduling priority. 0 = lowest, 255 = highest. Default: 128 (normal).
+    priority: u8,
+    /// Namespace for quota and isolation grouping. `None` = default namespace.
+    namespace_id: Option<String>,
+    /// CPU time reservation in nanoseconds for admission control.
+    cpu_limit_nanos: Option<u64>,
+    /// Memory reservation in bytes for admission control.
+    memory_limit_bytes: Option<u64>,
 }
 
 impl JobSpec {
@@ -447,6 +455,10 @@ impl JobSpec {
             stages: Vec::new(),
             checkpoint_interval_ms: None,
             checkpoint_storage_path: None,
+            priority: 128,
+            namespace_id: None,
+            cpu_limit_nanos: None,
+            memory_limit_bytes: None,
         }
     }
 
@@ -462,6 +474,34 @@ impl JobSpec {
     pub fn with_checkpoint(mut self, interval_ms: u64, storage_path: impl Into<String>) -> Self {
         self.checkpoint_interval_ms = Some(interval_ms);
         self.checkpoint_storage_path = Some(storage_path.into());
+        self
+    }
+
+    /// Set the scheduling priority (0 = lowest, 255 = highest; default 128).
+    #[must_use]
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Assign this job to a resource governance namespace.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace_id: impl Into<String>) -> Self {
+        self.namespace_id = Some(namespace_id.into());
+        self
+    }
+
+    /// Reserve CPU time (nanoseconds) for admission control.
+    #[must_use]
+    pub fn with_cpu_limit_nanos(mut self, nanos: u64) -> Self {
+        self.cpu_limit_nanos = Some(nanos);
+        self
+    }
+
+    /// Reserve memory (bytes) for admission control.
+    #[must_use]
+    pub fn with_memory_limit_bytes(mut self, bytes: u64) -> Self {
+        self.memory_limit_bytes = Some(bytes);
         self
     }
 
@@ -498,6 +538,26 @@ impl JobSpec {
     /// Storage path for checkpoint data, if checkpointing is enabled.
     pub fn checkpoint_storage_path(&self) -> Option<&str> {
         self.checkpoint_storage_path.as_deref()
+    }
+
+    /// Scheduling priority (0 = lowest, 255 = highest; default 128).
+    pub fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    /// Namespace for quota grouping, if set.
+    pub fn namespace_id(&self) -> Option<&str> {
+        self.namespace_id.as_deref()
+    }
+
+    /// CPU time reservation in nanoseconds, if set.
+    pub fn cpu_limit_nanos(&self) -> Option<u64> {
+        self.cpu_limit_nanos
+    }
+
+    /// Memory reservation in bytes, if set.
+    pub fn memory_limit_bytes(&self) -> Option<u64> {
+        self.memory_limit_bytes
     }
 }
 
