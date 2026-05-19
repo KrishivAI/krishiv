@@ -60,7 +60,7 @@ Out of scope:
 - [x] Define restore flow — `Coordinator::restore_job_from_checkpoint` validates epoch, checks parallelism, returns `CheckpointMetadata`.
 - [x] Define rescaling metadata model — `docs/architecture/rescaling-model.md`: savepoint+repartition is the only supported path; live rescaling and coordinator-side repartition are post-R6; restore rejects mismatched parallelism.
 - [x] Define state schema evolution baseline — `docs/architecture/rescaling-model.md` §3: reject unknown versions immediately (already enforced in `InMemoryStateBackend::load_snapshot` and `CheckpointMetadata::validate`); version increment policy documented; RocksDB schema evolution deferred.
-- [ ] Document exactly-once certification rules.
+- [ ] Document exactly-once certification rules — write `docs/architecture/exactly-once-certification.md` naming the certified triple; mark all other combinations as at-least-once.
 
 ## API And Interface Deliverables
 
@@ -87,8 +87,8 @@ Out of scope:
 - [x] Implement savepoint creation — `CheckpointCoordinator::initiate_savepoint()` + `Coordinator::savepoint_job()`.
 - [x] Implement savepoint restore — `Coordinator::restore_job_from_checkpoint()` reads and validates metadata; `chaos_e6` test covers rolling-upgrade restore path.
 - [x] Implement rolling upgrade protocol: coordinated savepoint → coordinator binary upgrade → restore streaming jobs — documented in `docs/architecture/rescaling-model.md`; `chaos_e6` integration test validates the epoch sequence.
-- [ ] Implement failed-checkpoint cleanup — post-R6; abort already discards staged sink output (chaos_3).
-- [ ] Implement Kafka transaction support where certified — deferred to post-R6.
+- [ ] Implement failed-checkpoint cleanup — **deferred post-R6**; abort already discards staged sink output (chaos_3 verifies this).
+- [ ] Implement Kafka transaction support where certified — **deferred post-R6**.
 - [x] Add executor kill/restart recovery path — `chaos_2` test: executor kill mid-checkpoint triggers clean abort; `TaskRunner::handle_initiate_checkpoint` in `krishiv-executor`.
 - [x] Add coordinator restart recovery path from durable checkpoint metadata — `chaos_1a` test; `Coordinator::recover_from_store` calls `CheckpointCoordinator::recover_from_storage()`.
 - [x] Add stale epoch rejection — `handle_checkpoint_ack` rejects acks with mismatched fencing token; `chaos_1` test covers coordinator kill then restart without duplicate commit.
@@ -105,7 +105,7 @@ Out of scope:
 - [x] Two-phase commit sink tests pass.
 - [x] Savepoint restore tests pass.
 - [x] Rolling upgrade test: streaming job survives coordinator binary upgrade via savepoint → upgrade → restore cycle without duplicate output (`chaos_e6`).
-- [ ] Failed checkpoint cleanup tests pass.
+- [ ] Failed checkpoint cleanup tests pass — deferred post-R6.
 - [x] State schema evolution baseline tests pass.
 - [x] **Chaos test 1:** Kill the coordinator mid-checkpoint; restart; verify no duplicate output on the certified path (`chaos_1_coordinator_kill_mid_checkpoint_no_duplicate_commit`).
 - [x] **Chaos test 1a:** Restart the coordinator from durable checkpoint metadata and verify checkpoint ownership resumes safely (`chaos_1a_coordinator_restart_recovers_from_durable_metadata`).
