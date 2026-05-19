@@ -60,7 +60,7 @@ Out of scope:
 - [x] Define restore flow — `Coordinator::restore_job_from_checkpoint` validates epoch, checks parallelism, returns `CheckpointMetadata`.
 - [x] Define rescaling metadata model — `docs/architecture/rescaling-model.md`: savepoint+repartition is the only supported path; live rescaling and coordinator-side repartition are post-R6; restore rejects mismatched parallelism.
 - [x] Define state schema evolution baseline — `docs/architecture/rescaling-model.md` §3: reject unknown versions immediately (already enforced in `InMemoryStateBackend::load_snapshot` and `CheckpointMetadata::validate`); version increment policy documented; RocksDB schema evolution deferred.
-- [ ] Document exactly-once certification rules — write `docs/architecture/exactly-once-certification.md` naming the certified triple; mark all other combinations as at-least-once.
+- [x] Document exactly-once certification rules — write `docs/architecture/exactly-once-certification.md` naming the certified triple; mark all other combinations as at-least-once.
 
 ## API And Interface Deliverables
 
@@ -125,7 +125,7 @@ R6 is complete when:
 - [x] Completed checkpoints can be listed and inspected.
 - [x] Checkpoint/savepoint metadata versions are readable across supported upgrades.
 - [x] Fencing token checks prevent a stale coordinator from committing a superseded epoch.
-- [ ] Exactly-once documentation explicitly names only the certified triple; all other combinations are documented as at-least-once.
+- [x] Exactly-once documentation explicitly names only the certified triple; all other combinations are documented as at-least-once.
 
 ## Risks And Mitigations
 

@@ -325,13 +325,22 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None. R6 complete. Ready for R7.
+- None. R6 fully closed. Pre-R7 hardening complete. Ready for R7.1.
 
 ## Next Steps
 
-1. **R7 query optimization**: Adaptive query execution (AQE), cost-based optimizer, statistics collection.
-2. **Live Kafka E2E** (optional R6 hardening): wire `rdkafka` behind `kafka-runtime` Cargo feature + Redpanda Docker Compose once R6 connector certification begins.
-3. **Exactly-once certification doc**: Write `docs/architecture/exactly-once-certification.md` naming the certified triple and marking all other combinations as at-least-once (last open R6 acceptance gate item).
+1. **R7.1 resource manager**: Implement `CrdQueueManager` (K8s) and `ConfigFileQueueManager` (process mode); add `KrishivQueue` CRD; wire quota enforcement into `submit_job` via `QueueManager`.
+2. **R7.1 admission tests**: Jobs above quota queued, cost metrics visible in status API.
+3. **R7.2 backpressure**: Credit-based flow control, bounded operator queues, source throttling.
+
+## Pre-R7 Hardening (completed this session)
+
+- **Exactly-once certification doc**: `docs/architecture/exactly-once-certification.md` written — names the certified triple, marks all other combinations at-least-once, cross-references chaos tests. R6 acceptance gate now fully closed.
+- **Checkpoint timer wired**: `CheckpointCoordinator::try_tick(elapsed_ms)` added; `advance_heartbeat_clock` drives per-job checkpoint interval timers automatically. `CoordinatorConfig::tick_period_ms` (default 1 000 ms) controls the tick-to-ms conversion. 3 new tests.
+- **`QueueManager` trait stabilized**: `QueueManager` + `InMemoryQueueManager` + `SubmitOutcome { Accepted, Queued }` added to `krishiv-scheduler`. `Coordinator::with_queue_manager` builder wired. `submit_job` returns `SchedulerResult<SubmitOutcome>`. 3 new tests.
+- **R7 tracker updated**: Pre-R7 architectural decisions documented in `docs/implementation/r7-resource-governance-and-adaptivity.md`.
+
+**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures (74 scheduler tests).
 
 ## Known Blockers
 

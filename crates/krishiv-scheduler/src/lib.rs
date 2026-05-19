@@ -48,6 +48,46 @@ pub enum TaskUpdateOutcome {
     Duplicate,
 }
 
+/// Result of a `Coordinator::submit_job` call.
+///
+/// R7.1 introduces `Queued` when admission control cannot immediately place the
+/// job.  All current callers receive `Accepted` because `InMemoryQueueManager`
+/// always admits.  Code that discards the outcome (`.unwrap()`, `?`) requires
+/// no change; code that pattern-matches must handle both variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Job was admitted and is now scheduled.
+    Accepted,
+    /// Job was held by the admission controller; not yet running.
+    ///
+    /// `position` is a 0-based index in the admission queue.
+    Queued { position: usize },
+}
+
+/// Admission decision returned by a `QueueManager`.
+///
+/// Controls whether a newly submitted job enters the scheduler immediately or
+/// waits behind other jobs.  Implementations are provided for process mode
+/// (`InMemoryQueueManager`) and will be added for Kubernetes CRD-backed queues
+/// in R7.1 (`CrdQueueManager`).
+pub trait QueueManager: Send + Sync + fmt::Debug {
+    /// Decide whether `spec` may be admitted now.
+    fn admit(&self, spec: &JobSpec) -> SubmitOutcome;
+}
+
+/// Always-admit queue manager for process mode and tests.
+///
+/// Every job is admitted immediately.  R7.1 will add quota-aware and
+/// CRD-backed implementations; this type remains the default.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryQueueManager;
+
+impl QueueManager for InMemoryQueueManager {
+    fn admit(&self, _spec: &JobSpec) -> SubmitOutcome {
+        SubmitOutcome::Accepted
+    }
+}
+
 /// Coordinator behavior knobs for deterministic R2 scheduler tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorConfig {
@@ -59,6 +99,11 @@ pub struct CoordinatorConfig {
     /// running streaming tasks need time to re-register after a coordinator
     /// restart; evicting them immediately would force a full re-run.
     streaming_reattach_grace_ticks: u64,
+    /// Wall-clock milliseconds represented by one heartbeat tick.
+    ///
+    /// Used to convert tick counts into elapsed-time estimates for the
+    /// per-job checkpoint interval timer.  Defaults to 1 000 ms (1 second).
+    tick_period_ms: u64,
 }
 
 impl CoordinatorConfig {
@@ -69,6 +114,7 @@ impl CoordinatorConfig {
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
+            tick_period_ms: 1_000,
         }
     }
 
@@ -83,6 +129,13 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_streaming_reattach_grace_ticks(mut self, ticks: u64) -> Self {
         self.streaming_reattach_grace_ticks = ticks;
+        self
+    }
+
+    /// Set the wall-clock duration of one heartbeat tick in milliseconds.
+    #[must_use]
+    pub fn with_tick_period_ms(mut self, ms: u64) -> Self {
+        self.tick_period_ms = ms.max(1);
         self
     }
 
@@ -104,6 +157,11 @@ impl CoordinatorConfig {
     /// Grace period after coordinator restart before streaming executor leases expire.
     pub fn streaming_reattach_grace_ticks(&self) -> u64 {
         self.streaming_reattach_grace_ticks
+    }
+
+    /// Wall-clock milliseconds per heartbeat tick.
+    pub fn tick_period_ms(&self) -> u64 {
+        self.tick_period_ms
     }
 }
 
@@ -233,6 +291,9 @@ pub struct CheckpointCoordinator {
     pending_savepoint_label: Option<String>,
     /// Whether the next commit should be flagged as a savepoint.
     pending_is_savepoint: bool,
+    /// Accumulated wall-clock ms since the last checkpoint was initiated.
+    /// Driven by `try_tick`; resets on each successful `initiate()`.
+    elapsed_ms: u64,
 }
 
 impl fmt::Debug for CheckpointCoordinator {
@@ -267,6 +328,7 @@ impl CheckpointCoordinator {
             state: CheckpointCoordinatorState::Idle,
             pending_savepoint_label: None,
             pending_is_savepoint: false,
+            elapsed_ms: 0,
         }
     }
 
@@ -282,6 +344,7 @@ impl CheckpointCoordinator {
             ));
         }
         self.current_epoch += 1;
+        self.elapsed_ms = 0;
         self.pending_acks.clear();
         // Wall-clock approximation using a monotonic epoch counter for determinism.
         let initiated_at_ms = self.current_epoch * self.interval_ms;
@@ -290,6 +353,26 @@ impl CheckpointCoordinator {
             initiated_at_ms,
         };
         Ok(self.current_epoch)
+    }
+
+    /// Advance the checkpoint clock by `elapsed_ms` milliseconds.
+    ///
+    /// Automatically initiates a new checkpoint epoch when accumulated time
+    /// crosses `interval_ms`.  Skips initiation while a checkpoint is already
+    /// awaiting acks — the next tick after the in-flight checkpoint commits
+    /// will fire the next epoch.
+    ///
+    /// Returns `Some(epoch)` if a checkpoint was initiated, `None` otherwise.
+    pub fn try_tick(&mut self, elapsed_ms: u64) -> Option<u64> {
+        if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
+            return None;
+        }
+        self.elapsed_ms = self.elapsed_ms.saturating_add(elapsed_ms);
+        if self.elapsed_ms >= self.interval_ms {
+            self.initiate().ok()
+        } else {
+            None
+        }
     }
 
     /// Initiate a savepoint (triggered checkpoint with `is_savepoint=true`).
@@ -503,6 +586,9 @@ pub struct Coordinator {
     store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
     /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
     checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
+    /// Controls admission of new jobs.  Defaults to `InMemoryQueueManager`
+    /// (always admits).  R7.1 will add quota-aware implementations.
+    queue_manager: Arc<dyn QueueManager>,
     /// Jobs that have just reached a terminal state and need shuffle GC.
     /// Drained by the coordinator binary's tick loop.
     gc_ready_jobs: Vec<JobId>,
@@ -939,6 +1025,7 @@ impl Coordinator {
             jobs: Vec::new(),
             store: None,
             checkpoint_coordinators: HashMap::new(),
+            queue_manager: Arc::new(InMemoryQueueManager),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
@@ -949,6 +1036,15 @@ impl Coordinator {
     #[must_use]
     pub fn with_store(mut self, store: impl MetadataStore + 'static) -> Self {
         self.store = Some(Arc::new(Mutex::new(store)));
+        self
+    }
+
+    /// Replace the default `InMemoryQueueManager` with a custom admission controller.
+    ///
+    /// R7.1 will use this to inject quota-aware and CRD-backed queue managers.
+    #[must_use]
+    pub fn with_queue_manager(mut self, qm: impl QueueManager + 'static) -> Self {
+        self.queue_manager = Arc::new(qm);
         self
     }
 
@@ -970,6 +1066,7 @@ impl Coordinator {
             jobs: Vec::new(),
             store: None,
             checkpoint_coordinators: HashMap::new(),
+            queue_manager: Arc::new(InMemoryQueueManager),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
@@ -1076,6 +1173,13 @@ impl Coordinator {
             self.reset_running_tasks_for_lost_executor(lost_id);
             evicted.push(lost_id.clone());
         }
+
+        // Drive per-job checkpoint interval timers.
+        let elapsed_ms = ticks.saturating_mul(self.config.tick_period_ms());
+        for coord in self.checkpoint_coordinators.values_mut() {
+            coord.try_tick(elapsed_ms);
+        }
+
         Ok(evicted)
     }
 
@@ -1118,7 +1222,7 @@ impl Coordinator {
     }
 
     /// Submit a job and statically assign its tasks.
-    pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<()> {
+    pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         self.ensure_active()?;
         validate_job(&spec)?;
 
@@ -1126,6 +1230,12 @@ impl Coordinator {
             return Err(SchedulerError::DuplicateJob {
                 job_id: spec.job_id().clone(),
             });
+        }
+
+        // Admission control: return early if the queue manager holds the job.
+        let outcome = self.queue_manager.admit(&spec);
+        if let SubmitOutcome::Queued { .. } = &outcome {
+            return Ok(outcome);
         }
 
         // Create a CheckpointCoordinator for streaming jobs with checkpoint config.
@@ -1162,7 +1272,7 @@ impl Coordinator {
             s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
         }
         self.jobs.push(record);
-        Ok(())
+        Ok(SubmitOutcome::Accepted)
     }
 
     /// Mutable access to the checkpoint coordinator for a specific job.
@@ -1275,7 +1385,7 @@ impl Coordinator {
         &mut self,
         job_id: JobId,
         plan: &LogicalPlan,
-    ) -> SchedulerResult<()> {
+    ) -> SchedulerResult<SubmitOutcome> {
         self.submit_job(job_spec_from_logical_plan(job_id, plan)?)
     }
 
@@ -1284,7 +1394,7 @@ impl Coordinator {
         &mut self,
         job_id: JobId,
         plan: &PhysicalPlan,
-    ) -> SchedulerResult<()> {
+    ) -> SchedulerResult<SubmitOutcome> {
         self.submit_job(job_spec_from_physical_plan(job_id, plan)?)
     }
 
@@ -3634,8 +3744,9 @@ mod tests {
     use super::{
         CheckpointCoordinator, CheckpointCoordinatorState, Coordinator, CoordinatorConfig,
         CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryMetadataStore,
-        JsonFileMetadataStore, LeaderElection, MetadataStore, SchedulerError, SharedCoordinator,
-        SingleNodeElection, StaticScheduler, TaskUpdateOutcome, job_spec_from_logical_plan,
+        InMemoryQueueManager, JsonFileMetadataStore, LeaderElection, MetadataStore, QueueManager,
+        SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
+        TaskUpdateOutcome, job_spec_from_logical_plan,
         serve_coordinator_executor_grpc_with_listener,
     };
 
@@ -6330,6 +6441,141 @@ mod tests {
             coord_b.list_epochs().unwrap(),
             vec![1, 2],
             "epoch 3 not committed yet — only 1 and 2 exist"
+        );
+    }
+
+    // ── Item 2: checkpoint timer wired into advance_heartbeat_clock ──────────
+
+    #[test]
+    fn checkpoint_coordinator_try_tick_fires_after_interval() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-tick").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id, storage, 5_000, 0);
+
+        // Accumulate 4 000 ms — below the 5 000 ms interval.
+        assert_eq!(coord.try_tick(4_000), None, "not yet due");
+        // Cross the threshold: 4 000 + 2 000 = 6 000 >= 5 000.
+        assert_eq!(coord.try_tick(2_000), Some(1), "epoch 1 initiated");
+        // Epoch 1 is now in AwaitingAcks. Abort it to return to Idle.
+        coord.abort_epoch("test reset");
+        // Clock resets on initiate: another 5 000 ms triggers epoch 2.
+        assert_eq!(coord.try_tick(5_000), Some(2), "epoch 2 initiated");
+    }
+
+    #[test]
+    fn checkpoint_coordinator_try_tick_skips_while_awaiting_acks() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-tick-busy").unwrap();
+        // expected_task_count = 1 so the coordinator will wait for an ack.
+        let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 1);
+
+        // First tick crosses the interval — epoch 1 initiated (now AwaitingAcks).
+        assert_eq!(coord.try_tick(1_000), Some(1));
+        // While awaiting acks, further ticks must not initiate.
+        assert_eq!(
+            coord.try_tick(10_000),
+            None,
+            "in-flight checkpoint blocks next"
+        );
+    }
+
+    #[test]
+    fn advance_heartbeat_clock_drives_checkpoint_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path().to_str().unwrap().to_owned();
+        let job_id = JobId::try_new("job-clock").unwrap();
+
+        let config = CoordinatorConfig::new(1, 3).with_tick_period_ms(1_000);
+        let coordinator_id = CoordinatorId::try_new("coord-clock").unwrap();
+        let mut coordinator = Coordinator::active_with_config(coordinator_id, config);
+
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "host-1", 2))
+            .unwrap();
+
+        // Submit a streaming job with a 3-second checkpoint interval.
+        let task_id = TaskId::try_new("t1").unwrap();
+        let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage-1")
+            .with_task(TaskSpec::new(task_id, "task-1"));
+        let spec = JobSpec::new(job_id.clone(), "clock-test", JobKind::Streaming)
+            .with_stage(stage)
+            .with_checkpoint(3_000, storage_path);
+        coordinator.submit_job(spec).unwrap();
+
+        // 2 ticks × 1 000 ms = 2 000 ms < 3 000 ms — no checkpoint yet.
+        coordinator.advance_heartbeat_clock(2).unwrap();
+        assert_eq!(
+            coordinator
+                .checkpoint_coordinator(&job_id)
+                .unwrap()
+                .current_epoch(),
+            0,
+            "epoch 0 — not yet due"
+        );
+
+        // 2 more ticks: 4 000 ms total >= 3 000 ms — epoch 1 fires.
+        coordinator.advance_heartbeat_clock(2).unwrap();
+        assert_eq!(
+            coordinator
+                .checkpoint_coordinator(&job_id)
+                .unwrap()
+                .current_epoch(),
+            1,
+            "epoch 1 initiated after 4 ticks × 1 000 ms"
+        );
+    }
+
+    // ── Items 3+4: QueueManager trait + SubmitOutcome ────────────────────────
+
+    #[test]
+    fn in_memory_queue_manager_always_accepts() {
+        let qm = InMemoryQueueManager;
+        let spec = demo_job();
+        assert_eq!(qm.admit(&spec), SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn coordinator_uses_queue_manager_on_submit() {
+        let coordinator_id = CoordinatorId::try_new("coord-qm").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-qm").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "host-1", 2))
+            .unwrap();
+
+        let outcome = coordinator.submit_job(demo_job()).unwrap();
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn coordinator_with_blocking_queue_manager_returns_queued() {
+        #[derive(Debug)]
+        struct BlockAllQueueManager;
+        impl QueueManager for BlockAllQueueManager {
+            fn admit(&self, _spec: &JobSpec) -> SubmitOutcome {
+                SubmitOutcome::Queued { position: 0 }
+            }
+        }
+
+        let coordinator_id = CoordinatorId::try_new("coord-block").unwrap();
+        let mut coordinator =
+            Coordinator::active(coordinator_id).with_queue_manager(BlockAllQueueManager);
+
+        let executor_id = ExecutorId::try_new("exec-block").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "host-1", 2))
+            .unwrap();
+
+        // Job is queued, not accepted — coordinator has no JobRecord yet.
+        let outcome = coordinator.submit_job(demo_job()).unwrap();
+        assert_eq!(outcome, SubmitOutcome::Queued { position: 0 });
+        assert!(
+            coordinator
+                .job_snapshot(&demo_job().job_id().clone())
+                .is_err(),
+            "queued job must not appear in job list"
         );
     }
 }
