@@ -830,7 +830,8 @@ pub struct Coordinator {
     state: CoordinatorState,
     config: CoordinatorConfig,
     executors: ExecutorRegistry,
-    jobs: Vec<JobRecord>,
+    /// O(1) job lookup by id.  Replaces Vec<JobRecord> linear scan.
+    jobs: HashMap<JobId, JobRecord>,
     store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
     /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
     checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
@@ -1206,6 +1207,48 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
     }
 }
 
+// ── R8 auth interceptor skeleton ─────────────────────────────────────────────
+
+/// Authentication context extracted by the auth interceptor.
+///
+/// In R8.1+ this will carry a validated bearer token or mTLS peer identity.
+/// For now it is always `Anonymous` — the interceptor is a no-op that ensures
+/// every future call site already accepts an `AuthContext` without structural
+/// changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthContext {
+    /// No credential presented; accepted in development / internal-only deployments.
+    Anonymous,
+    /// A validated bearer token (R8.1 wiring placeholder).
+    Bearer { subject: String },
+}
+
+impl AuthContext {
+    /// Return `true` if this context represents a known authenticated subject.
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, Self::Bearer { .. })
+    }
+
+    /// Subject string, or `"anonymous"` for unauthenticated callers.
+    pub fn subject(&self) -> &str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Bearer { subject } => subject.as_str(),
+        }
+    }
+}
+
+/// Extract an `AuthContext` from the gRPC request metadata.
+///
+/// Currently always returns `Anonymous`.  In R8.1 this will validate the
+/// `Authorization: Bearer <token>` header and return `Bearer { subject }`.
+pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthContext {
+    // R8.1 wiring: look up the "authorization" header, validate the JWT,
+    // and return Bearer { subject: claims.sub }.
+    let _ = metadata; // suppress unused warning; real logic added in R8.1
+    AuthContext::Anonymous
+}
+
 /// Build the generated tonic server around the scheduler-backed gRPC adapter.
 pub fn coordinator_executor_grpc_server(
     coordinator: SharedCoordinator,
@@ -1295,7 +1338,7 @@ impl Coordinator {
                 config.heartbeat_timeout_ticks(),
                 config.memory_threshold_bytes(),
             ),
-            jobs: Vec::new(),
+            jobs: HashMap::new(),
             store: None,
             checkpoint_coordinators: HashMap::new(),
             queue_manager: Arc::new(InMemoryQueueManager),
@@ -1455,7 +1498,7 @@ impl Coordinator {
 
     /// Update a task record's last-known watermark and source offset from executor-reported state.
     fn apply_streaming_task_state(&mut self, state: &StreamingTaskState) {
-        for job in &mut self.jobs {
+        for job in self.jobs.values_mut() {
             for stage in &mut job.stages {
                 for task in stage.tasks_mut() {
                     if task.task_id() == &state.task_id {
@@ -1515,7 +1558,7 @@ impl Coordinator {
 
     /// Returns true if the executor owns at least one Running task in a streaming job.
     fn executor_has_streaming_running_tasks(&self, executor_id: &ExecutorId) -> bool {
-        self.jobs.iter().any(|job| {
+        self.jobs.values().any(|job| {
             job.spec.kind() == JobKind::Streaming
                 && job.stages.iter().any(|stage| {
                     stage.tasks().iter().any(|task| {
@@ -1537,9 +1580,7 @@ impl Coordinator {
     /// via `CheckpointCoordinator::recover_from_storage`.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         for record in store.jobs() {
-            if !self.jobs.iter().any(|j| j.job_id() == record.job_id()) {
-                self.jobs.push(record.clone());
-            }
+            self.jobs.entry(record.job_id().clone()).or_insert_with(|| record.clone());
         }
         // Recover checkpoint coordinators from storage.
         for coord in self.checkpoint_coordinators.values_mut() {
@@ -1568,7 +1609,7 @@ impl Coordinator {
             namespace_id: namespace_id.map(str::to_owned),
             ..Default::default()
         };
-        for job in &self.jobs {
+        for job in self.jobs.values() {
             if job.state().is_terminal() {
                 continue;
             }
@@ -1590,7 +1631,7 @@ impl Coordinator {
         self.ensure_active()?;
         validate_job(&spec)?;
 
-        if self.jobs.iter().any(|job| job.job_id() == spec.job_id()) {
+        if self.jobs.contains_key(spec.job_id()) {
             return Err(SchedulerError::DuplicateJob {
                 job_id: spec.job_id().clone(),
             });
@@ -1632,7 +1673,7 @@ impl Coordinator {
             s.save_job(&record).ok();
             s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
         }
-        self.jobs.push(record);
+        self.jobs.insert(record.job_id().clone(), record);
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1787,15 +1828,15 @@ impl Coordinator {
     pub fn stability_metrics(&self) -> StabilityMetrics {
         StabilityMetrics {
             heartbeat_ages: self.executors.heartbeat_ages(),
-            failed_assignments: self.jobs.iter().map(JobRecord::failed_task_count).sum(),
-            retry_count: self.jobs.iter().map(JobRecord::retry_count).sum(),
-            running_task_count: self.jobs.iter().map(JobRecord::running_task_count).sum(),
+            failed_assignments: self.jobs.values().map(JobRecord::failed_task_count).sum(),
+            retry_count: self.jobs.values().map(JobRecord::retry_count).sum(),
+            running_task_count: self.jobs.values().map(JobRecord::running_task_count).sum(),
             shuffle_partitions_available: self
                 .jobs
-                .iter()
+                .values()
                 .map(JobRecord::shuffle_partitions_available_count)
                 .sum(),
-            shuffle_bytes_written: self.jobs.iter().map(JobRecord::shuffle_bytes_written).sum(),
+            shuffle_bytes_written: self.jobs.values().map(JobRecord::shuffle_bytes_written).sum(),
         }
     }
 
@@ -1919,8 +1960,7 @@ impl Coordinator {
         // Snapshot the job's current state and resource usage after the update.
         let (is_terminal, usage) = self
             .jobs
-            .iter()
-            .find(|j| j.job_id() == &job_id)
+            .get(&job_id)
             .map(|r| (r.state().is_terminal(), r.resource_usage.clone()))
             .unwrap_or((false, ResourceUsage::zero()));
 
@@ -1930,7 +1970,7 @@ impl Coordinator {
             // Notify the queue manager so it can release reserved capacity.
             self.queue_manager.on_job_complete(&job_id, &usage);
         }
-        if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
+        if let Some(record) = self.jobs.get(&job_id) {
             if let Some(store) = &self.store {
                 let mut s = store.lock().unwrap();
                 s.save_job(record).ok();
@@ -1959,7 +1999,7 @@ impl Coordinator {
 
     /// Snapshot all known jobs.
     pub fn job_snapshots(&self) -> Vec<JobSnapshot> {
-        self.jobs.iter().map(JobRecord::snapshot).collect()
+        self.jobs.values().map(JobRecord::snapshot).collect()
     }
 
     /// Snapshot all known executors.
@@ -1968,7 +2008,7 @@ impl Coordinator {
     }
 
     fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
-        for job in &mut self.jobs {
+        for job in self.jobs.values_mut() {
             let mut job_affected = false;
             for stage in &mut job.stages {
                 let mut stage_affected = false;
@@ -2006,21 +2046,15 @@ impl Coordinator {
     }
 
     fn find_job(&self, job_id: &JobId) -> SchedulerResult<&JobRecord> {
-        self.jobs
-            .iter()
-            .find(|job| job.job_id() == job_id)
-            .ok_or_else(|| SchedulerError::UnknownJob {
-                job_id: job_id.clone(),
-            })
+        self.jobs.get(job_id).ok_or_else(|| SchedulerError::UnknownJob {
+            job_id: job_id.clone(),
+        })
     }
 
     fn find_job_mut(&mut self, job_id: &JobId) -> SchedulerResult<&mut JobRecord> {
-        self.jobs
-            .iter_mut()
-            .find(|job| job.job_id() == job_id)
-            .ok_or_else(|| SchedulerError::UnknownJob {
-                job_id: job_id.clone(),
-            })
+        self.jobs.get_mut(job_id).ok_or_else(|| SchedulerError::UnknownJob {
+            job_id: job_id.clone(),
+        })
     }
 }
 
@@ -5818,12 +5852,13 @@ mod tests {
             ))
             .unwrap();
         coordinator.submit_job(demo_job()).unwrap();
-        store.save_job(&coordinator.jobs[0]).unwrap();
+        let record = coordinator.jobs.values().next().unwrap();
+        store.save_job(record).unwrap();
         assert_eq!(store.jobs().len(), 1);
         assert_eq!(store.jobs()[0].job_id(), &job_id);
 
         // Overwrite with the same record is idempotent.
-        store.save_job(&coordinator.jobs[0]).unwrap();
+        store.save_job(coordinator.jobs.values().next().unwrap()).unwrap();
         assert_eq!(store.jobs().len(), 1);
     }
 
@@ -5847,7 +5882,7 @@ mod tests {
         ))
         .unwrap();
         prev.submit_job(demo_job()).unwrap();
-        store.save_job(&prev.jobs[0]).unwrap();
+        store.save_job(prev.jobs.values().next().unwrap()).unwrap();
 
         let mut coordinator = Coordinator::active(coord_id);
         coordinator.recover_from_store(&store).unwrap();
@@ -5958,7 +5993,7 @@ mod tests {
         let mut external_store = InMemoryMetadataStore::default();
         // Save the job record into the external store by recovering c1's state.
         // (In production the write-through would have done this automatically.)
-        for job in &c1.jobs {
+        for job in c1.jobs.values() {
             external_store.save_job(job).unwrap();
         }
 
