@@ -84,6 +84,10 @@ pub trait StateBackend: Send + Sync {
     fn delete(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()>;
     /// Remove all keys in `namespace`.
     fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()>;
+    /// List all namespaces present in this backend (R5.2 inspection API).
+    fn list_namespaces(&self) -> StateResult<Vec<Namespace>>;
+    /// List all keys stored in `namespace` (R5.2 inspection API).
+    fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>>;
 }
 
 // ── InMemoryStateBackend ──────────────────────────────────────────────────────
@@ -140,6 +144,25 @@ impl StateBackend for InMemoryStateBackend {
         let name = namespace.state_name().to_owned();
         self.store.retain(|(o, n, _), _| o != &op || n != &name);
         Ok(())
+    }
+
+    fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (op_id, state_name, _) in self.store.keys() {
+            seen.insert(Namespace::new(op_id, state_name));
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
+        let op = namespace.operator_id();
+        let name = namespace.state_name();
+        Ok(self
+            .store
+            .keys()
+            .filter(|(o, n, _)| o == op && n == name)
+            .map(|(_, _, k)| k.clone())
+            .collect())
     }
 }
 
@@ -236,6 +259,230 @@ impl TimerService for InMemoryTimerService {
 
     fn pending_count(&self) -> usize {
         self.timers.len()
+    }
+}
+
+// ── ProcessingTimeTimerKey ────────────────────────────────────────────────────
+
+/// A registered processing-time timer.
+///
+/// Ordered by `(fire_at_ms, namespace, key)` so a BTreeMap prefix split
+/// efficiently drains all timers whose wall-clock deadline has passed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcessingTimeTimerKey {
+    /// Wall-clock time (ms since UNIX epoch) when the timer fires.
+    pub fire_at_ms: i64,
+    /// Namespace of the operator that registered the timer.
+    pub namespace: Namespace,
+    /// Record key the timer is associated with.
+    pub key: Vec<u8>,
+}
+
+impl ProcessingTimeTimerKey {
+    /// Create a processing-time timer key.
+    pub fn new(namespace: Namespace, key: Vec<u8>, fire_at_ms: i64) -> Self {
+        Self { fire_at_ms, namespace, key }
+    }
+}
+
+// ── ProcessingTimeTimerService ────────────────────────────────────────────────
+
+/// Processing-time timer service contract (R5.2).
+///
+/// Timers fire based on wall-clock time.  The caller passes `now_ms`
+/// explicitly so the implementation is deterministic under test.
+pub trait ProcessingTimeTimerService: Send + Sync {
+    /// Register a timer that fires when `now_ms >= timer.fire_at_ms`.
+    fn register_processing_time_timer(&mut self, timer: ProcessingTimeTimerKey) -> StateResult<()>;
+    /// Cancel a timer identified by `(namespace, key)`.  No-op if not found.
+    fn cancel_processing_time_timer(
+        &mut self,
+        namespace: &Namespace,
+        key: &[u8],
+    ) -> StateResult<()>;
+    /// Drain all timers with `fire_at_ms <= now_ms` in ascending order.
+    fn drain_fired_processing_time_timers(
+        &mut self,
+        now_ms: i64,
+    ) -> Vec<ProcessingTimeTimerKey>;
+    /// Number of pending timers.
+    fn pending_count(&self) -> usize;
+}
+
+// ── InMemoryProcessingTimeTimerService ────────────────────────────────────────
+
+/// In-memory processing-time timer service for R5.2.
+#[derive(Debug, Default)]
+pub struct InMemoryProcessingTimeTimerService {
+    timers: BTreeMap<ProcessingTimeTimerKey, ()>,
+}
+
+impl InMemoryProcessingTimeTimerService {
+    /// Create an empty service.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
+    fn register_processing_time_timer(&mut self, timer: ProcessingTimeTimerKey) -> StateResult<()> {
+        self.timers.insert(timer, ());
+        Ok(())
+    }
+
+    fn cancel_processing_time_timer(
+        &mut self,
+        namespace: &Namespace,
+        key: &[u8],
+    ) -> StateResult<()> {
+        self.timers.retain(|t, _| !(t.namespace == *namespace && t.key == key));
+        Ok(())
+    }
+
+    fn drain_fired_processing_time_timers(&mut self, now_ms: i64) -> Vec<ProcessingTimeTimerKey> {
+        let sentinel = ProcessingTimeTimerKey {
+            fire_at_ms: now_ms + 1,
+            namespace: Namespace::new("", ""),
+            key: vec![],
+        };
+        let pending = self.timers.split_off(&sentinel);
+        std::mem::replace(&mut self.timers, pending).into_keys().collect()
+    }
+
+    fn pending_count(&self) -> usize {
+        self.timers.len()
+    }
+}
+
+// ── TtlConfig ─────────────────────────────────────────────────────────────────
+
+/// State TTL (time-to-live) configuration (R5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtlConfig {
+    /// Duration in milliseconds.  State expires this many ms after it is written.
+    pub ttl_ms: u64,
+}
+
+impl TtlConfig {
+    /// Create a TTL config with the given duration.
+    pub fn new(ttl_ms: u64) -> Self {
+        Self { ttl_ms }
+    }
+}
+
+// ── TtlStateBackend ───────────────────────────────────────────────────────────
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A [`StateBackend`] wrapper that enforces TTL expiry on all stored values.
+///
+/// Values are encoded as `[8-byte LE expires_at_ms][raw value bytes]`.
+/// Expired values are treated as absent (lazy deletion on read; the raw bytes
+/// remain in the inner store until the next write or `clear_namespace`).
+pub struct TtlStateBackend<B: StateBackend> {
+    inner: B,
+    config: TtlConfig,
+}
+
+impl<B: StateBackend> TtlStateBackend<B> {
+    /// Wrap `inner` with the given TTL config.
+    pub fn new(inner: B, config: TtlConfig) -> Self {
+        Self { inner, config }
+    }
+
+    /// Access the underlying backend.
+    pub fn inner(&self) -> &B {
+        &self.inner
+    }
+
+    fn encode(value: Vec<u8>, expires_at_ms: i64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(8 + value.len());
+        encoded.extend_from_slice(&expires_at_ms.to_le_bytes());
+        encoded.extend_from_slice(&value);
+        encoded
+    }
+
+    fn decode_if_live(encoded: Vec<u8>, now_ms: i64) -> Option<Vec<u8>> {
+        if encoded.len() < 8 {
+            return None;
+        }
+        let expires_at_ms =
+            i64::from_le_bytes(encoded[..8].try_into().expect("slice is exactly 8 bytes"));
+        if now_ms >= expires_at_ms { None } else { Some(encoded[8..].to_vec()) }
+    }
+}
+
+impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
+    fn get(&self, namespace: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
+        match self.inner.get(namespace, key)? {
+            None => Ok(None),
+            Some(encoded) => Ok(Self::decode_if_live(encoded, unix_now_ms())),
+        }
+    }
+
+    fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
+        let expires_at_ms = unix_now_ms() + self.config.ttl_ms as i64;
+        self.inner.put(namespace, key, Self::encode(value, expires_at_ms))
+    }
+
+    fn delete(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()> {
+        self.inner.delete(namespace, key)
+    }
+
+    fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()> {
+        self.inner.clear_namespace(namespace)
+    }
+
+    fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+        self.inner.list_namespaces()
+    }
+
+    fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
+        self.inner.list_keys(namespace)
+    }
+}
+
+// ── StateInspector ────────────────────────────────────────────────────────────
+
+/// Read-only metadata inspector for a keyed state backend (R5.2).
+///
+/// Exposes namespace and key metadata without exposing value bytes or
+/// allowing any mutation.  The immutable borrow prevents concurrent writes.
+pub struct StateInspector<'a, B: StateBackend> {
+    backend: &'a B,
+}
+
+impl<'a, B: StateBackend> StateInspector<'a, B> {
+    /// Create an inspector.  The backend borrow prevents mutation while
+    /// the inspector is live.
+    pub fn new(backend: &'a B) -> Self {
+        Self { backend }
+    }
+
+    /// List all namespaces present in the backend.
+    pub fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+        self.backend.list_namespaces()
+    }
+
+    /// Count the number of keys in `namespace`.
+    pub fn key_count(&self, namespace: &Namespace) -> StateResult<usize> {
+        Ok(self.backend.list_keys(namespace)?.len())
+    }
+
+    /// Total bytes across all key vectors in `namespace`.  Value bytes are
+    /// intentionally not surfaced; use key size as a proxy for namespace size.
+    pub fn key_size_bytes(&self, namespace: &Namespace) -> StateResult<usize> {
+        Ok(self.backend.list_keys(namespace)?.iter().map(|k| k.len()).sum())
+    }
+
+    /// Always `true` — the inspector never mutates state.
+    pub fn is_read_only(&self) -> bool {
+        true
     }
 }
 
@@ -406,5 +653,130 @@ mod tests {
     fn timer_drain_empty_returns_empty() {
         let mut svc = InMemoryTimerService::new();
         assert!(svc.drain_fired_timers(9999).is_empty());
+    }
+
+    // ── list_namespaces / list_keys ───────────────────────────────────────────
+
+    #[test]
+    fn list_namespaces_empty_backend() {
+        let b = InMemoryStateBackend::new();
+        assert!(b.list_namespaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_namespaces_returns_unique_namespaces() {
+        let mut b = InMemoryStateBackend::new();
+        let n1 = ns("op1", "counts");
+        let n2 = ns("op2", "counts");
+        b.put(&n1, b"k1".to_vec(), b"v".to_vec()).unwrap();
+        b.put(&n1, b"k2".to_vec(), b"v".to_vec()).unwrap();
+        b.put(&n2, b"k1".to_vec(), b"v".to_vec()).unwrap();
+        let mut namespaces = b.list_namespaces().unwrap();
+        namespaces.sort();
+        assert_eq!(namespaces, vec![n1, n2]);
+    }
+
+    #[test]
+    fn list_keys_returns_keys_for_namespace() {
+        let mut b = InMemoryStateBackend::new();
+        let n = ns("op1", "window");
+        b.put(&n, b"alpha".to_vec(), b"v".to_vec()).unwrap();
+        b.put(&n, b"beta".to_vec(), b"v".to_vec()).unwrap();
+        b.put(&ns("op1", "other"), b"alpha".to_vec(), b"v".to_vec()).unwrap();
+        let mut keys = b.list_keys(&n).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec![b"alpha".to_vec(), b"beta".to_vec()]);
+    }
+
+    // ── ProcessingTimeTimerService ────────────────────────────────────────────
+
+    #[test]
+    fn processing_time_timer_fires_at_now_ms() {
+        let mut svc = InMemoryProcessingTimeTimerService::new();
+        let n = ns("op1", "pt");
+        svc.register_processing_time_timer(ProcessingTimeTimerKey::new(
+            n.clone(),
+            b"k1".to_vec(),
+            1000,
+        ))
+        .unwrap();
+        svc.register_processing_time_timer(ProcessingTimeTimerKey::new(
+            n.clone(),
+            b"k2".to_vec(),
+            2000,
+        ))
+        .unwrap();
+        assert!(svc.drain_fired_processing_time_timers(999).is_empty());
+        let fired = svc.drain_fired_processing_time_timers(1000);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].fire_at_ms, 1000);
+        assert_eq!(svc.pending_count(), 1);
+    }
+
+    #[test]
+    fn processing_time_timer_cancel_is_noop_for_missing() {
+        let mut svc = InMemoryProcessingTimeTimerService::new();
+        svc.cancel_processing_time_timer(&ns("op", "s"), b"nope").unwrap();
+        assert_eq!(svc.pending_count(), 0);
+    }
+
+    // ── TtlStateBackend ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ttl_backend_returns_value_before_expiry() {
+        let inner = InMemoryStateBackend::new();
+        let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+        let n = ns("op1", "session");
+        ttl.put(&n, b"k".to_vec(), b"val".to_vec()).unwrap();
+        // Immediately after write the value must be live.
+        assert_eq!(ttl.get(&n, b"k").unwrap(), Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn ttl_backend_expired_value_returns_none() {
+        // Write with an expiry in the past by constructing a raw inner entry.
+        let mut inner = InMemoryStateBackend::new();
+        let n = ns("op1", "session");
+        // Manually encode an already-expired entry (expires_at = 1 ms since epoch).
+        let expires_at_ms: i64 = 1;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&expires_at_ms.to_le_bytes());
+        encoded.extend_from_slice(b"stale");
+        inner.put(&n, b"k".to_vec(), encoded).unwrap();
+
+        let ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+        // now_ms() >> 1, so this entry must be expired.
+        assert!(ttl.get(&n, b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn ttl_backend_delete_removes_entry() {
+        let inner = InMemoryStateBackend::new();
+        let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+        let n = ns("op1", "s");
+        ttl.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
+        ttl.delete(&n, b"k").unwrap();
+        assert!(ttl.get(&n, b"k").unwrap().is_none());
+    }
+
+    // ── StateInspector ────────────────────────────────────────────────────────
+
+    #[test]
+    fn state_inspector_is_read_only() {
+        let b = InMemoryStateBackend::new();
+        let inspector = StateInspector::new(&b);
+        assert!(inspector.is_read_only());
+    }
+
+    #[test]
+    fn state_inspector_key_count_and_namespaces() {
+        let mut b = InMemoryStateBackend::new();
+        let n = ns("op1", "window");
+        b.put(&n, b"a".to_vec(), b"1".to_vec()).unwrap();
+        b.put(&n, b"b".to_vec(), b"2".to_vec()).unwrap();
+        let inspector = StateInspector::new(&b);
+        assert_eq!(inspector.list_namespaces().unwrap(), vec![n.clone()]);
+        assert_eq!(inspector.key_count(&n).unwrap(), 2);
+        assert_eq!(inspector.key_size_bytes(&n).unwrap(), 2); // "a" + "b"
     }
 }

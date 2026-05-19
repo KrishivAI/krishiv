@@ -2,9 +2,50 @@
 
 ## Current Phase
 
-R5.1 Stateful Streaming Core — all slices (A–G) complete. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace.
+R5.2 Stateful Streaming Hardening — all non-RocksDB slices complete. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace. RocksDB crate integration deferred (architecture doc written; crate dependency not yet added).
 
 ## Active Task
+
+R5.2 implementation complete (all slices except RocksDB crate integration):
+
+**R5.2 Architecture**
+- `docs/architecture/rocksdb-state-backend.md`: `spawn_blocking` isolation boundary, compaction thread budget `min(4, cpus/4)`, `Deployment` pod deployment model, key encoding, TTL cleanup policy, state inspection safety boundaries.
+
+**R5.2 `krishiv-state` additions**
+- `StateBackend` trait extended: `list_namespaces()`, `list_keys(namespace)`
+- `ProcessingTimeTimerKey`, `ProcessingTimeTimerService` trait, `InMemoryProcessingTimeTimerService`
+- `TtlConfig`, `TtlStateBackend<B: StateBackend>` (lazy expiry: 8-byte LE `expires_at_ms` prefix)
+- `StateInspector<'a, B>`: read-only access, `list_namespaces`, `key_count`, `key_size_bytes`, `is_read_only`
+- 12 new tests; 22 total in crate.
+
+**R5.2 `krishiv-exec` additions**
+- `MultiSourceWatermarkState`: tracks N sources, effective watermark = min of all
+- `SlidingWindowSpec` + `SlidingWindowOperator`: event at T belongs to `ceil(size/slide)` windows
+- `SessionWindowSpec` + `SessionWindowOperator`: dynamic session boundaries, closes when watermark passes `last_event + gap`
+- `StreamTableJoin`: stream-side nested-loop join against static `RecordBatch`
+- 8 new tests; 33 total in crate.
+
+**R5.2 `krishiv-api` additions**
+- `MultiSourceWatermarkSpec`: builder pattern, per-source `WatermarkSpec`
+- `StateTtlConfig`: `ttl_ms` accessor
+- `SlidingWindowedStream`: `window_size_ms`, `slide_ms` accessors
+- `SessionWindowedStream`: `session_gap_ms` accessor
+- `KeyedStream::sliding_window(size, slide)` and `session_window(gap)` builders
+- 4 new tests; 15 total in crate.
+
+**R5.2 `krishiv-cli` additions**
+- `state` command with `inspect` subcommand (`--job`, `--operator` flags)
+- Skeleton response noting executor-side RPC is R6
+- 4 new tests; `state_help_command_exits_zero`, `state_inspect_requires_job_and_operator`, `state_inspect_returns_skeleton_output`, `state_unknown_subcommand_exits_nonzero`
+
+**Validation**: `cargo test --workspace` — 0 failures across all crates.
+
+**Deferred** (RocksDB crate integration — no external crate dependency added yet):
+- `RocksDbStateBackend` implementation
+- RocksDB blocking-under-load test
+- Deterministic replay with RocksDB backend
+
+## R5.1 Implementation (completed prior session)
 
 R5.1 full implementation complete (270→~350 tests, 0 failures):
 

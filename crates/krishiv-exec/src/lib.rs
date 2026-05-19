@@ -807,6 +807,488 @@ impl TumblingWindowOperator {
     }
 }
 
+// ── MultiSourceWatermarkState ─────────────────────────────────────────────────
+
+/// Tracks watermarks for multiple input sources (R5.2).
+///
+/// The effective watermark is `min(watermark_source_0, watermark_source_1, …)`.
+/// A window is only closed when the effective watermark passes the window end,
+/// so a stalled source holds back all windows.
+#[derive(Debug, Default, Clone)]
+pub struct MultiSourceWatermarkState {
+    source_watermarks: HashMap<String, i64>,
+}
+
+impl MultiSourceWatermarkState {
+    /// Create an empty multi-source watermark tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the watermark for `source_id` (monotonic — decreasing values are ignored).
+    pub fn update(&mut self, source_id: &str, watermark_ms: i64) {
+        let entry = self.source_watermarks.entry(source_id.to_owned()).or_insert(i64::MIN);
+        if watermark_ms > *entry {
+            *entry = watermark_ms;
+        }
+    }
+
+    /// Effective watermark across all registered sources.  Returns `i64::MIN`
+    /// if no source has reported a watermark yet.
+    pub fn effective_watermark_ms(&self) -> i64 {
+        self.source_watermarks.values().copied().min().unwrap_or(i64::MIN)
+    }
+
+    /// Number of sources registered.
+    pub fn source_count(&self) -> usize {
+        self.source_watermarks.len()
+    }
+}
+
+// ── SlidingWindowSpec / SlidingWindowOperator ─────────────────────────────────
+
+/// Configuration for a sliding event-time window operator (R5.2).
+///
+/// A sliding window of size `window_size_ms` that advances by `slide_ms` means
+/// an event belongs to `ceil(window_size_ms / slide_ms)` overlapping windows.
+#[derive(Debug, Clone)]
+pub struct SlidingWindowSpec {
+    /// Column used to key the stream.
+    pub key_column: String,
+    /// Int64 column carrying event time in milliseconds.
+    pub event_time_column: String,
+    /// Total window duration in milliseconds.
+    pub window_size_ms: u64,
+    /// Window advance step in milliseconds (must be ≤ `window_size_ms`).
+    pub slide_ms: u64,
+    /// Aggregate expressions to apply within each window.
+    pub agg_exprs: Vec<AggExpr>,
+}
+
+/// Sliding event-time window operator (R5.2).
+///
+/// Each event is placed into every window `[w, w + size)` where
+/// `w` is a multiple of `slide_ms` and `w ≤ event_time_ms < w + size`.
+pub struct SlidingWindowOperator {
+    spec: SlidingWindowSpec,
+    // (serialised_key, window_start_ms) → aggregate accumulator
+    accumulators: HashMap<(String, i64), AggState>,
+    prev_watermark_ms: i64,
+}
+
+impl SlidingWindowOperator {
+    /// Create a new sliding window operator.
+    pub fn new(spec: SlidingWindowSpec) -> Self {
+        Self {
+            spec,
+            accumulators: HashMap::new(),
+            prev_watermark_ms: i64::MIN,
+        }
+    }
+
+    /// Number of open (not yet flushed) window buckets.
+    pub fn open_window_count(&self) -> usize {
+        self.accumulators.len()
+    }
+
+    /// All window starts (multiples of `slide`) that contain `event_time_ms`.
+    fn window_starts(event_time_ms: i64, size_ms: u64, slide_ms: u64) -> Vec<i64> {
+        let slide = slide_ms as i64;
+        let size = size_ms as i64;
+        // The largest multiple of slide that is ≤ event_time_ms.
+        let q = event_time_ms / slide;
+        let r = event_time_ms % slide;
+        let first = if r < 0 { (q - 1) * slide } else { q * slide };
+        let mut starts = Vec::new();
+        let mut s = first;
+        // Walk back until the event is no longer inside the window.
+        while event_time_ms < s + size {
+            starts.push(s);
+            s -= slide;
+        }
+        starts
+    }
+
+    /// Process one `RecordBatch`, returning closed window outputs.
+    pub fn process_batch(
+        &mut self,
+        batch: &RecordBatch,
+        new_watermark_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let key_idx = batch
+            .schema()
+            .index_of(&self.spec.key_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.spec.key_column.clone()))?;
+        let time_idx = batch
+            .schema()
+            .index_of(&self.spec.event_time_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.spec.event_time_column.clone()))?;
+
+        let time_arr = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                ExecError::UnsupportedType(format!(
+                    "event_time column '{}' must be Int64",
+                    self.spec.event_time_column
+                ))
+            })?;
+
+        let late_threshold = self.prev_watermark_ms;
+
+        for row in 0..batch.num_rows() {
+            let event_time_ms = time_arr.value(row);
+            if event_time_ms < late_threshold {
+                continue;
+            }
+            let key = format_key_value(batch, key_idx, row)?;
+            for win_start in
+                Self::window_starts(event_time_ms, self.spec.window_size_ms, self.spec.slide_ms)
+            {
+                let state = self
+                    .accumulators
+                    .entry((key.clone(), win_start))
+                    .or_insert_with(|| AggState::new(&self.spec.agg_exprs));
+                state.update(&self.spec.agg_exprs, batch, row)?;
+            }
+        }
+
+        self.prev_watermark_ms = new_watermark_ms;
+        self.flush_closed_windows(new_watermark_ms)
+    }
+
+    /// Flush windows whose end time is ≤ `watermark_ms`.
+    pub fn flush_closed_windows(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
+        let size = self.spec.window_size_ms as i64;
+        let mut closed: Vec<(String, i64)> = self
+            .accumulators
+            .keys()
+            .filter(|(_, ws)| ws + size <= watermark_ms)
+            .cloned()
+            .collect();
+        if closed.is_empty() {
+            return Ok(vec![]);
+        }
+        closed.sort_by(|(ka, wa), (kb, wb)| wa.cmp(wb).then(ka.cmp(kb)));
+        let mut output = Vec::with_capacity(closed.len());
+        for bucket in closed {
+            if let Some(state) = self.accumulators.remove(&bucket) {
+                output.push(self.build_output_batch(&bucket.0, bucket.1, &state)?);
+            }
+        }
+        Ok(output)
+    }
+
+    fn build_output_batch(
+        &self,
+        key_value: &str,
+        window_start_ms: i64,
+        state: &AggState,
+    ) -> ExecResult<RecordBatch> {
+        let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
+        let mut fields = vec![
+            Field::new(&self.spec.key_column, DataType::Utf8, false),
+            Field::new("window_start_ms", DataType::Int64, false),
+            Field::new("window_end_ms", DataType::Int64, false),
+        ];
+        for agg in &self.spec.agg_exprs {
+            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![key_value])),
+            Arc::new(Int64Array::from(vec![window_start_ms])),
+            Arc::new(Int64Array::from(vec![window_end_ms])),
+        ];
+        for (i, _) in self.spec.agg_exprs.iter().enumerate() {
+            columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+}
+
+// ── SessionWindowSpec / SessionWindowOperator ─────────────────────────────────
+
+/// Configuration for a session event-time window operator (R5.2).
+///
+/// A session window opens on the first event for a key and extends as long
+/// as events keep arriving within `session_gap_ms` of the previous event.
+/// The window closes when the watermark passes `last_event_time + session_gap_ms`.
+#[derive(Debug, Clone)]
+pub struct SessionWindowSpec {
+    /// Column used to key the stream.
+    pub key_column: String,
+    /// Int64 column carrying event time in milliseconds.
+    pub event_time_column: String,
+    /// Inactivity gap that closes the session in milliseconds.
+    pub session_gap_ms: u64,
+    /// Aggregate expressions to apply within each session.
+    pub agg_exprs: Vec<AggExpr>,
+}
+
+struct SessionState {
+    session_start_ms: i64,
+    last_event_time_ms: i64,
+    agg: AggState,
+}
+
+/// Session event-time window operator (R5.2).
+pub struct SessionWindowOperator {
+    spec: SessionWindowSpec,
+    // Keyed by serialised key value.
+    sessions: HashMap<String, SessionState>,
+    prev_watermark_ms: i64,
+}
+
+impl SessionWindowOperator {
+    /// Create a new session window operator.
+    pub fn new(spec: SessionWindowSpec) -> Self {
+        Self {
+            spec,
+            sessions: HashMap::new(),
+            prev_watermark_ms: i64::MIN,
+        }
+    }
+
+    /// Number of open sessions.
+    pub fn open_session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Process one `RecordBatch`, returning closed session outputs.
+    pub fn process_batch(
+        &mut self,
+        batch: &RecordBatch,
+        new_watermark_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let key_idx = batch
+            .schema()
+            .index_of(&self.spec.key_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.spec.key_column.clone()))?;
+        let time_idx = batch
+            .schema()
+            .index_of(&self.spec.event_time_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.spec.event_time_column.clone()))?;
+
+        let time_arr = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                ExecError::UnsupportedType(format!(
+                    "event_time column '{}' must be Int64",
+                    self.spec.event_time_column
+                ))
+            })?;
+
+        let late_threshold = self.prev_watermark_ms;
+
+        for row in 0..batch.num_rows() {
+            let event_time_ms = time_arr.value(row);
+            if event_time_ms < late_threshold {
+                continue;
+            }
+            let key = format_key_value(batch, key_idx, row)?;
+            let session = self.sessions.entry(key).or_insert_with(|| SessionState {
+                session_start_ms: event_time_ms,
+                last_event_time_ms: event_time_ms,
+                agg: AggState::new(&self.spec.agg_exprs),
+            });
+            if event_time_ms > session.last_event_time_ms {
+                session.last_event_time_ms = event_time_ms;
+            }
+            session.agg.update(&self.spec.agg_exprs, batch, row)?;
+        }
+
+        self.prev_watermark_ms = new_watermark_ms;
+        self.flush_closed_sessions(new_watermark_ms)
+    }
+
+    /// Flush sessions whose inactivity gap has passed the watermark.
+    pub fn flush_closed_sessions(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
+        let gap = self.spec.session_gap_ms as i64;
+        let closed: Vec<String> = self
+            .sessions
+            .keys()
+            .filter(|k| {
+                self.sessions[*k].last_event_time_ms + gap <= watermark_ms
+            })
+            .cloned()
+            .collect();
+        if closed.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut output = Vec::with_capacity(closed.len());
+        for key in closed {
+            if let Some(s) = self.sessions.remove(&key) {
+                output.push(self.build_output_batch(&key, s.session_start_ms, s.last_event_time_ms + gap, &s.agg)?);
+            }
+        }
+        Ok(output)
+    }
+
+    fn build_output_batch(
+        &self,
+        key_value: &str,
+        session_start_ms: i64,
+        session_end_ms: i64,
+        state: &AggState,
+    ) -> ExecResult<RecordBatch> {
+        let mut fields = vec![
+            Field::new(&self.spec.key_column, DataType::Utf8, false),
+            Field::new("session_start_ms", DataType::Int64, false),
+            Field::new("session_end_ms", DataType::Int64, false),
+        ];
+        for agg in &self.spec.agg_exprs {
+            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![key_value])),
+            Arc::new(Int64Array::from(vec![session_start_ms])),
+            Arc::new(Int64Array::from(vec![session_end_ms])),
+        ];
+        for (i, _) in self.spec.agg_exprs.iter().enumerate() {
+            columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+}
+
+// ── StreamTableJoin ───────────────────────────────────────────────────────────
+
+/// Stream-table (stream-static) join operator (R5.2).
+///
+/// The `table` side is a static `RecordBatch` loaded at job startup.
+/// Each streaming batch is inner-joined against the table on `join_key_column`.
+/// This is a baseline nested-loop join; hash-join optimisation is post-R5.2.
+pub struct StreamTableJoin {
+    /// Static table side of the join.
+    table: RecordBatch,
+    /// Column name present in both the stream batch and the table.
+    join_key_column: String,
+}
+
+impl StreamTableJoin {
+    /// Create a stream-table join with the given static table.
+    pub fn new(table: RecordBatch, join_key_column: impl Into<String>) -> Self {
+        Self { table, join_key_column: join_key_column.into() }
+    }
+
+    /// Join `stream_batch` against the static table, returning the inner-join result.
+    ///
+    /// Output schema is the union of all columns from both sides.  If the same
+    /// column name appears in both, the stream column takes precedence and the
+    /// table column is dropped.
+    pub fn process_batch(&self, stream_batch: &RecordBatch) -> ExecResult<RecordBatch> {
+        let stream_key_idx = stream_batch
+            .schema()
+            .index_of(&self.join_key_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.join_key_column.clone()))?;
+        let table_key_idx = self
+            .table
+            .schema()
+            .index_of(&self.join_key_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.join_key_column.clone()))?;
+
+        // Build key → row-index map for the table side.
+        let table_key_arr = self
+            .table
+            .column(table_key_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                ExecError::UnsupportedType(format!(
+                    "join key column '{}' must be Utf8",
+                    self.join_key_column
+                ))
+            })?;
+        let mut table_index: HashMap<String, Vec<u32>> = HashMap::new();
+        for row in 0..self.table.num_rows() {
+            table_index
+                .entry(table_key_arr.value(row).to_owned())
+                .or_default()
+                .push(row as u32);
+        }
+
+        let stream_key_arr = stream_batch
+            .column(stream_key_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                ExecError::UnsupportedType(format!(
+                    "join key column '{}' must be Utf8 in stream",
+                    self.join_key_column
+                ))
+            })?;
+
+        // Collect matching (stream_row, table_row) index pairs.
+        let mut stream_rows: Vec<u32> = Vec::new();
+        let mut table_rows: Vec<u32> = Vec::new();
+        for s_row in 0..stream_batch.num_rows() {
+            let key = stream_key_arr.value(s_row);
+            if let Some(t_rows) = table_index.get(key) {
+                for &t_row in t_rows {
+                    stream_rows.push(s_row as u32);
+                    table_rows.push(t_row);
+                }
+            }
+        }
+
+        if stream_rows.is_empty() {
+            return self.empty_output(stream_batch);
+        }
+
+        let stream_indices: ArrayRef = Arc::new(UInt32Array::from(stream_rows));
+        let table_indices: ArrayRef = Arc::new(UInt32Array::from(table_rows));
+
+        // Build output schema: all stream columns, then non-key table columns.
+        let mut fields: Vec<Field> =
+            stream_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        for (i, f) in self.table.schema().fields().iter().enumerate() {
+            if i != table_key_idx {
+                fields.push(f.as_ref().clone());
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for col in stream_batch.columns() {
+            columns.push(arrow::compute::take(col.as_ref(), &stream_indices, None)?);
+        }
+        for (i, col) in self.table.columns().iter().enumerate() {
+            if i != table_key_idx {
+                columns.push(arrow::compute::take(col.as_ref(), &table_indices, None)?);
+            }
+        }
+
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+
+    fn empty_output(&self, stream_batch: &RecordBatch) -> ExecResult<RecordBatch> {
+        let mut fields: Vec<Field> =
+            stream_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let table_key_idx = self
+            .table
+            .schema()
+            .index_of(&self.join_key_column)
+            .unwrap_or(usize::MAX);
+        for (i, f) in self.table.schema().fields().iter().enumerate() {
+            if i != table_key_idx {
+                fields.push(f.as_ref().clone());
+            }
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1434,5 +1916,208 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── MultiSourceWatermarkState tests ───────────────────────────────────────
+
+    use super::{
+        MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec,
+        SlidingWindowOperator, SlidingWindowSpec, StreamTableJoin,
+    };
+
+    #[test]
+    fn multi_source_watermark_effective_is_min() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("src-a", 5000);
+        state.update("src-b", 3000);
+        assert_eq!(state.effective_watermark_ms(), 3000);
+        state.update("src-b", 7000);
+        assert_eq!(state.effective_watermark_ms(), 5000);
+    }
+
+    #[test]
+    fn multi_source_watermark_empty_returns_min() {
+        let state = MultiSourceWatermarkState::new();
+        assert_eq!(state.effective_watermark_ms(), i64::MIN);
+    }
+
+    #[test]
+    fn multi_source_watermark_ignores_decrease() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("src", 1000);
+        state.update("src", 500); // decrease — must be ignored
+        assert_eq!(state.effective_watermark_ms(), 1000);
+    }
+
+    // ── SlidingWindowOperator tests ───────────────────────────────────────────
+
+    fn sliding_spec() -> SlidingWindowSpec {
+        SlidingWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            slide_ms: 500,
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Count,
+                input_column: "val".into(),
+                output_column: "cnt".into(),
+            }],
+        }
+    }
+
+    fn make_stream_batch_i64(
+        keys: Vec<&str>,
+        times: Vec<i64>,
+        vals: Vec<i64>,
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Int64Array::from(times)),
+                Arc::new(Int64Array::from(vals)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sliding_window_event_belongs_to_two_windows() {
+        // window_size=1000, slide=500: event at t=600 belongs to [0,1000) and [500,1500).
+        let mut op = SlidingWindowOperator::new(sliding_spec());
+        let batch = make_stream_batch_i64(vec!["a"], vec![600], vec![1]);
+        // watermark high enough to close both windows
+        let out = op.process_batch(&batch, 2000).unwrap();
+        // Two windows should close: [0,1000) and [500,1500)
+        assert_eq!(out.len(), 2, "event at t=600 must appear in two sliding windows");
+    }
+
+    #[test]
+    fn sliding_window_late_events_dropped() {
+        // size=1000, slide=500: event at t=1500 belongs to [1000,2000) and [1500,2500).
+        let mut op = SlidingWindowOperator::new(sliding_spec());
+        let b1 = make_stream_batch_i64(vec!["a"], vec![1500], vec![1]);
+        op.process_batch(&b1, 1500).unwrap();
+
+        // Attempt to add a late event (t=100 < prev_watermark=1500) — must be dropped.
+        let b2 = make_stream_batch_i64(vec!["a"], vec![100], vec![1]);
+        op.process_batch(&b2, 1500).unwrap();
+
+        // Advance watermark past both window ends (>2500) to force closure.
+        let out = op
+            .process_batch(&make_stream_batch_i64(vec![], vec![], vec![]), 3000)
+            .unwrap();
+        // Each of the two windows should have count=1 (only the t=1500 event).
+        assert_eq!(out.len(), 2, "both windows [1000,2000) and [1500,2500) must close");
+        let total_counts: i64 = out
+            .iter()
+            .map(|b| {
+                b.column_by_name("cnt")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum();
+        assert_eq!(total_counts, 2, "each window has count=1 from the t=1500 event only");
+    }
+
+    // ── SessionWindowOperator tests ───────────────────────────────────────────
+
+    fn session_spec() -> SessionWindowSpec {
+        SessionWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            session_gap_ms: 500,
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Count,
+                input_column: "val".into(),
+                output_column: "cnt".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn session_window_closes_after_gap() {
+        let mut op = SessionWindowOperator::new(session_spec());
+        // Events at t=100, 200 for key "a" — session gap = 500
+        let b1 = make_stream_batch_i64(vec!["a", "a"], vec![100, 200], vec![1, 1]);
+        let out1 = op.process_batch(&b1, 600).unwrap();
+        // watermark=600 >= last_event(200)+gap(500)=700 — NOT yet closed
+        assert!(out1.is_empty(), "session should not close at watermark=600");
+
+        let out2 = op.process_batch(&make_stream_batch_i64(vec![], vec![], vec![]), 800).unwrap();
+        // watermark=800 >= 200+500=700 — session must close
+        assert_eq!(out2.len(), 1, "session must close when watermark passes last_event+gap");
+        let cnt = out2[0]
+            .column_by_name("cnt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(cnt, 2);
+    }
+
+    #[test]
+    fn session_window_separate_keys_independent() {
+        let mut op = SessionWindowOperator::new(session_spec());
+        let batch = make_stream_batch_i64(
+            vec!["a", "b"],
+            vec![100, 200],
+            vec![1, 1],
+        );
+        let out = op.process_batch(&batch, 1000).unwrap();
+        // Both sessions close: "a" at 100+500=600 ≤ 1000, "b" at 200+500=700 ≤ 1000
+        assert_eq!(out.len(), 2, "each key's session must close independently");
+    }
+
+    // ── StreamTableJoin tests ─────────────────────────────────────────────────
+
+    fn make_table() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stream_table_join_inner_join() {
+        let join = StreamTableJoin::new(make_table(), "key");
+        let stream = make_stream_batch_i64(vec!["a", "b", "z"], vec![1, 2, 3], vec![10, 20, 30]);
+        let result = join.process_batch(&stream).unwrap();
+        // "z" has no match — only 2 output rows
+        assert_eq!(result.num_rows(), 2);
+        let labels = result
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut label_vals: Vec<&str> = (0..result.num_rows()).map(|i| labels.value(i)).collect();
+        label_vals.sort();
+        assert_eq!(label_vals, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn stream_table_join_no_matches_returns_empty() {
+        let join = StreamTableJoin::new(make_table(), "key");
+        let stream = make_stream_batch_i64(vec!["x", "y"], vec![1, 2], vec![10, 20]);
+        let result = join.process_batch(&stream).unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 }

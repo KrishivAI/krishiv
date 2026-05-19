@@ -65,14 +65,17 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["explain"] | ["explain", "--help"] | ["explain", "-h"] => CliResponse::ok(explain_help()),
         ["submit"] | ["submit", "--help"] | ["submit", "-h"] => CliResponse::ok(submit_help()),
         ["jobs", "--help"] | ["jobs", "-h"] => CliResponse::ok(jobs_help()),
+        ["state"] | ["state", "--help"] | ["state", "-h"] => CliResponse::ok(state_help()),
         ["help", "sql"] => CliResponse::ok(sql_help()),
         ["help", "explain"] => CliResponse::ok(explain_help()),
         ["help", "submit"] => CliResponse::ok(submit_help()),
         ["help", "jobs"] => CliResponse::ok(jobs_help()),
+        ["help", "state"] => CliResponse::ok(state_help()),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
         ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
+        ["state", rest @ ..] => run_state(rest),
         [unknown, ..] => {
             CliResponse::err(format!("unknown command: {unknown}\n\n{}", main_help()), 2)
         }
@@ -92,6 +95,7 @@ pub fn main_help() -> String {
            explain   Show logical/physical plan information\n\
            submit    Submit a distributed job to the R2 local scheduler\n\
            jobs      List local jobs for this process\n\
+           state     Inspect streaming operator state metadata (R5.2)\n\
            help      Show help for a command\n\
          \n\
          Options:\n\
@@ -250,6 +254,85 @@ fn run_jobs(args: &[&str]) -> CliResponse {
     }
 
     CliResponse::ok(output)
+}
+
+/// Help text for `krishiv state`.
+pub fn state_help() -> String {
+    String::from(
+        "Inspect streaming operator state metadata (read-only).\n\
+         \n\
+         Usage:\n\
+           krishiv state inspect --job <JOB_ID> --operator <OPERATOR_ID>\n\
+         \n\
+         Subcommands:\n\
+           inspect   List namespaces and key counts for a streaming operator\n\
+         \n\
+         Options:\n\
+           --job <JOB_ID>          Job ID of the streaming job\n\
+           --operator <OPERATOR_ID>  Operator ID within the job\n\
+           -h, --help              Show help\n\
+         \n\
+         Note: State inspection is read-only.  It reports namespace and key-count\n\
+         metadata but never exposes raw value bytes and never mutates live state.\n",
+    )
+}
+
+fn run_state(args: &[&str]) -> CliResponse {
+    match args {
+        ["inspect", rest @ ..] => run_state_inspect(rest),
+        _ => CliResponse::err(format!("unknown state subcommand\n\n{}", state_help()), 2),
+    }
+}
+
+fn run_state_inspect(args: &[&str]) -> CliResponse {
+    let mut job_id: Option<&str> = None;
+    let mut operator_id: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--operator" if i + 1 < args.len() => {
+                operator_id = Some(args[i + 1]);
+                i += 2;
+            }
+            _ => {
+                return CliResponse::err(
+                    format!(
+                        "unexpected argument '{}'\n\n{}",
+                        args[i],
+                        state_help()
+                    ),
+                    2,
+                );
+            }
+        }
+    }
+    let Some(job_id) = job_id else {
+        return CliResponse::err(
+            format!("--job is required\n\n{}", state_help()),
+            2,
+        );
+    };
+    let Some(operator_id) = operator_id else {
+        return CliResponse::err(
+            format!("--operator is required\n\n{}", state_help()),
+            2,
+        );
+    };
+    // In R5.2 this is a skeleton: state lives on executor nodes and is not
+    // accessible from the coordinator without an executor RPC.  The full
+    // implementation arrives with the executor state-inspection RPC in R6.
+    CliResponse::ok(format!(
+        "State inspection (read-only)\n\
+         Job:      {job_id}\n\
+         Operator: {operator_id}\n\
+         Status:   executor-side state inspection RPC not yet wired (R6)\n\
+         Note:     State metadata (namespaces, key counts) will be reported here\n\
+                   once the executor exposes the state inspection endpoint.\n"
+    ))
 }
 
 fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> {
@@ -675,5 +758,37 @@ mod tests {
                 .stderr
                 .contains("--tasks must be greater than zero")
         );
+    }
+
+    #[test]
+    fn state_help_command_exits_zero() {
+        let response = dispatch(&["state", "--help"]);
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("inspect"));
+        assert!(response.stdout.contains("read-only"));
+    }
+
+    #[test]
+    fn state_inspect_requires_job_and_operator() {
+        let response = dispatch(&["state", "inspect"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("--job is required"));
+    }
+
+    #[test]
+    fn state_inspect_returns_skeleton_output() {
+        let response =
+            dispatch(&["state", "inspect", "--job", "job-123", "--operator", "tumbling-1"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("job-123"));
+        assert!(response.stdout.contains("tumbling-1"));
+        assert!(response.stdout.contains("read-only"));
+    }
+
+    #[test]
+    fn state_unknown_subcommand_exits_nonzero() {
+        let response = dispatch(&["state", "unknown"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("unknown state subcommand"));
     }
 }

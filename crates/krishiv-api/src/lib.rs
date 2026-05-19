@@ -662,6 +662,129 @@ impl WindowedStream {
     }
 }
 
+// ── R5.2 Streaming API ────────────────────────────────────────────────────────
+
+/// Multi-source watermark configuration (R5.2).
+///
+/// Each source can have its own fixed-lag watermark.  The effective watermark
+/// across all sources is the minimum, so a stalled source blocks all windows.
+#[derive(Debug, Clone, Default)]
+pub struct MultiSourceWatermarkSpec {
+    source_specs: std::collections::HashMap<String, WatermarkSpec>,
+}
+
+impl MultiSourceWatermarkSpec {
+    /// Create an empty multi-source spec.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a watermark spec for `source_id`.
+    #[must_use]
+    pub fn source(mut self, source_id: impl Into<String>, spec: WatermarkSpec) -> Self {
+        self.source_specs.insert(source_id.into(), spec);
+        self
+    }
+
+    /// The configured per-source specs.
+    pub fn source_specs(&self) -> &std::collections::HashMap<String, WatermarkSpec> {
+        &self.source_specs
+    }
+}
+
+/// State TTL (time-to-live) configuration for streaming operators (R5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateTtlConfig {
+    ttl_ms: u64,
+}
+
+impl StateTtlConfig {
+    /// Create a TTL config with the given duration in milliseconds.
+    pub fn new(ttl_ms: u64) -> Self {
+        Self { ttl_ms }
+    }
+
+    /// TTL duration in milliseconds.
+    pub fn ttl_ms(&self) -> u64 {
+        self.ttl_ms
+    }
+}
+
+/// A keyed stream with a sliding window applied (R5.2).
+#[derive(Debug, Clone)]
+pub struct SlidingWindowedStream {
+    keyed: KeyedStream,
+    /// Total window duration in milliseconds.
+    window_size_ms: u64,
+    /// Slide step in milliseconds.
+    slide_ms: u64,
+}
+
+impl SlidingWindowedStream {
+    /// Key column name.
+    pub fn key_column(&self) -> &str {
+        self.keyed.key_column()
+    }
+
+    /// Event-time column name.
+    pub fn event_time_column(&self) -> Option<&str> {
+        self.keyed.event_time_column()
+    }
+
+    /// Watermark lag in milliseconds.
+    pub fn watermark_lag_ms(&self) -> u64 {
+        self.keyed.watermark_spec().map_or(0, WatermarkSpec::lag_ms)
+    }
+
+    /// Total window size in milliseconds.
+    pub fn window_size_ms(&self) -> u64 {
+        self.window_size_ms
+    }
+
+    /// Slide step in milliseconds.
+    pub fn slide_ms(&self) -> u64 {
+        self.slide_ms
+    }
+}
+
+/// A keyed stream with a session window applied (R5.2).
+#[derive(Debug, Clone)]
+pub struct SessionWindowedStream {
+    keyed: KeyedStream,
+    /// Inactivity gap that closes a session in milliseconds.
+    session_gap_ms: u64,
+}
+
+impl SessionWindowedStream {
+    /// Key column name.
+    pub fn key_column(&self) -> &str {
+        self.keyed.key_column()
+    }
+
+    /// Event-time column name.
+    pub fn event_time_column(&self) -> Option<&str> {
+        self.keyed.event_time_column()
+    }
+
+    /// Inactivity gap in milliseconds.
+    pub fn session_gap_ms(&self) -> u64 {
+        self.session_gap_ms
+    }
+}
+
+impl KeyedStream {
+    /// Create a sliding event-time window of total size `window_size_ms` advancing
+    /// by `slide_ms` (R5.2).
+    pub fn sliding_window(self, window_size_ms: u64, slide_ms: u64) -> SlidingWindowedStream {
+        SlidingWindowedStream { keyed: self, window_size_ms, slide_ms }
+    }
+
+    /// Create a session window that closes after `session_gap_ms` of inactivity (R5.2).
+    pub fn session_window(self, session_gap_ms: u64) -> SessionWindowedStream {
+        SessionWindowedStream { keyed: self, session_gap_ms }
+    }
+}
+
 fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
     match mode {
         ExecutionMode::Embedded | ExecutionMode::SingleNode => Ok(()),
@@ -908,6 +1031,53 @@ mod tests {
     fn watermark_spec_lag_ms_roundtrip() {
         let spec = WatermarkSpec::fixed_lag_ms(30_000);
         assert_eq!(spec.lag_ms(), 30_000);
+    }
+
+    use super::{MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig};
+
+    #[test]
+    fn multi_source_watermark_spec_roundtrip() {
+        let spec = MultiSourceWatermarkSpec::new()
+            .source("src-a", WatermarkSpec::fixed_lag_ms(1000))
+            .source("src-b", WatermarkSpec::fixed_lag_ms(2000));
+        assert_eq!(spec.source_specs().len(), 2);
+        assert_eq!(spec.source_specs()["src-a"].lag_ms(), 1000);
+        assert_eq!(spec.source_specs()["src-b"].lag_ms(), 2000);
+    }
+
+    #[test]
+    fn state_ttl_config_roundtrip() {
+        let cfg = StateTtlConfig::new(5_000);
+        assert_eq!(cfg.ttl_ms(), 5_000);
+    }
+
+    #[test]
+    fn sliding_window_api_builder() {
+        let session = Session::builder().build().unwrap();
+        let stream = session.unbounded_memory_stream("events");
+        let sliding: SlidingWindowedStream = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .watermark(WatermarkSpec::fixed_lag_ms(500))
+            .sliding_window(2_000, 500);
+        assert_eq!(sliding.key_column(), "user_id");
+        assert_eq!(sliding.event_time_column(), Some("ts"));
+        assert_eq!(sliding.watermark_lag_ms(), 500);
+        assert_eq!(sliding.window_size_ms(), 2_000);
+        assert_eq!(sliding.slide_ms(), 500);
+    }
+
+    #[test]
+    fn session_window_api_builder() {
+        let session = Session::builder().build().unwrap();
+        let stream = session.unbounded_memory_stream("events");
+        let sess: SessionWindowedStream = stream
+            .key_by("device_id")
+            .with_event_time("ts")
+            .session_window(30_000);
+        assert_eq!(sess.key_column(), "device_id");
+        assert_eq!(sess.event_time_column(), Some("ts"));
+        assert_eq!(sess.session_gap_ms(), 30_000);
     }
 
     fn write_people_parquet(path: &std::path::Path) {
