@@ -2424,7 +2424,7 @@ mod tests {
         JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
         OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
         StageId, StageSpec, StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId,
-        TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
         TransportVersion, wire,
     };
 
@@ -4030,7 +4030,7 @@ mod tests {
             TaskId::try_new("task-1").unwrap(),
             AttemptId::initial(),
         );
-        let mut assignment = ExecutorTaskAssignment::new(
+        let assignment = ExecutorTaskAssignment::new(
             ids,
             ExecutorId::try_new("exec-1").unwrap(),
             LeaseGeneration::initial(),

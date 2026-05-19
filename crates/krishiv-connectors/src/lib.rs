@@ -954,7 +954,6 @@ mod tests {
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let make_batch = |v: i64| -> RecordBatch {
             RecordBatch::try_new(
                 Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),

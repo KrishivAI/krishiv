@@ -1150,7 +1150,7 @@ mod tests {
     fn rocks_ttl_wrapper_expires_on_reopen() {
         // State written before expiry must be readable immediately after;
         // an artificially-expired entry (manually injected) must return None.
-        let mut b = rocks_backend();
+        let b = rocks_backend();
         let n = ns("op1", "session");
         // Write a real entry with a very long TTL so it's live.
         let mut ttl = TtlStateBackend::new(b, TtlConfig::new(60_000));

@@ -2,12 +2,13 @@
 
 ## Current Phase
 
-**R6 IN PROGRESS.** R6 startup sequence complete. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace (`cargo test --workspace`).
+**R6 IN PROGRESS.** R6 startup sequence complete. Branch `work`. Latest validated sweep for the warning cleanup: `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
 
 ## Active Task
 
 **R6 startup sequence** — all five pre-implementation decisions delivered:
 
+- Workspace bug-sweep: cleared compiler warning bugs in tests (`unused import`, `unused mut`, `unused variable`, `dead code`) across executor/shuffle/connectors/state crates; revalidated targeted crates with `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
 - `FencingToken(u64)` added to `krishiv-proto`: `initial()`, `next()`, `as_u64()`, ordering — 4 tests pass.
 - `StateBackend::snapshot()` + `load_snapshot()` added: implemented for `InMemoryStateBackend` (length-prefixed binary format, version=1); stubbed `SnapshotUnsupported` for `RocksDbStateBackend`; delegating for `TtlStateBackend<B>` — 4 new tests pass.
 - `TwoPhaseCommitSink` trait + `InMemoryTwoPhaseCommitSink` added to `krishiv-connectors`: `prepare/commit/abort` protocol with handle-based staging — 3 new tests pass.
