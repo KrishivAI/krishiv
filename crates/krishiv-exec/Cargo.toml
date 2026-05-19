@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 krishiv-plan = { path = "../krishiv-plan" }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [lib]
 path = "src/lib.rs"

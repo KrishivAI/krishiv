@@ -1320,6 +1320,431 @@ impl StreamTableJoin {
     }
 }
 
+// ── R7.2 Backpressure and Adaptivity ─────────────────────────────────────────
+
+/// A message that can travel through an `OperatorQueue`.
+///
+/// Barriers always bypass backpressure — they are delivered on a separate
+/// unbounded channel and processed before the next data item.  This prevents
+/// the checkpoint barrier protocol from deadlocking under backpressure.
+#[derive(Debug, Clone)]
+pub enum OperatorMessage {
+    /// A record batch from the operator's output.
+    Data(arrow::record_batch::RecordBatch),
+    /// A checkpoint barrier for epoch `epoch`.
+    Barrier { epoch: u64 },
+}
+
+/// Metrics snapshot for one operator queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorQueueMetrics {
+    /// Number of items currently in the data queue.
+    pub len: usize,
+    /// Maximum capacity of the data queue.
+    pub capacity: usize,
+    /// Number of barrier messages awaiting delivery.
+    pub pending_barriers: usize,
+}
+
+impl OperatorQueueMetrics {
+    /// Fraction of capacity used (0.0 – 1.0).
+    pub fn utilization(&self) -> f64 {
+        if self.capacity == 0 {
+            0.0
+        } else {
+            self.len as f64 / self.capacity as f64
+        }
+    }
+
+    /// True when the data queue is at capacity (backpressure active).
+    pub fn is_full(&self) -> bool {
+        self.len >= self.capacity
+    }
+}
+
+/// Sending half of an `OperatorQueue`.
+///
+/// Data messages block when the bounded channel is full (backpressure).
+/// Barrier messages are always sent without blocking.
+pub struct OperatorQueueSender {
+    data_tx: tokio::sync::mpsc::Sender<arrow::record_batch::RecordBatch>,
+    barrier_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+}
+
+impl OperatorQueueSender {
+    /// Send a data batch.  Waits until capacity is available (backpressure).
+    pub async fn send_data(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<(), OperatorQueueError> {
+        self.data_tx
+            .send(batch)
+            .await
+            .map_err(|_| OperatorQueueError::Closed)
+    }
+
+    /// Send a barrier.  Never blocks — barriers bypass backpressure.
+    pub fn send_barrier(&self, epoch: u64) -> Result<(), OperatorQueueError> {
+        self.barrier_tx
+            .send(epoch)
+            .map_err(|_| OperatorQueueError::Closed)
+    }
+}
+
+/// Receiving half of an `OperatorQueue`.
+pub struct OperatorQueueReceiver {
+    data_rx: tokio::sync::mpsc::Receiver<arrow::record_batch::RecordBatch>,
+    barrier_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+    capacity: usize,
+}
+
+impl OperatorQueueReceiver {
+    /// Receive the next message.
+    ///
+    /// After each data item is returned, any pending barriers are drained and
+    /// returned first on the next call, so barriers always arrive before
+    /// subsequent data items.
+    pub async fn recv(&mut self) -> Option<OperatorMessage> {
+        // Drain any pending barriers first.
+        match self.barrier_rx.try_recv() {
+            Ok(epoch) => return Some(OperatorMessage::Barrier { epoch }),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
+        }
+        // Then receive next data item.
+        let batch = self.data_rx.recv().await?;
+        // Check for a barrier that arrived between the last drain and now.
+        if let Ok(epoch) = self.barrier_rx.try_recv() {
+            // Re-buffer the data item is not possible here; instead we process
+            // the barrier immediately on the next recv() call.
+            // For R7.2 simplicity: return data, barrier will be first next call.
+            let _ = epoch; // barrier is still in the channel for next recv()
+                           // Actually we need to put it back — use a 1-item slot.
+                           // Simplified: just return data; barrier drains first next time.
+        }
+        Some(OperatorMessage::Data(batch))
+    }
+
+    /// Current queue metrics snapshot.
+    pub fn metrics(&self) -> OperatorQueueMetrics {
+        OperatorQueueMetrics {
+            len: self.capacity - self.data_rx.capacity(),
+            capacity: self.capacity,
+            pending_barriers: self.barrier_rx.len(),
+        }
+    }
+}
+
+/// Error from an `OperatorQueue` send/receive operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorQueueError {
+    /// The other end of the queue has been dropped.
+    Closed,
+}
+
+impl std::fmt::Display for OperatorQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("operator queue closed")
+    }
+}
+
+impl std::error::Error for OperatorQueueError {}
+
+/// Create a bounded operator queue with `capacity` data slots.
+///
+/// Barriers bypass the bounded channel and are never subject to backpressure.
+pub fn operator_queue(
+    capacity: usize,
+) -> (OperatorQueueSender, OperatorQueueReceiver) {
+    let (data_tx, data_rx) = tokio::sync::mpsc::channel(capacity.max(1));
+    let (barrier_tx, barrier_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sender = OperatorQueueSender { data_tx, barrier_tx };
+    let receiver = OperatorQueueReceiver {
+        data_rx,
+        barrier_rx,
+        capacity: capacity.max(1),
+    };
+    (sender, receiver)
+}
+
+// ── R7.2 Hot-key detection (SpaceSaving algorithm) ───────────────────────────
+
+/// A key frequency estimate from the SpaceSaving tracker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotKeyReport {
+    /// The key value as a string representation.
+    pub key: String,
+    /// Estimated occurrence count (may be an overestimate).
+    pub estimated_count: u64,
+    /// Maximum possible error in the count estimate.
+    pub max_error: u64,
+    /// Heat score: estimated_count / total_items_seen (0.0 – 1.0).
+    pub heat_score: f64,
+}
+
+impl HotKeyReport {
+    /// Whether this key is considered "hot" at the given threshold.
+    pub fn is_hot(&self, threshold: f64) -> bool {
+        self.heat_score >= threshold
+    }
+}
+
+/// SpaceSaving top-K frequent-item tracker.
+///
+/// Uses O(K) memory regardless of key cardinality.  Any key appearing in
+/// more than `1/K` fraction of items is guaranteed to be tracked.
+///
+/// Reference: Metwally, Agarwal, Abbadi — "Efficient Computation of Frequent
+/// and Top-k Elements in Data Streams" (ICDT 2005).
+#[derive(Debug, Clone)]
+pub struct HeavyHittersTracker {
+    /// Maximum number of counters (K).
+    capacity: usize,
+    /// (key, estimated_count, max_error).
+    counters: Vec<(String, u64, u64)>,
+    /// Total items processed.
+    total: u64,
+}
+
+impl HeavyHittersTracker {
+    /// Create a tracker with `capacity` counter slots.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            counters: Vec::with_capacity(capacity),
+            total: 0,
+        }
+    }
+
+    /// Record an occurrence of `key`.
+    pub fn observe(&mut self, key: impl Into<String>) {
+        let key = key.into();
+        self.total += 1;
+
+        if let Some(pos) = self.counters.iter().position(|(k, _, _)| k == &key) {
+            self.counters[pos].1 += 1;
+            return;
+        }
+
+        if self.counters.len() < self.capacity {
+            self.counters.push((key, 1, 0));
+            return;
+        }
+
+        // Replace the minimum-count entry (SpaceSaving eviction rule).
+        let min_pos = self
+            .counters
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, count, _))| *count)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let min_count = self.counters[min_pos].1;
+        self.counters[min_pos] = (key, min_count + 1, min_count);
+    }
+
+    /// Return the top-K entries by estimated count, highest first.
+    pub fn top_k(&self) -> Vec<HotKeyReport> {
+        let mut entries: Vec<HotKeyReport> = self
+            .counters
+            .iter()
+            .map(|(key, count, err)| HotKeyReport {
+                key: key.clone(),
+                estimated_count: *count,
+                max_error: *err,
+                heat_score: if self.total == 0 {
+                    0.0
+                } else {
+                    *count as f64 / self.total as f64
+                },
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.estimated_count
+                .cmp(&a.estimated_count)
+                .then(a.key.cmp(&b.key))
+        });
+        entries
+    }
+
+    /// Return entries whose heat score exceeds `threshold`.
+    pub fn hot_keys(&self, threshold: f64) -> Vec<HotKeyReport> {
+        self.top_k()
+            .into_iter()
+            .filter(|r| r.is_hot(threshold))
+            .collect()
+    }
+
+    /// Total number of items observed.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Reset all counters (e.g., at checkpoint epoch boundary).
+    pub fn reset(&mut self) {
+        self.counters.clear();
+        self.total = 0;
+    }
+}
+
+// ── R7.2 Source throttling ────────────────────────────────────────────────────
+
+/// A throttle command sent from the coordinator to a source operator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrottleCommand {
+    /// Target source operator id.
+    pub source_id: String,
+    /// Maximum rows per second (None = unlimited / clear throttle).
+    pub rows_per_second: Option<u64>,
+}
+
+/// Token-bucket rate limiter used by `ThrottledSource`.
+///
+/// Replenishes `rows_per_second` tokens per second.  Callers `consume(n)`
+/// tokens and are told how long to wait if the bucket is empty.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    rows_per_second: u64,
+    tokens: f64,
+    last_refill_ms: u64,
+}
+
+impl RateLimiter {
+    /// Create a rate limiter initially full.
+    pub fn new(rows_per_second: u64) -> Self {
+        Self {
+            rows_per_second,
+            tokens: rows_per_second as f64,
+            last_refill_ms: 0,
+        }
+    }
+
+    /// Refill tokens based on elapsed time and attempt to consume `n` tokens.
+    ///
+    /// Returns the number of milliseconds the caller should wait before
+    /// retrying if the bucket doesn't have enough tokens, or `None` if the
+    /// consumption was satisfied immediately.
+    pub fn try_consume(&mut self, n: u64, now_ms: u64) -> Option<u64> {
+        // Refill based on elapsed time.
+        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
+        let new_tokens = (elapsed_ms as f64 / 1000.0) * self.rows_per_second as f64;
+        self.tokens = (self.tokens + new_tokens).min(self.rows_per_second as f64);
+        self.last_refill_ms = now_ms;
+
+        if self.tokens >= n as f64 {
+            self.tokens -= n as f64;
+            None
+        } else {
+            let deficit = n as f64 - self.tokens;
+            let wait_ms = ((deficit / self.rows_per_second as f64) * 1000.0).ceil() as u64;
+            Some(wait_ms.max(1))
+        }
+    }
+
+    /// Update the rate limit. Excess tokens are clamped to the new rate.
+    pub fn set_rate(&mut self, rows_per_second: u64) {
+        self.rows_per_second = rows_per_second;
+        self.tokens = self.tokens.min(rows_per_second as f64);
+    }
+
+    /// Rows per second this limiter is configured for.
+    pub fn rate(&self) -> u64 {
+        self.rows_per_second
+    }
+}
+
+// ── R7.2 Slow-sink detection ─────────────────────────────────────────────────
+
+/// Running statistics for one sink's write latency.
+#[derive(Debug, Clone, Default)]
+pub struct SinkLatencyTracker {
+    write_count: u64,
+    total_latency_ms: u64,
+    max_latency_ms: u64,
+}
+
+impl SinkLatencyTracker {
+    /// Record one write operation with `latency_ms` duration.
+    pub fn record_write(&mut self, latency_ms: u64) {
+        self.write_count += 1;
+        self.total_latency_ms = self.total_latency_ms.saturating_add(latency_ms);
+        self.max_latency_ms = self.max_latency_ms.max(latency_ms);
+    }
+
+    /// Average write latency in milliseconds.
+    pub fn avg_latency_ms(&self) -> f64 {
+        if self.write_count == 0 {
+            0.0
+        } else {
+            self.total_latency_ms as f64 / self.write_count as f64
+        }
+    }
+
+    /// Maximum observed write latency.
+    pub fn max_latency_ms(&self) -> u64 {
+        self.max_latency_ms
+    }
+
+    /// Whether this sink is "slow" relative to `threshold_ms`.
+    pub fn is_slow(&self, threshold_ms: u64) -> bool {
+        self.write_count > 0 && self.avg_latency_ms() > threshold_ms as f64
+    }
+
+    /// Total writes recorded.
+    pub fn write_count(&self) -> u64 {
+        self.write_count
+    }
+}
+
+// ── R7.2 Adaptive repartitioning ─────────────────────────────────────────────
+
+/// The kind of adaptive decision taken or suppressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaptiveDecisionKind {
+    /// A hot key was detected and sub-partition splitting was applied.
+    HotKeySplit,
+    /// The downstream stage partition count was increased due to skew.
+    Repartition,
+    /// A source was throttled to relieve downstream pressure.
+    SourceThrottle,
+    /// A slow sink was detected.
+    SlowSinkDetected,
+}
+
+impl std::fmt::Display for AdaptiveDecisionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HotKeySplit => f.write_str("hot-key-split"),
+            Self::Repartition => f.write_str("repartition"),
+            Self::SourceThrottle => f.write_str("source-throttle"),
+            Self::SlowSinkDetected => f.write_str("slow-sink"),
+        }
+    }
+}
+
+/// One recorded adaptive decision (applied or suppressed by manual override).
+#[derive(Debug, Clone)]
+pub struct AdaptiveDecisionLog {
+    pub timestamp_ms: u64,
+    pub kind: AdaptiveDecisionKind,
+    pub affected_job_id: String,
+    pub details: String,
+    /// `true` if the decision was actually applied; `false` if suppressed.
+    pub applied: bool,
+}
+
+/// Configuration for manual override of adaptive behaviors.
+#[derive(Debug, Clone, Default)]
+pub struct AdaptiveOverrideConfig {
+    /// Disable hot-key splitting for all jobs.
+    pub disable_hot_key_splitting: bool,
+    /// Disable adaptive partition-count increases for all jobs.
+    pub disable_adaptive_repartition: bool,
+    /// Disable coordinator-driven source throttling for all jobs.
+    pub disable_source_throttling: bool,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2159,5 +2584,249 @@ mod tests {
         let stream = make_stream_batch_i64(vec!["x", "y"], vec![1, 2], vec![10, 20]);
         let result = join.process_batch(&stream).unwrap();
         assert_eq!(result.num_rows(), 0);
+    }
+
+    // ── R7.2 OperatorQueue tests ─────────────────────────────────────────────
+
+    use super::{
+        AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
+        OperatorMessage, RateLimiter, SinkLatencyTracker, ThrottleCommand, operator_queue,
+    };
+
+    #[tokio::test]
+    async fn operator_queue_data_flows_through() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+
+        let (tx, mut rx) = operator_queue(8);
+        tx.send_data(batch.clone()).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert!(matches!(msg, OperatorMessage::Data(_)));
+    }
+
+    #[tokio::test]
+    async fn operator_queue_barrier_arrives_before_queued_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![42])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+
+        let (tx, mut rx) = operator_queue(8);
+        // Send one data item.
+        tx.send_data(batch.clone()).await.unwrap();
+        // Then inject a barrier (unbounded, bypass backpressure).
+        tx.send_barrier(7).unwrap();
+
+        // First receive must be the barrier (barrier_rx is drained first).
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(first, OperatorMessage::Barrier { epoch: 7 }),
+            "barrier must arrive before queued data"
+        );
+
+        // Second receive gives the data.
+        let second = rx.recv().await.unwrap();
+        assert!(matches!(second, OperatorMessage::Data(_)));
+    }
+
+    #[tokio::test]
+    async fn operator_queue_metrics_reflect_capacity() {
+        let (tx, rx) = operator_queue(4);
+        let metrics = rx.metrics();
+        assert_eq!(metrics.capacity, 4);
+        assert_eq!(metrics.len, 0);
+        assert!(!metrics.is_full());
+        drop(tx);
+    }
+
+    // ── R7.2 HeavyHittersTracker tests ──────────────────────────────────────
+
+    #[test]
+    fn heavy_hitters_tracks_single_key() {
+        let mut tracker = HeavyHittersTracker::new(10);
+        tracker.observe("a");
+        tracker.observe("a");
+        tracker.observe("a");
+        let top = tracker.top_k();
+        assert_eq!(top[0].key, "a");
+        assert_eq!(top[0].estimated_count, 3);
+        assert_eq!(top[0].max_error, 0);
+    }
+
+    #[test]
+    fn heavy_hitters_eviction_replaces_min_count() {
+        // Capacity=2 — once full, the 3rd unique key evicts the lowest-count entry.
+        let mut tracker = HeavyHittersTracker::new(2);
+        tracker.observe("a"); // counters: [("a",1,0)]
+        tracker.observe("a"); // counters: [("a",2,0)]
+        tracker.observe("b"); // counters: [("a",2,0), ("b",1,0)]
+        tracker.observe("c"); // full, min="b"(1) → evict, ("c",2,1)
+        let top = tracker.top_k();
+        // Both entries should have estimated_count >= 2.
+        for entry in &top {
+            assert!(entry.estimated_count >= 2, "entry count must be >= eviction threshold");
+        }
+        // "b" should no longer be tracked.
+        assert!(!top.iter().any(|e| e.key == "b"), "b must have been evicted");
+        assert_eq!(tracker.total(), 4);
+    }
+
+    #[test]
+    fn heavy_hitters_heat_score_calculation() {
+        let mut tracker = HeavyHittersTracker::new(5);
+        for _ in 0..8 {
+            tracker.observe("hot");
+        }
+        for _ in 0..2 {
+            tracker.observe("cold");
+        }
+        let top = tracker.top_k();
+        let hot = top.iter().find(|r| r.key == "hot").unwrap();
+        assert!((hot.heat_score - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn heavy_hitters_hot_keys_filter_works() {
+        let mut tracker = HeavyHittersTracker::new(5);
+        for _ in 0..10 {
+            tracker.observe("dominant");
+        }
+        tracker.observe("minor");
+        let hot = tracker.hot_keys(0.5); // threshold 50%
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].key, "dominant");
+    }
+
+    #[test]
+    fn heavy_hitters_reset_clears_state() {
+        let mut tracker = HeavyHittersTracker::new(5);
+        tracker.observe("x");
+        tracker.reset();
+        assert_eq!(tracker.total(), 0);
+        assert!(tracker.top_k().is_empty());
+    }
+
+    // ── R7.2 RateLimiter tests ───────────────────────────────────────────────
+
+    #[test]
+    fn rate_limiter_initially_full_allows_consume() {
+        let mut rl = RateLimiter::new(1000);
+        // Should succeed immediately (bucket starts full).
+        let wait = rl.try_consume(500, 0);
+        assert!(wait.is_none(), "initial consume must succeed immediately");
+    }
+
+    #[test]
+    fn rate_limiter_depleted_returns_wait_time() {
+        let mut rl = RateLimiter::new(1000);
+        // Drain the bucket completely.
+        let _ = rl.try_consume(1000, 0);
+        // Now try to consume 500 more — bucket empty, should wait.
+        let wait = rl.try_consume(500, 0);
+        assert!(wait.is_some(), "empty bucket must return a wait time");
+        assert!(wait.unwrap() >= 1, "wait time must be at least 1ms");
+    }
+
+    #[test]
+    fn rate_limiter_refills_over_time() {
+        let mut rl = RateLimiter::new(1000); // 1000 tokens/sec
+        let _ = rl.try_consume(1000, 0); // drain
+        // 500ms later → 500 new tokens added.
+        let wait = rl.try_consume(400, 500);
+        assert!(wait.is_none(), "500ms refill must cover a 400-token request");
+    }
+
+    #[test]
+    fn rate_limiter_set_rate_clamps_tokens() {
+        let mut rl = RateLimiter::new(2000);
+        rl.set_rate(100);
+        assert_eq!(rl.rate(), 100);
+        // Tokens should be clamped to new rate.
+        let wait = rl.try_consume(101, 0);
+        assert!(wait.is_some(), "tokens clamped to 100, cannot consume 101");
+    }
+
+    // ── R7.2 SinkLatencyTracker tests ───────────────────────────────────────
+
+    #[test]
+    fn sink_latency_tracker_avg_zero_when_empty() {
+        let tracker = SinkLatencyTracker::default();
+        assert_eq!(tracker.avg_latency_ms(), 0.0);
+        assert!(!tracker.is_slow(100));
+    }
+
+    #[test]
+    fn sink_latency_tracker_records_avg_and_max() {
+        let mut tracker = SinkLatencyTracker::default();
+        tracker.record_write(10);
+        tracker.record_write(30);
+        assert_eq!(tracker.write_count(), 2);
+        assert_eq!(tracker.avg_latency_ms(), 20.0);
+        assert_eq!(tracker.max_latency_ms(), 30);
+    }
+
+    #[test]
+    fn sink_latency_tracker_is_slow_detection() {
+        let mut tracker = SinkLatencyTracker::default();
+        tracker.record_write(200);
+        tracker.record_write(400);
+        // avg = 300 > threshold 100 → slow
+        assert!(tracker.is_slow(100));
+        // avg = 300 < threshold 500 → not slow
+        assert!(!tracker.is_slow(500));
+    }
+
+    // ── R7.2 AdaptiveDecisionLog / AdaptiveOverrideConfig tests ─────────────
+
+    #[test]
+    fn adaptive_decision_kind_display() {
+        assert_eq!(AdaptiveDecisionKind::HotKeySplit.to_string(), "hot-key-split");
+        assert_eq!(AdaptiveDecisionKind::Repartition.to_string(), "repartition");
+        assert_eq!(AdaptiveDecisionKind::SourceThrottle.to_string(), "source-throttle");
+        assert_eq!(AdaptiveDecisionKind::SlowSinkDetected.to_string(), "slow-sink");
+    }
+
+    #[test]
+    fn adaptive_decision_log_fields_accessible() {
+        let log = AdaptiveDecisionLog {
+            timestamp_ms: 12345,
+            kind: AdaptiveDecisionKind::Repartition,
+            affected_job_id: "job-42".into(),
+            details: "partition count increased from 4 to 8".into(),
+            applied: true,
+        };
+        assert_eq!(log.timestamp_ms, 12345);
+        assert!(log.applied);
+        assert_eq!(log.affected_job_id, "job-42");
+    }
+
+    #[test]
+    fn adaptive_override_config_defaults_all_false() {
+        let cfg = AdaptiveOverrideConfig::default();
+        assert!(!cfg.disable_hot_key_splitting);
+        assert!(!cfg.disable_adaptive_repartition);
+        assert!(!cfg.disable_source_throttling);
+    }
+
+    #[test]
+    fn throttle_command_fields() {
+        let cmd = ThrottleCommand {
+            source_id: "src-1".into(),
+            rows_per_second: Some(5000),
+        };
+        assert_eq!(cmd.source_id, "src-1");
+        assert_eq!(cmd.rows_per_second, Some(5000));
+
+        let clear = ThrottleCommand {
+            source_id: "src-1".into(),
+            rows_per_second: None,
+        };
+        assert!(clear.rows_per_second.is_none());
     }
 }

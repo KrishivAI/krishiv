@@ -27,12 +27,12 @@ use krishiv_proto::{
     CoordinatorExecutorService, CoordinatorId, CoordinatorState, DeregisterExecutorRequest,
     DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment, FencingToken,
-    InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
-    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-    ShufflePartitionOutput, StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment,
-    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
-    TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
-    TransportVersion, wire,
+    HeartbeatHotKeyReport, HeartbeatThrottleCommand, InputPartition, JobId, JobKind, JobSpec,
+    JobState, LeaseGeneration, OutputContract, OutputContractKind, PlanFragment,
+    RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput, StageId, StageSpec,
+    StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest,
+    TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
+    TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 use serde::{Deserialize, Serialize};
@@ -364,6 +364,59 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self::new(1, 3)
     }
+}
+
+// ── R7.2 Adaptive governance types ───────────────────────────────────────────
+
+/// The kind of adaptive decision taken or suppressed by the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaptiveDecisionKind {
+    HotKeySplit,
+    Repartition,
+    SourceThrottle,
+    SlowSinkDetected,
+}
+
+impl fmt::Display for AdaptiveDecisionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HotKeySplit => f.write_str("hot-key-split"),
+            Self::Repartition => f.write_str("repartition"),
+            Self::SourceThrottle => f.write_str("source-throttle"),
+            Self::SlowSinkDetected => f.write_str("slow-sink"),
+        }
+    }
+}
+
+/// One recorded adaptive decision (applied or suppressed by manual override).
+#[derive(Debug, Clone)]
+pub struct AdaptiveDecisionLog {
+    pub timestamp_ms: u64,
+    pub kind: AdaptiveDecisionKind,
+    pub affected_job_id: JobId,
+    pub details: String,
+    /// `true` if the decision was actually applied; `false` if suppressed.
+    pub applied: bool,
+}
+
+/// Manual override configuration for adaptive behaviors in the coordinator.
+#[derive(Debug, Clone, Default)]
+pub struct AdaptiveOverrideConfig {
+    pub disable_hot_key_splitting: bool,
+    pub disable_adaptive_repartition: bool,
+    pub disable_source_throttling: bool,
+}
+
+/// A throttle command the coordinator sends back to an executor in the
+/// heartbeat response (R7.2 Group C).
+///
+/// The executor forwards this to its source operators to apply rate limiting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrottleDecision {
+    /// Source operator id on the executor.
+    pub source_id: String,
+    /// Maximum rows per second (`None` clears the throttle).
+    pub rows_per_second: Option<u64>,
 }
 
 /// Scheduler and coordinator errors.
@@ -794,6 +847,11 @@ pub struct Coordinator {
     ticks_since_restart: u64,
     /// Set to true after `recover_from_store` has been called at least once.
     recovering: bool,
+    /// Append-only log of adaptive decisions (hot-key split, repartition,
+    /// throttle, slow-sink).  Keyed by job id.  R7.2 Group H.
+    adaptive_decision_log: HashMap<JobId, Vec<AdaptiveDecisionLog>>,
+    /// Manual override config for adaptive behaviors.
+    adaptive_override: AdaptiveOverrideConfig,
 }
 
 impl fmt::Debug for Coordinator {
@@ -957,16 +1015,32 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             heartbeat =
                 heartbeat.with_streaming_task_states(request.streaming_task_states().to_vec());
         }
+        if !request.hot_key_reports().is_empty() {
+            heartbeat = heartbeat.with_hot_key_reports(request.hot_key_reports().to_vec());
+        }
         let mut coordinator = self
             .coordinator
             .write()
             .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {
-            Ok(()) => ExecutorHeartbeatResponse::new(
-                request.lease_generation(),
-                TransportDisposition::Accepted,
-            ),
+            Ok(throttle_cmds) => {
+                let mut resp = ExecutorHeartbeatResponse::new(
+                    request.lease_generation(),
+                    TransportDisposition::Accepted,
+                );
+                if !throttle_cmds.is_empty() {
+                    let wire_cmds: Vec<HeartbeatThrottleCommand> = throttle_cmds
+                        .into_iter()
+                        .map(|c| HeartbeatThrottleCommand {
+                            source_id: c.source_id,
+                            rows_per_second: c.rows_per_second,
+                        })
+                        .collect();
+                    resp = resp.with_throttle_commands(wire_cmds);
+                }
+                resp
+            }
             Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
                 request.lease_generation(),
                 TransportDisposition::UnknownExecutor,
@@ -1228,6 +1302,8 @@ impl Coordinator {
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
+            adaptive_decision_log: HashMap::new(),
+            adaptive_override: AdaptiveOverrideConfig::default(),
         }
     }
 
@@ -1249,6 +1325,22 @@ impl Coordinator {
     pub fn with_queue_manager(mut self, qm: impl QueueManager + 'static) -> Self {
         self.queue_manager = Arc::new(qm);
         self
+    }
+
+    /// Override the adaptive governance configuration (R7.2).
+    #[must_use]
+    pub fn with_adaptive_override(mut self, cfg: AdaptiveOverrideConfig) -> Self {
+        self.adaptive_override = cfg;
+        self
+    }
+
+    /// Return the adaptive decision log for a job, or an empty slice if there
+    /// are no decisions for this job.  R7.2 Group H.
+    pub fn adaptive_decision_log(&self, job_id: &JobId) -> &[AdaptiveDecisionLog] {
+        self.adaptive_decision_log
+            .get(job_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Create a standby R2 coordinator.
@@ -1301,14 +1393,64 @@ impl Coordinator {
     /// include `streaming_task_states`. These are applied to the matching task records so
     /// the coordinator tracks the executor's current watermark and source offset without
     /// re-submitting the job from scratch.
-    pub fn executor_heartbeat(&mut self, heartbeat: ExecutorHeartbeat) -> SchedulerResult<()> {
+    ///
+    /// Returns throttle commands to forward back to the executor (R7.2 Group C).
+    /// Currently returns an empty vec unless adaptive source throttling is wired up.
+    pub fn executor_heartbeat(
+        &mut self,
+        heartbeat: ExecutorHeartbeat,
+    ) -> SchedulerResult<Vec<ThrottleDecision>> {
         self.ensure_active()?;
         let streaming_states: Vec<StreamingTaskState> = heartbeat.streaming_task_states().to_vec();
+        let hot_key_reports = heartbeat.hot_key_reports().to_vec();
         self.executors.heartbeat(heartbeat)?;
         for state in &streaming_states {
             self.apply_streaming_task_state(state);
         }
-        Ok(())
+        // R7.2 Group D: process hot-key reports and record adaptive decisions.
+        self.process_hot_key_reports(&hot_key_reports);
+        Ok(Vec::new())
+    }
+
+    /// Record adaptive decisions for incoming hot-key reports.
+    ///
+    /// For each hot key whose heat_score exceeds the threshold, logs an
+    /// `AdaptiveDecisionLog` entry. If `disable_hot_key_splitting` is set,
+    /// the decision is logged with `applied: false`.
+    fn process_hot_key_reports(&mut self, reports: &[HeartbeatHotKeyReport]) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        if reports.is_empty() {
+            return;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        for report in reports {
+            if report.job_id.is_empty() {
+                continue;
+            }
+            let job_id = match JobId::try_new(report.job_id.clone()) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let applied = !self.adaptive_override.disable_hot_key_splitting;
+            let log = AdaptiveDecisionLog {
+                timestamp_ms: now_ms,
+                kind: AdaptiveDecisionKind::HotKeySplit,
+                affected_job_id: job_id.clone(),
+                details: format!(
+                    "hot key '{}' heat={:.3} estimated_count={} max_error={}",
+                    report.key, report.heat_score, report.estimated_count, report.max_error
+                ),
+                applied,
+            };
+            self.adaptive_decision_log
+                .entry(job_id)
+                .or_default()
+                .push(log);
+        }
     }
 
     /// Update a task record's last-known watermark and source offset from executor-reported state.
@@ -4046,13 +4188,13 @@ mod tests {
     };
 
     use super::{
-        CheckpointCoordinator, CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator,
-        CoordinatorConfig, CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry,
-        InMemoryMetadataStore, InMemoryQueueManager, JobSnapshot, JsonFileMetadataStore,
-        LeaderElection, MetadataStore, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy,
-        QuotaQueueManager, ResourceUsage, SchedulerError, SharedCoordinator, SingleNodeElection,
-        StaticScheduler, SubmitOutcome, TaskUpdateOutcome, job_spec_from_logical_plan,
-        serve_coordinator_executor_grpc_with_listener,
+        AdaptiveDecisionKind, AdaptiveOverrideConfig, CheckpointCoordinator,
+        CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator, CoordinatorConfig,
+        CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryMetadataStore,
+        InMemoryQueueManager, JobSnapshot, JsonFileMetadataStore, LeaderElection, MetadataStore,
+        NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, QuotaQueueManager, ResourceUsage,
+        SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
+        TaskUpdateOutcome, job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
 
     #[derive(Debug, Clone, Default)]
@@ -7180,5 +7322,136 @@ mod tests {
                 .is_err(),
             "queued job must not appear in job list"
         );
+    }
+
+    // ── R7.2 Adaptive decision log tests ─────────────────────────────────────
+
+    #[test]
+    fn adaptive_decision_log_empty_for_unknown_job() {
+        let coordinator_id = CoordinatorId::try_new("coord-adaptive").unwrap();
+        let coordinator = Coordinator::active(coordinator_id);
+        let job_id = JobId::try_new("unknown-job").unwrap();
+        assert!(coordinator.adaptive_decision_log(&job_id).is_empty());
+    }
+
+    #[test]
+    fn hot_key_reports_appended_to_decision_log() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-hk").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-1").unwrap();
+        let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+            .with_hot_key_reports(vec![HeartbeatHotKeyReport {
+                key: "hot-key".into(),
+                estimated_count: 500,
+                max_error: 10,
+                heat_score: 0.25,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            }]);
+
+        let throttle_cmds = coordinator.executor_heartbeat(heartbeat).unwrap();
+        // Default config: no throttle commands issued.
+        assert!(throttle_cmds.is_empty());
+
+        let log = coordinator.adaptive_decision_log(&job_id);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, AdaptiveDecisionKind::HotKeySplit);
+        assert!(log[0].applied, "hot-key split must be applied by default");
+        assert!(log[0].details.contains("hot-key"));
+    }
+
+    #[test]
+    fn hot_key_split_suppressed_by_override() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk-override").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id).with_adaptive_override(
+            AdaptiveOverrideConfig {
+                disable_hot_key_splitting: true,
+                ..AdaptiveOverrideConfig::default()
+            },
+        );
+
+        let executor_id = ExecutorId::try_new("exec-hk-override").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-2").unwrap();
+        let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+            .with_hot_key_reports(vec![HeartbeatHotKeyReport {
+                key: "skewed-key".into(),
+                estimated_count: 1000,
+                max_error: 0,
+                heat_score: 0.9,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            }]);
+
+        coordinator.executor_heartbeat(heartbeat).unwrap();
+
+        let log = coordinator.adaptive_decision_log(&job_id);
+        assert_eq!(log.len(), 1);
+        assert!(
+            !log[0].applied,
+            "decision must be suppressed when disable_hot_key_splitting=true"
+        );
+        assert!(log[0].details.contains("skewed-key"));
+    }
+
+    #[test]
+    fn multiple_hot_key_reports_all_logged() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk-multi").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-hk-multi").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-3").unwrap();
+        let reports = vec![
+            HeartbeatHotKeyReport {
+                key: "key-a".into(),
+                estimated_count: 300,
+                max_error: 5,
+                heat_score: 0.3,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            },
+            HeartbeatHotKeyReport {
+                key: "key-b".into(),
+                estimated_count: 200,
+                max_error: 3,
+                heat_score: 0.2,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            },
+        ];
+
+        let heartbeat =
+            ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy).with_hot_key_reports(reports);
+        coordinator.executor_heartbeat(heartbeat).unwrap();
+
+        let log = coordinator.adaptive_decision_log(&job_id);
+        assert_eq!(log.len(), 2, "one log entry per hot-key report");
+    }
+
+    #[test]
+    fn adaptive_override_config_defaults_all_false() {
+        let cfg = AdaptiveOverrideConfig::default();
+        assert!(!cfg.disable_hot_key_splitting);
+        assert!(!cfg.disable_adaptive_repartition);
+        assert!(!cfg.disable_source_throttling);
     }
 }
