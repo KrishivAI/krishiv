@@ -781,30 +781,50 @@ impl TumblingWindowOperator {
         window_start_ms: i64,
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
-        let size = self.spec.window_size_ms as i64;
-        let window_end_ms = window_start_ms + size;
-
-        let mut fields = vec![
-            Field::new(&self.spec.key_column, DataType::Utf8, false),
-            Field::new("window_start_ms", DataType::Int64, false),
-            Field::new("window_end_ms", DataType::Int64, false),
-        ];
-        for agg in &self.spec.agg_exprs {
-            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
-        }
-        let schema = Arc::new(Schema::new(fields));
-
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![key_value])),
-            Arc::new(Int64Array::from(vec![window_start_ms])),
-            Arc::new(Int64Array::from(vec![window_end_ms])),
-        ];
-        for (i, _) in self.spec.agg_exprs.iter().enumerate() {
-            columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
-        }
-
-        Ok(RecordBatch::try_new(schema, columns)?)
+        let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
+        build_window_record_batch(
+            &self.spec.key_column,
+            key_value,
+            window_start_ms,
+            window_end_ms,
+            &self.spec.agg_exprs,
+            state,
+        )
     }
+}
+
+// ── Shared window output builder ──────────────────────────────────────────────
+
+/// Build a single-row `RecordBatch` representing one closed window.
+///
+/// Used by both `TumblingWindowOperator` and `SlidingWindowOperator` so that
+/// the output schema and column layout stay in sync automatically.
+fn build_window_record_batch(
+    key_column: &str,
+    key_value: &str,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    agg_exprs: &[AggExpr],
+    state: &AggState,
+) -> ExecResult<RecordBatch> {
+    let mut fields = vec![
+        Field::new(key_column, DataType::Utf8, false),
+        Field::new("window_start_ms", DataType::Int64, false),
+        Field::new("window_end_ms", DataType::Int64, false),
+    ];
+    for agg in agg_exprs {
+        fields.push(Field::new(&agg.output_column, DataType::Int64, false));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![key_value])),
+        Arc::new(Int64Array::from(vec![window_start_ms])),
+        Arc::new(Int64Array::from(vec![window_end_ms])),
+    ];
+    for (i, _) in agg_exprs.iter().enumerate() {
+        columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
+    }
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 // ── MultiSourceWatermarkState ─────────────────────────────────────────────────
@@ -987,24 +1007,14 @@ impl SlidingWindowOperator {
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
-        let mut fields = vec![
-            Field::new(&self.spec.key_column, DataType::Utf8, false),
-            Field::new("window_start_ms", DataType::Int64, false),
-            Field::new("window_end_ms", DataType::Int64, false),
-        ];
-        for agg in &self.spec.agg_exprs {
-            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
-        }
-        let schema = Arc::new(Schema::new(fields));
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![key_value])),
-            Arc::new(Int64Array::from(vec![window_start_ms])),
-            Arc::new(Int64Array::from(vec![window_end_ms])),
-        ];
-        for (i, _) in self.spec.agg_exprs.iter().enumerate() {
-            columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
-        }
-        Ok(RecordBatch::try_new(schema, columns)?)
+        build_window_record_batch(
+            &self.spec.key_column,
+            key_value,
+            window_start_ms,
+            window_end_ms,
+            &self.spec.agg_exprs,
+            state,
+        )
     }
 }
 

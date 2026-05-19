@@ -218,11 +218,6 @@ const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
 const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
 const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
 const SHUFFLE_WRITE_PREFIX: &str = "shuffle-write:";
-/// Fragment prefix for local pre-aggregation stages.
-/// These fragments use `pre-agg:sql:<query>` format and route through the
-/// existing SQL execution path via `sql_query_from_fragment`.
-#[allow(dead_code)]
-pub const PRE_AGG_FRAGMENT_PREFIX: &str = "pre-agg:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalParquetPartition {
@@ -853,10 +848,18 @@ impl ExecutorTaskRunner {
                     ),
                 }
             })?;
-            if let Some(arr) = batch.column(time_idx).as_any().downcast_ref::<Int64Array>() {
-                for row in 0..arr.len() {
-                    watermark.advance(arr.value(row));
-                }
+            let arr = batch
+                .column(time_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| ExecutorError::LocalExecution {
+                    message: format!(
+                        "event_time column '{}' must be Int64",
+                        spec.time_col
+                    ),
+                })?;
+            for row in 0..arr.len() {
+                watermark.advance(arr.value(row));
             }
 
             let new_wm = watermark.current_watermark_ms();
@@ -1001,16 +1004,14 @@ async fn read_connector_parquet_partitions(
             message: format!("connector-parquet open failed for '{path_str}': {e}"),
         })?;
         let mut batches = Vec::new();
-        loop {
-            match source
-                .read_batch()
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: format!("connector-parquet read failed: {e}"),
-                })? {
-                Some(batch) => batches.push(batch),
-                None => break,
-            }
+        while let Some(batch) = source
+            .read_batch()
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("connector-parquet read failed: {e}"),
+            })?
+        {
+            batches.push(batch);
         }
         result.push((table_name, batches));
     }

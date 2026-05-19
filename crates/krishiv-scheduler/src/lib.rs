@@ -1623,7 +1623,7 @@ impl JobRecord {
             let meta = self
                 .shuffle_output
                 .entry(stage_id.clone())
-                .or_insert_with(ShuffleMetadata::new);
+                .or_default();
             for p in &shuffle_partitions {
                 let path = ShufflePath {
                     job_id: self.spec.job_id().as_str().to_owned(),
