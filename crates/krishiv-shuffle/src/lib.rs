@@ -1848,22 +1848,10 @@ pub mod flight {
 
         use arrow::array::{Int32Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::ipc::writer::StreamWriter;
         use arrow::record_batch::RecordBatch;
 
         use super::*;
         use crate::{LocalDiskShuffleStore, PartitionId, ShufflePartition};
-
-        fn batches_to_ipc(batches: &[RecordBatch]) -> Vec<u8> {
-            let schema = batches[0].schema();
-            let mut buf = Vec::new();
-            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
-            for batch in batches {
-                writer.write(batch).unwrap();
-            }
-            writer.finish().unwrap();
-            buf
-        }
 
         fn make_test_batch() -> RecordBatch {
             let schema = Arc::new(Schema::new(vec![
