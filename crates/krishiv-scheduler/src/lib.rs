@@ -14,17 +14,23 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use krishiv_checkpoint::{
+    CheckpointMetadata, CheckpointResult, IntegrityManifest, LocalFsCheckpointStorage,
+    OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
+    read_operator_snapshot, write_epoch_metadata, write_manifest,
+};
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
-    AttemptId, ConnectorCapabilityFlags, CoordinatorExecutorService, CoordinatorId,
-    CoordinatorState, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
-    ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
-    ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState,
-    LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, ShufflePartitionOutput, StageId, StageSpec, StageState,
-    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId,
-    TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
-    TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
+    AttemptId, CheckpointAckRequest, CheckpointAckResponse, ConnectorCapabilityFlags,
+    CoordinatorExecutorService, CoordinatorId, CoordinatorState, DeregisterExecutorRequest,
+    DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
+    ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment, FencingToken,
+    InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
+    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
+    ShufflePartitionOutput, StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment,
+    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
+    TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
+    TransportVersion, wire,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 use serde::{Deserialize, Serialize};
@@ -192,6 +198,299 @@ impl fmt::Display for SchedulerError {
 
 impl Error for SchedulerError {}
 
+// ── CheckpointCoordinator ─────────────────────────────────────────────────────
+
+/// State of the per-job checkpoint coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointCoordinatorState {
+    /// No checkpoint is in progress.
+    Idle,
+    /// Waiting for executor acks for `epoch`.
+    AwaitingAcks { epoch: u64, initiated_at_ms: u64 },
+    /// `epoch` was successfully committed.
+    Committed { epoch: u64 },
+    /// Checkpoint failed; reason recorded.
+    Failed { epoch: u64, reason: String },
+}
+
+/// Per-job checkpoint coordinator (R6).
+///
+/// Created when a streaming job with `checkpoint_interval_ms.is_some()` is submitted.
+/// Drives the barrier protocol: initiates epochs, collects executor acks, writes
+/// `CheckpointMetadata` + `IntegrityManifest` to storage on quorum.
+#[derive(Clone)]
+pub struct CheckpointCoordinator {
+    job_id: JobId,
+    storage: Arc<LocalFsCheckpointStorage>,
+    interval_ms: u64,
+    current_epoch: u64,
+    fencing_token: FencingToken,
+    pending_acks: HashMap<String, CheckpointAckRequest>, // key: task_id string
+    expected_task_count: usize,
+    state: CheckpointCoordinatorState,
+    /// Savepoint label to attach when the next epoch is committed.
+    pending_savepoint_label: Option<String>,
+    /// Whether the next commit should be flagged as a savepoint.
+    pending_is_savepoint: bool,
+}
+
+impl fmt::Debug for CheckpointCoordinator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointCoordinator")
+            .field("job_id", &self.job_id)
+            .field("interval_ms", &self.interval_ms)
+            .field("current_epoch", &self.current_epoch)
+            .field("fencing_token", &self.fencing_token)
+            .field("expected_task_count", &self.expected_task_count)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl CheckpointCoordinator {
+    /// Create a new checkpoint coordinator for `job_id`.
+    pub fn new(
+        job_id: JobId,
+        storage: Arc<LocalFsCheckpointStorage>,
+        interval_ms: u64,
+        expected_task_count: usize,
+    ) -> Self {
+        Self {
+            job_id,
+            storage,
+            interval_ms,
+            current_epoch: 0,
+            fencing_token: FencingToken::initial(),
+            pending_acks: HashMap::new(),
+            expected_task_count,
+            state: CheckpointCoordinatorState::Idle,
+            pending_savepoint_label: None,
+            pending_is_savepoint: false,
+        }
+    }
+
+    /// Begin a new checkpoint epoch.
+    ///
+    /// Returns `Ok(epoch)` with the epoch number that was initiated.
+    /// Returns `Err` if a checkpoint is already awaiting acks.
+    pub fn initiate(&mut self) -> Result<u64, String> {
+        if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
+            return Err(format!(
+                "checkpoint coordinator for job {} is already awaiting acks",
+                self.job_id
+            ));
+        }
+        self.current_epoch += 1;
+        self.pending_acks.clear();
+        // Wall-clock approximation using a monotonic epoch counter for determinism.
+        let initiated_at_ms = self.current_epoch * self.interval_ms;
+        self.state = CheckpointCoordinatorState::AwaitingAcks {
+            epoch: self.current_epoch,
+            initiated_at_ms,
+        };
+        Ok(self.current_epoch)
+    }
+
+    /// Initiate a savepoint (triggered checkpoint with `is_savepoint=true`).
+    ///
+    /// Stores `label` for use when `commit_epoch` writes the metadata.
+    pub fn initiate_savepoint(&mut self, label: Option<String>) -> Result<u64, String> {
+        self.pending_is_savepoint = true;
+        self.pending_savepoint_label = label;
+        self.initiate()
+    }
+
+    /// Record one executor ack.
+    ///
+    /// Returns `Ok(true)` when quorum is complete (all expected acks received).
+    /// Returns `Err` if the ack's epoch is stale.
+    pub fn receive_ack(&mut self, ack: CheckpointAckRequest) -> Result<bool, String> {
+        let current_epoch = match &self.state {
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            _ => {
+                return Err(format!(
+                    "checkpoint coordinator for job {} is not awaiting acks",
+                    self.job_id
+                ));
+            }
+        };
+        if ack.epoch != current_epoch {
+            return Err(format!(
+                "stale checkpoint ack for job {}: expected epoch {current_epoch}, got epoch {}",
+                self.job_id, ack.epoch
+            ));
+        }
+        // Fencing token check: reject acks from coordinators with a stale token.
+        if ack.fencing_token < self.fencing_token {
+            return Err(format!(
+                "stale fencing token in ack for job {}: expected >= {}, got {}",
+                self.job_id,
+                self.fencing_token.as_u64(),
+                ack.fencing_token.as_u64()
+            ));
+        }
+        let key = ack.task_id.as_str().to_owned();
+        self.pending_acks.insert(key, ack);
+        if self.pending_acks.len() >= self.expected_task_count {
+            self.commit_epoch().map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Commit the current epoch: write metadata + manifest to storage.
+    ///
+    /// Normally called automatically when quorum is reached in `receive_ack`.
+    pub fn commit_epoch(&mut self) -> CheckpointResult<u64> {
+        let epoch = match &self.state {
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            _ => {
+                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                    message: format!(
+                        "commit_epoch called but coordinator for job {} is not awaiting acks",
+                        self.job_id
+                    ),
+                });
+            }
+        };
+
+        // Collect source offsets — last write wins per partition_id.
+        let mut offset_map: HashMap<String, i64> = HashMap::new();
+        for ack in self.pending_acks.values() {
+            for so in &ack.source_offsets {
+                offset_map.insert(so.partition_id.clone(), so.offset);
+            }
+        }
+        let source_offsets: Vec<SourceOffsetRecord> = offset_map
+            .iter()
+            .enumerate()
+            .map(|(i, (_, &offset))| SourceOffsetRecord {
+                partition_id: i as u32,
+                offset,
+            })
+            .collect();
+
+        // Collect operator snapshots from acks that have snapshot_path.
+        let operator_snapshots: Vec<OperatorSnapshotRef> = self
+            .pending_acks
+            .values()
+            .filter_map(|ack| {
+                ack.snapshot_path.as_ref().map(|path| OperatorSnapshotRef {
+                    operator_id: ack.operator_id.clone(),
+                    task_id: ack.task_id.as_str().to_owned(),
+                    snapshot_path: path.clone(),
+                })
+            })
+            .collect();
+
+        let is_savepoint = self.pending_is_savepoint;
+        let savepoint_label = self.pending_savepoint_label.take();
+        let metadata = CheckpointMetadata {
+            version: CheckpointMetadata::VERSION,
+            epoch,
+            job_id: self.job_id.as_str().to_owned(),
+            fencing_token: self.fencing_token.as_u64(),
+            timestamp_ms: epoch * self.interval_ms,
+            source_offsets,
+            operator_snapshots: operator_snapshots.clone(),
+            is_savepoint,
+            savepoint_label,
+        };
+
+        write_epoch_metadata(
+            self.storage.as_ref(),
+            self.job_id.as_str(),
+            epoch,
+            &metadata,
+        )?;
+
+        // Build manifest: hash metadata.json + each snapshot file.
+        let mut manifest = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(&metadata).map_err(|e| {
+            krishiv_checkpoint::CheckpointError::Storage {
+                message: format!("metadata serialize for manifest: {e}"),
+            }
+        })?;
+        manifest.insert_bytes("metadata.json", &meta_json);
+        for snap_ref in &operator_snapshots {
+            if let Some(bytes) = read_operator_snapshot(
+                self.storage.as_ref(),
+                self.job_id.as_str(),
+                epoch,
+                &snap_ref.operator_id,
+                &snap_ref.task_id,
+            )? {
+                // The manifest key is the path relative to the epoch dir.
+                let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
+                manifest.insert_bytes(&rel_path, &bytes);
+            }
+        }
+        write_manifest(
+            self.storage.as_ref(),
+            self.job_id.as_str(),
+            epoch,
+            &manifest,
+        )?;
+
+        self.state = CheckpointCoordinatorState::Committed { epoch };
+        self.pending_is_savepoint = false;
+        Ok(epoch)
+    }
+
+    /// Abort the current in-progress epoch (timeout or failure).
+    pub fn abort_epoch(&mut self, reason: &str) {
+        let epoch = match &self.state {
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            _ => return,
+        };
+        self.pending_acks.clear();
+        self.pending_is_savepoint = false;
+        self.pending_savepoint_label = None;
+        self.state = CheckpointCoordinatorState::Failed {
+            epoch,
+            reason: reason.to_owned(),
+        };
+    }
+
+    /// Load the latest valid epoch from storage on coordinator restart.
+    pub fn recover_from_storage(&mut self) -> CheckpointResult<Option<u64>> {
+        match latest_valid_epoch(self.storage.as_ref(), self.job_id.as_str()) {
+            Ok(epoch) => {
+                self.current_epoch = epoch;
+                self.state = CheckpointCoordinatorState::Committed { epoch };
+                Ok(Some(epoch))
+            }
+            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all valid epoch numbers for this job.
+    pub fn list_epochs(&self) -> CheckpointResult<Vec<u64>> {
+        list_valid_epochs(self.storage.as_ref(), self.job_id.as_str())
+    }
+
+    /// Current epoch counter.
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch
+    }
+
+    /// Current fencing token.
+    pub fn fencing_token(&self) -> FencingToken {
+        self.fencing_token
+    }
+
+    /// Whether a checkpoint is currently in progress (awaiting acks).
+    pub fn is_awaiting_acks(&self) -> bool {
+        matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. })
+    }
+
+    /// Coordinator state.
+    pub fn coordinator_state(&self) -> &CheckpointCoordinatorState {
+        &self.state
+    }
+}
+
 /// R2 coordinator skeleton.
 #[derive(Clone)]
 pub struct Coordinator {
@@ -201,6 +500,8 @@ pub struct Coordinator {
     executors: ExecutorRegistry,
     jobs: Vec<JobRecord>,
     store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
+    /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
+    checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
     /// Jobs that have just reached a terminal state and need shuffle GC.
     /// Drained by the coordinator binary's tick loop.
     gc_ready_jobs: Vec<JobId>,
@@ -636,6 +937,7 @@ impl Coordinator {
             ),
             jobs: Vec::new(),
             store: None,
+            checkpoint_coordinators: HashMap::new(),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
@@ -666,6 +968,7 @@ impl Coordinator {
             ),
             jobs: Vec::new(),
             store: None,
+            checkpoint_coordinators: HashMap::new(),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
@@ -794,11 +1097,18 @@ impl Coordinator {
     /// window starts here: executors owning those tasks will not be evicted for
     /// missing heartbeats during the grace period, allowing them to re-register
     /// and resume without re-processing already-committed events.
+    ///
+    /// For streaming jobs with checkpoint config, checkpoint state is recovered
+    /// via `CheckpointCoordinator::recover_from_storage`.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         for record in store.jobs() {
             if !self.jobs.iter().any(|j| j.job_id() == record.job_id()) {
                 self.jobs.push(record.clone());
             }
+        }
+        // Recover checkpoint coordinators from storage.
+        for coord in self.checkpoint_coordinators.values_mut() {
+            let _ = coord.recover_from_storage();
         }
         // Start the re-attach grace period.
         self.ticks_since_restart = 0;
@@ -817,6 +1127,29 @@ impl Coordinator {
             });
         }
 
+        // Create a CheckpointCoordinator for streaming jobs with checkpoint config.
+        if spec.kind() == JobKind::Streaming {
+            if let (Some(interval_ms), Some(storage_path)) = (
+                spec.checkpoint_interval_ms(),
+                spec.checkpoint_storage_path(),
+            ) {
+                let storage = LocalFsCheckpointStorage::new(storage_path).map_err(|e| {
+                    SchedulerError::InvalidJob {
+                        message: format!("failed to create checkpoint storage: {e}"),
+                    }
+                })?;
+                let task_count: usize = spec.stages().iter().map(|s| s.tasks().len()).sum();
+                let ckpt_coord = CheckpointCoordinator::new(
+                    spec.job_id().clone(),
+                    Arc::new(storage),
+                    interval_ms,
+                    task_count,
+                );
+                self.checkpoint_coordinators
+                    .insert(spec.job_id().clone(), ckpt_coord);
+            }
+        }
+
         let executors = self.executors.schedulable_executors();
         let assignments = StaticScheduler::place(&spec, &executors)?;
         let job_id = spec.job_id().clone();
@@ -829,6 +1162,34 @@ impl Coordinator {
         }
         self.jobs.push(record);
         Ok(())
+    }
+
+    /// Mutable access to the checkpoint coordinator for a specific job.
+    pub fn checkpoint_coordinator_mut(
+        &mut self,
+        job_id: &JobId,
+    ) -> Option<&mut CheckpointCoordinator> {
+        self.checkpoint_coordinators.get_mut(job_id)
+    }
+
+    /// Read-only access to the checkpoint coordinator for a specific job.
+    pub fn checkpoint_coordinator(&self, job_id: &JobId) -> Option<&CheckpointCoordinator> {
+        self.checkpoint_coordinators.get(job_id)
+    }
+
+    /// Route a checkpoint ack to the correct per-job coordinator.
+    pub fn handle_checkpoint_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
+        let job_id = ack.job_id.clone();
+        match self.checkpoint_coordinators.get_mut(&job_id) {
+            None => CheckpointAckResponse::JobNotFound,
+            Some(coord) => {
+                let current_epoch = coord.current_epoch();
+                match coord.receive_ack(ack) {
+                    Ok(_) => CheckpointAckResponse::Accepted,
+                    Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+                }
+            }
+        }
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.
@@ -3178,21 +3539,25 @@ pub trait JobSubmitter: Send + Sync {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use krishiv_checkpoint::{
+        CheckpointMetadata, IntegrityManifest, LocalFsCheckpointStorage, read_epoch_metadata,
+        validate_epoch, write_epoch_metadata, write_manifest,
+    };
     use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
-        AttemptId, CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
-        ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorId, ExecutorState,
-        JobId, JobKind, JobSpec, JobState, LeaseGeneration, RegisterExecutorRequest, StageId,
-        StageSpec, StreamingTaskState, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec,
-        TaskState, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
-        wire,
+        AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
+        CoordinatorId, DeregisterExecutorRequest, ExecutorDescriptor, ExecutorHeartbeat,
+        ExecutorHeartbeatRequest, ExecutorId, ExecutorState, FencingToken, JobId, JobKind, JobSpec,
+        JobState, LeaseGeneration, RegisterExecutorRequest, StageId, StageSpec, StreamingTaskState,
+        TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
+        TaskStatusResponse, TaskStatusUpdate, TransportDisposition, wire,
     };
 
     use super::{
-        Coordinator, CoordinatorConfig, CoordinatorExecutorTonicService, EventLogEvent,
-        ExecutorRegistry, InMemoryMetadataStore, JsonFileMetadataStore, LeaderElection,
-        MetadataStore, SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler,
-        TaskUpdateOutcome, job_spec_from_logical_plan,
+        CheckpointCoordinator, CheckpointCoordinatorState, Coordinator, CoordinatorConfig,
+        CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryMetadataStore,
+        JsonFileMetadataStore, LeaderElection, MetadataStore, SchedulerError, SharedCoordinator,
+        SingleNodeElection, StaticScheduler, TaskUpdateOutcome, job_spec_from_logical_plan,
         serve_coordinator_executor_grpc_with_listener,
     };
 
@@ -5282,5 +5647,261 @@ mod tests {
             "expected NoExecutors, got {:?}",
             result
         );
+    }
+
+    // ── CheckpointCoordinator tests ───────────────────────────────────────────
+
+    fn make_ack(
+        job_id: &JobId,
+        task_id: &str,
+        epoch: u64,
+        fencing_token: FencingToken,
+        snapshot_path: Option<String>,
+    ) -> CheckpointAckRequest {
+        CheckpointAckRequest {
+            job_id: job_id.clone(),
+            operator_id: format!("operator-{task_id}"),
+            task_id: TaskId::try_new(task_id).unwrap(),
+            epoch,
+            fencing_token,
+            source_offsets: vec![krishiv_proto::CheckpointSourceOffset {
+                partition_id: format!("partition-{task_id}"),
+                offset: 100,
+            }],
+            snapshot_path,
+        }
+    }
+
+    #[test]
+    fn checkpoint_coordinator_initiates_and_collects_acks() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ck-1").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 5000, 2);
+
+        // Write state snapshots so the manifest can hash them.
+        krishiv_checkpoint::write_operator_snapshot(
+            storage.as_ref(),
+            "job-ck-1",
+            1,
+            "operator-task-1",
+            "task-1",
+            b"state bytes",
+        )
+        .unwrap();
+        krishiv_checkpoint::write_operator_snapshot(
+            storage.as_ref(),
+            "job-ck-1",
+            1,
+            "operator-task-2",
+            "task-2",
+            b"state bytes 2",
+        )
+        .unwrap();
+
+        let epoch = coord.initiate().unwrap();
+        assert_eq!(epoch, 1);
+        assert!(coord.is_awaiting_acks());
+
+        let snap_path1 =
+            krishiv_checkpoint::snapshot_path("job-ck-1", 1, "operator-task-1", "task-1");
+        let snap_path2 =
+            krishiv_checkpoint::snapshot_path("job-ck-1", 1, "operator-task-2", "task-2");
+        let ack1 = make_ack(
+            &job_id,
+            "task-1",
+            1,
+            FencingToken::initial(),
+            Some(snap_path1),
+        );
+        let ack2 = make_ack(
+            &job_id,
+            "task-2",
+            1,
+            FencingToken::initial(),
+            Some(snap_path2),
+        );
+
+        // First ack: not yet quorum.
+        let done = coord.receive_ack(ack1).unwrap();
+        assert!(!done);
+        assert!(coord.is_awaiting_acks());
+
+        // Second ack: quorum complete, epoch committed.
+        let done = coord.receive_ack(ack2).unwrap();
+        assert!(done);
+        assert!(!coord.is_awaiting_acks());
+        assert_eq!(coord.current_epoch(), 1);
+
+        // Verify metadata was written to storage.
+        let meta = krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-ck-1", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.epoch, 1);
+        assert_eq!(meta.job_id, "job-ck-1");
+        assert!(!meta.is_savepoint);
+
+        // Verify manifest exists and epoch validates.
+        assert!(krishiv_checkpoint::validate_epoch(storage.as_ref(), "job-ck-1", 1).unwrap());
+    }
+
+    #[test]
+    fn checkpoint_coordinator_rejects_stale_epoch_ack() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ck-stale").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 1);
+        let _ = coord.initiate().unwrap(); // epoch = 1
+
+        // Send ack with wrong epoch.
+        let ack = make_ack(&job_id, "task-1", 99, FencingToken::initial(), None);
+        let result = coord.receive_ack(ack);
+        assert!(result.is_err(), "stale epoch ack must be rejected");
+    }
+
+    #[test]
+    fn checkpoint_coordinator_abort_resets_state() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ck-abort").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 2);
+        let _ = coord.initiate().unwrap();
+        assert!(coord.is_awaiting_acks());
+
+        coord.abort_epoch("timeout");
+        assert!(!coord.is_awaiting_acks());
+        assert!(matches!(
+            coord.coordinator_state(),
+            CheckpointCoordinatorState::Failed { epoch: 1, .. }
+        ));
+
+        // Can initiate again after abort.
+        let _ = coord.initiate().unwrap();
+        assert!(coord.is_awaiting_acks());
+    }
+
+    #[test]
+    fn checkpoint_coordinator_recover_finds_latest_epoch() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ck-recover").unwrap();
+
+        // Write two complete epochs manually.
+        for epoch in [1u64, 2] {
+            let meta = CheckpointMetadata {
+                version: CheckpointMetadata::VERSION,
+                epoch,
+                job_id: "job-ck-recover".to_owned(),
+                fencing_token: 1,
+                timestamp_ms: epoch * 5000,
+                source_offsets: vec![],
+                operator_snapshots: vec![],
+                is_savepoint: false,
+                savepoint_label: None,
+            };
+            write_epoch_metadata(storage.as_ref(), "job-ck-recover", epoch, &meta).unwrap();
+            let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+            let mut manifest = IntegrityManifest::new();
+            manifest.insert_bytes("metadata.json", &meta_json);
+            write_manifest(storage.as_ref(), "job-ck-recover", epoch, &manifest).unwrap();
+        }
+
+        let mut coord = CheckpointCoordinator::new(job_id, storage, 5000, 1);
+        let recovered = coord.recover_from_storage().unwrap();
+        assert_eq!(recovered, Some(2));
+        assert_eq!(coord.current_epoch(), 2);
+    }
+
+    #[test]
+    fn checkpoint_coordinator_savepoint_sets_flag() {
+        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ck-sp").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 5000, 1);
+
+        let epoch = coord
+            .initiate_savepoint(Some("my-savepoint".to_owned()))
+            .unwrap();
+        assert_eq!(epoch, 1);
+
+        let ack = make_ack(&job_id, "task-1", 1, FencingToken::initial(), None);
+        let done = coord.receive_ack(ack).unwrap();
+        assert!(done);
+
+        let meta = krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-ck-sp", 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            meta.is_savepoint,
+            "is_savepoint must be true for savepoints"
+        );
+        assert_eq!(meta.savepoint_label.as_deref(), Some("my-savepoint"));
+    }
+
+    #[test]
+    fn coordinator_creates_checkpoint_coordinator_for_streaming_job_with_config() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage_path = storage.base_dir().to_string_lossy().to_string();
+
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-ck-test").unwrap());
+        let executor_id = ExecutorId::try_new("exec-ck-test").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-ck", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-ck-stream").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "stream-ck", JobKind::Streaming)
+            .with_checkpoint(5000, &storage_path)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream:tw"),
+                ),
+            );
+        coordinator.submit_job(spec).unwrap();
+
+        assert!(
+            coordinator.checkpoint_coordinator(&job_id).is_some(),
+            "streaming job with checkpoint config must have a CheckpointCoordinator"
+        );
+    }
+
+    #[test]
+    fn coordinator_routes_ack_to_correct_job() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage_path = storage.base_dir().to_string_lossy().to_string();
+
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-ck-route").unwrap());
+        let executor_id = ExecutorId::try_new("exec-ck-route").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-ck", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-ck-route").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "route-ck", JobKind::Streaming)
+            .with_checkpoint(5000, &storage_path)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream:tw"),
+                ),
+            );
+        coordinator.submit_job(spec).unwrap();
+
+        // Initiate an epoch on the coordinator's checkpoint coordinator.
+        let _ = coordinator
+            .checkpoint_coordinator_mut(&job_id)
+            .unwrap()
+            .initiate()
+            .unwrap();
+
+        // Route an ack through the coordinator.
+        let ack = make_ack(&job_id, "task-1", 1, FencingToken::initial(), None);
+        let response = coordinator.handle_checkpoint_ack(ack);
+        assert_eq!(
+            response,
+            CheckpointAckResponse::Accepted,
+            "ack for valid epoch must be accepted"
+        );
+
+        // Unknown job → JobNotFound.
+        let unknown_job_id = JobId::try_new("job-unknown").unwrap();
+        let ack = make_ack(&unknown_job_id, "task-1", 1, FencingToken::initial(), None);
+        let response = coordinator.handle_checkpoint_ack(ack);
+        assert_eq!(response, CheckpointAckResponse::JobNotFound);
     }
 }

@@ -88,6 +88,10 @@ pub struct CheckpointMetadata {
     pub source_offsets: Vec<SourceOffsetRecord>,
     /// One entry per operator instance that contributed a state snapshot.
     pub operator_snapshots: Vec<OperatorSnapshotRef>,
+    /// Whether this checkpoint was triggered as a savepoint.
+    pub is_savepoint: bool,
+    /// Optional human-readable label for savepoints.
+    pub savepoint_label: Option<String>,
 }
 
 impl CheckpointMetadata {
@@ -428,6 +432,11 @@ impl LocalFsCheckpointStorage {
         Ok(Self { base_dir })
     }
 
+    /// Return the base directory for this storage instance.
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
+    }
+
     /// Create storage in a uniquely-named temporary subdirectory under `std::env::temp_dir()`.
     pub fn ephemeral() -> CheckpointResult<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -537,6 +546,8 @@ mod tests {
                 task_id: "task-0".to_owned(),
                 snapshot_path: snapshot_path("job-test", epoch, "op-0", "task-0"),
             }],
+            is_savepoint: false,
+            savepoint_label: None,
         }
     }
 

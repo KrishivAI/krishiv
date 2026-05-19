@@ -8,12 +8,15 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 axum = { workspace = true }
+krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
 krishiv-sql = { path = "../krishiv-sql" }
+krishiv-state = { path = "../krishiv-state" }
 object_store = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "signal"] }
 tokio-stream.workspace = true
 tonic.workspace = true

@@ -2,9 +2,33 @@
 
 ## Current Phase
 
-**R6 IN PROGRESS.** R6 startup sequence complete. Branch `work`. Latest validated sweep for the warning cleanup: `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
+**R6 IN PROGRESS.** R6 Groups A, B, C complete. Branch `claude/track-skills-slices-MSvac`. Zero failures across full workspace (`cargo test --workspace`).
 
 ## Active Task
+
+**R6 Groups A, B, C — Checkpoint Foundation Slices** — all three groups implemented:
+
+### Group A: Proto + Config Foundation
+- A1: `checkpoint_interval_ms`/`checkpoint_storage_path` fields + builder `with_checkpoint()` + accessors added to `JobSpec` in `krishiv-proto`.
+- A2: Checkpoint control-plane messages added to `krishiv-proto`: `CheckpointSourceOffset`, `InitiateCheckpointRequest`, `CheckpointAckRequest`, `AbortCheckpointRequest`, `CheckpointInitiateResponse`, `CheckpointAckResponse`.
+- A3: `is_savepoint: bool` + `savepoint_label: Option<String>` added to `CheckpointMetadata`; existing test fixtures updated.
+- A4: `fencing_token: u64` already present in `CheckpointMetadata`; `base_dir()` accessor added to `LocalFsCheckpointStorage`.
+- A5: `supports_checkpoint` + `supports_two_phase_commit` flags added to `ConnectorCapabilities` with `with_checkpoint()`, `with_two_phase_commit()`, `is_checkpoint_capable()`, `is_two_phase_commit_capable()` methods; 2 new tests pass.
+
+### Group B: CheckpointCoordinator in krishiv-scheduler
+- B1: `CheckpointCoordinator` struct added with `CheckpointCoordinatorState` enum; `krishiv-checkpoint` dep added to `krishiv-scheduler/Cargo.toml`.
+- B2: Core methods: `new()`, `initiate()`, `initiate_savepoint()`, `receive_ack()`, `commit_epoch()`, `abort_epoch()`, `recover_from_storage()`, `list_epochs()`, accessors.
+- B3: `checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>` added to `Coordinator`; `submit_job` creates coordinator for streaming jobs with checkpoint config; `checkpoint_coordinator()`, `checkpoint_coordinator_mut()`, `handle_checkpoint_ack()` added.
+- B4: `recover_from_store` calls `checkpoint_coordinator.recover_from_storage()` for all registered coordinators.
+- B5: 7 tests: `checkpoint_coordinator_initiates_and_collects_acks`, `checkpoint_coordinator_rejects_stale_epoch_ack`, `checkpoint_coordinator_abort_resets_state`, `checkpoint_coordinator_recover_finds_latest_epoch`, `checkpoint_coordinator_savepoint_sets_flag`, `coordinator_creates_checkpoint_coordinator_for_streaming_job_with_config`, `coordinator_routes_ack_to_correct_job`.
+
+### Group C: Executor Checkpoint Participation
+- C1/C2: `TaskRunner` struct added to `krishiv-executor` with `last_acked_epoch`, `operator_id`, `task_id`, `kafka_source_offset` fields; `handle_initiate_checkpoint()` method.
+- C3/C4: 4 tests: `executor_checkpoint_takes_state_snapshot_and_writes_to_storage`, `executor_checkpoint_ack_includes_snapshot_path`, `executor_checkpoint_ack_includes_source_offset`, `executor_rejects_stale_checkpoint_epoch`.
+
+**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures across all crates.
+
+## Previous Active Task
 
 **R6 startup sequence** — all six pre-implementation decisions delivered:
 
