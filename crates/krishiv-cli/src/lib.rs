@@ -350,10 +350,7 @@ fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> 
         ))
         .map_err(|error| error.to_string())?;
     coordinator
-        .executor_heartbeat(ExecutorHeartbeat::new(
-            executor_id.clone(),
-            ExecutorState::Healthy,
-        ))
+        .executor_heartbeat(ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy))
         .map_err(|error| error.to_string())?;
 
     let job = build_submit_job(command)?;

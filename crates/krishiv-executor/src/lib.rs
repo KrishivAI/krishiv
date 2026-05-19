@@ -7,7 +7,7 @@
 //! path. The task runner executes the first narrow local SQL fragments through
 //! the Krishiv SQL/DataFusion seam and returns lightweight output metadata.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
@@ -119,7 +119,7 @@ impl ExecutionModel {
 /// In-memory receiver queue for task assignments delivered to an executor.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorAssignmentInbox {
-    assignments: Arc<RwLock<Vec<ExecutorTaskAssignment>>>,
+    assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
     cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
 }
 
@@ -134,21 +134,17 @@ impl ExecutorAssignmentInbox {
         self.assignments
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .push(assignment);
+            .push_back(assignment);
         Ok(())
     }
 
     /// Remove the next received assignment in FIFO order.
     pub fn pop_next(&self) -> ExecutorResult<Option<ExecutorTaskAssignment>> {
-        let mut assignments = self
+        Ok(self
             .assignments
             .write()
-            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
-        if assignments.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(assignments.remove(0)))
-        }
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .pop_front())
     }
 
     /// Cancel and remove queued assignments for a task id.
@@ -195,7 +191,9 @@ impl ExecutorAssignmentInbox {
             .assignments
             .read()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .clone())
+            .iter()
+            .cloned()
+            .collect())
     }
 
     /// Number of assignments received so far.
@@ -581,7 +579,7 @@ impl TaskRunner {
             Err(_) => Vec::new(),
         };
 
-        // Write snapshot if non-empty.
+        // Write snapshot if non-empty; suppress phantom path on write failure.
         let snap_path = if !snapshot_bytes.is_empty() {
             let path = snapshot_path(
                 req.job_id.as_str(),
@@ -589,15 +587,17 @@ impl TaskRunner {
                 &self.operator_id,
                 self.task_id.as_str(),
             );
-            let _ = write_operator_snapshot(
+            match write_operator_snapshot(
                 storage,
                 req.job_id.as_str(),
                 req.epoch,
                 &self.operator_id,
                 self.task_id.as_str(),
                 &snapshot_bytes,
-            );
-            Some(path)
+            ) {
+                Ok(()) => Some(path),
+                Err(_) => None,
+            }
         } else {
             None
         };

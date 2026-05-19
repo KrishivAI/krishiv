@@ -112,7 +112,7 @@ impl CheckpointMetadata {
 /// Last processed offset for one source partition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceOffsetRecord {
-    pub partition_id: u32,
+    pub partition_id: String,
     pub offset: i64,
 }
 
@@ -174,9 +174,10 @@ impl IntegrityManifest {
     /// Serialize to the on-disk text format:
     /// `sha256:<hex>  <relative_path>\n` per entry.
     pub fn serialize(&self) -> Vec<u8> {
+        use std::fmt::Write;
         let mut out = String::new();
         for (path, hex) in &self.entries {
-            out.push_str(&format!("sha256:{hex}  {path}\n"));
+            writeln!(out, "sha256:{hex}  {path}").unwrap();
         }
         out.into_bytes()
     }
@@ -538,7 +539,7 @@ mod tests {
             fencing_token: 1,
             timestamp_ms: 1_716_000_000_000,
             source_offsets: vec![SourceOffsetRecord {
-                partition_id: 0,
+                partition_id: "partition-0".to_owned(),
                 offset: 42,
             }],
             operator_snapshots: vec![OperatorSnapshotRef {

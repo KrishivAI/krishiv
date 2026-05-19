@@ -446,12 +446,8 @@ impl CheckpointCoordinator {
             }
         }
         let source_offsets: Vec<SourceOffsetRecord> = offset_map
-            .iter()
-            .enumerate()
-            .map(|(i, (_, &offset))| SourceOffsetRecord {
-                partition_id: i as u32,
-                offset,
-            })
+            .into_iter()
+            .map(|(partition_id, offset)| SourceOffsetRecord { partition_id, offset })
             .collect();
 
         // Collect operator snapshots from acks that have snapshot_path.
@@ -476,7 +472,7 @@ impl CheckpointCoordinator {
             fencing_token: self.fencing_token.as_u64(),
             timestamp_ms: epoch * self.interval_ms,
             source_offsets,
-            operator_snapshots: operator_snapshots.clone(),
+            operator_snapshots,
             is_savepoint,
             savepoint_label,
         };
@@ -496,7 +492,7 @@ impl CheckpointCoordinator {
             }
         })?;
         manifest.insert_bytes("metadata.json", &meta_json);
-        for snap_ref in &operator_snapshots {
+        for snap_ref in &metadata.operator_snapshots {
             if let Some(bytes) = read_operator_snapshot(
                 self.storage.as_ref(),
                 self.job_id.as_str(),
@@ -530,6 +526,7 @@ impl CheckpointCoordinator {
         self.pending_acks.clear();
         self.pending_is_savepoint = false;
         self.pending_savepoint_label = None;
+        self.elapsed_ms = 0;
         self.state = CheckpointCoordinatorState::Failed {
             epoch,
             reason: reason.to_owned(),
@@ -1013,10 +1010,10 @@ impl Coordinator {
     }
 
     /// Create an active R2 coordinator with explicit config.
-    pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
+    fn build(coordinator_id: CoordinatorId, config: CoordinatorConfig, state: CoordinatorState) -> Self {
         Self {
             coordinator_id,
-            state: CoordinatorState::Active,
+            state,
             config,
             executors: ExecutorRegistry::new(
                 config.heartbeat_timeout_ticks(),
@@ -1030,6 +1027,10 @@ impl Coordinator {
             ticks_since_restart: u64::MAX,
             recovering: false,
         }
+    }
+
+    pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
+        Self::build(coordinator_id, config, CoordinatorState::Active)
     }
 
     /// Attach a metadata store to this coordinator (builder).
@@ -1055,22 +1056,7 @@ impl Coordinator {
 
     /// Create a standby R2 coordinator with explicit config.
     pub fn standby_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
-        Self {
-            coordinator_id,
-            state: CoordinatorState::Standby,
-            config,
-            executors: ExecutorRegistry::new(
-                config.heartbeat_timeout_ticks(),
-                config.memory_threshold_bytes(),
-            ),
-            jobs: Vec::new(),
-            store: None,
-            checkpoint_coordinators: HashMap::new(),
-            queue_manager: Arc::new(InMemoryQueueManager),
-            gc_ready_jobs: Vec::new(),
-            ticks_since_restart: u64::MAX,
-            recovering: false,
-        }
+        Self::build(coordinator_id, config, CoordinatorState::Standby)
     }
 
     /// Coordinator id.
@@ -1221,6 +1207,12 @@ impl Coordinator {
         Ok(())
     }
 
+    fn open_checkpoint_storage(path: &str) -> SchedulerResult<LocalFsCheckpointStorage> {
+        LocalFsCheckpointStorage::new(path).map_err(|e| SchedulerError::InvalidJob {
+            message: format!("failed to open checkpoint storage at {path}: {e}"),
+        })
+    }
+
     /// Submit a job and statically assign its tasks.
     pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         self.ensure_active()?;
@@ -1244,11 +1236,7 @@ impl Coordinator {
                 spec.checkpoint_interval_ms(),
                 spec.checkpoint_storage_path(),
             ) {
-                let storage = LocalFsCheckpointStorage::new(storage_path).map_err(|e| {
-                    SchedulerError::InvalidJob {
-                        message: format!("failed to create checkpoint storage: {e}"),
-                    }
-                })?;
+                let storage = Self::open_checkpoint_storage(storage_path)?;
                 let task_count: usize = spec.stages().iter().map(|s| s.tasks().len()).sum();
                 let ckpt_coord = CheckpointCoordinator::new(
                     spec.job_id().clone(),
@@ -1341,11 +1329,7 @@ impl Coordinator {
         epoch: u64,
         storage_path: &str,
     ) -> SchedulerResult<CheckpointMetadata> {
-        let storage = LocalFsCheckpointStorage::new(storage_path).map_err(|e| {
-            SchedulerError::InvalidJob {
-                message: format!("cannot open checkpoint storage at {storage_path}: {e}"),
-            }
-        })?;
+        let storage = Self::open_checkpoint_storage(storage_path)?;
 
         let meta = read_epoch_metadata(&storage, job_id.as_str(), epoch).map_err(|e| {
             SchedulerError::InvalidJob {
@@ -1422,6 +1406,7 @@ impl Coordinator {
         if !self.gc_ready_jobs.contains(job_id) {
             self.gc_ready_jobs.push(job_id.clone());
         }
+        self.checkpoint_coordinators.remove(job_id);
         Ok(())
     }
 
@@ -1560,6 +1545,7 @@ impl Coordinator {
         if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
             if record.state().is_terminal() && !self.gc_ready_jobs.contains(&job_id) {
                 self.gc_ready_jobs.push(job_id.clone());
+                self.checkpoint_coordinators.remove(&job_id);
             }
             if let Some(store) = &self.store {
                 let mut s = store.lock().unwrap();
@@ -3020,50 +3006,43 @@ impl JsonFileMetadataStore {
     /// Open or create a JSON-file metadata store at `path`.
     pub fn open(path: impl AsRef<Path>) -> SchedulerResult<Self> {
         let path = path.as_ref().to_path_buf();
-        if path.exists() {
-            let bytes = std::fs::read(&path).map_err(|error| SchedulerError::Transport {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let store = Self { path, events: Vec::new(), jobs: Vec::new() };
+                store.persist()?;
+                return Ok(store);
+            }
+            Err(e) => {
+                return Err(SchedulerError::Transport {
+                    message: format!("failed to read metadata store '{}': {e}", path.display()),
+                })
+            }
+        };
+        if bytes.is_empty() {
+            return Ok(Self { path, events: Vec::new(), jobs: Vec::new() });
+        }
+        let persisted: PersistedMetadata =
+            serde_json::from_slice(&bytes).map_err(|error| SchedulerError::InvalidJob {
                 message: format!(
-                    "failed to read metadata store '{}': {error}",
+                    "failed to decode metadata store '{}': {error}",
                     path.display()
                 ),
             })?;
-            if bytes.is_empty() {
-                return Ok(Self {
-                    path,
-                    events: Vec::new(),
-                    jobs: Vec::new(),
-                });
-            }
-            let persisted: PersistedMetadata =
-                serde_json::from_slice(&bytes).map_err(|error| SchedulerError::InvalidJob {
-                    message: format!(
-                        "failed to decode metadata store '{}': {error}",
-                        path.display()
-                    ),
-                })?;
-            persisted.validate_schema_version()?;
-            Ok(Self {
-                path,
-                events: persisted
-                    .events
-                    .into_iter()
-                    .map(EventLogEvent::try_from)
-                    .collect::<SchedulerResult<Vec<_>>>()?,
-                jobs: persisted
-                    .jobs
-                    .into_iter()
-                    .map(JobRecord::try_from)
-                    .collect::<SchedulerResult<Vec<_>>>()?,
-            })
-        } else {
-            let store = Self {
-                path,
-                events: Vec::new(),
-                jobs: Vec::new(),
-            };
-            store.persist()?;
-            Ok(store)
-        }
+        persisted.validate_schema_version()?;
+        Ok(Self {
+            path,
+            events: persisted
+                .events
+                .into_iter()
+                .map(EventLogEvent::try_from)
+                .collect::<SchedulerResult<Vec<_>>>()?,
+            jobs: persisted
+                .jobs
+                .into_iter()
+                .map(JobRecord::try_from)
+                .collect::<SchedulerResult<Vec<_>>>()?,
+        })
     }
 
     fn persist(&self) -> SchedulerResult<()> {
