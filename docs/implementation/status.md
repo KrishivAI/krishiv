@@ -2,11 +2,19 @@
 
 ## Current Phase
 
-**R5 COMPLETE.** R5.1 + R5.2 all acceptance gates closed. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace (`cargo test --workspace`). Ready to begin R6 (Checkpoints and Savepoints).
+**R6 IN PROGRESS.** R6 startup sequence complete. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace (`cargo test --workspace`).
 
 ## Active Task
 
-R5.2 implementation complete — all slices including durable backend:
+**R6 startup sequence** — all five pre-implementation decisions delivered:
+
+- `FencingToken(u64)` added to `krishiv-proto`: `initial()`, `next()`, `as_u64()`, ordering — 4 tests pass.
+- `StateBackend::snapshot()` + `load_snapshot()` added: implemented for `InMemoryStateBackend` (length-prefixed binary format, version=1); stubbed `SnapshotUnsupported` for `RocksDbStateBackend`; delegating for `TtlStateBackend<B>` — 4 new tests pass.
+- `TwoPhaseCommitSink` trait + `InMemoryTwoPhaseCommitSink` added to `krishiv-connectors`: `prepare/commit/abort` protocol with handle-based staging — 3 new tests pass.
+- `crates/krishiv-checkpoint` created: `CheckpointStorage` trait, `LocalFsCheckpointStorage` (atomic write, path traversal guard), `CheckpointMetadata` (versioned JSON), `IntegrityManifest` (SHA-256), higher-level helpers (`write_epoch_metadata`, `validate_epoch`, `list_valid_epochs`, `latest_valid_epoch`, `delete_epoch`, corrupt-checkpoint fallback) — 21 tests pass.
+- `docs/architecture/checkpoint-storage.md` written: key schema, snapshot binary format, integrity manifest format, two-phase commit API shape, rolling upgrade protocol, risks/mitigations.
+
+## Previous Task: R5.2 implementation complete — all slices including durable backend:
 
 **R5.2 `RocksDbStateBackend`** (NEW — completes R5.2)
 - `RocksDbStateBackend::open(base_dir)` / `RocksDbStateBackend::ephemeral()` — filesystem-backed durable state using `std::fs`
@@ -280,7 +288,10 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## Next Steps
 
-1. **R6**: Checkpoints and Savepoints — durable checkpoint coordination, exactly-once Kafka sink, versioned checkpoint metadata, savepoint write/restore.
+1. **R6 checkpoint coordinator**: Implement in `krishiv-scheduler` — `CheckpointCoordinator` struct, `initiate_checkpoint(epoch)` injects barriers into source operators, collects `CheckpointAck`, writes `CheckpointMetadata` + `IntegrityManifest` via `LocalFsCheckpointStorage`. Fencing token check on write.
+2. **R6 source offset coordination**: Wire `source_offsets` into `CheckpointMetadata` from executor-reported last Kafka offset at barrier time.
+3. **R6 savepoint CLI**: `krishiv savepoint` + `krishiv restore` commands.
+4. **R6 chaos tests**: coordinator kill mid-checkpoint, executor kill mid-checkpoint, corrupt checkpoint fallback.
 2. **Live Kafka E2E** (optional R6 hardening): wire `rdkafka` behind `kafka-runtime` Cargo feature + Redpanda Docker Compose once R6 connector certification begins.
 
 ## Known Blockers

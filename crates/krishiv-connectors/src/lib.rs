@@ -469,6 +469,113 @@ impl CertificationSuite {
 use std::future::Future;
 
 // ---------------------------------------------------------------------------
+// TwoPhaseCommitSink
+// ---------------------------------------------------------------------------
+
+/// Sink that participates in two-phase checkpoint commit (R6).
+///
+/// The caller drives the protocol:
+/// 1. Call `prepare(epoch, batch)` — the sink buffers the batch under a
+///    staging key tied to `epoch` and returns an opaque `Handle`.
+/// 2. After all operators in the job acknowledge the barrier for `epoch`,
+///    call `commit(handle)` — the sink makes the buffered output durable
+///    (e.g., an atomic rename from a staging prefix to the final key).
+/// 3. If the checkpoint is aborted, call `abort(handle)` — the sink discards
+///    the staged output without making it visible.
+///
+/// `commit` and `abort` are mutually exclusive for a given handle.
+/// Calling `commit` after `abort`, or vice versa, is a logic error and
+/// implementations may panic.
+///
+/// The certified R6 sink is `S3/Parquet` (object-level atomic rename).
+/// `InMemoryTwoPhaseCommitSink` is provided for deterministic testing.
+pub trait TwoPhaseCommitSink: Send {
+    /// Opaque handle returned by `prepare`.
+    type Handle: Send;
+
+    /// Buffer `batch` under a staging area keyed to `epoch`.
+    ///
+    /// Returns a `Handle` that identifies this staged write.
+    fn prepare(
+        &mut self,
+        epoch: u64,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<Self::Handle>;
+
+    /// Make the staged output for `handle` durable and visible.
+    fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()>;
+
+    /// Discard the staged output for `handle` without making it visible.
+    fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()>;
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryTwoPhaseCommitSink
+// ---------------------------------------------------------------------------
+
+/// In-memory two-phase commit sink for deterministic testing.
+///
+/// `prepare` stages a batch under `(epoch, handle_id)`.
+/// `commit` moves it to the committed list.
+/// `abort` drops it.
+#[derive(Debug, Default)]
+pub struct InMemoryTwoPhaseCommitSink {
+    staged: std::collections::BTreeMap<u64, Vec<arrow::record_batch::RecordBatch>>,
+    committed: Vec<(u64, arrow::record_batch::RecordBatch)>,
+    next_handle: u64,
+}
+
+impl InMemoryTwoPhaseCommitSink {
+    pub fn new() -> Self { Self::default() }
+
+    /// All committed `(epoch, batch)` pairs, in commit order.
+    pub fn committed(&self) -> &[(u64, arrow::record_batch::RecordBatch)] {
+        &self.committed
+    }
+
+    /// Number of batches currently staged but not yet committed or aborted.
+    pub fn staged_count(&self) -> usize {
+        self.staged.values().map(|v| v.len()).sum()
+    }
+}
+
+/// Handle for a staged write in `InMemoryTwoPhaseCommitSink`.
+#[derive(Debug, Clone, Copy)]
+pub struct InMemoryCommitHandle {
+    epoch: u64,
+    handle_id: u64,
+}
+
+impl TwoPhaseCommitSink for InMemoryTwoPhaseCommitSink {
+    type Handle = InMemoryCommitHandle;
+
+    fn prepare(
+        &mut self,
+        epoch: u64,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<Self::Handle> {
+        let handle_id = self.next_handle;
+        self.next_handle += 1;
+        self.staged.entry(handle_id).or_default().push(batch.clone());
+        Ok(InMemoryCommitHandle { epoch, handle_id })
+    }
+
+    fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        if let Some(batches) = self.staged.remove(&handle.handle_id) {
+            for batch in batches {
+                self.committed.push((handle.epoch, batch));
+            }
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        self.staged.remove(&handle.handle_id);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -791,5 +898,76 @@ mod tests {
         assert!(matches!(err, ConnectorError::Io { .. }));
         assert_eq!(sink.events, vec!["write", "flush"]);
         assert!(committer.committed.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TwoPhaseCommitSink
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_phase_commit_sink_prepare_commit_roundtrip() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+        ).unwrap();
+
+        let mut sink = InMemoryTwoPhaseCommitSink::new();
+        let handle = sink.prepare(1, &batch).unwrap();
+        assert_eq!(sink.staged_count(), 1);
+        assert_eq!(sink.committed().len(), 0);
+        sink.commit(handle).unwrap();
+        assert_eq!(sink.staged_count(), 0);
+        assert_eq!(sink.committed().len(), 1);
+        assert_eq!(sink.committed()[0].0, 1); // epoch
+    }
+
+    #[test]
+    fn two_phase_commit_sink_abort_discards() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![42i64]))],
+        ).unwrap();
+
+        let mut sink = InMemoryTwoPhaseCommitSink::new();
+        let handle = sink.prepare(2, &batch).unwrap();
+        sink.abort(handle).unwrap();
+        assert_eq!(sink.staged_count(), 0);
+        assert_eq!(sink.committed().len(), 0);
+    }
+
+    #[test]
+    fn two_phase_commit_sink_multiple_epochs() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let make_batch = |v: i64| -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from(vec![v]))],
+            ).unwrap()
+        };
+
+        let mut sink = InMemoryTwoPhaseCommitSink::new();
+        let h1 = sink.prepare(1, &make_batch(10)).unwrap();
+        let h2 = sink.prepare(2, &make_batch(20)).unwrap();
+        sink.commit(h1).unwrap();
+        sink.abort(h2).unwrap();
+        assert_eq!(sink.committed().len(), 1);
+        assert_eq!(sink.committed()[0].0, 1);
     }
 }

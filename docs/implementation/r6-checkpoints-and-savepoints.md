@@ -47,16 +47,16 @@ Out of scope:
 
 ## Architecture Deliverables
 
-- [ ] Add `crates/krishiv-checkpoint`.
-- [ ] Define minimal `FencingToken` type in `krishiv-proto` (monotonic epoch counter, upgradeable to durable lease in R9).
+- [x] Add `crates/krishiv-checkpoint`.
+- [x] Define minimal `FencingToken` type in `krishiv-proto` (monotonic epoch counter, upgradeable to durable lease in R9).
 - [ ] Enforce fencing token checks on all checkpoint epoch ownership transitions.
 - [ ] Define checkpoint epoch ownership.
-- [ ] Define versioned checkpoint metadata format.
-- [ ] Define checkpoint storage abstraction.
+- [x] Define versioned checkpoint metadata format — `CheckpointMetadata` JSON envelope (`version`, `epoch`, `job_id`, `fencing_token`, `timestamp_ms`, `source_offsets`, `operator_snapshots`); see `docs/architecture/checkpoint-storage.md`.
+- [x] Define checkpoint storage abstraction — `CheckpointStorage` trait + `LocalFsCheckpointStorage` in `crates/krishiv-checkpoint`.
 - [ ] Define versioned savepoint metadata format.
-- [ ] Define metadata compatibility policy for future upgrades.
-- [ ] Define checkpoint integrity manifest (SHA-256 hash per file, stored alongside metadata).
-- [ ] Define corrupt checkpoint detection and fallback policy: validate manifest on restore; fall back to the most recent prior valid checkpoint; never restore from a corrupt checkpoint.
+- [x] Define metadata compatibility policy for future upgrades — `version` field validated on every `CheckpointMetadata::validate()`; unknown versions rejected with `IncompatibleVersion`.
+- [x] Define checkpoint integrity manifest (SHA-256 hash per file, stored alongside metadata) — `IntegrityManifest` in `crates/krishiv-checkpoint`.
+- [x] Define corrupt checkpoint detection and fallback policy — `validate_epoch` + `list_valid_epochs` + `latest_valid_epoch` implement manifest-based fallback; `docs/architecture/checkpoint-storage.md` §5.
 - [ ] Define restore flow.
 - [ ] Define rescaling metadata model.
 - [ ] Define state schema evolution baseline.
@@ -68,7 +68,7 @@ Out of scope:
 - [ ] Add `krishiv restore` CLI command.
 - [ ] Add checkpoint listing/status API.
 - [ ] Add checkpoint inspection output.
-- [ ] Add two-phase commit sink trait.
+- [x] Add two-phase commit sink trait — `TwoPhaseCommitSink` + `InMemoryTwoPhaseCommitSink` in `crates/krishiv-connectors`.
 - [ ] Add connector certification fields for checkpoint compatibility.
 - [ ] Add job config for checkpoint interval and checkpoint storage path.
 

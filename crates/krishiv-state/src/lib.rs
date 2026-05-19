@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 #[derive(Debug)]
 pub enum StateError {
     BackendUnavailable { message: String },
+    SnapshotUnsupported { backend: &'static str },
+    SnapshotCorrupt { message: String },
 }
 
 impl std::fmt::Display for StateError {
@@ -29,6 +31,12 @@ impl std::fmt::Display for StateError {
         match self {
             Self::BackendUnavailable { message } => {
                 write!(f, "state backend unavailable: {message}")
+            }
+            Self::SnapshotUnsupported { backend } => {
+                write!(f, "snapshot not supported by backend: {backend}")
+            }
+            Self::SnapshotCorrupt { message } => {
+                write!(f, "snapshot corrupt: {message}")
             }
         }
     }
@@ -95,6 +103,17 @@ pub trait StateBackend: Send + Sync {
     fn list_namespaces(&self) -> StateResult<Vec<Namespace>>;
     /// List all keys stored in `namespace` (R5.2 inspection API).
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>>;
+
+    /// Serialize all state to a portable byte snapshot.
+    ///
+    /// Format: `[4-byte LE version=1][8-byte LE entry_count][entries...]`
+    /// where each entry is: `[8-byte LE op_id_len][op_id][8-byte LE name_len][name][8-byte LE key_len][key][8-byte LE val_len][val]`
+    fn snapshot(&self) -> StateResult<Vec<u8>>;
+
+    /// Replace current state with the contents of a snapshot produced by `snapshot()`.
+    ///
+    /// The backend is cleared before loading; partial failures leave the backend empty.
+    fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()>;
 }
 
 // ── InMemoryStateBackend ──────────────────────────────────────────────────────
@@ -170,6 +189,48 @@ impl StateBackend for InMemoryStateBackend {
             .filter(|(o, n, _)| o == op && n == name)
             .map(|(_, _, k)| k.clone())
             .collect())
+    }
+
+    fn snapshot(&self) -> StateResult<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u32.to_le_bytes()); // version
+        out.extend_from_slice(&(self.store.len() as u64).to_le_bytes());
+        for ((op_id, state_name, key), value) in &self.store {
+            let ob = op_id.as_bytes();
+            out.extend_from_slice(&(ob.len() as u64).to_le_bytes());
+            out.extend_from_slice(ob);
+            let nb = state_name.as_bytes();
+            out.extend_from_slice(&(nb.len() as u64).to_le_bytes());
+            out.extend_from_slice(nb);
+            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            out.extend_from_slice(key);
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value);
+        }
+        Ok(out)
+    }
+
+    fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
+        let corrupt = |msg: &str| StateError::SnapshotCorrupt { message: msg.to_owned() };
+        if bytes.len() < 12 { return Err(corrupt("too short")); }
+        let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if version != 1 { return Err(corrupt(&format!("unsupported snapshot version {version}"))); }
+        let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
+        let mut pos = 12usize;
+        let mut new_store = BTreeMap::new();
+
+        for _ in 0..count {
+            let op_id_b = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated op_id"))?.to_vec();
+            let op_id = String::from_utf8(op_id_b).map_err(|_| corrupt("op_id not utf8"))?;
+            let name_b = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated state_name"))?.to_vec();
+            let state_name = String::from_utf8(name_b).map_err(|_| corrupt("state_name not utf8"))?;
+            let key = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated key"))?.to_vec();
+            let value = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated value"))?.to_vec();
+            new_store.insert((op_id, state_name, key), value);
+        }
+
+        self.store = new_store;
+        Ok(())
     }
 }
 
@@ -438,6 +499,26 @@ impl StateBackend for RocksDbStateBackend {
         keys.sort();
         Ok(keys)
     }
+
+    fn snapshot(&self) -> StateResult<Vec<u8>> {
+        Err(StateError::SnapshotUnsupported { backend: "RocksDbStateBackend" })
+    }
+
+    fn load_snapshot(&mut self, _bytes: &[u8]) -> StateResult<()> {
+        Err(StateError::SnapshotUnsupported { backend: "RocksDbStateBackend" })
+    }
+}
+
+// ── Snapshot helpers ──────────────────────────────────────────────────────────
+
+fn read_lp_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    if buf.len() < *pos + 8 { return None; }
+    let len = u64::from_le_bytes(buf[*pos..*pos+8].try_into().ok()?) as usize;
+    *pos += 8;
+    if buf.len() < *pos + len { return None; }
+    let v = &buf[*pos..*pos+len];
+    *pos += len;
+    Some(v)
 }
 
 // Hex helpers (no external deps).
@@ -637,6 +718,14 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
 
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
         self.inner.list_keys(namespace)
+    }
+
+    fn snapshot(&self) -> StateResult<Vec<u8>> {
+        self.inner.snapshot()
+    }
+
+    fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
+        self.inner.load_snapshot(bytes)
     }
 }
 
@@ -1148,5 +1237,49 @@ mod tests {
         .expect("thread panicked");
 
         assert_eq!(result, Some(b"blocking-val".to_vec()));
+    }
+
+    // ── snapshot / load_snapshot ──────────────────────────────────────────────
+
+    #[test]
+    fn in_memory_snapshot_round_trips() {
+        let mut b = InMemoryStateBackend::new();
+        let ns = Namespace::new("op1", "counts");
+        b.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        b.put(&ns, b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        let snap = b.snapshot().unwrap();
+        let mut b2 = InMemoryStateBackend::new();
+        b2.load_snapshot(&snap).unwrap();
+        assert_eq!(b2.get(&ns, b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(b2.get(&ns, b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(b2.key_count(), 2);
+    }
+
+    #[test]
+    fn in_memory_snapshot_empty() {
+        let b = InMemoryStateBackend::new();
+        let snap = b.snapshot().unwrap();
+        let mut b2 = InMemoryStateBackend::new();
+        b2.load_snapshot(&snap).unwrap();
+        assert_eq!(b2.key_count(), 0);
+    }
+
+    #[test]
+    fn in_memory_load_snapshot_clears_existing_state() {
+        let ns = Namespace::new("op1", "counts");
+        let mut src = InMemoryStateBackend::new();
+        src.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
+        let snap = src.snapshot().unwrap();
+        let mut dst = InMemoryStateBackend::new();
+        dst.put(&ns, b"old_key".to_vec(), b"old_val".to_vec()).unwrap();
+        dst.load_snapshot(&snap).unwrap();
+        assert_eq!(dst.get(&ns, b"old_key").unwrap(), None);
+        assert_eq!(dst.get(&ns, b"k1").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn rocks_snapshot_unsupported() {
+        let b = RocksDbStateBackend::ephemeral().unwrap();
+        assert!(b.snapshot().is_err());
     }
 }
