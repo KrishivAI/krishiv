@@ -107,6 +107,10 @@ pub fn router(state: UiState) -> Router {
         .route("/metrics", get(metrics))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_detail))
+        .route(
+            "/api/v1/jobs/{job_id}/checkpoints",
+            get(api_job_checkpoints),
+        )
         .route("/api/v1/executors", get(api_executors))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
@@ -163,6 +167,17 @@ pub struct JobDetailResponse {
 pub struct ExecutorsResponse {
     /// Executor summaries.
     pub executors: Vec<ExecutorView>,
+}
+
+/// Response body for `GET /api/v1/jobs/{job_id}/checkpoints`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JobCheckpointsResponse {
+    /// Job id.
+    pub job_id: String,
+    /// All valid committed epochs for this job, in ascending order.
+    pub epochs: Vec<u64>,
+    /// Latest valid epoch, or `None` if no checkpoints exist.
+    pub latest_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -373,6 +388,28 @@ async fn api_executors(State(state): State<UiState>) -> Result<Json<ExecutorsRes
     let snapshot = status_snapshot(&state)?;
     Ok(Json(ExecutorsResponse {
         executors: snapshot.executors,
+    }))
+}
+
+async fn api_job_checkpoints(
+    State(state): State<UiState>,
+    Path(job_id_str): Path<String>,
+) -> Result<Json<JobCheckpointsResponse>, UiError> {
+    let job_id = JobId::try_new(job_id_str.clone()).map_err(|e| UiError::Id(e.to_string()))?;
+    let coordinator = state
+        .coordinator
+        .read()
+        .map_err(|_| UiError::LockPoisoned)?;
+
+    // Verify the job exists — returns UnknownJob (→ 404) if not.
+    coordinator.job_detail_snapshot(&job_id)?;
+
+    let epochs = coordinator.list_job_checkpoints(&job_id)?;
+    let latest_epoch = epochs.last().copied();
+    Ok(Json(JobCheckpointsResponse {
+        job_id: job_id_str,
+        epochs,
+        latest_epoch,
     }))
 }
 
@@ -738,6 +775,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{UiState, demo_state, empty_state, router};
+    #[allow(unused_imports)]
+    use serde_json;
 
     #[tokio::test]
     async fn health_route_reports_ok() {
@@ -906,5 +945,42 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Krishiv R2 Status"));
         assert!(body.contains("job-demo"));
+    }
+
+    #[tokio::test]
+    async fn api_job_checkpoints_returns_empty_for_no_coordinator() {
+        // demo_state has job-demo which is a batch job with no checkpoint config.
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs/job-demo/checkpoints")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::OK, "response body: {text}");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["job_id"], "job-demo");
+        assert_eq!(parsed["epochs"], serde_json::json!([]));
+        assert_eq!(parsed["latest_epoch"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn api_job_checkpoints_returns_404_for_unknown_job() {
+        let response = router(demo_state().unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs/job-does-not-exist/checkpoints")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

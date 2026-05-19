@@ -18,6 +18,8 @@ tokio-stream.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+arrow = { workspace = true }
+krishiv-connectors = { path = "../krishiv-connectors" }
 tempfile = { workspace = true }
 
 [lib]

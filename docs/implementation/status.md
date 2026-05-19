@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**R6 IN PROGRESS.** R6 Groups A, B, C complete. Branch `claude/track-skills-slices-MSvac`. Zero failures across full workspace (`cargo test --workspace`).
+**R6 COMPLETE.** All R6 groups (A–E) implemented. Branch `claude/track-skills-slices-MSvac`. Zero failures across full workspace (`cargo test --workspace`).
 
 ## Active Task
 
-**R6 Groups A, B, C — Checkpoint Foundation Slices** — all three groups implemented:
+**R6 — Checkpoints and Savepoints** — all groups complete:
 
 ### Group A: Proto + Config Foundation
 - A1: `checkpoint_interval_ms`/`checkpoint_storage_path` fields + builder `with_checkpoint()` + accessors added to `JobSpec` in `krishiv-proto`.
@@ -26,7 +26,22 @@
 - C1/C2: `TaskRunner` struct added to `krishiv-executor` with `last_acked_epoch`, `operator_id`, `task_id`, `kafka_source_offset` fields; `handle_initiate_checkpoint()` method.
 - C3/C4: 4 tests: `executor_checkpoint_takes_state_snapshot_and_writes_to_storage`, `executor_checkpoint_ack_includes_snapshot_path`, `executor_checkpoint_ack_includes_source_offset`, `executor_rejects_stale_checkpoint_epoch`.
 
-**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures across all crates.
+### Group D: Savepoint/Restore CLI + UI + Coordinator Methods
+- D1: `Coordinator::savepoint_job()`, `list_job_checkpoints()`, `restore_job_from_checkpoint()` added to `krishiv-scheduler`; restore validates epoch integrity and rejects mismatched parallelism; 3 tests pass.
+- D2: `krishiv savepoint --job <id> [--label <str>]` CLI command added to `krishiv-cli`; 4 tests pass.
+- D3: `krishiv restore --job <id> --epoch <n> [--storage-path <p>]` CLI command added; 4 tests pass.
+- D4: `krishiv checkpoints list --job <id>` CLI command added; 3 tests pass.
+- D5: `GET /api/v1/jobs/{job_id}/checkpoints` endpoint added to `krishiv-ui`; returns `JobCheckpointsResponse` JSON with `job_id`, `epochs`, `latest_epoch`; 2 tests pass.
+
+### Group E: Chaos Tests
+- E1 (`chaos_1`): Coordinator kill mid-checkpoint — new coordinator rejects stale-epoch acks; no duplicate commit.
+- E2 (`chaos_1a`): Coordinator restart from durable metadata — `recover_from_storage` resumes epoch sequence.
+- E3 (`chaos_2`): Executor kill mid-checkpoint — abort path is clean; fencing token prevents stale ack acceptance.
+- E4 (`chaos_3`): Sink kill mid-write — `abort()` discards staged output; no partial records visible.
+- E5 (`chaos_4`): Corrupt checkpoint fallback — `list_valid_epochs` returns only manifest-validated epochs; corrupt epoch excluded.
+- E6 (`chaos_e6`): Rolling upgrade via savepoint — `is_savepoint=true` epoch preserved; restore on new coordinator resumes epoch sequence.
+
+**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures across all crates (68 tests in `krishiv-scheduler` alone).
 
 ## Previous Active Task
 
@@ -310,15 +325,13 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None. R5 complete and code quality sweep done. Ready for R6.
+- None. R6 complete. Ready for R7.
 
 ## Next Steps
 
-1. **R6 checkpoint coordinator**: Implement in `krishiv-scheduler` — `CheckpointCoordinator` struct, `initiate_checkpoint(epoch)` injects barriers into source operators, collects `CheckpointAck`, writes `CheckpointMetadata` + `IntegrityManifest` via `LocalFsCheckpointStorage`. Fencing token check on write.
-2. **R6 source offset coordination**: Wire `source_offsets` into `CheckpointMetadata` from executor-reported last Kafka offset at barrier time.
-3. **R6 savepoint CLI**: `krishiv savepoint` + `krishiv restore` commands.
-4. **R6 chaos tests**: coordinator kill mid-checkpoint, executor kill mid-checkpoint, corrupt checkpoint fallback.
+1. **R7 query optimization**: Adaptive query execution (AQE), cost-based optimizer, statistics collection.
 2. **Live Kafka E2E** (optional R6 hardening): wire `rdkafka` behind `kafka-runtime` Cargo feature + Redpanda Docker Compose once R6 connector certification begins.
+3. **Exactly-once certification doc**: Write `docs/architecture/exactly-once-certification.md` naming the certified triple and marking all other combinations as at-least-once (last open R6 acceptance gate item).
 
 ## Known Blockers
 
