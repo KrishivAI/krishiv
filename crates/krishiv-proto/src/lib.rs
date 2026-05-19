@@ -160,6 +160,33 @@ impl fmt::Display for LeaseGeneration {
     }
 }
 
+/// Monotonic fencing token for checkpoint epoch ownership.
+///
+/// The checkpoint store rejects metadata writes where the token is older than
+/// the last committed writer's token, preventing stale coordinators from
+/// committing superseded epochs (see `docs/architecture/checkpoint-protocol.md`
+/// §Fencing Invariant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FencingToken(u64);
+
+impl FencingToken {
+    pub fn try_new(value: u64) -> ProtoResult<Self> {
+        if value == 0 {
+            return Err(IdError::zero("fencing token"));
+        }
+        Ok(Self(value))
+    }
+    pub fn initial() -> Self { Self(1) }
+    pub fn next(self) -> Self { Self(self.0.saturating_add(1)) }
+    pub fn as_u64(self) -> u64 { self.0 }
+}
+
+impl fmt::Display for FencingToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Version for coordinator/executor transport contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TransportVersion {
@@ -1350,6 +1377,11 @@ pub struct ExecutorHeartbeatRequest {
     memory_used_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
     active_task_count: Option<u32>,
+    /// Per-task streaming state for the re-attach protocol.
+    /// Populated on the first heartbeat after a coordinator restart by executors
+    /// that have running streaming tasks, so the coordinator can resume tracking
+    /// watermark and offset without re-running the job from scratch.
+    streaming_task_states: Vec<StreamingTaskState>,
 }
 
 impl ExecutorHeartbeatRequest {
@@ -1368,6 +1400,7 @@ impl ExecutorHeartbeatRequest {
             memory_used_bytes: None,
             memory_limit_bytes: None,
             active_task_count: None,
+            streaming_task_states: Vec::new(),
         }
     }
 
@@ -1403,6 +1436,13 @@ impl ExecutorHeartbeatRequest {
     #[must_use]
     pub fn with_active_task_count(mut self, count: u32) -> Self {
         self.active_task_count = Some(count);
+        self
+    }
+
+    /// Attach streaming task states for the re-attach protocol.
+    #[must_use]
+    pub fn with_streaming_task_states(mut self, states: Vec<StreamingTaskState>) -> Self {
+        self.streaming_task_states = states;
         self
     }
 
@@ -1444,6 +1484,11 @@ impl ExecutorHeartbeatRequest {
     /// Active task count.
     pub fn active_task_count(&self) -> Option<u32> {
         self.active_task_count
+    }
+
+    /// Per-task streaming state for the re-attach protocol.
+    pub fn streaming_task_states(&self) -> &[StreamingTaskState] {
+        &self.streaming_task_states
     }
 }
 
@@ -3098,7 +3143,7 @@ pub mod wire {
 mod tests {
     use super::{
         AttemptId, ConnectorCapabilityFlags, DeregisterExecutorRequest, ExecutorDescriptor,
-        ExecutorHeartbeatRequest, ExecutorId, ExecutorState, ExecutorTaskAssignment,
+        ExecutorHeartbeatRequest, ExecutorId, ExecutorState, ExecutorTaskAssignment, FencingToken,
         InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState,
         LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
         OutputContractKind, PlanFragment, RegisterExecutorRequest, StageId, StageSpec,
@@ -3407,5 +3452,25 @@ mod tests {
             response.message(),
             Some("newer attempt already owns this task")
         );
+    }
+
+    #[test]
+    fn fencing_token_initial_is_one() {
+        assert_eq!(FencingToken::initial().as_u64(), 1);
+    }
+
+    #[test]
+    fn fencing_token_next_increments() {
+        assert_eq!(FencingToken::initial().next().as_u64(), 2);
+    }
+
+    #[test]
+    fn fencing_token_zero_rejected() {
+        assert!(FencingToken::try_new(0).is_err());
+    }
+
+    #[test]
+    fn fencing_token_ordering() {
+        assert!(FencingToken::initial() < FencingToken::initial().next());
     }
 }

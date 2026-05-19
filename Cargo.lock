@@ -2298,6 +2298,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "krishiv-cli"
 version = "0.1.0"
 dependencies = [
@@ -2337,6 +2347,7 @@ dependencies = [
  "arrow",
  "axum 0.8.9",
  "krishiv-connectors",
+ "krishiv-exec",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-shuffle",
@@ -2435,6 +2446,10 @@ dependencies = [
  "krishiv-plan",
  "tokio",
 ]
+
+[[package]]
+name = "krishiv-state"
+version = "0.1.0"
 
 [[package]]
 name = "krishiv-ui"

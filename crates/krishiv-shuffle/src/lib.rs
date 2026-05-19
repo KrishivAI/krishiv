@@ -559,6 +559,15 @@ pub trait ShuffleStore: Send + Sync {
     fn delete_job_partitions(&self, job_id: &str) -> impl Future<Output = StoreResult<()>> + Send;
 }
 
+// ── Shared type aliases ───────────────────────────────────────────────────────
+
+/// Compound key used for both `InMemoryShuffleStore` and `LocalDiskShuffleStore`
+/// lease maps: `(job_id, stage_id, partition_index)`.
+type PartitionKey = (String, String, u32);
+
+/// Shared lease-token map type used by both in-memory and disk-backed stores.
+type LeaseMap = Arc<RwLock<BTreeMap<PartitionKey, u64>>>;
+
 // ── InMemoryShuffleStore ──────────────────────────────────────────────────────
 
 /// An in-memory shuffle store backed by a `BTreeMap` under an `RwLock`.
@@ -568,9 +577,9 @@ pub trait ShuffleStore: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryShuffleStore {
     // key: (job_id, stage_id, partition) → latest accepted partition
-    partitions: Arc<RwLock<BTreeMap<(String, String, u32), ShufflePartition>>>,
+    partitions: Arc<RwLock<BTreeMap<PartitionKey, ShufflePartition>>>,
     // key: (job_id, stage_id, partition) → current assignment lease token
-    lease_tokens: Arc<RwLock<BTreeMap<(String, String, u32), u64>>>,
+    lease_tokens: LeaseMap,
 }
 
 impl InMemoryShuffleStore {
@@ -652,7 +661,7 @@ impl ShuffleStore for InMemoryShuffleStore {
 /// the store object is alive.
 pub struct LocalDiskShuffleStore {
     base_dir: PathBuf,
-    lease_tokens: Arc<RwLock<BTreeMap<(String, String, u32), u64>>>,
+    lease_tokens: LeaseMap,
 }
 
 impl LocalDiskShuffleStore {
@@ -848,113 +857,97 @@ impl ObjectStoreShuffleStore {
 }
 
 impl ShuffleStore for ObjectStoreShuffleStore {
-    fn register_partition_lease(
+    async fn register_partition_lease(
         &self,
         _id: PartitionId,
         _lease_token: u64,
-    ) -> impl Future<Output = StoreResult<()>> + Send {
-        async { Ok(()) }
+    ) -> StoreResult<()> {
+        Ok(())
     }
 
-    fn write_partition(
+    async fn write_partition(
         &self,
         partition: ShufflePartition,
         _lease_token: u64,
-    ) -> impl Future<Output = StoreResult<()>> + Send {
-        let store = Arc::clone(&self.store);
-        let path = self.object_path(&partition.id);
-        async move {
-            use arrow::ipc::writer::StreamWriter;
+    ) -> StoreResult<()> {
+        use arrow::ipc::writer::StreamWriter;
 
-            let mut buf = Vec::new();
-            let mut writer =
-                StreamWriter::try_new(&mut buf, &partition.schema).map_err(|e| StoreError::Io {
-                    message: e.to_string(),
-                })?;
-            for batch in &partition.batches {
-                writer.write(batch).map_err(|e| StoreError::Io {
-                    message: e.to_string(),
-                })?;
-            }
-            writer.finish().map_err(|e| StoreError::Io {
+        let mut buf = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut buf, &partition.schema).map_err(|e| StoreError::Io {
                 message: e.to_string(),
             })?;
-
-            store
-                .put(&path, bytes::Bytes::from(buf).into())
-                .await
-                .map_err(|e| StoreError::Io {
-                    message: e.to_string(),
-                })?;
-            Ok(())
+        for batch in &partition.batches {
+            writer.write(batch).map_err(|e| StoreError::Io {
+                message: e.to_string(),
+            })?;
         }
+        writer.finish().map_err(|e| StoreError::Io {
+            message: e.to_string(),
+        })?;
+
+        self.store
+            .put(&self.object_path(&partition.id), bytes::Bytes::from(buf).into())
+            .await
+            .map_err(|e| StoreError::Io {
+                message: e.to_string(),
+            })?;
+        Ok(())
     }
 
-    fn read_partition(
-        &self,
-        id: &PartitionId,
-    ) -> impl Future<Output = StoreResult<Option<ShufflePartition>>> + Send {
-        let store = Arc::clone(&self.store);
-        let path = self.object_path(id);
-        let id = id.clone();
-        async move {
-            use arrow::ipc::reader::StreamReader;
+    async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
+        use arrow::ipc::reader::StreamReader;
 
-            let result = store.get(&path).await;
-            match result {
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                Err(e) => {
-                    return Err(StoreError::Io {
-                        message: e.to_string(),
-                    });
-                }
-                Ok(obj) => {
-                    let data = obj.bytes().await.map_err(|e| StoreError::Io {
+        let path = self.object_path(id);
+        let result = self.store.get(&path).await;
+        match result {
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(StoreError::Io {
+                message: e.to_string(),
+            }),
+            Ok(obj) => {
+                let data = obj.bytes().await.map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
+                let cursor = std::io::Cursor::new(data.as_ref());
+                let mut reader =
+                    StreamReader::try_new(cursor, None).map_err(|e| StoreError::Io {
                         message: e.to_string(),
                     })?;
-                    let cursor = std::io::Cursor::new(data.as_ref());
-                    let mut reader =
-                        StreamReader::try_new(cursor, None).map_err(|e| StoreError::Io {
-                            message: e.to_string(),
-                        })?;
-                    let schema = reader.schema();
-                    let mut batches = Vec::new();
-                    for batch_result in &mut reader {
-                        let batch = batch_result.map_err(|e| StoreError::Io {
-                            message: e.to_string(),
-                        })?;
-                        batches.push(batch);
-                    }
-                    Ok(Some(ShufflePartition {
-                        id,
-                        schema,
-                        batches,
-                    }))
+                let schema = reader.schema();
+                let mut batches = Vec::new();
+                for batch_result in &mut reader {
+                    let batch = batch_result.map_err(|e| StoreError::Io {
+                        message: e.to_string(),
+                    })?;
+                    batches.push(batch);
                 }
+                Ok(Some(ShufflePartition {
+                    id: id.clone(),
+                    schema,
+                    batches,
+                }))
             }
         }
     }
 
-    fn delete_job_partitions(&self, job_id: &str) -> impl Future<Output = StoreResult<()>> + Send {
+    async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
         use futures::TryStreamExt;
 
-        let store = Arc::clone(&self.store);
         let prefix = self.job_prefix(job_id);
-        async move {
-            let mut stream = store.list(Some(&prefix));
-            let mut keys = Vec::new();
-            while let Some(meta) = stream.try_next().await.map_err(|e| StoreError::Io {
-                message: e.to_string(),
-            })? {
-                keys.push(meta.location);
-            }
-            for key in keys {
-                store.delete(&key).await.map_err(|e| StoreError::Io {
-                    message: e.to_string(),
-                })?;
-            }
-            Ok(())
+        let mut stream = self.store.list(Some(&prefix));
+        let mut keys = Vec::new();
+        while let Some(meta) = stream.try_next().await.map_err(|e| StoreError::Io {
+            message: e.to_string(),
+        })? {
+            keys.push(meta.location);
         }
+        for key in keys {
+            self.store.delete(&key).await.map_err(|e| StoreError::Io {
+                message: e.to_string(),
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -1690,7 +1683,6 @@ pub mod flight {
 
     use arrow::array::RecordBatch;
     use arrow::ipc::reader::StreamReader;
-    use arrow::ipc::writer::StreamWriter;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1703,6 +1695,23 @@ pub mod flight {
         }
         let partition_id = parts[2].parse::<u32>().ok()?;
         Some((parts[0].to_owned(), parts[1].to_owned(), partition_id))
+    }
+
+    /// Serialize `batches` to Arrow IPC stream format. Returns `None` on any
+    /// serialization error so callers can fall back to sending an empty response
+    /// rather than partial / corrupted bytes.
+    fn serialize_ipc_partition(
+        schema: &arrow::datatypes::Schema,
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> Option<Vec<u8>> {
+        use arrow::ipc::writer::StreamWriter;
+        let mut buf = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut buf, schema).ok()?;
+        for batch in batches {
+            writer.write(batch).ok()?;
+        }
+        writer.finish().ok()?;
+        Some(buf)
     }
 
     async fn handle_connection(mut stream: TcpStream, store: Arc<LocalDiskShuffleStore>) {
@@ -1743,14 +1752,11 @@ pub mod flight {
 
         match result {
             Ok(Some(partition)) => {
-                let mut buf = Vec::new();
-                let schema = partition.schema;
-                if let Ok(mut writer) = StreamWriter::try_new(&mut buf, &schema) {
-                    for batch in &partition.batches {
-                        let _ = writer.write(batch);
-                    }
-                    let _ = writer.finish();
-                }
+                // Serialize to a local buffer first; send len=0 if serialization
+                // fails so the client gets a clean "not found" rather than
+                // partial / corrupted Arrow IPC bytes.
+                let buf = serialize_ipc_partition(&partition.schema, &partition.batches)
+                    .unwrap_or_default();
                 let len = buf.len() as u32;
                 let _ = stream.write_all(&len.to_be_bytes()).await;
                 let _ = stream.write_all(&buf).await;
@@ -1772,14 +1778,9 @@ pub mod flight {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let store = Arc::clone(&store);
-                        tokio::spawn(handle_connection(stream, store));
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let store = Arc::clone(&store);
+                tokio::spawn(handle_connection(stream, store));
             }
         });
         Ok((local_addr, handle))
@@ -1811,6 +1812,18 @@ pub mod flight {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("partition {job_id}/{stage_id}/{partition_id} not found"),
+                ));
+            }
+
+            // Guard against a server sending a maliciously large length that
+            // would cause an OOM allocation on the client side.
+            const MAX_PARTITION_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+            if len > MAX_PARTITION_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "partition length {len} exceeds maximum {MAX_PARTITION_BYTES} bytes"
+                    ),
                 ));
             }
 
