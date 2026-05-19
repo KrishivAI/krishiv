@@ -58,8 +58,8 @@ Out of scope:
 - [x] Define checkpoint integrity manifest (SHA-256 hash per file, stored alongside metadata) — `IntegrityManifest` in `crates/krishiv-checkpoint`.
 - [x] Define corrupt checkpoint detection and fallback policy — `validate_epoch` + `list_valid_epochs` + `latest_valid_epoch` implement manifest-based fallback; `docs/architecture/checkpoint-storage.md` §5.
 - [ ] Define restore flow.
-- [ ] Define rescaling metadata model.
-- [ ] Define state schema evolution baseline.
+- [x] Define rescaling metadata model — `docs/architecture/rescaling-model.md`: savepoint+repartition is the only supported path; live rescaling and coordinator-side repartition are post-R6; restore rejects mismatched parallelism.
+- [x] Define state schema evolution baseline — `docs/architecture/rescaling-model.md` §3: reject unknown versions immediately (already enforced in `InMemoryStateBackend::load_snapshot` and `CheckpointMetadata::validate`); version increment policy documented; RocksDB schema evolution deferred.
 - [ ] Document exactly-once certification rules.
 
 ## API And Interface Deliverables

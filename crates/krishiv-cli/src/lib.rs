@@ -300,27 +300,17 @@ fn run_state_inspect(args: &[&str]) -> CliResponse {
             }
             _ => {
                 return CliResponse::err(
-                    format!(
-                        "unexpected argument '{}'\n\n{}",
-                        args[i],
-                        state_help()
-                    ),
+                    format!("unexpected argument '{}'\n\n{}", args[i], state_help()),
                     2,
                 );
             }
         }
     }
     let Some(job_id) = job_id else {
-        return CliResponse::err(
-            format!("--job is required\n\n{}", state_help()),
-            2,
-        );
+        return CliResponse::err(format!("--job is required\n\n{}", state_help()), 2);
     };
     let Some(operator_id) = operator_id else {
-        return CliResponse::err(
-            format!("--operator is required\n\n{}", state_help()),
-            2,
-        );
+        return CliResponse::err(format!("--operator is required\n\n{}", state_help()), 2);
     };
     // In R5.2 this is a skeleton: state lives on executor nodes and is not
     // accessible from the coordinator without an executor RPC.  The full
@@ -777,8 +767,14 @@ mod tests {
 
     #[test]
     fn state_inspect_returns_skeleton_output() {
-        let response =
-            dispatch(&["state", "inspect", "--job", "job-123", "--operator", "tumbling-1"]);
+        let response = dispatch(&[
+            "state",
+            "inspect",
+            "--job",
+            "job-123",
+            "--operator",
+            "tumbling-1",
+        ]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);
         assert!(response.stdout.contains("job-123"));
         assert!(response.stdout.contains("tumbling-1"));

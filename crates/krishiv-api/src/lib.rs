@@ -776,12 +776,19 @@ impl KeyedStream {
     /// Create a sliding event-time window of total size `window_size_ms` advancing
     /// by `slide_ms` (R5.2).
     pub fn sliding_window(self, window_size_ms: u64, slide_ms: u64) -> SlidingWindowedStream {
-        SlidingWindowedStream { keyed: self, window_size_ms, slide_ms }
+        SlidingWindowedStream {
+            keyed: self,
+            window_size_ms,
+            slide_ms,
+        }
     }
 
     /// Create a session window that closes after `session_gap_ms` of inactivity (R5.2).
     pub fn session_window(self, session_gap_ms: u64) -> SessionWindowedStream {
-        SessionWindowedStream { keyed: self, session_gap_ms }
+        SessionWindowedStream {
+            keyed: self,
+            session_gap_ms,
+        }
     }
 }
 
@@ -1033,7 +1040,9 @@ mod tests {
         assert_eq!(spec.lag_ms(), 30_000);
     }
 
-    use super::{MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig};
+    use super::{
+        MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig,
+    };
 
     #[test]
     fn multi_source_watermark_spec_roundtrip() {

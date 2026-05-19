@@ -526,7 +526,9 @@ pub struct InMemoryTwoPhaseCommitSink {
 }
 
 impl InMemoryTwoPhaseCommitSink {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// All committed `(epoch, batch)` pairs, in commit order.
     pub fn committed(&self) -> &[(u64, arrow::record_batch::RecordBatch)] {
@@ -556,7 +558,10 @@ impl TwoPhaseCommitSink for InMemoryTwoPhaseCommitSink {
     ) -> ConnectorResult<Self::Handle> {
         let handle_id = self.next_handle;
         self.next_handle += 1;
-        self.staged.entry(handle_id).or_default().push(batch.clone());
+        self.staged
+            .entry(handle_id)
+            .or_default()
+            .push(batch.clone());
         Ok(InMemoryCommitHandle { epoch, handle_id })
     }
 
@@ -912,10 +917,9 @@ mod tests {
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
-        ).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
+                .unwrap();
 
         let mut sink = InMemoryTwoPhaseCommitSink::new();
         let handle = sink.prepare(1, &batch).unwrap();
@@ -935,10 +939,8 @@ mod tests {
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![42i64]))],
-        ).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42i64]))]).unwrap();
 
         let mut sink = InMemoryTwoPhaseCommitSink::new();
         let handle = sink.prepare(2, &batch).unwrap();
@@ -958,7 +960,8 @@ mod tests {
             RecordBatch::try_new(
                 Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
                 vec![Arc::new(Int64Array::from(vec![v]))],
-            ).unwrap()
+            )
+            .unwrap()
         };
 
         let mut sink = InMemoryTwoPhaseCommitSink::new();

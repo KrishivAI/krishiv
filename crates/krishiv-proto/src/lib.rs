@@ -176,9 +176,15 @@ impl FencingToken {
         }
         Ok(Self(value))
     }
-    pub fn initial() -> Self { Self(1) }
-    pub fn next(self) -> Self { Self(self.0.saturating_add(1)) }
-    pub fn as_u64(self) -> u64 { self.0 }
+    pub fn initial() -> Self {
+        Self(1)
+    }
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Display for FencingToken {

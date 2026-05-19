@@ -2,7 +2,7 @@
 
 **Status:** Approved for R6 implementation.
 **Linked releases:** R6 (durable checkpoints, savepoints, exactly-once).
-**Linked docs:** `docs/architecture/checkpoint-protocol.md` (barrier model and fencing invariants).
+**Linked docs:** `docs/architecture/checkpoint-protocol.md` (barrier model and fencing invariants), `docs/architecture/rescaling-model.md` (rescaling and state schema evolution decisions).
 
 ---
 

@@ -853,10 +853,7 @@ impl ExecutorTaskRunner {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| ExecutorError::LocalExecution {
-                    message: format!(
-                        "event_time column '{}' must be Int64",
-                        spec.time_col
-                    ),
+                    message: format!("event_time column '{}' must be Int64", spec.time_col),
                 })?;
             for row in 0..arr.len() {
                 watermark.advance(arr.value(row));
@@ -1004,12 +1001,13 @@ async fn read_connector_parquet_partitions(
             message: format!("connector-parquet open failed for '{path_str}': {e}"),
         })?;
         let mut batches = Vec::new();
-        while let Some(batch) = source
-            .read_batch()
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: format!("connector-parquet read failed: {e}"),
-            })?
+        while let Some(batch) =
+            source
+                .read_batch()
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("connector-parquet read failed: {e}"),
+                })?
         {
             batches.push(batch);
         }

@@ -189,13 +189,17 @@ impl IntegrityManifest {
                 continue;
             }
             // Format: "sha256:<hex>  <path>"
-            let rest = line.strip_prefix("sha256:").ok_or_else(|| CheckpointError::Storage {
-                message: format!("manifest line missing sha256 prefix: {line}"),
-            })?;
+            let rest = line
+                .strip_prefix("sha256:")
+                .ok_or_else(|| CheckpointError::Storage {
+                    message: format!("manifest line missing sha256 prefix: {line}"),
+                })?;
             // Split on two spaces separating hash from path
-            let (hex, path) = rest.split_once("  ").ok_or_else(|| CheckpointError::Storage {
-                message: format!("manifest line missing separator: {line}"),
-            })?;
+            let (hex, path) = rest
+                .split_once("  ")
+                .ok_or_else(|| CheckpointError::Storage {
+                    message: format!("manifest line missing separator: {line}"),
+                })?;
             manifest.insert(path.trim(), hex.trim());
         }
         Ok(manifest)
@@ -395,12 +399,12 @@ pub fn delete_epoch(
 }
 
 /// Find the most recent valid epoch.  Returns `Err(NoValidEpoch)` if none.
-pub fn latest_valid_epoch(
-    storage: &dyn CheckpointStorage,
-    job_id: &str,
-) -> CheckpointResult<u64> {
+pub fn latest_valid_epoch(storage: &dyn CheckpointStorage, job_id: &str) -> CheckpointResult<u64> {
     let epochs = list_valid_epochs(storage, job_id)?;
-    epochs.into_iter().last().ok_or(CheckpointError::NoValidEpoch)
+    epochs
+        .into_iter()
+        .last()
+        .ok_or(CheckpointError::NoValidEpoch)
 }
 
 // ── LocalFsCheckpointStorage ──────────────────────────────────────────────────
@@ -541,8 +545,14 @@ mod tests {
     #[test]
     fn local_fs_write_read_roundtrip() {
         let s = make_storage();
-        s.write_bytes("job1/checkpoints/00000000000000000001/metadata.json", b"hello").unwrap();
-        let data = s.read_bytes("job1/checkpoints/00000000000000000001/metadata.json").unwrap();
+        s.write_bytes(
+            "job1/checkpoints/00000000000000000001/metadata.json",
+            b"hello",
+        )
+        .unwrap();
+        let data = s
+            .read_bytes("job1/checkpoints/00000000000000000001/metadata.json")
+            .unwrap();
         assert_eq!(data, Some(b"hello".to_vec()));
     }
 
@@ -555,11 +565,15 @@ mod tests {
     #[test]
     fn local_fs_delete_prefix_removes_tree() {
         let s = make_storage();
-        s.write_bytes("job1/checkpoints/00000000000000000001/metadata.json", b"x").unwrap();
-        s.write_bytes("job1/checkpoints/00000000000000000001/state.bin", b"y").unwrap();
-        s.delete_prefix("job1/checkpoints/00000000000000000001").unwrap();
+        s.write_bytes("job1/checkpoints/00000000000000000001/metadata.json", b"x")
+            .unwrap();
+        s.write_bytes("job1/checkpoints/00000000000000000001/state.bin", b"y")
+            .unwrap();
+        s.delete_prefix("job1/checkpoints/00000000000000000001")
+            .unwrap();
         assert_eq!(
-            s.read_bytes("job1/checkpoints/00000000000000000001/metadata.json").unwrap(),
+            s.read_bytes("job1/checkpoints/00000000000000000001/metadata.json")
+                .unwrap(),
             None
         );
     }
@@ -567,13 +581,18 @@ mod tests {
     #[test]
     fn local_fs_list_dir_returns_entry_names() {
         let s = make_storage();
-        s.write_bytes("job1/checkpoints/00000000000000000001/metadata.json", b"a").unwrap();
-        s.write_bytes("job1/checkpoints/00000000000000000002/metadata.json", b"b").unwrap();
+        s.write_bytes("job1/checkpoints/00000000000000000001/metadata.json", b"a")
+            .unwrap();
+        s.write_bytes("job1/checkpoints/00000000000000000002/metadata.json", b"b")
+            .unwrap();
         let mut names = s.list_dir("job1/checkpoints").unwrap();
         names.sort();
         assert_eq!(
             names,
-            vec!["00000000000000000001".to_owned(), "00000000000000000002".to_owned()]
+            vec![
+                "00000000000000000001".to_owned(),
+                "00000000000000000002".to_owned()
+            ]
         );
     }
 
@@ -699,7 +718,8 @@ mod tests {
         s.write_bytes(
             &snapshot_path("job-test", 9, "op-0", "task-0"),
             b"tampered state",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!validate_epoch(&s, "job-test", 9).unwrap());
     }
@@ -791,7 +811,8 @@ mod tests {
         m5.insert_bytes("op-0/task-0/state.bin", state5);
         write_manifest(&s, "job-fb", 5, &m5).unwrap();
         // Tamper
-        s.write_bytes(&snapshot_path("job-fb", 5, "op-0", "task-0"), b"corrupt").unwrap();
+        s.write_bytes(&snapshot_path("job-fb", 5, "op-0", "task-0"), b"corrupt")
+            .unwrap();
 
         // latest_valid_epoch falls back to epoch 4
         assert_eq!(latest_valid_epoch(&s, "job-fb").unwrap(), 4);

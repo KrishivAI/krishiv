@@ -6,7 +6,7 @@
 
 ## Active Task
 
-**R6 startup sequence** — all five pre-implementation decisions delivered:
+**R6 startup sequence** — all six pre-implementation decisions delivered:
 
 - Workspace bug-sweep: cleared compiler warning bugs in tests (`unused import`, `unused mut`, `unused variable`, `dead code`) across executor/shuffle/connectors/state crates; revalidated targeted crates with `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
 - `FencingToken(u64)` added to `krishiv-proto`: `initial()`, `next()`, `as_u64()`, ordering — 4 tests pass.
@@ -14,6 +14,7 @@
 - `TwoPhaseCommitSink` trait + `InMemoryTwoPhaseCommitSink` added to `krishiv-connectors`: `prepare/commit/abort` protocol with handle-based staging — 3 new tests pass.
 - `crates/krishiv-checkpoint` created: `CheckpointStorage` trait, `LocalFsCheckpointStorage` (atomic write, path traversal guard), `CheckpointMetadata` (versioned JSON), `IntegrityManifest` (SHA-256), higher-level helpers (`write_epoch_metadata`, `validate_epoch`, `list_valid_epochs`, `latest_valid_epoch`, `delete_epoch`, corrupt-checkpoint fallback) — 21 tests pass.
 - `docs/architecture/checkpoint-storage.md` written: key schema, snapshot binary format, integrity manifest format, two-phase commit API shape, rolling upgrade protocol, risks/mitigations.
+- `docs/architecture/rescaling-model.md` written: rescaling decision (savepoint+repartition only; live rescaling post-R6; restore rejects mismatched parallelism); state schema evolution baseline (reject unknown versions immediately — already enforced in `InMemoryStateBackend::load_snapshot` and `CheckpointMetadata::validate`; version increment policy; RocksDB schema evolution deferred). R6 tracker updated: rescaling model and schema evolution baseline marked complete.
 
 ## Previous Task: R5.2 implementation complete — all slices including durable backend:
 
