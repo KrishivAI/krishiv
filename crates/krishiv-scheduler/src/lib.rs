@@ -7,6 +7,7 @@
 //! executors; R3.1 maps coordinator/executor contracts to a networked gRPC
 //! service.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
@@ -20,10 +21,12 @@ use krishiv_proto::{
     ExecutorHeartbeat, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
     ExecutorState, ExecutorTaskAssignment, InputPartition, JobId, JobKind, JobSpec, JobState,
     LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, RegisterExecutorRequest,
-    RegisterExecutorResponse, StageId, StageSpec, StageState, TaskAssignment, TaskAttemptRef,
-    TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
-    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
+    RegisterExecutorResponse, ShufflePartitionOutput, StageId, StageSpec, StageState,
+    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec,
+    TaskState, TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
+    TransportVersion, wire,
 };
+use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 use serde::{Deserialize, Serialize};
 
 /// Scheduler result alias.
@@ -44,6 +47,11 @@ pub struct CoordinatorConfig {
     max_stage_retries: u32,
     heartbeat_timeout_ticks: u64,
     memory_threshold_bytes: Option<u64>,
+    /// Number of ticks after coordinator restart during which streaming-job
+    /// executor leases are not evicted for missing heartbeats.  Executors
+    /// running streaming tasks need time to re-register after a coordinator
+    /// restart; evicting them immediately would force a full re-run.
+    streaming_reattach_grace_ticks: u64,
 }
 
 impl CoordinatorConfig {
@@ -53,6 +61,7 @@ impl CoordinatorConfig {
             max_stage_retries,
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
             memory_threshold_bytes: None,
+            streaming_reattach_grace_ticks: 5,
         }
     }
 
@@ -60,6 +69,13 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_memory_threshold(mut self, bytes: u64) -> Self {
         self.memory_threshold_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the streaming re-attach grace period in heartbeat ticks.
+    #[must_use]
+    pub fn with_streaming_reattach_grace_ticks(mut self, ticks: u64) -> Self {
+        self.streaming_reattach_grace_ticks = ticks;
         self
     }
 
@@ -76,6 +92,11 @@ impl CoordinatorConfig {
     /// Memory threshold above which executors are skipped for placement.
     pub fn memory_threshold_bytes(&self) -> Option<u64> {
         self.memory_threshold_bytes
+    }
+
+    /// Grace period after coordinator restart before streaming executor leases expire.
+    pub fn streaming_reattach_grace_ticks(&self) -> u64 {
+        self.streaming_reattach_grace_ticks
     }
 }
 
@@ -180,6 +201,16 @@ pub struct Coordinator {
     executors: ExecutorRegistry,
     jobs: Vec<JobRecord>,
     store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
+    /// Jobs that have just reached a terminal state and need shuffle GC.
+    /// Drained by the coordinator binary's tick loop.
+    gc_ready_jobs: Vec<JobId>,
+    /// Number of heartbeat ticks since the last coordinator restart.
+    /// Used to implement `streaming_reattach_grace_ticks`: for this many ticks
+    /// after `recover_from_store` is called, streaming-job executors are not
+    /// evicted for missing heartbeats.
+    ticks_since_restart: u64,
+    /// Set to true after `recover_from_store` has been called at least once.
+    recovering: bool,
 }
 
 impl fmt::Debug for Coordinator {
@@ -601,6 +632,9 @@ impl Coordinator {
             ),
             jobs: Vec::new(),
             store: None,
+            gc_ready_jobs: Vec::new(),
+            ticks_since_restart: u64::MAX,
+            recovering: false,
         }
     }
 
@@ -628,6 +662,9 @@ impl Coordinator {
             ),
             jobs: Vec::new(),
             store: None,
+            gc_ready_jobs: Vec::new(),
+            ticks_since_restart: u64::MAX,
+            recovering: false,
         }
     }
 
@@ -683,22 +720,61 @@ impl Coordinator {
     ///
     /// Tasks previously assigned to lost executors are reset to `Assigned` so they
     /// will be relaunched on the next `launch_assigned_task_assignments` call.
+    ///
+    /// During the streaming re-attach grace period after a coordinator restart,
+    /// executors that own Running tasks in streaming jobs are not evicted even if
+    /// they have missed heartbeats. This gives them time to re-register without
+    /// forcing a full streaming job re-run.
     pub fn advance_heartbeat_clock(&mut self, ticks: u64) -> SchedulerResult<Vec<ExecutorId>> {
         self.ensure_active()?;
+        // Advance the restart tick counter.
+        self.ticks_since_restart = self.ticks_since_restart.saturating_add(ticks);
+
+        let in_grace_period = self.recovering
+            && self.ticks_since_restart <= self.config.streaming_reattach_grace_ticks();
+
         let lost = self.executors.advance_clock(ticks);
+        let mut evicted: Vec<ExecutorId> = Vec::new();
         for lost_id in &lost {
+            // During the re-attach grace period, skip evicting executors that own
+            // Running tasks in streaming jobs so they can re-register.
+            if in_grace_period && self.executor_has_streaming_running_tasks(lost_id) {
+                continue;
+            }
             self.reset_running_tasks_for_lost_executor(lost_id);
+            evicted.push(lost_id.clone());
         }
-        Ok(lost)
+        Ok(evicted)
+    }
+
+    /// Returns true if the executor owns at least one Running task in a streaming job.
+    fn executor_has_streaming_running_tasks(&self, executor_id: &ExecutorId) -> bool {
+        self.jobs.iter().any(|job| {
+            job.spec.kind() == JobKind::Streaming
+                && job.stages.iter().any(|stage| {
+                    stage.tasks().iter().any(|task| {
+                        task.state() == TaskState::Running
+                            && task.assigned_executor() == Some(executor_id)
+                    })
+                })
+        })
     }
 
     /// Restore job state from a `MetadataStore` after coordinator restart.
+    ///
+    /// For streaming jobs with Running tasks, the `streaming_reattach_grace_ticks`
+    /// window starts here: executors owning those tasks will not be evicted for
+    /// missing heartbeats during the grace period, allowing them to re-register
+    /// and resume without re-processing already-committed events.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         for record in store.jobs() {
             if !self.jobs.iter().any(|j| j.job_id() == record.job_id()) {
                 self.jobs.push(record.clone());
             }
         }
+        // Start the re-attach grace period.
+        self.ticks_since_restart = 0;
+        self.recovering = true;
         Ok(())
     }
 
@@ -718,12 +794,12 @@ impl Coordinator {
         let job_id = spec.job_id().clone();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
-        self.jobs.push(record);
         if let Some(store) = &self.store {
             let mut s = store.lock().unwrap();
-            s.save_job(self.jobs.last().unwrap()).ok();
+            s.save_job(&record).ok();
             s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
         }
+        self.jobs.push(record);
         Ok(())
     }
 
@@ -766,6 +842,9 @@ impl Coordinator {
     pub fn cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
         self.ensure_active()?;
         self.find_job_mut(job_id)?.cancel();
+        if !self.gc_ready_jobs.contains(job_id) {
+            self.gc_ready_jobs.push(job_id.clone());
+        }
         Ok(())
     }
 
@@ -776,6 +855,12 @@ impl Coordinator {
             failed_assignments: self.jobs.iter().map(JobRecord::failed_task_count).sum(),
             retry_count: self.jobs.iter().map(JobRecord::retry_count).sum(),
             running_task_count: self.jobs.iter().map(JobRecord::running_task_count).sum(),
+            shuffle_partitions_available: self
+                .jobs
+                .iter()
+                .map(JobRecord::shuffle_partitions_available_count)
+                .sum(),
+            shuffle_bytes_written: self.jobs.iter().map(JobRecord::shuffle_bytes_written).sum(),
         }
     }
 
@@ -895,13 +980,24 @@ impl Coordinator {
             .validate_lease(update.executor_id(), update.lease_generation())?;
         let job_id = update.job_id().clone();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
-        if let Some(store) = &self.store {
-            if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
+        if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
+            if record.state().is_terminal() && !self.gc_ready_jobs.contains(&job_id) {
+                self.gc_ready_jobs.push(job_id.clone());
+            }
+            if let Some(store) = &self.store {
                 let mut s = store.lock().unwrap();
                 s.save_job(record).ok();
             }
         }
         Ok(outcome)
+    }
+
+    /// Drain the list of jobs that have reached a terminal state and need shuffle GC.
+    ///
+    /// The coordinator binary's tick loop should call this, then asynchronously
+    /// delete partitions for each returned job id via the shuffle store.
+    pub fn take_gc_ready_jobs(&mut self) -> Vec<JobId> {
+        std::mem::take(&mut self.gc_ready_jobs)
     }
 
     /// Snapshot one job.
@@ -1328,6 +1424,9 @@ pub struct JobRecord {
     state: JobState,
     max_stage_retries: u32,
     stages: Vec<StageRecord>,
+    /// Shuffle partition availability metadata per producing stage.
+    /// Updated when tasks report ShufflePartitionOutput in TaskOutputMetadata.
+    shuffle_output: HashMap<StageId, ShuffleMetadata>,
 }
 
 impl JobRecord {
@@ -1343,6 +1442,7 @@ impl JobRecord {
             state: JobState::Accepted,
             max_stage_retries,
             stages,
+            shuffle_output: HashMap::new(),
         }
     }
 
@@ -1383,8 +1483,29 @@ impl JobRecord {
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
+
+        // Collect the set of stage ids whose shuffle output is fully available.
+        // A stage's output is available when all tasks in it have Succeeded.
+        let succeeded_stage_ids: Vec<StageId> = self
+            .stages
+            .iter()
+            .filter(|s| s.state == StageState::Succeeded)
+            .map(|s| s.stage_id().clone())
+            .collect();
+
         for stage in &mut self.stages {
             let stage_id = stage.stage_id().clone();
+
+            // Skip stages whose upstream shuffle dependencies are not yet complete.
+            let upstream_ready = stage
+                .spec
+                .upstream_stage_ids()
+                .iter()
+                .all(|up| succeeded_stage_ids.contains(up));
+            if !upstream_ready {
+                continue;
+            }
+
             for task in &mut stage.tasks {
                 if task.state == TaskState::Assigned {
                     let executor_id = task.assigned_executor.clone().ok_or_else(|| {
@@ -1453,15 +1574,38 @@ impl JobRecord {
         &mut self,
         update: TaskStatusUpdate,
     ) -> SchedulerResult<TaskUpdateOutcome> {
+        let stage_id = update.stage_id().clone();
+        let shuffle_partitions: Vec<ShufflePartitionOutput> = update
+            .output_metadata()
+            .map(|m| m.shuffle_partitions().to_vec())
+            .unwrap_or_default();
+
         let stage = self
             .stages
             .iter_mut()
-            .find(|stage| stage.stage_id() == update.stage_id())
+            .find(|stage| stage.stage_id() == &stage_id)
             .ok_or_else(|| SchedulerError::UnknownStage {
-                stage_id: update.stage_id().clone(),
+                stage_id: stage_id.clone(),
             })?;
 
         let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
+
+        // If the task succeeded with shuffle output, record partition availability.
+        if !shuffle_partitions.is_empty() {
+            let meta = self
+                .shuffle_output
+                .entry(stage_id.clone())
+                .or_insert_with(ShuffleMetadata::new);
+            for p in &shuffle_partitions {
+                let path = ShufflePath {
+                    job_id: self.spec.job_id().as_str().to_owned(),
+                    stage_id: stage_id.as_str().to_owned(),
+                    partition_id: p.partition_id,
+                };
+                meta.mark_available(&path);
+            }
+        }
+
         self.refresh_state();
         Ok(outcome)
     }
@@ -1500,15 +1644,20 @@ impl JobRecord {
         if self
             .stages
             .iter()
-            .all(|stage| stage.state == StageState::Succeeded)
-        {
-            self.state = JobState::Succeeded;
-        } else if self
-            .stages
-            .iter()
             .any(|stage| stage.state == StageState::Failed)
         {
             self.state = JobState::Failed;
+            return;
+        }
+        // Streaming jobs never enter Succeeded while running — they run until
+        // explicitly stopped or failed. Only batch jobs transition to Succeeded.
+        if self.spec.kind() != JobKind::Streaming
+            && self
+                .stages
+                .iter()
+                .all(|stage| stage.state == StageState::Succeeded)
+        {
+            self.state = JobState::Succeeded;
         } else {
             self.state = JobState::Running;
         }
@@ -1550,6 +1699,26 @@ impl JobRecord {
             job: self.snapshot(),
             stages: self.stages.iter().map(StageRecord::snapshot).collect(),
         }
+    }
+
+    /// Total number of shuffle partitions marked Available across all stages.
+    pub fn shuffle_partitions_available_count(&self) -> usize {
+        self.shuffle_output
+            .values()
+            .map(ShuffleMetadata::available_count)
+            .sum()
+    }
+
+    /// Total shuffle bytes written across all stages (sum of partition size_bytes
+    /// as recorded by executor TaskOutputMetadata).
+    pub fn shuffle_bytes_written(&self) -> u64 {
+        self.stages
+            .iter()
+            .flat_map(StageRecord::tasks)
+            .filter_map(|t| t.output_metadata.as_ref())
+            .flat_map(|m| m.shuffle_partitions())
+            .map(|p| p.size_bytes)
+            .sum()
     }
 }
 
@@ -2002,6 +2171,10 @@ pub struct StabilityMetrics {
     retry_count: usize,
     running_task_count: usize,
     failed_assignments: usize,
+    /// Total shuffle partitions currently marked Available across all active jobs.
+    pub shuffle_partitions_available: usize,
+    /// Total shuffle bytes written across all active jobs.
+    pub shuffle_bytes_written: u64,
 }
 
 impl StabilityMetrics {
@@ -2012,6 +2185,8 @@ impl StabilityMetrics {
             retry_count: 0,
             running_task_count: 0,
             failed_assignments: 0,
+            shuffle_partitions_available: 0,
+            shuffle_bytes_written: 0,
         }
     }
 
@@ -2046,6 +2221,21 @@ fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
         return Err(SchedulerError::InvalidJob {
             message: String::from("each stage must contain at least one task"),
         });
+    }
+    let stage_ids: std::collections::HashSet<&StageId> =
+        spec.stages().iter().map(|s| s.stage_id()).collect();
+    for stage in spec.stages() {
+        for upstream_id in stage.upstream_stage_ids() {
+            if !stage_ids.contains(upstream_id) {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "stage {} declares upstream dependency on unknown stage {}",
+                        stage.stage_id(),
+                        upstream_id
+                    ),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -2614,6 +2804,9 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
                 .into_iter()
                 .map(StageRecord::try_from)
                 .collect::<SchedulerResult<Vec<_>>>()?,
+            // Shuffle output metadata is not persisted; it is rebuilt from
+            // executor task status updates after coordinator restart.
+            shuffle_output: HashMap::new(),
         })
     }
 }
@@ -4115,6 +4308,262 @@ mod tests {
             StageSpec::new(StageId::try_new("stage-1").unwrap(), "scan")
                 .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "scan a")),
         )
+    }
+
+    fn single_task_streaming_job(job_id: JobId) -> JobSpec {
+        JobSpec::new(job_id, "streaming job", JobKind::Streaming).with_stage(
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "stream-stage").with_task(
+                TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream-task"),
+            ),
+        )
+    }
+
+    // ── streaming refresh_state guard ─────────────────────────────────────
+
+    #[test]
+    fn streaming_job_does_not_succeed_when_all_stages_succeed() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                1,
+            ))
+            .unwrap();
+        let job_id = JobId::try_new("job-stream-1").unwrap();
+        coordinator
+            .submit_job(single_task_streaming_job(job_id.clone()))
+            .unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task_id = detail.stages()[0].tasks()[0].task_id().clone();
+        let executor_id = detail.stages()[0].tasks()[0]
+            .assigned_executor()
+            .unwrap()
+            .clone();
+        let lease = coordinator.executor_snapshots()[0].lease_generation();
+        let attempt = detail.stages()[0].tasks()[0].attempt();
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    StageId::try_new("stage-1").unwrap(),
+                    task_id,
+                    executor_id,
+                    TaskState::Succeeded,
+                    attempt,
+                )
+                .with_lease_generation(lease),
+            )
+            .unwrap();
+
+        // Streaming jobs must never reach Succeeded — they stay Running.
+        let final_snapshot = coordinator.job_snapshot(&job_id).unwrap();
+        assert_ne!(
+            final_snapshot.state(),
+            JobState::Succeeded,
+            "streaming job must not transition to Succeeded"
+        );
+        assert_eq!(final_snapshot.state(), JobState::Running);
+    }
+
+    #[test]
+    fn batch_job_succeeds_when_all_stages_succeed() {
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                1,
+            ))
+            .unwrap();
+        let job_id = JobId::try_new("job-batch-1").unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task_id = detail.stages()[0].tasks()[0].task_id().clone();
+        let executor_id = detail.stages()[0].tasks()[0]
+            .assigned_executor()
+            .unwrap()
+            .clone();
+        let lease = coordinator.executor_snapshots()[0].lease_generation();
+        let attempt = detail.stages()[0].tasks()[0].attempt();
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    StageId::try_new("stage-1").unwrap(),
+                    task_id,
+                    executor_id,
+                    TaskState::Succeeded,
+                    attempt,
+                )
+                .with_lease_generation(lease),
+            )
+            .unwrap();
+
+        assert_eq!(
+            coordinator.job_snapshot(&job_id).unwrap().state(),
+            JobState::Succeeded,
+            "batch job must transition to Succeeded"
+        );
+    }
+
+    // ── streaming re-attach grace period ──────────────────────────────────
+
+    #[test]
+    fn streaming_executor_not_evicted_within_grace_period() {
+        let config = CoordinatorConfig::new(1, 2).with_streaming_reattach_grace_ticks(10);
+        let mut coordinator =
+            Coordinator::active_with_config(CoordinatorId::try_new("coord-1").unwrap(), config);
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-s-1").unwrap();
+        coordinator
+            .submit_job(single_task_streaming_job(job_id.clone()))
+            .unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        // Mark the task Running so it has a committed executor assignment.
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task_id = detail.stages()[0].tasks()[0].task_id().clone();
+        let exec_id_clone = detail.stages()[0].tasks()[0]
+            .assigned_executor()
+            .unwrap()
+            .clone();
+        let lease = coordinator.executor_snapshots()[0].lease_generation();
+        let attempt = detail.stages()[0].tasks()[0].attempt();
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    StageId::try_new("stage-1").unwrap(),
+                    task_id,
+                    exec_id_clone,
+                    TaskState::Running,
+                    attempt,
+                )
+                .with_lease_generation(lease),
+            )
+            .unwrap();
+
+        // Simulate coordinator restart via recover_from_store.
+        let store = InMemoryMetadataStore::default();
+        coordinator.recover_from_store(&store).unwrap();
+
+        // Advance 3 ticks (> timeout of 2, but < grace period of 10).
+        let evicted = coordinator.advance_heartbeat_clock(3).unwrap();
+        assert!(
+            !evicted.contains(&executor_id),
+            "streaming executor must not be evicted within grace period"
+        );
+    }
+
+    #[test]
+    fn streaming_executor_evicted_after_grace_period() {
+        let config = CoordinatorConfig::new(1, 2).with_streaming_reattach_grace_ticks(2);
+        let mut coordinator =
+            Coordinator::active_with_config(CoordinatorId::try_new("coord-1").unwrap(), config);
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-s-2").unwrap();
+        coordinator
+            .submit_job(single_task_streaming_job(job_id.clone()))
+            .unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        // Mark task Running.
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task_id = detail.stages()[0].tasks()[0].task_id().clone();
+        let exec_id_clone = detail.stages()[0].tasks()[0]
+            .assigned_executor()
+            .unwrap()
+            .clone();
+        let lease = coordinator.executor_snapshots()[0].lease_generation();
+        let attempt = detail.stages()[0].tasks()[0].attempt();
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    job_id.clone(),
+                    StageId::try_new("stage-1").unwrap(),
+                    task_id,
+                    exec_id_clone,
+                    TaskState::Running,
+                    attempt,
+                )
+                .with_lease_generation(lease),
+            )
+            .unwrap();
+
+        // Trigger grace period.
+        let store = InMemoryMetadataStore::default();
+        coordinator.recover_from_store(&store).unwrap();
+
+        // 5 ticks > grace period (2) + heartbeat timeout (2).
+        let evicted = coordinator.advance_heartbeat_clock(5).unwrap();
+        assert!(
+            evicted.contains(&executor_id),
+            "streaming executor must be evicted after grace period expires"
+        );
+    }
+
+    #[test]
+    fn validate_job_rejects_unknown_upstream_stage() {
+        let job_id = JobId::try_new("job-1").unwrap();
+        let spec = JobSpec::new(job_id, "bad upstream", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage1")
+                .with_upstream_stage(StageId::try_new("ghost-stage").unwrap())
+                .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+        );
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                1,
+            ))
+            .unwrap();
+        let result = coordinator.submit_job(spec);
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidJob { .. })),
+            "expected InvalidJob, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_job_accepts_valid_upstream_stage() {
+        let job_id = JobId::try_new("job-2").unwrap();
+        let spec = JobSpec::new(job_id, "good upstream", JobKind::Batch)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "producer")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+            )
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-2").unwrap(), "consumer")
+                    .with_upstream_stage(StageId::try_new("stage-1").unwrap())
+                    .with_task(TaskSpec::new(TaskId::try_new("task-2").unwrap(), "t2")),
+            );
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-2").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                2,
+            ))
+            .unwrap();
+        assert!(coordinator.submit_job(spec).is_ok());
     }
 
     #[test]

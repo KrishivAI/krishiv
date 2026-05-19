@@ -450,6 +450,12 @@ pub struct StageSpec {
     stage_id: StageId,
     name: String,
     tasks: Vec<TaskSpec>,
+    /// Stage ids that must be fully Succeeded before this stage may launch.
+    /// Empty means this stage has no upstream shuffle dependencies.
+    upstream_stage_ids: Vec<StageId>,
+    /// Number of shuffle output partitions this stage produces, if known.
+    /// Coordinator uses this to pre-register Pending partition slots.
+    output_partition_count: Option<u32>,
 }
 
 impl StageSpec {
@@ -459,6 +465,8 @@ impl StageSpec {
             stage_id,
             name: name.into(),
             tasks: Vec::new(),
+            upstream_stage_ids: Vec::new(),
+            output_partition_count: None,
         }
     }
 
@@ -466,6 +474,21 @@ impl StageSpec {
     #[must_use]
     pub fn with_task(mut self, task: TaskSpec) -> Self {
         self.tasks.push(task);
+        self
+    }
+
+    /// Declare that this stage depends on `upstream_stage_id` having all shuffle
+    /// partitions Available before any task in this stage may be launched.
+    #[must_use]
+    pub fn with_upstream_stage(mut self, upstream_stage_id: StageId) -> Self {
+        self.upstream_stage_ids.push(upstream_stage_id);
+        self
+    }
+
+    /// Set the expected shuffle output partition count for this stage.
+    #[must_use]
+    pub fn with_output_partition_count(mut self, count: u32) -> Self {
+        self.output_partition_count = Some(count);
         self
     }
 
@@ -487,6 +510,16 @@ impl StageSpec {
     /// Number of tasks in this stage.
     pub fn task_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// Stage ids that must be fully Succeeded before this stage may launch.
+    pub fn upstream_stage_ids(&self) -> &[StageId] {
+        &self.upstream_stage_ids
+    }
+
+    /// Expected shuffle output partition count, if declared at submission time.
+    pub fn output_partition_count(&self) -> Option<u32> {
+        self.output_partition_count
     }
 }
 
@@ -612,13 +645,65 @@ impl ExecutorDescriptor {
     }
 }
 
-/// Output metadata reported by an executor without carrying Arrow payloads.
+/// Metadata for a single shuffle partition produced by a task.
+///
+/// The coordinator uses this to transition the partition from Pending → Available
+/// in its `ShuffleMetadata` store and gate Stage N+1 launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShufflePartitionOutput {
+    /// Partition index within the stage.
+    pub partition_id: u32,
+    /// Bytes written to the shuffle store.
+    pub size_bytes: u64,
+    /// Arrow Flight endpoint the executor is serving for this partition.
+    /// Format: `http://<host>:<port>`. Empty string means in-process (single-node mode).
+    pub flight_endpoint: String,
+}
+
+impl ShufflePartitionOutput {
+    /// Create a shuffle partition output descriptor.
+    pub fn new(partition_id: u32, size_bytes: u64, flight_endpoint: impl Into<String>) -> Self {
+        Self {
+            partition_id,
+            size_bytes,
+            flight_endpoint: flight_endpoint.into(),
+        }
+    }
+
+    /// In-process (single-node) partition with no Flight endpoint.
+    pub fn inline(partition_id: u32, size_bytes: u64) -> Self {
+        Self::new(partition_id, size_bytes, "")
+    }
+}
+
+/// Runtime statistics collected by a task during execution.
+///
+/// Fed into AQE rules and stored in `TaskRecord` for job-level aggregation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskRuntimeStats {
+    /// Rows read from all input sources.
+    pub input_rows: u64,
+    /// Rows written to output / shuffle.
+    pub output_rows: u64,
+    /// CPU time in nanoseconds.
+    pub cpu_nanos: u64,
+    /// Peak memory used in bytes.
+    pub memory_bytes: u64,
+    /// Bytes spilled to local disk.
+    pub spill_bytes: u64,
+}
+
+/// Task output metadata reported when a task completes successfully.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskOutputMetadata {
     output_kind: String,
     row_count: u64,
     batch_count: u64,
     column_count: u64,
+    /// Shuffle partitions produced by this task, if this was a shuffle-write task.
+    shuffle_partitions: Vec<ShufflePartitionOutput>,
+    /// Runtime statistics for this task execution.
+    runtime_stats: Option<TaskRuntimeStats>,
 }
 
 impl TaskOutputMetadata {
@@ -634,7 +719,23 @@ impl TaskOutputMetadata {
             row_count,
             batch_count,
             column_count,
+            shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
+    }
+
+    /// Attach shuffle partition outputs (for shuffle-write tasks).
+    #[must_use]
+    pub fn with_shuffle_partitions(mut self, partitions: Vec<ShufflePartitionOutput>) -> Self {
+        self.shuffle_partitions = partitions;
+        self
+    }
+
+    /// Attach runtime statistics.
+    #[must_use]
+    pub fn with_runtime_stats(mut self, stats: TaskRuntimeStats) -> Self {
+        self.runtime_stats = Some(stats);
+        self
     }
 
     /// Output kind label.
@@ -655,6 +756,16 @@ impl TaskOutputMetadata {
     /// Number of columns produced.
     pub fn column_count(&self) -> u64 {
         self.column_count
+    }
+
+    /// Shuffle partitions produced by this task.
+    pub fn shuffle_partitions(&self) -> &[ShufflePartitionOutput] {
+        &self.shuffle_partitions
+    }
+
+    /// Runtime statistics for this task.
+    pub fn runtime_stats(&self) -> Option<&TaskRuntimeStats> {
+        self.runtime_stats.as_ref()
     }
 }
 
@@ -779,6 +890,34 @@ impl DeregisterExecutorResponse {
     }
 }
 
+/// Per-task streaming state reported by an executor during heartbeat.
+///
+/// Used by the streaming re-attach protocol: when a coordinator restarts while
+/// streaming tasks are running, executors include this in their first heartbeat
+/// so the coordinator can resume the job at the right watermark and source offset
+/// instead of re-running from scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingTaskState {
+    /// Task this state belongs to.
+    pub task_id: TaskId,
+    /// Current event-time watermark in milliseconds since epoch.
+    pub watermark_ms: u64,
+    /// Last committed source offset for this task's input partition.
+    /// Encoded as a byte string whose interpretation is connector-specific.
+    pub source_offset: Vec<u8>,
+}
+
+impl StreamingTaskState {
+    /// Create a streaming task state report.
+    pub fn new(task_id: TaskId, watermark_ms: u64, source_offset: Vec<u8>) -> Self {
+        Self {
+            task_id,
+            watermark_ms,
+            source_offset,
+        }
+    }
+}
+
 /// Executor heartbeat contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorHeartbeat {
@@ -789,6 +928,9 @@ pub struct ExecutorHeartbeat {
     memory_used_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
     active_task_count: Option<u32>,
+    /// Per-task streaming state for the re-attach protocol.
+    /// Empty for batch tasks and executors that have no streaming tasks.
+    streaming_task_states: Vec<StreamingTaskState>,
 }
 
 impl ExecutorHeartbeat {
@@ -802,6 +944,7 @@ impl ExecutorHeartbeat {
             memory_used_bytes: None,
             memory_limit_bytes: None,
             active_task_count: None,
+            streaming_task_states: Vec::new(),
         }
     }
 
@@ -873,6 +1016,18 @@ impl ExecutorHeartbeat {
     /// Active task count reported by executor.
     pub fn active_task_count(&self) -> Option<u32> {
         self.active_task_count
+    }
+
+    /// Attach streaming task states for the re-attach protocol.
+    #[must_use]
+    pub fn with_streaming_task_states(mut self, states: Vec<StreamingTaskState>) -> Self {
+        self.streaming_task_states = states;
+        self
+    }
+
+    /// Per-task streaming state reported by this executor.
+    pub fn streaming_task_states(&self) -> &[StreamingTaskState] {
+        &self.streaming_task_states
     }
 }
 
@@ -1370,6 +1525,23 @@ pub enum InputPartitionDescriptor {
         start_offset: i64,
         records: Vec<MemoryKafkaRecord>,
     },
+    /// Arrow Flight endpoint for reading an upstream shuffle partition.
+    ///
+    /// The executor connects to `flight_endpoint` and reads `partition_id`
+    /// from the upstream stage. The data is registered as `table_name` in
+    /// the local DataFusion context before executing the fragment SQL.
+    ShuffleFlight {
+        table_name: String,
+        /// Arrow Flight endpoint of the upstream executor (e.g. `http://10.0.0.5:50051`).
+        /// Empty string means in-process (single-node mode, read from InMemoryShuffleStore).
+        flight_endpoint: String,
+        /// Job id of the upstream stage.
+        job_id: String,
+        /// Stage id that produced this partition.
+        upstream_stage_id: String,
+        /// Partition index.
+        partition_id: u32,
+    },
 }
 
 impl InputPartitionDescriptor {
@@ -1397,6 +1569,17 @@ impl InputPartitionDescriptor {
                     .collect::<Vec<_>>()
                     .join(",");
                 format!("memory-kafka:{topic}:{partition}:{start_offset}:{records}")
+            }
+            Self::ShuffleFlight {
+                table_name,
+                flight_endpoint,
+                upstream_stage_id,
+                partition_id,
+                ..
+            } => {
+                format!(
+                    "shuffle-flight:{table_name}:{flight_endpoint}:{upstream_stage_id}:{partition_id}"
+                )
             }
         }
     }
@@ -2002,9 +2185,10 @@ pub mod wire {
         ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
         ExecutorTaskAssignment, InputPartition, InputPartitionDescriptor, JobId, LeaseGeneration,
         MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind,
-        PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, StageId, TaskAttemptRef,
-        TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskState, TaskStatusRequest,
-        TaskStatusResponse, TransportDisposition, TransportVersion,
+        PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput,
+        StageId, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata,
+        TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+        TransportVersion,
     };
 
     /// Generated protobuf and tonic service types for `krishiv.transport.v1`.
@@ -2382,6 +2566,27 @@ pub mod wire {
             row_count: value.row_count(),
             batch_count: value.batch_count(),
             column_count: value.column_count(),
+            // Shuffle partition and runtime stats are carried in-process for R4;
+            // proto encoding is deferred until the wire schema stabilises.
+            shuffle_partition_ids: value
+                .shuffle_partitions()
+                .iter()
+                .map(|p| p.partition_id)
+                .collect(),
+            shuffle_partition_bytes: value
+                .shuffle_partitions()
+                .iter()
+                .map(|p| p.size_bytes)
+                .collect(),
+            shuffle_flight_endpoints: value
+                .shuffle_partitions()
+                .iter()
+                .map(|p| p.flight_endpoint.clone())
+                .collect(),
+            input_rows: value.runtime_stats().map_or(0, |s| s.input_rows),
+            output_rows: value.runtime_stats().map_or(0, |s| s.output_rows),
+            cpu_nanos: value.runtime_stats().map_or(0, |s| s.cpu_nanos),
+            spill_bytes: value.runtime_stats().map_or(0, |s| s.spill_bytes),
         }
     }
 
@@ -2391,12 +2596,36 @@ pub mod wire {
         if value.output_kind.trim().is_empty() {
             return Err(WireError::new("task output metadata kind cannot be empty"));
         }
-        Ok(TaskOutputMetadata::new(
+        let shuffle_partitions: Vec<ShufflePartitionOutput> = value
+            .shuffle_partition_ids
+            .into_iter()
+            .zip(value.shuffle_partition_bytes)
+            .zip(value.shuffle_flight_endpoints)
+            .map(|((id, bytes), endpoint)| ShufflePartitionOutput::new(id, bytes, endpoint))
+            .collect();
+        let mut meta = TaskOutputMetadata::new(
             value.output_kind,
             value.row_count,
             value.batch_count,
             value.column_count,
-        ))
+        );
+        if !shuffle_partitions.is_empty() {
+            meta = meta.with_shuffle_partitions(shuffle_partitions);
+        }
+        let has_stats = value.input_rows > 0
+            || value.output_rows > 0
+            || value.cpu_nanos > 0
+            || value.spill_bytes > 0;
+        if has_stats {
+            meta = meta.with_runtime_stats(TaskRuntimeStats {
+                input_rows: value.input_rows,
+                output_rows: value.output_rows,
+                cpu_nanos: value.cpu_nanos,
+                memory_bytes: 0,
+                spill_bytes: value.spill_bytes,
+            });
+        }
+        Ok(meta)
     }
 
     fn required<T>(value: Option<T>, field: &'static str) -> WireResult<T> {
@@ -2538,6 +2767,21 @@ pub mod wire {
                     .collect(),
                 ..Default::default()
             },
+            InputPartitionDescriptor::ShuffleFlight {
+                table_name,
+                flight_endpoint,
+                job_id,
+                upstream_stage_id,
+                partition_id,
+            } => v1::InputPartitionDescriptor {
+                kind: v1::InputPartitionDescriptorKind::ShuffleFlight as i32,
+                table_name: table_name.clone(),
+                shuffle_flight_endpoint: flight_endpoint.clone(),
+                shuffle_job_id: job_id.clone(),
+                shuffle_upstream_stage_id: upstream_stage_id.clone(),
+                shuffle_partition_id: *partition_id,
+                ..Default::default()
+            },
         }
     }
 
@@ -2589,6 +2833,20 @@ pub mod wire {
                         .into_iter()
                         .map(|record| MemoryKafkaRecord::new(record.id, record.value))
                         .collect(),
+                })
+            }
+            v1::InputPartitionDescriptorKind::ShuffleFlight => {
+                require_non_empty(&value.table_name, "shuffle flight table name")?;
+                require_non_empty(
+                    &value.shuffle_upstream_stage_id,
+                    "shuffle upstream stage id",
+                )?;
+                Ok(InputPartitionDescriptor::ShuffleFlight {
+                    table_name: value.table_name,
+                    flight_endpoint: value.shuffle_flight_endpoint,
+                    job_id: value.shuffle_job_id,
+                    upstream_stage_id: value.shuffle_upstream_stage_id,
+                    partition_id: value.shuffle_partition_id,
                 })
             }
         }

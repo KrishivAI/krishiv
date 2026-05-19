@@ -10,10 +10,13 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+arrow-flight = { workspace = true }
 bytes = { workspace = true }
+object_store = { workspace = true }
 parquet = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "net"] }
 futures = { workspace = true }
+tonic = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

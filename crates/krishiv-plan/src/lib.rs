@@ -413,6 +413,12 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
         if node.partitioning() != &Partitioning::Unpartitioned {
             output.push_str(&format!(" [partitioning: {}]", node.partitioning()));
         }
+        if node.broadcast_eligible() {
+            output.push_str(" [broadcast-eligible]");
+        }
+        if let Some(rows) = node.estimated_rows() {
+            output.push_str(&format!(" [est-rows: {rows}]"));
+        }
     }
 
     output

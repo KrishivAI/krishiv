@@ -1,10 +1,16 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::net::SocketAddr;
 use std::process;
 use std::time::Duration;
 
+use axum::Router;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use krishiv_executor::{ExecutorConfig, ExecutorRuntime};
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
@@ -27,13 +33,49 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
     let mode = config.mode;
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
+    let http_addr = config.http_addr;
     let runtime = ExecutorRuntime::new(config.into_executor_config()?);
+
+    // Start optional HTTP health server (/healthz, /readyz, /metrics).
+    if let Some(addr) = http_addr {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind HTTP addr {addr}: {e}"))?;
+        println!(
+            "Krishiv executor HTTP listening on {}",
+            listener.local_addr().unwrap()
+        );
+        tokio::spawn(async move {
+            let router = executor_http_router();
+            let _ = axum::serve(listener, router).await;
+        });
+    }
 
     match mode {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
         ExecutorMode::RegisterOnce => register_once(&runtime).await,
         ExecutorMode::Connect => heartbeat_loop(&runtime, heartbeat_interval_secs).await,
     }
+}
+
+fn executor_http_router() -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok\n" }))
+        .route("/readyz", get(|| async { "ready\n" }))
+        .route("/metrics", get(executor_metrics))
+}
+
+async fn executor_metrics() -> impl IntoResponse {
+    let body = "\
+# HELP krishiv_executor_up Executor process is running
+# TYPE krishiv_executor_up gauge
+krishiv_executor_up 1
+"
+    .to_owned();
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
@@ -124,6 +166,7 @@ struct ExecutorCliConfig {
     coordinator_endpoint: String,
     mode: ExecutorMode,
     heartbeat_interval_secs: u64,
+    http_addr: Option<SocketAddr>,
     help: bool,
 }
 
@@ -151,6 +194,9 @@ impl ExecutorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(10),
+            http_addr: env::var("KRISHIV_HTTP_ADDR")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             help: false,
         };
         let mut args = args.into_iter();
@@ -173,6 +219,13 @@ impl ExecutorCliConfig {
                 }
                 "--connect" => {
                     config.set_mode(ExecutorMode::Connect)?;
+                }
+                "--http-addr" => {
+                    let value = next_arg(&mut args, "--http-addr")?;
+                    config.http_addr =
+                        Some(value.parse().map_err(|_| {
+                            format!("invalid socket address for --http-addr: {value}")
+                        })?);
                 }
                 "--heartbeat-interval-secs" => {
                     let value = next_arg(&mut args, "--heartbeat-interval-secs")?;

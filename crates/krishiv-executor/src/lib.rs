@@ -19,8 +19,9 @@ use krishiv_proto::{
     ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
     ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartitionDescriptor,
     LeaseGeneration, OutputContract, OutputContractDescriptor, RegisterExecutorRequest,
-    RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest, TaskOutputMetadata,
-    TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
+    RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef, TaskCancellationRequest,
+    TaskOutputMetadata, TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse,
+    TransportDisposition, TransportVersion, wire,
 };
 use krishiv_sql::SqlEngine;
 
@@ -45,6 +46,9 @@ pub enum ExecutorError {
     InvalidAssignment { message: String },
     /// Local stage fragment execution failed.
     LocalExecution { message: String },
+    /// A streaming task fragment was submitted but the streaming runner is not
+    /// yet implemented.  This becomes a real runner in R5.
+    StreamingNotImplemented,
 }
 
 impl fmt::Display for ExecutorError {
@@ -58,11 +62,56 @@ impl fmt::Display for ExecutorError {
             Self::LocalExecution { message } => {
                 write!(f, "local stage fragment execution failed: {message}")
             }
+            Self::StreamingNotImplemented => f.write_str(
+                "streaming task runner not yet implemented; available in R5 \
+                 (fragment must not use the 'stream:' prefix until R5.1)",
+            ),
         }
     }
 }
 
 impl Error for ExecutorError {}
+
+// ── ExecutionModel ────────────────────────────────────────────────────────────
+
+/// Execution model inferred from a plan fragment description.
+///
+/// This is the central dispatch point that separates batch-terminal execution
+/// (R1–R4) from streaming-continuous execution (R5+).  Every call site that
+/// would otherwise string-match on the fragment prefix should use this enum.
+///
+/// **Batch**: the runner executes the fragment, collects output, and reports
+/// `TaskState::Succeeded` or `TaskState::Failed`.  The task has a finite
+/// lifetime. Optional `task_timeout_secs` applies.
+///
+/// **Streaming**: the runner enters a continuous operator loop and never reports
+/// `Succeeded` while the job is running.  The task terminates only on an
+/// explicit `Stop` signal from the coordinator or on a fatal error.
+/// `task_timeout_secs` is *ignored* for streaming tasks because the duration
+/// is unbounded by design.  R5.1 provides the first real streaming runner;
+/// until then, submitting a `stream:` fragment returns
+/// `ExecutorError::StreamingNotImplemented`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionModel {
+    /// Task runs to completion and returns terminal output.
+    Batch,
+    /// Task runs an unbounded loop until a `Stop` signal or fatal error.
+    Streaming,
+}
+
+impl ExecutionModel {
+    /// Infer the execution model from the plan fragment description.
+    ///
+    /// All `stream:` prefixed fragments use the streaming model.
+    /// Everything else is treated as batch (existing behaviour is preserved).
+    pub fn from_fragment(fragment: &str) -> Self {
+        if fragment.starts_with("stream:") {
+            Self::Streaming
+        } else {
+            Self::Batch
+        }
+    }
+}
 
 /// In-memory receiver queue for task assignments delivered to an executor.
 #[derive(Debug, Clone, Default)]
@@ -168,6 +217,12 @@ const OBJECT_PARQUET_SINK_PREFIX: &str = "object-parquet-sink:";
 const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
 const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
 const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
+const SHUFFLE_WRITE_PREFIX: &str = "shuffle-write:";
+/// Fragment prefix for local pre-aggregation stages.
+/// These fragments use `pre-agg:sql:<query>` format and route through the
+/// existing SQL execution path via `sql_query_from_fragment`.
+#[allow(dead_code)]
+pub const PRE_AGG_FRAGMENT_PREFIX: &str = "pre-agg:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalParquetPartition {
@@ -283,6 +338,8 @@ pub struct ExecutorTaskOutput {
     row_count: usize,
     batch_count: usize,
     column_count: usize,
+    shuffle_partitions: Vec<krishiv_proto::ShufflePartitionOutput>,
+    runtime_stats: Option<TaskRuntimeStats>,
 }
 
 impl ExecutorTaskOutput {
@@ -292,6 +349,8 @@ impl ExecutorTaskOutput {
             row_count,
             batch_count,
             column_count,
+            shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -301,6 +360,8 @@ impl ExecutorTaskOutput {
             row_count,
             batch_count,
             column_count,
+            shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -310,6 +371,8 @@ impl ExecutorTaskOutput {
             row_count: 0,
             batch_count: 0,
             column_count: 0,
+            shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
     }
 
@@ -319,7 +382,28 @@ impl ExecutorTaskOutput {
             row_count: 0,
             batch_count: 0,
             column_count: 0,
+            shuffle_partitions: Vec::new(),
+            runtime_stats: None,
         }
+    }
+
+    fn shuffle_write(
+        row_count: usize,
+        partitions: Vec<krishiv_proto::ShufflePartitionOutput>,
+    ) -> Self {
+        Self {
+            kind: ExecutorTaskOutputKind::ShuffleWrite,
+            row_count,
+            batch_count: partitions.len(),
+            column_count: 0,
+            shuffle_partitions: partitions,
+            runtime_stats: None,
+        }
+    }
+
+    fn with_runtime_stats(mut self, stats: TaskRuntimeStats) -> Self {
+        self.runtime_stats = Some(stats);
+        self
     }
 
     /// Output kind.
@@ -344,12 +428,24 @@ impl ExecutorTaskOutput {
 
     /// Convert to coordinator-visible lightweight metadata.
     pub fn to_task_output_metadata(&self) -> TaskOutputMetadata {
-        TaskOutputMetadata::new(
+        let mut meta = TaskOutputMetadata::new(
             self.kind.as_str(),
             self.row_count as u64,
             self.batch_count as u64,
             self.column_count as u64,
-        )
+        );
+        if !self.shuffle_partitions.is_empty() {
+            meta = meta.with_shuffle_partitions(self.shuffle_partitions.clone());
+        }
+        if let Some(stats) = &self.runtime_stats {
+            meta = meta.with_runtime_stats(stats.clone());
+        }
+        meta
+    }
+
+    /// Shuffle partition outputs produced by this task (empty for non-shuffle tasks).
+    pub fn shuffle_partitions(&self) -> &[krishiv_proto::ShufflePartitionOutput] {
+        &self.shuffle_partitions
     }
 }
 
@@ -364,6 +460,8 @@ pub enum ExecutorTaskOutputKind {
     Placeholder,
     /// Task was cancelled before execution started.
     Cancelled,
+    /// Shuffle write: hash-partitioned batches written to the local shuffle store.
+    ShuffleWrite,
 }
 
 impl ExecutorTaskOutputKind {
@@ -373,7 +471,27 @@ impl ExecutorTaskOutputKind {
             Self::ConnectorPipeline => "connector_pipeline",
             Self::Placeholder => "placeholder",
             Self::Cancelled => "cancelled",
+            Self::ShuffleWrite => "shuffle_write",
         }
+    }
+}
+
+/// Shuffle store context held by the task runner.
+///
+/// When present, `shuffle-write:` fragments can write hash-partitioned output to
+/// the local store and report `ShufflePartitionOutput` back to the coordinator.
+#[derive(Clone)]
+pub struct ShuffleContext {
+    pub store: std::sync::Arc<krishiv_shuffle::LocalDiskShuffleStore>,
+    /// `<host>:<port>` of this executor's Arrow IPC flight server.
+    pub flight_endpoint: String,
+}
+
+impl fmt::Debug for ShuffleContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShuffleContext")
+            .field("flight_endpoint", &self.flight_endpoint)
+            .finish()
     }
 }
 
@@ -381,12 +499,22 @@ impl ExecutorTaskOutputKind {
 #[derive(Debug, Clone)]
 pub struct ExecutorTaskRunner {
     inbox: ExecutorAssignmentInbox,
+    shuffle: Option<ShuffleContext>,
 }
 
 impl ExecutorTaskRunner {
     /// Create a runner over an executor assignment inbox.
     pub fn new(inbox: ExecutorAssignmentInbox) -> Self {
-        Self { inbox }
+        Self {
+            inbox,
+            shuffle: None,
+        }
+    }
+
+    /// Attach a shuffle context so this runner can handle `shuffle-write:` fragments.
+    pub fn with_shuffle(mut self, ctx: ShuffleContext) -> Self {
+        self.shuffle = Some(ctx);
+        self
     }
 
     /// Assignment inbox consumed by this runner.
@@ -460,20 +588,36 @@ impl ExecutorTaskRunner {
             ));
         }
 
-        let execute_result = if let Some(timeout_secs) = assignment.task_timeout_secs() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                self.execute_stage_fragment(&assignment),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
-                    message: format!("task timed out after {} seconds", timeout_secs),
-                }),
+        let model = ExecutionModel::from_fragment(assignment.plan_fragment().description().trim());
+
+        let execute_result = match model {
+            ExecutionModel::Batch => {
+                // Batch tasks respect task_timeout_secs: they are expected to
+                // complete in bounded time.
+                if let Some(timeout_secs) = assignment.task_timeout_secs() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        self.execute_batch_fragment(&assignment),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
+                            message: format!("task timed out after {} seconds", timeout_secs),
+                        }),
+                    }
+                } else {
+                    self.execute_batch_fragment(&assignment).await
+                }
             }
-        } else {
-            self.execute_stage_fragment(&assignment).await
+            ExecutionModel::Streaming => {
+                // Streaming tasks run an unbounded loop; task_timeout_secs is
+                // intentionally ignored.  The real continuous operator loop
+                // arrives in R5.1; until then return a clear not-implemented
+                // error so R5 can replace this branch without touching call
+                // sites.
+                self.execute_streaming_fragment(&assignment).await
+            }
         };
 
         let output = match execute_result {
@@ -512,7 +656,12 @@ impl ExecutorTaskRunner {
         ))
     }
 
-    async fn execute_stage_fragment(
+    /// Execute a batch (terminal) stage fragment.
+    ///
+    /// All R1–R4 fragment kinds route through here.  The function collects
+    /// output and returns it so the caller can report `TaskState::Succeeded`.
+    /// This is always called with `ExecutionModel::Batch`.
+    async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
     ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -530,6 +679,18 @@ impl ExecutorTaskRunner {
 
         if fragment == KAFKA_TO_PARQUET_FRAGMENT {
             return execute_kafka_to_parquet_pipeline(assignment).await;
+        }
+
+        if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
+            if let Some(ctx) = &self.shuffle {
+                return execute_shuffle_write_fragment(assignment, shuffle_spec, ctx).await;
+            } else {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: String::from(
+                        "shuffle-write fragment requires a shuffle context but none is configured",
+                    ),
+                });
+            }
         }
 
         if let Some(query) = sql_query_from_fragment(fragment) {
@@ -562,6 +723,16 @@ impl ExecutorTaskRunner {
                         message: error.to_string(),
                     })?;
             }
+            for (table_name, batches) in
+                read_shuffle_flight_partitions(assignment.input_partitions()).await?
+            {
+                engine
+                    .register_record_batches(&table_name, batches)
+                    .await
+                    .map_err(|error| ExecutorError::LocalExecution {
+                        message: error.to_string(),
+                    })?;
+            }
 
             let dataframe =
                 engine
@@ -570,13 +741,11 @@ impl ExecutorTaskRunner {
                     .map_err(|error| ExecutorError::LocalExecution {
                         message: error.to_string(),
                     })?;
-            let batches =
-                dataframe
-                    .collect()
-                    .await
-                    .map_err(|error| ExecutorError::LocalExecution {
-                        message: error.to_string(),
-                    })?;
+            let (batches, sql_stats) = dataframe.collect_with_stats().await.map_err(|error| {
+                ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                }
+            })?;
             if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
                 && assignment
                     .output_contract()
@@ -588,14 +757,39 @@ impl ExecutorTaskRunner {
             }
             let row_count = batches.iter().map(|batch| batch.num_rows()).sum();
             let column_count = batches.first().map_or(0, |batch| batch.num_columns());
-            return Ok(ExecutorTaskOutput::sql(
-                row_count,
-                batches.len(),
-                column_count,
-            ));
+            let runtime_stats = TaskRuntimeStats {
+                input_rows: 0,
+                output_rows: sql_stats.output_rows,
+                cpu_nanos: sql_stats.cpu_nanos,
+                memory_bytes: 0,
+                spill_bytes: 0,
+            };
+            return Ok(
+                ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
+                    .with_runtime_stats(runtime_stats),
+            );
         }
 
         Ok(ExecutorTaskOutput::placeholder())
+    }
+
+    /// Execute a streaming (continuous) stage fragment.
+    ///
+    /// R5.1 replaces this stub with the real watermark-driven operator loop.
+    /// Until then, any `stream:` fragment is rejected immediately so that
+    /// R5 work is self-contained in this single method body.
+    ///
+    /// **Contract for R5.1 implementors**: this method must:
+    /// - Run a continuous `loop { receive_batch → advance_watermark → process → flush_windows → send_output }`
+    /// - Respond to a cancellation token by draining in-flight batches and returning `Ok(ExecutorTaskOutput::stopped())`
+    /// - Never return `Ok(...)` with a terminal-succeeded semantics while the job is still running
+    /// - Report heartbeat updates to the coordinator inside the loop (not via the return path)
+    #[allow(clippy::unused_async)]
+    async fn execute_streaming_fragment(
+        &self,
+        _assignment: &ExecutorTaskAssignment,
+    ) -> ExecutorResult<ExecutorTaskOutput> {
+        Err(ExecutorError::StreamingNotImplemented)
     }
 
     async fn send_task_status<S>(
@@ -875,6 +1069,245 @@ fn parse_object_parquet_descriptor(
         PathBuf::from(base_dir),
         object_path.to_owned(),
     ))
+}
+
+/// Fetch all `shuffle-flight:` input partitions via Arrow IPC over TCP and return
+/// `(table_name, batches)` pairs ready for registration with the SQL engine.
+///
+/// Multiple partitions sharing the same table name are merged so the engine sees
+/// one logical table regardless of how many physical shuffle partitions were read.
+async fn read_shuffle_flight_partitions(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    use std::collections::BTreeMap;
+
+    use krishiv_shuffle::flight::FlightShuffleClient;
+
+    let mut table_batches: BTreeMap<String, Vec<arrow::record_batch::RecordBatch>> =
+        BTreeMap::new();
+
+    for partition in partitions {
+        let (table_name, flight_endpoint, job_id, upstream_stage_id, partition_id) =
+            match partition.descriptor() {
+                Some(InputPartitionDescriptor::ShuffleFlight {
+                    table_name,
+                    flight_endpoint,
+                    job_id,
+                    upstream_stage_id,
+                    partition_id,
+                }) => (
+                    table_name.clone(),
+                    flight_endpoint.clone(),
+                    job_id.clone(),
+                    upstream_stage_id.clone(),
+                    *partition_id,
+                ),
+                Some(_) | None => continue,
+            };
+
+        let batches =
+            FlightShuffleClient::fetch(&flight_endpoint, &job_id, &upstream_stage_id, partition_id)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
+                 stage={upstream_stage_id} partition={partition_id}): {e}"
+                    ),
+                })?;
+        table_batches.entry(table_name).or_default().extend(batches);
+    }
+
+    Ok(table_batches.into_iter().collect())
+}
+
+/// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.
+///
+/// Runs the stage SQL, hash-partitions the result, writes each bucket to the
+/// local shuffle store, and returns `ShufflePartitionOutput` records to be
+/// forwarded to the coordinator via `TaskOutputMetadata`.
+async fn execute_shuffle_write_fragment(
+    assignment: &ExecutorTaskAssignment,
+    spec: &str,
+    ctx: &ShuffleContext,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
+
+    // Parse "hash:<key_column>:<num_partitions>"
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "hash" {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "shuffle-write spec must be 'hash:<key_column>:<num_partitions>', got '{spec}'"
+            ),
+        });
+    }
+    let key_column = parts[1].trim();
+    let num_partitions: u32 =
+        parts[2]
+            .trim()
+            .parse()
+            .map_err(|_| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "shuffle-write num_partitions is not a valid u32: '{}'",
+                    parts[2]
+                ),
+            })?;
+    if key_column.is_empty() || num_partitions == 0 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from("shuffle-write key_column and num_partitions must be non-empty"),
+        });
+    }
+
+    // Find the SQL query embedded in the input partitions or output contract.
+    // By convention, the first local-parquet input provides the data; the fragment
+    // description has already been stripped of "shuffle-write:"; the SQL sub-query
+    // is encoded in the output contract description.
+    let query = assignment
+        .output_contract()
+        .description()
+        .trim()
+        .strip_prefix("sql:")
+        .map(str::trim)
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: String::from(
+                "shuffle-write output contract must start with 'sql:' followed by the query",
+            ),
+        })?;
+
+    let engine = SqlEngine::new();
+    for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
+        engine
+            .register_parquet(partition.table_name(), partition.path())
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    for (table_name, batches) in
+        read_connector_parquet_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    for (table_name, batches) in
+        read_object_parquet_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    for (table_name, batches) in
+        read_shuffle_flight_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+
+    let dataframe = engine
+        .sql(query)
+        .await
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: e.to_string(),
+        })?;
+    let batches = dataframe
+        .collect()
+        .await
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: e.to_string(),
+        })?;
+
+    let partitioner = HashPartitioner::new(key_column, num_partitions);
+    let job_id = assignment.job_id().as_str();
+    let stage_id = assignment.stage_id().as_str();
+    let lease_token = assignment.lease_generation().as_u64();
+
+    // Pre-register all partition leases for this assignment.
+    for p in 0..num_partitions {
+        let id = PartitionId {
+            job_id: job_id.to_owned(),
+            stage_id: stage_id.to_owned(),
+            partition: p,
+        };
+        ctx.store
+            .register_partition_lease(id, lease_token)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("shuffle lease registration failed: {e}"),
+            })?;
+    }
+
+    // Accumulate partitioned batches per bucket across all input batches.
+    // Writing each partition once avoids overwriting data from earlier batches.
+    let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
+        vec![Vec::new(); num_partitions as usize];
+    let mut total_rows: usize = 0;
+
+    for batch in &batches {
+        total_rows += batch.num_rows();
+        let buckets = partitioner
+            .partition(batch)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("hash partition failed: {e}"),
+            })?;
+        for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
+            if bucket_batch.num_rows() > 0 {
+                partition_batches[bucket_idx].push(bucket_batch);
+            }
+        }
+    }
+
+    let output_schema: arrow::datatypes::SchemaRef = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+
+    let mut outputs: Vec<ShufflePartitionOutput> = Vec::with_capacity(num_partitions as usize);
+
+    for (p, part_batches) in partition_batches.into_iter().enumerate() {
+        let p = p as u32;
+        let id = PartitionId {
+            job_id: job_id.to_owned(),
+            stage_id: stage_id.to_owned(),
+            partition: p,
+        };
+        let schema = part_batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| output_schema.clone());
+        let size_bytes: u64 = part_batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+        let partition = ShufflePartition {
+            id,
+            schema,
+            batches: part_batches,
+        };
+        ctx.store
+            .write_partition(partition, lease_token)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("shuffle write failed for partition {p}: {e}"),
+            })?;
+        outputs.push(ShufflePartitionOutput::new(
+            p,
+            size_bytes,
+            ctx.flight_endpoint.clone(),
+        ));
+    }
+
+    Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs))
 }
 
 async fn execute_kafka_to_parquet_pipeline(
@@ -1580,6 +2013,8 @@ mod tests {
         TaskAttemptRef, TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest,
         TaskStatusResponse, TransportDisposition, TransportVersion, wire,
     };
+
+    use super::ExecutionModel;
     use krishiv_scheduler::{
         Coordinator, CoordinatorExecutorTonicService, SharedCoordinator,
         serve_coordinator_executor_grpc_with_listener,
@@ -2719,7 +3154,7 @@ mod tests {
         )]);
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
         let err = runner
-            .execute_stage_fragment(&assignment)
+            .execute_batch_fragment(&assignment)
             .await
             .unwrap_err();
         match err {
@@ -2807,5 +3242,395 @@ mod tests {
             .unwrap();
         let stored = store.read_partition(&id).await.unwrap().unwrap();
         assert_eq!(stored.batches[0].num_rows(), 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TPC-H Q1 style two-stage shuffle correctness gate
+    //
+    // Verifies the full shuffle pipeline:
+    //   Stage 0 – hash-partition lineitem data into 3 buckets by l_returnflag
+    //   Stage 1 – read all shuffle partitions via Arrow IPC flight, run the
+    //             TPC-H Q1 aggregate (GROUP BY l_returnflag, l_linestatus),
+    //             and check that the result matches the known correct answer.
+    //
+    // Input data (10 rows):
+    //   l_returnflag | l_linestatus | l_quantity | l_extendedprice
+    //   N / O        | 10           | 1000
+    //   A / F        | 20           | 2000
+    //   R / F        | 30           | 3000
+    //   N / O        | 40           | 4000
+    //   A / F        | 50           | 5000
+    //   R / F        | 60           | 6000
+    //   N / F        | 70           | 7000
+    //   A / F        | 80           | 8000
+    //   N / O        | 90           | 9000
+    //   R / F        | 100          | 10000
+    //
+    // Expected Q1 result (4 groups, sorted by l_returnflag, l_linestatus):
+    //   A / F : sum_qty=150, sum_price=15000, count=3
+    //   N / F : sum_qty=70,  sum_price=7000,  count=1
+    //   N / O : sum_qty=140, sum_price=14000, count=3
+    //   R / F : sum_qty=190, sum_price=19000, count=3
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tpch_q1_style_shuffle_pipeline_produces_correct_aggregation() {
+        use std::net::SocketAddr;
+
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        use krishiv_proto::{
+            InputPartitionDescriptor, JobKind, JobSpec, OutputContractKind, StageSpec, StageState,
+            TaskSpec,
+        };
+        use krishiv_shuffle::LocalDiskShuffleStore;
+
+        use super::ShuffleContext;
+
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("lineitem.parquet");
+        let shuffle_dir = temp.path().join("shuffle");
+        std::fs::create_dir_all(&shuffle_dir).unwrap();
+
+        // Write lineitem rows to Parquet for Stage 0 to read.
+        {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("l_returnflag", DataType::Utf8, false),
+                Field::new("l_linestatus", DataType::Utf8, false),
+                Field::new("l_quantity", DataType::Int64, false),
+                Field::new("l_extendedprice", DataType::Int64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![
+                        "N", "A", "R", "N", "A", "R", "N", "A", "N", "R",
+                    ])),
+                    Arc::new(StringArray::from(vec![
+                        "O", "F", "F", "O", "F", "F", "F", "F", "O", "F",
+                    ])),
+                    Arc::new(Int64Array::from(vec![
+                        10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
+                    ])),
+                    Arc::new(Int64Array::from(vec![
+                        1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+                    ])),
+                ],
+            )
+            .unwrap();
+            let file = File::create(&parquet_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        // Start the Arrow IPC shuffle flight server.
+        let store = Arc::new(LocalDiskShuffleStore::new(&shuffle_dir).unwrap());
+        let flight_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (flight_local_addr, flight_handle) =
+            match krishiv_shuffle::flight::serve(flight_addr, Arc::clone(&store)).await {
+                Ok(pair) => pair,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    eprintln!("skipping tpch shuffle test: loopback sockets denied");
+                    return;
+                }
+                Err(e) => panic!("failed to start shuffle flight server: {e}"),
+            };
+        let flight_endpoint = flight_local_addr.to_string();
+
+        // Set up coordinator and register one executor.
+        let executor_id = ExecutorId::try_new("exec-tpch-0").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-tpch-0").unwrap(),
+        ));
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
+
+        let stage0_id = StageId::try_new("stage-0").unwrap();
+        let stage1_id = StageId::try_new("stage-1").unwrap();
+        let job_id = JobId::try_new("job-tpch-q1").unwrap();
+
+        {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    "pod-tpch",
+                    2,
+                ))
+                .unwrap();
+            coordinator
+                .submit_job(
+                    JobSpec::new(job_id.clone(), "tpch-q1", JobKind::Batch)
+                        .with_stage(
+                            StageSpec::new(stage0_id.clone(), "shuffle-write stage").with_task(
+                                TaskSpec::new(
+                                    TaskId::try_new("task-s0-t0").unwrap(),
+                                    "shuffle-write:hash:l_returnflag:3",
+                                ),
+                            ),
+                        )
+                        .with_stage(
+                            StageSpec::new(stage1_id.clone(), "aggregate stage")
+                                .with_upstream_stage(stage0_id.clone())
+                                .with_task(TaskSpec::new(
+                                    TaskId::try_new("task-s1-t0").unwrap(),
+                                    "sql: SELECT l_returnflag, l_linestatus, \
+                                     SUM(l_quantity) AS sum_qty, \
+                                     SUM(l_extendedprice) AS sum_price, \
+                                     COUNT(*) AS count_order \
+                                     FROM lineitem \
+                                     GROUP BY l_returnflag, l_linestatus \
+                                     ORDER BY l_returnflag, l_linestatus",
+                                )),
+                        ),
+                )
+                .unwrap();
+        }
+
+        // ── Stage 0: shuffle-write ────────────────────────────────────────────
+
+        let s0_launched = {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+        };
+        assert_eq!(s0_launched.len(), 1, "stage-0 should launch 1 task");
+
+        let s0_launch = &s0_launched[0];
+        let s0_assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                s0_launch.job_id().clone(),
+                s0_launch.stage_id().clone(),
+                s0_launch.task_id().clone(),
+                s0_launch.attempt_id(),
+            ),
+            s0_launch.executor_id().clone(),
+            s0_launch.lease_generation(),
+            PlanFragment::new("shuffle-write:hash:l_returnflag:3"),
+            OutputContract::new(OutputContractKind::Shuffle, "sql: SELECT * FROM lineitem"),
+        )
+        .with_input_partitions(vec![InputPartition::typed(
+            "lineitem-part-0",
+            InputPartitionDescriptor::LocalParquet {
+                table_name: String::from("lineitem"),
+                path: parquet_path.display().to_string(),
+            },
+        )]);
+
+        let s0_inbox = ExecutorAssignmentInbox::new();
+        let shuffle_ctx = ShuffleContext {
+            store: Arc::clone(&store),
+            flight_endpoint: flight_endpoint.clone(),
+        };
+        let s0_runner = ExecutorTaskRunner::new(s0_inbox.clone()).with_shuffle(shuffle_ctx);
+        s0_inbox.push(s0_assignment).unwrap();
+
+        let s0_report = s0_runner.run_next_with(&service).await.unwrap().unwrap();
+        assert_eq!(
+            s0_report.output().kind(),
+            ExecutorTaskOutputKind::ShuffleWrite,
+            "stage-0 should produce ShuffleWrite output"
+        );
+        assert_eq!(
+            s0_report.output().row_count(),
+            10,
+            "stage-0 should process all 10 input rows"
+        );
+        // 3 partition outputs (one per bucket).
+        assert_eq!(
+            s0_report.output().shuffle_partitions().len(),
+            3,
+            "stage-0 should produce exactly 3 shuffle partition outputs"
+        );
+        assert_eq!(
+            s0_report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+
+        // Verify stage-0 is now Succeeded in the coordinator.
+        {
+            let coordinator = shared.read().unwrap();
+            let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+            let s0_stage = detail
+                .stages()
+                .iter()
+                .find(|s| s.stage_id() == &stage0_id)
+                .unwrap();
+            assert_eq!(
+                s0_stage.state(),
+                StageState::Succeeded,
+                "stage-0 should be Succeeded after all tasks complete"
+            );
+        }
+
+        // ── Stage 1: aggregate via shuffle read ───────────────────────────────
+
+        // Stage-1 should now be unblocked; launch its tasks.
+        let s1_launched = {
+            let mut coordinator = shared.write().unwrap();
+            coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap()
+        };
+        assert_eq!(s1_launched.len(), 1, "stage-1 should launch 1 task");
+
+        let s1_launch = &s1_launched[0];
+
+        // Build ShuffleFlight input descriptors for all 3 shuffle partitions.
+        // All point to the same logical "lineitem" table; the executor merges them.
+        let shuffle_inputs: Vec<InputPartition> = (0u32..3)
+            .map(|p| {
+                InputPartition::typed(
+                    format!("shuffle-part-{p}"),
+                    InputPartitionDescriptor::ShuffleFlight {
+                        table_name: String::from("lineitem"),
+                        flight_endpoint: flight_endpoint.clone(),
+                        job_id: job_id.as_str().to_owned(),
+                        upstream_stage_id: stage0_id.as_str().to_owned(),
+                        partition_id: p,
+                    },
+                )
+            })
+            .collect();
+
+        let s1_assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                s1_launch.job_id().clone(),
+                s1_launch.stage_id().clone(),
+                s1_launch.task_id().clone(),
+                s1_launch.attempt_id(),
+            ),
+            s1_launch.executor_id().clone(),
+            s1_launch.lease_generation(),
+            PlanFragment::new(
+                "sql: SELECT l_returnflag, l_linestatus, \
+                 SUM(l_quantity) AS sum_qty, \
+                 SUM(l_extendedprice) AS sum_price, \
+                 COUNT(*) AS count_order \
+                 FROM lineitem \
+                 GROUP BY l_returnflag, l_linestatus \
+                 ORDER BY l_returnflag, l_linestatus",
+            ),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline result"),
+        )
+        .with_input_partitions(shuffle_inputs);
+
+        // Stage-1 runner does not need a ShuffleContext (reads, does not write).
+        let s1_inbox = ExecutorAssignmentInbox::new();
+        let s1_runner = ExecutorTaskRunner::new(s1_inbox.clone());
+        s1_inbox.push(s1_assignment).unwrap();
+
+        let s1_report = s1_runner.run_next_with(&service).await.unwrap().unwrap();
+        assert_eq!(
+            s1_report.output().kind(),
+            ExecutorTaskOutputKind::Sql,
+            "stage-1 should produce Sql output"
+        );
+        assert_eq!(
+            s1_report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+
+        // 4 aggregate groups: A/F, N/F, N/O, R/F.
+        assert_eq!(
+            s1_report.output().row_count(),
+            4,
+            "Q1 aggregate should produce 4 groups"
+        );
+
+        // Confirm the job reached Succeeded state.
+        {
+            let coordinator = shared.read().unwrap();
+            let snapshot = coordinator.job_snapshot(&job_id).unwrap();
+            assert_eq!(snapshot.state(), JobState::Succeeded);
+
+            let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+            let s1_stage = detail
+                .stages()
+                .iter()
+                .find(|s| s.stage_id() == &stage1_id)
+                .unwrap();
+            let s1_meta = s1_stage.tasks()[0].output_metadata().unwrap();
+            assert_eq!(s1_meta.output_kind(), "sql");
+            // 4 groups: A/F, N/F, N/O, R/F.
+            assert_eq!(s1_meta.row_count(), 4);
+        }
+
+        flight_handle.abort();
+    }
+
+    // ── ExecutionModel dispatch ───────────────────────────────────────────
+
+    #[test]
+    fn execution_model_batch_for_sql_fragment() {
+        assert_eq!(
+            ExecutionModel::from_fragment("sql: SELECT 1"),
+            ExecutionModel::Batch
+        );
+    }
+
+    #[test]
+    fn execution_model_batch_for_shuffle_write() {
+        assert_eq!(
+            ExecutionModel::from_fragment("shuffle-write:hash:key:4"),
+            ExecutionModel::Batch
+        );
+    }
+
+    #[test]
+    fn execution_model_batch_for_kafka_pipeline() {
+        assert_eq!(
+            ExecutionModel::from_fragment("kafka-to-parquet"),
+            ExecutionModel::Batch
+        );
+    }
+
+    #[test]
+    fn execution_model_streaming_for_stream_prefix() {
+        assert_eq!(
+            ExecutionModel::from_fragment("stream:tumbling-window:key:60s"),
+            ExecutionModel::Streaming
+        );
+    }
+
+    #[test]
+    fn execution_model_streaming_exact_prefix() {
+        // Any fragment starting with "stream:" is streaming regardless of suffix.
+        assert_eq!(
+            ExecutionModel::from_fragment("stream:"),
+            ExecutionModel::Streaming
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_fragment_returns_not_implemented() {
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let assignment = ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("stream:tumbling-window:key:60s"),
+            OutputContract::new(
+                krishiv_proto::OutputContractKind::InlineRecordBatches,
+                "streaming output",
+            ),
+        );
+        let err = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, super::ExecutorError::StreamingNotImplemented),
+            "expected StreamingNotImplemented, got {err}"
+        );
     }
 }

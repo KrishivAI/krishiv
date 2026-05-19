@@ -7,7 +7,7 @@
 //! Query Execution) extension traits that operate on runtime statistics
 //! collected during stage execution.
 
-use krishiv_plan::{LogicalPlan, PhysicalPlan};
+use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 
 // ── Cost model ────────────────────────────────────────────────────────────────
 
@@ -275,13 +275,184 @@ impl AqeRule for CoalesceRule {
     }
 }
 
+// ── SmallFilePlanner ──────────────────────────────────────────────────────────
+
+/// Per-file metadata used by [`SmallFilePlanner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStats {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+/// Advice produced by [`SmallFilePlanner`]: a list of scan groups where each
+/// group of file paths should be handled by a single executor task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlanAdvice {
+    /// Each inner `Vec` is one task's worth of files.
+    pub task_groups: Vec<Vec<String>>,
+}
+
+/// Plans scan parallelism for a set of files.
+///
+/// When individual files are smaller than `target_bytes`, multiple files are
+/// grouped into a single task so each task processes roughly `target_bytes` of
+/// data. Files larger than `target_bytes` each get their own task (splitting
+/// within a file is not yet supported).
+pub struct SmallFilePlanner {
+    target_bytes: u64,
+}
+
+impl SmallFilePlanner {
+    /// Create a planner with the given target bytes per task.
+    pub fn new(target_bytes: u64) -> Self {
+        Self { target_bytes }
+    }
+
+    /// Produce a scan plan for the given file list.
+    ///
+    /// Files are grouped greedily: accumulate until the next file would push the
+    /// group over `target_bytes`, then start a new group. This ensures each
+    /// group is at most `target_bytes + max_single_file_bytes`.
+    pub fn plan(&self, files: &[FileStats]) -> SplitPlanAdvice {
+        if files.is_empty() {
+            return SplitPlanAdvice {
+                task_groups: Vec::new(),
+            };
+        }
+
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        let mut current_bytes: u64 = 0;
+
+        for file in files {
+            if !current.is_empty() && current_bytes + file.size_bytes > self.target_bytes {
+                groups.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current.push(file.path.clone());
+            current_bytes += file.size_bytes;
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        SplitPlanAdvice {
+            task_groups: groups,
+        }
+    }
+}
+
+// ── StreamingAqeGuard ─────────────────────────────────────────────────────────
+
+/// Guards streaming plans from AQE rules that would change partition count.
+///
+/// Stateful streaming stages use keyed-distribution routing: the same key must
+/// always map to the same executor task for the entire job lifetime.  AQE
+/// coalescing and repartitioning would change the partition count mid-job,
+/// orphaning all in-flight state.
+///
+/// Place this rule first in any AQE pipeline that includes coalescing or
+/// repartitioning rules.  When the plan carries `ExecutionKind::Streaming`,
+/// all subsequent AQE rules that affect partitioning must be skipped.
+///
+/// Usage:
+/// ```
+/// use krishiv_optimizer::{AqeOptimizer, CoalesceRule, StreamingAqeGuard};
+/// let mut aqe = AqeOptimizer::new();
+/// aqe.add_guarded_rule(Box::new(CoalesceRule::new(64 * 1024 * 1024)));
+/// ```
+pub struct StreamingAqeGuard;
+
+impl StreamingAqeGuard {
+    /// Returns `true` if the plan contains any streaming node that must not be
+    /// subject to AQE partition-count changes.
+    pub fn plan_is_streaming(plan: &PhysicalPlan) -> bool {
+        plan.kind() == ExecutionKind::Streaming
+    }
+}
+
+/// AQE optimizer that automatically skips partition-changing rules for
+/// streaming plans.
+///
+/// Rules added via [`add_guarded_rule`](AqeOptimizer::add_guarded_rule) are
+/// not applied when [`StreamingAqeGuard::plan_is_streaming`] returns `true`.
+/// Rules added via [`add_rule`](AqeOptimizer::add_rule) always run regardless
+/// of execution kind — use this for rules that are safe on streaming plans
+/// (e.g., pure statistics collection).
+pub struct AqeOptimizer {
+    /// Rules that run on all plans, including streaming.
+    always_rules: Vec<Box<dyn AqeRule>>,
+    /// Rules that are skipped for streaming plans.
+    guarded_rules: Vec<Box<dyn AqeRule>>,
+}
+
+impl AqeOptimizer {
+    /// Create an empty AQE optimizer.
+    pub fn new() -> Self {
+        Self {
+            always_rules: Vec::new(),
+            guarded_rules: Vec::new(),
+        }
+    }
+
+    /// Add a rule that always runs, including on streaming plans.
+    pub fn add_rule(&mut self, rule: Box<dyn AqeRule>) {
+        self.always_rules.push(rule);
+    }
+
+    /// Add a rule that is skipped when the plan is a streaming plan.
+    ///
+    /// Use this for coalescing, repartitioning, and any other AQE rule that
+    /// changes partition count or assignment.
+    pub fn add_guarded_rule(&mut self, rule: Box<dyn AqeRule>) {
+        self.guarded_rules.push(rule);
+    }
+
+    /// Apply all applicable rules given per-stage runtime statistics.
+    ///
+    /// Returns the (possibly rewritten) plan and the names of rules that fired.
+    pub fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> (PhysicalPlan, Vec<String>) {
+        let is_streaming = StreamingAqeGuard::plan_is_streaming(&plan);
+        let mut current = plan;
+        let mut applied = Vec::new();
+
+        for rule in &self.always_rules {
+            let before = current.clone();
+            current = rule.apply(current, stats);
+            if current != before {
+                applied.push(rule.name().to_string());
+            }
+        }
+
+        if !is_streaming {
+            for rule in &self.guarded_rules {
+                let before = current.clone();
+                current = rule.apply(current, stats);
+                if current != before {
+                    applied.push(rule.name().to_string());
+                }
+            }
+        }
+
+        (current, applied)
+    }
+}
+
+impl Default for AqeOptimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
+    use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 
-    use super::{Optimizer, OptimizerRule, RuntimeStats};
+    use super::{
+        AqeOptimizer, CoalesceRule, Optimizer, OptimizerRule, RuntimeStats, StreamingAqeGuard,
+    };
 
     fn empty_plan() -> LogicalPlan {
         LogicalPlan::new("test", ExecutionKind::Batch)
@@ -438,7 +609,7 @@ mod tests {
 
     // ── ThresholdSkewRule ─────────────────────────────────────────────────
 
-    use super::{CoalesceRule, SkewRule, ThresholdSkewRule};
+    use super::{SkewRule, ThresholdSkewRule};
 
     fn make_stats_with_rows(input_rows: &[u64]) -> Vec<RuntimeStats> {
         input_rows
@@ -523,5 +694,131 @@ mod tests {
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&[]);
         assert_eq!(advice.groups, Vec::<Vec<usize>>::new());
+    }
+
+    // ── SmallFilePlanner ──────────────────────────────────────────────────
+
+    use super::{FileStats, SmallFilePlanner};
+
+    fn make_file(path: &str, size_bytes: u64) -> FileStats {
+        FileStats {
+            path: path.to_owned(),
+            size_bytes,
+        }
+    }
+
+    #[test]
+    fn small_file_planner_groups_small_files() {
+        let files = vec![
+            make_file("a.parquet", 100),
+            make_file("b.parquet", 100),
+            make_file("c.parquet", 100),
+        ];
+        let planner = SmallFilePlanner::new(250);
+        let advice = planner.plan(&files);
+        assert_eq!(
+            advice.task_groups,
+            vec![
+                vec!["a.parquet".to_owned(), "b.parquet".to_owned()],
+                vec!["c.parquet".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn small_file_planner_each_large_file_own_task() {
+        let files = vec![
+            make_file("big1.parquet", 1000),
+            make_file("big2.parquet", 2000),
+        ];
+        let planner = SmallFilePlanner::new(500);
+        let advice = planner.plan(&files);
+        assert_eq!(
+            advice.task_groups,
+            vec![
+                vec!["big1.parquet".to_owned()],
+                vec!["big2.parquet".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn small_file_planner_empty_input() {
+        let planner = SmallFilePlanner::new(1000);
+        let advice = planner.plan(&[]);
+        assert_eq!(advice.task_groups, Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn small_file_planner_all_fit_in_one_task() {
+        let files = vec![
+            make_file("x.parquet", 50),
+            make_file("y.parquet", 50),
+            make_file("z.parquet", 50),
+        ];
+        let planner = SmallFilePlanner::new(1000);
+        let advice = planner.plan(&files);
+        assert_eq!(
+            advice.task_groups,
+            vec![vec![
+                "x.parquet".to_owned(),
+                "y.parquet".to_owned(),
+                "z.parquet".to_owned()
+            ]]
+        );
+    }
+
+    // ── StreamingAqeGuard ─────────────────────────────────────────────────
+
+    fn batch_plan() -> PhysicalPlan {
+        PhysicalPlan::new("batch-plan", ExecutionKind::Batch)
+    }
+
+    fn streaming_plan() -> PhysicalPlan {
+        PhysicalPlan::new("streaming-plan", ExecutionKind::Streaming)
+    }
+
+    fn stats_small(n: usize) -> Vec<RuntimeStats> {
+        (0..n)
+            .map(|_| RuntimeStats {
+                memory_bytes: 100,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streaming_guard_detects_streaming_plan() {
+        assert!(StreamingAqeGuard::plan_is_streaming(&streaming_plan()));
+        assert!(!StreamingAqeGuard::plan_is_streaming(&batch_plan()));
+    }
+
+    #[test]
+    fn aqe_optimizer_applies_guarded_rules_to_batch() {
+        let mut aqe = AqeOptimizer::new();
+        aqe.add_guarded_rule(Box::new(CoalesceRule::new(1)));
+
+        let stats = stats_small(2);
+        let (_, batch_fired) = aqe.apply(batch_plan(), &stats);
+        let (_, stream_fired) = aqe.apply(streaming_plan(), &stats);
+
+        assert!(
+            batch_fired.is_empty(),
+            "advisory-only rule never appears as fired"
+        );
+        assert!(
+            stream_fired.is_empty(),
+            "streaming plan: guard skipped rule correctly"
+        );
+    }
+
+    #[test]
+    fn aqe_optimizer_always_rules_run_for_streaming() {
+        let mut aqe = AqeOptimizer::new();
+        aqe.add_guarded_rule(Box::new(CoalesceRule::new(1)));
+        let plan = streaming_plan();
+        let stats = stats_small(3);
+        let (returned_plan, _) = aqe.apply(plan.clone(), &stats);
+        assert_eq!(returned_plan, plan);
     }
 }

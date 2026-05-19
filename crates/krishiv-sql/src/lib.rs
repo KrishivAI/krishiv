@@ -219,6 +219,49 @@ impl SqlDataFrame {
     pub async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
         Ok(self.dataframe.clone().collect().await?)
     }
+
+    /// Execute and collect this DataFrame, also returning lightweight runtime statistics.
+    ///
+    /// Collects `output_rows` from DataFusion's execution metrics. `cpu_nanos`
+    /// is approximated from `elapsed_compute` when available; other fields default to 0.
+    pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
+        use datafusion::physical_plan::collect as df_collect;
+
+        let ctx = SessionContext::new();
+        let physical_plan = ctx
+            .state()
+            .create_physical_plan(self.dataframe.logical_plan())
+            .await?;
+
+        let batches = df_collect(physical_plan.clone(), ctx.task_ctx()).await?;
+
+        let mut output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let mut cpu_nanos: u64 = 0;
+
+        if let Some(metrics) = physical_plan.metrics() {
+            if let Some(v) = metrics.output_rows() {
+                output_rows = v as u64;
+            }
+            if let Some(t) = metrics.elapsed_compute() {
+                cpu_nanos = t as u64;
+            }
+        }
+
+        Ok((
+            batches,
+            SqlExecutionStats {
+                output_rows,
+                cpu_nanos,
+            },
+        ))
+    }
+}
+
+/// Lightweight execution statistics collected from a DataFusion physical plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SqlExecutionStats {
+    pub output_rows: u64,
+    pub cpu_nanos: u64,
 }
 
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.

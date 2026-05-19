@@ -13,7 +13,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Int32Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{
+    Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray, UInt32Array,
+};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -68,7 +70,7 @@ pub enum PartitionState {
 // ── ShuffleMetadata ───────────────────────────────────────────────────────────
 
 /// In-memory registry tracking the state of shuffle partitions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ShuffleMetadata {
     states: HashMap<ShufflePath, PartitionState>,
 }
@@ -105,6 +107,19 @@ impl ShuffleMetadata {
         paths
             .iter()
             .all(|p| matches!(self.states.get(p), Some(PartitionState::Available)))
+    }
+
+    /// Number of partitions currently in the `Available` state.
+    pub fn available_count(&self) -> usize {
+        self.states
+            .values()
+            .filter(|s| **s == PartitionState::Available)
+            .count()
+    }
+
+    /// Number of partitions currently tracked (any state).
+    pub fn total_count(&self) -> usize {
+        self.states.len()
     }
 }
 
@@ -379,6 +394,26 @@ impl HashPartitioner {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("data type is Utf8");
+                for row in 0..num_rows {
+                    let bucket = hash_str(arr.value(row), self.buckets);
+                    bucket_indices[bucket as usize].push(row as u32);
+                }
+            }
+            DataType::Utf8View => {
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .expect("data type is Utf8View");
+                for row in 0..num_rows {
+                    let bucket = hash_str(arr.value(row), self.buckets);
+                    bucket_indices[bucket as usize].push(row as u32);
+                }
+            }
+            DataType::LargeUtf8 => {
+                let arr = key_col
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("data type is LargeUtf8");
                 for row in 0..num_rows {
                     let bucket = hash_str(arr.value(row), self.buckets);
                     bucket_indices[bucket as usize].push(row as u32);
@@ -765,6 +800,161 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let mut tokens = self.lease_tokens.write().unwrap();
         tokens.retain(|(jid, _, _), _| jid != job_id);
         Ok(())
+    }
+}
+
+// ── ObjectStoreShuffleStore ───────────────────────────────────────────────────
+
+/// An object-store backed shuffle store.
+///
+/// Partitions are stored as Arrow IPC stream files at paths:
+///   `<prefix>/<job_id>/<stage_id>/<partition>.ipc`
+///
+/// This store has no lease mechanism — it is intended for batch jobs where
+/// task retries use overwrite semantics on the same object key.
+pub struct ObjectStoreShuffleStore {
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: object_store::path::Path,
+}
+
+impl ObjectStoreShuffleStore {
+    /// Create a new store backed by `store` rooted at `prefix`.
+    pub fn new(store: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
+        let prefix_str = prefix.into();
+        let prefix = if prefix_str.is_empty() {
+            object_store::path::Path::default()
+        } else {
+            object_store::path::Path::from(prefix_str.as_str())
+        };
+        Self { store, prefix }
+    }
+
+    fn object_path(&self, id: &PartitionId) -> object_store::path::Path {
+        let key = format!("{}/{}/{}.ipc", id.job_id, id.stage_id, id.partition);
+        if self.prefix.as_ref().is_empty() {
+            object_store::path::Path::from(key.as_str())
+        } else {
+            object_store::path::Path::from(format!("{}/{key}", self.prefix).as_str())
+        }
+    }
+
+    fn job_prefix(&self, job_id: &str) -> object_store::path::Path {
+        if self.prefix.as_ref().is_empty() {
+            object_store::path::Path::from(job_id)
+        } else {
+            object_store::path::Path::from(format!("{}/{job_id}", self.prefix).as_str())
+        }
+    }
+}
+
+impl ShuffleStore for ObjectStoreShuffleStore {
+    fn register_partition_lease(
+        &self,
+        _id: PartitionId,
+        _lease_token: u64,
+    ) -> impl Future<Output = StoreResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    fn write_partition(
+        &self,
+        partition: ShufflePartition,
+        _lease_token: u64,
+    ) -> impl Future<Output = StoreResult<()>> + Send {
+        let store = Arc::clone(&self.store);
+        let path = self.object_path(&partition.id);
+        async move {
+            use arrow::ipc::writer::StreamWriter;
+
+            let mut buf = Vec::new();
+            let mut writer =
+                StreamWriter::try_new(&mut buf, &partition.schema).map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
+            for batch in &partition.batches {
+                writer.write(batch).map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
+            }
+            writer.finish().map_err(|e| StoreError::Io {
+                message: e.to_string(),
+            })?;
+
+            store
+                .put(&path, bytes::Bytes::from(buf).into())
+                .await
+                .map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
+            Ok(())
+        }
+    }
+
+    fn read_partition(
+        &self,
+        id: &PartitionId,
+    ) -> impl Future<Output = StoreResult<Option<ShufflePartition>>> + Send {
+        let store = Arc::clone(&self.store);
+        let path = self.object_path(id);
+        let id = id.clone();
+        async move {
+            use arrow::ipc::reader::StreamReader;
+
+            let result = store.get(&path).await;
+            match result {
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => {
+                    return Err(StoreError::Io {
+                        message: e.to_string(),
+                    });
+                }
+                Ok(obj) => {
+                    let data = obj.bytes().await.map_err(|e| StoreError::Io {
+                        message: e.to_string(),
+                    })?;
+                    let cursor = std::io::Cursor::new(data.as_ref());
+                    let mut reader =
+                        StreamReader::try_new(cursor, None).map_err(|e| StoreError::Io {
+                            message: e.to_string(),
+                        })?;
+                    let schema = reader.schema();
+                    let mut batches = Vec::new();
+                    for batch_result in &mut reader {
+                        let batch = batch_result.map_err(|e| StoreError::Io {
+                            message: e.to_string(),
+                        })?;
+                        batches.push(batch);
+                    }
+                    Ok(Some(ShufflePartition {
+                        id,
+                        schema,
+                        batches,
+                    }))
+                }
+            }
+        }
+    }
+
+    fn delete_job_partitions(&self, job_id: &str) -> impl Future<Output = StoreResult<()>> + Send {
+        use futures::TryStreamExt;
+
+        let store = Arc::clone(&self.store);
+        let prefix = self.job_prefix(job_id);
+        async move {
+            let mut stream = store.list(Some(&prefix));
+            let mut keys = Vec::new();
+            while let Some(meta) = stream.try_next().await.map_err(|e| StoreError::Io {
+                message: e.to_string(),
+            })? {
+                keys.push(meta.location);
+            }
+            for key in keys {
+                store.delete(&key).await.map_err(|e| StoreError::Io {
+                    message: e.to_string(),
+                })?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1392,5 +1582,341 @@ mod tests {
 
         store.write_partition(partition, 11).await.unwrap();
         assert!(store.read_partition(&id).await.unwrap().is_some());
+    }
+
+    // ── ObjectStoreShuffleStore ───────────────────────────────────────────
+
+    use crate::ObjectStoreShuffleStore;
+    use object_store::memory::InMemory;
+
+    fn make_object_store_partition(
+        job_id: &str,
+        stage_id: &str,
+        partition: u32,
+    ) -> ShufflePartition {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![partition as i32]))],
+        )
+        .unwrap();
+        ShufflePartition {
+            id: PartitionId {
+                job_id: job_id.to_owned(),
+                stage_id: stage_id.to_owned(),
+                partition,
+            },
+            schema,
+            batches: vec![batch],
+        }
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_write_and_read_round_trip() {
+        let inner = Arc::new(InMemory::new());
+        let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+
+        let partition = make_object_store_partition("job-os-1", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 0).await.unwrap();
+
+        let read = store.read_partition(&id).await.unwrap().unwrap();
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_read_missing_returns_none() {
+        let inner = Arc::new(InMemory::new());
+        let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+        let id = PartitionId {
+            job_id: "missing".into(),
+            stage_id: "s0".into(),
+            partition: 0,
+        };
+        let result = store.read_partition(&id).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_delete_job_removes_all_partitions() {
+        let inner = Arc::new(InMemory::new());
+        let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+
+        store
+            .write_partition(make_object_store_partition("job-del-os", "s0", 0), 0)
+            .await
+            .unwrap();
+        store
+            .write_partition(make_object_store_partition("job-del-os", "s0", 1), 0)
+            .await
+            .unwrap();
+
+        store.delete_job_partitions("job-del-os").await.unwrap();
+
+        let id0 = PartitionId {
+            job_id: "job-del-os".into(),
+            stage_id: "s0".into(),
+            partition: 0,
+        };
+        let id1 = PartitionId {
+            job_id: "job-del-os".into(),
+            stage_id: "s0".into(),
+            partition: 1,
+        };
+        assert!(store.read_partition(&id0).await.unwrap().is_none());
+        assert!(store.read_partition(&id1).await.unwrap().is_none());
+    }
+}
+
+// ── Shuffle partition transport (Arrow IPC over TCP) ─────────────────────────
+//
+// Krishiv uses Arrow IPC framing over a simple TCP connection for shuffle reads.
+// The protocol is intentionally minimal:
+//   client → server: "<job_id>/<stage_id>/<partition_id>\n" (UTF-8 ticket)
+//   server → client: 4-byte big-endian u32 payload length, then raw Arrow IPC bytes
+//                    A length of 0 means "partition not found".
+//
+// This achieves the same data transport as Arrow Flight DoGet without requiring
+// the full gRPC/Flight service trait implementation. The `arrow-flight` crate is
+// retained as a dependency for future upgrade to the full Flight protocol.
+
+pub mod flight {
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use arrow::ipc::reader::StreamReader;
+    use arrow::ipc::writer::StreamWriter;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::{LocalDiskShuffleStore, PartitionId, ShuffleStore};
+
+    fn parse_ticket(ticket: &str) -> Option<(String, String, u32)> {
+        let parts: Vec<&str> = ticket.trim().splitn(3, '/').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let partition_id = parts[2].parse::<u32>().ok()?;
+        Some((parts[0].to_owned(), parts[1].to_owned(), partition_id))
+    }
+
+    async fn handle_connection(mut stream: TcpStream, store: Arc<LocalDiskShuffleStore>) {
+        // Read ticket line terminated by '\n'.
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            match stream.read_exact(&mut byte).await {
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    buf.push(byte[0]);
+                }
+                Err(_) => return,
+            }
+        }
+
+        let ticket = match std::str::from_utf8(&buf) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                let _ = stream.write_all(&0u32.to_be_bytes()).await;
+                return;
+            }
+        };
+
+        let Some((job_id, stage_id, partition_id)) = parse_ticket(&ticket) else {
+            let _ = stream.write_all(&0u32.to_be_bytes()).await;
+            return;
+        };
+
+        let id = PartitionId {
+            job_id,
+            stage_id,
+            partition: partition_id,
+        };
+        let result = store.read_partition(&id).await;
+
+        match result {
+            Ok(Some(partition)) => {
+                let mut buf = Vec::new();
+                let schema = partition.schema;
+                if let Ok(mut writer) = StreamWriter::try_new(&mut buf, &schema) {
+                    for batch in &partition.batches {
+                        let _ = writer.write(batch);
+                    }
+                    let _ = writer.finish();
+                }
+                let len = buf.len() as u32;
+                let _ = stream.write_all(&len.to_be_bytes()).await;
+                let _ = stream.write_all(&buf).await;
+            }
+            _ => {
+                let _ = stream.write_all(&0u32.to_be_bytes()).await;
+            }
+        }
+    }
+
+    /// Start the shuffle IPC server on `addr` backed by `store`.
+    ///
+    /// Returns the local address and a join handle. Call `abort()` on the handle
+    /// to shut down the server.
+    pub async fn serve(
+        addr: SocketAddr,
+        store: Arc<LocalDiskShuffleStore>,
+    ) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let store = Arc::clone(&store);
+                        tokio::spawn(handle_connection(stream, store));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok((local_addr, handle))
+    }
+
+    /// Fetch all [`RecordBatch`]es for one shuffle partition from a remote server.
+    ///
+    /// `endpoint` format: `<host>:<port>` (e.g. `"10.0.0.5:50051"`)
+    pub struct FlightShuffleClient;
+
+    impl FlightShuffleClient {
+        pub async fn fetch(
+            endpoint: impl Into<String>,
+            job_id: &str,
+            stage_id: &str,
+            partition_id: u32,
+        ) -> io::Result<Vec<RecordBatch>> {
+            let endpoint = endpoint.into();
+            let mut stream = TcpStream::connect(&endpoint).await?;
+
+            let ticket = format!("{job_id}/{stage_id}/{partition_id}\n");
+            stream.write_all(ticket.as_bytes()).await?;
+
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            if len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("partition {job_id}/{stage_id}/{partition_id} not found"),
+                ));
+            }
+
+            let mut data = vec![0u8; len];
+            stream.read_exact(&mut data).await?;
+
+            let cursor = std::io::Cursor::new(data);
+            let reader = StreamReader::try_new(cursor, None)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut batches = Vec::new();
+            for batch in reader {
+                let batch = batch.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                batches.push(batch);
+            }
+            Ok(batches)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        use super::*;
+        use crate::{LocalDiskShuffleStore, PartitionId, ShufflePartition};
+
+        fn batches_to_ipc(batches: &[RecordBatch]) -> Vec<u8> {
+            let schema = batches[0].schema();
+            let mut buf = Vec::new();
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            for batch in batches {
+                writer.write(batch).unwrap();
+            }
+            writer.finish().unwrap();
+            buf
+        }
+
+        fn make_test_batch() -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn flight_server_serves_partition_and_client_reads_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+
+            let batch = make_test_batch();
+
+            let id = PartitionId {
+                job_id: "job-flight-1".to_owned(),
+                stage_id: "s0".to_owned(),
+                partition: 0,
+            };
+            let partition = ShufflePartition {
+                id: id.clone(),
+                schema: batch.schema(),
+                batches: vec![batch.clone()],
+            };
+            store.register_partition_lease(id.clone(), 1).await.unwrap();
+            store.write_partition(partition, 1).await.unwrap();
+
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
+
+            let endpoint = local_addr.to_string();
+            let result = FlightShuffleClient::fetch(&endpoint, "job-flight-1", "s0", 0)
+                .await
+                .unwrap();
+
+            server_handle.abort();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].num_rows(), 3);
+            assert_eq!(result[0].num_columns(), 2);
+        }
+
+        #[tokio::test]
+        async fn flight_client_returns_error_for_missing_partition() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (local_addr, server_handle) = serve(addr, Arc::clone(&store)).await.unwrap();
+            let endpoint = local_addr.to_string();
+
+            let result = FlightShuffleClient::fetch(&endpoint, "missing", "s0", 0).await;
+            server_handle.abort();
+
+            assert!(
+                matches!(result, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+                "expected NotFound, got: {result:?}"
+            );
+        }
     }
 }

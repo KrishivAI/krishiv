@@ -429,6 +429,18 @@ Acceptance gate:
 - [ ] Orphan shuffle data is detected and cleaned up deterministically.
 - [x] `docs/architecture/streaming-execution-model.md` is written and approved.
 
+### Pre-R5 Hardening (required before R5.1 implementation begins)
+
+These items must be completed after R4's acceptance gate and before any R5.1 streaming code is written:
+
+- [x] Fix `JobRecord::refresh_state()` to guard streaming jobs from transitioning to `JobState::Succeeded`.
+- [x] Add `TaskRunner` enum dispatch to `krishiv-executor` separating batch-terminal runners from streaming-continuous runners.
+- [x] Add streaming task state (watermark, source offset) to `ExecutorHeartbeat` for the re-attach protocol.
+- [x] Add `streaming_reattach_grace_ticks` to `CoordinatorConfig` and implement streaming re-attach in `recover_from_store`.
+- [x] Add `StreamingAqeGuard` rule to `krishiv-optimizer` preventing AQE coalescing on streaming plans.
+- [x] Write `docs/architecture/checkpoint-protocol.md` (aligned barrier model, R5.1 simulation requirements).
+- [x] Write `docs/architecture/keyed-distribution-stability.md`.
+
 ### R5: Stateful Streaming Core
 
 Scope: Flink-style stateful stream processing. Split into two gated sub-milestones. R5.1 cannot start until `docs/architecture/streaming-execution-model.md` is approved.

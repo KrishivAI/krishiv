@@ -2,15 +2,32 @@
 
 ## Current Phase
 
-R3 hardening active / R4 Bootstrap.
+R4 Shuffle and Batch AQE — Tier 1 + Tier 2 + Tier 3 complete. Pre-R5 hardening complete. R5.1 stateful streaming core is unblocked.
 
 ## Active Task
 
-R3 hardening slices complete: Kafka post-write offset commit protocol, deterministic Kafka-compatible source/committer harness, Kafka → Parquet execution on the real executor runner, task lease generation → exact shuffle stale-token rejection proof, object-store Parquet executor source/sink path, durable JSON-file metadata store, operator executor pod launch failure detection that marks associated executors lost and requeues running tasks, typed task I/O descriptors with legacy compatibility, and versioned JSON metadata envelopes.
-Remaining follow-up:
-1. Live external Kafka broker feature/integration test (requires selecting a Kafka client/runtime feature; current R3 path uses deterministic in-memory Kafka-compatible harness).
-2. Full distributed zombie-executor network-partition shuffle e2e is carried into R4, because it depends on the R4 shuffle implementation beyond the R3 lease-token foundation.
-3. Durable shuffle metadata and full executor operator-runtime separation remain R4/R5 follow-ups.
+R4 full implementation complete across all three tiers (122→270 tests, 0 failures):
+
+**Tier 1 (Foundation)**
+- Proto extensions: `StageSpec.upstream_stage_ids`, `output_partition_count`, `ShufflePartitionOutput`, `TaskRuntimeStats`, `InputPartitionDescriptor::ShuffleFlight`
+- Arrow IPC shuffle server (`krishiv-shuffle::flight`): TCP `<job/stage/partition>\n` → 4-byte length + IPC bytes; `FlightShuffleClient::fetch`
+- Stage N+1 wait in coordinator: checks `upstream_stage_ids` before launching
+- Shuffle GC: `Coordinator::take_gc_ready_jobs()` + coordinator binary `--shuffle-dir` GC loop
+- Executor shuffle read path: `read_shuffle_flight_partitions` → registers as DataFusion tables
+- Executor shuffle write path: `shuffle-write:hash:<key>:<N>` fragment via `HashPartitioner` + `LocalDiskShuffleStore`
+
+**Tier 2 (TPC-H gate correctness)**
+- Pre-aggregation: `pre-agg:sql:` fragments auto-route through existing SQL path
+- Runtime statistics: `SqlDataFrame::collect_with_stats` reads DataFusion `output_rows`/`elapsed_compute`; executor wires into `TaskOutputMetadata`
+- Distributed joins: two-stage (shuffle + local DataFusion JOIN) works with current `ShuffleFlight` + SQL execution path
+
+**Tier 3 (AQE / observability)**
+- Health/metrics HTTP: `--http-addr` on coordinator + executor; `/healthz`, `/readyz`, `/metrics` (Prometheus)
+- EXPLAIN annotations: `describe_plan` shows `[broadcast-eligible]` and `[est-rows: N]`
+- `SmallFilePlanner`: greedy file grouper for scan parallelism (4 tests)
+- `ObjectStoreShuffleStore`: `ShuffleStore` impl backed by `Arc<dyn ObjectStore>` (3 tests)
+
+Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-recovery-expectations.md` (per-failure-point recovery matrix)
 
 ## Completed
 
@@ -169,12 +186,14 @@ Remaining follow-up:
 
 ## In Progress
 
-- None.
+- None (R4 TPC-H correctness gate committed to branch `claude/analyze-r3-plan-r4-0QYyr`).
 
 ## Next Steps
 
-1. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
-2. Continue R4 shuffle integration: wire shuffle writer/reader APIs into multi-stage executor execution and coordinator shuffle metadata.
+1. Begin R5.1: implement `crates/krishiv-state` with keyed state API and in-memory backend.
+2. Add `key_by`, event-time timestamp assignment, watermark, and tumbling-window APIs to `krishiv-api`.
+3. Implement continuous operator execution loop in `execute_streaming_fragment` (replace `StreamingNotImplemented` stub).
+4. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
 
 ## Known Blockers
 
@@ -312,12 +331,27 @@ Remaining follow-up:
 - **R3 practical remaining slices (previous session)**: Hardened `ShuffleStore` with registered exact lease-token validation before commit, extended the zombie-executor proof so stale writes cannot win before fresh output commits, and made operator pod-launch failure handling mark associated executors lost/requeue running tasks.
 - **R1–R3 architecture remediation (this session)**: Added typed task input/output descriptors and wire round trips while keeping legacy string compatibility; migrated executor connector/object/Kafka tests to typed descriptors; added JSON metadata `schema_version`/`store_kind` envelope validation; reconciled R1/R2 roadmap checklist state; documented the R1–R3 architecture review and reconciled the already-approved streaming execution model in the roadmap.
 
-## Last Validation (R1–R3 architecture remediation, branch current)
+## Last Validation (post-R4 bug sweep, branch `claude/analyze-r3-plan-r4-0QYyr`)
 
-- `cargo fmt --all --check` passed.
-- `cargo check --workspace` passed.
-- `cargo test -p krishiv-proto -p krishiv-executor -p krishiv-scheduler` passed — proto 17 tests, executor 20 lib/4 bin tests, scheduler 44 lib/5 coordinator-bin/10 manifest tests, and doc tests.
+- `cargo fmt --all` applied.
+- `cargo build --workspace` passed (clean, 0 errors).
 - `cargo test --workspace` passed — 0 failures across all crates and doc tests.
+- Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3), `e328e89` (TPC-H correctness gate), `1492fac` (fmt), `bea4f03` (post-R4 bug sweep).
+- Branch pushed to remote: `origin/claude/analyze-r3-plan-r4-0QYyr`.
+
+## Last Validation (Pre-R5 hardening, branch `claude/analyze-r3-plan-r4-0QYyr`)
+
+- `cargo fmt --all` applied.
+- `cargo test --workspace` passed — 0 failures (scheduler: 48 lib tests including 4 new streaming tests; all other crates clean).
+
+## Pre-R5 Hardening Summary
+
+- **`refresh_state()` streaming guard**: `JobRecord::refresh_state()` in `krishiv-scheduler` now guards `JobKind::Streaming` jobs from ever transitioning to `JobState::Succeeded`. Tests: `streaming_job_does_not_succeed_when_all_stages_succeed` and `batch_job_succeeds_when_all_stages_succeed` both pass.
+- **Streaming re-attach protocol**: `CoordinatorConfig::streaming_reattach_grace_ticks` (default 5), `Coordinator::recovering` flag, and grace-period eviction guard added to `advance_heartbeat_clock`. `recover_from_store` now sets `ticks_since_restart = 0` and `recovering = true`. Tests: `streaming_executor_not_evicted_within_grace_period` and `streaming_executor_evicted_after_grace_period` both pass.
+- **Executor `ExecutionModel` dispatch**: `ExecutionModel` enum (`Batch` / `Streaming`) added to `krishiv-executor`; dispatch on `stream:` fragment prefix; `execute_stage_fragment` renamed to `execute_batch_fragment`; `execute_streaming_fragment` stub added returning `StreamingNotImplemented`. 6 new executor tests pass.
+- **`StreamingAqeGuard` and `AqeOptimizer`**: Added to `krishiv-optimizer`; `AqeOptimizer::guarded_rules` are skipped for streaming plans; 3 new optimizer tests pass.
+- **`StreamingTaskState` proto type**: Added to `krishiv-proto` with `task_id`, `watermark_ms`, `source_offset`; attached to `ExecutorHeartbeat` via `streaming_task_states` field.
+- **Architecture docs**: `docs/architecture/checkpoint-protocol.md` and `docs/architecture/keyed-distribution-stability.md` written and committed.
 
 ## Resume Instructions
 
@@ -325,8 +359,8 @@ For a new Codex session:
 
 1. Read `AGENTS.md`.
 2. Read this file.
-3. Read `docs/implementation/r3-connector-contracts.md`.
-4. R3 hardening and architecture-remediation slices are done except live external Kafka broker integration. Continue with Kafka runtime selection or R4 durable shuffle metadata/writer/reader integration.
+3. Read `docs/implementation/r5-stateful-streaming-core.md`.
+4. Pre-R5 hardening is complete. Begin R5.1 with `crates/krishiv-state` keyed state API.
 
 For a new Claude Code session:
 
@@ -335,5 +369,5 @@ Start with `/krishiv-engine resume`, then:
 1. Read `AGENTS.md`.
 2. Read `CLAUDE.md`.
 3. Read this file.
-4. Read `docs/implementation/r3-connector-contracts.md`.
+4. Read `docs/implementation/r5-stateful-streaming-core.md`.
 5. Continue from the Next Steps list above; do not rely on Codex-only or Claude-only chat history.
