@@ -7,23 +7,26 @@
 //! path. The task runner executes the first narrow local SQL fragments through
 //! the Krishiv SQL/DataFusion seam and returns lightweight output metadata.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
-    CoordinatorExecutorService, DeregisterExecutorRequest, DeregisterExecutorResponse,
-    ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
-    ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InputPartitionDescriptor,
-    LeaseGeneration, OutputContract, OutputContractDescriptor, RegisterExecutorRequest,
-    RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef, TaskCancellationRequest,
-    TaskOutputMetadata, TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse,
-    TransportDisposition, TransportVersion, wire,
+    CheckpointAckRequest, CheckpointSourceOffset, CoordinatorExecutorService,
+    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
+    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
+    ExecutorTaskAssignment, ExecutorTaskService, InitiateCheckpointRequest,
+    InputPartitionDescriptor, LeaseGeneration, OutputContract, OutputContractDescriptor,
+    RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef,
+    TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
 };
 use krishiv_sql::SqlEngine;
+use krishiv_state::StateBackend;
 
 /// Executor crate result alias.
 pub type ExecutorResult<T> = Result<T, ExecutorError>;
@@ -116,7 +119,7 @@ impl ExecutionModel {
 /// In-memory receiver queue for task assignments delivered to an executor.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutorAssignmentInbox {
-    assignments: Arc<RwLock<Vec<ExecutorTaskAssignment>>>,
+    assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
     cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
 }
 
@@ -131,21 +134,17 @@ impl ExecutorAssignmentInbox {
         self.assignments
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .push(assignment);
+            .push_back(assignment);
         Ok(())
     }
 
     /// Remove the next received assignment in FIFO order.
     pub fn pop_next(&self) -> ExecutorResult<Option<ExecutorTaskAssignment>> {
-        let mut assignments = self
+        Ok(self
             .assignments
             .write()
-            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
-        if assignments.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(assignments.remove(0)))
-        }
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
+            .pop_front())
     }
 
     /// Cancel and remove queued assignments for a task id.
@@ -192,7 +191,9 @@ impl ExecutorAssignmentInbox {
             .assignments
             .read()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .clone())
+            .iter()
+            .cloned()
+            .collect())
     }
 
     /// Number of assignments received so far.
@@ -506,6 +507,122 @@ impl fmt::Debug for ShuffleContext {
         f.debug_struct("ShuffleContext")
             .field("flight_endpoint", &self.flight_endpoint)
             .finish()
+    }
+}
+
+// ── R6 CheckpointState ────────────────────────────────────────────────────────
+
+/// Per-task checkpoint state for executor-side checkpoint participation (R6).
+///
+/// Tracks the last acked epoch, operator/task identity, and source offset so the
+/// executor can correctly handle `InitiateCheckpointRequest` messages.
+#[derive(Debug, Clone)]
+pub struct TaskRunner {
+    /// Last checkpoint epoch that this task acked (0 = none acked yet).
+    pub last_acked_epoch: u64,
+    /// Operator identifier for this task: defaults to `"operator-<task_id>"`.
+    pub operator_id: String,
+    /// Task identifier.
+    pub task_id: TaskId,
+    /// Last Kafka offset processed.  `-1` if this is not a Kafka source task.
+    pub kafka_source_offset: i64,
+}
+
+impl TaskRunner {
+    /// Create a new `TaskRunner` for `task_id`.
+    pub fn new(task_id: TaskId) -> Self {
+        let operator_id = format!("operator-{}", task_id.as_str());
+        Self {
+            last_acked_epoch: 0,
+            operator_id,
+            task_id,
+            kafka_source_offset: -1,
+        }
+    }
+
+    /// Set the Kafka source offset (for source tasks).
+    pub fn with_kafka_offset(mut self, offset: i64) -> Self {
+        self.kafka_source_offset = offset;
+        self
+    }
+
+    /// Handle a `InitiateCheckpointRequest`.
+    ///
+    /// 1. Rejects stale epochs (epoch <= last_acked_epoch).
+    /// 2. Takes a snapshot via `state_backend.snapshot()`.
+    /// 3. Writes the snapshot to `storage`.
+    /// 4. Returns a `CheckpointAckRequest` with source offsets and snapshot path.
+    /// 5. Updates `last_acked_epoch`.
+    pub fn handle_initiate_checkpoint(
+        &mut self,
+        req: InitiateCheckpointRequest,
+        state_backend: &dyn StateBackend,
+        storage: &impl CheckpointStorage,
+    ) -> CheckpointAckRequest {
+        // Stale epoch: return an ack that signals the stale condition via epoch.
+        if req.epoch <= self.last_acked_epoch {
+            return CheckpointAckRequest {
+                job_id: req.job_id,
+                operator_id: self.operator_id.clone(),
+                task_id: self.task_id.clone(),
+                epoch: self.last_acked_epoch, // signal: stale
+                fencing_token: req.fencing_token,
+                source_offsets: vec![],
+                snapshot_path: None,
+            };
+        }
+
+        // Take a state snapshot.
+        let snapshot_bytes = match state_backend.snapshot() {
+            Ok(bytes) => bytes,
+            Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => Vec::new(),
+            Err(_) => Vec::new(),
+        };
+
+        // Write snapshot if non-empty; suppress phantom path on write failure.
+        let snap_path = if !snapshot_bytes.is_empty() {
+            let path = snapshot_path(
+                req.job_id.as_str(),
+                req.epoch,
+                &self.operator_id,
+                self.task_id.as_str(),
+            );
+            match write_operator_snapshot(
+                storage,
+                req.job_id.as_str(),
+                req.epoch,
+                &self.operator_id,
+                self.task_id.as_str(),
+                &snapshot_bytes,
+            ) {
+                Ok(()) => Some(path),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Build source offsets.
+        let source_offsets = if self.kafka_source_offset >= 0 {
+            vec![CheckpointSourceOffset {
+                partition_id: format!("kafka-{}", self.task_id.as_str()),
+                offset: self.kafka_source_offset,
+            }]
+        } else {
+            vec![]
+        };
+
+        self.last_acked_epoch = req.epoch;
+
+        CheckpointAckRequest {
+            job_id: req.job_id,
+            operator_id: self.operator_id.clone(),
+            task_id: self.task_id.clone(),
+            epoch: req.epoch,
+            fencing_token: req.fencing_token,
+            source_offsets,
+            snapshot_path: snap_path,
+        }
     }
 }
 
@@ -853,10 +970,7 @@ impl ExecutorTaskRunner {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| ExecutorError::LocalExecution {
-                    message: format!(
-                        "event_time column '{}' must be Int64",
-                        spec.time_col
-                    ),
+                    message: format!("event_time column '{}' must be Int64", spec.time_col),
                 })?;
             for row in 0..arr.len() {
                 watermark.advance(arr.value(row));
@@ -1004,12 +1118,13 @@ async fn read_connector_parquet_partitions(
             message: format!("connector-parquet open failed for '{path_str}': {e}"),
         })?;
         let mut batches = Vec::new();
-        while let Some(batch) = source
-            .read_batch()
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: format!("connector-parquet read failed: {e}"),
-            })?
+        while let Some(batch) =
+            source
+                .read_batch()
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!("connector-parquet read failed: {e}"),
+                })?
         {
             batches.push(batch);
         }
@@ -4451,6 +4566,152 @@ mod tests {
             shared.read().unwrap().job_snapshots().len(),
             1,
             "coordinator must not create a duplicate job on re-attach"
+        );
+    }
+
+    // ── Group C: executor checkpoint participation ─────────────────────────────
+
+    use krishiv_checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
+    use krishiv_proto::{FencingToken, InitiateCheckpointRequest};
+    use krishiv_state::{InMemoryStateBackend, StateBackend};
+
+    use super::TaskRunner;
+
+    #[test]
+    fn executor_checkpoint_takes_state_snapshot_and_writes_to_storage() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let task_id = TaskId::try_new("task-cp-1").unwrap();
+        let job_id = JobId::try_new("job-cp-1").unwrap();
+        let mut runner = TaskRunner::new(task_id.clone());
+
+        // Set up a state backend with some entries.
+        let mut backend = InMemoryStateBackend::new();
+        let ns = krishiv_state::Namespace::new("operator-task-cp-1", "my-state");
+        backend
+            .put(&ns, b"key1".to_vec(), b"value1".to_vec())
+            .unwrap();
+
+        let req = InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+        };
+
+        let ack = runner.handle_initiate_checkpoint(req, &backend, &storage);
+
+        assert_eq!(ack.epoch, 1, "ack epoch must match request");
+        assert_eq!(ack.task_id, task_id);
+        assert!(
+            ack.snapshot_path.is_some(),
+            "state backend produced snapshot"
+        );
+        assert_eq!(runner.last_acked_epoch, 1);
+
+        // Verify the snapshot was written to storage.
+        let expected_path = snapshot_path("job-cp-1", 1, "operator-task-cp-1", "task-cp-1");
+        let data = storage.read_bytes(&expected_path).unwrap();
+        assert!(data.is_some(), "snapshot file must be written to storage");
+    }
+
+    #[test]
+    fn executor_checkpoint_ack_includes_snapshot_path() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let task_id = TaskId::try_new("task-cp-path").unwrap();
+        let job_id = JobId::try_new("job-cp-path").unwrap();
+        let mut runner = TaskRunner::new(task_id.clone());
+
+        // Put state so the backend produces a non-empty snapshot.
+        let mut backend_with_state = InMemoryStateBackend::new();
+        let ns = krishiv_state::Namespace::new("operator-task-cp-path", "data");
+        backend_with_state
+            .put(&ns, b"k".to_vec(), b"v".to_vec())
+            .unwrap();
+
+        let req = InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch: 2,
+            fencing_token: FencingToken::initial(),
+        };
+        let ack = runner.handle_initiate_checkpoint(req, &backend_with_state, &storage);
+        assert!(
+            ack.snapshot_path.is_some(),
+            "ack must include snapshot_path when state backend produced snapshot bytes"
+        );
+
+        // Verify the snapshot file actually exists at the expected path.
+        let expected_path =
+            snapshot_path("job-cp-path", 2, "operator-task-cp-path", "task-cp-path");
+        let data = storage.read_bytes(&expected_path).unwrap();
+        assert!(
+            data.is_some(),
+            "snapshot file must be written at the expected path"
+        );
+    }
+
+    #[test]
+    fn executor_checkpoint_ack_includes_source_offset() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let task_id = TaskId::try_new("task-cp-offset").unwrap();
+        let job_id = JobId::try_new("job-cp-offset").unwrap();
+        let mut runner = TaskRunner::new(task_id.clone()).with_kafka_offset(42);
+        let backend = InMemoryStateBackend::new();
+
+        let req = InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+        };
+        let ack = runner.handle_initiate_checkpoint(req, &backend, &storage);
+        assert_eq!(ack.source_offsets.len(), 1);
+        assert_eq!(ack.source_offsets[0].offset, 42);
+
+        // Non-Kafka task produces no source offsets.
+        let mut runner2 = TaskRunner::new(TaskId::try_new("task-cp-nooffset").unwrap());
+        let req2 = InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+        };
+        let ack2 = runner2.handle_initiate_checkpoint(req2, &backend, &storage);
+        assert!(
+            ack2.source_offsets.is_empty(),
+            "non-Kafka task must have no source offsets"
+        );
+    }
+
+    #[test]
+    fn executor_rejects_stale_checkpoint_epoch() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let task_id = TaskId::try_new("task-cp-stale").unwrap();
+        let job_id = JobId::try_new("job-cp-stale").unwrap();
+        let mut runner = TaskRunner::new(task_id.clone());
+        let backend = InMemoryStateBackend::new();
+
+        // First ack epoch 5.
+        let req5 = InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch: 5,
+            fencing_token: FencingToken::initial(),
+        };
+        let ack5 = runner.handle_initiate_checkpoint(req5, &backend, &storage);
+        assert_eq!(ack5.epoch, 5, "first ack must be for epoch 5");
+        assert_eq!(runner.last_acked_epoch, 5);
+
+        // Now try epoch 3 — stale.
+        let req3 = InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch: 3,
+            fencing_token: FencingToken::initial(),
+        };
+        let stale_ack = runner.handle_initiate_checkpoint(req3, &backend, &storage);
+        // Stale acks return the last_acked_epoch as the epoch field to signal staleness.
+        assert_eq!(
+            stale_ack.epoch, 5,
+            "stale ack epoch must be last_acked_epoch (5), not the stale request epoch (3)"
+        );
+        assert_eq!(
+            runner.last_acked_epoch, 5,
+            "last_acked_epoch must not change on stale rejection"
         );
     }
 }

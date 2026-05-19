@@ -847,7 +847,10 @@ impl MultiSourceWatermarkState {
 
     /// Update the watermark for `source_id` (monotonic — decreasing values are ignored).
     pub fn update(&mut self, source_id: &str, watermark_ms: i64) {
-        let entry = self.source_watermarks.entry(source_id.to_owned()).or_insert(i64::MIN);
+        let entry = self
+            .source_watermarks
+            .entry(source_id.to_owned())
+            .or_insert(i64::MIN);
         if watermark_ms > *entry {
             *entry = watermark_ms;
         }
@@ -856,7 +859,11 @@ impl MultiSourceWatermarkState {
     /// Effective watermark across all registered sources.  Returns `i64::MIN`
     /// if no source has reported a watermark yet.
     pub fn effective_watermark_ms(&self) -> i64 {
-        self.source_watermarks.values().copied().min().unwrap_or(i64::MIN)
+        self.source_watermarks
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(i64::MIN)
     }
 
     /// Number of sources registered.
@@ -1121,9 +1128,7 @@ impl SessionWindowOperator {
         let closed: Vec<String> = self
             .sessions
             .keys()
-            .filter(|k| {
-                self.sessions[*k].last_event_time_ms + gap <= watermark_ms
-            })
+            .filter(|k| self.sessions[*k].last_event_time_ms + gap <= watermark_ms)
             .cloned()
             .collect();
         if closed.is_empty() {
@@ -1132,7 +1137,12 @@ impl SessionWindowOperator {
         let mut output = Vec::with_capacity(closed.len());
         for key in closed {
             if let Some(s) = self.sessions.remove(&key) {
-                output.push(self.build_output_batch(&key, s.session_start_ms, s.last_event_time_ms + gap, &s.agg)?);
+                output.push(self.build_output_batch(
+                    &key,
+                    s.session_start_ms,
+                    s.last_event_time_ms + gap,
+                    &s.agg,
+                )?);
             }
         }
         Ok(output)
@@ -1183,7 +1193,10 @@ pub struct StreamTableJoin {
 impl StreamTableJoin {
     /// Create a stream-table join with the given static table.
     pub fn new(table: RecordBatch, join_key_column: impl Into<String>) -> Self {
-        Self { table, join_key_column: join_key_column.into() }
+        Self {
+            table,
+            join_key_column: join_key_column.into(),
+        }
     }
 
     /// Join `stream_batch` against the static table, returning the inner-join result.
@@ -1254,8 +1267,12 @@ impl StreamTableJoin {
         let table_indices: ArrayRef = Arc::new(UInt32Array::from(table_rows));
 
         // Build output schema: all stream columns, then non-key table columns.
-        let mut fields: Vec<Field> =
-            stream_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = stream_batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         for (i, f) in self.table.schema().fields().iter().enumerate() {
             if i != table_key_idx {
                 fields.push(f.as_ref().clone());
@@ -1277,8 +1294,12 @@ impl StreamTableJoin {
     }
 
     fn empty_output(&self, stream_batch: &RecordBatch) -> ExecResult<RecordBatch> {
-        let mut fields: Vec<Field> =
-            stream_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = stream_batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         let table_key_idx = self
             .table
             .schema()
@@ -1931,8 +1952,8 @@ mod tests {
     // ── MultiSourceWatermarkState tests ───────────────────────────────────────
 
     use super::{
-        MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec,
-        SlidingWindowOperator, SlidingWindowSpec, StreamTableJoin,
+        MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
+        SlidingWindowSpec, StreamTableJoin,
     };
 
     #[test]
@@ -1975,11 +1996,7 @@ mod tests {
         }
     }
 
-    fn make_stream_batch_i64(
-        keys: Vec<&str>,
-        times: Vec<i64>,
-        vals: Vec<i64>,
-    ) -> RecordBatch {
+    fn make_stream_batch_i64(keys: Vec<&str>, times: Vec<i64>, vals: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("ts", DataType::Int64, false),
@@ -2004,7 +2021,11 @@ mod tests {
         // watermark high enough to close both windows
         let out = op.process_batch(&batch, 2000).unwrap();
         // Two windows should close: [0,1000) and [500,1500)
-        assert_eq!(out.len(), 2, "event at t=600 must appear in two sliding windows");
+        assert_eq!(
+            out.len(),
+            2,
+            "event at t=600 must appear in two sliding windows"
+        );
     }
 
     #[test]
@@ -2023,7 +2044,11 @@ mod tests {
             .process_batch(&make_stream_batch_i64(vec![], vec![], vec![]), 3000)
             .unwrap();
         // Each of the two windows should have count=1 (only the t=1500 event).
-        assert_eq!(out.len(), 2, "both windows [1000,2000) and [1500,2500) must close");
+        assert_eq!(
+            out.len(),
+            2,
+            "both windows [1000,2000) and [1500,2500) must close"
+        );
         let total_counts: i64 = out
             .iter()
             .map(|b| {
@@ -2035,7 +2060,10 @@ mod tests {
                     .value(0)
             })
             .sum();
-        assert_eq!(total_counts, 2, "each window has count=1 from the t=1500 event only");
+        assert_eq!(
+            total_counts, 2,
+            "each window has count=1 from the t=1500 event only"
+        );
     }
 
     // ── SessionWindowOperator tests ───────────────────────────────────────────
@@ -2062,9 +2090,15 @@ mod tests {
         // watermark=600 >= last_event(200)+gap(500)=700 — NOT yet closed
         assert!(out1.is_empty(), "session should not close at watermark=600");
 
-        let out2 = op.process_batch(&make_stream_batch_i64(vec![], vec![], vec![]), 800).unwrap();
+        let out2 = op
+            .process_batch(&make_stream_batch_i64(vec![], vec![], vec![]), 800)
+            .unwrap();
         // watermark=800 >= 200+500=700 — session must close
-        assert_eq!(out2.len(), 1, "session must close when watermark passes last_event+gap");
+        assert_eq!(
+            out2.len(),
+            1,
+            "session must close when watermark passes last_event+gap"
+        );
         let cnt = out2[0]
             .column_by_name("cnt")
             .unwrap()
@@ -2078,11 +2112,7 @@ mod tests {
     #[test]
     fn session_window_separate_keys_independent() {
         let mut op = SessionWindowOperator::new(session_spec());
-        let batch = make_stream_batch_i64(
-            vec!["a", "b"],
-            vec![100, 200],
-            vec![1, 1],
-        );
+        let batch = make_stream_batch_i64(vec!["a", "b"], vec![100, 200], vec![1, 1]);
         let out = op.process_batch(&batch, 1000).unwrap();
         // Both sessions close: "a" at 100+500=600 ≤ 1000, "b" at 200+500=700 ≤ 1000
         assert_eq!(out.len(), 2, "each key's session must close independently");

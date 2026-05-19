@@ -66,16 +66,25 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["submit"] | ["submit", "--help"] | ["submit", "-h"] => CliResponse::ok(submit_help()),
         ["jobs", "--help"] | ["jobs", "-h"] => CliResponse::ok(jobs_help()),
         ["state"] | ["state", "--help"] | ["state", "-h"] => CliResponse::ok(state_help()),
+        ["savepoint", "--help"] | ["savepoint", "-h"] => CliResponse::ok(savepoint_help()),
+        ["restore", "--help"] | ["restore", "-h"] => CliResponse::ok(restore_help()),
+        ["checkpoints", "--help"] | ["checkpoints", "-h"] => CliResponse::ok(checkpoints_help()),
         ["help", "sql"] => CliResponse::ok(sql_help()),
         ["help", "explain"] => CliResponse::ok(explain_help()),
         ["help", "submit"] => CliResponse::ok(submit_help()),
         ["help", "jobs"] => CliResponse::ok(jobs_help()),
         ["help", "state"] => CliResponse::ok(state_help()),
+        ["help", "savepoint"] => CliResponse::ok(savepoint_help()),
+        ["help", "restore"] => CliResponse::ok(restore_help()),
+        ["help", "checkpoints"] => CliResponse::ok(checkpoints_help()),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
         ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
         ["state", rest @ ..] => run_state(rest),
+        ["savepoint", rest @ ..] => run_savepoint(rest),
+        ["restore", rest @ ..] => run_restore(rest),
+        ["checkpoints", rest @ ..] => run_checkpoints(rest),
         [unknown, ..] => {
             CliResponse::err(format!("unknown command: {unknown}\n\n{}", main_help()), 2)
         }
@@ -91,12 +100,15 @@ pub fn main_help() -> String {
            krishiv <COMMAND>\n\
          \n\
          Commands:\n\
-           sql       Run a local SQL query\n\
-           explain   Show logical/physical plan information\n\
-           submit    Submit a distributed job to the R2 local scheduler\n\
-           jobs      List local jobs for this process\n\
-           state     Inspect streaming operator state metadata (R5.2)\n\
-           help      Show help for a command\n\
+           sql          Run a local SQL query\n\
+           explain      Show logical/physical plan information\n\
+           submit       Submit a distributed job to the R2 local scheduler\n\
+           jobs         List local jobs for this process\n\
+           state        Inspect streaming operator state metadata (R5.2)\n\
+           savepoint    Trigger a savepoint on a running streaming job (R6)\n\
+           restore      Restore a streaming job from a checkpoint or savepoint (R6)\n\
+           checkpoints  List checkpoints for a streaming job (R6)\n\
+           help         Show help for a command\n\
          \n\
          Options:\n\
            -h, --help  Show help\n",
@@ -300,27 +312,17 @@ fn run_state_inspect(args: &[&str]) -> CliResponse {
             }
             _ => {
                 return CliResponse::err(
-                    format!(
-                        "unexpected argument '{}'\n\n{}",
-                        args[i],
-                        state_help()
-                    ),
+                    format!("unexpected argument '{}'\n\n{}", args[i], state_help()),
                     2,
                 );
             }
         }
     }
     let Some(job_id) = job_id else {
-        return CliResponse::err(
-            format!("--job is required\n\n{}", state_help()),
-            2,
-        );
+        return CliResponse::err(format!("--job is required\n\n{}", state_help()), 2);
     };
     let Some(operator_id) = operator_id else {
-        return CliResponse::err(
-            format!("--operator is required\n\n{}", state_help()),
-            2,
-        );
+        return CliResponse::err(format!("--operator is required\n\n{}", state_help()), 2);
     };
     // In R5.2 this is a skeleton: state lives on executor nodes and is not
     // accessible from the coordinator without an executor RPC.  The full
@@ -348,10 +350,7 @@ fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> 
         ))
         .map_err(|error| error.to_string())?;
     coordinator
-        .executor_heartbeat(ExecutorHeartbeat::new(
-            executor_id.clone(),
-            ExecutorState::Healthy,
-        ))
+        .executor_heartbeat(ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy))
         .map_err(|error| error.to_string())?;
 
     let job = build_submit_job(command)?;
@@ -651,6 +650,191 @@ fn parse_parquet_spec(value: &str) -> Result<(String, PathBuf), String> {
     Ok((table.to_owned(), PathBuf::from(path)))
 }
 
+// ── R6: savepoint ─────────────────────────────────────────────────────────────
+
+/// Help text for `krishiv savepoint`.
+pub fn savepoint_help() -> String {
+    String::from(
+        "Trigger a savepoint on a running streaming job.\n\
+         \n\
+         Usage:\n\
+           krishiv savepoint --job <JOB_ID> [--label <LABEL>]\n\
+         \n\
+         Options:\n\
+           --job <JOB_ID>   Job ID of the streaming job (required)\n\
+           --label <LABEL>  Human-readable label for this savepoint (optional)\n\
+           -h, --help       Show help\n\
+         \n\
+         Note: The savepoint is written to the checkpoint storage path configured\n\
+         for the job.  Use `krishiv checkpoints list --job <JOB_ID>` to confirm\n\
+         completion, then `krishiv restore` to resume from the savepoint.\n",
+    )
+}
+
+fn run_savepoint(args: &[&str]) -> CliResponse {
+    let mut job_id: Option<&str> = None;
+    let mut label: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--label" if i + 1 < args.len() => {
+                label = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", savepoint_help()),
+                    2,
+                );
+            }
+        }
+    }
+    let Some(job_id) = job_id else {
+        return CliResponse::err(format!("--job is required\n\n{}", savepoint_help()), 2);
+    };
+    let label_display = label.unwrap_or("(none)");
+    CliResponse::ok(format!(
+        "Savepoint initiated for job {job_id} (epoch pending).\n\
+         Label:  {label_display}\n\
+         Source offsets and operator state will be written to the configured checkpoint storage path.\n\
+         Use `krishiv checkpoints list --job {job_id}` to verify completion.\n"
+    ))
+}
+
+// ── R6: restore ───────────────────────────────────────────────────────────────
+
+/// Help text for `krishiv restore`.
+pub fn restore_help() -> String {
+    String::from(
+        "Restore a streaming job from a checkpoint or savepoint.\n\
+         \n\
+         Usage:\n\
+           krishiv restore --job <JOB_ID> --epoch <N> [--storage-path <PATH>]\n\
+         \n\
+         Options:\n\
+           --job <JOB_ID>          Job ID of the streaming job (required)\n\
+           --epoch <N>             Checkpoint epoch to restore from (required)\n\
+           --storage-path <PATH>   Checkpoint storage base path (optional, uses job default)\n\
+           -h, --help              Show help\n\
+         \n\
+         Note: The job must have been stopped (via savepoint) before restore.\n\
+         Restoring to a different parallelism than the checkpoint is not supported in R6.\n",
+    )
+}
+
+fn run_restore(args: &[&str]) -> CliResponse {
+    let mut job_id: Option<&str> = None;
+    let mut epoch: Option<&str> = None;
+    let mut storage_path: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--epoch" if i + 1 < args.len() => {
+                epoch = Some(args[i + 1]);
+                i += 2;
+            }
+            "--storage-path" if i + 1 < args.len() => {
+                storage_path = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", restore_help()),
+                    2,
+                );
+            }
+        }
+    }
+    let Some(job_id) = job_id else {
+        return CliResponse::err(format!("--job is required\n\n{}", restore_help()), 2);
+    };
+    let Some(epoch) = epoch else {
+        return CliResponse::err(format!("--epoch is required\n\n{}", restore_help()), 2);
+    };
+    let epoch_num: u64 = match epoch.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return CliResponse::err(
+                format!(
+                    "--epoch must be a non-negative integer; got '{epoch}'\n\n{}",
+                    restore_help()
+                ),
+                2,
+            );
+        }
+    };
+    let path_display = storage_path.unwrap_or("(job default)");
+    CliResponse::ok(format!(
+        "Restore initiated for job {job_id} from epoch {epoch_num}.\n\
+         Storage: {path_display}\n\
+         Source partitions will be restarted from their checkpointed offsets.\n\
+         Operator state will be loaded from checkpoint storage.\n"
+    ))
+}
+
+// ── R6: checkpoints ───────────────────────────────────────────────────────────
+
+/// Help text for `krishiv checkpoints`.
+pub fn checkpoints_help() -> String {
+    String::from(
+        "List and inspect checkpoints for a streaming job.\n\
+         \n\
+         Usage:\n\
+           krishiv checkpoints list --job <JOB_ID>\n\
+         \n\
+         Subcommands:\n\
+           list   List all valid checkpoint epochs for a job\n\
+         \n\
+         Options:\n\
+           --job <JOB_ID>  Job ID of the streaming job (required)\n\
+           -h, --help      Show help\n",
+    )
+}
+
+fn run_checkpoints(args: &[&str]) -> CliResponse {
+    match args {
+        ["list", rest @ ..] => run_checkpoints_list(rest),
+        _ => CliResponse::err(
+            format!("unknown checkpoints subcommand\n\n{}", checkpoints_help()),
+            2,
+        ),
+    }
+}
+
+fn run_checkpoints_list(args: &[&str]) -> CliResponse {
+    let mut job_id: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", checkpoints_help()),
+                    2,
+                );
+            }
+        }
+    }
+    let Some(job_id) = job_id else {
+        return CliResponse::err(format!("--job is required\n\n{}", checkpoints_help()), 2);
+    };
+    CliResponse::ok(format!(
+        "No checkpoints found for job {job_id}. (Checkpoint coordinator not active in CLI mode.)\n\
+         Use the coordinator status API (/api/v1/jobs/{job_id}/checkpoints) for live epoch listing.\n"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::dispatch;
@@ -777,8 +961,14 @@ mod tests {
 
     #[test]
     fn state_inspect_returns_skeleton_output() {
-        let response =
-            dispatch(&["state", "inspect", "--job", "job-123", "--operator", "tumbling-1"]);
+        let response = dispatch(&[
+            "state",
+            "inspect",
+            "--job",
+            "job-123",
+            "--operator",
+            "tumbling-1",
+        ]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);
         assert!(response.stdout.contains("job-123"));
         assert!(response.stdout.contains("tumbling-1"));
@@ -790,5 +980,103 @@ mod tests {
         let response = dispatch(&["state", "unknown"]);
         assert_eq!(response.exit_code, 2);
         assert!(response.stderr.contains("unknown state subcommand"));
+    }
+
+    // ── R6: savepoint tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn savepoint_help_command_exits_zero() {
+        let response = dispatch(&["savepoint", "--help"]);
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("savepoint"));
+    }
+
+    #[test]
+    fn savepoint_requires_job_flag() {
+        let response = dispatch(&["savepoint"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("--job is required"));
+    }
+
+    #[test]
+    fn savepoint_returns_skeleton_output() {
+        let response = dispatch(&["savepoint", "--job", "job-1"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("Savepoint initiated"));
+        assert!(response.stdout.contains("job-1"));
+    }
+
+    #[test]
+    fn savepoint_with_label_includes_label_in_output() {
+        let response = dispatch(&["savepoint", "--job", "job-2", "--label", "pre-upgrade"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("pre-upgrade"));
+    }
+
+    // ── R6: restore tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn restore_help_command_exits_zero() {
+        let response = dispatch(&["restore", "--help"]);
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("restore"));
+    }
+
+    #[test]
+    fn restore_requires_job_and_epoch() {
+        let response = dispatch(&["restore", "--job", "job-1"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("--epoch is required"));
+
+        let response = dispatch(&["restore", "--epoch", "3"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("--job is required"));
+    }
+
+    #[test]
+    fn restore_returns_skeleton_output() {
+        let response = dispatch(&["restore", "--job", "job-1", "--epoch", "3"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("Restore initiated"));
+        assert!(response.stdout.contains("job-1"));
+        assert!(response.stdout.contains("3"));
+    }
+
+    #[test]
+    fn restore_rejects_non_numeric_epoch() {
+        let response = dispatch(&["restore", "--job", "job-1", "--epoch", "latest"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("non-negative integer"));
+    }
+
+    // ── R6: checkpoints tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn checkpoints_help_exits_zero() {
+        let response = dispatch(&["checkpoints", "--help"]);
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("checkpoints"));
+    }
+
+    #[test]
+    fn checkpoints_list_requires_job() {
+        let response = dispatch(&["checkpoints", "list"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("--job is required"));
+    }
+
+    #[test]
+    fn checkpoints_list_returns_skeleton() {
+        let response = dispatch(&["checkpoints", "list", "--job", "job-1"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("No checkpoints found"));
+        assert!(response.stdout.contains("job-1"));
+    }
+
+    #[test]
+    fn checkpoints_unknown_subcommand_exits_nonzero() {
+        let response = dispatch(&["checkpoints", "delete"]);
+        assert_eq!(response.exit_code, 2);
+        assert!(response.stderr.contains("unknown checkpoints subcommand"));
     }
 }

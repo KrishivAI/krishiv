@@ -2346,14 +2346,17 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum 0.8.9",
+ "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-exec",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-shuffle",
  "krishiv-sql",
+ "krishiv-state",
  "object_store",
  "parquet",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -2409,7 +2412,10 @@ dependencies = [
 name = "krishiv-scheduler"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "axum 0.8.9",
+ "krishiv-checkpoint",
+ "krishiv-connectors",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
@@ -2460,6 +2466,7 @@ dependencies = [
  "krishiv-proto",
  "krishiv-scheduler",
  "serde",
+ "serde_json",
  "tokio",
  "tower 0.5.3",
 ]

@@ -211,21 +211,36 @@ impl StateBackend for InMemoryStateBackend {
     }
 
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
-        let corrupt = |msg: &str| StateError::SnapshotCorrupt { message: msg.to_owned() };
-        if bytes.len() < 12 { return Err(corrupt("too short")); }
+        let corrupt = |msg: &str| StateError::SnapshotCorrupt {
+            message: msg.to_owned(),
+        };
+        if bytes.len() < 12 {
+            return Err(corrupt("too short"));
+        }
         let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if version != 1 { return Err(corrupt(&format!("unsupported snapshot version {version}"))); }
+        if version != 1 {
+            return Err(corrupt(&format!("unsupported snapshot version {version}")));
+        }
         let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
         let mut pos = 12usize;
         let mut new_store = BTreeMap::new();
 
         for _ in 0..count {
-            let op_id_b = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated op_id"))?.to_vec();
+            let op_id_b = read_lp_bytes(bytes, &mut pos)
+                .ok_or_else(|| corrupt("truncated op_id"))?
+                .to_vec();
             let op_id = String::from_utf8(op_id_b).map_err(|_| corrupt("op_id not utf8"))?;
-            let name_b = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated state_name"))?.to_vec();
-            let state_name = String::from_utf8(name_b).map_err(|_| corrupt("state_name not utf8"))?;
-            let key = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated key"))?.to_vec();
-            let value = read_lp_bytes(bytes, &mut pos).ok_or_else(|| corrupt("truncated value"))?.to_vec();
+            let name_b = read_lp_bytes(bytes, &mut pos)
+                .ok_or_else(|| corrupt("truncated state_name"))?
+                .to_vec();
+            let state_name =
+                String::from_utf8(name_b).map_err(|_| corrupt("state_name not utf8"))?;
+            let key = read_lp_bytes(bytes, &mut pos)
+                .ok_or_else(|| corrupt("truncated key"))?
+                .to_vec();
+            let value = read_lp_bytes(bytes, &mut pos)
+                .ok_or_else(|| corrupt("truncated value"))?
+                .to_vec();
             new_store.insert((op_id, state_name, key), value);
         }
 
@@ -501,29 +516,42 @@ impl StateBackend for RocksDbStateBackend {
     }
 
     fn snapshot(&self) -> StateResult<Vec<u8>> {
-        Err(StateError::SnapshotUnsupported { backend: "RocksDbStateBackend" })
+        Err(StateError::SnapshotUnsupported {
+            backend: "RocksDbStateBackend",
+        })
     }
 
     fn load_snapshot(&mut self, _bytes: &[u8]) -> StateResult<()> {
-        Err(StateError::SnapshotUnsupported { backend: "RocksDbStateBackend" })
+        Err(StateError::SnapshotUnsupported {
+            backend: "RocksDbStateBackend",
+        })
     }
 }
 
 // ── Snapshot helpers ──────────────────────────────────────────────────────────
 
 fn read_lp_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
-    if buf.len() < *pos + 8 { return None; }
-    let len = u64::from_le_bytes(buf[*pos..*pos+8].try_into().ok()?) as usize;
+    if buf.len() < *pos + 8 {
+        return None;
+    }
+    let len = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().ok()?) as usize;
     *pos += 8;
-    if buf.len() < *pos + len { return None; }
-    let v = &buf[*pos..*pos+len];
+    if buf.len() < *pos + len {
+        return None;
+    }
+    let v = &buf[*pos..*pos + len];
     *pos += len;
     Some(v)
 }
 
 // Hex helpers (no external deps).
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
@@ -555,7 +583,11 @@ pub struct ProcessingTimeTimerKey {
 impl ProcessingTimeTimerKey {
     /// Create a processing-time timer key.
     pub fn new(namespace: Namespace, key: Vec<u8>, fire_at_ms: i64) -> Self {
-        Self { fire_at_ms, namespace, key }
+        Self {
+            fire_at_ms,
+            namespace,
+            key,
+        }
     }
 }
 
@@ -575,10 +607,7 @@ pub trait ProcessingTimeTimerService: Send + Sync {
         key: &[u8],
     ) -> StateResult<()>;
     /// Drain all timers with `fire_at_ms <= now_ms` in ascending order.
-    fn drain_fired_processing_time_timers(
-        &mut self,
-        now_ms: i64,
-    ) -> Vec<ProcessingTimeTimerKey>;
+    fn drain_fired_processing_time_timers(&mut self, now_ms: i64) -> Vec<ProcessingTimeTimerKey>;
     /// Number of pending timers.
     fn pending_count(&self) -> usize;
 }
@@ -609,7 +638,8 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
         namespace: &Namespace,
         key: &[u8],
     ) -> StateResult<()> {
-        self.timers.retain(|t, _| !(t.namespace == *namespace && t.key == key));
+        self.timers
+            .retain(|t, _| !(t.namespace == *namespace && t.key == key));
         Ok(())
     }
 
@@ -620,7 +650,9 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
             key: vec![],
         };
         let pending = self.timers.split_off(&sentinel);
-        std::mem::replace(&mut self.timers, pending).into_keys().collect()
+        std::mem::replace(&mut self.timers, pending)
+            .into_keys()
+            .collect()
     }
 
     fn pending_count(&self) -> usize {
@@ -687,7 +719,11 @@ impl<B: StateBackend> TtlStateBackend<B> {
         }
         let expires_at_ms =
             i64::from_le_bytes(encoded[..8].try_into().expect("slice is exactly 8 bytes"));
-        if now_ms >= expires_at_ms { None } else { Some(encoded[8..].to_vec()) }
+        if now_ms >= expires_at_ms {
+            None
+        } else {
+            Some(encoded[8..].to_vec())
+        }
     }
 }
 
@@ -701,7 +737,8 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
 
     fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
         let expires_at_ms = unix_now_ms() + self.config.ttl_ms as i64;
-        self.inner.put(namespace, key, Self::encode(value, expires_at_ms))
+        self.inner
+            .put(namespace, key, Self::encode(value, expires_at_ms))
     }
 
     fn delete(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()> {
@@ -759,7 +796,12 @@ impl<'a, B: StateBackend> StateInspector<'a, B> {
     /// Total bytes across all key vectors in `namespace`.  Value bytes are
     /// intentionally not surfaced; use key size as a proxy for namespace size.
     pub fn key_size_bytes(&self, namespace: &Namespace) -> StateResult<usize> {
-        Ok(self.backend.list_keys(namespace)?.iter().map(|k| k.len()).sum())
+        Ok(self
+            .backend
+            .list_keys(namespace)?
+            .iter()
+            .map(|k| k.len())
+            .sum())
     }
 
     /// Always `true` — the inspector never mutates state.
@@ -964,7 +1006,8 @@ mod tests {
         let n = ns("op1", "window");
         b.put(&n, b"alpha".to_vec(), b"v".to_vec()).unwrap();
         b.put(&n, b"beta".to_vec(), b"v".to_vec()).unwrap();
-        b.put(&ns("op1", "other"), b"alpha".to_vec(), b"v".to_vec()).unwrap();
+        b.put(&ns("op1", "other"), b"alpha".to_vec(), b"v".to_vec())
+            .unwrap();
         let mut keys = b.list_keys(&n).unwrap();
         keys.sort();
         assert_eq!(keys, vec![b"alpha".to_vec(), b"beta".to_vec()]);
@@ -998,7 +1041,8 @@ mod tests {
     #[test]
     fn processing_time_timer_cancel_is_noop_for_missing() {
         let mut svc = InMemoryProcessingTimeTimerService::new();
-        svc.cancel_processing_time_timer(&ns("op", "s"), b"nope").unwrap();
+        svc.cancel_processing_time_timer(&ns("op", "s"), b"nope")
+            .unwrap();
         assert_eq!(svc.pending_count(), 0);
     }
 
@@ -1154,8 +1198,12 @@ mod tests {
         let n = ns("op1", "session");
         // Write a real entry with a very long TTL so it's live.
         let mut ttl = TtlStateBackend::new(b, TtlConfig::new(60_000));
-        ttl.put(&n, b"live-key".to_vec(), b"live-val".to_vec()).unwrap();
-        assert_eq!(ttl.get(&n, b"live-key").unwrap(), Some(b"live-val".to_vec()));
+        ttl.put(&n, b"live-key".to_vec(), b"live-val".to_vec())
+            .unwrap();
+        assert_eq!(
+            ttl.get(&n, b"live-key").unwrap(),
+            Some(b"live-val".to_vec())
+        );
 
         // Inject an already-expired raw entry directly into the inner backend.
         let expires_at_ms: i64 = 1; // 1 ms since epoch — always expired
@@ -1171,8 +1219,14 @@ mod tests {
         // Re-wrap with TTL and verify the stale key returns None.
         let inner2 = RocksDbStateBackend::open(dir).unwrap();
         let ttl2 = TtlStateBackend::new(inner2, TtlConfig::new(60_000));
-        assert!(ttl2.get(&n, b"stale-key").unwrap().is_none(), "expired key must be None");
-        assert_eq!(ttl2.get(&n, b"live-key").unwrap(), Some(b"live-val".to_vec()));
+        assert!(
+            ttl2.get(&n, b"stale-key").unwrap().is_none(),
+            "expired key must be None"
+        );
+        assert_eq!(
+            ttl2.get(&n, b"live-key").unwrap(),
+            Some(b"live-val".to_vec())
+        );
     }
 
     #[test]
@@ -1181,8 +1235,10 @@ mod tests {
         // and produce identical get results — proving deterministic replay.
         let write_state = |b: &mut RocksDbStateBackend| {
             let n = ns("tumbling-1", "window-counts");
-            b.put(&n, b"user-a:0".to_vec(), 42i64.to_le_bytes().to_vec()).unwrap();
-            b.put(&n, b"user-b:0".to_vec(), 17i64.to_le_bytes().to_vec()).unwrap();
+            b.put(&n, b"user-a:0".to_vec(), 42i64.to_le_bytes().to_vec())
+                .unwrap();
+            b.put(&n, b"user-b:0".to_vec(), 17i64.to_le_bytes().to_vec())
+                .unwrap();
         };
 
         let mut b1 = rocks_backend();
@@ -1225,7 +1281,8 @@ mod tests {
         use std::thread;
         let mut b = rocks_backend();
         let n = ns("op1", "window");
-        b.put(&n, b"blocking-key".to_vec(), b"blocking-val".to_vec()).unwrap();
+        b.put(&n, b"blocking-key".to_vec(), b"blocking-val".to_vec())
+            .unwrap();
         let dir = b.base_dir().to_path_buf();
 
         // Simulate spawn_blocking by moving state access into a thread.
@@ -1271,7 +1328,8 @@ mod tests {
         src.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
         let snap = src.snapshot().unwrap();
         let mut dst = InMemoryStateBackend::new();
-        dst.put(&ns, b"old_key".to_vec(), b"old_val".to_vec()).unwrap();
+        dst.put(&ns, b"old_key".to_vec(), b"old_val".to_vec())
+            .unwrap();
         dst.load_snapshot(&snap).unwrap();
         assert_eq!(dst.get(&ns, b"old_key").unwrap(), None);
         assert_eq!(dst.get(&ns, b"k1").unwrap(), Some(b"v1".to_vec()));

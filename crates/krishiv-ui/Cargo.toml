@@ -14,4 +14,5 @@ serde.workspace = true
 tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tower = { workspace = true, features = ["util"] }

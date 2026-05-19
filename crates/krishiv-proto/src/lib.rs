@@ -176,9 +176,15 @@ impl FencingToken {
         }
         Ok(Self(value))
     }
-    pub fn initial() -> Self { Self(1) }
-    pub fn next(self) -> Self { Self(self.0.saturating_add(1)) }
-    pub fn as_u64(self) -> u64 { self.0 }
+    pub fn initial() -> Self {
+        Self(1)
+    }
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Display for FencingToken {
@@ -425,6 +431,10 @@ pub struct JobSpec {
     name: String,
     kind: JobKind,
     stages: Vec<StageSpec>,
+    /// Checkpoint interval in milliseconds. `None` means checkpointing is disabled.
+    checkpoint_interval_ms: Option<u64>,
+    /// Storage path for checkpoint data. `None` means checkpointing is disabled.
+    checkpoint_storage_path: Option<String>,
 }
 
 impl JobSpec {
@@ -435,6 +445,8 @@ impl JobSpec {
             name: name.into(),
             kind,
             stages: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
         }
     }
 
@@ -442,6 +454,14 @@ impl JobSpec {
     #[must_use]
     pub fn with_stage(mut self, stage: StageSpec) -> Self {
         self.stages.push(stage);
+        self
+    }
+
+    /// Enable checkpointing with an interval and storage path.
+    #[must_use]
+    pub fn with_checkpoint(mut self, interval_ms: u64, storage_path: impl Into<String>) -> Self {
+        self.checkpoint_interval_ms = Some(interval_ms);
+        self.checkpoint_storage_path = Some(storage_path.into());
         self
     }
 
@@ -469,6 +489,70 @@ impl JobSpec {
     pub fn task_count(&self) -> usize {
         self.stages.iter().map(StageSpec::task_count).sum()
     }
+
+    /// Checkpoint interval in milliseconds, if checkpointing is enabled.
+    pub fn checkpoint_interval_ms(&self) -> Option<u64> {
+        self.checkpoint_interval_ms
+    }
+
+    /// Storage path for checkpoint data, if checkpointing is enabled.
+    pub fn checkpoint_storage_path(&self) -> Option<&str> {
+        self.checkpoint_storage_path.as_deref()
+    }
+}
+
+// ── Checkpoint control-plane messages ─────────────────────────────────────────
+
+/// One source partition offset captured at the barrier boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointSourceOffset {
+    pub partition_id: String,
+    pub offset: i64,
+}
+
+/// Coordinator → Executor: begin checkpoint epoch E.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitiateCheckpointRequest {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+}
+
+/// Executor → Coordinator: operator snapshot complete for epoch E.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointAckRequest {
+    pub job_id: JobId,
+    pub operator_id: String,
+    pub task_id: TaskId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+    /// One per source partition this task owns.
+    pub source_offsets: Vec<CheckpointSourceOffset>,
+    /// None if operator has no state.
+    pub snapshot_path: Option<String>,
+}
+
+/// Coordinator → Executor: abort the in-progress checkpoint epoch E.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortCheckpointRequest {
+    pub job_id: JobId,
+    pub epoch: u64,
+}
+
+/// Response to `InitiateCheckpointRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointInitiateResponse {
+    Accepted,
+    StaleEpoch { current_epoch: u64 },
+    JobNotFound,
+}
+
+/// Response to `CheckpointAckRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointAckResponse {
+    Accepted,
+    StaleEpoch { current_epoch: u64 },
+    JobNotFound,
 }
 
 /// Stage contract inside a job.

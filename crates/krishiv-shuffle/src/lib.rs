@@ -887,7 +887,10 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         })?;
 
         self.store
-            .put(&self.object_path(&partition.id), bytes::Bytes::from(buf).into())
+            .put(
+                &self.object_path(&partition.id),
+                bytes::Bytes::from(buf).into(),
+            )
             .await
             .map_err(|e| StoreError::Io {
                 message: e.to_string(),
@@ -1821,9 +1824,7 @@ pub mod flight {
             if len > MAX_PARTITION_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "partition length {len} exceeds maximum {MAX_PARTITION_BYTES} bytes"
-                    ),
+                    format!("partition length {len} exceeds maximum {MAX_PARTITION_BYTES} bytes"),
                 ));
             }
 

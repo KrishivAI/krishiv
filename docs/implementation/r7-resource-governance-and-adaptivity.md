@@ -46,14 +46,44 @@ Out of scope:
 
 Deliver job queues, priorities, admission control, quotas, namespace isolation, and cost metrics. Prove that the coordinator can enforce resource policy before work is submitted to executors.
 
+### Pre-R7.1 Architectural Decisions (implemented during R6 closeout)
+
+These decisions were made and partially implemented before R7.1 began, to avoid mid-release breakage:
+
+**`QueueManager` trait stabilized in `krishiv-scheduler`.**
+
+The trait is implemented inside `krishiv-scheduler` (same crate as `MetadataStore` and `LeaderElection`) to keep the deployment unit cohesive. The interface:
+
+```rust
+pub trait QueueManager: Send + Sync + fmt::Debug {
+    fn admit(&self, spec: &JobSpec) -> SubmitOutcome;
+}
+pub enum SubmitOutcome { Accepted, Queued { position: usize } }
+```
+
+`InMemoryQueueManager` (always admits) is the default — wired into `Coordinator::active_with_config` and `standby_with_config`. Replaced via `Coordinator::with_queue_manager(qm)` builder. R7.1 will add `CrdQueueManager` (Kubernetes) and `ConfigFileQueueManager` (process mode) without touching any existing call sites.
+
+**`submit_job` now returns `SchedulerResult<SubmitOutcome>`** (was `SchedulerResult<()>`).
+
+All existing callers that use `?` or `.unwrap()` and discard the value compile unchanged. R7.1 adds quota enforcement by returning `Queued` before placement, with no API changes needed.
+
+**Checkpoint interval timer wired.**
+
+`CheckpointCoordinator::try_tick(elapsed_ms)` and `CoordinatorConfig::tick_period_ms` (default 1 000 ms) added. `Coordinator::advance_heartbeat_clock` now drives per-job checkpoint interval timers automatically. R7 throttling can adjust tick frequency or call `try_tick` directly.
+
+**Per-job resource attribution model** (decision, not yet implemented): `TaskRuntimeStats` in `krishiv-proto` carries `output_rows` and `cpu_nanos` per task. R7.1 quota enforcement will accumulate these into a per-job `ResourceUsage` aggregate stored on `JobRecord`. No schema changes required — the data is already being sent by executors.
+
 ### Architecture Deliverables
 
+- [x] Define `QueueManager` trait — `QueueManager` + `InMemoryQueueManager` in `krishiv-scheduler`; `Coordinator::with_queue_manager` builder wired.
+- [x] Define `SubmitOutcome` — `Accepted` | `Queued { position }` returned by `submit_job`.
 - [ ] Add resource manager service.
-- [ ] Define `QueueManager` trait with `CrdQueueManager` (for Kubernetes mode) and `ConfigQueueManager` (for process mode).
+- [ ] Define `CrdQueueManager` (Kubernetes mode) — wraps `KrishivQueue` CRD status.
+- [ ] Define `ConfigFileQueueManager` (process mode) — reads queue config from a TOML/YAML file.
 - [ ] Define `KrishivQueue` CRD (used by Kubernetes mode).
 - [ ] Define queue and priority model.
 - [ ] Define admission control policy model.
-- [ ] Define CPU and memory quota model.
+- [ ] Define CPU and memory quota model — accumulate `TaskRuntimeStats` into per-job `ResourceUsage` on `JobRecord`.
 - [ ] Define namespace isolation model.
 - [ ] Define cost metric model.
 - [ ] Document resource manager API and operator guide.
@@ -72,7 +102,7 @@ Deliver job queues, priorities, admission control, quotas, namespace isolation, 
 - [ ] Implement resource manager service.
 - [ ] Implement job queues.
 - [ ] Implement job priorities.
-- [ ] Implement admission control.
+- [ ] Implement admission control via `QueueManager` (replace `InMemoryQueueManager` with quota-aware implementation).
 - [ ] Implement CPU and memory quota enforcement.
 - [ ] Implement namespace isolation enforcement.
 - [ ] Add runtime cost metrics.

@@ -820,7 +820,7 @@ impl KrishivJobReconciler {
             Err(SchedulerError::UnknownJob { .. }) => {
                 let job = job_spec_from_resource(resource)?;
                 match coordinator.submit_job(job) {
-                    Ok(()) => {
+                    Ok(_) => {
                         let snapshot = coordinator.job_snapshot(&job_id)?;
                         let status =
                             status_from_snapshot(resource, &self.coordinator_id, &snapshot);

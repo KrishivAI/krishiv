@@ -64,6 +64,10 @@ pub struct ConnectorCapabilities {
     rewindable: bool,
     transactional: bool,
     idempotent: bool,
+    /// Can participate in the barrier checkpoint protocol (R6).
+    supports_checkpoint: bool,
+    /// Implements `TwoPhaseCommitSink` for exactly-once delivery (R6).
+    supports_two_phase_commit: bool,
 }
 
 impl ConnectorCapabilities {
@@ -107,6 +111,20 @@ impl ConnectorCapabilities {
         self
     }
 
+    /// Mark the connector as capable of participating in the barrier checkpoint protocol.
+    #[must_use]
+    pub fn with_checkpoint(mut self) -> Self {
+        self.supports_checkpoint = true;
+        self
+    }
+
+    /// Mark the connector as implementing two-phase commit for exactly-once delivery.
+    #[must_use]
+    pub fn with_two_phase_commit(mut self) -> Self {
+        self.supports_two_phase_commit = true;
+        self
+    }
+
     /// Returns `true` if the data stream is bounded (finite).
     pub fn is_bounded(&self) -> bool {
         self.bounded
@@ -132,9 +150,25 @@ impl ConnectorCapabilities {
         self.idempotent
     }
 
+    /// Returns `true` if the connector can participate in the barrier checkpoint protocol.
+    pub fn is_checkpoint_capable(&self) -> bool {
+        self.supports_checkpoint
+    }
+
+    /// Returns `true` if the connector implements two-phase commit for exactly-once delivery.
+    pub fn is_two_phase_commit_capable(&self) -> bool {
+        self.supports_two_phase_commit
+    }
+
     /// Returns `true` if at least one capability flag is set.
     pub fn has_any(&self) -> bool {
-        self.bounded || self.unbounded || self.rewindable || self.transactional || self.idempotent
+        self.bounded
+            || self.unbounded
+            || self.rewindable
+            || self.transactional
+            || self.idempotent
+            || self.supports_checkpoint
+            || self.supports_two_phase_commit
     }
 }
 
@@ -526,7 +560,9 @@ pub struct InMemoryTwoPhaseCommitSink {
 }
 
 impl InMemoryTwoPhaseCommitSink {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// All committed `(epoch, batch)` pairs, in commit order.
     pub fn committed(&self) -> &[(u64, arrow::record_batch::RecordBatch)] {
@@ -556,7 +592,10 @@ impl TwoPhaseCommitSink for InMemoryTwoPhaseCommitSink {
     ) -> ConnectorResult<Self::Handle> {
         let handle_id = self.next_handle;
         self.next_handle += 1;
-        self.staged.entry(handle_id).or_default().push(batch.clone());
+        self.staged
+            .entry(handle_id)
+            .or_default()
+            .push(batch.clone());
         Ok(InMemoryCommitHandle { epoch, handle_id })
     }
 
@@ -610,6 +649,22 @@ mod tests {
     fn connector_capabilities_default_all_false() {
         let caps = ConnectorCapabilities::new();
         assert!(!caps.has_any());
+    }
+
+    #[test]
+    fn connector_capabilities_checkpoint_flag() {
+        let caps = ConnectorCapabilities::new().with_checkpoint();
+        assert!(caps.is_checkpoint_capable());
+        assert!(!caps.is_two_phase_commit_capable());
+        assert!(caps.has_any());
+    }
+
+    #[test]
+    fn connector_capabilities_two_phase_commit_flag() {
+        let caps = ConnectorCapabilities::new().with_two_phase_commit();
+        assert!(caps.is_two_phase_commit_capable());
+        assert!(!caps.is_checkpoint_capable());
+        assert!(caps.has_any());
     }
 
     // -----------------------------------------------------------------------
@@ -912,10 +967,9 @@ mod tests {
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
-        ).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
+                .unwrap();
 
         let mut sink = InMemoryTwoPhaseCommitSink::new();
         let handle = sink.prepare(1, &batch).unwrap();
@@ -935,10 +989,8 @@ mod tests {
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![42i64]))],
-        ).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42i64]))]).unwrap();
 
         let mut sink = InMemoryTwoPhaseCommitSink::new();
         let handle = sink.prepare(2, &batch).unwrap();
@@ -958,7 +1010,8 @@ mod tests {
             RecordBatch::try_new(
                 Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
                 vec![Arc::new(Int64Array::from(vec![v]))],
-            ).unwrap()
+            )
+            .unwrap()
         };
 
         let mut sink = InMemoryTwoPhaseCommitSink::new();

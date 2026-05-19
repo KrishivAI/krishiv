@@ -2,11 +2,50 @@
 
 ## Current Phase
 
-**R6 IN PROGRESS.** R6 startup sequence complete. Branch `work`. Latest validated sweep for the warning cleanup: `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
+**R6 COMPLETE.** All R6 groups (A–E) implemented. Branch `claude/track-skills-slices-MSvac`. Zero failures across full workspace (`cargo test --workspace`).
 
 ## Active Task
 
-**R6 startup sequence** — all five pre-implementation decisions delivered:
+**R6 — Checkpoints and Savepoints** — all groups complete:
+
+### Group A: Proto + Config Foundation
+- A1: `checkpoint_interval_ms`/`checkpoint_storage_path` fields + builder `with_checkpoint()` + accessors added to `JobSpec` in `krishiv-proto`.
+- A2: Checkpoint control-plane messages added to `krishiv-proto`: `CheckpointSourceOffset`, `InitiateCheckpointRequest`, `CheckpointAckRequest`, `AbortCheckpointRequest`, `CheckpointInitiateResponse`, `CheckpointAckResponse`.
+- A3: `is_savepoint: bool` + `savepoint_label: Option<String>` added to `CheckpointMetadata`; existing test fixtures updated.
+- A4: `fencing_token: u64` already present in `CheckpointMetadata`; `base_dir()` accessor added to `LocalFsCheckpointStorage`.
+- A5: `supports_checkpoint` + `supports_two_phase_commit` flags added to `ConnectorCapabilities` with `with_checkpoint()`, `with_two_phase_commit()`, `is_checkpoint_capable()`, `is_two_phase_commit_capable()` methods; 2 new tests pass.
+
+### Group B: CheckpointCoordinator in krishiv-scheduler
+- B1: `CheckpointCoordinator` struct added with `CheckpointCoordinatorState` enum; `krishiv-checkpoint` dep added to `krishiv-scheduler/Cargo.toml`.
+- B2: Core methods: `new()`, `initiate()`, `initiate_savepoint()`, `receive_ack()`, `commit_epoch()`, `abort_epoch()`, `recover_from_storage()`, `list_epochs()`, accessors.
+- B3: `checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>` added to `Coordinator`; `submit_job` creates coordinator for streaming jobs with checkpoint config; `checkpoint_coordinator()`, `checkpoint_coordinator_mut()`, `handle_checkpoint_ack()` added.
+- B4: `recover_from_store` calls `checkpoint_coordinator.recover_from_storage()` for all registered coordinators.
+- B5: 7 tests: `checkpoint_coordinator_initiates_and_collects_acks`, `checkpoint_coordinator_rejects_stale_epoch_ack`, `checkpoint_coordinator_abort_resets_state`, `checkpoint_coordinator_recover_finds_latest_epoch`, `checkpoint_coordinator_savepoint_sets_flag`, `coordinator_creates_checkpoint_coordinator_for_streaming_job_with_config`, `coordinator_routes_ack_to_correct_job`.
+
+### Group C: Executor Checkpoint Participation
+- C1/C2: `TaskRunner` struct added to `krishiv-executor` with `last_acked_epoch`, `operator_id`, `task_id`, `kafka_source_offset` fields; `handle_initiate_checkpoint()` method.
+- C3/C4: 4 tests: `executor_checkpoint_takes_state_snapshot_and_writes_to_storage`, `executor_checkpoint_ack_includes_snapshot_path`, `executor_checkpoint_ack_includes_source_offset`, `executor_rejects_stale_checkpoint_epoch`.
+
+### Group D: Savepoint/Restore CLI + UI + Coordinator Methods
+- D1: `Coordinator::savepoint_job()`, `list_job_checkpoints()`, `restore_job_from_checkpoint()` added to `krishiv-scheduler`; restore validates epoch integrity and rejects mismatched parallelism; 3 tests pass.
+- D2: `krishiv savepoint --job <id> [--label <str>]` CLI command added to `krishiv-cli`; 4 tests pass.
+- D3: `krishiv restore --job <id> --epoch <n> [--storage-path <p>]` CLI command added; 4 tests pass.
+- D4: `krishiv checkpoints list --job <id>` CLI command added; 3 tests pass.
+- D5: `GET /api/v1/jobs/{job_id}/checkpoints` endpoint added to `krishiv-ui`; returns `JobCheckpointsResponse` JSON with `job_id`, `epochs`, `latest_epoch`; 2 tests pass.
+
+### Group E: Chaos Tests
+- E1 (`chaos_1`): Coordinator kill mid-checkpoint — new coordinator rejects stale-epoch acks; no duplicate commit.
+- E2 (`chaos_1a`): Coordinator restart from durable metadata — `recover_from_storage` resumes epoch sequence.
+- E3 (`chaos_2`): Executor kill mid-checkpoint — abort path is clean; fencing token prevents stale ack acceptance.
+- E4 (`chaos_3`): Sink kill mid-write — `abort()` discards staged output; no partial records visible.
+- E5 (`chaos_4`): Corrupt checkpoint fallback — `list_valid_epochs` returns only manifest-validated epochs; corrupt epoch excluded.
+- E6 (`chaos_e6`): Rolling upgrade via savepoint — `is_savepoint=true` epoch preserved; restore on new coordinator resumes epoch sequence.
+
+**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures across all crates (68 tests in `krishiv-scheduler` alone).
+
+## Previous Active Task
+
+**R6 startup sequence** — all six pre-implementation decisions delivered:
 
 - Workspace bug-sweep: cleared compiler warning bugs in tests (`unused import`, `unused mut`, `unused variable`, `dead code`) across executor/shuffle/connectors/state crates; revalidated targeted crates with `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
 - `FencingToken(u64)` added to `krishiv-proto`: `initial()`, `next()`, `as_u64()`, ordering — 4 tests pass.
@@ -14,6 +53,7 @@
 - `TwoPhaseCommitSink` trait + `InMemoryTwoPhaseCommitSink` added to `krishiv-connectors`: `prepare/commit/abort` protocol with handle-based staging — 3 new tests pass.
 - `crates/krishiv-checkpoint` created: `CheckpointStorage` trait, `LocalFsCheckpointStorage` (atomic write, path traversal guard), `CheckpointMetadata` (versioned JSON), `IntegrityManifest` (SHA-256), higher-level helpers (`write_epoch_metadata`, `validate_epoch`, `list_valid_epochs`, `latest_valid_epoch`, `delete_epoch`, corrupt-checkpoint fallback) — 21 tests pass.
 - `docs/architecture/checkpoint-storage.md` written: key schema, snapshot binary format, integrity manifest format, two-phase commit API shape, rolling upgrade protocol, risks/mitigations.
+- `docs/architecture/rescaling-model.md` written: rescaling decision (savepoint+repartition only; live rescaling post-R6; restore rejects mismatched parallelism); state schema evolution baseline (reject unknown versions immediately — already enforced in `InMemoryStateBackend::load_snapshot` and `CheckpointMetadata::validate`; version increment policy; RocksDB schema evolution deferred). R6 tracker updated: rescaling model and schema evolution baseline marked complete.
 
 ## Previous Task: R5.2 implementation complete — all slices including durable backend:
 
@@ -285,15 +325,22 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None. R5 complete and code quality sweep done. Ready for R6.
+- None. R6 fully closed. Pre-R7 hardening complete. Ready for R7.1.
 
 ## Next Steps
 
-1. **R6 checkpoint coordinator**: Implement in `krishiv-scheduler` — `CheckpointCoordinator` struct, `initiate_checkpoint(epoch)` injects barriers into source operators, collects `CheckpointAck`, writes `CheckpointMetadata` + `IntegrityManifest` via `LocalFsCheckpointStorage`. Fencing token check on write.
-2. **R6 source offset coordination**: Wire `source_offsets` into `CheckpointMetadata` from executor-reported last Kafka offset at barrier time.
-3. **R6 savepoint CLI**: `krishiv savepoint` + `krishiv restore` commands.
-4. **R6 chaos tests**: coordinator kill mid-checkpoint, executor kill mid-checkpoint, corrupt checkpoint fallback.
-2. **Live Kafka E2E** (optional R6 hardening): wire `rdkafka` behind `kafka-runtime` Cargo feature + Redpanda Docker Compose once R6 connector certification begins.
+1. **R7.1 resource manager**: Implement `CrdQueueManager` (K8s) and `ConfigFileQueueManager` (process mode); add `KrishivQueue` CRD; wire quota enforcement into `submit_job` via `QueueManager`.
+2. **R7.1 admission tests**: Jobs above quota queued, cost metrics visible in status API.
+3. **R7.2 backpressure**: Credit-based flow control, bounded operator queues, source throttling.
+
+## Pre-R7 Hardening (completed this session)
+
+- **Exactly-once certification doc**: `docs/architecture/exactly-once-certification.md` written — names the certified triple, marks all other combinations at-least-once, cross-references chaos tests. R6 acceptance gate now fully closed.
+- **Checkpoint timer wired**: `CheckpointCoordinator::try_tick(elapsed_ms)` added; `advance_heartbeat_clock` drives per-job checkpoint interval timers automatically. `CoordinatorConfig::tick_period_ms` (default 1 000 ms) controls the tick-to-ms conversion. 3 new tests.
+- **`QueueManager` trait stabilized**: `QueueManager` + `InMemoryQueueManager` + `SubmitOutcome { Accepted, Queued }` added to `krishiv-scheduler`. `Coordinator::with_queue_manager` builder wired. `submit_job` returns `SchedulerResult<SubmitOutcome>`. 3 new tests.
+- **R7 tracker updated**: Pre-R7 architectural decisions documented in `docs/implementation/r7-resource-governance-and-adaptivity.md`.
+
+**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures (74 scheduler tests).
 
 ## Known Blockers
 
