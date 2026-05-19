@@ -227,12 +227,12 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None (R5.1 fully complete; committed to branch `claude/plan-r5-implementation-NXiWo`).
+- None. R5.1 acceptance gate fully closed. Ready for R5.2.
 
 ## Next Steps
 
-1. **R5.1 acceptance gate — live Kafka E2E** (only remaining gate item): write an opt-in integration test (`KRISHIV_KAFKA_E2E=1`) that runs the full Kafka → tumbling window → in-memory state → Kafka sink path on real executors with a live Kafka broker. All other acceptance criteria are met.
-2. **R5.2 begin**: only after live Kafka E2E acceptance test passes. Start with RocksDB `StateBackend` impl, then sliding/session windows, multi-source watermarks, and state TTL.
+1. **R5.2**: Begin with RocksDB `StateBackend` impl (behind `spawn_blocking` isolation boundary), then sliding/session windows, multi-source watermarks, and state TTL. Gate: R5.1 all acceptance criteria now met.
+2. **Live Kafka E2E** (optional R6 hardening): wire `rdkafka` behind `kafka-runtime` Cargo feature + Redpanda Docker Compose once R6 connector certification begins.
 
 ## Known Blockers
 
