@@ -14,6 +14,7 @@ members = [
     "crates/krishiv-scheduler",
     "crates/krishiv-shuffle",
     "crates/krishiv-sql",
+    "crates/krishiv-state",
     "crates/krishiv-ui",
 ]
 resolver = "3"

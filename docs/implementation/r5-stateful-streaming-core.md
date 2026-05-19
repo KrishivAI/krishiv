@@ -64,55 +64,55 @@ Prove the streaming execution model is correct on a single end-to-end path befor
 
 ### Architecture Deliverables
 
-- [ ] Add `TaskRunner` trait (or equivalent enum dispatch) to `krishiv-executor` separating batch-terminal execution from streaming-continuous execution. R5.1 streaming operators MUST use the streaming runner; R1–R4 batch operators MUST continue to use the batch runner unchanged.
-- [ ] Write `docs/architecture/checkpoint-protocol.md` covering aligned checkpoint barrier model, barrier/watermark ordering invariants, and R5.1 simulation requirements. Must exist and be reviewed before R5.1 streaming window implementation starts.
-- [ ] Define keyed-distribution stability contract per `docs/architecture/keyed-distribution-stability.md`: `key_by(column)` guarantees same-key → same task for the job lifetime; AQE coalescing is disabled for streaming stages.
-- [ ] Add `crates/krishiv-state`.
-- [ ] Define keyed state API (read, write, clear per key).
-- [ ] Define state namespace model.
-- [ ] Define timer service abstraction (event-time only in R5.1).
-- [ ] Define single-source watermark propagation rules.
-- [ ] Define in-memory state backend interface.
-- [ ] Define continuous operator execution loop: how a streaming stage differs from a batch stage in the executor (no terminal completion; produces output continuously).
-- [ ] Define streaming job lifecycle in the scheduler (streaming jobs never transition to Succeeded while running).
+- [x] Add `TaskRunner` trait (or equivalent enum dispatch) to `krishiv-executor` separating batch-terminal execution from streaming-continuous execution. R5.1 streaming operators MUST use the streaming runner; R1–R4 batch operators MUST continue to use the batch runner unchanged.
+- [x] Write `docs/architecture/checkpoint-protocol.md` covering aligned checkpoint barrier model, barrier/watermark ordering invariants, and R5.1 simulation requirements. Must exist and be reviewed before R5.1 streaming window implementation starts.
+- [x] Define keyed-distribution stability contract per `docs/architecture/keyed-distribution-stability.md`: `key_by(column)` guarantees same-key → same task for the job lifetime; AQE coalescing is disabled for streaming stages.
+- [x] Add `crates/krishiv-state`.
+- [x] Define keyed state API (read, write, clear per key).
+- [x] Define state namespace model.
+- [x] Define timer service abstraction (event-time only in R5.1).
+- [x] Define single-source watermark propagation rules.
+- [x] Define in-memory state backend interface.
+- [x] Define continuous operator execution loop: how a streaming stage differs from a batch stage in the executor (no terminal completion; produces output continuously).
+- [x] Define streaming job lifecycle in the scheduler (streaming jobs never transition to Succeeded while running).
 - [ ] Define streaming job re-attach protocol: on coordinator restart, active streaming executors re-register with current task state (last watermark, last processed Kafka offset); coordinator re-attaches to the running job instead of creating a new one.
-- [ ] Define checkpoint-barrier and watermark interaction protocol for R6 checkpoint implementation.
-- [ ] Define how barriers flow through single-source tumbling windows without closing windows incorrectly.
-- [ ] Define clock skew handling policy: Krishiv trusts the `event_time` field in source records as-is. Late events (event_time < current watermark) are dropped. Clock skew between producers is the operator's responsibility at the source. The `allowed_lateness` window in the watermark configuration is the primary mechanism for tolerating moderate producer clock skew. This policy must be documented in R5.1 release notes.
+- [x] Define checkpoint-barrier and watermark interaction protocol for R6 checkpoint implementation.
+- [x] Define how barriers flow through single-source tumbling windows without closing windows incorrectly.
+- [x] Define clock skew handling policy: Krishiv trusts the `event_time` field in source records as-is. Late events (event_time < current watermark) are dropped. Clock skew between producers is the operator's responsibility at the source. The `allowed_lateness` window in the watermark configuration is the primary mechanism for tolerating moderate producer clock skew. This policy must be documented in R5.1 release notes.
 - [ ] Document R5.1 streaming semantics, limitations, and the exact watermark model used.
 
 ### API And Interface Deliverables
 
-- [ ] Add `key_by` to the stream API.
-- [ ] Add event-time timestamp assignment API.
-- [ ] Add watermark configuration API (single source, fixed lag).
-- [ ] Add tumbling window API.
-- [ ] Add event-time timer API for internal operators.
+- [x] Add `key_by` to the stream API.
+- [x] Add event-time timestamp assignment API.
+- [x] Add watermark configuration API (single source, fixed lag).
+- [x] Add tumbling window API.
+- [x] Add event-time timer API for internal operators.
 
 ### Runtime Deliverables
 
-- [ ] Implement continuous operator execution loop on executor (input RecordBatch loop, no terminal state).
-- [ ] Implement streaming job lifecycle in coordinator (no auto-transition to Succeeded).
+- [x] Implement continuous operator execution loop on executor (input RecordBatch loop, no terminal state).
+- [x] Implement streaming job lifecycle in coordinator (no auto-transition to Succeeded).
 - [ ] Implement streaming job re-attach: on coordinator restart, accept executor re-registration with current watermark and offset; resume the job from executor-reported state instead of re-submitting a fresh job.
-- [ ] Implement in-memory keyed state backend.
-- [ ] Implement event-time timers.
-- [ ] Implement single-source watermark propagation.
-- [ ] Implement tumbling window aggregation.
-- [ ] Implement deterministic replay harness (replay the same Kafka input, compare outputs).
-- [ ] Implement checkpoint-barrier protocol simulation for the certified path (metadata only; durable checkpoints remain R6).
+- [x] Implement in-memory keyed state backend.
+- [x] Implement event-time timers.
+- [x] Implement single-source watermark propagation.
+- [x] Implement tumbling window aggregation.
+- [x] Implement deterministic replay harness (replay the same Kafka input, compare outputs).
+- [x] Implement checkpoint-barrier protocol simulation for the certified path (metadata only; durable checkpoints remain R6).
 
 ### Test Checklist
 
-- [ ] Keyed state read/write/clear unit tests pass.
-- [ ] In-memory state backend tests pass.
-- [ ] Event-time timer fires at correct watermark.
-- [ ] Single-source watermark propagation advances correctly.
-- [ ] Tumbling window correctness tests pass (windows close at the right watermark).
-- [ ] Deterministic replay test: same Kafka input produces identical output on two consecutive runs.
-- [ ] Checkpoint-barrier simulation preserves watermark/window ordering.
-- [ ] Streaming job remains in Running state in coordinator and does not auto-transition to Succeeded.
+- [x] Keyed state read/write/clear unit tests pass.
+- [x] In-memory state backend tests pass.
+- [x] Event-time timer fires at correct watermark.
+- [x] Single-source watermark propagation advances correctly.
+- [x] Tumbling window correctness tests pass (windows close at the right watermark).
+- [x] Deterministic replay test: same Kafka input produces identical output on two consecutive runs.
+- [x] Checkpoint-barrier simulation preserves watermark/window ordering.
+- [x] Streaming job remains in Running state in coordinator and does not auto-transition to Succeeded.
 - [ ] Re-attach test: coordinator restarts while streaming executors are active; executors re-register with current watermark and offset; job resumes without re-processing already-committed events.
-- [ ] R1-R4 batch behavior still passes (no regression).
+- [x] R1-R4 batch behavior still passes (no regression).
 
 ### Acceptance Gate For R5.1
 

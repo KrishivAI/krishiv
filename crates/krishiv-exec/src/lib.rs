@@ -578,6 +578,235 @@ impl LocalAggregator {
     }
 }
 
+// ── WatermarkState ────────────────────────────────────────────────────────────
+
+/// Per-operator monotonic watermark tracker for event-time streaming.
+///
+/// Watermark = max(event_time_seen) − lag_ms.  The watermark never decreases.
+/// Events with `event_time_ms < current_watermark_ms()` are late and must be
+/// dropped by the operator before calling `advance`.
+#[derive(Debug, Clone)]
+pub struct WatermarkState {
+    max_event_time_ms: i64,
+    lag_ms: u64,
+}
+
+impl WatermarkState {
+    /// Create a watermark tracker with the given allowed lateness in milliseconds.
+    pub fn new(lag_ms: u64) -> Self {
+        Self {
+            max_event_time_ms: i64::MIN,
+            lag_ms,
+        }
+    }
+
+    /// Advance the high-water mark to `event_time_ms` if it is greater than
+    /// the current maximum.  The watermark is recalculated after each advance.
+    pub fn advance(&mut self, event_time_ms: i64) {
+        if event_time_ms > self.max_event_time_ms {
+            self.max_event_time_ms = event_time_ms;
+        }
+    }
+
+    /// Current watermark in milliseconds.  Returns `i64::MIN` until the first
+    /// event has been observed.
+    pub fn current_watermark_ms(&self) -> i64 {
+        if self.max_event_time_ms == i64::MIN {
+            i64::MIN
+        } else {
+            self.max_event_time_ms.saturating_sub(self.lag_ms as i64)
+        }
+    }
+
+    /// Whether `event_time_ms` is strictly less than the current watermark
+    /// (i.e. the event arrived late and must be dropped).
+    pub fn is_late(&self, event_time_ms: i64) -> bool {
+        event_time_ms < self.current_watermark_ms()
+    }
+}
+
+// ── TumblingWindowSpec ────────────────────────────────────────────────────────
+
+/// Configuration for a tumbling event-time window operator.
+#[derive(Debug, Clone)]
+pub struct TumblingWindowSpec {
+    /// Name of the column to key by (Utf8 or Int64; serialised to String).
+    pub key_column: String,
+    /// Name of the Int64 column carrying event time in milliseconds.
+    pub event_time_column: String,
+    /// Window duration in milliseconds.
+    pub window_size_ms: u64,
+    /// Aggregate expressions to apply within each window.
+    pub agg_exprs: Vec<AggExpr>,
+}
+
+// ── TumblingWindowOperator ────────────────────────────────────────────────────
+
+/// Tumbling event-time window operator backed by an in-memory accumulation map.
+///
+/// State structure: `(serialised_key, window_start_ms) → AggState`.
+/// Windows are closed and flushed when the watermark reaches their end time.
+///
+/// **Late-event semantics**: an event is late if its `event_time_ms` is
+/// strictly less than the watermark from the *previous* batch (stored as
+/// `prev_watermark_ms`).  Events in the current batch are never late relative
+/// to the watermark they themselves advance — the caller computes the new
+/// watermark from this batch and passes it as `new_watermark_ms`.
+///
+/// Output schema per closed window:
+/// `key_column (Utf8), window_start_ms (Int64), window_end_ms (Int64),
+///  …agg output columns (Int64)`.
+pub struct TumblingWindowOperator {
+    spec: TumblingWindowSpec,
+    // (serialised_key, window_start_ms) → aggregate accumulator
+    accumulators: HashMap<(String, i64), AggState>,
+    // Watermark from before the last processed batch; used for late-event
+    // detection.  Initialised to i64::MIN so the first batch is never late.
+    prev_watermark_ms: i64,
+}
+
+impl TumblingWindowOperator {
+    /// Create a new operator.
+    pub fn new(spec: TumblingWindowSpec) -> Self {
+        Self {
+            spec,
+            accumulators: HashMap::new(),
+            prev_watermark_ms: i64::MIN,
+        }
+    }
+
+    /// Number of open (not yet flushed) window buckets.
+    pub fn open_window_count(&self) -> usize {
+        self.accumulators.len()
+    }
+
+    /// Compute the window start for an event time using floor division.
+    fn window_start(event_time_ms: i64, window_size_ms: u64) -> i64 {
+        let size = window_size_ms as i64;
+        // Integer floor division that works for negative timestamps too.
+        let q = event_time_ms / size;
+        let r = event_time_ms % size;
+        if r < 0 { (q - 1) * size } else { q * size }
+    }
+
+    /// Process one `RecordBatch`.
+    ///
+    /// `new_watermark_ms` is the watermark computed *after* advancing from
+    /// this batch's event times.  Events are late only if their
+    /// `event_time_ms` is below the watermark from the **previous** batch
+    /// (`prev_watermark_ms`).  Windows whose `window_end ≤ new_watermark_ms`
+    /// are closed and returned.
+    pub fn process_batch(
+        &mut self,
+        batch: &RecordBatch,
+        new_watermark_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let key_idx = batch
+            .schema()
+            .index_of(&self.spec.key_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.spec.key_column.clone()))?;
+        let time_idx = batch
+            .schema()
+            .index_of(&self.spec.event_time_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.spec.event_time_column.clone()))?;
+
+        let time_col = batch.column(time_idx);
+        let time_arr = time_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                ExecError::UnsupportedType(format!(
+                    "event_time column '{}' must be Int64",
+                    self.spec.event_time_column
+                ))
+            })?;
+
+        // Use the watermark from the PREVIOUS batch as the late threshold.
+        let late_threshold = self.prev_watermark_ms;
+
+        for row in 0..batch.num_rows() {
+            let event_time_ms = time_arr.value(row);
+            // Drop events that arrived late relative to the previous watermark.
+            if event_time_ms < late_threshold {
+                continue;
+            }
+            let key = format_key_value(batch, key_idx, row)?;
+            let win_start = Self::window_start(event_time_ms, self.spec.window_size_ms);
+            let state = self
+                .accumulators
+                .entry((key, win_start))
+                .or_insert_with(|| AggState::new(&self.spec.agg_exprs));
+            state.update(&self.spec.agg_exprs, batch, row)?;
+        }
+
+        // Advance internal watermark AFTER accumulating this batch.
+        self.prev_watermark_ms = new_watermark_ms;
+
+        self.flush_closed_windows(new_watermark_ms)
+    }
+
+    /// Flush all window buckets whose end time is ≤ `watermark_ms`.
+    ///
+    /// Returns one `RecordBatch` per closed window, sorted by
+    /// `(window_start_ms, key)` for deterministic output.
+    pub fn flush_closed_windows(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
+        let size = self.spec.window_size_ms as i64;
+
+        let mut closed: Vec<(String, i64)> = self
+            .accumulators
+            .keys()
+            .filter(|(_, win_start)| win_start + size <= watermark_ms)
+            .cloned()
+            .collect();
+
+        if closed.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Deterministic output order.
+        closed.sort_by(|(ka, wa), (kb, wb)| wa.cmp(wb).then(ka.cmp(kb)));
+
+        let mut output = Vec::with_capacity(closed.len());
+        for bucket in closed {
+            if let Some(state) = self.accumulators.remove(&bucket) {
+                output.push(self.build_output_batch(&bucket.0, bucket.1, &state)?);
+            }
+        }
+        Ok(output)
+    }
+
+    fn build_output_batch(
+        &self,
+        key_value: &str,
+        window_start_ms: i64,
+        state: &AggState,
+    ) -> ExecResult<RecordBatch> {
+        let size = self.spec.window_size_ms as i64;
+        let window_end_ms = window_start_ms + size;
+
+        let mut fields = vec![
+            Field::new(&self.spec.key_column, DataType::Utf8, false),
+            Field::new("window_start_ms", DataType::Int64, false),
+            Field::new("window_end_ms", DataType::Int64, false),
+        ];
+        for agg in &self.spec.agg_exprs {
+            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![key_value])),
+            Arc::new(Int64Array::from(vec![window_start_ms])),
+            Arc::new(Int64Array::from(vec![window_end_ms])),
+        ];
+        for (i, _) in self.spec.agg_exprs.iter().enumerate() {
+            columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
+        }
+
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -605,11 +834,14 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::{AggExpr, AggFunction, BroadcastJoin, ExecError, HashJoin, LocalAggregator};
+    use super::{
+        AggExpr, AggFunction, BroadcastJoin, ExecError, HashJoin, LocalAggregator,
+        TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
+    };
 
     fn make_int32_batch(
         key_name: &str,
@@ -953,5 +1185,254 @@ mod tests {
         let result = agg.aggregate(&batch).unwrap();
         // 3 unique groups: a, b, c
         assert_eq!(result.num_rows(), 3);
+    }
+
+    // ── WatermarkState tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn watermark_starts_at_min() {
+        let wm = WatermarkState::new(0);
+        assert_eq!(wm.current_watermark_ms(), i64::MIN);
+    }
+
+    #[test]
+    fn watermark_advances_monotonically() {
+        let mut wm = WatermarkState::new(0);
+        wm.advance(1000);
+        assert_eq!(wm.current_watermark_ms(), 1000);
+        wm.advance(500); // older — must not reduce watermark
+        assert_eq!(wm.current_watermark_ms(), 1000);
+        wm.advance(2000);
+        assert_eq!(wm.current_watermark_ms(), 2000);
+    }
+
+    #[test]
+    fn watermark_lag_subtracted_correctly() {
+        let mut wm = WatermarkState::new(500);
+        wm.advance(1000);
+        assert_eq!(wm.current_watermark_ms(), 500); // 1000 − 500
+    }
+
+    #[test]
+    fn watermark_is_late_detects_late_events() {
+        let mut wm = WatermarkState::new(0);
+        wm.advance(1000);
+        assert!(!wm.is_late(1000)); // exact watermark — not late
+        assert!(wm.is_late(999)); // below watermark — late
+        assert!(!wm.is_late(1001));
+    }
+
+    // ── TumblingWindowOperator tests ──────────────────────────────────────────
+
+    fn make_stream_batch(keys: Vec<&str>, timestamps: Vec<i64>, vals: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(Int64Array::from(timestamps)) as ArrayRef,
+                Arc::new(Int64Array::from(vals)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn count_window_spec() -> TumblingWindowSpec {
+        TumblingWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000, // 1-second windows
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Count,
+                input_column: String::new(),
+                output_column: "count".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn window_does_not_flush_before_watermark() {
+        let mut op = TumblingWindowOperator::new(count_window_spec());
+        // Events at t=100 and t=200 both land in window [0, 1000).
+        // Watermark = 0 (no lag) → window_end = 1000 > 0, so nothing flushes.
+        let batch = make_stream_batch(vec!["a", "a"], vec![100, 200], vec![1, 1]);
+        let output = op.process_batch(&batch, 0).unwrap();
+        assert!(
+            output.is_empty(),
+            "window should not flush before watermark reaches window_end"
+        );
+        assert_eq!(op.open_window_count(), 1);
+    }
+
+    #[test]
+    fn window_flushes_when_watermark_reaches_window_end() {
+        let mut op = TumblingWindowOperator::new(count_window_spec());
+        // Feed events into window [0, 1000).
+        let batch = make_stream_batch(vec!["a", "b", "a"], vec![100, 200, 300], vec![1, 1, 1]);
+        // Watermark = 1000 → window [0,1000) closes.
+        let output = op.process_batch(&batch, 1000).unwrap();
+        assert_eq!(output.len(), 2, "one batch per unique key: a and b");
+
+        // Collect counts.
+        let total_rows: usize = output.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+
+        // Find a's count (should be 2).
+        let a_batch = output
+            .iter()
+            .find(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0)
+                    == "a"
+            })
+            .expect("expected output for key 'a'");
+        let count_col = a_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count_col.value(0), 2);
+    }
+
+    #[test]
+    fn late_events_are_dropped() {
+        let mut op = TumblingWindowOperator::new(count_window_spec());
+
+        // First batch: establish prev_watermark = 500 by processing an event
+        // at ts=500.  After this call prev_watermark_ms = 500.
+        let wm_batch = make_stream_batch(vec!["x"], vec![500], vec![0]);
+        let _ = op.process_batch(&wm_batch, 500).unwrap();
+
+        // Second batch: ts=100 and ts=200 are late (< prev_watermark=500);
+        // ts=600 is valid and lands in window [0, 1000).
+        let batch = make_stream_batch(vec!["a", "a", "a"], vec![100, 200, 600], vec![1, 1, 1]);
+        // Pass new_watermark=500 (unchanged — no later event in this batch).
+        let output = op.process_batch(&batch, 500).unwrap();
+        // Window [0,1000) still open (window_end=1000 > 500).
+        assert!(output.is_empty());
+
+        // Flush by advancing watermark past window end.
+        let final_out = op.flush_closed_windows(1000).unwrap();
+        // Two keys: "x" (count=1 from first batch) and "a" (count=1 from ts=600).
+        let total: i64 = final_out
+            .iter()
+            .map(|b| {
+                b.column(3)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .sum();
+        assert_eq!(total, 2); // "x"=1 + "a"=1 (ts=100,200 were late and dropped)
+    }
+
+    #[test]
+    fn window_sum_aggregation() {
+        let spec = TumblingWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Sum,
+                input_column: "val".into(),
+                output_column: "sum_val".into(),
+            }],
+        };
+        let mut op = TumblingWindowOperator::new(spec);
+        let batch = make_stream_batch(vec!["x", "x", "x"], vec![0, 100, 200], vec![10, 20, 30]);
+        let output = op.process_batch(&batch, 1000).unwrap();
+        assert_eq!(output.len(), 1);
+        let sum = output[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sum, 60);
+    }
+
+    #[test]
+    fn window_output_schema_is_correct() {
+        let mut op = TumblingWindowOperator::new(count_window_spec());
+        let batch = make_stream_batch(vec!["a"], vec![100], vec![1]);
+        let output = op.process_batch(&batch, 1000).unwrap();
+        assert_eq!(output.len(), 1);
+        let schema = output[0].schema();
+        assert_eq!(schema.field(0).name(), "key");
+        assert_eq!(schema.field(1).name(), "window_start_ms");
+        assert_eq!(schema.field(2).name(), "window_end_ms");
+        assert_eq!(schema.field(3).name(), "count");
+    }
+
+    #[test]
+    fn window_start_end_values_are_correct() {
+        let mut op = TumblingWindowOperator::new(count_window_spec());
+        // Event at t=100, window_size=1000 → window [0, 1000).
+        let batch = make_stream_batch(vec!["a"], vec![100], vec![1]);
+        let output = op.process_batch(&batch, 1000).unwrap();
+        let win_start = output[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let win_end = output[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(win_start, 0);
+        assert_eq!(win_end, 1000);
+    }
+
+    #[test]
+    fn deterministic_replay_produces_identical_output() {
+        // Slice G — same input must produce identical output on two runs.
+        let run = |spec: TumblingWindowSpec, batch: &RecordBatch| -> Vec<RecordBatch> {
+            let mut op = TumblingWindowOperator::new(spec);
+            let mut out = op.process_batch(batch, 1000).unwrap();
+            out.extend(op.flush_closed_windows(i64::MAX).unwrap());
+            out
+        };
+
+        let batch = make_stream_batch(
+            vec!["a", "b", "a", "b", "a"],
+            vec![100, 150, 200, 250, 300],
+            vec![1, 2, 3, 4, 5],
+        );
+
+        let run1 = run(count_window_spec(), &batch);
+        let run2 = run(count_window_spec(), &batch);
+
+        assert_eq!(
+            run1.len(),
+            run2.len(),
+            "run1 and run2 must produce the same number of output batches"
+        );
+        for (b1, b2) in run1.iter().zip(run2.iter()) {
+            assert_eq!(b1.schema(), b2.schema());
+            assert_eq!(b1.num_rows(), b2.num_rows());
+            // Compare column by column.
+            for col_idx in 0..b1.num_columns() {
+                let c1 = b1.column(col_idx);
+                let c2 = b2.column(col_idx);
+                assert_eq!(c1.data_type(), c2.data_type());
+                // Compare as debug strings — sufficient for Int64/Utf8.
+                assert_eq!(
+                    format!("{c1:?}"),
+                    format!("{c2:?}"),
+                    "column {col_idx} differs between run1 and run2"
+                );
+            }
+        }
     }
 }

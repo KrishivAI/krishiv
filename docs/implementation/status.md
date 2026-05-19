@@ -2,11 +2,52 @@
 
 ## Current Phase
 
-R4 Shuffle and Batch AQE — Tier 1 + Tier 2 + Tier 3 complete. Pre-R5 hardening complete. R5.1 stateful streaming core is unblocked.
+R5.1 Stateful Streaming Core — all slices (A–G) complete. Branch `claude/plan-r5-implementation-NXiWo`. Zero failures across full workspace.
 
 ## Active Task
 
-R4 full implementation complete across all three tiers (122→270 tests, 0 failures):
+R5.1 full implementation complete (270→~350 tests, 0 failures):
+
+**Slice A — `krishiv-state` crate** (NEW)
+- `StateBackend` trait: `get`, `put`, `delete`, `clear_namespace`
+- `InMemoryStateBackend`: BTreeMap-backed, keyed by `(operator_id, state_name, key)`
+- `Namespace`: column-family model (`operator_id:state_name`)
+- `TimerService` trait: event-time timer registration/cancellation/drain
+- `InMemoryTimerService`: BTreeMap-ordered by `(deadline_ms, namespace, key)` with O(log n) `split_off` drain
+- 12 tests pass
+
+**Slice B — `krishiv-api` streaming builder API**
+- `WatermarkSpec::fixed_lag_ms(lag_ms)` 
+- `Stream::key_by(column)` → `KeyedStream`
+- `KeyedStream::with_event_time(col).watermark(spec).tumbling_window(ms)` → `WindowedStream`
+- Accessor methods for all fields; 4 new tests pass
+
+**Slice C — `WatermarkState` in `krishiv-exec`**
+- `advance(event_time_ms)`, `current_watermark_ms()` (max - lag, `i64::MIN` if no events), `is_late(event_time_ms)`
+- Monotonic guarantees; 4 new tests pass
+
+**Slice D — `execute_streaming_fragment` in `krishiv-executor`**
+- Parses `stream:tw:key=<col>:time=<col>:win=<ms>:lag=<ms>[:agg=count|sum:col=<col>]`
+- Parses `stream-kafka:<topic>:<partition>:<start_offset>:key=k,ts=t,val=v|...` input partitions
+- Calls `WatermarkState` + `TumblingWindowOperator`; returns `ExecutorTaskOutput::streaming_window(...)`
+
+**Slice E — `TumblingWindowOperator` in `krishiv-exec`**
+- `TumblingWindowSpec`: `key_column`, `event_time_column`, `window_size_ms`, `agg_exprs`
+- `process_batch(batch, new_watermark_ms)`: uses `prev_watermark_ms` for late-event detection (events are late relative to the PREVIOUS batch's watermark); flushes closed windows
+- `flush_closed_windows(watermark_ms)`: emits `(key, window_start_ms, window_end_ms, ...agg)` batches
+- 9 tests pass including `deterministic_replay_produces_identical_output`
+
+**Slice F — `BarrierSimulator` + `BarrierSnapshot` in `krishiv-executor`**
+- `BarrierSimulator::process_barrier(epoch, watermark_ms, open_windows)`: enforces monotonically increasing epoch
+- `BarrierSnapshot`: records epoch, watermark_ms, open_windows count
+- 5 barrier tests pass
+
+**Slice G — `deterministic_replay_end_to_end` test in `krishiv-executor`**
+- Two independent executor instances; same `stream-kafka:` input; outputs compared for identity
+
+## Completed
+
+- R4 full implementation complete across all three tiers (122→270 tests, 0 failures):
 
 **Tier 1 (Foundation)**
 - Proto extensions: `StageSpec.upstream_stage_ids`, `output_partition_count`, `ShufflePartitionOutput`, `TaskRuntimeStats`, `InputPartitionDescriptor::ShuffleFlight`
@@ -186,14 +227,13 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 
 ## In Progress
 
-- None (R4 TPC-H correctness gate committed to branch `claude/analyze-r3-plan-r4-0QYyr`).
+- None (R5.1 slices A–G committed to branch `claude/plan-r5-implementation-NXiWo`).
 
 ## Next Steps
 
-1. Begin R5.1: implement `crates/krishiv-state` with keyed state API and in-memory backend.
-2. Add `key_by`, event-time timestamp assignment, watermark, and tumbling-window APIs to `krishiv-api`.
-3. Implement continuous operator execution loop in `execute_streaming_fragment` (replace `StreamingNotImplemented` stub).
-4. Add live external Kafka broker integration behind an opt-in test once a real Kafka runtime feature is selected.
+1. **R5.1 acceptance gate**: wire the certified path on real executor with a live Kafka broker (opt-in, `KRISHIV_KAFKA_E2E=1`). The streaming job must not auto-transition to Succeeded. Re-attach test: coordinator restart while streaming executor is active.
+2. **R5.2 begin**: only after R5.1 acceptance gate passes. Start with RocksDB `StateBackend` impl, then sliding/session windows, multi-source watermarks, and state TTL.
+3. Update `docs/implementation/r5-stateful-streaming-core.md` checklist items to `[x]` as acceptance gates pass.
 
 ## Known Blockers
 
@@ -353,6 +393,14 @@ Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-
 - **`StreamingTaskState` proto type**: Added to `krishiv-proto` with `task_id`, `watermark_ms`, `source_offset`; attached to `ExecutorHeartbeat` via `streaming_task_states` field.
 - **Architecture docs**: `docs/architecture/checkpoint-protocol.md` and `docs/architecture/keyed-distribution-stability.md` written and committed.
 
+## Last Validation (R5.1, branch `claude/plan-r5-implementation-NXiWo`)
+
+- `cargo fmt --all` applied; `cargo test --workspace` passed — 0 failures across all crates.
+- New crate `krishiv-state`: 12 tests pass.
+- `krishiv-api` streaming builder: 4 new tests pass.
+- `krishiv-exec` `WatermarkState` + `TumblingWindowOperator`: 9 + 4 tests pass.
+- `krishiv-executor` `execute_streaming_fragment` + `BarrierSimulator`: 10 new tests pass.
+
 ## Resume Instructions
 
 For a new Codex session:
@@ -360,7 +408,7 @@ For a new Codex session:
 1. Read `AGENTS.md`.
 2. Read this file.
 3. Read `docs/implementation/r5-stateful-streaming-core.md`.
-4. Pre-R5 hardening is complete. Begin R5.1 with `crates/krishiv-state` keyed state API.
+4. R5.1 implementation (slices A–G) is complete. Next: R5.1 acceptance gate (live Kafka path), then R5.2.
 
 For a new Claude Code session:
 

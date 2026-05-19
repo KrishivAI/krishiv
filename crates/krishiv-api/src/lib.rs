@@ -528,6 +528,138 @@ impl Stream {
             self.execution_mode,
         ))
     }
+
+    /// Key the stream by `column`, returning a [`KeyedStream`] that supports
+    /// event-time windowing and stateful aggregation.
+    ///
+    /// `key_by` is the entry point for the R5.1 stateful streaming API.
+    /// The same key always routes to the same executor task for the job
+    /// lifetime (keyed-distribution stability contract).
+    pub fn key_by(self, column: impl Into<String>) -> KeyedStream {
+        KeyedStream {
+            key_column: column.into(),
+            event_time_column: None,
+            watermark_spec: None,
+            inner: self,
+        }
+    }
+}
+
+// ── Streaming API ─────────────────────────────────────────────────────────────
+
+/// Watermark configuration for event-time streaming.
+///
+/// A fixed-lag watermark declares that no event with `event_time < max_seen − lag`
+/// will ever arrive.  This is the only watermark strategy in R5.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatermarkSpec {
+    lag_ms: u64,
+}
+
+impl WatermarkSpec {
+    /// Create a fixed-lag watermark with the given allowed lateness in milliseconds.
+    pub fn fixed_lag_ms(lag_ms: u64) -> Self {
+        Self { lag_ms }
+    }
+
+    /// Allowed lateness in milliseconds.
+    pub fn lag_ms(&self) -> u64 {
+        self.lag_ms
+    }
+}
+
+/// A stream keyed by a column value.
+///
+/// Created by [`Stream::key_by`].  Use the builder methods to configure
+/// event-time extraction, watermarking, and windowing before submitting to a
+/// distributed runtime.
+#[derive(Debug, Clone)]
+pub struct KeyedStream {
+    inner: Stream,
+    key_column: String,
+    event_time_column: Option<String>,
+    watermark_spec: Option<WatermarkSpec>,
+}
+
+impl KeyedStream {
+    /// Assign event time from `column` (must be `Int64` milliseconds since epoch).
+    #[must_use]
+    pub fn with_event_time(mut self, column: impl Into<String>) -> Self {
+        self.event_time_column = Some(column.into());
+        self
+    }
+
+    /// Configure the watermark strategy for late-event handling.
+    #[must_use]
+    pub fn watermark(mut self, spec: WatermarkSpec) -> Self {
+        self.watermark_spec = Some(spec);
+        self
+    }
+
+    /// Create a tumbling event-time window of `window_size_ms` milliseconds.
+    pub fn tumbling_window(self, window_size_ms: u64) -> WindowedStream {
+        WindowedStream {
+            keyed: self,
+            window_size_ms,
+        }
+    }
+
+    /// The column used to key the stream.
+    pub fn key_column(&self) -> &str {
+        &self.key_column
+    }
+
+    /// The event-time column, if configured.
+    pub fn event_time_column(&self) -> Option<&str> {
+        self.event_time_column.as_deref()
+    }
+
+    /// The watermark configuration, if set.
+    pub fn watermark_spec(&self) -> Option<&WatermarkSpec> {
+        self.watermark_spec.as_ref()
+    }
+
+    /// The inner stream.
+    pub fn inner(&self) -> &Stream {
+        &self.inner
+    }
+}
+
+/// A keyed stream with a tumbling window applied.
+///
+/// This is a descriptor type — no execution happens until the stream is
+/// submitted to a distributed runtime.
+#[derive(Debug, Clone)]
+pub struct WindowedStream {
+    keyed: KeyedStream,
+    window_size_ms: u64,
+}
+
+impl WindowedStream {
+    /// Key column name.
+    pub fn key_column(&self) -> &str {
+        self.keyed.key_column()
+    }
+
+    /// Event-time column name.
+    pub fn event_time_column(&self) -> Option<&str> {
+        self.keyed.event_time_column()
+    }
+
+    /// Watermark lag in milliseconds (0 if not configured).
+    pub fn watermark_lag_ms(&self) -> u64 {
+        self.keyed.watermark_spec().map_or(0, WatermarkSpec::lag_ms)
+    }
+
+    /// Window size in milliseconds.
+    pub fn window_size_ms(&self) -> u64 {
+        self.window_size_ms
+    }
+
+    /// The underlying keyed stream.
+    pub fn keyed_stream(&self) -> &KeyedStream {
+        &self.keyed
+    }
 }
 
 fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
@@ -724,6 +856,58 @@ mod tests {
 
         assert!(!stream.is_bounded());
         assert!(stream.collect_bounded().is_err());
+    }
+
+    // ── Streaming API tests ───────────────────────────────────────────────────
+
+    #[allow(unused_imports)]
+    use super::Stream;
+    use super::{KeyedStream, WatermarkSpec, WindowedStream};
+
+    #[test]
+    fn key_by_returns_keyed_stream_with_correct_column() {
+        let session = Session::builder().build().unwrap();
+        let stream = session.memory_stream("events", vec![]);
+        let keyed: KeyedStream = stream.key_by("user_id");
+        assert_eq!(keyed.key_column(), "user_id");
+        assert!(keyed.event_time_column().is_none());
+        assert!(keyed.watermark_spec().is_none());
+    }
+
+    #[test]
+    fn keyed_stream_builder_chain() {
+        let session = Session::builder().build().unwrap();
+        let stream = session.memory_stream("events", vec![]);
+        let keyed = stream
+            .key_by("user_id")
+            .with_event_time("event_ts")
+            .watermark(WatermarkSpec::fixed_lag_ms(5000));
+
+        assert_eq!(keyed.key_column(), "user_id");
+        assert_eq!(keyed.event_time_column(), Some("event_ts"));
+        assert_eq!(keyed.watermark_spec().unwrap().lag_ms(), 5000);
+    }
+
+    #[test]
+    fn tumbling_window_carries_correct_config() {
+        let session = Session::builder().build().unwrap();
+        let stream = session.memory_stream("events", vec![]);
+        let windowed: WindowedStream = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .watermark(WatermarkSpec::fixed_lag_ms(1000))
+            .tumbling_window(60_000);
+
+        assert_eq!(windowed.key_column(), "user_id");
+        assert_eq!(windowed.event_time_column(), Some("ts"));
+        assert_eq!(windowed.watermark_lag_ms(), 1000);
+        assert_eq!(windowed.window_size_ms(), 60_000);
+    }
+
+    #[test]
+    fn watermark_spec_lag_ms_roundtrip() {
+        let spec = WatermarkSpec::fixed_lag_ms(30_000);
+        assert_eq!(spec.lag_ms(), 30_000);
     }
 
     fn write_people_parquet(path: &std::path::Path) {
