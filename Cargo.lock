@@ -2847,6 +2847,7 @@ dependencies = [
  "krishiv-proto",
  "object_store",
  "parquet 55.2.0",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

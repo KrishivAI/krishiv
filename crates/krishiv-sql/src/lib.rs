@@ -5,6 +5,7 @@
 //! This crate owns the DataFusion integration for R1 while keeping DataFusion
 //! out of the long-term public API exposed by `krishiv-api`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -447,6 +448,173 @@ fn apply_masking(
 
     RecordBatch::try_new(schema, columns)
         .map_err(|e| SqlError::DataFusion { message: e.to_string() })
+}
+
+// ─── Materialized Views Baseline ─────────────────────────────────────────────
+
+/// Materialized view refresh policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshPolicy {
+    /// Refresh whenever the backing table(s) receive a write commit.
+    OnCommit,
+    /// Only refresh when explicitly triggered by `MaterializedViewRegistry::refresh()`.
+    Manual,
+}
+
+/// Declaration of a named materialized view.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct MaterializedViewDefinition {
+    /// Unique view name.
+    pub name: String,
+    /// SQL SELECT query that defines the view.
+    pub query: String,
+    /// Refresh policy.
+    pub refresh_policy: RefreshPolicy,
+    /// Partition columns for storage keying (empty = unpartitioned).
+    pub partition_columns: Vec<String>,
+}
+
+impl MaterializedViewDefinition {
+    /// Create a new view definition with OnCommit refresh and no partitioning.
+    pub fn new(name: impl Into<String>, query: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            query: query.into(),
+            refresh_policy: RefreshPolicy::OnCommit,
+            partition_columns: Vec::new(),
+        }
+    }
+
+    /// Set the refresh policy.
+    #[must_use]
+    pub fn with_refresh_policy(mut self, policy: RefreshPolicy) -> Self {
+        self.refresh_policy = policy;
+        self
+    }
+
+    /// Set partition columns.
+    #[must_use]
+    pub fn with_partition_columns(mut self, cols: Vec<String>) -> Self {
+        self.partition_columns = cols;
+        self
+    }
+}
+
+/// In-memory registry for materialized view definitions and their cached results.
+///
+/// In production, results would be persisted to `RedbStateBackend`. For R10
+/// the registry is in-memory and resets on process restart.
+#[derive(Debug, Default)]
+pub struct MaterializedViewRegistry {
+    definitions: HashMap<String, MaterializedViewDefinition>,
+    /// Cached results keyed by view name → serialized batch (Arrow IPC).
+    cache: HashMap<String, Vec<RecordBatch>>,
+    /// Current write LSN — incremented on each `mark_table_committed()` call.
+    current_lsn: u64,
+    /// LSN at which each view was last refreshed.
+    view_lsn: HashMap<String, u64>,
+}
+
+impl MaterializedViewRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a materialized view definition.
+    pub fn register(&mut self, def: MaterializedViewDefinition) {
+        self.definitions.insert(def.name.clone(), def);
+    }
+
+    /// Mark a table as having received a commit. Increments the current LSN.
+    /// All OnCommit views are now stale.
+    pub fn mark_table_committed(&mut self) {
+        self.current_lsn += 1;
+    }
+
+    /// Returns true if the view is stale (backing table committed after last refresh,
+    /// or the view has never been cached / is not registered).
+    pub fn is_stale(&self, view_name: &str) -> bool {
+        // Unregistered or never-cached views are always considered stale.
+        if !self.view_lsn.contains_key(view_name) {
+            return true;
+        }
+        let last_refresh = self.view_lsn.get(view_name).copied().unwrap_or(0);
+        last_refresh < self.current_lsn
+    }
+
+    /// Store refreshed results for a view.
+    pub fn set_cached(&mut self, view_name: &str, batches: Vec<RecordBatch>) {
+        self.cache.insert(view_name.to_string(), batches);
+        self.view_lsn.insert(view_name.to_string(), self.current_lsn);
+    }
+
+    /// Get cached results if the view is fresh.
+    pub fn get_if_fresh(&self, view_name: &str) -> Option<&Vec<RecordBatch>> {
+        if self.is_stale(view_name) {
+            None
+        } else {
+            self.cache.get(view_name)
+        }
+    }
+
+    /// Get the view definition, if registered.
+    pub fn definition(&self, view_name: &str) -> Option<&MaterializedViewDefinition> {
+        self.definitions.get(view_name)
+    }
+}
+
+#[cfg(test)]
+mod matview_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_view_returns_cached_results() {
+        let mut reg = MaterializedViewRegistry::new();
+        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+        let batch = vec![]; // empty batch for test
+        reg.set_cached("v1", batch.clone());
+        assert!(reg.get_if_fresh("v1").is_some());
+    }
+
+    #[test]
+    fn committed_table_marks_view_stale() {
+        let mut reg = MaterializedViewRegistry::new();
+        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+        reg.set_cached("v1", vec![]);
+        assert!(!reg.is_stale("v1"));
+        reg.mark_table_committed();
+        assert!(reg.is_stale("v1"));
+        assert!(reg.get_if_fresh("v1").is_none());
+    }
+
+    #[test]
+    fn refresh_after_commit_restores_freshness() {
+        let mut reg = MaterializedViewRegistry::new();
+        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+        reg.set_cached("v1", vec![]);
+        reg.mark_table_committed();
+        assert!(reg.is_stale("v1"));
+        reg.set_cached("v1", vec![]); // refresh
+        assert!(!reg.is_stale("v1"));
+    }
+
+    #[test]
+    fn unregistered_view_is_stale() {
+        let reg = MaterializedViewRegistry::new();
+        assert!(reg.is_stale("nonexistent"));
+    }
+
+    #[test]
+    fn definition_builder_sets_fields() {
+        let def = MaterializedViewDefinition::new("sales_summary", "SELECT SUM(amount) FROM sales")
+            .with_refresh_policy(RefreshPolicy::Manual)
+            .with_partition_columns(vec!["region".into()]);
+        assert_eq!(def.name, "sales_summary");
+        assert_eq!(def.refresh_policy, RefreshPolicy::Manual);
+        assert_eq!(def.partition_columns, vec!["region".to_string()]);
+    }
 }
 
 #[cfg(test)]
