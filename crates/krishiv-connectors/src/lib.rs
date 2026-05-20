@@ -615,6 +615,105 @@ impl TwoPhaseCommitSink for InMemoryTwoPhaseCommitSink {
 }
 
 // ---------------------------------------------------------------------------
+// LocalParquetTwoPhaseCommitSink
+// ---------------------------------------------------------------------------
+
+/// Handle for a staged Parquet write.
+///
+/// Carries the `.tmp` staging path and the final target path so `commit` can
+/// atomically rename and `abort` can delete the staging file.
+#[derive(Debug, Clone)]
+pub struct ParquetCommitHandle {
+    pub epoch: u64,
+    /// Path to the `.tmp` file written during `prepare`.
+    pub staging_path: std::path::PathBuf,
+    /// Final target path (after rename on `commit`).
+    pub final_path: std::path::PathBuf,
+}
+
+/// Parquet-backed two-phase commit sink.
+///
+/// `prepare(epoch, batch)` serializes `batch` to a `.tmp` file named
+/// `<epoch>-<handle_id>.parquet.tmp` inside `output_dir`.
+/// `commit(handle)` renames the `.tmp` file to its final `.parquet` name.
+/// `abort(handle)` deletes the `.tmp` file.
+///
+/// The rename in `commit` is atomic on POSIX filesystems, providing
+/// exactly-once delivery guarantees for local storage.
+pub struct LocalParquetTwoPhaseCommitSink {
+    output_dir: std::path::PathBuf,
+    next_handle: u64,
+}
+
+impl LocalParquetTwoPhaseCommitSink {
+    /// Create a sink that writes Parquet files to `output_dir`.
+    /// The directory must already exist.
+    pub fn new(output_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            output_dir: output_dir.into(),
+            next_handle: 0,
+        }
+    }
+}
+
+impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
+    type Handle = ParquetCommitHandle;
+
+    fn prepare(
+        &mut self,
+        epoch: u64,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<Self::Handle> {
+        let handle_id = self.next_handle;
+        self.next_handle += 1;
+
+        let staging_name = format!("{epoch}-{handle_id}.parquet.tmp");
+        let final_name = format!("{epoch}-{handle_id}.parquet");
+        let staging_path = self.output_dir.join(&staging_name);
+        let final_path = self.output_dir.join(&final_name);
+
+        let file = std::fs::File::create(&staging_path).map_err(|e| ConnectorError::Io {
+            message: format!("parquet 2pc prepare: cannot create {staging_name}: {e}"),
+        })?;
+
+        let mut writer = ::parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+            .map_err(|e| ConnectorError::Io {
+                message: format!("parquet 2pc prepare: cannot create writer: {e}"),
+            })?;
+        writer.write(batch).map_err(|e| ConnectorError::Io {
+            message: format!("parquet 2pc prepare: write error: {e}"),
+        })?;
+        writer.close().map_err(|e| ConnectorError::Io {
+            message: format!("parquet 2pc prepare: close error: {e}"),
+        })?;
+
+        Ok(ParquetCommitHandle {
+            epoch,
+            staging_path,
+            final_path,
+        })
+    }
+
+    fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        std::fs::rename(&handle.staging_path, &handle.final_path).map_err(|e| ConnectorError::Io {
+            message: format!(
+                "parquet 2pc commit: rename {:?} → {:?}: {e}",
+                handle.staging_path, handle.final_path
+            ),
+        })
+    }
+
+    fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
+        if handle.staging_path.exists() {
+            std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::Io {
+                message: format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -1021,5 +1120,83 @@ mod tests {
         sink.abort(h2).unwrap();
         assert_eq!(sink.committed().len(), 1);
         assert_eq!(sink.committed()[0].0, 1);
+    }
+
+    // ── LocalParquetTwoPhaseCommitSink ────────────────────────────────────────
+
+    fn make_int32_batch(values: Vec<i32>) -> arrow::record_batch::RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values)) as _],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parquet_2pc_prepare_commit_creates_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+
+        let batch = make_int32_batch(vec![1, 2, 3]);
+        let handle = sink.prepare(1, &batch).unwrap();
+
+        assert!(
+            handle.staging_path.exists(),
+            "staging .tmp file must exist after prepare"
+        );
+        assert!(
+            !handle.final_path.exists(),
+            "final .parquet file must not exist before commit"
+        );
+
+        sink.commit(handle).unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.ends_with(".parquet") && !f.ends_with(".tmp")),
+            "final .parquet file must exist after commit"
+        );
+        assert!(
+            !files.iter().any(|f| f.ends_with(".tmp")),
+            "staging .tmp file must be gone after commit"
+        );
+    }
+
+    #[test]
+    fn parquet_2pc_abort_deletes_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+
+        let batch = make_int32_batch(vec![10, 20]);
+        let handle = sink.prepare(2, &batch).unwrap();
+        assert!(handle.staging_path.exists(), "staging file must exist");
+
+        sink.abort(handle).unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(files.is_empty(), "abort must remove staging file");
+    }
+
+    #[test]
+    fn parquet_2pc_abort_is_idempotent_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+
+        let batch = make_int32_batch(vec![1]);
+        let handle = sink.prepare(3, &batch).unwrap();
+        // Remove the staging file manually before calling abort.
+        std::fs::remove_file(&handle.staging_path).unwrap();
+
+        // abort on a missing file must not error.
+        sink.abort(handle).unwrap();
     }
 }
