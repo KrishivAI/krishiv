@@ -74,7 +74,7 @@ Out of scope:
 - [ ] Add data quality expectation interface.
 - [ ] Add rejected-row output configuration.
 - [ ] Add dead-letter sink configuration.
-- [ ] Publish production hardening guide.
+- [x] Publish production hardening guide.
 
 ## Runtime Deliverables
 
@@ -123,7 +123,7 @@ R10 is complete when:
 - [ ] Metadata schema compatibility tests pass.
 - [ ] Chaos suite passes.
 - [ ] Certified connector matrix passes.
-- [ ] Public API stability policy is documented.
+- [x] Public API stability policy is documented.
 - [ ] SQL/function compatibility matrix is published.
 - [ ] Production hardening guide is published.
 
