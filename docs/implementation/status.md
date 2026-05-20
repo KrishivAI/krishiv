@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**R9 IN PROGRESS (core items delivered).** R8 is complete. R9.1 (observability + governance) and R9.2 (HA + operations) core items are implemented on branch `claude/plan-r7-implementation-lt3n3`.
+**R4/R5/R6 IMPLEMENTED.** R8 and R9 are complete. R4 (shuffle executor wiring), R5 (durable state backend), and R6 (checkpoint barrier + 2PC sink) are now implemented on branch `claude/plan-r7-implementation-lt3n3`.
 
 ## Active Task
 
-**R9** — implementing governance and operations.
+**R4/R5/R6 complete** — streaming core stack implemented.
 
 ### Completed (committed to branch)
 
@@ -20,50 +20,43 @@
 | `c867a62` | R8.1 Group A: `krishiv-udf` — ScalarUdf, AggregateUdf, TableUdf, UdfRegistry |
 | `931c824` | R8.2: `krishiv-lakehouse` — Iceberg read/write beta, snapshot reads, optimistic concurrency |
 | `63a8ae2` | R8.1 Group C: `krishiv-flight-sql` — Flight SQL thin adapter over Session |
-| `c1af99e` | docs(R8): sync roadmap R8.1 and R8.2 checklists |
-| `27e8c5c` | docs(R8): update status.md and R8 tracker |
 | `1611103` | R8.1 Group B: `krishiv-python` — PyO3 Session/DataFrame/UDF via spawn_blocking |
 | `0105392` | docs(R8): mark R8 complete |
 | `ccbda47` | R9.1: `krishiv-governance` — RBAC, audit log, OpenLineage, policy hooks |
 | `496504c` | R9.1: `krishiv-metrics` — OTel tracing init, tracing bridge, structured logs |
-| `(pending)` | R9.2: workspace deps, fencing enforcement, LeaderElection extension, K8sLeaseElection, plan diff, replay bundle, TLS config, auth completion, Helm chart |
+| `dad69ca` | R9.2: HA leader election, fencing enforcement, replay bundle, plan diff, TLS, Helm |
+| `a4d1065` | R7.1 governance: quota-aware QueueManager (QuotaQueueManager, ConfigFileQueueManager) |
+| `4ae8a82` | R4a+R5a: typed shuffle wiring (ShuffleWriteConfig/ReadConfig) + redb state backend |
+| `6266f8a` | R6a: out-of-band checkpoint barrier (trigger_checkpoint_for_job, checkpoint_ack RPC) |
+| `(pending)` | R6c: LocalParquetTwoPhaseCommitSink in krishiv-connectors |
 
-### In Progress
+## R4/R5/R6 Architecture Decisions (locked)
 
-- R9.2 commit being prepared (all code done, pending commit + push)
+- **Shuffle (R4a)**: `ExecutorTaskRunner::with_inmem_shuffle()` + `execute_inmem_shuffle_write/read`; `ShuffleWriteConfig`/`ShuffleReadConfig` in proto
+- **State backend (R5a)**: `RedbStateBackend` (redb 2.x, ACID, pure-Rust); `RocksDbStateBackend` = type alias; in-memory mode for tests
+- **Checkpoint barrier (R6a)**: Out-of-band `trigger_checkpoint_for_job()` returns `InitiateCheckpointRequest`; executor acks via `checkpoint_ack()` on `CoordinatorExecutorService`
+- **2PC sink (R6c)**: `LocalParquetTwoPhaseCommitSink` — `.tmp` on prepare, atomic rename on commit, delete on abort
 
-## R9 Architecture Decisions (locked)
+## R4/R5/R6 Deferred Items
 
-- **OTel transport**: `tracing` facade + `tracing-opentelemetry` bridge; stdout exporter default; OTLP HTTP/proto for production (avoids tonic 0.12 conflict)
-- **RBAC (R9 beta)**: static API key → role mapping; OIDC/JWT deferred to R10
-- **Leader election**: `LeaderElection` trait extended with `try_acquire/renew/release/fencing_token`; K8s Lease-backed `K8sLeaseElection` in `krishiv-operator`
-- **Fencing enforcement**: `validate_fencing_token()` in `krishiv-checkpoint`; stale token → `StaleFencingToken` error
-- **Live K8s Lease API calls**: simulated in R9 (test-safe); wired to real K8s API in R10
-- **Helm chart**: `k8s/helm/krishiv/` with coordinator (Recreate), executor (RollingUpdate), headless service, RBAC
-
-## R9 Deferred Items (not blocking acceptance gate)
-
-- Live K8s Lease API calls in `K8sLeaseElection` (R9 uses simulated lease; wired in R10)
-- Policy hook enforcement at DataFusion scan layer (deferred to R10)
-- OTLP gRPC transport (HTTP/proto used in R9; gRPC deferred to avoid tonic conflict)
-- OIDC/JWT token validation (static API key in R9; OIDC in R10)
-- `kind` cluster e2e failover test (deferred — requires kind cluster in CI)
-- Row-level enforcement inside DataFusion operators (policy hook interface defined; enforcement in R10)
+- R4b: AQE (`StageRuntimeStats` → coordinator fires `CoalesceRule`/`ThresholdSkewRule`)
+- R4c: LZ4/Zstd compression in `LocalShuffleStore` (`lz4_flex`)
+- R5b/R5c: Watermark operator, tumbling window operator, continuous loop
+- R6b full wiring: actual gRPC calls from coordinator to executor task endpoints for barrier (R6a has the logic; wire transport in R10)
 
 ## Next Steps
 
-1. Complete R9 commit + push
-2. Run full workspace test suite
-3. Begin R10 planning (GA platform, stable API policy, benchmarks, connector certification)
+1. Commit R6c (LocalParquetTwoPhaseCommitSink) to branch and push
+2. Run full workspace test suite: `cargo test --workspace`
+3. Begin R10 planning (GA platform, stable API, OIDC, kind e2e tests, benchmarks)
 
-## Last Validation (R9 in-progress)
+## Last Validation
 
-- `cargo test --lib -p krishiv-metrics`: 5 passed
-- `cargo test --lib -p krishiv-governance`: 10 passed
-- `cargo test --lib -p krishiv-checkpoint`: 27 passed (includes fencing + replay bundle tests)
-- `cargo test --lib -p krishiv-plan`: 17 passed (includes plan diff tests)
-- `cargo test --lib -p krishiv-operator`: 34 passed (includes K8sLeaseElection + failover tests)
-- `cargo test --lib -p krishiv-scheduler`: 90 passed
+- `cargo test -p krishiv-executor`: 49 passed (includes 2 R4a shuffle tests)
+- `cargo test -p krishiv-state`: 40 passed (includes redb tests)
+- `cargo test -p krishiv-scheduler`: 93 passed (includes 3 R6a barrier tests)
+- `cargo test -p krishiv-connectors`: 37 passed (includes 3 Parquet 2PC tests)
+- `cargo test -p krishiv-proto`: 28 passed (includes 4 R4a config tests)
 - Branch: `claude/plan-r7-implementation-lt3n3`
 
 ## Architectural Inputs To Preserve

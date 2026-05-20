@@ -1288,7 +1288,10 @@ impl K8sLeaseElection {
             namespace: namespace.into(),
             holder_identity: holder_identity.into(),
             lease_duration_s: 15,
-            state: std::sync::Mutex::new(K8sLeaseState { is_leader: false, fencing_token: 0 }),
+            state: std::sync::Mutex::new(K8sLeaseState {
+                is_leader: false,
+                fencing_token: 0,
+            }),
         }
     }
 
@@ -1363,9 +1366,9 @@ mod tests {
         BootstrapExecutor, ConditionStatus, EXECUTOR_ID_LABEL, ExecutorPodLaunchFailure,
         K8sLeaseElection, KrishivJobMode, KrishivJobPhase, KrishivJobReconciler,
         KrishivJobResource, KrishivJobSpec, KubernetesControllerConfig,
-        KubernetesControllerRuntime, ObjectMeta, OperatorError, ReconcileAction,
-        demo_coordinator, detect_executor_pod_launch_failure, job_spec_from_resource,
-        krishivjob_api_resource, resource_from_dynamic_object, status_patch,
+        KubernetesControllerRuntime, ObjectMeta, OperatorError, ReconcileAction, demo_coordinator,
+        detect_executor_pod_launch_failure, job_spec_from_resource, krishivjob_api_resource,
+        resource_from_dynamic_object, status_patch,
     };
     use krishiv_scheduler::{Coordinator, LeaderElection as _};
     use kube::core::DynamicObject;
@@ -2046,7 +2049,13 @@ mod tests {
         meta_epoch1.fencing_token = 1; // A's old token
         let result = validate_fencing_token(&meta_epoch1, coord_b.fencing_token()); // current=2
         assert!(
-            matches!(result, Err(CheckpointError::StaleFencingToken { stored: 1, current: 2 })),
+            matches!(
+                result,
+                Err(CheckpointError::StaleFencingToken {
+                    stored: 1,
+                    current: 2
+                })
+            ),
             "expected StaleFencingToken, got: {result:?}"
         );
     }

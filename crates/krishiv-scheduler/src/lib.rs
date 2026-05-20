@@ -27,12 +27,12 @@ use krishiv_proto::{
     CoordinatorExecutorService, CoordinatorId, CoordinatorState, DeregisterExecutorRequest,
     DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment, FencingToken,
-    HeartbeatHotKeyReport, HeartbeatThrottleCommand, InputPartition, JobId, JobKind, JobSpec,
-    JobState, LeaseGeneration, OutputContract, OutputContractKind, PlanFragment,
-    RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput, StageId, StageSpec,
-    StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest,
-    TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
-    TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
+    HeartbeatHotKeyReport, HeartbeatThrottleCommand, InitiateCheckpointRequest, InputPartition,
+    JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract, OutputContractKind,
+    PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput,
+    StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef,
+    TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest,
+    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 use serde::{Deserialize, Serialize};
@@ -1118,6 +1118,19 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
 
         Ok(tonic::Response::new(response))
     }
+
+    async fn checkpoint_ack(
+        &self,
+        request: tonic::Request<CheckpointAckRequest>,
+    ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+        let ack = request.into_inner();
+        let mut coordinator = self
+            .coordinator
+            .write()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let response = coordinator.handle_checkpoint_ack(ack);
+        Ok(tonic::Response::new(response))
+    }
 }
 
 /// Networked gRPC adapter for coordinator/executor transport calls.
@@ -1255,7 +1268,9 @@ pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthCont
     if let Some(token) = header.strip_prefix("Bearer ") {
         let token = token.trim();
         if !token.is_empty() {
-            return AuthContext::Bearer { subject: token.to_owned() };
+            return AuthContext::Bearer {
+                subject: token.to_owned(),
+            };
         }
     }
     AuthContext::Anonymous
@@ -1592,7 +1607,9 @@ impl Coordinator {
     /// via `CheckpointCoordinator::recover_from_storage`.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         for record in store.jobs() {
-            self.jobs.entry(record.job_id().clone()).or_insert_with(|| record.clone());
+            self.jobs
+                .entry(record.job_id().clone())
+                .or_insert_with(|| record.clone());
         }
         // Recover checkpoint coordinators from storage.
         for coord in self.checkpoint_coordinators.values_mut() {
@@ -1790,6 +1807,49 @@ impl Coordinator {
         Ok(meta)
     }
 
+    // ── R6a: Out-of-band barrier trigger ──────────────────────────────────────
+
+    /// Initiate a new checkpoint epoch for a streaming job and return one
+    /// `InitiateCheckpointRequest` per currently running task.
+    ///
+    /// The caller is responsible for delivering each request to its executor
+    /// (via gRPC or in-process simulation). Executors respond by calling
+    /// `handle_checkpoint_ack()` on this coordinator.
+    ///
+    /// Returns `Err` if the job has no checkpoint coordinator (not a streaming
+    /// job with checkpoint config) or if a checkpoint is already in flight.
+    pub fn trigger_checkpoint_for_job(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<InitiateCheckpointRequest>> {
+        // Validate job exists first.
+        self.find_job(job_id)?;
+
+        let coord = self
+            .checkpoint_coordinators
+            .get_mut(job_id)
+            .ok_or_else(|| SchedulerError::InvalidJob {
+                message: format!(
+                    "no checkpoint coordinator for job {job_id}; \
+                     job must be streaming with checkpoint_interval_ms set"
+                ),
+            })?;
+
+        let epoch = coord
+            .initiate()
+            .map_err(|msg| SchedulerError::InvalidJob { message: msg })?;
+        let fencing_token = coord.fencing_token();
+
+        // One broadcast request covers all executors for the job — the
+        // coordinator doesn't need per-task granularity for the barrier trigger.
+        // The executor processes the request once per running task internally.
+        Ok(vec![InitiateCheckpointRequest {
+            job_id: job_id.clone(),
+            epoch,
+            fencing_token,
+        }])
+    }
+
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.
     pub fn submit_logical_plan(
         &mut self,
@@ -1848,7 +1908,11 @@ impl Coordinator {
                 .values()
                 .map(JobRecord::shuffle_partitions_available_count)
                 .sum(),
-            shuffle_bytes_written: self.jobs.values().map(JobRecord::shuffle_bytes_written).sum(),
+            shuffle_bytes_written: self
+                .jobs
+                .values()
+                .map(JobRecord::shuffle_bytes_written)
+                .sum(),
         }
     }
 
@@ -2058,15 +2122,19 @@ impl Coordinator {
     }
 
     fn find_job(&self, job_id: &JobId) -> SchedulerResult<&JobRecord> {
-        self.jobs.get(job_id).ok_or_else(|| SchedulerError::UnknownJob {
-            job_id: job_id.clone(),
-        })
+        self.jobs
+            .get(job_id)
+            .ok_or_else(|| SchedulerError::UnknownJob {
+                job_id: job_id.clone(),
+            })
     }
 
     fn find_job_mut(&mut self, job_id: &JobId) -> SchedulerResult<&mut JobRecord> {
-        self.jobs.get_mut(job_id).ok_or_else(|| SchedulerError::UnknownJob {
-            job_id: job_id.clone(),
-        })
+        self.jobs
+            .get_mut(job_id)
+            .ok_or_else(|| SchedulerError::UnknownJob {
+                job_id: job_id.clone(),
+            })
     }
 }
 
@@ -4311,7 +4379,8 @@ mod tests {
         InMemoryQueueManager, JobSnapshot, JsonFileMetadataStore, LeaderElection, MetadataStore,
         NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, QuotaQueueManager, ResourceUsage,
         SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
-        TaskUpdateOutcome, job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
+        TaskUpdateOutcome, job_spec_from_logical_plan,
+        serve_coordinator_executor_grpc_with_listener,
     };
 
     #[derive(Debug, Clone, Default)]
@@ -5941,7 +6010,9 @@ mod tests {
         assert_eq!(store.jobs()[0].job_id(), &job_id);
 
         // Overwrite with the same record is idempotent.
-        store.save_job(coordinator.jobs.values().next().unwrap()).unwrap();
+        store
+            .save_job(coordinator.jobs.values().next().unwrap())
+            .unwrap();
         assert_eq!(store.jobs().len(), 1);
     }
 
@@ -7091,6 +7162,122 @@ mod tests {
         );
     }
 
+    // ── R6a: Out-of-band barrier trigger ──────────────────────────────────────
+
+    #[test]
+    fn trigger_checkpoint_for_job_returns_initiate_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path().to_str().unwrap().to_owned();
+        let coordinator_id = CoordinatorId::try_new("coord-r6a").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-r6a").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "host", 2))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-r6a").unwrap();
+        let stage_id = StageId::try_new("s-r6a").unwrap();
+        let task_id = TaskId::try_new("t-r6a").unwrap();
+
+        let spec = JobSpec::new(job_id.clone(), "stream", JobKind::Streaming)
+            .with_stage(StageSpec::new(stage_id, "stage").with_task(TaskSpec::new(task_id, "task")))
+            .with_checkpoint(1_000, storage_path);
+        coordinator.submit_job(spec).unwrap();
+
+        // trigger_checkpoint_for_job initiates epoch 1 and returns the request.
+        let requests = coordinator.trigger_checkpoint_for_job(&job_id).unwrap();
+        assert_eq!(requests.len(), 1, "one broadcast request");
+        assert_eq!(requests[0].epoch, 1, "first epoch");
+        assert_eq!(requests[0].job_id, job_id);
+
+        // A second trigger while epoch 1 is in flight must fail.
+        assert!(
+            coordinator.trigger_checkpoint_for_job(&job_id).is_err(),
+            "cannot trigger while acks are pending"
+        );
+    }
+
+    #[test]
+    fn trigger_checkpoint_then_ack_commits_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path().to_str().unwrap().to_owned();
+        let coordinator_id = CoordinatorId::try_new("coord-r6b").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-r6b").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host", 2))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-r6b").unwrap();
+        let stage_id = StageId::try_new("s-r6b").unwrap();
+        let task_id = TaskId::try_new("t-r6b-1").unwrap();
+
+        let spec = JobSpec::new(job_id.clone(), "stream", JobKind::Streaming)
+            .with_stage(
+                StageSpec::new(stage_id, "stage").with_task(TaskSpec::new(task_id.clone(), "task")),
+            )
+            .with_checkpoint(1_000, storage_path);
+        coordinator.submit_job(spec).unwrap();
+
+        // Trigger checkpoint — epoch 1.
+        let requests = coordinator.trigger_checkpoint_for_job(&job_id).unwrap();
+        let req = &requests[0];
+        let epoch = req.epoch;
+        let fencing_token = req.fencing_token.clone();
+
+        // Simulate executor acking the checkpoint.
+        let ack = CheckpointAckRequest {
+            job_id: job_id.clone(),
+            operator_id: format!("operator-{}", task_id.as_str()),
+            task_id: task_id.clone(),
+            epoch,
+            fencing_token,
+            source_offsets: vec![],
+            snapshot_path: None,
+        };
+
+        let response = coordinator.handle_checkpoint_ack(ack);
+        assert_eq!(
+            response,
+            CheckpointAckResponse::Accepted,
+            "ack must be accepted"
+        );
+
+        // After all tasks ack, coordinator should commit epoch 1.
+        let coord = coordinator.checkpoint_coordinator(&job_id).unwrap();
+        assert_eq!(coord.current_epoch(), 1);
+        assert!(
+            !coord.is_awaiting_acks(),
+            "epoch 1 should be committed after all acks received"
+        );
+    }
+
+    #[test]
+    fn trigger_checkpoint_fails_without_checkpoint_config() {
+        let coordinator_id = CoordinatorId::try_new("coord-r6c").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-r6c").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "host", 2))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-r6c").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "stream", JobKind::Streaming).with_stage(
+            StageSpec::new(StageId::try_new("s-r6c").unwrap(), "stage")
+                .with_task(TaskSpec::new(TaskId::try_new("t-r6c").unwrap(), "task")),
+        );
+        coordinator.submit_job(spec).unwrap();
+
+        // No checkpoint_interval_ms set — must fail.
+        assert!(
+            coordinator.trigger_checkpoint_for_job(&job_id).is_err(),
+            "trigger must fail when job has no checkpoint coordinator"
+        );
+    }
+
     // ── Items 3+4: QueueManager trait + SubmitOutcome ────────────────────────
 
     #[test]
@@ -7491,12 +7678,11 @@ mod tests {
         use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
 
         let coordinator_id = CoordinatorId::try_new("coord-hk-override").unwrap();
-        let mut coordinator = Coordinator::active(coordinator_id).with_adaptive_override(
-            AdaptiveOverrideConfig {
+        let mut coordinator =
+            Coordinator::active(coordinator_id).with_adaptive_override(AdaptiveOverrideConfig {
                 disable_hot_key_splitting: true,
                 ..AdaptiveOverrideConfig::default()
-            },
-        );
+            });
 
         let executor_id = ExecutorId::try_new("exec-hk-override").unwrap();
         coordinator
@@ -7557,8 +7743,8 @@ mod tests {
             },
         ];
 
-        let heartbeat =
-            ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy).with_hot_key_reports(reports);
+        let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+            .with_hot_key_reports(reports);
         coordinator.executor_heartbeat(heartbeat).unwrap();
 
         let log = coordinator.adaptive_decision_log(&job_id);

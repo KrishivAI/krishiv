@@ -39,7 +39,15 @@ impl StaticApiKeyAuthProvider {
     pub fn new(entries: impl IntoIterator<Item = (String, String, Role)>) -> Self {
         let keys = entries
             .into_iter()
-            .map(|(k, s, r)| (k, Principal { subject: s, role: r }))
+            .map(|(k, s, r)| {
+                (
+                    k,
+                    Principal {
+                        subject: s,
+                        role: r,
+                    },
+                )
+            })
             .collect();
         Self { keys }
     }
@@ -355,13 +363,7 @@ mod tests {
     }
 
     fn sample_run_event() -> RunEvent {
-        new_run_event(
-            RunEventType::Start,
-            "test_job",
-            "default",
-            vec![],
-            vec![],
-        )
+        new_run_event(RunEventType::Start, "test_job", "default", vec![], vec![])
     }
 
     #[test]

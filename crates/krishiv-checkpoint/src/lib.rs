@@ -475,8 +475,8 @@ pub fn generate_replay_bundle(
     job_id: &str,
     epoch: u64,
 ) -> CheckpointResult<ReplayBundle> {
-    let metadata = read_epoch_metadata(storage, job_id, epoch)?
-        .ok_or(CheckpointError::NoValidEpoch)?;
+    let metadata =
+        read_epoch_metadata(storage, job_id, epoch)?.ok_or(CheckpointError::NoValidEpoch)?;
     Ok(ReplayBundle {
         job_id: metadata.job_id,
         epoch: metadata.epoch,
@@ -932,7 +932,10 @@ mod tests {
         let result = validate_fencing_token(&meta, 2);
         assert!(matches!(
             result,
-            Err(CheckpointError::StaleFencingToken { stored: 1, current: 2 })
+            Err(CheckpointError::StaleFencingToken {
+                stored: 1,
+                current: 2
+            })
         ));
     }
 

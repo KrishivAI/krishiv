@@ -5,8 +5,8 @@
 //! concurrency control for multi-writer Iceberg table access.
 
 use std::fmt;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use arrow::array::Array;
 use arrow::datatypes::{Field, Schema};
@@ -170,10 +170,7 @@ pub trait LakehouseTable: Send + Sync {
     async fn schema(&self) -> Result<SchemaVersion, LakehouseError>;
 
     #[doc = "**Beta API**: may change between minor releases."]
-    async fn scan(
-        &self,
-        opts: &IcebergScanOptions,
-    ) -> Result<Vec<RecordBatch>, LakehouseError>;
+    async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError>;
 
     #[doc = "**Beta API**: may change between minor releases."]
     async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError>;
@@ -230,14 +227,10 @@ impl LakehouseTable for MemoryLakehouseTable {
                         .filter_map(|col_name| schema.index_of(col_name).ok())
                         .collect();
 
-                    let columns: Vec<Arc<dyn Array>> = indices
-                        .iter()
-                        .map(|&i| batch.column(i).clone())
-                        .collect();
-                    let fields: Vec<Field> = indices
-                        .iter()
-                        .map(|&i| schema.field(i).clone())
-                        .collect();
+                    let columns: Vec<Arc<dyn Array>> =
+                        indices.iter().map(|&i| batch.column(i).clone()).collect();
+                    let fields: Vec<Field> =
+                        indices.iter().map(|&i| schema.field(i).clone()).collect();
                     let new_schema = Arc::new(Schema::new(fields));
 
                     RecordBatch::try_new(new_schema, columns)
@@ -280,11 +273,7 @@ impl LakehouseTable for MemoryLakehouseTable {
 
     async fn current_snapshot_id(&self) -> Result<Option<i64>, LakehouseError> {
         let snap = self.next_snapshot.load(Ordering::SeqCst);
-        if snap == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(snap))
-        }
+        if snap == 0 { Ok(None) } else { Ok(Some(snap)) }
     }
 }
 
@@ -369,11 +358,7 @@ mod tests {
 
     fn make_batch(values: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(values))],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
     }
 
     #[test]
@@ -389,10 +374,7 @@ mod tests {
             .with_columns(vec!["a".to_string(), "b".to_string()])
             .with_row_limit(100);
         assert_eq!(opts.snapshot_id, Some(42));
-        assert_eq!(
-            opts.columns,
-            Some(vec!["a".to_string(), "b".to_string()])
-        );
+        assert_eq!(opts.columns, Some(vec!["a".to_string(), "b".to_string()]));
         assert_eq!(opts.row_limit, Some(100));
     }
 
@@ -400,8 +382,7 @@ mod tests {
     fn memory_table_append_and_scan() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let table =
-                MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
+            let table = MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
 
             let batch1 = make_batch(vec![1, 2, 3]);
             let batch2 = make_batch(vec![4, 5]);
@@ -419,8 +400,7 @@ mod tests {
     fn memory_table_snapshot_id_increments() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let table =
-                MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
+            let table = MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
 
             assert_eq!(table.current_snapshot_id().await.unwrap(), None);
 
@@ -440,12 +420,17 @@ mod tests {
     fn scan_with_row_limit() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let table =
-                MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
+            let table = MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
 
             // Append 10 rows across two batches
-            table.append(vec![make_batch(vec![1, 2, 3, 4, 5])]).await.unwrap();
-            table.append(vec![make_batch(vec![6, 7, 8, 9, 10])]).await.unwrap();
+            table
+                .append(vec![make_batch(vec![1, 2, 3, 4, 5])])
+                .await
+                .unwrap();
+            table
+                .append(vec![make_batch(vec![6, 7, 8, 9, 10])])
+                .await
+                .unwrap();
 
             let opts = IcebergScanOptions::new().with_row_limit(5);
             let result = table.scan(&opts).await.unwrap();

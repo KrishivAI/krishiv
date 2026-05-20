@@ -16,10 +16,10 @@ use std::sync::{Arc, RwLock};
 
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointSourceOffset, CoordinatorExecutorService,
-    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-    ExecutorTaskAssignment, ExecutorTaskService, InitiateCheckpointRequest,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
+    CoordinatorExecutorService, DeregisterExecutorRequest, DeregisterExecutorResponse,
+    ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
+    ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InitiateCheckpointRequest,
     InputPartitionDescriptor, LeaseGeneration, OutputContract, OutputContractDescriptor,
     RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef,
     TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
@@ -627,10 +627,27 @@ impl TaskRunner {
 }
 
 /// Minimal R3.1 stage-local task runner skeleton.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutorTaskRunner {
     inbox: ExecutorAssignmentInbox,
     shuffle: Option<ShuffleContext>,
+    inmem_shuffle: Option<std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>>,
+}
+
+impl fmt::Debug for ExecutorTaskRunner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutorTaskRunner")
+            .field("inbox", &self.inbox)
+            .field("shuffle", &self.shuffle)
+            .field(
+                "inmem_shuffle",
+                &self
+                    .inmem_shuffle
+                    .as_ref()
+                    .map(|_| "<InMemoryShuffleStore>"),
+            )
+            .finish()
+    }
 }
 
 impl ExecutorTaskRunner {
@@ -639,12 +656,22 @@ impl ExecutorTaskRunner {
         Self {
             inbox,
             shuffle: None,
+            inmem_shuffle: None,
         }
     }
 
     /// Attach a shuffle context so this runner can handle `shuffle-write:` fragments.
     pub fn with_shuffle(mut self, ctx: ShuffleContext) -> Self {
         self.shuffle = Some(ctx);
+        self
+    }
+
+    /// Attach an in-memory shuffle store for R4a typed shuffle write/read tasks.
+    pub fn with_inmem_shuffle(
+        mut self,
+        store: std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
+    ) -> Self {
+        self.inmem_shuffle = Some(store);
         self
     }
 
@@ -808,6 +835,19 @@ impl ExecutorTaskRunner {
             });
         }
 
+        // R4a typed shuffle read: read from the in-memory store and return batches directly.
+        if let Some(read_cfg) = assignment.shuffle_read() {
+            if let Some(store) = &self.inmem_shuffle {
+                return execute_inmem_shuffle_read(assignment, read_cfg, store).await;
+            } else {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: String::from(
+                        "shuffle_read config requires an in-memory shuffle store but none is configured",
+                    ),
+                });
+            }
+        }
+
         if fragment == KAFKA_TO_PARQUET_FRAGMENT {
             return execute_kafka_to_parquet_pipeline(assignment).await;
         }
@@ -819,6 +859,19 @@ impl ExecutorTaskRunner {
                 return Err(ExecutorError::InvalidAssignment {
                     message: String::from(
                         "shuffle-write fragment requires a shuffle context but none is configured",
+                    ),
+                });
+            }
+        }
+
+        // R4a typed shuffle write: hash-partition SQL output and write to the in-memory store.
+        if let Some(write_cfg) = assignment.shuffle_write() {
+            if let Some(store) = &self.inmem_shuffle {
+                return execute_inmem_shuffle_write(assignment, write_cfg, store).await;
+            } else {
+                return Err(ExecutorError::InvalidAssignment {
+                    message: String::from(
+                        "shuffle_write config requires an in-memory shuffle store but none is configured",
                     ),
                 });
             }
@@ -972,24 +1025,20 @@ impl ExecutorTaskRunner {
             match msg {
                 OperatorMessage::Data(batch) => {
                     // Advance watermark from event times in this batch.
-                    let time_idx =
-                        batch.schema().index_of(&spec.time_col).map_err(|_| {
-                            ExecutorError::LocalExecution {
-                                message: format!(
-                                    "event_time column '{}' not found in stream-kafka batch",
-                                    spec.time_col
-                                ),
-                            }
-                        })?;
+                    let time_idx = batch.schema().index_of(&spec.time_col).map_err(|_| {
+                        ExecutorError::LocalExecution {
+                            message: format!(
+                                "event_time column '{}' not found in stream-kafka batch",
+                                spec.time_col
+                            ),
+                        }
+                    })?;
                     let arr = batch
                         .column(time_idx)
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .ok_or_else(|| ExecutorError::LocalExecution {
-                            message: format!(
-                                "event_time column '{}' must be Int64",
-                                spec.time_col
-                            ),
+                            message: format!("event_time column '{}' must be Int64", spec.time_col),
                         })?;
                     for row in 0..arr.len() {
                         watermark.advance(arr.value(row));
@@ -1553,6 +1602,181 @@ async fn execute_shuffle_write_fragment(
     }
 
     Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs))
+}
+
+/// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
+async fn execute_inmem_shuffle_write(
+    assignment: &ExecutorTaskAssignment,
+    write_cfg: &krishiv_proto::ShuffleWriteConfig,
+    store: &std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
+
+    let batches = if let Some(query) =
+        sql_query_from_fragment(assignment.plan_fragment().description().trim())
+    {
+        let engine = SqlEngine::new();
+        for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
+            engine
+                .register_parquet(partition.table_name(), partition.path())
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: e.to_string(),
+                })?;
+        }
+        for (table_name, tbl_batches) in
+            read_connector_parquet_partitions(assignment.input_partitions()).await?
+        {
+            engine
+                .register_record_batches(&table_name, tbl_batches)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: e.to_string(),
+                })?;
+        }
+        for (table_name, tbl_batches) in
+            read_object_parquet_partitions(assignment.input_partitions()).await?
+        {
+            engine
+                .register_record_batches(&table_name, tbl_batches)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: e.to_string(),
+                })?;
+        }
+        for (table_name, tbl_batches) in
+            read_shuffle_flight_partitions(assignment.input_partitions()).await?
+        {
+            engine
+                .register_record_batches(&table_name, tbl_batches)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: e.to_string(),
+                })?;
+        }
+        let dataframe = engine
+            .sql(query)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+        dataframe
+            .collect()
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?
+    } else {
+        Vec::new()
+    };
+
+    let num_partitions = write_cfg.num_partitions as u32;
+    let lease_token = write_cfg.lease_token;
+    let job_id = assignment.job_id().as_str();
+    let stage_id = write_cfg.stage_id.as_str();
+    let key_column = write_cfg.key_columns.first().map(String::as_str);
+
+    let output_schema: arrow::datatypes::SchemaRef = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+
+    let mut partition_batches: Vec<Vec<arrow::record_batch::RecordBatch>> =
+        vec![Vec::new(); num_partitions as usize];
+    let mut total_rows: usize = 0;
+
+    for batch in &batches {
+        total_rows += batch.num_rows();
+        if num_partitions == 0 || batch.num_rows() == 0 {
+            continue;
+        }
+        if let Some(key_col) = key_column {
+            let partitioner = HashPartitioner::new(key_col, num_partitions);
+            let buckets =
+                partitioner
+                    .partition(batch)
+                    .map_err(|e| ExecutorError::LocalExecution {
+                        message: format!("R4a hash partition failed: {e}"),
+                    })?;
+            for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
+                if bucket_batch.num_rows() > 0 {
+                    partition_batches[bucket_idx].push(bucket_batch);
+                }
+            }
+        } else {
+            partition_batches[0].push(batch.clone());
+        }
+    }
+
+    let mut outputs: Vec<krishiv_proto::ShufflePartitionOutput> =
+        Vec::with_capacity(num_partitions as usize);
+
+    for (p, part_batches) in partition_batches.into_iter().enumerate() {
+        let p = p as u32;
+        let id = PartitionId {
+            job_id: job_id.to_owned(),
+            stage_id: stage_id.to_owned(),
+            partition: p,
+        };
+        let schema = part_batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| output_schema.clone());
+        let size_bytes: u64 = part_batches
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+        let partition = ShufflePartition {
+            id,
+            schema,
+            batches: part_batches,
+        };
+        store
+            .write_partition(partition, lease_token)
+            .await
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("R4a in-memory shuffle write failed for partition {p}: {e}"),
+            })?;
+        outputs.push(krishiv_proto::ShufflePartitionOutput::inline(p, size_bytes));
+    }
+
+    Ok(ExecutorTaskOutput::shuffle_write(total_rows, outputs))
+}
+
+/// Execute a typed R4a shuffle-read task backed by `InMemoryShuffleStore`.
+async fn execute_inmem_shuffle_read(
+    assignment: &ExecutorTaskAssignment,
+    read_cfg: &krishiv_proto::ShuffleReadConfig,
+    store: &std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_shuffle::{PartitionId, ShuffleStore as _};
+
+    let id = PartitionId {
+        job_id: assignment.job_id().as_str().to_owned(),
+        stage_id: read_cfg.stage_id.as_str().to_owned(),
+        partition: read_cfg.partition_id as u32,
+    };
+
+    let partition = store
+        .read_partition(&id)
+        .await
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: format!(
+                "R4a in-memory shuffle read failed for partition {}: {e}",
+                read_cfg.partition_id
+            ),
+        })?;
+
+    let batches = partition.map(|p| p.batches).unwrap_or_default();
+    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let batch_count = batches.len();
+    let column_count = batches.first().map_or(0, |b| b.num_columns());
+
+    Ok(ExecutorTaskOutput::sql(
+        row_count,
+        batch_count,
+        column_count,
+    ))
 }
 
 async fn execute_kafka_to_parquet_pipeline(
@@ -2557,15 +2781,15 @@ mod tests {
     use tempfile::tempdir;
 
     use krishiv_proto::{
-        AttemptId, CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
-        DeregisterExecutorResponse, ExecutorHeartbeat, ExecutorHeartbeatRequest,
-        ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-        ExecutorTaskService, InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec,
-        JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
-        OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-        StageId, StageSpec, StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId,
-        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
-        wire,
+        AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
+        CoordinatorId, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorHeartbeat,
+        ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
+        ExecutorTaskAssignment, ExecutorTaskService, InputPartition, InputPartitionDescriptor,
+        JobId, JobKind, JobSpec, JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract,
+        OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
+        RegisterExecutorResponse, StageId, StageSpec, StreamingTaskState, TaskAttemptRef,
+        TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest, TaskStatusResponse,
+        TransportDisposition, TransportVersion, wire,
     };
 
     use super::ExecutionModel;
@@ -2625,6 +2849,13 @@ mod tests {
             Ok(tonic::Response::new(TaskStatusResponse::new(
                 TransportDisposition::Accepted,
             )))
+        }
+
+        async fn checkpoint_ack(
+            &self,
+            _request: tonic::Request<CheckpointAckRequest>,
+        ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+            Ok(tonic::Response::new(CheckpointAckResponse::Accepted))
         }
     }
 
@@ -2723,6 +2954,16 @@ mod tests {
             let response = wire::task_status_response_from_wire(response)
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
             Ok(tonic::Response::new(response))
+        }
+
+        async fn checkpoint_ack(
+            &self,
+            _request: tonic::Request<CheckpointAckRequest>,
+        ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+            // Network path not implemented for R6a; in-process test only.
+            Err(tonic::Status::unimplemented(
+                "checkpoint_ack wire transport deferred to R10",
+            ))
         }
     }
 
@@ -4766,5 +5007,162 @@ mod tests {
             runner.last_acked_epoch, 5,
             "last_acked_epoch must not change on stale rejection"
         );
+    }
+
+    // ── R4a typed shuffle write / read ────────────────────────────────────────
+
+    use krishiv_proto::{ShuffleReadConfig, ShuffleWriteConfig};
+    use krishiv_shuffle::{InMemoryShuffleStore, PartitionId, ShufflePartition, ShuffleStore};
+
+    fn shuffle_assignment_helper(
+        job_id: &str,
+        stage_id: &str,
+        task_id: &str,
+        fragment: &str,
+    ) -> ExecutorTaskAssignment {
+        ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new(job_id).unwrap(),
+                StageId::try_new(stage_id).unwrap(),
+                TaskId::try_new(task_id).unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-shuffle-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(fragment),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_write_task_partitions_output() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("data.parquet");
+        {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])) as _,
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f"])) as _,
+                ],
+            )
+            .unwrap();
+            let file = File::create(&parquet_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let store = Arc::new(InMemoryShuffleStore::new());
+        let inbox = ExecutorAssignmentInbox::new();
+        let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(Arc::clone(&store));
+
+        let num_partitions = 3usize;
+        let write_cfg = ShuffleWriteConfig {
+            stage_id: StageId::try_new("stage-sw").unwrap(),
+            num_partitions,
+            key_columns: vec![String::from("id")],
+            lease_token: 1,
+        };
+
+        let assignment = shuffle_assignment_helper(
+            "job-sw",
+            "stage-sw",
+            "task-sw-1",
+            "sql: select id, name from data",
+        )
+        .with_input_partitions(vec![InputPartition::new(
+            "data-part-1",
+            format!("local-parquet:data:{}", parquet_path.display()),
+        )])
+        .with_shuffle_write(write_cfg);
+
+        let service = AcceptingCoordinatorService;
+        let report = runner
+            .run_assignment_with(assignment, &service)
+            .await
+            .unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::ShuffleWrite);
+        assert_eq!(report.output().row_count(), 6);
+        assert_eq!(report.output().shuffle_partitions().len(), num_partitions);
+
+        let mut total_stored_rows = 0usize;
+        for p in 0..num_partitions {
+            let id = PartitionId {
+                job_id: String::from("job-sw"),
+                stage_id: String::from("stage-sw"),
+                partition: p as u32,
+            };
+            if let Some(partition) = store.read_partition(&id).await.unwrap() {
+                total_stored_rows += partition
+                    .batches
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>();
+            }
+        }
+        assert_eq!(total_stored_rows, 6);
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_read_task_returns_batches() {
+        let store = Arc::new(InMemoryShuffleStore::new());
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])) as _,
+                Arc::new(StringArray::from(vec!["x", "y", "z"])) as _,
+            ],
+        )
+        .unwrap();
+        let id = PartitionId {
+            job_id: String::from("job-sr"),
+            stage_id: String::from("stage-sr"),
+            partition: 1,
+        };
+        store
+            .write_partition(
+                ShufflePartition {
+                    id,
+                    schema,
+                    batches: vec![batch],
+                },
+                42,
+            )
+            .await
+            .unwrap();
+
+        let inbox = ExecutorAssignmentInbox::new();
+        let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(Arc::clone(&store));
+
+        let read_cfg = ShuffleReadConfig {
+            stage_id: StageId::try_new("stage-sr").unwrap(),
+            partition_id: 1,
+            lease_token: 42,
+        };
+
+        let assignment =
+            shuffle_assignment_helper("job-sr", "stage-sr", "task-sr-1", "shuffle-read")
+                .with_shuffle_read(read_cfg);
+
+        let service = AcceptingCoordinatorService;
+        let report = runner
+            .run_assignment_with(assignment, &service)
+            .await
+            .unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 3);
+        assert_eq!(report.output().column_count(), 2);
     }
 }
