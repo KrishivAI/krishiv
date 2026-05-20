@@ -1,0 +1,15 @@
+apiVersion: v2
+name: krishiv
+description: Krishiv hybrid compute framework — coordinator, executor, and operator.
+type: application
+version: 0.9.0
+appVersion: "0.1.0"
+keywords:
+  - krishiv
+  - data
+  - streaming
+  - batch
+  - lakehouse
+home: https://github.com/krishivai/krishiv
+maintainers:
+  - name: Krishiv Engineering

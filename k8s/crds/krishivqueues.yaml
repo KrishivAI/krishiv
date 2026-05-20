@@ -1,0 +1,72 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: krishivqueues.krishiv.io
+spec:
+  group: krishiv.io
+  scope: Namespaced
+  names:
+    plural: krishivqueues
+    singular: krishivqueue
+    kind: KrishivQueue
+    shortNames:
+      - kq
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["namespace"]
+              properties:
+                namespace:
+                  type: string
+                  description: Governance namespace name (must match JobSpec.namespace_id).
+                cpu_nanos_limit:
+                  type: integer
+                  format: int64
+                  description: Max CPU nanoseconds reserved simultaneously. Omit for unlimited.
+                memory_bytes_limit:
+                  type: integer
+                  format: int64
+                  description: Max memory bytes reserved simultaneously. Omit for unlimited.
+                max_concurrent_jobs:
+                  type: integer
+                  description: Max active jobs at once. Omit for unlimited.
+                priority:
+                  type: integer
+                  minimum: 0
+                  maximum: 255
+                  default: 128
+                  description: Scheduling priority band (0=lowest, 255=highest).
+            status:
+              type: object
+              properties:
+                active_job_count:
+                  type: integer
+                cpu_nanos_reserved:
+                  type: integer
+                  format: int64
+                memory_bytes_reserved:
+                  type: integer
+                  format: int64
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Namespace
+          type: string
+          jsonPath: .spec.namespace
+        - name: MaxJobs
+          type: integer
+          jsonPath: .spec.max_concurrent_jobs
+        - name: ActiveJobs
+          type: integer
+          jsonPath: .status.active_job_count
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

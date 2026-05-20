@@ -424,6 +424,70 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
     output
 }
 
+// ── Plan diffing ──────────────────────────────────────────────────────────────
+
+/// Summary of structural differences between two physical plans.
+///
+/// Used by operators to understand what changed between two versions of the same
+/// job's physical plan (e.g. after an adaptive repartitioning decision in R7/R9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanDiff {
+    /// Node ids present in `after` but not in `before`.
+    pub added: Vec<String>,
+    /// Node ids present in `before` but not in `after`.
+    pub removed: Vec<String>,
+    /// Node ids present in both plans but with different labels or operators.
+    pub changed: Vec<String>,
+}
+
+impl PlanDiff {
+    /// Whether the two plans are structurally identical.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Compute the structural diff between two physical plans.
+///
+/// Nodes are matched by id. A node is "changed" if its label or operator type
+/// differs between `before` and `after`.
+pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
+    use std::collections::HashMap;
+
+    let before_map: HashMap<&str, &PlanNode> =
+        before.nodes().iter().map(|n| (n.id(), n)).collect();
+    let after_map: HashMap<&str, &PlanNode> =
+        after.nodes().iter().map(|n| (n.id(), n)).collect();
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+
+    for (id, after_node) in &after_map {
+        match before_map.get(id) {
+            None => added.push((*id).to_owned()),
+            Some(before_node) => {
+                if before_node.label() != after_node.label()
+                    || before_node.op() != after_node.op()
+                {
+                    changed.push((*id).to_owned());
+                }
+            }
+        }
+    }
+    for id in before_map.keys() {
+        if !after_map.contains_key(id) {
+            removed.push((*id).to_owned());
+        }
+    }
+
+    added.sort();
+    removed.sort();
+    changed.sort();
+
+    PlanDiff { added, removed, changed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -619,5 +683,52 @@ mod tests {
             "round-robin(buckets=2)"
         );
         assert_eq!(Partitioning::Broadcast.to_string(), "broadcast");
+    }
+
+    // ── PlanDiff ──────────────────────────────────────────────────────────
+
+    fn make_plan(nodes: &[(&str, &str)]) -> PhysicalPlan {
+        let mut plan = PhysicalPlan::new("test", ExecutionKind::Batch);
+        for (id, label) in nodes {
+            plan.add_node(PlanNode::new(*id, *label, ExecutionKind::Batch));
+        }
+        plan
+    }
+
+    #[test]
+    fn diff_plans_identical_is_empty() {
+        let p = make_plan(&[("scan", "Scan"), ("agg", "Aggregate")]);
+        let diff = super::diff_plans(&p, &p);
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn diff_plans_added_node() {
+        let before = make_plan(&[("scan", "Scan")]);
+        let after = make_plan(&[("scan", "Scan"), ("filter", "Filter")]);
+        let diff = super::diff_plans(&before, &after);
+        assert_eq!(diff.added, vec!["filter"]);
+        assert!(diff.removed.is_empty());
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn diff_plans_removed_node() {
+        let before = make_plan(&[("scan", "Scan"), ("filter", "Filter")]);
+        let after = make_plan(&[("scan", "Scan")]);
+        let diff = super::diff_plans(&before, &after);
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.removed, vec!["filter"]);
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn diff_plans_changed_label() {
+        let before = make_plan(&[("n1", "OldLabel")]);
+        let after = make_plan(&[("n1", "NewLabel")]);
+        let diff = super::diff_plans(&before, &after);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert_eq!(diff.changed, vec!["n1"]);
     }
 }

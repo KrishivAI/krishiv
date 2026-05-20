@@ -1,0 +1,40 @@
+---
+# Coordinator gRPC service — used by executors and CLI clients.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krishiv.fullname" . }}-coordinator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  selector:
+    {{- include "krishiv.coordinatorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.coordinator.port }}
+      targetPort: grpc
+      protocol: TCP
+  type: ClusterIP
+---
+# Executor gRPC service — used by the coordinator to push task assignments.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "krishiv.fullname" . }}-executor
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: executor
+spec:
+  selector:
+    {{- include "krishiv.executorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.executor.port }}
+      targetPort: grpc
+      protocol: TCP
+  type: ClusterIP
+  # Use headless service so each executor pod is individually addressable.
+  clusterIP: None

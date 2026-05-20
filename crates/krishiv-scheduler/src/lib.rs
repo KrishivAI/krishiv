@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -26,12 +27,12 @@ use krishiv_proto::{
     CoordinatorExecutorService, CoordinatorId, CoordinatorState, DeregisterExecutorRequest,
     DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment, FencingToken,
-    InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
-    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-    ShufflePartitionOutput, StageId, StageSpec, StageState, StreamingTaskState, TaskAssignment,
-    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
-    TaskStatusRequest, TaskStatusResponse, TaskStatusUpdate, TransportDisposition,
-    TransportVersion, wire,
+    HeartbeatHotKeyReport, HeartbeatThrottleCommand, InputPartition, JobId, JobKind, JobSpec,
+    JobState, LeaseGeneration, OutputContract, OutputContractKind, PlanFragment,
+    RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput, StageId, StageSpec,
+    StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskCancellationRequest,
+    TaskId, TaskOutputMetadata, TaskSpec, TaskState, TaskStatusRequest, TaskStatusResponse,
+    TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 use serde::{Deserialize, Serialize};
@@ -64,27 +65,221 @@ pub enum SubmitOutcome {
     Queued { position: usize },
 }
 
-/// Admission decision returned by a `QueueManager`.
+// ── R7.1 Resource governance types ───────────────────────────────────────────
+
+/// Accumulated resource consumption for one job.
 ///
-/// Controls whether a newly submitted job enters the scheduler immediately or
-/// waits behind other jobs.  Implementations are provided for process mode
-/// (`InMemoryQueueManager`) and will be added for Kubernetes CRD-backed queues
-/// in R7.1 (`CrdQueueManager`).
-pub trait QueueManager: Send + Sync + fmt::Debug {
-    /// Decide whether `spec` may be admitted now.
-    fn admit(&self, spec: &JobSpec) -> SubmitOutcome;
+/// Populated from `TaskRuntimeStats` as tasks complete. Used by the status API
+/// and for post-hoc cost attribution. Not used for real-time quota enforcement
+/// (admission uses reservation-based accounting from `JobSpec` fields).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    /// Total CPU nanoseconds consumed by all completed tasks.
+    pub cpu_nanos: u64,
+    /// Peak memory bytes observed across all completed tasks.
+    pub memory_peak_bytes: u64,
+    /// Number of completed tasks that have reported stats.
+    pub task_count: u32,
 }
 
-/// Always-admit queue manager for process mode and tests.
+impl ResourceUsage {
+    /// Empty usage.
+    pub fn zero() -> Self {
+        Self::default()
+    }
+
+    /// Absorb stats from one completed task.
+    pub fn add_task_stats(&mut self, cpu_nanos: u64, memory_bytes: u64) {
+        self.cpu_nanos = self.cpu_nanos.saturating_add(cpu_nanos);
+        self.memory_peak_bytes = self.memory_peak_bytes.max(memory_bytes);
+        self.task_count = self.task_count.saturating_add(1);
+    }
+}
+
+/// Dynamic namespace quota state supplied to `QueueManager::admit` by the
+/// coordinator.
 ///
-/// Every job is admitted immediately.  R7.1 will add quota-aware and
-/// CRD-backed implementations; this type remains the default.
+/// Contains the current reservation totals for the namespace the submitted job
+/// belongs to. `QueueManager` implementations compare these against their
+/// configured static limits to decide admission.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceQuotaSnapshot {
+    /// The namespace being queried (`None` = default namespace).
+    pub namespace_id: Option<String>,
+    /// CPU nanoseconds reserved by active (non-terminal) jobs in this namespace.
+    pub cpu_nanos_reserved: u64,
+    /// Memory bytes reserved by active (non-terminal) jobs in this namespace.
+    pub memory_bytes_reserved: u64,
+    /// Number of active (non-terminal) jobs in this namespace.
+    pub active_job_count: usize,
+}
+
+/// Admission decision returned by a `QueueManager`.
+///
+/// Receives the static `JobSpec` and a live `NamespaceQuotaSnapshot` from the
+/// coordinator. Implementations compare the spec's resource requests against
+/// the snapshot's current reservations and their own configured limits.
+pub trait QueueManager: Send + Sync + fmt::Debug {
+    /// Return whether `spec` may enter the scheduler immediately.
+    ///
+    /// `quota` contains the live reservation totals for the job's namespace.
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome;
+
+    /// Notify the queue manager when a job reaches a terminal state.
+    ///
+    /// `usage` carries the accumulated cost from `TaskRuntimeStats`. The
+    /// default is a no-op; stateful implementations may use this for
+    /// accounting or logging.
+    fn on_job_complete(&self, _job_id: &JobId, _usage: &ResourceUsage) {}
+}
+
+/// Always-admit queue manager for embedded and test contexts.
+///
+/// Every job is immediately accepted regardless of quota snapshot values. This
+/// is the default; R7.1 `QuotaQueueManager` and `CrdQueueManager` replace it
+/// for production deployments.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryQueueManager;
 
 impl QueueManager for InMemoryQueueManager {
-    fn admit(&self, _spec: &JobSpec) -> SubmitOutcome {
+    fn admit(&self, _spec: &JobSpec, _quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
         SubmitOutcome::Accepted
+    }
+}
+
+// ── QuotaQueueManager (process-mode quota enforcement) ───────────────────────
+
+/// Static resource limits for one namespace (or the default namespace).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaPolicy {
+    /// Maximum total CPU nanoseconds reserved simultaneously (`None` = unlimited).
+    pub cpu_nanos_limit: Option<u64>,
+    /// Maximum total memory bytes reserved simultaneously (`None` = unlimited).
+    pub memory_bytes_limit: Option<u64>,
+    /// Maximum number of concurrently active jobs (`None` = unlimited).
+    pub max_concurrent_jobs: Option<usize>,
+}
+
+/// Quota-aware queue manager for process (non-Kubernetes) deployments.
+///
+/// Checks `cpu_limit_nanos`, `memory_limit_bytes`, and concurrent-job count
+/// against per-namespace or default policies. A job that would exceed any
+/// limit is returned as `Queued { position: 0 }` rather than rejected, so the
+/// caller may retry admission after earlier jobs complete.
+#[derive(Debug)]
+pub struct QuotaQueueManager {
+    default_policy: QuotaPolicy,
+    namespace_policies: HashMap<String, QuotaPolicy>,
+}
+
+impl QuotaQueueManager {
+    /// Create a quota manager with a default policy and optional per-namespace overrides.
+    pub fn new(
+        default_policy: QuotaPolicy,
+        namespace_policies: HashMap<String, QuotaPolicy>,
+    ) -> Self {
+        Self {
+            default_policy,
+            namespace_policies,
+        }
+    }
+
+    /// Create a quota manager with a single default policy applied to all namespaces.
+    pub fn with_default(default_policy: QuotaPolicy) -> Self {
+        Self::new(default_policy, HashMap::new())
+    }
+
+    fn policy_for(&self, namespace_id: Option<&str>) -> &QuotaPolicy {
+        match namespace_id {
+            Some(ns) => self
+                .namespace_policies
+                .get(ns)
+                .unwrap_or(&self.default_policy),
+            None => &self.default_policy,
+        }
+    }
+}
+
+impl QueueManager for QuotaQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        let policy = self.policy_for(spec.namespace_id());
+
+        if let Some(limit) = policy.max_concurrent_jobs {
+            if quota.active_job_count >= limit {
+                return SubmitOutcome::Queued {
+                    position: quota.active_job_count - limit,
+                };
+            }
+        }
+        if let Some(limit) = policy.cpu_nanos_limit {
+            let requested = spec.cpu_limit_nanos().unwrap_or(0);
+            if quota.cpu_nanos_reserved.saturating_add(requested) > limit {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        if let Some(limit) = policy.memory_bytes_limit {
+            let requested = spec.memory_limit_bytes().unwrap_or(0);
+            if quota.memory_bytes_reserved.saturating_add(requested) > limit {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        SubmitOutcome::Accepted
+    }
+}
+
+// ── ConfigFileQueueManager ────────────────────────────────────────────────────
+
+/// On-disk config format for `ConfigFileQueueManager`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct QueueConfig {
+    #[serde(default)]
+    default: QuotaPolicy,
+    #[serde(default)]
+    namespaces: HashMap<String, QuotaPolicy>,
+}
+
+/// File-backed queue manager that reads quota policies from a JSON config file.
+///
+/// Policies are loaded once at construction time. Re-load by creating a new
+/// instance from the updated file. This keeps the implementation free of async
+/// runtimes and background threads.
+///
+/// Config file format (JSON):
+/// ```json
+/// {
+///   "default": { "max_concurrent_jobs": 10 },
+///   "namespaces": {
+///     "analytics": { "cpu_nanos_limit": 1000000000000, "memory_bytes_limit": 8589934592 }
+///   }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ConfigFileQueueManager {
+    inner: QuotaQueueManager,
+}
+
+impl ConfigFileQueueManager {
+    /// Load queue policies from the JSON file at `path`.
+    pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let config: QueueConfig = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self {
+            inner: QuotaQueueManager::new(config.default, config.namespaces),
+        })
+    }
+
+    /// Construct directly from a `QueueConfig` (useful in tests).
+    pub fn from_config(default: QuotaPolicy, namespaces: HashMap<String, QuotaPolicy>) -> Self {
+        Self {
+            inner: QuotaQueueManager::new(default, namespaces),
+        }
+    }
+}
+
+impl QueueManager for ConfigFileQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        self.inner.admit(spec, quota)
     }
 }
 
@@ -169,6 +364,59 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self::new(1, 3)
     }
+}
+
+// ── R7.2 Adaptive governance types ───────────────────────────────────────────
+
+/// The kind of adaptive decision taken or suppressed by the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaptiveDecisionKind {
+    HotKeySplit,
+    Repartition,
+    SourceThrottle,
+    SlowSinkDetected,
+}
+
+impl fmt::Display for AdaptiveDecisionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HotKeySplit => f.write_str("hot-key-split"),
+            Self::Repartition => f.write_str("repartition"),
+            Self::SourceThrottle => f.write_str("source-throttle"),
+            Self::SlowSinkDetected => f.write_str("slow-sink"),
+        }
+    }
+}
+
+/// One recorded adaptive decision (applied or suppressed by manual override).
+#[derive(Debug, Clone)]
+pub struct AdaptiveDecisionLog {
+    pub timestamp_ms: u64,
+    pub kind: AdaptiveDecisionKind,
+    pub affected_job_id: JobId,
+    pub details: String,
+    /// `true` if the decision was actually applied; `false` if suppressed.
+    pub applied: bool,
+}
+
+/// Manual override configuration for adaptive behaviors in the coordinator.
+#[derive(Debug, Clone, Default)]
+pub struct AdaptiveOverrideConfig {
+    pub disable_hot_key_splitting: bool,
+    pub disable_adaptive_repartition: bool,
+    pub disable_source_throttling: bool,
+}
+
+/// A throttle command the coordinator sends back to an executor in the
+/// heartbeat response (R7.2 Group C).
+///
+/// The executor forwards this to its source operators to apply rate limiting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrottleDecision {
+    /// Source operator id on the executor.
+    pub source_id: String,
+    /// Maximum rows per second (`None` clears the throttle).
+    pub rows_per_second: Option<u64>,
 }
 
 /// Scheduler and coordinator errors.
@@ -447,7 +695,10 @@ impl CheckpointCoordinator {
         }
         let source_offsets: Vec<SourceOffsetRecord> = offset_map
             .into_iter()
-            .map(|(partition_id, offset)| SourceOffsetRecord { partition_id, offset })
+            .map(|(partition_id, offset)| SourceOffsetRecord {
+                partition_id,
+                offset,
+            })
             .collect();
 
         // Collect operator snapshots from acks that have snapshot_path.
@@ -579,7 +830,8 @@ pub struct Coordinator {
     state: CoordinatorState,
     config: CoordinatorConfig,
     executors: ExecutorRegistry,
-    jobs: Vec<JobRecord>,
+    /// O(1) job lookup by id.  Replaces Vec<JobRecord> linear scan.
+    jobs: HashMap<JobId, JobRecord>,
     store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
     /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
     checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
@@ -596,6 +848,11 @@ pub struct Coordinator {
     ticks_since_restart: u64,
     /// Set to true after `recover_from_store` has been called at least once.
     recovering: bool,
+    /// Append-only log of adaptive decisions (hot-key split, repartition,
+    /// throttle, slow-sink).  Keyed by job id.  R7.2 Group H.
+    adaptive_decision_log: HashMap<JobId, Vec<AdaptiveDecisionLog>>,
+    /// Manual override config for adaptive behaviors.
+    adaptive_override: AdaptiveOverrideConfig,
 }
 
 impl fmt::Debug for Coordinator {
@@ -759,16 +1016,32 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             heartbeat =
                 heartbeat.with_streaming_task_states(request.streaming_task_states().to_vec());
         }
+        if !request.hot_key_reports().is_empty() {
+            heartbeat = heartbeat.with_hot_key_reports(request.hot_key_reports().to_vec());
+        }
         let mut coordinator = self
             .coordinator
             .write()
             .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {
-            Ok(()) => ExecutorHeartbeatResponse::new(
-                request.lease_generation(),
-                TransportDisposition::Accepted,
-            ),
+            Ok(throttle_cmds) => {
+                let mut resp = ExecutorHeartbeatResponse::new(
+                    request.lease_generation(),
+                    TransportDisposition::Accepted,
+                );
+                if !throttle_cmds.is_empty() {
+                    let wire_cmds: Vec<HeartbeatThrottleCommand> = throttle_cmds
+                        .into_iter()
+                        .map(|c| HeartbeatThrottleCommand {
+                            source_id: c.source_id,
+                            rows_per_second: c.rows_per_second,
+                        })
+                        .collect();
+                    resp = resp.with_throttle_commands(wire_cmds);
+                }
+                resp
+            }
             Err(SchedulerError::UnknownExecutor { .. }) => ExecutorHeartbeatResponse::new(
                 request.lease_generation(),
                 TransportDisposition::UnknownExecutor,
@@ -934,6 +1207,60 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
     }
 }
 
+// ── R8 auth interceptor skeleton ─────────────────────────────────────────────
+
+/// Authentication context extracted by the auth interceptor.
+///
+/// In R8.1+ this will carry a validated bearer token or mTLS peer identity.
+/// For now it is always `Anonymous` — the interceptor is a no-op that ensures
+/// every future call site already accepts an `AuthContext` without structural
+/// changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthContext {
+    /// No credential presented; accepted in development / internal-only deployments.
+    Anonymous,
+    /// A validated bearer token (R8.1 wiring placeholder).
+    Bearer { subject: String },
+}
+
+impl AuthContext {
+    /// Return `true` if this context represents a known authenticated subject.
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, Self::Bearer { .. })
+    }
+
+    /// Subject string, or `"anonymous"` for unauthenticated callers.
+    pub fn subject(&self) -> &str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Bearer { subject } => subject.as_str(),
+        }
+    }
+}
+
+/// Extract an `AuthContext` from the gRPC request metadata.
+///
+/// Reads the `authorization` header. If it starts with `"Bearer "` the token
+/// is extracted and returned as `Bearer { subject: <token> }`. In R9 the token
+/// is the API key validated by `krishiv_governance::StaticApiKeyAuthProvider`;
+/// JWT/OIDC validation is deferred to R10.
+///
+/// Returns `Anonymous` when no header is present or parsing fails.
+pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthContext {
+    let header = metadata
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return AuthContext::Bearer { subject: token.to_owned() };
+        }
+    }
+    AuthContext::Anonymous
+}
+
 /// Build the generated tonic server around the scheduler-backed gRPC adapter.
 pub fn coordinator_executor_grpc_server(
     coordinator: SharedCoordinator,
@@ -1010,7 +1337,11 @@ impl Coordinator {
     }
 
     /// Create an active R2 coordinator with explicit config.
-    fn build(coordinator_id: CoordinatorId, config: CoordinatorConfig, state: CoordinatorState) -> Self {
+    fn build(
+        coordinator_id: CoordinatorId,
+        config: CoordinatorConfig,
+        state: CoordinatorState,
+    ) -> Self {
         Self {
             coordinator_id,
             state,
@@ -1019,13 +1350,15 @@ impl Coordinator {
                 config.heartbeat_timeout_ticks(),
                 config.memory_threshold_bytes(),
             ),
-            jobs: Vec::new(),
+            jobs: HashMap::new(),
             store: None,
             checkpoint_coordinators: HashMap::new(),
             queue_manager: Arc::new(InMemoryQueueManager),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
+            adaptive_decision_log: HashMap::new(),
+            adaptive_override: AdaptiveOverrideConfig::default(),
         }
     }
 
@@ -1047,6 +1380,22 @@ impl Coordinator {
     pub fn with_queue_manager(mut self, qm: impl QueueManager + 'static) -> Self {
         self.queue_manager = Arc::new(qm);
         self
+    }
+
+    /// Override the adaptive governance configuration (R7.2).
+    #[must_use]
+    pub fn with_adaptive_override(mut self, cfg: AdaptiveOverrideConfig) -> Self {
+        self.adaptive_override = cfg;
+        self
+    }
+
+    /// Return the adaptive decision log for a job, or an empty slice if there
+    /// are no decisions for this job.  R7.2 Group H.
+    pub fn adaptive_decision_log(&self, job_id: &JobId) -> &[AdaptiveDecisionLog] {
+        self.adaptive_decision_log
+            .get(job_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Create a standby R2 coordinator.
@@ -1099,19 +1448,69 @@ impl Coordinator {
     /// include `streaming_task_states`. These are applied to the matching task records so
     /// the coordinator tracks the executor's current watermark and source offset without
     /// re-submitting the job from scratch.
-    pub fn executor_heartbeat(&mut self, heartbeat: ExecutorHeartbeat) -> SchedulerResult<()> {
+    ///
+    /// Returns throttle commands to forward back to the executor (R7.2 Group C).
+    /// Currently returns an empty vec unless adaptive source throttling is wired up.
+    pub fn executor_heartbeat(
+        &mut self,
+        heartbeat: ExecutorHeartbeat,
+    ) -> SchedulerResult<Vec<ThrottleDecision>> {
         self.ensure_active()?;
         let streaming_states: Vec<StreamingTaskState> = heartbeat.streaming_task_states().to_vec();
+        let hot_key_reports = heartbeat.hot_key_reports().to_vec();
         self.executors.heartbeat(heartbeat)?;
         for state in &streaming_states {
             self.apply_streaming_task_state(state);
         }
-        Ok(())
+        // R7.2 Group D: process hot-key reports and record adaptive decisions.
+        self.process_hot_key_reports(&hot_key_reports);
+        Ok(Vec::new())
+    }
+
+    /// Record adaptive decisions for incoming hot-key reports.
+    ///
+    /// For each hot key whose heat_score exceeds the threshold, logs an
+    /// `AdaptiveDecisionLog` entry. If `disable_hot_key_splitting` is set,
+    /// the decision is logged with `applied: false`.
+    fn process_hot_key_reports(&mut self, reports: &[HeartbeatHotKeyReport]) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        if reports.is_empty() {
+            return;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        for report in reports {
+            if report.job_id.is_empty() {
+                continue;
+            }
+            let job_id = match JobId::try_new(report.job_id.clone()) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let applied = !self.adaptive_override.disable_hot_key_splitting;
+            let log = AdaptiveDecisionLog {
+                timestamp_ms: now_ms,
+                kind: AdaptiveDecisionKind::HotKeySplit,
+                affected_job_id: job_id.clone(),
+                details: format!(
+                    "hot key '{}' heat={:.3} estimated_count={} max_error={}",
+                    report.key, report.heat_score, report.estimated_count, report.max_error
+                ),
+                applied,
+            };
+            self.adaptive_decision_log
+                .entry(job_id)
+                .or_default()
+                .push(log);
+        }
     }
 
     /// Update a task record's last-known watermark and source offset from executor-reported state.
     fn apply_streaming_task_state(&mut self, state: &StreamingTaskState) {
-        for job in &mut self.jobs {
+        for job in self.jobs.values_mut() {
             for stage in &mut job.stages {
                 for task in stage.tasks_mut() {
                     if task.task_id() == &state.task_id {
@@ -1171,7 +1570,7 @@ impl Coordinator {
 
     /// Returns true if the executor owns at least one Running task in a streaming job.
     fn executor_has_streaming_running_tasks(&self, executor_id: &ExecutorId) -> bool {
-        self.jobs.iter().any(|job| {
+        self.jobs.values().any(|job| {
             job.spec.kind() == JobKind::Streaming
                 && job.stages.iter().any(|stage| {
                     stage.tasks().iter().any(|task| {
@@ -1193,9 +1592,7 @@ impl Coordinator {
     /// via `CheckpointCoordinator::recover_from_storage`.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         for record in store.jobs() {
-            if !self.jobs.iter().any(|j| j.job_id() == record.job_id()) {
-                self.jobs.push(record.clone());
-            }
+            self.jobs.entry(record.job_id().clone()).or_insert_with(|| record.clone());
         }
         // Recover checkpoint coordinators from storage.
         for coord in self.checkpoint_coordinators.values_mut() {
@@ -1213,19 +1610,48 @@ impl Coordinator {
         })
     }
 
-    /// Submit a job and statically assign its tasks.
+    /// Compute the current reservation totals for the given namespace.
+    ///
+    /// Walks active (non-terminal) jobs and sums their `cpu_limit_nanos` and
+    /// `memory_limit_bytes` reservations. The returned snapshot is passed to
+    /// `QueueManager::admit` so quota enforcement is stateless in the queue
+    /// manager itself.
+    pub fn namespace_quota_snapshot(&self, namespace_id: Option<&str>) -> NamespaceQuotaSnapshot {
+        let mut snap = NamespaceQuotaSnapshot {
+            namespace_id: namespace_id.map(str::to_owned),
+            ..Default::default()
+        };
+        for job in self.jobs.values() {
+            if job.state().is_terminal() {
+                continue;
+            }
+            if job.spec.namespace_id() != namespace_id {
+                continue;
+            }
+            snap.active_job_count += 1;
+            snap.cpu_nanos_reserved = snap
+                .cpu_nanos_reserved
+                .saturating_add(job.spec.cpu_limit_nanos().unwrap_or(0));
+            snap.memory_bytes_reserved = snap
+                .memory_bytes_reserved
+                .saturating_add(job.spec.memory_limit_bytes().unwrap_or(0));
+        }
+        snap
+    }
+
     pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         self.ensure_active()?;
         validate_job(&spec)?;
 
-        if self.jobs.iter().any(|job| job.job_id() == spec.job_id()) {
+        if self.jobs.contains_key(spec.job_id()) {
             return Err(SchedulerError::DuplicateJob {
                 job_id: spec.job_id().clone(),
             });
         }
 
-        // Admission control: return early if the queue manager holds the job.
-        let outcome = self.queue_manager.admit(&spec);
+        // Admission control: compute live quota snapshot then ask the queue manager.
+        let quota = self.namespace_quota_snapshot(spec.namespace_id());
+        let outcome = self.queue_manager.admit(&spec, &quota);
         if let SubmitOutcome::Queued { .. } = &outcome {
             return Ok(outcome);
         }
@@ -1259,7 +1685,7 @@ impl Coordinator {
             s.save_job(&record).ok();
             s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
         }
-        self.jobs.push(record);
+        self.jobs.insert(record.job_id().clone(), record);
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1414,15 +1840,15 @@ impl Coordinator {
     pub fn stability_metrics(&self) -> StabilityMetrics {
         StabilityMetrics {
             heartbeat_ages: self.executors.heartbeat_ages(),
-            failed_assignments: self.jobs.iter().map(JobRecord::failed_task_count).sum(),
-            retry_count: self.jobs.iter().map(JobRecord::retry_count).sum(),
-            running_task_count: self.jobs.iter().map(JobRecord::running_task_count).sum(),
+            failed_assignments: self.jobs.values().map(JobRecord::failed_task_count).sum(),
+            retry_count: self.jobs.values().map(JobRecord::retry_count).sum(),
+            running_task_count: self.jobs.values().map(JobRecord::running_task_count).sum(),
             shuffle_partitions_available: self
                 .jobs
-                .iter()
+                .values()
                 .map(JobRecord::shuffle_partitions_available_count)
                 .sum(),
-            shuffle_bytes_written: self.jobs.iter().map(JobRecord::shuffle_bytes_written).sum(),
+            shuffle_bytes_written: self.jobs.values().map(JobRecord::shuffle_bytes_written).sum(),
         }
     }
 
@@ -1542,11 +1968,21 @@ impl Coordinator {
             .validate_lease(update.executor_id(), update.lease_generation())?;
         let job_id = update.job_id().clone();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
-        if let Some(record) = self.jobs.iter().find(|j| j.job_id() == &job_id) {
-            if record.state().is_terminal() && !self.gc_ready_jobs.contains(&job_id) {
-                self.gc_ready_jobs.push(job_id.clone());
-                self.checkpoint_coordinators.remove(&job_id);
-            }
+
+        // Snapshot the job's current state and resource usage after the update.
+        let (is_terminal, usage) = self
+            .jobs
+            .get(&job_id)
+            .map(|r| (r.state().is_terminal(), r.resource_usage.clone()))
+            .unwrap_or((false, ResourceUsage::zero()));
+
+        if is_terminal && !self.gc_ready_jobs.contains(&job_id) {
+            self.gc_ready_jobs.push(job_id.clone());
+            self.checkpoint_coordinators.remove(&job_id);
+            // Notify the queue manager so it can release reserved capacity.
+            self.queue_manager.on_job_complete(&job_id, &usage);
+        }
+        if let Some(record) = self.jobs.get(&job_id) {
             if let Some(store) = &self.store {
                 let mut s = store.lock().unwrap();
                 s.save_job(record).ok();
@@ -1575,7 +2011,7 @@ impl Coordinator {
 
     /// Snapshot all known jobs.
     pub fn job_snapshots(&self) -> Vec<JobSnapshot> {
-        self.jobs.iter().map(JobRecord::snapshot).collect()
+        self.jobs.values().map(JobRecord::snapshot).collect()
     }
 
     /// Snapshot all known executors.
@@ -1584,7 +2020,7 @@ impl Coordinator {
     }
 
     fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
-        for job in &mut self.jobs {
+        for job in self.jobs.values_mut() {
             let mut job_affected = false;
             for stage in &mut job.stages {
                 let mut stage_affected = false;
@@ -1622,21 +2058,15 @@ impl Coordinator {
     }
 
     fn find_job(&self, job_id: &JobId) -> SchedulerResult<&JobRecord> {
-        self.jobs
-            .iter()
-            .find(|job| job.job_id() == job_id)
-            .ok_or_else(|| SchedulerError::UnknownJob {
-                job_id: job_id.clone(),
-            })
+        self.jobs.get(job_id).ok_or_else(|| SchedulerError::UnknownJob {
+            job_id: job_id.clone(),
+        })
     }
 
     fn find_job_mut(&mut self, job_id: &JobId) -> SchedulerResult<&mut JobRecord> {
-        self.jobs
-            .iter_mut()
-            .find(|job| job.job_id() == job_id)
-            .ok_or_else(|| SchedulerError::UnknownJob {
-                job_id: job_id.clone(),
-            })
+        self.jobs.get_mut(job_id).ok_or_else(|| SchedulerError::UnknownJob {
+            job_id: job_id.clone(),
+        })
     }
 }
 
@@ -1990,6 +2420,8 @@ pub struct JobRecord {
     /// Shuffle partition availability metadata per producing stage.
     /// Updated when tasks report ShufflePartitionOutput in TaskOutputMetadata.
     shuffle_output: HashMap<StageId, ShuffleMetadata>,
+    /// Accumulated resource consumption from completed tasks.
+    resource_usage: ResourceUsage,
 }
 
 impl JobRecord {
@@ -2006,7 +2438,13 @@ impl JobRecord {
             max_stage_retries,
             stages,
             shuffle_output: HashMap::new(),
+            resource_usage: ResourceUsage::zero(),
         }
+    }
+
+    /// Accumulated resource consumption reported by completed tasks.
+    pub fn resource_usage(&self) -> &ResourceUsage {
+        &self.resource_usage
     }
 
     /// Job id.
@@ -2143,6 +2581,12 @@ impl JobRecord {
             .map(|m| m.shuffle_partitions().to_vec())
             .unwrap_or_default();
 
+        // Capture stats before consuming the update.
+        let runtime_stats = update
+            .output_metadata()
+            .and_then(|m| m.runtime_stats())
+            .map(|s| (s.cpu_nanos, s.memory_bytes));
+
         let stage = self
             .stages
             .iter_mut()
@@ -2152,6 +2596,13 @@ impl JobRecord {
             })?;
 
         let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
+
+        // Accumulate resource stats from successfully-completed tasks.
+        if outcome != TaskUpdateOutcome::Duplicate {
+            if let Some((cpu_nanos, memory_bytes)) = runtime_stats {
+                self.resource_usage.add_task_stats(cpu_nanos, memory_bytes);
+            }
+        }
 
         // If the task succeeded with shuffle output, record partition availability.
         if !shuffle_partitions.is_empty() {
@@ -2251,6 +2702,9 @@ impl JobRecord {
             running_task_count,
             succeeded_task_count,
             failed_task_count,
+            priority: self.spec.priority(),
+            namespace_id: self.spec.namespace_id().map(str::to_owned),
+            resource_usage: self.resource_usage.clone(),
         }
     }
 
@@ -2589,6 +3043,12 @@ pub struct JobSnapshot {
     running_task_count: usize,
     succeeded_task_count: usize,
     failed_task_count: usize,
+    /// Scheduling priority (0 = lowest, 255 = highest).
+    priority: u8,
+    /// Governance namespace, if set.
+    namespace_id: Option<String>,
+    /// Accumulated resource consumption from completed tasks.
+    resource_usage: ResourceUsage,
 }
 
 impl JobSnapshot {
@@ -2635,6 +3095,21 @@ impl JobSnapshot {
     /// Number of failed tasks.
     pub fn failed_task_count(&self) -> usize {
         self.failed_task_count
+    }
+
+    /// Scheduling priority.
+    pub fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    /// Governance namespace.
+    pub fn namespace_id(&self) -> Option<&str> {
+        self.namespace_id.as_deref()
+    }
+
+    /// Accumulated resource consumption.
+    pub fn resource_usage(&self) -> &ResourceUsage {
+        &self.resource_usage
     }
 }
 
@@ -3009,18 +3484,26 @@ impl JsonFileMetadataStore {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let store = Self { path, events: Vec::new(), jobs: Vec::new() };
+                let store = Self {
+                    path,
+                    events: Vec::new(),
+                    jobs: Vec::new(),
+                };
                 store.persist()?;
                 return Ok(store);
             }
             Err(e) => {
                 return Err(SchedulerError::Transport {
                     message: format!("failed to read metadata store '{}': {e}", path.display()),
-                })
+                });
             }
         };
         if bytes.is_empty() {
-            return Ok(Self { path, events: Vec::new(), jobs: Vec::new() });
+            return Ok(Self {
+                path,
+                events: Vec::new(),
+                jobs: Vec::new(),
+            });
         }
         let persisted: PersistedMetadata =
             serde_json::from_slice(&bytes).map_err(|error| SchedulerError::InvalidJob {
@@ -3318,6 +3801,9 @@ struct PersistedJobRecord {
     state: String,
     max_stage_retries: u32,
     stages: Vec<PersistedStageRecord>,
+    /// Accumulated resource consumption. `None` in records written before R7.1.
+    #[serde(default)]
+    resource_usage: Option<ResourceUsage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3344,6 +3830,15 @@ struct PersistedJobSpec {
     name: String,
     kind: String,
     stages: Vec<PersistedStageSpec>,
+    /// R7.1 fields — absent in records written before R7.1 (backward compatible).
+    #[serde(default)]
+    priority: Option<u8>,
+    #[serde(default)]
+    namespace_id: Option<String>,
+    #[serde(default)]
+    cpu_limit_nanos: Option<u64>,
+    #[serde(default)]
+    memory_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3390,6 +3885,7 @@ impl From<&JobRecord> for PersistedJobRecord {
                 .iter()
                 .map(PersistedStageRecord::from)
                 .collect(),
+            resource_usage: Some(value.resource_usage.clone()),
         }
     }
 }
@@ -3410,6 +3906,7 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
             // Shuffle output metadata is not persisted; it is rebuilt from
             // executor task status updates after coordinator restart.
             shuffle_output: HashMap::new(),
+            resource_usage: value.resource_usage.unwrap_or_default(),
         })
     }
 }
@@ -3491,6 +3988,10 @@ impl From<&JobSpec> for PersistedJobSpec {
                 .iter()
                 .map(PersistedStageSpec::from)
                 .collect(),
+            priority: Some(value.priority()),
+            namespace_id: value.namespace_id().map(str::to_owned),
+            cpu_limit_nanos: value.cpu_limit_nanos(),
+            memory_limit_bytes: value.memory_limit_bytes(),
         }
     }
 }
@@ -3506,6 +4007,18 @@ impl TryFrom<PersistedJobSpec> for JobSpec {
         );
         for stage in value.stages {
             spec = spec.with_stage(StageSpec::try_from(stage)?);
+        }
+        if let Some(p) = value.priority {
+            spec = spec.with_priority(p);
+        }
+        if let Some(ns) = value.namespace_id {
+            spec = spec.with_namespace(ns);
+        }
+        if let Some(cpu) = value.cpu_limit_nanos {
+            spec = spec.with_cpu_limit_nanos(cpu);
+        }
+        if let Some(mem) = value.memory_limit_bytes {
+            spec = spec.with_memory_limit_bytes(mem);
         }
         Ok(spec)
     }
@@ -3677,10 +4190,47 @@ fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 
 /// Leader election interface for single-coordinator and HA deployments.
 ///
-/// `SingleNodeElection` is the only R3.1 implementation. HA election backed by
-/// an etcd or Kubernetes lease is deferred to R6.
+/// Per-job leader election contract.
+///
+/// `SingleNodeElection` is the embedded/single-node implementation.
+/// `K8sLeaseElection` in `krishiv-operator` implements this for Kubernetes HA.
+/// Bare-metal HA backed by external etcd is deferred post-R9.
 pub trait LeaderElection: Send + Sync {
+    /// Whether this node currently holds the leader lease.
     fn is_leader(&self) -> bool;
+
+    /// Attempt to acquire the leader lease. Returns `true` if acquired.
+    ///
+    /// Default: always succeeds (single-node behaviour).
+    fn try_acquire(&self) -> bool {
+        self.is_leader()
+    }
+
+    /// Renew the current leader lease. Returns `true` if the renewal succeeded.
+    ///
+    /// A `false` result means another node has taken the lease — this node must
+    /// stop acting as leader immediately and reject any pending checkpoint writes.
+    ///
+    /// Default: returns `is_leader()` (single-node behaviour).
+    fn renew(&self) -> bool {
+        self.is_leader()
+    }
+
+    /// Release the leader lease voluntarily (graceful shutdown).
+    ///
+    /// Default: no-op.
+    fn release(&self) {}
+
+    /// Monotonically increasing fencing token for this lease holder.
+    ///
+    /// Must be stored in every [`CheckpointMetadata`] committed by this
+    /// coordinator. A checkpoint whose `fencing_token` is less than the current
+    /// token must be rejected with [`CheckpointError::StaleFencingToken`].
+    ///
+    /// Default: returns `0` (single-node — no competing coordinators).
+    fn fencing_token(&self) -> u64 {
+        0
+    }
 }
 
 /// No-op leader election that always reports this node as the leader.
@@ -3690,6 +4240,40 @@ pub struct SingleNodeElection;
 impl LeaderElection for SingleNodeElection {
     fn is_leader(&self) -> bool {
         true
+    }
+}
+
+/// TLS configuration for the coordinator/executor gRPC transport.
+///
+/// When `None` is passed to the TLS-aware server builder, connections are
+/// plaintext (appropriate for K8s pod-to-pod within a NetworkPolicy-controlled
+/// namespace, or local development).
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded server certificate chain.
+    pub cert_pem: Vec<u8>,
+    /// PEM-encoded server private key.
+    pub key_pem: Vec<u8>,
+    /// Optional PEM-encoded CA certificate for client certificate verification
+    /// (mTLS). When `None`, client certificates are not required.
+    pub ca_pem: Option<Vec<u8>>,
+}
+
+impl TlsConfig {
+    /// Build a `TlsConfig` from PEM byte slices.
+    pub fn new(cert_pem: impl Into<Vec<u8>>, key_pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            cert_pem: cert_pem.into(),
+            key_pem: key_pem.into(),
+            ca_pem: None,
+        }
+    }
+
+    /// Attach a CA certificate for mTLS peer verification.
+    #[must_use]
+    pub fn with_ca(mut self, ca_pem: impl Into<Vec<u8>>) -> Self {
+        self.ca_pem = Some(ca_pem.into());
+        self
     }
 }
 
@@ -3721,12 +4305,13 @@ mod tests {
     };
 
     use super::{
-        CheckpointCoordinator, CheckpointCoordinatorState, Coordinator, CoordinatorConfig,
+        AdaptiveDecisionKind, AdaptiveOverrideConfig, CheckpointCoordinator,
+        CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator, CoordinatorConfig,
         CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryMetadataStore,
-        InMemoryQueueManager, JsonFileMetadataStore, LeaderElection, MetadataStore, QueueManager,
+        InMemoryQueueManager, JobSnapshot, JsonFileMetadataStore, LeaderElection, MetadataStore,
+        NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, QuotaQueueManager, ResourceUsage,
         SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
-        TaskUpdateOutcome, job_spec_from_logical_plan,
-        serve_coordinator_executor_grpc_with_listener,
+        TaskUpdateOutcome, job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
 
     #[derive(Debug, Clone, Default)]
@@ -5350,12 +5935,13 @@ mod tests {
             ))
             .unwrap();
         coordinator.submit_job(demo_job()).unwrap();
-        store.save_job(&coordinator.jobs[0]).unwrap();
+        let record = coordinator.jobs.values().next().unwrap();
+        store.save_job(record).unwrap();
         assert_eq!(store.jobs().len(), 1);
         assert_eq!(store.jobs()[0].job_id(), &job_id);
 
         // Overwrite with the same record is idempotent.
-        store.save_job(&coordinator.jobs[0]).unwrap();
+        store.save_job(coordinator.jobs.values().next().unwrap()).unwrap();
         assert_eq!(store.jobs().len(), 1);
     }
 
@@ -5379,7 +5965,7 @@ mod tests {
         ))
         .unwrap();
         prev.submit_job(demo_job()).unwrap();
-        store.save_job(&prev.jobs[0]).unwrap();
+        store.save_job(prev.jobs.values().next().unwrap()).unwrap();
 
         let mut coordinator = Coordinator::active(coord_id);
         coordinator.recover_from_store(&store).unwrap();
@@ -5490,7 +6076,7 @@ mod tests {
         let mut external_store = InMemoryMetadataStore::default();
         // Save the job record into the external store by recovering c1's state.
         // (In production the write-through would have done this automatically.)
-        for job in &c1.jobs {
+        for job in c1.jobs.values() {
             external_store.save_job(job).unwrap();
         }
 
@@ -6511,7 +7097,305 @@ mod tests {
     fn in_memory_queue_manager_always_accepts() {
         let qm = InMemoryQueueManager;
         let spec = demo_job();
-        assert_eq!(qm.admit(&spec), SubmitOutcome::Accepted);
+        let quota = NamespaceQuotaSnapshot::default();
+        assert_eq!(qm.admit(&spec, &quota), SubmitOutcome::Accepted);
+    }
+
+    // ── R7.1 Resource governance tests ───────────────────────────────────────
+
+    #[test]
+    fn quota_queue_manager_admits_within_limits() {
+        let qm = QuotaQueueManager::with_default(QuotaPolicy {
+            cpu_nanos_limit: Some(1_000_000_000),
+            memory_bytes_limit: Some(512 * 1024 * 1024),
+            max_concurrent_jobs: Some(5),
+        });
+        let spec = demo_job()
+            .with_cpu_limit_nanos(100_000_000)
+            .with_memory_limit_bytes(64 * 1024 * 1024);
+        let quota = NamespaceQuotaSnapshot {
+            active_job_count: 2,
+            cpu_nanos_reserved: 200_000_000,
+            memory_bytes_reserved: 128 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(qm.admit(&spec, &quota), SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn quota_queue_manager_queues_when_cpu_limit_exceeded() {
+        let qm = QuotaQueueManager::with_default(QuotaPolicy {
+            cpu_nanos_limit: Some(1_000_000_000),
+            memory_bytes_limit: None,
+            max_concurrent_jobs: None,
+        });
+        let spec = demo_job().with_cpu_limit_nanos(600_000_000);
+        let quota = NamespaceQuotaSnapshot {
+            cpu_nanos_reserved: 500_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            qm.admit(&spec, &quota),
+            SubmitOutcome::Queued { position: 0 }
+        );
+    }
+
+    #[test]
+    fn quota_queue_manager_queues_when_memory_limit_exceeded() {
+        let qm = QuotaQueueManager::with_default(QuotaPolicy {
+            cpu_nanos_limit: None,
+            memory_bytes_limit: Some(512 * 1024 * 1024),
+            max_concurrent_jobs: None,
+        });
+        let spec = demo_job().with_memory_limit_bytes(300 * 1024 * 1024);
+        let quota = NamespaceQuotaSnapshot {
+            memory_bytes_reserved: 300 * 1024 * 1024,
+            ..Default::default()
+        };
+        assert_eq!(
+            qm.admit(&spec, &quota),
+            SubmitOutcome::Queued { position: 0 }
+        );
+    }
+
+    #[test]
+    fn quota_queue_manager_queues_when_job_count_exceeded() {
+        let qm = QuotaQueueManager::with_default(QuotaPolicy {
+            cpu_nanos_limit: None,
+            memory_bytes_limit: None,
+            max_concurrent_jobs: Some(2),
+        });
+        let spec = demo_job();
+        let quota = NamespaceQuotaSnapshot {
+            active_job_count: 2,
+            ..Default::default()
+        };
+        assert!(matches!(
+            qm.admit(&spec, &quota),
+            SubmitOutcome::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn quota_queue_manager_uses_namespace_policy() {
+        use std::collections::HashMap;
+        let mut ns_policies = HashMap::new();
+        ns_policies.insert(
+            "analytics".to_owned(),
+            QuotaPolicy {
+                cpu_nanos_limit: None,
+                memory_bytes_limit: None,
+                max_concurrent_jobs: Some(1),
+            },
+        );
+        let qm = QuotaQueueManager::new(QuotaPolicy::default(), ns_policies);
+
+        let spec_ns = demo_job().with_namespace("analytics");
+        let spec_default = demo_job();
+        let quota_full = NamespaceQuotaSnapshot {
+            namespace_id: Some("analytics".to_owned()),
+            active_job_count: 1,
+            ..Default::default()
+        };
+        let quota_empty = NamespaceQuotaSnapshot {
+            namespace_id: Some("analytics".to_owned()),
+            active_job_count: 0,
+            ..Default::default()
+        };
+        // Analytics namespace is full.
+        assert!(matches!(
+            qm.admit(&spec_ns, &quota_full),
+            SubmitOutcome::Queued { .. }
+        ));
+        // Default namespace has no limit — admits.
+        assert_eq!(
+            qm.admit(&spec_default, &quota_full),
+            SubmitOutcome::Accepted
+        );
+        // Analytics namespace has capacity — admits.
+        assert_eq!(qm.admit(&spec_ns, &quota_empty), SubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn config_file_queue_manager_admits_from_in_memory_config() {
+        use std::collections::HashMap;
+        let qm = ConfigFileQueueManager::from_config(
+            QuotaPolicy {
+                max_concurrent_jobs: Some(3),
+                ..Default::default()
+            },
+            HashMap::new(),
+        );
+        let spec = demo_job();
+        let quota_ok = NamespaceQuotaSnapshot {
+            active_job_count: 2,
+            ..Default::default()
+        };
+        let quota_full = NamespaceQuotaSnapshot {
+            active_job_count: 3,
+            ..Default::default()
+        };
+        assert_eq!(qm.admit(&spec, &quota_ok), SubmitOutcome::Accepted);
+        assert!(matches!(
+            qm.admit(&spec, &quota_full),
+            SubmitOutcome::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn config_file_queue_manager_loads_from_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queues.json");
+        std::fs::write(
+            &path,
+            r#"{"default":{"max_concurrent_jobs":1},"namespaces":{}}"#,
+        )
+        .unwrap();
+        let qm = ConfigFileQueueManager::from_path(&path).unwrap();
+        let spec = demo_job();
+        let quota_ok = NamespaceQuotaSnapshot {
+            active_job_count: 0,
+            ..Default::default()
+        };
+        let quota_full = NamespaceQuotaSnapshot {
+            active_job_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(qm.admit(&spec, &quota_ok), SubmitOutcome::Accepted);
+        assert!(matches!(
+            qm.admit(&spec, &quota_full),
+            SubmitOutcome::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn namespace_quota_snapshot_sums_active_jobs() {
+        let coordinator_id = CoordinatorId::try_new("coord-quota").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+        let executor_id = ExecutorId::try_new("exec-quota").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host", 4))
+            .unwrap();
+
+        let job_id_a = JobId::try_new("quota-a").unwrap();
+        let job_id_b = JobId::try_new("quota-b").unwrap();
+
+        let spec_a = single_task_job(job_id_a.clone())
+            .with_namespace("team-a")
+            .with_cpu_limit_nanos(500_000_000)
+            .with_memory_limit_bytes(256 * 1024 * 1024);
+
+        let spec_b = single_task_job(job_id_b.clone())
+            .with_namespace("team-a")
+            .with_cpu_limit_nanos(300_000_000)
+            .with_memory_limit_bytes(128 * 1024 * 1024);
+
+        coordinator.submit_job(spec_a).unwrap();
+        coordinator.submit_job(spec_b).unwrap();
+
+        let snap = coordinator.namespace_quota_snapshot(Some("team-a"));
+        assert_eq!(snap.active_job_count, 2);
+        assert_eq!(snap.cpu_nanos_reserved, 800_000_000);
+        assert_eq!(snap.memory_bytes_reserved, (256 + 128) * 1024 * 1024);
+
+        let snap_other = coordinator.namespace_quota_snapshot(Some("team-b"));
+        assert_eq!(snap_other.active_job_count, 0);
+    }
+
+    #[test]
+    fn coordinator_queues_job_when_quota_exceeded() {
+        let coordinator_id = CoordinatorId::try_new("coord-qe").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id).with_queue_manager(
+            QuotaQueueManager::with_default(QuotaPolicy {
+                max_concurrent_jobs: Some(1),
+                ..Default::default()
+            }),
+        );
+        let executor_id = ExecutorId::try_new("exec-qe").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "host", 2))
+            .unwrap();
+
+        let job_id_a = JobId::try_new("qe-a").unwrap();
+        let job_id_b = JobId::try_new("qe-b").unwrap();
+
+        coordinator.submit_job(single_task_job(job_id_a)).unwrap();
+
+        // Second job exceeds the 1-job concurrent limit.
+        let outcome = coordinator.submit_job(single_task_job(job_id_b)).unwrap();
+        assert!(matches!(outcome, SubmitOutcome::Queued { .. }));
+    }
+
+    #[test]
+    fn resource_usage_accumulates_from_task_stats() {
+        let coordinator_id = CoordinatorId::try_new("coord-ru").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+        let executor_id = ExecutorId::try_new("exec-ru").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host", 2))
+            .unwrap();
+        coordinator
+            .executor_heartbeat(ExecutorHeartbeat::new(
+                executor_id.clone(),
+                ExecutorState::Healthy,
+            ))
+            .unwrap();
+
+        let job_id = JobId::try_new("ru-job").unwrap();
+        let stage_id = StageId::try_new("stage-1").unwrap();
+        let task_id = TaskId::try_new("task-1").unwrap();
+
+        use krishiv_proto::{AttemptId, LeaseGeneration, TaskRuntimeStats, TaskStatusUpdate};
+
+        let spec = JobSpec::new(job_id.clone(), "ru", JobKind::Batch).with_stage(
+            StageSpec::new(stage_id.clone(), "s").with_task(TaskSpec::new(task_id.clone(), "t")),
+        );
+        coordinator.submit_job(spec).unwrap();
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        let assignment = assignments.first().unwrap();
+
+        let mut meta = TaskOutputMetadata::new("inline", 10, 1, 5);
+        meta = meta.with_runtime_stats(TaskRuntimeStats {
+            input_rows: 0,
+            output_rows: 10,
+            cpu_nanos: 1_000_000,
+            memory_bytes: 0,
+            spill_bytes: 0,
+        });
+
+        let update = TaskStatusUpdate::new(
+            assignment.job_id().clone(),
+            assignment.stage_id().clone(),
+            assignment.task_id().clone(),
+            executor_id,
+            TaskState::Succeeded,
+            assignment.attempt_id().as_u32(),
+        )
+        .with_lease_generation(assignment.lease_generation())
+        .with_output_metadata(meta);
+
+        coordinator.apply_task_update(update).unwrap();
+
+        let snap = coordinator.job_snapshot(&job_id).unwrap();
+        assert_eq!(snap.resource_usage().cpu_nanos, 1_000_000);
+        assert_eq!(snap.resource_usage().task_count, 1);
+    }
+
+    #[test]
+    fn job_spec_priority_and_namespace_round_trip() {
+        let job_id = JobId::try_new("prio-job").unwrap();
+        let spec = JobSpec::new(job_id, "test", JobKind::Batch)
+            .with_priority(200)
+            .with_namespace("eng")
+            .with_cpu_limit_nanos(1_000_000)
+            .with_memory_limit_bytes(1024);
+
+        assert_eq!(spec.priority(), 200);
+        assert_eq!(spec.namespace_id(), Some("eng"));
+        assert_eq!(spec.cpu_limit_nanos(), Some(1_000_000));
+        assert_eq!(spec.memory_limit_bytes(), Some(1024));
     }
 
     #[test]
@@ -6533,7 +7417,7 @@ mod tests {
         #[derive(Debug)]
         struct BlockAllQueueManager;
         impl QueueManager for BlockAllQueueManager {
-            fn admit(&self, _spec: &JobSpec) -> SubmitOutcome {
+            fn admit(&self, _spec: &JobSpec, _quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
                 SubmitOutcome::Queued { position: 0 }
             }
         }
@@ -6556,5 +7440,136 @@ mod tests {
                 .is_err(),
             "queued job must not appear in job list"
         );
+    }
+
+    // ── R7.2 Adaptive decision log tests ─────────────────────────────────────
+
+    #[test]
+    fn adaptive_decision_log_empty_for_unknown_job() {
+        let coordinator_id = CoordinatorId::try_new("coord-adaptive").unwrap();
+        let coordinator = Coordinator::active(coordinator_id);
+        let job_id = JobId::try_new("unknown-job").unwrap();
+        assert!(coordinator.adaptive_decision_log(&job_id).is_empty());
+    }
+
+    #[test]
+    fn hot_key_reports_appended_to_decision_log() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-hk").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-1").unwrap();
+        let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+            .with_hot_key_reports(vec![HeartbeatHotKeyReport {
+                key: "hot-key".into(),
+                estimated_count: 500,
+                max_error: 10,
+                heat_score: 0.25,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            }]);
+
+        let throttle_cmds = coordinator.executor_heartbeat(heartbeat).unwrap();
+        // Default config: no throttle commands issued.
+        assert!(throttle_cmds.is_empty());
+
+        let log = coordinator.adaptive_decision_log(&job_id);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, AdaptiveDecisionKind::HotKeySplit);
+        assert!(log[0].applied, "hot-key split must be applied by default");
+        assert!(log[0].details.contains("hot-key"));
+    }
+
+    #[test]
+    fn hot_key_split_suppressed_by_override() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk-override").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id).with_adaptive_override(
+            AdaptiveOverrideConfig {
+                disable_hot_key_splitting: true,
+                ..AdaptiveOverrideConfig::default()
+            },
+        );
+
+        let executor_id = ExecutorId::try_new("exec-hk-override").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-2").unwrap();
+        let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+            .with_hot_key_reports(vec![HeartbeatHotKeyReport {
+                key: "skewed-key".into(),
+                estimated_count: 1000,
+                max_error: 0,
+                heat_score: 0.9,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            }]);
+
+        coordinator.executor_heartbeat(heartbeat).unwrap();
+
+        let log = coordinator.adaptive_decision_log(&job_id);
+        assert_eq!(log.len(), 1);
+        assert!(
+            !log[0].applied,
+            "decision must be suppressed when disable_hot_key_splitting=true"
+        );
+        assert!(log[0].details.contains("skewed-key"));
+    }
+
+    #[test]
+    fn multiple_hot_key_reports_all_logged() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorState, HeartbeatHotKeyReport};
+
+        let coordinator_id = CoordinatorId::try_new("coord-hk-multi").unwrap();
+        let mut coordinator = Coordinator::active(coordinator_id);
+
+        let executor_id = ExecutorId::try_new("exec-hk-multi").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 4))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-hk-3").unwrap();
+        let reports = vec![
+            HeartbeatHotKeyReport {
+                key: "key-a".into(),
+                estimated_count: 300,
+                max_error: 5,
+                heat_score: 0.3,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            },
+            HeartbeatHotKeyReport {
+                key: "key-b".into(),
+                estimated_count: 200,
+                max_error: 3,
+                heat_score: 0.2,
+                job_id: job_id.as_str().to_owned(),
+                source_id: "src-0".into(),
+            },
+        ];
+
+        let heartbeat =
+            ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy).with_hot_key_reports(reports);
+        coordinator.executor_heartbeat(heartbeat).unwrap();
+
+        let log = coordinator.adaptive_decision_log(&job_id);
+        assert_eq!(log.len(), 2, "one log entry per hot-key report");
+    }
+
+    #[test]
+    fn adaptive_override_config_defaults_all_false() {
+        let cfg = AdaptiveOverrideConfig::default();
+        assert!(!cfg.disable_hot_key_splitting);
+        assert!(!cfg.disable_adaptive_repartition);
+        assert!(!cfg.disable_source_throttling);
     }
 }
