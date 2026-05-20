@@ -1,0 +1,28 @@
+[package]
+name = "krishiv-flight-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+krishiv-api = { path = "../krishiv-api" }
+tokio = { workspace = true }
+# Use tonic 0.12 — same version as arrow-flight 55 to avoid type conflicts
+tonic = { version = "0.12", features = ["transport"] }
+# Use prost 0.13 — same version as arrow-flight 55 to avoid type conflicts
+prost = "0.13"
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

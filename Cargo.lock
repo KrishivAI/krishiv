@@ -2873,6 +2873,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-flight-sql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "bytes",
+ "futures",
+ "krishiv-api",
+ "prost 0.13.5",
+ "tokio",
+ "tonic 0.12.3",
+]
+
+[[package]]
 name = "krishiv-lakehouse"
 version = "0.1.0"
 dependencies = [

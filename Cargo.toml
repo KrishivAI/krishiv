@@ -20,6 +20,7 @@ members = [
     "crates/krishiv-ui",
     "crates/krishiv-python",
     "crates/krishiv-lakehouse",
+    "crates/krishiv-flight-sql",
 ]
 resolver = "3"
 
