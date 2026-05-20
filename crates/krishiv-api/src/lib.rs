@@ -1250,7 +1250,6 @@ mod tests {
 
     // ── sql_as tests ─────────────────────────────────────────────────────────────
 
-    use super::{KrishivError, SessionBuilder};
     use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
 
     struct AllowAllPolicy;
