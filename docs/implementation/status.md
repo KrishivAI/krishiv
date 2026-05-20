@@ -9,6 +9,25 @@
 
 None — R10 acceptance gate is satisfied. Ready for GA tag.
 
+## Post-R10 Gap Fixes
+
+Two production-readiness gaps were identified and fixed on `claude/plan-r10-architecture-GnRvo`:
+
+1. **`PolicyEnforcingSqlEngine` wired into `Session::sql_as`** (`crates/krishiv-api/src/lib.rs`):
+   - `KrishivError::AccessDenied` variant added.
+   - `SessionBuilder::with_auth()` and `with_policy()` builder methods added.
+   - `Session::sql_as(api_key, query)` async method executes SQL under auth + policy enforcement.
+   - `DataFrame::from_batches()` constructor added for wrapping pre-collected batches.
+   - `PolicyEnforcingSqlEngine` now has `Debug` + `Clone` impls (added to `krishiv-sql`).
+   - 4 new tests: `session_sql_as_with_valid_key_executes_query`, `session_sql_as_with_invalid_key_returns_access_denied`, `session_without_policy_sql_as_returns_access_denied`, `extract_table_hint_parses_from_clause`.
+
+2. **OTLP metrics initialized in `krishiv-cli`** (`crates/krishiv-cli/src/main.rs`):
+   - `krishiv-metrics` dep added to `crates/krishiv-cli/Cargo.toml`.
+   - `MetricsHandle::noop()` constructor added to `crates/krishiv-metrics/src/lib.rs`.
+   - `main()` now calls `krishiv_metrics::init()` at startup; OTLP endpoint opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT` env var.
+
+## Final Validation (Post-Fix)
+
 ## Completed R10 Sprints
 
 | Sprint | Deliverables | Commits |
@@ -44,6 +63,13 @@ cargo test -p krishiv-upgrade-tests          → 6 passed
 cargo test -p krishiv-flight-sql             → 13 passed
 cargo test -p krishiv-operator               → 35 passed
 cargo test -p krishiv-metrics                → 6 passed (1 ignored, needs live OTLP)
+```
+
+## Final Validation (Post-Fix)
+
+```
+cargo check --workspace                      → clean (0 errors, 0 warnings)
+cargo test -p krishiv-api --lib              → 19 passed (16 existing + 3 sql_as + 1 extract_table_hint)
 ```
 
 ## Architecture Decisions Locked

@@ -56,7 +56,9 @@ pub struct MetricsHandle {
 }
 
 impl MetricsHandle {
-    /// Create a no-op handle used when metrics init fails or telemetry is disabled.
+    /// Create a no-op handle (used when metrics init fails or telemetry is disabled).
+    ///
+    /// The returned handle owns a no-op tracer provider — no spans are exported.
     pub fn noop() -> Self {
         Self {
             tracer_provider: SdkTracerProvider::builder().build(),

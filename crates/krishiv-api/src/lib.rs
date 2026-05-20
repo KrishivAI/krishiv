@@ -355,7 +355,12 @@ impl Session {
             .execute_as(&principal, query_str, &table_hint)
             .await
             .map_err(|e| KrishivError::AccessDenied { reason: e.to_string() })?;
-        Ok(DataFrame::from_batches(batches))
+        Ok(DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+        ))
     }
 
     /// Create a DataFrame by reading a local Parquet path directly.
@@ -445,15 +450,24 @@ impl DataFrame {
         }
     }
 
-    /// Construct a DataFrame from pre-collected record batches (e.g. from `Session::sql_as`).
-    pub fn from_batches(batches: Vec<RecordBatch>) -> Self {
+    /// Construct a [`DataFrame`] from a pre-collected list of record batches.
+    ///
+    /// Used by [`Session::sql_as`] to wrap the results of a policy-enforced query.
+    pub(crate) fn from_batches(
+        mode: ExecutionMode,
+        batches: Vec<RecordBatch>,
+        jobs: Arc<Mutex<LocalJobRegistry>>,
+        next_job_id: Arc<AtomicU64>,
+    ) -> Self {
+        let logical_plan =
+            LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
         Self {
-            logical_plan: LogicalPlan::new("pre-collected", krishiv_plan::ExecutionKind::Batch),
+            logical_plan,
             sql_dataframe: None,
             pre_collected: Some(batches),
-            mode: ExecutionMode::Embedded,
-            jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
-            next_job_id: Arc::new(AtomicU64::new(1)),
+            mode,
+            jobs,
+            next_job_id,
         }
     }
 
@@ -495,9 +509,14 @@ impl DataFrame {
         let job_id = self.start_job("local-dataframe");
         self.update_job(&job_id, "local-dataframe", JobState::Running);
 
-        let result = if let Some(batches) = &self.pre_collected {
-            Ok(QueryResult::new(batches.clone()))
-        } else if let Err(error) = accept_plan_with_backend(
+        // If this DataFrame wraps pre-collected batches (e.g. from sql_as),
+        // return them directly without going through DataFusion again.
+        if let Some(batches) = &self.pre_collected {
+            self.update_job(&job_id, "local-dataframe", JobState::Succeeded);
+            return Ok(QueryResult::new(batches.clone()));
+        }
+
+        let result = if let Err(error) = accept_plan_with_backend(
             self.mode,
             self.logical_plan.name(),
             self.logical_plan.kind(),
@@ -1229,64 +1248,78 @@ mod tests {
             .unwrap_or_else(|error| panic!("unexpected parquet close error: {error}"));
     }
 
-    #[tokio::test]
-    async fn session_sql_as_valid_key_executes_query() {
-        use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
-        use std::sync::Arc;
+    // ── sql_as tests ─────────────────────────────────────────────────────────────
 
-        struct AllowAll;
-        impl PolicyHook for AllowAll {
-            fn check_table_access(&self, _p: &Principal, _t: &str) -> bool { true }
-            fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> { None }
+    use super::{KrishivError, SessionBuilder};
+    use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+
+    struct AllowAllPolicy;
+    impl PolicyHook for AllowAllPolicy {
+        fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
+            true
         }
-        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![
-            (String::from("key123"), String::from("alice"), Role::Reader),
-        ]));
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _table: &str,
+            _col: &str,
+        ) -> Option<MaskingRule> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn session_sql_as_with_valid_key_executes_query() {
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key123".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
         let session = SessionBuilder::new()
             .with_auth(auth)
-            .with_policy(Arc::new(AllowAll))
+            .with_policy(Arc::new(AllowAllPolicy))
             .build()
             .unwrap();
-        let df: DataFrame = session.sql_as("key123", "SELECT 42 AS v").await.unwrap();
+        let df = session
+            .sql_as("key123", "SELECT 42 AS v")
+            .await
+            .unwrap();
         let result = df.collect_async().await.unwrap();
         assert_eq!(result.row_count(), 1);
     }
 
     #[tokio::test]
-    async fn session_sql_as_invalid_key_returns_access_denied() {
-        use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
-        use std::sync::Arc;
-
-        struct AllowAll;
-        impl PolicyHook for AllowAll {
-            fn check_table_access(&self, _p: &Principal, _t: &str) -> bool { true }
-            fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> { None }
-        }
-
-        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![
-            (String::from("key123"), String::from("alice"), Role::Reader),
-        ]));
+    async fn session_sql_as_with_invalid_key_returns_access_denied() {
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key123".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
         let session = SessionBuilder::new()
             .with_auth(auth)
-            .with_policy(Arc::new(AllowAll))
+            .with_policy(Arc::new(AllowAllPolicy))
             .build()
             .unwrap();
-        let result: Result<DataFrame, KrishivError> = session.sql_as("wrong_key", "SELECT 1").await;
-        assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
-    }
-
-    #[tokio::test]
-    async fn session_without_policy_sql_as_returns_access_denied() {
-        let session = SessionBuilder::new().build().unwrap();
-        let result: Result<DataFrame, KrishivError> = session.sql_as("any_key", "SELECT 1").await;
+        let result = session.sql_as("wrong_key", "SELECT 1").await;
         assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
     }
 
     #[test]
-    fn extract_table_hint_finds_table_name() {
-        use crate::extract_table_hint;
-        assert_eq!(extract_table_hint("SELECT * FROM orders"), "orders");
-        assert_eq!(extract_table_hint("SELECT * FROM orders WHERE id = 1"), "orders");
-        assert_eq!(extract_table_hint("SELECT 1"), "");
+    fn session_without_policy_sql_as_returns_access_denied() {
+        let session = SessionBuilder::new().build().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(session.sql_as("any_key", "SELECT 1"));
+        assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
+    }
+
+    #[test]
+    fn extract_table_hint_parses_from_clause() {
+        use super::extract_table_hint;
+        assert_eq!(extract_table_hint("SELECT * FROM orders WHERE id=1"), "orders");
+        assert_eq!(extract_table_hint("SELECT 42 AS v"), "");
+        assert_eq!(
+            extract_table_hint("select a from users limit 10"),
+            "users"
+        );
     }
 }

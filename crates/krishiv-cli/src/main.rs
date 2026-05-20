@@ -4,6 +4,7 @@ use std::env;
 use std::process;
 
 fn main() {
+    // Initialize telemetry. OTLP endpoint is opt-in via OTEL_EXPORTER_OTLP_ENDPOINT.
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     let metrics_config = krishiv_metrics::MetricsConfig {
         service_name: "krishiv-cli".into(),

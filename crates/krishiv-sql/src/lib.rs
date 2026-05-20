@@ -417,6 +417,14 @@ pub struct PolicyEnforcingSqlEngine {
     policy: std::sync::Arc<dyn PolicyHook>,
 }
 
+impl fmt::Debug for PolicyEnforcingSqlEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PolicyEnforcingSqlEngine")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PolicyEnforcingSqlEngine {
     /// Create a new `PolicyEnforcingSqlEngine` wrapping `inner`.
     pub fn new(
