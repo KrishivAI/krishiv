@@ -5,6 +5,7 @@
 //! This crate owns the DataFusion integration for R1 while keeping DataFusion
 //! out of the long-term public API exposed by `krishiv-api`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -21,6 +22,7 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 pub type SqlResult<T> = Result<T, SqlError>;
 
 /// SQL-layer errors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlError {
     /// Query was empty or whitespace only.
@@ -31,6 +33,8 @@ pub enum SqlError {
     Unsupported { feature: String },
     /// DataFusion returned an error.
     DataFusion { message: String },
+    /// Access denied by auth or policy check.
+    AccessDenied { reason: String },
 }
 
 impl fmt::Display for SqlError {
@@ -40,6 +44,7 @@ impl fmt::Display for SqlError {
             Self::EmptyTableName => f.write_str("table name is empty"),
             Self::Unsupported { feature } => write!(f, "unsupported SQL feature: {feature}"),
             Self::DataFusion { message } => write!(f, "DataFusion error: {message}"),
+            Self::AccessDenied { reason } => write!(f, "access denied: {reason}"),
         }
     }
 }
@@ -77,6 +82,7 @@ impl SqlPlan {
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
+    view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -98,7 +104,18 @@ impl SqlEngine {
     pub fn new() -> Self {
         Self {
             context: SessionContext::new(),
+            view_registry: None,
         }
+    }
+
+    /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
+    #[must_use]
+    pub fn with_view_registry(
+        mut self,
+        registry: std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>,
+    ) -> Self {
+        self.view_registry = Some(registry);
+        self
     }
 
     /// Register a local Parquet path as a table.
@@ -116,6 +133,11 @@ impl SqlEngine {
         self.context
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await?;
+        if let Some(ref reg) = self.view_registry {
+            if let Ok(mut r) = reg.lock() {
+                r.mark_table_committed();
+            }
+        }
         Ok(())
     }
 
@@ -159,6 +181,11 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
+        if let Some(ref reg) = self.view_registry {
+            if let Ok(mut r) = reg.lock() {
+                r.mark_table_committed();
+            }
+        }
         Ok(())
     }
 
@@ -172,6 +199,56 @@ impl SqlEngine {
         let dataframe = self.context.sql(query).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe))
     }
+
+    /// Execute `query` with materialized view cache lookup.
+    ///
+    /// If the query targets a registered, fresh view, returns cached batches directly.
+    /// Otherwise executes normally and caches the result for `OnCommit` views.
+    pub async fn sql_with_view_cache(
+        &self,
+        query: impl AsRef<str>,
+    ) -> SqlResult<Vec<RecordBatch>> {
+        let q = query.as_ref().trim();
+        let view_name_candidate = extract_simple_view_name(q);
+
+        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
+            if let Ok(r) = reg.lock() {
+                if let Some(cached) = r.get_if_fresh(name) {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        let df = self.sql(q).await?;
+        let batches = df.collect().await?;
+
+        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
+            if let Ok(mut r) = reg.lock() {
+                if let Some(def) = r.definition(name).cloned() {
+                    if def.refresh_policy == RefreshPolicy::OnCommit {
+                        r.set_cached(name, batches.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(batches)
+    }
+}
+
+fn extract_simple_view_name(query: &str) -> Option<String> {
+    let lower = query.to_lowercase();
+    if let Some(pos) = lower.find(" from ") {
+        let after = query[pos + 6..].trim();
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';')
+            .unwrap_or(after.len());
+        let name = after[..end].trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
@@ -326,6 +403,500 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
             message: error.to_string(),
         })?
         .to_string())
+}
+
+// ─── Policy-Enforcing SQL Engine ──────────────────────────────────────────────
+
+use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
+
+/// Wraps [`SqlEngine`] and enforces table-access and column-masking policy.
+#[derive(Clone)]
+pub struct PolicyEnforcingSqlEngine {
+    inner: SqlEngine,
+    auth: std::sync::Arc<dyn AuthProvider>,
+    policy: std::sync::Arc<dyn PolicyHook>,
+}
+
+impl fmt::Debug for PolicyEnforcingSqlEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PolicyEnforcingSqlEngine")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PolicyEnforcingSqlEngine {
+    /// Create a new `PolicyEnforcingSqlEngine` wrapping `inner`.
+    pub fn new(
+        inner: SqlEngine,
+        auth: std::sync::Arc<dyn AuthProvider>,
+        policy: std::sync::Arc<dyn PolicyHook>,
+    ) -> Self {
+        Self { inner, auth, policy }
+    }
+
+    /// Authenticate `api_key`. Returns [`SqlError::AccessDenied`] if invalid.
+    pub fn authenticate(&self, api_key: &str) -> SqlResult<Principal> {
+        self.auth
+            .authenticate(api_key)
+            .ok_or_else(|| SqlError::AccessDenied {
+                reason: "invalid or missing API key".into(),
+            })
+    }
+
+    /// Execute a query as `principal`, applying table-access check and column masking.
+    ///
+    /// `table_name` is the logical table being queried — used for the access check and
+    /// as the table context for the column-masking hook.
+    pub async fn execute_as(
+        &self,
+        principal: &Principal,
+        query: &str,
+        table_name: &str,
+    ) -> SqlResult<Vec<RecordBatch>> {
+        // Table access check
+        if !self.policy.check_table_access(principal, table_name) {
+            return Err(SqlError::AccessDenied {
+                reason: format!(
+                    "principal '{}' denied access to table '{}'",
+                    principal.subject, table_name
+                ),
+            });
+        }
+
+        // Execute query via inner engine
+        let df = self.inner.sql(query).await?;
+        let batches = df.collect().await?;
+
+        // Apply column masking
+        let masked = batches
+            .iter()
+            .map(|batch| apply_masking(batch, principal, table_name, self.policy.as_ref()))
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        Ok(masked)
+    }
+}
+
+/// Apply column-masking rules from `policy` to a single [`RecordBatch`].
+fn apply_masking(
+    batch: &RecordBatch,
+    principal: &Principal,
+    table_name: &str,
+    policy: &dyn PolicyHook,
+) -> SqlResult<RecordBatch> {
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::array::Array;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let schema = batch.schema();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        match policy.column_masking_rule(principal, table_name, field.name()) {
+            None => columns.push(col.clone()),
+            Some(MaskingRule::Nullify) => {
+                // Rebuild the column as a null array cast to the same type.
+                // Using arrow's NullArray directly changes the data type, so we
+                // cast a NullArray back to the original type so the schema stays
+                // consistent.
+                use arrow::array::new_null_array;
+                columns.push(new_null_array(col.data_type(), batch.num_rows()));
+            }
+            Some(MaskingRule::Redact) => {
+                let redacted: StringArray = (0..batch.num_rows())
+                    .map(|_| Some("REDACTED"))
+                    .collect();
+                columns.push(std::sync::Arc::new(redacted));
+            }
+            Some(MaskingRule::Hash) => {
+                let options = FormatOptions::default();
+                let formatter = ArrayFormatter::try_new(col.as_ref(), &options)
+                    .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+                let hashed: StringArray = (0..batch.num_rows())
+                    .map(|row| {
+                        use std::hash::{Hash, Hasher};
+                        let val = formatter.value(row).to_string();
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        val.hash(&mut h);
+                        Some(format!("{:016x}", h.finish()))
+                    })
+                    .collect();
+                columns.push(std::sync::Arc::new(hashed));
+            }
+        }
+    }
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| SqlError::DataFusion { message: e.to_string() })
+}
+
+// ─── Materialized Views Baseline ─────────────────────────────────────────────
+
+/// Materialized view refresh policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshPolicy {
+    /// Refresh whenever the backing table(s) receive a write commit.
+    OnCommit,
+    /// Only refresh when explicitly triggered by `MaterializedViewRegistry::refresh()`.
+    Manual,
+}
+
+/// Declaration of a named materialized view.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct MaterializedViewDefinition {
+    /// Unique view name.
+    pub name: String,
+    /// SQL SELECT query that defines the view.
+    pub query: String,
+    /// Refresh policy.
+    pub refresh_policy: RefreshPolicy,
+    /// Partition columns for storage keying (empty = unpartitioned).
+    pub partition_columns: Vec<String>,
+}
+
+impl MaterializedViewDefinition {
+    /// Create a new view definition with OnCommit refresh and no partitioning.
+    pub fn new(name: impl Into<String>, query: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            query: query.into(),
+            refresh_policy: RefreshPolicy::OnCommit,
+            partition_columns: Vec::new(),
+        }
+    }
+
+    /// Set the refresh policy.
+    #[must_use]
+    pub fn with_refresh_policy(mut self, policy: RefreshPolicy) -> Self {
+        self.refresh_policy = policy;
+        self
+    }
+
+    /// Set partition columns.
+    #[must_use]
+    pub fn with_partition_columns(mut self, cols: Vec<String>) -> Self {
+        self.partition_columns = cols;
+        self
+    }
+}
+
+/// In-memory registry for materialized view definitions and their cached results.
+///
+/// In production, results would be persisted to `RedbStateBackend`. For R10
+/// the registry is in-memory and resets on process restart.
+#[derive(Debug, Default)]
+pub struct MaterializedViewRegistry {
+    definitions: HashMap<String, MaterializedViewDefinition>,
+    /// Cached results keyed by view name → serialized batch (Arrow IPC).
+    cache: HashMap<String, Vec<RecordBatch>>,
+    /// Current write LSN — incremented on each `mark_table_committed()` call.
+    current_lsn: u64,
+    /// LSN at which each view was last refreshed.
+    view_lsn: HashMap<String, u64>,
+}
+
+impl MaterializedViewRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a materialized view definition.
+    pub fn register(&mut self, def: MaterializedViewDefinition) {
+        self.definitions.insert(def.name.clone(), def);
+    }
+
+    /// Mark a table as having received a commit. Increments the current LSN.
+    /// All OnCommit views are now stale.
+    pub fn mark_table_committed(&mut self) {
+        self.current_lsn += 1;
+    }
+
+    /// Returns true if the view is stale (backing table committed after last refresh,
+    /// or the view has never been cached / is not registered).
+    pub fn is_stale(&self, view_name: &str) -> bool {
+        // Unregistered or never-cached views are always considered stale.
+        if !self.view_lsn.contains_key(view_name) {
+            return true;
+        }
+        let last_refresh = self.view_lsn.get(view_name).copied().unwrap_or(0);
+        last_refresh < self.current_lsn
+    }
+
+    /// Store refreshed results for a view.
+    pub fn set_cached(&mut self, view_name: &str, batches: Vec<RecordBatch>) {
+        self.cache.insert(view_name.to_string(), batches);
+        self.view_lsn.insert(view_name.to_string(), self.current_lsn);
+    }
+
+    /// Get cached results if the view is fresh.
+    pub fn get_if_fresh(&self, view_name: &str) -> Option<&Vec<RecordBatch>> {
+        if self.is_stale(view_name) {
+            None
+        } else {
+            self.cache.get(view_name)
+        }
+    }
+
+    /// Get the view definition, if registered.
+    pub fn definition(&self, view_name: &str) -> Option<&MaterializedViewDefinition> {
+        self.definitions.get(view_name)
+    }
+}
+
+#[cfg(test)]
+mod matview_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_view_returns_cached_results() {
+        let mut reg = MaterializedViewRegistry::new();
+        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+        let batch = vec![]; // empty batch for test
+        reg.set_cached("v1", batch.clone());
+        assert!(reg.get_if_fresh("v1").is_some());
+    }
+
+    #[test]
+    fn committed_table_marks_view_stale() {
+        let mut reg = MaterializedViewRegistry::new();
+        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+        reg.set_cached("v1", vec![]);
+        assert!(!reg.is_stale("v1"));
+        reg.mark_table_committed();
+        assert!(reg.is_stale("v1"));
+        assert!(reg.get_if_fresh("v1").is_none());
+    }
+
+    #[test]
+    fn refresh_after_commit_restores_freshness() {
+        let mut reg = MaterializedViewRegistry::new();
+        reg.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+        reg.set_cached("v1", vec![]);
+        reg.mark_table_committed();
+        assert!(reg.is_stale("v1"));
+        reg.set_cached("v1", vec![]); // refresh
+        assert!(!reg.is_stale("v1"));
+    }
+
+    #[test]
+    fn unregistered_view_is_stale() {
+        let reg = MaterializedViewRegistry::new();
+        assert!(reg.is_stale("nonexistent"));
+    }
+
+    #[test]
+    fn definition_builder_sets_fields() {
+        let def = MaterializedViewDefinition::new("sales_summary", "SELECT SUM(amount) FROM sales")
+            .with_refresh_policy(RefreshPolicy::Manual)
+            .with_partition_columns(vec!["region".into()]);
+        assert_eq!(def.name, "sales_summary");
+        assert_eq!(def.refresh_policy, RefreshPolicy::Manual);
+        assert_eq!(def.partition_columns, vec!["region".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod view_cache_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn engine_marks_table_committed_after_register() {
+        let registry = Arc::new(Mutex::new(MaterializedViewRegistry::new()));
+        {
+            let mut r = registry.lock().unwrap();
+            r.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+            r.set_cached("v1", vec![]);
+        }
+        assert!(!registry.lock().unwrap().is_stale("v1"));
+
+        let engine = SqlEngine::new().with_view_registry(registry.clone());
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let col = arrow::array::Int64Array::from(vec![1i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        engine.register_record_batches("t1", vec![batch]).await.unwrap();
+
+        assert!(registry.lock().unwrap().is_stale("v1"), "commit must mark view stale");
+    }
+
+    #[tokio::test]
+    async fn sql_with_view_cache_returns_fresh_cache() {
+        let registry = Arc::new(Mutex::new(MaterializedViewRegistry::new()));
+        let expected_batch = {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let col = arrow::array::Int64Array::from(vec![99i64]);
+            RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
+        };
+        {
+            let mut r = registry.lock().unwrap();
+            r.register(
+                MaterializedViewDefinition::new("summary", "SELECT 99 AS v")
+                    .with_refresh_policy(RefreshPolicy::OnCommit),
+            );
+            r.set_cached("summary", vec![expected_batch.clone()]);
+        }
+
+        let engine = SqlEngine::new().with_view_registry(registry.clone());
+        let batches = engine
+            .sql_with_view_cache("SELECT * FROM summary")
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use krishiv_governance::{MaskingRule, Principal, Role, StaticApiKeyAuthProvider};
+    use std::sync::Arc;
+
+    struct DenyTablePolicy {
+        denied_table: String,
+    }
+    impl PolicyHook for DenyTablePolicy {
+        fn check_table_access(&self, _p: &Principal, table: &str) -> bool {
+            table != self.denied_table
+        }
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _table: &str,
+            _col: &str,
+        ) -> Option<MaskingRule> {
+            None
+        }
+    }
+
+    struct RedactColumnPolicy {
+        column: String,
+    }
+    impl PolicyHook for RedactColumnPolicy {
+        fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
+            true
+        }
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _table: &str,
+            col: &str,
+        ) -> Option<MaskingRule> {
+            if col == self.column {
+                Some(MaskingRule::Redact)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn make_engine_with_policy(
+        policy: Arc<dyn PolicyHook>,
+    ) -> PolicyEnforcingSqlEngine {
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key1".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
+        PolicyEnforcingSqlEngine::new(SqlEngine::new(), auth, policy)
+    }
+
+    #[test]
+    fn authenticate_valid_key_returns_principal() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        assert_eq!(p.subject, "alice");
+    }
+
+    #[test]
+    fn authenticate_invalid_key_returns_access_denied() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let err = engine.authenticate("bad_key").unwrap_err();
+        assert!(matches!(err, SqlError::AccessDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn denied_table_returns_access_denied() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        let err = engine
+            .execute_as(&p, "SELECT 1", "secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SqlError::AccessDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn allowed_table_returns_results() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        let batches = engine
+            .execute_as(&p, "SELECT 42 AS val", "public")
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn redact_policy_replaces_column_values() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = make_engine_with_policy(Arc::new(RedactColumnPolicy {
+            column: "name".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+
+        // Register an in-memory table with a "name" column
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        use arrow::array::{Int64Array, StringArray as SA};
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1_i64])),
+                std::sync::Arc::new(SA::from(vec!["alice"])),
+            ],
+        )
+        .unwrap();
+        engine
+            .inner
+            .register_record_batches("people", vec![batch])
+            .await
+            .unwrap();
+
+        let batches = engine
+            .execute_as(&p, "SELECT id, name FROM people", "people")
+            .await
+            .unwrap();
+
+        assert!(!batches.is_empty());
+        let name_col = batches[0]
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "REDACTED");
+    }
 }
 
 #[cfg(test)]

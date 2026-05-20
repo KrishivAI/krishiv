@@ -2659,14 +2659,15 @@ pub mod wire {
     use std::fmt;
 
     use super::{
-        AttemptId, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
+        AttemptId, CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
+        DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
         ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-        ExecutorTaskAssignment, InputPartition, InputPartitionDescriptor, JobId, LeaseGeneration,
-        MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind,
-        PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput,
-        StageId, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata,
-        TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
-        TransportVersion,
+        ExecutorTaskAssignment, FencingToken, InputPartition, InputPartitionDescriptor, JobId,
+        LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
+        OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
+        ShufflePartitionOutput, StageId, TaskAttemptRef, TaskCancellationRequest, TaskId,
+        TaskOutputMetadata, TaskRuntimeStats, TaskState, TaskStatusRequest, TaskStatusResponse,
+        TransportDisposition, TransportVersion,
     };
 
     /// Generated protobuf and tonic service types for `krishiv.transport.v1`.
@@ -3562,6 +3563,96 @@ pub mod wire {
             v1::TransportDisposition::UnknownJob => Ok(TransportDisposition::UnknownJob),
             v1::TransportDisposition::UnknownTask => Ok(TransportDisposition::UnknownTask),
             v1::TransportDisposition::UnknownExecutor => Ok(TransportDisposition::UnknownExecutor),
+        }
+    }
+
+    /// Convert a domain checkpoint ack request to protobuf.
+    pub fn checkpoint_ack_request_to_wire(value: CheckpointAckRequest) -> v1::CheckpointAckRequest {
+        v1::CheckpointAckRequest {
+            job_id: value.job_id.as_str().to_owned(),
+            operator_id: value.operator_id,
+            task_id: value.task_id.as_str().to_owned(),
+            epoch: value.epoch,
+            fencing_token: value.fencing_token.as_u64(),
+            source_offsets: value
+                .source_offsets
+                .into_iter()
+                .map(|o| v1::CheckpointSourceOffset {
+                    partition_id: o.partition_id,
+                    offset: o.offset,
+                })
+                .collect(),
+            snapshot_path: value.snapshot_path.unwrap_or_default(),
+        }
+    }
+
+    /// Convert a protobuf checkpoint ack request to the domain contract.
+    pub fn checkpoint_ack_request_from_wire(
+        value: v1::CheckpointAckRequest,
+    ) -> WireResult<CheckpointAckRequest> {
+        let job_id = JobId::try_new(value.job_id).map_err(WireError::from_id)?;
+        let task_id = TaskId::try_new(value.task_id).map_err(WireError::from_id)?;
+        let fencing_token =
+            FencingToken::try_new(value.fencing_token).map_err(WireError::from_id)?;
+        let source_offsets = value
+            .source_offsets
+            .into_iter()
+            .map(|o| CheckpointSourceOffset {
+                partition_id: o.partition_id,
+                offset: o.offset,
+            })
+            .collect();
+        let snapshot_path = if value.snapshot_path.is_empty() {
+            None
+        } else {
+            Some(value.snapshot_path)
+        };
+        Ok(CheckpointAckRequest {
+            job_id,
+            operator_id: value.operator_id,
+            task_id,
+            epoch: value.epoch,
+            fencing_token,
+            source_offsets,
+            snapshot_path,
+        })
+    }
+
+    /// Convert a domain checkpoint ack response to protobuf.
+    pub fn checkpoint_ack_response_to_wire(
+        value: CheckpointAckResponse,
+    ) -> v1::CheckpointAckResponse {
+        use v1::checkpoint_ack_response::Result as WireResult;
+        let result = match value {
+            CheckpointAckResponse::Accepted => {
+                WireResult::Accepted(v1::CheckpointAckAccepted {})
+            }
+            CheckpointAckResponse::StaleEpoch { current_epoch } => {
+                WireResult::StaleEpoch(v1::CheckpointAckStaleEpoch { current_epoch })
+            }
+            CheckpointAckResponse::JobNotFound => {
+                WireResult::JobNotFound(v1::CheckpointAckJobNotFound {})
+            }
+        };
+        v1::CheckpointAckResponse {
+            result: Some(result),
+        }
+    }
+
+    /// Convert a protobuf checkpoint ack response to the domain contract.
+    pub fn checkpoint_ack_response_from_wire(
+        value: v1::CheckpointAckResponse,
+    ) -> WireResult<CheckpointAckResponse> {
+        use v1::checkpoint_ack_response::Result as WireVariant;
+        match value.result {
+            Some(WireVariant::Accepted(_)) => Ok(CheckpointAckResponse::Accepted),
+            Some(WireVariant::StaleEpoch(s)) => Ok(CheckpointAckResponse::StaleEpoch {
+                current_epoch: s.current_epoch,
+            }),
+            Some(WireVariant::JobNotFound(_)) => Ok(CheckpointAckResponse::JobNotFound),
+            None => Err(WireError::new(
+                "missing required field `checkpoint_ack_response.result`",
+            )),
         }
     }
 

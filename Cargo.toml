@@ -23,6 +23,9 @@ members = [
     "crates/krishiv-flight-sql",
     "crates/krishiv-metrics",
     "crates/krishiv-governance",
+    "crates/krishiv-upgrade-tests",
+    "crates/krishiv-bench",
+    "crates/krishiv-chaos",
 ]
 resolver = "3"
 
@@ -66,6 +69,7 @@ tracing-opentelemetry = "0.28"
 opentelemetry = { version = "0.27", features = ["trace"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
 opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 redb = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }

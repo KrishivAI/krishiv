@@ -1,0 +1,73 @@
+name: kind e2e failover
+
+on:
+  push:
+    branches: ["main", "release/**"]
+  pull_request:
+    paths:
+      - "crates/krishiv-operator/**"
+      - "crates/krishiv-scheduler/**"
+      - "crates/krishiv-checkpoint/**"
+      - ".github/workflows/kind-e2e.yml"
+
+jobs:
+  kind-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install kubectl
+        run: |
+          curl -Lo ./kubectl "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Create kind cluster
+        run: kind create cluster --name krishiv-e2e --wait 60s
+
+      - name: Build operator and scheduler
+        run: cargo build -p krishiv-operator -p krishiv-scheduler --release
+
+      - name: Run failover integration test
+        run: |
+          cargo test -p krishiv-operator failover_stale_coordinator --release -- --nocapture
+        env:
+          KRISHIV_E2E_KIND_CLUSTER: "true"
+          KUBECONFIG: ${{ env.HOME }}/.kube/config
+
+      - name: Collect kind logs on failure
+        if: failure()
+        run: |
+          kind export logs ./kind-logs --name krishiv-e2e
+          tar -czf kind-logs.tar.gz ./kind-logs
+
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-logs
+          path: kind-logs.tar.gz
+
+      - name: Delete kind cluster
+        if: always()
+        run: kind delete cluster --name krishiv-e2e

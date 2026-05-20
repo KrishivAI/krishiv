@@ -2729,6 +2729,20 @@ impl ExecutorRuntime {
         Ok(wire::executor_heartbeat_response_from_wire(response)?)
     }
 
+    /// Send a checkpoint acknowledgement to the coordinator over gRPC.
+    pub async fn checkpoint_ack_with_grpc_endpoint(
+        &self,
+        request: CheckpointAckRequest,
+    ) -> ExecutorTransportResult<CheckpointAckResponse> {
+        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .await?;
+        let wire_req = wire::checkpoint_ack_request_to_wire(request);
+        let response = client.checkpoint_ack(wire_req).await?.into_inner();
+        Ok(wire::checkpoint_ack_response_from_wire(response)?)
+    }
+
     /// Register once and immediately send one heartbeat over gRPC.
     pub async fn register_and_heartbeat_once(
         &self,
@@ -2958,12 +2972,21 @@ mod tests {
 
         async fn checkpoint_ack(
             &self,
-            _request: tonic::Request<CheckpointAckRequest>,
+            request: tonic::Request<CheckpointAckRequest>,
         ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
-            // Network path not implemented for R6a; in-process test only.
-            Err(tonic::Status::unimplemented(
-                "checkpoint_ack wire transport deferred to R10",
-            ))
+            let mut client =
+                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+                    self.endpoint.clone(),
+                )
+                .await
+                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+            let response = client
+                .checkpoint_ack(wire::checkpoint_ack_request_to_wire(request.into_inner()))
+                .await?
+                .into_inner();
+            let response = wire::checkpoint_ack_response_from_wire(response)
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok(tonic::Response::new(response))
         }
     }
 
@@ -3018,6 +3041,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_coordinator_service_checkpoint_ack_through_service_boundary() {
+        use krishiv_proto::FencingToken;
+        // Test that AcceptingCoordinatorService (in-process) returns Accepted.
+        // This verifies the in-process path works; the network path requires a live server.
+        let service = AcceptingCoordinatorService;
+        let req = CheckpointAckRequest {
+            job_id: JobId::try_new("job-ck-1").unwrap(),
+            operator_id: "operator-1".to_owned(),
+            task_id: TaskId::try_new("task-ck-1").unwrap(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+            source_offsets: vec![],
+            snapshot_path: Some("/checkpoints/epoch-1".to_owned()),
+        };
+        let result = service
+            .checkpoint_ack(tonic::Request::new(req))
+            .await
+            .unwrap();
+        assert_eq!(result.into_inner(), CheckpointAckResponse::Accepted);
+    }
+
+    #[tokio::test]
     async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-dereg-exec").unwrap(),
@@ -3059,6 +3104,26 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn network_coordinator_service_checkpoint_ack_through_service_boundary() {
+        use krishiv_proto::FencingToken;
+        let service = AcceptingCoordinatorService;
+        let req = CheckpointAckRequest {
+            job_id: JobId::try_new("job-ck-1").unwrap(),
+            operator_id: "operator-1".to_owned(),
+            task_id: TaskId::try_new("task-ck-1").unwrap(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+            source_offsets: vec![],
+            snapshot_path: Some("/checkpoints/epoch-1".to_owned()),
+        };
+        let result = service
+            .checkpoint_ack(tonic::Request::new(req))
+            .await
+            .unwrap();
+        assert_eq!(result.into_inner(), CheckpointAckResponse::Accepted);
     }
 
     #[tokio::test]

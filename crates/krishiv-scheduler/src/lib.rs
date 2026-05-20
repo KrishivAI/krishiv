@@ -1218,6 +1218,22 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
             response,
         )))
     }
+
+    async fn checkpoint_ack(
+        &self,
+        request: tonic::Request<wire::v1::CheckpointAckRequest>,
+    ) -> Result<tonic::Response<wire::v1::CheckpointAckResponse>, tonic::Status> {
+        let request = wire::checkpoint_ack_request_from_wire(request.into_inner())
+            .map_err(status_from_wire_error)?;
+        let response = self
+            .inner
+            .checkpoint_ack(tonic::Request::new(request))
+            .await?
+            .into_inner();
+        Ok(tonic::Response::new(wire::checkpoint_ack_response_to_wire(
+            response,
+        )))
+    }
 }
 
 // ── R8 auth interceptor skeleton ─────────────────────────────────────────────

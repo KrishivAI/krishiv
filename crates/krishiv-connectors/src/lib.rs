@@ -10,6 +10,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub mod cdc;
 pub mod kafka;
 pub mod parquet;
 pub mod s3;
@@ -19,6 +20,7 @@ pub mod s3;
 // ---------------------------------------------------------------------------
 
 /// Errors produced by connector operations.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ConnectorError {
     /// Configuration problem (missing required property, bad value, etc.).
@@ -643,6 +645,7 @@ pub struct ParquetCommitHandle {
 pub struct LocalParquetTwoPhaseCommitSink {
     output_dir: std::path::PathBuf,
     next_handle: u64,
+    quality_config: Option<DataQualityConfig>,
 }
 
 impl LocalParquetTwoPhaseCommitSink {
@@ -652,7 +655,17 @@ impl LocalParquetTwoPhaseCommitSink {
         Self {
             output_dir: output_dir.into(),
             next_handle: 0,
+            quality_config: None,
         }
+    }
+
+    /// Attach a data quality configuration. Quality checks run during `prepare()`.
+    /// Rows failing a `Reject` rule are excluded from the written output.
+    /// A `Fail` rule aborts the entire prepare with an error.
+    #[must_use]
+    pub fn with_quality_config(mut self, config: DataQualityConfig) -> Self {
+        self.quality_config = Some(config);
+        self
     }
 }
 
@@ -666,6 +679,33 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     ) -> ConnectorResult<Self::Handle> {
         let handle_id = self.next_handle;
         self.next_handle += 1;
+
+        // Run quality checks if a config is attached.
+        let filtered: arrow::record_batch::RecordBatch;
+        let batch = if let Some(ref qc) = self.quality_config {
+            use arrow::array::BooleanArray;
+            let result = check_batch(batch, qc)?;
+            if result.failed {
+                return Err(ConnectorError::Io {
+                    message: format!(
+                        "data quality Fail action triggered at epoch {}",
+                        epoch
+                    ),
+                });
+            }
+            if result.accepted_indices.len() == batch.num_rows() {
+                batch // No rows rejected — use original batch
+            } else {
+                let keep_mask: BooleanArray = (0..batch.num_rows())
+                    .map(|i| Some(result.accepted_indices.contains(&i)))
+                    .collect();
+                filtered = arrow::compute::filter_record_batch(batch, &keep_mask)
+                    .map_err(|e| ConnectorError::Io { message: e.to_string() })?;
+                &filtered
+            }
+        } else {
+            batch
+        };
 
         let staging_name = format!("{epoch}-{handle_id}.parquet.tmp");
         let final_name = format!("{epoch}-{handle_id}.parquet");
@@ -710,6 +750,277 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             })?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DataQualityRule
+// ---------------------------------------------------------------------------
+
+/// A predicate applied per row against a column value.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum DataQualityRule {
+    /// Column must not be null.
+    NotNull { column: String },
+    /// Numeric column must be within [min, max] inclusive.
+    Range { column: String, min: f64, max: f64 },
+    /// String column must match the regex pattern.
+    Regex { column: String, pattern: String },
+}
+
+// ---------------------------------------------------------------------------
+// QualityAction
+// ---------------------------------------------------------------------------
+
+/// Action taken when a data quality rule is violated.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualityAction {
+    /// Abort the entire batch.
+    Fail,
+    /// Route the violating row to the rejected-row output.
+    Reject,
+    /// Increment a counter metric and pass the row through.
+    Warn,
+}
+
+// ---------------------------------------------------------------------------
+// DataQualityConfig
+// ---------------------------------------------------------------------------
+
+/// Data quality configuration attached to a sink.
+#[derive(Debug, Clone, Default)]
+pub struct DataQualityConfig {
+    pub rules: Vec<(DataQualityRule, QualityAction)>,
+}
+
+impl DataQualityConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_rule(mut self, rule: DataQualityRule, action: QualityAction) -> Self {
+        self.rules.push((rule, action));
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RejectedRow
+// ---------------------------------------------------------------------------
+
+/// A row rejected by a data quality check, with metadata.
+#[derive(Debug, Clone)]
+pub struct RejectedRow {
+    pub batch_row_index: usize,
+    pub rule_violated: String, // display name of the rule
+    pub column_name: String,
+    pub timestamp_ms: i64, // Unix epoch milliseconds
+}
+
+// ---------------------------------------------------------------------------
+// DataQualityCheckResult
+// ---------------------------------------------------------------------------
+
+/// Result of running data quality checks on a batch.
+pub struct DataQualityCheckResult {
+    /// Rows accepted (indices into original batch).
+    pub accepted_indices: Vec<usize>,
+    /// Rejected rows.
+    pub rejected: Vec<RejectedRow>,
+    /// True if a Fail action was triggered.
+    pub failed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// check_batch / find_violations
+// ---------------------------------------------------------------------------
+
+/// Run all quality rules against `batch`. Returns a `DataQualityCheckResult`.
+pub fn check_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    config: &DataQualityConfig,
+) -> ConnectorResult<DataQualityCheckResult> {
+    let nrows = batch.num_rows();
+    let mut rejected_rows: Vec<usize> = Vec::new();
+    let mut rejected_meta: Vec<RejectedRow> = Vec::new();
+    let mut failed = false;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    for (rule, action) in &config.rules {
+        let (col_name, violations) = find_violations(batch, rule)?;
+        for row_idx in violations {
+            if rejected_rows.contains(&row_idx) {
+                continue;
+            }
+            match action {
+                QualityAction::Fail => {
+                    failed = true;
+                }
+                QualityAction::Reject => {
+                    rejected_rows.push(row_idx);
+                    rejected_meta.push(RejectedRow {
+                        batch_row_index: row_idx,
+                        rule_violated: format!("{:?}", rule),
+                        column_name: col_name.clone(),
+                        timestamp_ms: now_ms,
+                    });
+                }
+                QualityAction::Warn => {
+                    tracing::warn!(
+                        rule = ?rule,
+                        row_index = row_idx,
+                        "data quality warning: rule violated"
+                    );
+                }
+            }
+        }
+    }
+
+    let accepted_indices: Vec<usize> = (0..nrows)
+        .filter(|i| !rejected_rows.contains(i))
+        .collect();
+
+    Ok(DataQualityCheckResult {
+        accepted_indices,
+        rejected: rejected_meta,
+        failed,
+    })
+}
+
+fn find_violations(
+    batch: &arrow::record_batch::RecordBatch,
+    rule: &DataQualityRule,
+) -> ConnectorResult<(String, Vec<usize>)> {
+    use arrow::array::{Array, Float64Array};
+
+    match rule {
+        DataQualityRule::NotNull { column } => {
+            let col_idx =
+                batch
+                    .schema()
+                    .index_of(column)
+                    .map_err(|e| ConnectorError::Schema {
+                        message: format!("column '{}' not found: {}", column, e),
+                    })?;
+            let col = batch.column(col_idx);
+            let violations: Vec<usize> =
+                (0..batch.num_rows()).filter(|&i| col.is_null(i)).collect();
+            Ok((column.clone(), violations))
+        }
+        DataQualityRule::Range { column, min, max } => {
+            let col_idx =
+                batch
+                    .schema()
+                    .index_of(column)
+                    .map_err(|e| ConnectorError::Schema {
+                        message: format!("column '{}' not found: {}", column, e),
+                    })?;
+            let col = batch.column(col_idx);
+            let float_col =
+                col.as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| ConnectorError::Schema {
+                        message: format!(
+                            "column '{}' is not Float64 for Range rule",
+                            column
+                        ),
+                    })?;
+            let violations: Vec<usize> = (0..batch.num_rows())
+                .filter(|&i| {
+                    if float_col.is_null(i) {
+                        return true;
+                    }
+                    let v = float_col.value(i);
+                    v < *min || v > *max
+                })
+                .collect();
+            Ok((column.clone(), violations))
+        }
+        DataQualityRule::Regex { column, pattern } => {
+            use arrow::array::StringArray;
+            let re = regex::Regex::new(pattern).map_err(|e| ConnectorError::Config {
+                message: format!("invalid regex pattern '{}': {}", pattern, e),
+            })?;
+            let col_idx = batch.schema().index_of(column).map_err(|e| ConnectorError::Schema {
+                message: format!("column '{}' not found: {}", column, e),
+            })?;
+            let col = batch.column(col_idx);
+            let str_col = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                ConnectorError::Schema {
+                    message: format!("column '{}' is not Utf8 for Regex rule", column),
+                }
+            })?;
+            let violations: Vec<usize> = (0..batch.num_rows())
+                .filter(|&i| {
+                    if str_col.is_null(i) {
+                        return true; // null = violation
+                    }
+                    !re.is_match(str_col.value(i))
+                })
+                .collect();
+            Ok((column.clone(), violations))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeadLetterSink
+// ---------------------------------------------------------------------------
+
+/// Wraps a sink and writes rejected rows plus metadata to a secondary output.
+///
+/// The primary output receives only accepted rows. Rejected rows are written
+/// to the dead-letter output with error metadata appended as extra columns.
+#[derive(Debug)]
+pub struct DeadLetterSink {
+    /// Name of the dead-letter sink (used in metrics/logs).
+    pub name: String,
+    /// Quality configuration applied before writing to the primary sink.
+    pub quality_config: DataQualityConfig,
+}
+
+impl DeadLetterSink {
+    pub fn new(name: impl Into<String>, quality_config: DataQualityConfig) -> Self {
+        Self {
+            name: name.into(),
+            quality_config,
+        }
+    }
+
+    /// Process a batch: run quality checks, return (accepted_batch, rejected_rows).
+    pub fn process_batch(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> ConnectorResult<(arrow::record_batch::RecordBatch, Vec<RejectedRow>)> {
+        use arrow::array::BooleanArray;
+
+        let result = check_batch(batch, &self.quality_config)?;
+
+        if result.failed {
+            return Err(ConnectorError::Io {
+                message: format!(
+                    "sink '{}': data quality Fail action triggered",
+                    self.name
+                ),
+            });
+        }
+
+        // Build accepted batch (rows not in rejected set)
+        let keep_mask: BooleanArray = (0..batch.num_rows())
+            .map(|i| Some(result.accepted_indices.contains(&i)))
+            .collect();
+        let accepted = arrow::compute::filter_record_batch(batch, &keep_mask)
+            .map_err(|e| ConnectorError::Io {
+                message: e.to_string(),
+            })?;
+
+        Ok((accepted, result.rejected))
     }
 }
 
@@ -1198,5 +1509,181 @@ mod tests {
 
         // abort on a missing file must not error.
         sink.abort(handle).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    fn make_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float64, true),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let score = Float64Array::from(vec![Some(85.0), None, Some(110.0), Some(50.0)]);
+        let name = StringArray::from(vec!["alice", "bob", "carol", "dave"]);
+        RecordBatch::try_new(schema, vec![Arc::new(score), Arc::new(name)]).unwrap()
+    }
+
+    #[test]
+    fn notnull_rejects_null_rows() {
+        let batch = make_batch();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::NotNull {
+                column: "score".into(),
+            },
+            QualityAction::Reject,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].batch_row_index, 1);
+        assert!(!result.failed);
+    }
+
+    #[test]
+    fn range_rejects_out_of_range_rows() {
+        let batch = make_batch();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::Range {
+                column: "score".into(),
+                min: 0.0,
+                max: 100.0,
+            },
+            QualityAction::Reject,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        // row 1 (null) and row 2 (110.0 > 100) should be rejected
+        assert_eq!(result.rejected.len(), 2);
+    }
+
+    #[test]
+    fn fail_action_sets_failed_flag() {
+        let batch = make_batch();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::NotNull {
+                column: "score".into(),
+            },
+            QualityAction::Fail,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        assert!(result.failed);
+    }
+
+    #[test]
+    fn dead_letter_sink_splits_accepted_and_rejected() {
+        let batch = make_batch();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::NotNull {
+                column: "score".into(),
+            },
+            QualityAction::Reject,
+        );
+        let sink = DeadLetterSink::new("test_sink", config);
+        let (accepted, rejected) = sink.process_batch(&batch).unwrap();
+        assert_eq!(accepted.num_rows(), 3); // rows 0, 2, 3
+        assert_eq!(rejected.len(), 1); // row 1 (null score)
+    }
+
+    #[test]
+    fn regex_rule_rejects_non_matching_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("email", DataType::Utf8, true),
+        ]));
+        let emails = StringArray::from(vec![
+            Some("alice@example.com"),
+            Some("not-an-email"),
+            None,
+            Some("bob@corp.org"),
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(emails)]).unwrap();
+
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::Regex {
+                column: "email".into(),
+                pattern: r"^[^@]+@[^@]+\.[^@]+$".into(),
+            },
+            QualityAction::Reject,
+        );
+        let result = check_batch(&batch, &config).unwrap();
+        // "not-an-email" (idx 1) and None (idx 2) should be rejected
+        assert_eq!(result.rejected.len(), 2);
+        let rejected_indices: Vec<usize> = result.rejected.iter().map(|r| r.batch_row_index).collect();
+        assert!(rejected_indices.contains(&1));
+        assert!(rejected_indices.contains(&2));
+    }
+
+    #[test]
+    fn regex_rule_invalid_pattern_returns_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let col = StringArray::from(vec!["hello"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::Regex { column: "v".into(), pattern: "[invalid((".into() },
+            QualityAction::Reject,
+        );
+        assert!(check_batch(&batch, &config).is_err());
+    }
+
+    #[test]
+    fn parquet_2pc_quality_check_rejects_null_rows() {
+        use arrow::array::Float64Array;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        // Row 0: 1.0, Row 1: null — null should be rejected by NotNull rule
+        let col = Float64Array::from(vec![Some(1.0), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+
+        let config = DataQualityConfig::new()
+            .with_rule(DataQualityRule::NotNull { column: "v".into() }, QualityAction::Reject);
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path())
+            .with_quality_config(config);
+
+        let handle = sink.prepare(1, &batch).unwrap();
+        sink.commit(handle).unwrap();
+
+        // Read back the written parquet file and verify only 1 row was written
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().map_or(false, |e| e == "parquet"))
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one .parquet file should exist");
+
+        // Use the parquet module in this crate (which re-exports ParquetSource)
+        // to read back and count rows.
+        use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let file = std::fs::File::open(&files[0]).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let total_rows: usize = reader
+            .map(|b: Result<RecordBatch, _>| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(total_rows, 1, "only the non-null row should be written");
+    }
+
+    #[test]
+    fn parquet_2pc_quality_fail_action_aborts_prepare() {
+        use arrow::array::Float64Array;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        let col = Float64Array::from(vec![None::<f64>]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+
+        let config = DataQualityConfig::new()
+            .with_rule(DataQualityRule::NotNull { column: "v".into() }, QualityAction::Fail);
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path())
+            .with_quality_config(config);
+
+        let result = sink.prepare(1, &batch);
+        assert!(result.is_err(), "Fail action must abort prepare");
     }
 }

@@ -11,6 +11,7 @@ arrow-flight = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 krishiv-api = { path = "../krishiv-api" }
+krishiv-governance = { path = "../krishiv-governance" }
 tokio = { workspace = true }
 # Use tonic 0.12 — same version as arrow-flight 55 to avoid type conflicts
 tonic = { version = "0.12", features = ["transport"] }

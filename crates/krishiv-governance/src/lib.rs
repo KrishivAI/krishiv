@@ -149,6 +149,45 @@ pub enum AuditAction<'a> {
     AdminAction { description: &'a str },
 }
 
+/// A structured audit event for external SIEM/audit-log forwarding.
+#[derive(Debug, Clone)]
+pub struct AuditEvent {
+    pub principal: String,
+    pub action: String,
+    pub resource: Option<String>,
+    pub timestamp_ms: i64,
+    pub outcome: AuditOutcome,
+}
+
+/// Outcome of an audited action.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// Action was permitted and completed.
+    Allowed,
+    /// Action was denied by a policy check.
+    Denied,
+}
+
+/// Pluggable audit log sink.
+pub trait AuditSink: Send + Sync {
+    fn record(&self, event: &AuditEvent);
+}
+
+/// No-op audit sink that routes to tracing.
+pub struct TracingAuditSink;
+impl AuditSink for TracingAuditSink {
+    fn record(&self, event: &AuditEvent) {
+        tracing::info!(
+            principal = %event.principal,
+            action = %event.action,
+            resource = ?event.resource,
+            outcome = ?event.outcome,
+            "audit"
+        );
+    }
+}
+
 /// **Beta API**: Emit a structured audit log event via `tracing` (target `"krishiv::audit"`).
 ///
 /// In production, the `tracing` subscriber routes these to the audit log
@@ -169,6 +208,17 @@ pub fn audit_log(principal: &str, action: &AuditAction<'_>) {
         ),
         AuditAction::AdminAction { description } => ("admin_action", (*description).to_owned()),
     };
+    let event = AuditEvent {
+        principal: principal.to_string(),
+        action: action_name.to_string(),
+        resource: Some(detail.clone()),
+        timestamp_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+        outcome: AuditOutcome::Allowed,
+    };
+    TracingAuditSink.record(&event);
     tracing::info!(
         target: "krishiv::audit",
         principal = principal,
@@ -420,6 +470,32 @@ mod tests {
     #[test]
     fn audit_log_does_not_panic() {
         audit_log("alice", &AuditAction::JobSubmitted { job_id: "j1" });
+    }
+
+    #[test]
+    fn audit_event_constructs_correctly() {
+        let event = AuditEvent {
+            principal: "alice".into(),
+            action: "query_execute".into(),
+            resource: Some("orders".into()),
+            timestamp_ms: 1716201600000,
+            outcome: AuditOutcome::Allowed,
+        };
+        assert_eq!(event.principal, "alice");
+        assert_eq!(event.outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn tracing_audit_sink_does_not_panic() {
+        let sink = TracingAuditSink;
+        let event = AuditEvent {
+            principal: "bob".into(),
+            action: "job_submit".into(),
+            resource: None,
+            timestamp_ms: 0,
+            outcome: AuditOutcome::Allowed,
+        };
+        sink.record(&event);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+[package]
+name = "krishiv-chaos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "krishiv_chaos"
+path = "src/lib.rs"
+
+[dev-dependencies]
+krishiv-checkpoint = { path = "../krishiv-checkpoint" }
+krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-governance = { path = "../krishiv-governance" }
+krishiv-operator = { path = "../krishiv-operator" }
+arrow = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
