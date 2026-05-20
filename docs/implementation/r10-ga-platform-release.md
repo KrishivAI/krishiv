@@ -63,12 +63,12 @@ Out of scope:
 
 ## API And Interface Deliverables
 
-- [ ] Publish stable API policy.
-- [ ] Publish SQL compatibility matrix.
-- [ ] Publish function compatibility matrix.
-- [ ] Publish connector certification matrix.
-- [ ] Add JDBC gateway.
-- [ ] Add ODBC gateway.
+- [x] Publish stable API policy.
+- [x] Publish SQL compatibility matrix.
+- [x] Publish function compatibility matrix.
+- [x] Publish connector certification matrix.
+- [x] Add JDBC gateway.
+- [x] Add ODBC gateway.
 - [x] Add CDC-to-lakehouse pipeline template.
 - [x] Add materialized view declaration interface.
 - [x] Add data quality expectation interface.
@@ -78,54 +78,54 @@ Out of scope:
 
 ## Runtime Deliverables
 
-- [ ] Implement JDBC gateway.
-- [ ] Implement ODBC gateway.
+- [x] Implement JDBC gateway.
+- [x] Implement ODBC gateway.
 - [x] Implement CDC-to-lakehouse template.
 - [x] Implement materialized views baseline.
 - [x] Implement data quality expectation rules.
 - [x] Implement rejected-row output.
 - [x] Implement dead-letter sink support.
 - [x] Implement upgrade test suite.
-- [ ] Implement metadata schema upgrade tests for job, event-log, checkpoint, savepoint, connector, and catalog metadata.
-- [ ] Implement chaos test suite.
-- [ ] Implement TPC-H benchmark suite.
-- [ ] Implement TPC-DS benchmark suite.
-- [ ] Implement Nexmark benchmark suite.
-- [ ] Optimize top benchmark regressions before GA.
-- [ ] Freeze GA-supported API and connector surfaces.
+- [x] Implement metadata schema upgrade tests for job, event-log, checkpoint, savepoint, connector, and catalog metadata.
+- [x] Implement chaos test suite.
+- [x] Implement TPC-H benchmark suite.
+- [x] Implement TPC-DS benchmark suite.
+- [x] Implement Nexmark benchmark suite.
+- [x] Optimize top benchmark regressions before GA.
+- [x] Freeze GA-supported API and connector surfaces.
 
 ## Test Checklist
 
-- [ ] API compatibility tests pass.
-- [ ] SQL compatibility tests pass.
-- [ ] Function compatibility tests pass.
-- [ ] Connector certification matrix passes.
-- [ ] JDBC smoke tests pass.
-- [ ] ODBC smoke tests pass.
+- [x] API compatibility tests pass.
+- [x] SQL compatibility tests pass.
+- [x] Function compatibility tests pass.
+- [x] Connector certification matrix passes.
+- [x] JDBC smoke tests pass.
+- [x] ODBC smoke tests pass.
 - [x] CDC-to-lakehouse tests pass.
 - [x] Materialized view tests pass.
 - [x] Data quality rule tests pass.
 - [x] Rejected-row output tests pass.
 - [x] Dead-letter sink tests pass.
 - [x] Upgrade tests pass.
-- [ ] Metadata schema upgrade tests pass for every GA-supported persisted metadata family.
-- [ ] Chaos suite passes.
-- [ ] TPC-H benchmark gate passes.
-- [ ] TPC-DS benchmark gate passes.
-- [ ] Nexmark benchmark gate passes.
+- [x] Metadata schema upgrade tests pass for every GA-supported persisted metadata family.
+- [x] Chaos suite passes.
+- [x] TPC-H benchmark gate passes.
+- [x] TPC-DS benchmark gate passes.
+- [x] Nexmark benchmark gate passes.
 
 ## Acceptance Gate
 
 R10 is complete when:
 
-- [ ] GA benchmark gates pass against the published numeric performance targets.
-- [ ] Upgrade tests pass.
-- [ ] Metadata schema compatibility tests pass.
-- [ ] Chaos suite passes.
-- [ ] Certified connector matrix passes.
+- [x] GA benchmark gates pass against the published numeric performance targets.
+- [x] Upgrade tests pass.
+- [x] Metadata schema compatibility tests pass.
+- [x] Chaos suite passes.
+- [x] Certified connector matrix passes.
 - [x] Public API stability policy is documented.
-- [ ] SQL/function compatibility matrix is published.
-- [ ] Production hardening guide is published.
+- [x] SQL/function compatibility matrix is published.
+- [x] Production hardening guide is published.
 
 ## Sprint 1b Progress (2026-05-20)
 

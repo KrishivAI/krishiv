@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
+    CheckpointAckRequest, CheckpointSourceOffset,
     CoordinatorExecutorService, DeregisterExecutorRequest, DeregisterExecutorResponse,
     ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
     ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InitiateCheckpointRequest,

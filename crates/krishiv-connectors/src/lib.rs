@@ -20,6 +20,7 @@ pub mod s3;
 // ---------------------------------------------------------------------------
 
 /// Errors produced by connector operations.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ConnectorError {
     /// Configuration problem (missing required property, bad value, etc.).

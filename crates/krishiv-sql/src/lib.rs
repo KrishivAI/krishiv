@@ -22,6 +22,7 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 pub type SqlResult<T> = Result<T, SqlError>;
 
 /// SQL-layer errors.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqlError {
     /// Query was empty or whitespace only.
