@@ -31,9 +31,7 @@ fn dead_letter_sink_certification_notnull() {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
     let config = DataQualityConfig::new().with_rule(
-        DataQualityRule::NotNull {
-            column: "v".into(),
-        },
+        DataQualityRule::NotNull { column: "v".into() },
         QualityAction::Reject,
     );
     let sink = DeadLetterSink::new("cert_test", config);

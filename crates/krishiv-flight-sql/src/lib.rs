@@ -116,7 +116,7 @@ fn mask_batch(
     table_name: &str,
     policy: &dyn PolicyHook,
 ) -> Result<RecordBatch, Status> {
-    use arrow::array::{new_null_array, Array, ArrayRef};
+    use arrow::array::{Array, ArrayRef, new_null_array};
     use arrow::util::display::{ArrayFormatter, FormatOptions};
 
     let schema = batch.schema();
@@ -130,7 +130,8 @@ fn mask_batch(
                 columns.push(new_null_array(col.data_type(), batch.num_rows()));
             }
             Some(MaskingRule::Redact) => {
-                let redacted: StringArray = (0..batch.num_rows()).map(|_| Some("REDACTED")).collect();
+                let redacted: StringArray =
+                    (0..batch.num_rows()).map(|_| Some("REDACTED")).collect();
                 columns.push(Arc::new(redacted));
             }
             Some(MaskingRule::Hash) => {

@@ -15,7 +15,7 @@
 //! - `RocksDbStateBackend` — type alias for `RedbStateBackend` (kept for
 //!   source compatibility; the old filesystem-based placeholder is removed).
 
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::BTreeMap;
 
 // ── redb table definition ─────────────────────────────────────────────────────

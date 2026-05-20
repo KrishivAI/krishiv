@@ -36,7 +36,9 @@ impl FaultInjector {
         if self.faults.is_empty() {
             return &FaultMode::None;
         }
-        let idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         &self.faults[idx % self.faults.len()]
     }
 }

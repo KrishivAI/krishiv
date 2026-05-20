@@ -5,7 +5,13 @@
 use krishiv_sql::SqlEngine;
 
 async fn run(query: &str) -> Vec<arrow::record_batch::RecordBatch> {
-    SqlEngine::new().sql(query).await.unwrap().collect().await.unwrap()
+    SqlEngine::new()
+        .sql(query)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -16,11 +22,9 @@ async fn sql_compat_select_literal() {
 
 #[tokio::test]
 async fn sql_compat_group_by_count() {
-    let r = run(
-        "SELECT n % 2 AS parity, COUNT(*) AS cnt \
+    let r = run("SELECT n % 2 AS parity, COUNT(*) AS cnt \
          FROM (VALUES (1),(2),(3),(4)) AS t(n) \
-         GROUP BY n % 2 ORDER BY parity",
-    )
+         GROUP BY n % 2 ORDER BY parity")
     .await;
     assert_eq!(r[0].num_rows(), 2);
 }
@@ -41,7 +45,11 @@ async fn sql_compat_limit() {
 async fn sql_compat_order_by() {
     use arrow::array::Int64Array;
     let r = run("SELECT n FROM (VALUES (3),(1),(2)) AS t(n) ORDER BY n ASC").await;
-    let col = r[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(col.value(0), 1);
     assert_eq!(col.value(2), 3);
 }
@@ -50,7 +58,11 @@ async fn sql_compat_order_by() {
 async fn sql_compat_string_function_length() {
     use arrow::array::Int32Array;
     let r = run("SELECT length('hello') AS len").await;
-    let col = r[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     assert_eq!(col.value(0), 5);
 }
 
@@ -58,7 +70,11 @@ async fn sql_compat_string_function_length() {
 async fn sql_compat_math_function_abs() {
     use arrow::array::Int64Array;
     let r = run("SELECT abs(-7) AS v").await;
-    let col = r[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(col.value(0), 7);
 }
 
@@ -66,7 +82,11 @@ async fn sql_compat_math_function_abs() {
 async fn sql_compat_aggregate_sum() {
     use arrow::array::Int64Array;
     let r = run("SELECT SUM(n) AS total FROM (VALUES (1),(2),(3)) AS t(n)").await;
-    let col = r[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let col = r[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(col.value(0), 6);
 }
 

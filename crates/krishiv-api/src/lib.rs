@@ -226,9 +226,11 @@ impl SessionBuilder {
     /// Build a session.
     pub fn build(self) -> Result<Session> {
         let policy_engine = match (self.auth, self.policy) {
-            (Some(auth), Some(policy)) => {
-                Some(PolicyEnforcingSqlEngine::new(SqlEngine::new(), auth, policy))
-            }
+            (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
+                SqlEngine::new(),
+                auth,
+                policy,
+            )),
             _ => None,
         };
         Ok(Session {
@@ -258,7 +260,10 @@ impl fmt::Debug for Session {
             .field("sql_engine", &self.sql_engine)
             .field(
                 "policy_engine",
-                &self.policy_engine.as_ref().map(|_| "<PolicyEnforcingSqlEngine>"),
+                &self
+                    .policy_engine
+                    .as_ref()
+                    .map(|_| "<PolicyEnforcingSqlEngine>"),
             )
             .finish_non_exhaustive()
     }
@@ -338,23 +343,26 @@ impl Session {
     /// and masks columns per the masking rules before returning results.
     /// Returns [`KrishivError::AccessDenied`] if the session has no policy engine or
     /// if authentication fails.
-    pub async fn sql_as(
-        &self,
-        api_key: &str,
-        query: impl AsRef<str>,
-    ) -> Result<DataFrame> {
-        let engine = self.policy_engine.as_ref().ok_or_else(|| KrishivError::AccessDenied {
-            reason: "session was not built with an AuthProvider and PolicyHook".into(),
-        })?;
-        let principal = engine.authenticate(api_key).map_err(|e| KrishivError::AccessDenied {
-            reason: e.to_string(),
-        })?;
+    pub async fn sql_as(&self, api_key: &str, query: impl AsRef<str>) -> Result<DataFrame> {
+        let engine = self
+            .policy_engine
+            .as_ref()
+            .ok_or_else(|| KrishivError::AccessDenied {
+                reason: "session was not built with an AuthProvider and PolicyHook".into(),
+            })?;
+        let principal = engine
+            .authenticate(api_key)
+            .map_err(|e| KrishivError::AccessDenied {
+                reason: e.to_string(),
+            })?;
         let query_str = query.as_ref();
         let table_hint = extract_table_hint(query_str);
         let batches = engine
             .execute_as(&principal, query_str, &table_hint)
             .await
-            .map_err(|e| KrishivError::AccessDenied { reason: e.to_string() })?;
+            .map_err(|e| KrishivError::AccessDenied {
+                reason: e.to_string(),
+            })?;
         Ok(DataFrame::from_batches(
             self.mode,
             batches,
@@ -384,7 +392,6 @@ impl Session {
 
     /// Create a bounded local memory stream.
     pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Stream {
-
         Stream::for_session(name, StreamMode::Bounded, batches, self.mode)
     }
 
@@ -459,8 +466,7 @@ impl DataFrame {
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
     ) -> Self {
-        let logical_plan =
-            LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
+        let logical_plan = LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
         Self {
             logical_plan,
             sql_dataframe: None,
@@ -1279,10 +1285,7 @@ mod tests {
             .with_policy(Arc::new(AllowAllPolicy))
             .build()
             .unwrap();
-        let df = session
-            .sql_as("key123", "SELECT 42 AS v")
-            .await
-            .unwrap();
+        let df = session.sql_as("key123", "SELECT 42 AS v").await.unwrap();
         let result = df.collect_async().await.unwrap();
         assert_eq!(result.row_count(), 1);
     }
@@ -1314,11 +1317,11 @@ mod tests {
     #[test]
     fn extract_table_hint_parses_from_clause() {
         use super::extract_table_hint;
-        assert_eq!(extract_table_hint("SELECT * FROM orders WHERE id=1"), "orders");
-        assert_eq!(extract_table_hint("SELECT 42 AS v"), "");
         assert_eq!(
-            extract_table_hint("select a from users limit 10"),
-            "users"
+            extract_table_hint("SELECT * FROM orders WHERE id=1"),
+            "orders"
         );
+        assert_eq!(extract_table_hint("SELECT 42 AS v"), "");
+        assert_eq!(extract_table_hint("select a from users limit 10"), "users");
     }
 }

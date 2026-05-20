@@ -7,7 +7,38 @@ GA platform release on branch `claude/plan-r10-architecture-GnRvo`.
 
 ## Active Task
 
-None — all P0/P1/P2 gaps resolved. Ready for GA tag.
+None — dependency upgrade to latest versions complete.
+
+## Dependency Upgrade (2026-05-20)
+
+Upgraded all workspace dependencies to latest versions and adopted new APIs:
+
+| Package | Old | New | Breaking changes handled |
+|---------|-----|-----|--------------------------|
+| datafusion | 47.x | 53.1.0 | `EmptyRelation: rows=1` explain format; missing parquet → empty (added file-existence guard in CLI) |
+| arrow / parquet | 52.x | 58.3.0 | — |
+| arrow-flight | 52.x | 58.3.0 | removed tonic 0.12 pin in `krishiv-flight-sql` |
+| opentelemetry / otel_sdk | 0.27 | 0.32.0 | `SdkTracerProvider` rename; runtime param removed from batch exporter |
+| k8s-openapi | 0.23 | 0.27.1 | chrono → jiff (`Timestamp::now()`, `.as_second()`) |
+| kube | 0.98 | 3.1.0 | uses k8s-openapi 0.27 |
+| object_store | 0.10 | 0.13.2 | `put/get/delete` moved to `ObjectStoreExt` extension trait |
+| redb | 2.x | 4.1.0 | `begin_read()` moved to `ReadableDatabase` trait |
+| reqwest | 0.12 | 0.13.3 | `rustls-tls` feature renamed to `rustls` |
+| criterion | 0.5 | 0.8.2 | — |
+| tokio | 1.44 | 1.52.3 | — |
+| tonic / prost | 0.12/0.13 | 0.14.x | — |
+| axum | 0.7 | 0.8.9 | — |
+| pyo3 | 0.22 | 0.28.3 | — |
+
+All `collapsible_if` clippy lints fixed using Rust 2024 let-chains across:
+`krishiv-checkpoint`, `krishiv-sql`, `krishiv-shuffle`, `krishiv-scheduler`, `krishiv-operator`
+
+**Validation:**
+```
+cargo clippy --workspace -- -D warnings  → clean
+cargo fmt --check                         → clean
+cargo test --workspace                    → all pass
+```
 
 ## Post-R10 Gap Fixes (P0 → P2)
 

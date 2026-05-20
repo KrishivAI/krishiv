@@ -204,12 +204,12 @@ impl QueueManager for QuotaQueueManager {
     fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
         let policy = self.policy_for(spec.namespace_id());
 
-        if let Some(limit) = policy.max_concurrent_jobs {
-            if quota.active_job_count >= limit {
-                return SubmitOutcome::Queued {
-                    position: quota.active_job_count - limit,
-                };
-            }
+        if let Some(limit) = policy.max_concurrent_jobs
+            && quota.active_job_count >= limit
+        {
+            return SubmitOutcome::Queued {
+                position: quota.active_job_count - limit,
+            };
         }
         if let Some(limit) = policy.cpu_nanos_limit {
             let requested = spec.cpu_limit_nanos().unwrap_or(0);
@@ -1690,22 +1690,22 @@ impl Coordinator {
         }
 
         // Create a CheckpointCoordinator for streaming jobs with checkpoint config.
-        if spec.kind() == JobKind::Streaming {
-            if let (Some(interval_ms), Some(storage_path)) = (
+        if spec.kind() == JobKind::Streaming
+            && let (Some(interval_ms), Some(storage_path)) = (
                 spec.checkpoint_interval_ms(),
                 spec.checkpoint_storage_path(),
-            ) {
-                let storage = Self::open_checkpoint_storage(storage_path)?;
-                let task_count: usize = spec.stages().iter().map(|s| s.tasks().len()).sum();
-                let ckpt_coord = CheckpointCoordinator::new(
-                    spec.job_id().clone(),
-                    Arc::new(storage),
-                    interval_ms,
-                    task_count,
-                );
-                self.checkpoint_coordinators
-                    .insert(spec.job_id().clone(), ckpt_coord);
-            }
+            )
+        {
+            let storage = Self::open_checkpoint_storage(storage_path)?;
+            let task_count: usize = spec.stages().iter().map(|s| s.tasks().len()).sum();
+            let ckpt_coord = CheckpointCoordinator::new(
+                spec.job_id().clone(),
+                Arc::new(storage),
+                interval_ms,
+                task_count,
+            );
+            self.checkpoint_coordinators
+                .insert(spec.job_id().clone(), ckpt_coord);
         }
 
         let executors = self.executors.schedulable_executors();
@@ -1991,27 +1991,24 @@ impl Coordinator {
             let job = self.find_job(job_id)?;
             for stage in job.stages() {
                 for task in stage.tasks() {
-                    if task.state() == TaskState::Running {
-                        if let Some(executor_id) = task.assigned_executor() {
-                            if let Ok(record) = self.executors.find_executor(executor_id) {
-                                if let Some(endpoint) = record.descriptor().task_endpoint() {
-                                    let attempt_id =
-                                        AttemptId::try_new(task.attempt()).map_err(|e| {
-                                            SchedulerError::InvalidJob {
-                                                message: e.to_string(),
-                                            }
-                                        })?;
-                                    let req = TaskCancellationRequest::new(TaskAttemptRef::new(
-                                        job_id.clone(),
-                                        stage.stage_id().clone(),
-                                        task.task_id().clone(),
-                                        attempt_id,
-                                    ))
-                                    .with_reason("job cancelled");
-                                    targets.push((endpoint.to_owned(), req));
-                                }
+                    if task.state() == TaskState::Running
+                        && let Some(executor_id) = task.assigned_executor()
+                        && let Ok(record) = self.executors.find_executor(executor_id)
+                        && let Some(endpoint) = record.descriptor().task_endpoint()
+                    {
+                        let attempt_id = AttemptId::try_new(task.attempt()).map_err(|e| {
+                            SchedulerError::InvalidJob {
+                                message: e.to_string(),
                             }
-                        }
+                        })?;
+                        let req = TaskCancellationRequest::new(TaskAttemptRef::new(
+                            job_id.clone(),
+                            stage.stage_id().clone(),
+                            task.task_id().clone(),
+                            attempt_id,
+                        ))
+                        .with_reason("job cancelled");
+                        targets.push((endpoint.to_owned(), req));
                     }
                 }
             }
@@ -2062,11 +2059,11 @@ impl Coordinator {
             // Notify the queue manager so it can release reserved capacity.
             self.queue_manager.on_job_complete(&job_id, &usage);
         }
-        if let Some(record) = self.jobs.get(&job_id) {
-            if let Some(store) = &self.store {
-                let mut s = store.lock().unwrap();
-                s.save_job(record).ok();
-            }
+        if let Some(record) = self.jobs.get(&job_id)
+            && let Some(store) = &self.store
+        {
+            let mut s = store.lock().unwrap();
+            s.save_job(record).ok();
         }
         Ok(outcome)
     }
@@ -2207,12 +2204,11 @@ impl ExecutorRegistry {
             .executors
             .iter()
             .find(|executor| executor.executor_id() == descriptor.executor_id())
+            && (executor.state().can_accept_work() || executor.state() == ExecutorState::Draining)
         {
-            if executor.state().can_accept_work() || executor.state() == ExecutorState::Draining {
-                return Err(SchedulerError::DuplicateExecutor {
-                    executor_id: descriptor.executor_id().clone(),
-                });
-            }
+            return Err(SchedulerError::DuplicateExecutor {
+                executor_id: descriptor.executor_id().clone(),
+            });
         }
 
         if let Some(executor) = self
@@ -2351,14 +2347,12 @@ impl ExecutorRegistry {
                 if !executor.state().can_accept_work() || executor.descriptor().slots() == 0 {
                     return false;
                 }
-                if let Some(threshold) = self.memory_threshold_bytes {
-                    if let Some(snapshot) = &executor.health_snapshot {
-                        if let Some(used) = snapshot.memory_used_bytes {
-                            if used >= threshold {
-                                return false;
-                            }
-                        }
-                    }
+                if let Some(threshold) = self.memory_threshold_bytes
+                    && let Some(snapshot) = &executor.health_snapshot
+                    && let Some(used) = snapshot.memory_used_bytes
+                    && used >= threshold
+                {
+                    return false;
                 }
                 true
             })
@@ -2682,10 +2676,10 @@ impl JobRecord {
         let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
 
         // Accumulate resource stats from successfully-completed tasks.
-        if outcome != TaskUpdateOutcome::Duplicate {
-            if let Some((cpu_nanos, memory_bytes)) = runtime_stats {
-                self.resource_usage.add_task_stats(cpu_nanos, memory_bytes);
-            }
+        if outcome != TaskUpdateOutcome::Duplicate
+            && let Some((cpu_nanos, memory_bytes)) = runtime_stats
+        {
+            self.resource_usage.add_task_stats(cpu_nanos, memory_bytes);
         }
 
         // If the task succeeded with shuffle output, record partition availability.

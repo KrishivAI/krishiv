@@ -12,6 +12,8 @@ use std::error::Error;
 use std::fmt;
 
 use futures::StreamExt;
+use k8s_openapi::api::coordination::v1::Lease;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
     JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec,
@@ -20,8 +22,6 @@ use krishiv_scheduler::{
     Coordinator, JobSnapshot, LeaderElection, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy,
     ResourceUsage, SchedulerError, SharedCoordinator, SubmitOutcome,
 };
-use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::Client;
 use kube::api::{Api, ObjectMeta as KubeObjectMeta, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
@@ -1214,30 +1214,28 @@ impl QueueManager for CrdQueueManager {
             .and_then(|ns| self.namespace_policies.get(ns))
             .unwrap_or(&self.default_policy);
 
-        if let Some(limit) = policy.max_concurrent_jobs {
-            if quota.active_job_count >= limit {
-                return SubmitOutcome::Queued {
-                    position: quota.active_job_count.saturating_sub(limit),
-                };
-            }
+        if let Some(limit) = policy.max_concurrent_jobs
+            && quota.active_job_count >= limit
+        {
+            return SubmitOutcome::Queued {
+                position: quota.active_job_count.saturating_sub(limit),
+            };
         }
-        if let Some(limit) = policy.cpu_nanos_limit {
-            if quota
+        if let Some(limit) = policy.cpu_nanos_limit
+            && quota
                 .cpu_nanos_reserved
                 .saturating_add(spec.cpu_limit_nanos().unwrap_or(0))
                 > limit
-            {
-                return SubmitOutcome::Queued { position: 0 };
-            }
+        {
+            return SubmitOutcome::Queued { position: 0 };
         }
-        if let Some(limit) = policy.memory_bytes_limit {
-            if quota
+        if let Some(limit) = policy.memory_bytes_limit
+            && quota
                 .memory_bytes_reserved
                 .saturating_add(spec.memory_limit_bytes().unwrap_or(0))
                 > limit
-            {
-                return SubmitOutcome::Queued { position: 0 };
-            }
+        {
+            return SubmitOutcome::Queued { position: 0 };
         }
         SubmitOutcome::Accepted
     }
@@ -1360,7 +1358,7 @@ impl K8sLeaseElection {
 
     /// Current UTC time as a `MicroTime`.
     fn now_micro() -> MicroTime {
-        MicroTime(k8s_openapi::chrono::Utc::now())
+        MicroTime(k8s_openapi::jiff::Timestamp::now())
     }
 
     /// Try to acquire the lease via live K8s API calls.
@@ -1425,17 +1423,15 @@ impl K8sLeaseElection {
                     .spec
                     .as_ref()
                     .and_then(|s| s.renew_time.as_ref())
-                    .map(|t| t.0.timestamp());
+                    .map(|t| t.0.as_second());
                 let duration = existing
                     .spec
                     .as_ref()
                     .and_then(|s| s.lease_duration_seconds)
                     .unwrap_or(self.lease_duration_s as i32) as i64;
-                let now_ts = k8s_openapi::chrono::Utc::now().timestamp();
+                let now_ts = k8s_openapi::jiff::Timestamp::now().as_second();
                 let is_ours = holder == self.holder_identity;
-                let is_expired = renew_time
-                    .map(|rt| rt + duration < now_ts)
-                    .unwrap_or(true);
+                let is_expired = renew_time.map(|rt| rt + duration < now_ts).unwrap_or(true);
 
                 if !is_ours && !is_expired {
                     // Another holder owns a live lease — we cannot take over.

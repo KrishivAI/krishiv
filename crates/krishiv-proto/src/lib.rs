@@ -3624,9 +3624,7 @@ pub mod wire {
     ) -> v1::CheckpointAckResponse {
         use v1::checkpoint_ack_response::Result as WireResult;
         let result = match value {
-            CheckpointAckResponse::Accepted => {
-                WireResult::Accepted(v1::CheckpointAckAccepted {})
-            }
+            CheckpointAckResponse::Accepted => WireResult::Accepted(v1::CheckpointAckAccepted {}),
             CheckpointAckResponse::StaleEpoch { current_epoch } => {
                 WireResult::StaleEpoch(v1::CheckpointAckStaleEpoch { current_epoch })
             }

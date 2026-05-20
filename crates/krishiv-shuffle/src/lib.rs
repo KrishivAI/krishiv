@@ -13,6 +13,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use object_store::ObjectStoreExt as _;
+
 use arrow::array::{
     Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray, UInt32Array,
 };
@@ -592,13 +594,13 @@ impl ShuffleStore for InMemoryShuffleStore {
     async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = self.lease_tokens.write().unwrap();
-        if let Some(&expected) = leases.get(&key) {
-            if lease_token < expected {
-                return Err(StoreError::StaleLeaseToken {
-                    expected,
-                    actual: lease_token,
-                });
-            }
+        if let Some(&expected) = leases.get(&key)
+            && lease_token < expected
+        {
+            return Err(StoreError::StaleLeaseToken {
+                expected,
+                actual: lease_token,
+            });
         }
         leases.insert(key, lease_token);
         Ok(())
@@ -692,13 +694,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
     async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = self.lease_tokens.write().unwrap();
-        if let Some(&expected) = leases.get(&key) {
-            if lease_token < expected {
-                return Err(StoreError::StaleLeaseToken {
-                    expected,
-                    actual: lease_token,
-                });
-            }
+        if let Some(&expected) = leases.get(&key)
+            && lease_token < expected
+        {
+            return Err(StoreError::StaleLeaseToken {
+                expected,
+                actual: lease_token,
+            });
         }
         leases.insert(key, lease_token);
         Ok(())

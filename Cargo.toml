@@ -32,46 +32,46 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "55.1.0", features = ["prettyprint"] }
-arrow-flight = { version = "55.1.0", features = ["flight-sql-experimental"] }
-pyo3 = { version = "0.28", features = ["extension-module"] }
-iceberg = "0.9"
+arrow = { version = "58.3.0", features = ["prettyprint"] }
+arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+iceberg = "0.9.1"
 async-trait = "0.1"
 bytes = "1"
-object_store = "0.12"
-askama = "0.12"
-axum = "0.8"
-datafusion = "48.0.1"
+object_store = "0.13.2"
+askama = "0.16.0"
+axum = "0.8.9"
+datafusion = "53.1.0"
 futures = "0.3"
-k8s-openapi = { version = "0.26.1", features = ["v1_31"] }
-kube = { version = "2.0.1", features = ["runtime"] }
-parquet = "55.1.0"
+k8s-openapi = { version = "0.27.1", features = ["v1_31"] }
+kube = { version = "3.1.0", features = ["runtime"] }
+parquet = "58.3.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 prost = "0.14.3"
-prost-build = "0.14.1"
+prost-build = "0.14.3"
 protoc-bin-vendored = "3.2.0"
-tokio = { version = "1.45", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
-tonic = { version = "0.14.5", features = ["transport"] }
-tonic-prost = "0.14.5"
-tonic-prost-build = "0.14.5"
-tower = "0.5"
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tower = "0.5.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-tracing-opentelemetry = "0.28"
-opentelemetry = { version = "0.27", features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
-opentelemetry-stdout = { version = "0.27", features = ["trace"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
-redb = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing-opentelemetry = "0.33.0"
+opentelemetry = { version = "0.32.0", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.0", features = ["trace"] }
+opentelemetry-stdout = { version = "0.32.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
+redb = "4.1.0"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]

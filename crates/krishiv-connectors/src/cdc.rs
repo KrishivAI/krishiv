@@ -61,11 +61,7 @@ pub struct CdcEvent {
 /// ```
 ///
 /// Returns `None` if the envelope is malformed or `op` is unrecognized.
-pub fn parse_debezium_envelope(
-    json: &str,
-    partition_id: u32,
-    offset: i64,
-) -> Option<CdcEvent> {
+pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Option<CdcEvent> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let op_str = v["op"].as_str()?;
     let op = CdcOp::from_debezium(op_str)?;
@@ -226,7 +222,11 @@ mod tests {
     #[test]
     fn pipeline_validate_rejects_empty_topic() {
         let p = CdcToLakehousePipeline::new(
-            "", vec!["kafka:9092".into()], "cat", "tbl", vec!["id".into()]
+            "",
+            vec!["kafka:9092".into()],
+            "cat",
+            "tbl",
+            vec!["id".into()],
         );
         assert!(p.validate().is_err());
     }
@@ -234,7 +234,11 @@ mod tests {
     #[test]
     fn pipeline_validate_accepts_valid_config() {
         let p = CdcToLakehousePipeline::new(
-            "orders.cdc", vec!["kafka:9092".into()], "iceberg", "warehouse.orders", vec!["id".into()]
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into()],
         );
         assert!(p.validate().is_ok());
     }
