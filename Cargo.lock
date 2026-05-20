@@ -2999,6 +2999,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-api",
+ "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
  "parquet 55.2.0",

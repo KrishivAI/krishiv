@@ -108,9 +108,7 @@ impl SqlEngine {
         }
     }
 
-    /// Attach a [`MaterializedViewRegistry`] to this engine.
-    /// The registry's `mark_table_committed()` is called after every successful
-    /// table registration (treating registration as a "commit" for R10).
+    /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
     #[must_use]
     pub fn with_view_registry(
         mut self,
@@ -204,16 +202,13 @@ impl SqlEngine {
 
     /// Execute `query` with materialized view cache lookup.
     ///
-    /// If `query` matches a registered view name and the view is fresh, returns
-    /// the cached batches directly. Otherwise falls through to normal execution
-    /// and caches the result for `OnCommit` views.
+    /// If the query targets a registered, fresh view, returns cached batches directly.
+    /// Otherwise executes normally and caches the result for `OnCommit` views.
     pub async fn sql_with_view_cache(
         &self,
         query: impl AsRef<str>,
     ) -> SqlResult<Vec<RecordBatch>> {
         let q = query.as_ref().trim();
-
-        // View name match: if query is exactly "SELECT * FROM <view_name>" or just "<view_name>"
         let view_name_candidate = extract_simple_view_name(q);
 
         if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
@@ -224,11 +219,9 @@ impl SqlEngine {
             }
         }
 
-        // Fall through: execute normally
         let df = self.sql(q).await?;
         let batches = df.collect().await?;
 
-        // Cache result for OnCommit views
         if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
             if let Ok(mut r) = reg.lock() {
                 if let Some(def) = r.definition(name).cloned() {
@@ -243,7 +236,6 @@ impl SqlEngine {
     }
 }
 
-/// Extract a view name from a simple query: "SELECT * FROM <name>" or just "<name>".
 fn extract_simple_view_name(query: &str) -> Option<String> {
     let lower = query.to_lowercase();
     if let Some(pos) = lower.find(" from ") {
@@ -715,7 +707,6 @@ mod view_cache_tests {
         assert!(!registry.lock().unwrap().is_stale("v1"));
 
         let engine = SqlEngine::new().with_view_registry(registry.clone());
-        // register_record_batches triggers mark_table_committed → view becomes stale
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
         ]));

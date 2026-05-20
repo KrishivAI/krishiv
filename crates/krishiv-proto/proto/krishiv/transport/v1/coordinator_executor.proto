@@ -7,6 +7,7 @@ service CoordinatorExecutor {
   rpc DeregisterExecutor(DeregisterExecutorRequest) returns (DeregisterExecutorResponse);
   rpc ExecutorHeartbeat(ExecutorHeartbeatRequest) returns (ExecutorHeartbeatResponse);
   rpc TaskStatus(TaskStatusRequest) returns (TaskStatusResponse);
+  rpc CheckpointAck(CheckpointAckRequest) returns (CheckpointAckResponse);
 }
 
 service ExecutorTask {
@@ -226,6 +227,37 @@ enum OutputContractKind {
   OUTPUT_CONTRACT_KIND_SHUFFLE = 3;
   OUTPUT_CONTRACT_KIND_SINK = 4;
 }
+
+message CheckpointSourceOffset {
+  string partition_id = 1;
+  int64 offset = 2;
+}
+
+message CheckpointAckRequest {
+  string job_id = 1;
+  string operator_id = 2;
+  string task_id = 3;
+  uint64 epoch = 4;
+  uint64 fencing_token = 5;
+  repeated CheckpointSourceOffset source_offsets = 6;
+  string snapshot_path = 7;
+}
+
+message CheckpointAckResponse {
+  oneof result {
+    CheckpointAckAccepted accepted = 1;
+    CheckpointAckStaleEpoch stale_epoch = 2;
+    CheckpointAckJobNotFound job_not_found = 3;
+  }
+}
+
+message CheckpointAckAccepted {}
+
+message CheckpointAckStaleEpoch {
+  uint64 current_epoch = 1;
+}
+
+message CheckpointAckJobNotFound {}
 
 enum TransportDisposition {
   TRANSPORT_DISPOSITION_UNSPECIFIED = 0;

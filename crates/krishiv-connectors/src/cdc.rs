@@ -78,7 +78,6 @@ pub fn parse_debezium_envelope(
         .to_string();
 
     // Build one column per key in the JSON object for before/after payloads.
-    // In a real implementation this would use the full Debezium schema registry.
     let make_payload_batch = |payload: &serde_json::Value| -> Option<RecordBatch> {
         if payload.is_null() || !payload.is_object() {
             return None;
@@ -87,7 +86,6 @@ pub fn parse_debezium_envelope(
         if obj.is_empty() {
             return None;
         }
-        // Build one Utf8 column per key in the JSON object.
         let mut fields: Vec<Field> = Vec::new();
         let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
         for (key, val) in obj {
@@ -199,11 +197,12 @@ mod tests {
         assert_eq!(event.op, CdcOp::Insert);
         assert!(event.before.is_none());
         let after = event.after.unwrap();
-        // After batch should have 'id' and 'name' columns, not '_payload'
         let schema = after.schema();
         let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert!(col_names.contains(&"id") || col_names.contains(&"name"),
-            "after batch must have unpacked columns, got: {:?}", col_names);
+        assert!(
+            col_names.contains(&"id") || col_names.contains(&"name"),
+            "after batch must have unpacked columns, got: {col_names:?}"
+        );
         assert_eq!(event.source_lsn, Some(100));
         assert_eq!(event.table, "orders");
     }

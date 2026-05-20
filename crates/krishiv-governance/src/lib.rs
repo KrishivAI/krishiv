@@ -174,7 +174,7 @@ pub trait AuditSink: Send + Sync {
     fn record(&self, event: &AuditEvent);
 }
 
-/// No-op audit sink (default — routes only to tracing).
+/// No-op audit sink that routes to tracing.
 pub struct TracingAuditSink;
 impl AuditSink for TracingAuditSink {
     fn record(&self, event: &AuditEvent) {
@@ -495,7 +495,7 @@ mod tests {
             timestamp_ms: 0,
             outcome: AuditOutcome::Allowed,
         };
-        sink.record(&event); // must not panic
+        sink.record(&event);
     }
 
     #[test]

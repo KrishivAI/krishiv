@@ -56,6 +56,13 @@ pub struct MetricsHandle {
 }
 
 impl MetricsHandle {
+    /// Create a no-op handle used when metrics init fails or telemetry is disabled.
+    pub fn noop() -> Self {
+        Self {
+            tracer_provider: SdkTracerProvider::builder().build(),
+        }
+    }
+
     /// Explicitly shut down the tracer provider and flush any pending spans.
     ///
     /// This is equivalent to dropping the handle.  Calling it more than once is
