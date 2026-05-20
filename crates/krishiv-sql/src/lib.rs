@@ -82,6 +82,7 @@ impl SqlPlan {
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
+    view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -103,7 +104,20 @@ impl SqlEngine {
     pub fn new() -> Self {
         Self {
             context: SessionContext::new(),
+            view_registry: None,
         }
+    }
+
+    /// Attach a [`MaterializedViewRegistry`] to this engine.
+    /// The registry's `mark_table_committed()` is called after every successful
+    /// table registration (treating registration as a "commit" for R10).
+    #[must_use]
+    pub fn with_view_registry(
+        mut self,
+        registry: std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>,
+    ) -> Self {
+        self.view_registry = Some(registry);
+        self
     }
 
     /// Register a local Parquet path as a table.
@@ -121,6 +135,11 @@ impl SqlEngine {
         self.context
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await?;
+        if let Some(ref reg) = self.view_registry {
+            if let Ok(mut r) = reg.lock() {
+                r.mark_table_committed();
+            }
+        }
         Ok(())
     }
 
@@ -164,6 +183,11 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
+        if let Some(ref reg) = self.view_registry {
+            if let Ok(mut r) = reg.lock() {
+                r.mark_table_committed();
+            }
+        }
         Ok(())
     }
 
@@ -177,6 +201,62 @@ impl SqlEngine {
         let dataframe = self.context.sql(query).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe))
     }
+
+    /// Execute `query` with materialized view cache lookup.
+    ///
+    /// If `query` matches a registered view name and the view is fresh, returns
+    /// the cached batches directly. Otherwise falls through to normal execution
+    /// and caches the result for `OnCommit` views.
+    pub async fn sql_with_view_cache(
+        &self,
+        query: impl AsRef<str>,
+    ) -> SqlResult<Vec<RecordBatch>> {
+        let q = query.as_ref().trim();
+
+        // View name match: if query is exactly "SELECT * FROM <view_name>" or just "<view_name>"
+        let view_name_candidate = extract_simple_view_name(q);
+
+        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
+            if let Ok(r) = reg.lock() {
+                if let Some(cached) = r.get_if_fresh(name) {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        // Fall through: execute normally
+        let df = self.sql(q).await?;
+        let batches = df.collect().await?;
+
+        // Cache result for OnCommit views
+        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
+            if let Ok(mut r) = reg.lock() {
+                if let Some(def) = r.definition(name).cloned() {
+                    if def.refresh_policy == RefreshPolicy::OnCommit {
+                        r.set_cached(name, batches.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(batches)
+    }
+}
+
+/// Extract a view name from a simple query: "SELECT * FROM <name>" or just "<name>".
+fn extract_simple_view_name(query: &str) -> Option<String> {
+    let lower = query.to_lowercase();
+    if let Some(pos) = lower.find(" from ") {
+        let after = query[pos + 6..].trim();
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';')
+            .unwrap_or(after.len());
+        let name = after[..end].trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
@@ -616,6 +696,62 @@ mod matview_tests {
         assert_eq!(def.name, "sales_summary");
         assert_eq!(def.refresh_policy, RefreshPolicy::Manual);
         assert_eq!(def.partition_columns, vec!["region".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod view_cache_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn engine_marks_table_committed_after_register() {
+        let registry = Arc::new(Mutex::new(MaterializedViewRegistry::new()));
+        {
+            let mut r = registry.lock().unwrap();
+            r.register(MaterializedViewDefinition::new("v1", "SELECT 1"));
+            r.set_cached("v1", vec![]);
+        }
+        assert!(!registry.lock().unwrap().is_stale("v1"));
+
+        let engine = SqlEngine::new().with_view_registry(registry.clone());
+        // register_record_batches triggers mark_table_committed → view becomes stale
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let col = arrow::array::Int64Array::from(vec![1i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        engine.register_record_batches("t1", vec![batch]).await.unwrap();
+
+        assert!(registry.lock().unwrap().is_stale("v1"), "commit must mark view stale");
+    }
+
+    #[tokio::test]
+    async fn sql_with_view_cache_returns_fresh_cache() {
+        let registry = Arc::new(Mutex::new(MaterializedViewRegistry::new()));
+        let expected_batch = {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, false),
+            ]));
+            let col = arrow::array::Int64Array::from(vec![99i64]);
+            RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap()
+        };
+        {
+            let mut r = registry.lock().unwrap();
+            r.register(
+                MaterializedViewDefinition::new("summary", "SELECT 99 AS v")
+                    .with_refresh_policy(RefreshPolicy::OnCommit),
+            );
+            r.set_cached("summary", vec![expected_batch.clone()]);
+        }
+
+        let engine = SqlEngine::new().with_view_registry(registry.clone());
+        let batches = engine
+            .sql_with_view_cache("SELECT * FROM summary")
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
     }
 }
 

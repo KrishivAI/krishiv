@@ -77,16 +77,31 @@ pub fn parse_debezium_envelope(
         .unwrap_or("unknown")
         .to_string();
 
-    // Build minimal single-column record batches for before/after payloads.
-    // In a real implementation this would use the full Debezium schema.
-    // For R10, we represent the payload as a single JSON string column.
+    // Build one column per key in the JSON object for before/after payloads.
+    // In a real implementation this would use the full Debezium schema registry.
     let make_payload_batch = |payload: &serde_json::Value| -> Option<RecordBatch> {
-        if payload.is_null() {
+        if payload.is_null() || !payload.is_object() {
             return None;
         }
-        let schema = Arc::new(Schema::new(vec![Field::new("_payload", DataType::Utf8, false)]));
-        let arr = arrow::array::StringArray::from(vec![payload.to_string()]);
-        RecordBatch::try_new(schema, vec![Arc::new(arr)]).ok()
+        let obj = payload.as_object()?;
+        if obj.is_empty() {
+            return None;
+        }
+        // Build one Utf8 column per key in the JSON object.
+        let mut fields: Vec<Field> = Vec::new();
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+        for (key, val) in obj {
+            fields.push(Field::new(key.as_str(), DataType::Utf8, true));
+            let str_val: Option<String> = match val {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s.clone()),
+                other => Some(other.to_string()),
+            };
+            let arr: arrow::array::StringArray = std::iter::once(str_val.as_deref()).collect();
+            columns.push(Arc::new(arr));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).ok()
     };
 
     let before = make_payload_batch(&v["before"]);
@@ -183,7 +198,12 @@ mod tests {
         let event = parse_debezium_envelope(json, 0, 0).unwrap();
         assert_eq!(event.op, CdcOp::Insert);
         assert!(event.before.is_none());
-        assert!(event.after.is_some());
+        let after = event.after.unwrap();
+        // After batch should have 'id' and 'name' columns, not '_payload'
+        let schema = after.schema();
+        let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(col_names.contains(&"id") || col_names.contains(&"name"),
+            "after batch must have unpacked columns, got: {:?}", col_names);
         assert_eq!(event.source_lsn, Some(100));
         assert_eq!(event.table, "orders");
     }
