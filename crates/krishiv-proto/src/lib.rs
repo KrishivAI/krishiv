@@ -2629,6 +2629,12 @@ pub trait CoordinatorExecutorService: Send + Sync + 'static {
         &self,
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status>;
+
+    /// Route a checkpoint ack from an executor to the active coordinator (R6a).
+    async fn checkpoint_ack(
+        &self,
+        request: tonic::Request<CheckpointAckRequest>,
+    ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status>;
 }
 
 /// Tonic-shaped executor service implemented by executor processes.

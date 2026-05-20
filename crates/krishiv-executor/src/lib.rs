@@ -16,10 +16,10 @@ use std::sync::{Arc, RwLock};
 
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointSourceOffset, CoordinatorExecutorService,
-    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-    ExecutorTaskAssignment, ExecutorTaskService, InitiateCheckpointRequest,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
+    CoordinatorExecutorService, DeregisterExecutorRequest, DeregisterExecutorResponse,
+    ExecutorDescriptor, ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId,
+    ExecutorState, ExecutorTaskAssignment, ExecutorTaskService, InitiateCheckpointRequest,
     InputPartitionDescriptor, LeaseGeneration, OutputContract, OutputContractDescriptor,
     RegisterExecutorRequest, RegisterExecutorResponse, ShufflePartitionOutput, TaskAttemptRef,
     TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
@@ -2781,15 +2781,15 @@ mod tests {
     use tempfile::tempdir;
 
     use krishiv_proto::{
-        AttemptId, CoordinatorExecutorService, CoordinatorId, DeregisterExecutorRequest,
-        DeregisterExecutorResponse, ExecutorHeartbeat, ExecutorHeartbeatRequest,
-        ExecutorHeartbeatResponse, ExecutorId, ExecutorState, ExecutorTaskAssignment,
-        ExecutorTaskService, InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec,
-        JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
-        OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-        StageId, StageSpec, StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId,
-        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
-        wire,
+        AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
+        CoordinatorId, DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorHeartbeat,
+        ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
+        ExecutorTaskAssignment, ExecutorTaskService, InputPartition, InputPartitionDescriptor,
+        JobId, JobKind, JobSpec, JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract,
+        OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
+        RegisterExecutorResponse, StageId, StageSpec, StreamingTaskState, TaskAttemptRef,
+        TaskCancellationRequest, TaskId, TaskSpec, TaskStatusRequest, TaskStatusResponse,
+        TransportDisposition, TransportVersion, wire,
     };
 
     use super::ExecutionModel;
@@ -2849,6 +2849,13 @@ mod tests {
             Ok(tonic::Response::new(TaskStatusResponse::new(
                 TransportDisposition::Accepted,
             )))
+        }
+
+        async fn checkpoint_ack(
+            &self,
+            _request: tonic::Request<CheckpointAckRequest>,
+        ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+            Ok(tonic::Response::new(CheckpointAckResponse::Accepted))
         }
     }
 
@@ -2947,6 +2954,16 @@ mod tests {
             let response = wire::task_status_response_from_wire(response)
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
             Ok(tonic::Response::new(response))
+        }
+
+        async fn checkpoint_ack(
+            &self,
+            _request: tonic::Request<CheckpointAckRequest>,
+        ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+            // Network path not implemented for R6a; in-process test only.
+            Err(tonic::Status::unimplemented(
+                "checkpoint_ack wire transport deferred to R10",
+            ))
         }
     }
 
