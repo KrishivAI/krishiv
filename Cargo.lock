@@ -3014,9 +3014,11 @@ dependencies = [
  "krishiv-proto",
  "object_store",
  "parquet 55.2.0",
+ "regex",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
