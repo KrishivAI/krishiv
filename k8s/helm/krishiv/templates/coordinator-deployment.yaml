@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "krishiv.fullname" . }}-coordinator
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "krishiv.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: {{ .Values.coordinator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "krishiv.coordinatorSelectorLabels" . | nindent 6 }}
+  strategy:
+    # Only one active coordinator at a time (per-job leader election via Lease API).
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "krishiv.coordinatorSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "krishiv.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: coordinator
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["krishiv-coordinator"]
+          args:
+            - "--listen=0.0.0.0:{{ .Values.coordinator.port }}"
+            - "--lease-duration={{ .Values.leaderElection.leaseDurationSeconds }}"
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.coordinator.port }}
+              protocol: TCP
+          env:
+            - name: KRISHIV_SERVICE_NAME
+              value: {{ .Values.observability.serviceName | quote }}
+            {{- if .Values.observability.otlpEndpoint }}
+            - name: KRISHIV_OTLP_ENDPOINT
+              value: {{ .Values.observability.otlpEndpoint | quote }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+          readinessProbe:
+            grpc:
+              port: {{ .Values.coordinator.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            grpc:
+              port: {{ .Values.coordinator.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 30

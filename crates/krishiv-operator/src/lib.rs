@@ -17,8 +17,8 @@ use krishiv_proto::{
     JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
-    Coordinator, JobSnapshot, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, ResourceUsage,
-    SchedulerError, SharedCoordinator, SubmitOutcome,
+    Coordinator, JobSnapshot, LeaderElection, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy,
+    ResourceUsage, SchedulerError, SharedCoordinator, SubmitOutcome,
 };
 use kube::Client;
 use kube::api::{Api, Patch, PatchParams};
@@ -1243,6 +1243,115 @@ impl QueueManager for CrdQueueManager {
     fn on_job_complete(&self, _job_id: &krishiv_proto::JobId, _usage: &ResourceUsage) {}
 }
 
+// ── K8s Lease-backed leader election ─────────────────────────────────────────
+
+/// Kubernetes `coordination.k8s.io/v1` Lease-backed leader election.
+///
+/// In production this communicates with the Kubernetes API using the `kube`
+/// client.  The R9 implementation provides the structural contract and a
+/// simulated in-process lease for testing; live K8s API calls are wired in R10.
+///
+/// Lease duration: configurable (default 15 s, matching K8s controller-manager).
+/// Renewal interval: every `lease_duration_s / 3` seconds.
+/// Fencing: each successful `try_acquire` increments the fencing token so stale
+/// coordinators are rejected at [`validate_fencing_token`] call sites.
+///
+/// [`validate_fencing_token`]: krishiv_checkpoint::validate_fencing_token
+#[derive(Debug)]
+pub struct K8sLeaseElection {
+    lease_name: String,
+    namespace: String,
+    holder_identity: String,
+    lease_duration_s: u64,
+    state: std::sync::Mutex<K8sLeaseState>,
+}
+
+#[derive(Debug)]
+struct K8sLeaseState {
+    is_leader: bool,
+    fencing_token: u64,
+}
+
+impl K8sLeaseElection {
+    /// Create a new election handle.
+    ///
+    /// `lease_name` — the K8s Lease object name (typically the job id or coordinator id).
+    /// `namespace` — the K8s namespace containing the Lease.
+    /// `holder_identity` — unique coordinator identity (pod name / hostname).
+    pub fn new(
+        lease_name: impl Into<String>,
+        namespace: impl Into<String>,
+        holder_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            lease_name: lease_name.into(),
+            namespace: namespace.into(),
+            holder_identity: holder_identity.into(),
+            lease_duration_s: 15,
+            state: std::sync::Mutex::new(K8sLeaseState { is_leader: false, fencing_token: 0 }),
+        }
+    }
+
+    /// Set the lease duration in seconds (default: 15).
+    #[must_use]
+    pub fn with_lease_duration(mut self, secs: u64) -> Self {
+        self.lease_duration_s = secs;
+        self
+    }
+
+    /// Lease name.
+    pub fn lease_name(&self) -> &str {
+        &self.lease_name
+    }
+
+    /// Namespace.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Holder identity.
+    pub fn holder_identity(&self) -> &str {
+        &self.holder_identity
+    }
+
+    /// Configured lease duration in seconds.
+    pub fn lease_duration_s(&self) -> u64 {
+        self.lease_duration_s
+    }
+}
+
+impl LeaderElection for K8sLeaseElection {
+    fn is_leader(&self) -> bool {
+        self.state.lock().unwrap().is_leader
+    }
+
+    fn try_acquire(&self) -> bool {
+        let mut s = self.state.lock().unwrap();
+        // Simulate a successful acquire: increment the fencing token and mark
+        // this node as leader. In production this would POST/PUT the K8s Lease
+        // object with optimistic concurrency and only set `is_leader = true`
+        // when the API server confirms the write.
+        s.fencing_token += 1;
+        s.is_leader = true;
+        true
+    }
+
+    fn renew(&self) -> bool {
+        // Simulate a successful renewal (lease not expired, no competing holder).
+        // In production this would PATCH the Lease renewTime and fail if another
+        // holder has taken over (resourceVersion conflict → return false).
+        self.state.lock().unwrap().is_leader
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().is_leader = false;
+    }
+
+    fn fencing_token(&self) -> u64 {
+        self.state.lock().unwrap().fencing_token
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use krishiv_proto::{
@@ -1252,13 +1361,13 @@ mod tests {
 
     use super::{
         BootstrapExecutor, ConditionStatus, EXECUTOR_ID_LABEL, ExecutorPodLaunchFailure,
-        KrishivJobMode, KrishivJobPhase, KrishivJobReconciler, KrishivJobResource, KrishivJobSpec,
-        KubernetesControllerConfig, KubernetesControllerRuntime, ObjectMeta, OperatorError,
-        ReconcileAction, demo_coordinator, detect_executor_pod_launch_failure,
-        job_spec_from_resource, krishivjob_api_resource, resource_from_dynamic_object,
-        status_patch,
+        K8sLeaseElection, KrishivJobMode, KrishivJobPhase, KrishivJobReconciler,
+        KrishivJobResource, KrishivJobSpec, KubernetesControllerConfig,
+        KubernetesControllerRuntime, ObjectMeta, OperatorError, ReconcileAction,
+        demo_coordinator, detect_executor_pod_launch_failure, job_spec_from_resource,
+        krishivjob_api_resource, resource_from_dynamic_object, status_patch,
     };
-    use krishiv_scheduler::Coordinator;
+    use krishiv_scheduler::{Coordinator, LeaderElection as _};
     use kube::core::DynamicObject;
     use serde_json::json;
 
@@ -1849,5 +1958,96 @@ mod tests {
         let policy = q.quota_policy();
         assert_eq!(policy.max_concurrent_jobs, Some(5));
         assert!(policy.cpu_nanos_limit.is_none());
+    }
+
+    // ── K8sLeaseElection failover tests ───────────────────────────────────
+
+    #[test]
+    fn k8s_lease_election_initially_not_leader() {
+        let election = K8sLeaseElection::new("job-1", "default", "pod-a");
+        assert!(!election.is_leader());
+        assert_eq!(election.fencing_token(), 0);
+    }
+
+    #[test]
+    fn k8s_lease_election_try_acquire_succeeds() {
+        let election = K8sLeaseElection::new("job-1", "default", "pod-a");
+        assert!(election.try_acquire());
+        assert!(election.is_leader());
+        assert_eq!(election.fencing_token(), 1);
+    }
+
+    #[test]
+    fn k8s_lease_election_fencing_token_increments_on_each_acquire() {
+        let election = K8sLeaseElection::new("job-1", "default", "pod-a");
+        election.try_acquire();
+        election.release();
+        election.try_acquire();
+        assert_eq!(election.fencing_token(), 2);
+    }
+
+    #[test]
+    fn k8s_lease_election_release_clears_leader() {
+        let election = K8sLeaseElection::new("job-1", "default", "pod-a");
+        election.try_acquire();
+        assert!(election.is_leader());
+        election.release();
+        assert!(!election.is_leader());
+    }
+
+    #[test]
+    fn k8s_lease_election_renew_while_leader() {
+        let election = K8sLeaseElection::new("job-1", "default", "pod-a");
+        election.try_acquire();
+        assert!(election.renew());
+    }
+
+    #[test]
+    fn k8s_lease_election_renew_after_release_fails() {
+        let election = K8sLeaseElection::new("job-1", "default", "pod-a");
+        election.try_acquire();
+        election.release();
+        assert!(!election.renew());
+    }
+
+    #[test]
+    fn failover_stale_coordinator_checkpoint_rejected() {
+        // Coordinator A acquires at token=1, commits epoch 1.
+        // Coordinator B takes over at token=2.
+        // Coordinator A tries to commit epoch 2 with its old token=1 → rejected.
+        use krishiv_checkpoint::{CheckpointError, CheckpointMetadata, validate_fencing_token};
+
+        let coord_a = K8sLeaseElection::new("job-failover", "default", "pod-a");
+        coord_a.try_acquire(); // token = 1
+
+        let mut meta_epoch1 = CheckpointMetadata {
+            version: CheckpointMetadata::VERSION,
+            epoch: 1,
+            job_id: "job-failover".to_owned(),
+            fencing_token: coord_a.fencing_token(), // 1
+            timestamp_ms: 0,
+            source_offsets: vec![],
+            operator_snapshots: vec![],
+            is_savepoint: false,
+            savepoint_label: None,
+        };
+        // Epoch 1 commit succeeds (current token = 1, meta token = 1).
+        assert!(validate_fencing_token(&meta_epoch1, coord_a.fencing_token()).is_ok());
+
+        // Coordinator A loses the lease; Coordinator B acquires (token = 2).
+        coord_a.release();
+        let coord_b = K8sLeaseElection::new("job-failover", "default", "pod-b");
+        coord_b.try_acquire(); // token = 1 (fresh election handle)
+        // Simulate that the global fencing token is now 2 (B's acquire follows A's).
+        coord_b.try_acquire(); // token = 2
+
+        // Coordinator A tries to commit epoch 2 with its stale token = 1.
+        meta_epoch1.epoch = 2;
+        meta_epoch1.fencing_token = 1; // A's old token
+        let result = validate_fencing_token(&meta_epoch1, coord_b.fencing_token()); // current=2
+        assert!(
+            matches!(result, Err(CheckpointError::StaleFencingToken { stored: 1, current: 2 })),
+            "expected StaleFencingToken, got: {result:?}"
+        );
     }
 }

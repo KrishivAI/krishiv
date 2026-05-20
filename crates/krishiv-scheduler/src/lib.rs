@@ -1240,12 +1240,24 @@ impl AuthContext {
 
 /// Extract an `AuthContext` from the gRPC request metadata.
 ///
-/// Currently always returns `Anonymous`.  In R8.1 this will validate the
-/// `Authorization: Bearer <token>` header and return `Bearer { subject }`.
+/// Reads the `authorization` header. If it starts with `"Bearer "` the token
+/// is extracted and returned as `Bearer { subject: <token> }`. In R9 the token
+/// is the API key validated by `krishiv_governance::StaticApiKeyAuthProvider`;
+/// JWT/OIDC validation is deferred to R10.
+///
+/// Returns `Anonymous` when no header is present or parsing fails.
 pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthContext {
-    // R8.1 wiring: look up the "authorization" header, validate the JWT,
-    // and return Bearer { subject: claims.sub }.
-    let _ = metadata; // suppress unused warning; real logic added in R8.1
+    let header = metadata
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(token) = header.strip_prefix("Bearer ") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return AuthContext::Bearer { subject: token.to_owned() };
+        }
+    }
     AuthContext::Anonymous
 }
 
@@ -4178,10 +4190,47 @@ fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 
 /// Leader election interface for single-coordinator and HA deployments.
 ///
-/// `SingleNodeElection` is the only R3.1 implementation. HA election backed by
-/// an etcd or Kubernetes lease is deferred to R6.
+/// Per-job leader election contract.
+///
+/// `SingleNodeElection` is the embedded/single-node implementation.
+/// `K8sLeaseElection` in `krishiv-operator` implements this for Kubernetes HA.
+/// Bare-metal HA backed by external etcd is deferred post-R9.
 pub trait LeaderElection: Send + Sync {
+    /// Whether this node currently holds the leader lease.
     fn is_leader(&self) -> bool;
+
+    /// Attempt to acquire the leader lease. Returns `true` if acquired.
+    ///
+    /// Default: always succeeds (single-node behaviour).
+    fn try_acquire(&self) -> bool {
+        self.is_leader()
+    }
+
+    /// Renew the current leader lease. Returns `true` if the renewal succeeded.
+    ///
+    /// A `false` result means another node has taken the lease — this node must
+    /// stop acting as leader immediately and reject any pending checkpoint writes.
+    ///
+    /// Default: returns `is_leader()` (single-node behaviour).
+    fn renew(&self) -> bool {
+        self.is_leader()
+    }
+
+    /// Release the leader lease voluntarily (graceful shutdown).
+    ///
+    /// Default: no-op.
+    fn release(&self) {}
+
+    /// Monotonically increasing fencing token for this lease holder.
+    ///
+    /// Must be stored in every [`CheckpointMetadata`] committed by this
+    /// coordinator. A checkpoint whose `fencing_token` is less than the current
+    /// token must be rejected with [`CheckpointError::StaleFencingToken`].
+    ///
+    /// Default: returns `0` (single-node — no competing coordinators).
+    fn fencing_token(&self) -> u64 {
+        0
+    }
 }
 
 /// No-op leader election that always reports this node as the leader.
@@ -4191,6 +4240,40 @@ pub struct SingleNodeElection;
 impl LeaderElection for SingleNodeElection {
     fn is_leader(&self) -> bool {
         true
+    }
+}
+
+/// TLS configuration for the coordinator/executor gRPC transport.
+///
+/// When `None` is passed to the TLS-aware server builder, connections are
+/// plaintext (appropriate for K8s pod-to-pod within a NetworkPolicy-controlled
+/// namespace, or local development).
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded server certificate chain.
+    pub cert_pem: Vec<u8>,
+    /// PEM-encoded server private key.
+    pub key_pem: Vec<u8>,
+    /// Optional PEM-encoded CA certificate for client certificate verification
+    /// (mTLS). When `None`, client certificates are not required.
+    pub ca_pem: Option<Vec<u8>>,
+}
+
+impl TlsConfig {
+    /// Build a `TlsConfig` from PEM byte slices.
+    pub fn new(cert_pem: impl Into<Vec<u8>>, key_pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            cert_pem: cert_pem.into(),
+            key_pem: key_pem.into(),
+            ca_pem: None,
+        }
+    }
+
+    /// Attach a CA certificate for mTLS peer verification.
+    #[must_use]
+    pub fn with_ca(mut self, ca_pem: impl Into<Vec<u8>>) -> Self {
+        self.ca_pem = Some(ca_pem.into());
+        self
     }
 }
 
