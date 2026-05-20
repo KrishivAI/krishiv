@@ -20,8 +20,10 @@ use krishiv_scheduler::{
     Coordinator, JobSnapshot, LeaderElection, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy,
     ResourceUsage, SchedulerError, SharedCoordinator, SubmitOutcome,
 };
+use k8s_openapi::api::coordination::v1::Lease;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::Client;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, ObjectMeta as KubeObjectMeta, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::watcher::{self, Event as WatchEvent};
 use serde::{Deserialize, Serialize};
@@ -1248,8 +1250,10 @@ impl QueueManager for CrdQueueManager {
 /// Kubernetes `coordination.k8s.io/v1` Lease-backed leader election.
 ///
 /// In production this communicates with the Kubernetes API using the `kube`
-/// client.  The R9 implementation provides the structural contract and a
-/// simulated in-process lease for testing; live K8s API calls are wired in R10.
+/// client.  When `client` is `Some`, all lease operations use live K8s API
+/// calls with optimistic concurrency via `resourceVersion`.  When `client` is
+/// `None` the implementation falls back to a simulated in-process lease, which
+/// is used by unit tests so they can run without a real cluster.
 ///
 /// Lease duration: configurable (default 15 s, matching K8s controller-manager).
 /// Renewal interval: every `lease_duration_s / 3` seconds.
@@ -1257,13 +1261,27 @@ impl QueueManager for CrdQueueManager {
 /// coordinators are rejected at [`validate_fencing_token`] call sites.
 ///
 /// [`validate_fencing_token`]: krishiv_checkpoint::validate_fencing_token
-#[derive(Debug)]
 pub struct K8sLeaseElection {
     lease_name: String,
     namespace: String,
     holder_identity: String,
     lease_duration_s: u64,
+    /// Live K8s client.  `None` → simulation mode (unit tests).
+    client: Option<kube::Client>,
     state: std::sync::Mutex<K8sLeaseState>,
+}
+
+impl fmt::Debug for K8sLeaseElection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("K8sLeaseElection")
+            .field("lease_name", &self.lease_name)
+            .field("namespace", &self.namespace)
+            .field("holder_identity", &self.holder_identity)
+            .field("lease_duration_s", &self.lease_duration_s)
+            .field("client", &self.client.as_ref().map(|_| "<kube::Client>"))
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -1273,7 +1291,7 @@ struct K8sLeaseState {
 }
 
 impl K8sLeaseElection {
-    /// Create a new election handle.
+    /// Create a new election handle in **simulation mode** (no K8s client).
     ///
     /// `lease_name` — the K8s Lease object name (typically the job id or coordinator id).
     /// `namespace` — the K8s namespace containing the Lease.
@@ -1288,11 +1306,22 @@ impl K8sLeaseElection {
             namespace: namespace.into(),
             holder_identity: holder_identity.into(),
             lease_duration_s: 15,
+            client: None,
             state: std::sync::Mutex::new(K8sLeaseState {
                 is_leader: false,
                 fencing_token: 0,
             }),
         }
+    }
+
+    /// Attach a live `kube::Client` to enable real K8s Lease API calls.
+    ///
+    /// When a client is present, `try_acquire`, `renew`, and `release` all
+    /// issue actual HTTP requests to the Kubernetes API server.
+    #[must_use]
+    pub fn with_kube_client(mut self, client: kube::Client) -> Self {
+        self.client = Some(client);
+        self
     }
 
     /// Set the lease duration in seconds (default: 15).
@@ -1321,6 +1350,257 @@ impl K8sLeaseElection {
     pub fn lease_duration_s(&self) -> u64 {
         self.lease_duration_s
     }
+
+    // ── Live K8s helpers ──────────────────────────────────────────────────────
+
+    /// Returns a namespaced `Api<Lease>` using the stored client.
+    fn lease_api(&self, client: &kube::Client) -> Api<Lease> {
+        Api::namespaced(client.clone(), &self.namespace)
+    }
+
+    /// Current UTC time as a `MicroTime`.
+    fn now_micro() -> MicroTime {
+        MicroTime(k8s_openapi::chrono::Utc::now())
+    }
+
+    /// Try to acquire the lease via live K8s API calls.
+    ///
+    /// Returns `true` and increments the fencing token when the API server
+    /// confirms the write.  Returns `false` on any conflict or error.
+    async fn k8s_try_acquire(&self, client: &kube::Client) -> bool {
+        let api = self.lease_api(client);
+        let now = Self::now_micro();
+
+        match api.get_opt(&self.lease_name).await {
+            Err(e) => {
+                tracing::warn!(
+                    lease = %self.lease_name,
+                    error = %e,
+                    "k8s_lease: GET failed during try_acquire"
+                );
+                false
+            }
+            Ok(None) => {
+                // Lease does not exist — create it.
+                let lease = Lease {
+                    metadata: KubeObjectMeta {
+                        name: Some(self.lease_name.clone()),
+                        namespace: Some(self.namespace.clone()),
+                        ..Default::default()
+                    },
+                    spec: Some(k8s_openapi::api::coordination::v1::LeaseSpec {
+                        holder_identity: Some(self.holder_identity.clone()),
+                        lease_duration_seconds: Some(self.lease_duration_s as i32),
+                        acquire_time: Some(now.clone()),
+                        renew_time: Some(now),
+                        lease_transitions: Some(1),
+                        ..Default::default()
+                    }),
+                };
+                match api.create(&PostParams::default(), &lease).await {
+                    Ok(_) => {
+                        let mut s = self.state.lock().unwrap();
+                        s.fencing_token += 1;
+                        s.is_leader = true;
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            lease = %self.lease_name,
+                            error = %e,
+                            "k8s_lease: POST failed during try_acquire"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(Some(existing)) => {
+                // Check if we already hold the lease or if it has expired.
+                let holder = existing
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.holder_identity.as_deref())
+                    .unwrap_or("");
+                let renew_time = existing
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.renew_time.as_ref())
+                    .map(|t| t.0.timestamp());
+                let duration = existing
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.lease_duration_seconds)
+                    .unwrap_or(self.lease_duration_s as i32) as i64;
+                let now_ts = k8s_openapi::chrono::Utc::now().timestamp();
+                let is_ours = holder == self.holder_identity;
+                let is_expired = renew_time
+                    .map(|rt| rt + duration < now_ts)
+                    .unwrap_or(true);
+
+                if !is_ours && !is_expired {
+                    // Another holder owns a live lease — we cannot take over.
+                    return false;
+                }
+
+                // Patch the existing lease (optimistic concurrency via resourceVersion).
+                let resource_version = existing
+                    .metadata
+                    .resource_version
+                    .clone()
+                    .unwrap_or_default();
+                let patch_value = serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": {
+                        "name": self.lease_name,
+                        "namespace": self.namespace,
+                        "resourceVersion": resource_version,
+                    },
+                    "spec": {
+                        "holderIdentity": self.holder_identity,
+                        "leaseDurationSeconds": self.lease_duration_s as i32,
+                        "renewTime": now,
+                    }
+                });
+                let patch = Patch::Merge(patch_value);
+                match api
+                    .patch(&self.lease_name, &PatchParams::default(), &patch)
+                    .await
+                {
+                    Ok(_) => {
+                        let mut s = self.state.lock().unwrap();
+                        s.fencing_token += 1;
+                        s.is_leader = true;
+                        true
+                    }
+                    Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
+                        tracing::warn!(
+                            lease = %self.lease_name,
+                            "k8s_lease: PATCH conflict (409) during try_acquire — another holder won the race"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            lease = %self.lease_name,
+                            error = %e,
+                            "k8s_lease: PATCH failed during try_acquire"
+                        );
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Renew the lease via live K8s API calls.
+    ///
+    /// Returns `true` when renewTime is updated successfully.  Returns `false`
+    /// if another holder has taken over or on any API error.
+    async fn k8s_renew(&self, client: &kube::Client) -> bool {
+        let api = self.lease_api(client);
+
+        let existing = match api.get_opt(&self.lease_name).await {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                tracing::warn!(lease = %self.lease_name, "k8s_lease: lease not found during renew");
+                self.state.lock().unwrap().is_leader = false;
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(lease = %self.lease_name, error = %e, "k8s_lease: GET failed during renew");
+                self.state.lock().unwrap().is_leader = false;
+                return false;
+            }
+        };
+
+        let holder = existing
+            .spec
+            .as_ref()
+            .and_then(|s| s.holder_identity.as_deref())
+            .unwrap_or("");
+        if holder != self.holder_identity {
+            tracing::warn!(
+                lease = %self.lease_name,
+                current_holder = %holder,
+                our_identity = %self.holder_identity,
+                "k8s_lease: holderIdentity mismatch during renew — lost leadership"
+            );
+            self.state.lock().unwrap().is_leader = false;
+            return false;
+        }
+
+        let resource_version = existing
+            .metadata
+            .resource_version
+            .clone()
+            .unwrap_or_default();
+        let now = Self::now_micro();
+        let patch_value = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": self.lease_name,
+                "namespace": self.namespace,
+                "resourceVersion": resource_version,
+            },
+            "spec": {
+                "renewTime": now,
+            }
+        });
+        let patch = Patch::Merge(patch_value);
+        match api
+            .patch(&self.lease_name, &PatchParams::default(), &patch)
+            .await
+        {
+            Ok(_) => true,
+            Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
+                tracing::warn!(
+                    lease = %self.lease_name,
+                    "k8s_lease: PATCH conflict (409) during renew — lost leadership"
+                );
+                self.state.lock().unwrap().is_leader = false;
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    lease = %self.lease_name,
+                    error = %e,
+                    "k8s_lease: PATCH failed during renew"
+                );
+                self.state.lock().unwrap().is_leader = false;
+                false
+            }
+        }
+    }
+
+    /// Release the lease via live K8s API calls.
+    async fn k8s_release(&self, client: &kube::Client) {
+        let api = self.lease_api(client);
+        let patch_value = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": self.lease_name,
+                "namespace": self.namespace,
+            },
+            "spec": {
+                "holderIdentity": "",
+            }
+        });
+        let patch = Patch::Merge(patch_value);
+        if let Err(e) = api
+            .patch(&self.lease_name, &PatchParams::default(), &patch)
+            .await
+        {
+            tracing::warn!(
+                lease = %self.lease_name,
+                error = %e,
+                "k8s_lease: PATCH failed during release (ignoring)"
+            );
+        }
+        self.state.lock().unwrap().is_leader = false;
+    }
 }
 
 impl LeaderElection for K8sLeaseElection {
@@ -1329,25 +1609,35 @@ impl LeaderElection for K8sLeaseElection {
     }
 
     fn try_acquire(&self) -> bool {
-        let mut s = self.state.lock().unwrap();
-        // Simulate a successful acquire: increment the fencing token and mark
-        // this node as leader. In production this would POST/PUT the K8s Lease
-        // object with optimistic concurrency and only set `is_leader = true`
-        // when the API server confirms the write.
-        s.fencing_token += 1;
-        s.is_leader = true;
-        true
+        if let Some(ref client) = self.client {
+            // Drive the async K8s call from this sync context.
+            // Safe: `LeaderElection` is always called from a dedicated control-loop
+            // thread, never from inside an async task, so block_on cannot deadlock.
+            tokio::runtime::Handle::current().block_on(self.k8s_try_acquire(client))
+        } else {
+            // Simulation mode: increment fencing token and mark as leader.
+            let mut s = self.state.lock().unwrap();
+            s.fencing_token += 1;
+            s.is_leader = true;
+            true
+        }
     }
 
     fn renew(&self) -> bool {
-        // Simulate a successful renewal (lease not expired, no competing holder).
-        // In production this would PATCH the Lease renewTime and fail if another
-        // holder has taken over (resourceVersion conflict → return false).
-        self.state.lock().unwrap().is_leader
+        if let Some(ref client) = self.client {
+            tokio::runtime::Handle::current().block_on(self.k8s_renew(client))
+        } else {
+            // Simulation: renewal succeeds as long as we are still marked leader.
+            self.state.lock().unwrap().is_leader
+        }
     }
 
     fn release(&self) {
-        self.state.lock().unwrap().is_leader = false;
+        if let Some(ref client) = self.client {
+            tokio::runtime::Handle::current().block_on(self.k8s_release(client));
+        } else {
+            self.state.lock().unwrap().is_leader = false;
+        }
     }
 
     fn fencing_token(&self) -> u64 {
@@ -1961,6 +2251,39 @@ mod tests {
         let policy = q.quota_policy();
         assert_eq!(policy.max_concurrent_jobs, Some(5));
         assert!(policy.cpu_nanos_limit.is_none());
+    }
+
+    // ── K8sLeaseElection simulation mode (no client) ─────────────────────
+
+    #[test]
+    fn k8s_lease_simulation_mode_works() {
+        // Exercises try_acquire → renew → release without a kube::Client so
+        // the test runs in any environment without a live cluster.
+        let election = K8sLeaseElection::new("sim-lease", "default", "pod-sim");
+
+        // Initially not a leader.
+        assert!(!election.is_leader());
+        assert_eq!(election.fencing_token(), 0);
+
+        // Acquire succeeds.
+        assert!(election.try_acquire());
+        assert!(election.is_leader());
+        assert_eq!(election.fencing_token(), 1);
+
+        // Renewal succeeds while we hold the lease.
+        assert!(election.renew());
+        assert!(election.is_leader());
+
+        // Release clears leadership.
+        election.release();
+        assert!(!election.is_leader());
+
+        // Renewal after release returns false.
+        assert!(!election.renew());
+
+        // Re-acquire increments fencing token again.
+        assert!(election.try_acquire());
+        assert_eq!(election.fencing_token(), 2);
     }
 
     // ── K8sLeaseElection failover tests ───────────────────────────────────

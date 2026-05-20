@@ -2892,6 +2892,7 @@ dependencies = [
  "bytes",
  "futures",
  "krishiv-api",
+ "krishiv-governance",
  "prost 0.13.5",
  "tokio",
  "tonic 0.12.3",
@@ -2927,8 +2928,10 @@ name = "krishiv-metrics"
 version = "0.1.0"
 dependencies = [
  "opentelemetry",
+ "opentelemetry-otlp",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -2948,6 +2951,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3031,6 +3035,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "datafusion",
+ "krishiv-governance",
  "krishiv-optimizer",
  "krishiv-plan",
  "tokio",
@@ -3571,6 +3576,37 @@ dependencies = [
  "pin-project-lite",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91cf61a1868dacc576bf2b2a1c3e9ab150af7272909e80085c3173384fe11f76"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "http",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost 0.13.5",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic 0.12.3",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6e05acbfada5ec79023c85368af14abd0b307c015e9064d249b2a950ef459a6"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost 0.13.5",
+ "tonic 0.12.3",
 ]
 
 [[package]]

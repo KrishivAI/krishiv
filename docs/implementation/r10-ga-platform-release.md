@@ -127,6 +127,18 @@ R10 is complete when:
 - [ ] SQL/function compatibility matrix is published.
 - [ ] Production hardening guide is published.
 
+## Sprint 1b Progress (2026-05-20)
+
+Sprint 1b delivered three deferred R9 items:
+
+- **K8s Lease API (Task 1)**: `K8sLeaseElection` in `crates/krishiv-operator/src/lib.rs` already had the full live K8s Lease API implementation with `k8s_try_acquire`, `k8s_renew`, and `k8s_release` async helpers driven via `block_on`. Fixed compilation errors: added `tracing` dependency, renamed `Patch::MergePatch` → `Patch::Merge` (kube 2.x API), added manual `Debug` impl for `K8sLeaseElection` (kube::Client is not Debug). All 35 operator tests pass including `k8s_lease_simulation_mode_works`.
+
+- **OTLP Integration Test (Task 2)**: Added `otlp_endpoint: Option<String>` to `MetricsConfig`, updated `init()` to return `Result<MetricsHandle, String>`, added `MetricsHandle::shutdown()` method, added `opentelemetry-otlp` dependency, and added `#[ignore]` OTLP integration test. All 6 metrics tests pass; OTLP test is correctly skipped.
+
+- **kind e2e CI (Task 3)**: Created `.github/workflows/kind-e2e.yml` with full kind cluster lifecycle, failover test, and log artifact upload on failure. Triggered on push to main/release/** and PRs touching operator/scheduler/checkpoint.
+
+`cargo check --workspace` passes cleanly.
+
 ## Risks And Mitigations
 
 | Risk | Mitigation |

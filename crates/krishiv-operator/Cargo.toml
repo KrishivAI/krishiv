@@ -16,3 +16,4 @@ kube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net"] }
+tracing = { workspace = true }

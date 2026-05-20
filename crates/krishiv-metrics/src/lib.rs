@@ -29,6 +29,11 @@ pub struct MetricsConfig {
     /// Tracing filter string (e.g. `"info"`, `"krishiv=debug,warn"`).
     /// Defaults to `"info"` when `None`.
     pub log_filter: Option<String>,
+    /// Optional OTLP collector endpoint (e.g. `"http://localhost:4317"`).
+    ///
+    /// When `Some`, the OTLP gRPC exporter is used instead of the `exporter`
+    /// field.  When `None`, the `exporter` field controls output.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for MetricsConfig {
@@ -38,6 +43,7 @@ impl Default for MetricsConfig {
             // NoOp default so tests don't write to stdout.
             exporter: TracerExporter::NoOp,
             log_filter: None,
+            otlp_endpoint: None,
         }
     }
 }
@@ -47,6 +53,18 @@ impl Default for MetricsConfig {
 /// Opaque handle returned by [`init`]. Shuts down the OTel tracer provider on drop.
 pub struct MetricsHandle {
     tracer_provider: SdkTracerProvider,
+}
+
+impl MetricsHandle {
+    /// Explicitly shut down the tracer provider and flush any pending spans.
+    ///
+    /// This is equivalent to dropping the handle.  Calling it more than once is
+    /// safe — the second call is a no-op because the provider has already been
+    /// shut down.
+    pub fn shutdown(self) {
+        // Explicit drop triggers the Drop impl which calls provider.shutdown().
+        drop(self);
+    }
 }
 
 impl Drop for MetricsHandle {
@@ -63,16 +81,36 @@ impl Drop for MetricsHandle {
 /// Calling this multiple times is safe: subsequent calls will fail to set a new global
 /// subscriber (which is ignored) but the returned [`MetricsHandle`] still owns a valid
 /// tracer provider.
-pub fn init(config: MetricsConfig) -> MetricsHandle {
+///
+/// # Errors
+///
+/// Returns an error string if the OTLP exporter pipeline fails to build (only
+/// possible when `config.otlp_endpoint` is `Some`).
+pub fn init(config: MetricsConfig) -> Result<MetricsHandle, String> {
     let filter_str = config.log_filter.as_deref().unwrap_or("info").to_string();
 
     let filter = tracing_subscriber::EnvFilter::new(&filter_str);
 
-    let tracer_provider = match config.exporter {
-        TracerExporter::Stdout => SdkTracerProvider::builder()
-            .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
-            .build(),
-        TracerExporter::NoOp => SdkTracerProvider::builder().build(),
+    let tracer_provider = if let Some(endpoint) = config.otlp_endpoint {
+        // Build an OTLP gRPC exporter pipeline.
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig as _};
+
+        let exporter = SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .map_err(|e| format!("OTLP exporter build failed: {e}"))?;
+
+        SdkTracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .build()
+    } else {
+        match config.exporter {
+            TracerExporter::Stdout => SdkTracerProvider::builder()
+                .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
+                .build(),
+            TracerExporter::NoOp => SdkTracerProvider::builder().build(),
+        }
     };
 
     let tracer = tracer_provider.tracer(config.service_name.clone());
@@ -87,14 +125,14 @@ pub fn init(config: MetricsConfig) -> MetricsHandle {
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .try_init();
 
-    MetricsHandle { tracer_provider }
+    Ok(MetricsHandle { tracer_provider })
 }
 
 /// **Beta API**: may change between minor releases.
 ///
 /// Shuts down the OTel tracer provider by dropping the handle (the `Drop` impl does the work).
 pub fn shutdown(handle: MetricsHandle) {
-    drop(handle);
+    handle.shutdown();
 }
 
 /// **Beta API**: may change between minor releases.
@@ -130,18 +168,18 @@ mod tests {
 
     #[test]
     fn init_noop_does_not_panic() {
-        let _handle = init(MetricsConfig::default());
+        let _handle = init(MetricsConfig::default()).expect("noop init should succeed");
     }
 
     #[test]
     fn shutdown_does_not_panic() {
-        let handle = init(MetricsConfig::default());
+        let handle = init(MetricsConfig::default()).expect("init");
         shutdown(handle);
     }
 
     #[test]
     fn tracing_span_does_not_panic() {
-        let _handle = init(MetricsConfig::default());
+        let _handle = init(MetricsConfig::default()).expect("init");
         let _s = tracing::info_span!("test_span").entered();
     }
 
@@ -151,8 +189,40 @@ mod tests {
     }
 
     #[test]
+    fn default_config_otlp_endpoint_is_none() {
+        assert!(MetricsConfig::default().otlp_endpoint.is_none());
+    }
+
+    #[test]
     fn current_traceparent_no_span_returns_none() {
         // Outside any active span, current_traceparent must return None.
         assert_eq!(current_traceparent(), None);
+    }
+
+    /// OTLP integration test — only runs when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    /// Skips silently in normal CI. Run manually with a live collector:
+    ///   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo test -p krishiv-metrics otlp_integration -- --ignored
+    #[tokio::test]
+    #[ignore = "requires live OTLP collector at OTEL_EXPORTER_OTLP_ENDPOINT"]
+    async fn otlp_integration_exports_span() {
+        let endpoint = match std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+            Ok(e) => e,
+            Err(_) => return, // skip if not set
+        };
+        // Initialize with OTLP endpoint.
+        let config = MetricsConfig {
+            service_name: "krishiv-test".into(),
+            otlp_endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        let handle = init(config).expect("metrics init with OTLP endpoint failed");
+        // Emit a test span.
+        let tracer = opentelemetry::global::tracer("test");
+        {
+            use opentelemetry::trace::Tracer as _;
+            let _span = tracer.start("otlp_integration_test_span");
+            // span closes when dropped
+        }
+        handle.shutdown();
     }
 }
