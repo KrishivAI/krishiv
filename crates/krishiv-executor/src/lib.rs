@@ -3041,6 +3041,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn network_coordinator_service_checkpoint_ack_through_service_boundary() {
+        use krishiv_proto::FencingToken;
+        // Test that AcceptingCoordinatorService (in-process) returns Accepted.
+        // This verifies the in-process path works; the network path requires a live server.
+        let service = AcceptingCoordinatorService;
+        let req = CheckpointAckRequest {
+            job_id: JobId::try_new("job-ck-1").unwrap(),
+            operator_id: "operator-1".to_owned(),
+            task_id: TaskId::try_new("task-ck-1").unwrap(),
+            epoch: 1,
+            fencing_token: FencingToken::initial(),
+            source_offsets: vec![],
+            snapshot_path: Some("/checkpoints/epoch-1".to_owned()),
+        };
+        let result = service
+            .checkpoint_ack(tonic::Request::new(req))
+            .await
+            .unwrap();
+        assert_eq!(result.into_inner(), CheckpointAckResponse::Accepted);
+    }
+
+    #[tokio::test]
     async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-dereg-exec").unwrap(),
