@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -64,27 +65,216 @@ pub enum SubmitOutcome {
     Queued { position: usize },
 }
 
-/// Admission decision returned by a `QueueManager`.
+// ── R7.1 Resource governance types ───────────────────────────────────────────
+
+/// Accumulated resource consumption for one job.
 ///
-/// Controls whether a newly submitted job enters the scheduler immediately or
-/// waits behind other jobs.  Implementations are provided for process mode
-/// (`InMemoryQueueManager`) and will be added for Kubernetes CRD-backed queues
-/// in R7.1 (`CrdQueueManager`).
-pub trait QueueManager: Send + Sync + fmt::Debug {
-    /// Decide whether `spec` may be admitted now.
-    fn admit(&self, spec: &JobSpec) -> SubmitOutcome;
+/// Populated from `TaskRuntimeStats` as tasks complete. Used by the status API
+/// and for post-hoc cost attribution. Not used for real-time quota enforcement
+/// (admission uses reservation-based accounting from `JobSpec` fields).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    /// Total CPU nanoseconds consumed by all completed tasks.
+    pub cpu_nanos: u64,
+    /// Peak memory bytes observed across all completed tasks.
+    pub memory_peak_bytes: u64,
+    /// Number of completed tasks that have reported stats.
+    pub task_count: u32,
 }
 
-/// Always-admit queue manager for process mode and tests.
+impl ResourceUsage {
+    /// Empty usage.
+    pub fn zero() -> Self {
+        Self::default()
+    }
+
+    /// Absorb stats from one completed task.
+    pub fn add_task_stats(&mut self, cpu_nanos: u64, memory_bytes: u64) {
+        self.cpu_nanos = self.cpu_nanos.saturating_add(cpu_nanos);
+        self.memory_peak_bytes = self.memory_peak_bytes.max(memory_bytes);
+        self.task_count = self.task_count.saturating_add(1);
+    }
+}
+
+/// Dynamic namespace quota state supplied to `QueueManager::admit` by the
+/// coordinator.
 ///
-/// Every job is admitted immediately.  R7.1 will add quota-aware and
-/// CRD-backed implementations; this type remains the default.
+/// Contains the current reservation totals for the namespace the submitted job
+/// belongs to. `QueueManager` implementations compare these against their
+/// configured static limits to decide admission.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceQuotaSnapshot {
+    /// The namespace being queried (`None` = default namespace).
+    pub namespace_id: Option<String>,
+    /// CPU nanoseconds reserved by active (non-terminal) jobs in this namespace.
+    pub cpu_nanos_reserved: u64,
+    /// Memory bytes reserved by active (non-terminal) jobs in this namespace.
+    pub memory_bytes_reserved: u64,
+    /// Number of active (non-terminal) jobs in this namespace.
+    pub active_job_count: usize,
+}
+
+/// Admission decision returned by a `QueueManager`.
+///
+/// Receives the static `JobSpec` and a live `NamespaceQuotaSnapshot` from the
+/// coordinator. Implementations compare the spec's resource requests against
+/// the snapshot's current reservations and their own configured limits.
+pub trait QueueManager: Send + Sync + fmt::Debug {
+    /// Return whether `spec` may enter the scheduler immediately.
+    ///
+    /// `quota` contains the live reservation totals for the job's namespace.
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome;
+
+    /// Notify the queue manager when a job reaches a terminal state.
+    ///
+    /// `usage` carries the accumulated cost from `TaskRuntimeStats`. The
+    /// default is a no-op; stateful implementations may use this for
+    /// accounting or logging.
+    fn on_job_complete(&self, _job_id: &JobId, _usage: &ResourceUsage) {}
+}
+
+/// Always-admit queue manager for embedded and test contexts.
+///
+/// Every job is immediately accepted regardless of quota snapshot values. This
+/// is the default; R7.1 `QuotaQueueManager` and `CrdQueueManager` replace it
+/// for production deployments.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryQueueManager;
 
 impl QueueManager for InMemoryQueueManager {
-    fn admit(&self, _spec: &JobSpec) -> SubmitOutcome {
+    fn admit(&self, _spec: &JobSpec, _quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
         SubmitOutcome::Accepted
+    }
+}
+
+// ── QuotaQueueManager (process-mode quota enforcement) ───────────────────────
+
+/// Static resource limits for one namespace (or the default namespace).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaPolicy {
+    /// Maximum total CPU nanoseconds reserved simultaneously (`None` = unlimited).
+    pub cpu_nanos_limit: Option<u64>,
+    /// Maximum total memory bytes reserved simultaneously (`None` = unlimited).
+    pub memory_bytes_limit: Option<u64>,
+    /// Maximum number of concurrently active jobs (`None` = unlimited).
+    pub max_concurrent_jobs: Option<usize>,
+}
+
+/// Quota-aware queue manager for process (non-Kubernetes) deployments.
+///
+/// Checks `cpu_limit_nanos`, `memory_limit_bytes`, and concurrent-job count
+/// against per-namespace or default policies. A job that would exceed any
+/// limit is returned as `Queued { position: 0 }` rather than rejected, so the
+/// caller may retry admission after earlier jobs complete.
+#[derive(Debug)]
+pub struct QuotaQueueManager {
+    default_policy: QuotaPolicy,
+    namespace_policies: HashMap<String, QuotaPolicy>,
+}
+
+impl QuotaQueueManager {
+    /// Create a quota manager with a default policy and optional per-namespace overrides.
+    pub fn new(
+        default_policy: QuotaPolicy,
+        namespace_policies: HashMap<String, QuotaPolicy>,
+    ) -> Self {
+        Self {
+            default_policy,
+            namespace_policies,
+        }
+    }
+
+    /// Create a quota manager with a single default policy applied to all namespaces.
+    pub fn with_default(default_policy: QuotaPolicy) -> Self {
+        Self::new(default_policy, HashMap::new())
+    }
+
+    fn policy_for(&self, namespace_id: Option<&str>) -> &QuotaPolicy {
+        match namespace_id {
+            Some(ns) => self.namespace_policies.get(ns).unwrap_or(&self.default_policy),
+            None => &self.default_policy,
+        }
+    }
+}
+
+impl QueueManager for QuotaQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        let policy = self.policy_for(spec.namespace_id());
+
+        if let Some(limit) = policy.max_concurrent_jobs {
+            if quota.active_job_count >= limit {
+                return SubmitOutcome::Queued { position: quota.active_job_count - limit };
+            }
+        }
+        if let Some(limit) = policy.cpu_nanos_limit {
+            let requested = spec.cpu_limit_nanos().unwrap_or(0);
+            if quota.cpu_nanos_reserved.saturating_add(requested) > limit {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        if let Some(limit) = policy.memory_bytes_limit {
+            let requested = spec.memory_limit_bytes().unwrap_or(0);
+            if quota.memory_bytes_reserved.saturating_add(requested) > limit {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        SubmitOutcome::Accepted
+    }
+}
+
+// ── ConfigFileQueueManager ────────────────────────────────────────────────────
+
+/// On-disk config format for `ConfigFileQueueManager`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct QueueConfig {
+    #[serde(default)]
+    default: QuotaPolicy,
+    #[serde(default)]
+    namespaces: HashMap<String, QuotaPolicy>,
+}
+
+/// File-backed queue manager that reads quota policies from a JSON config file.
+///
+/// Policies are loaded once at construction time. Re-load by creating a new
+/// instance from the updated file. This keeps the implementation free of async
+/// runtimes and background threads.
+///
+/// Config file format (JSON):
+/// ```json
+/// {
+///   "default": { "max_concurrent_jobs": 10 },
+///   "namespaces": {
+///     "analytics": { "cpu_nanos_limit": 1000000000000, "memory_bytes_limit": 8589934592 }
+///   }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ConfigFileQueueManager {
+    inner: QuotaQueueManager,
+}
+
+impl ConfigFileQueueManager {
+    /// Load queue policies from the JSON file at `path`.
+    pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let config: QueueConfig = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self {
+            inner: QuotaQueueManager::new(config.default, config.namespaces),
+        })
+    }
+
+    /// Construct directly from a `QueueConfig` (useful in tests).
+    pub fn from_config(default: QuotaPolicy, namespaces: HashMap<String, QuotaPolicy>) -> Self {
+        Self {
+            inner: QuotaQueueManager::new(default, namespaces),
+        }
+    }
+}
+
+impl QueueManager for ConfigFileQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        self.inner.admit(spec, quota)
     }
 }
 
@@ -1214,6 +1404,35 @@ impl Coordinator {
     }
 
     /// Submit a job and statically assign its tasks.
+    /// Compute the current reservation totals for the given namespace.
+    ///
+    /// Walks active (non-terminal) jobs and sums their `cpu_limit_nanos` and
+    /// `memory_limit_bytes` reservations. The returned snapshot is passed to
+    /// `QueueManager::admit` so quota enforcement is stateless in the queue
+    /// manager itself.
+    pub fn namespace_quota_snapshot(&self, namespace_id: Option<&str>) -> NamespaceQuotaSnapshot {
+        let mut snap = NamespaceQuotaSnapshot {
+            namespace_id: namespace_id.map(str::to_owned),
+            ..Default::default()
+        };
+        for job in &self.jobs {
+            if job.state().is_terminal() {
+                continue;
+            }
+            if job.spec.namespace_id() != namespace_id {
+                continue;
+            }
+            snap.active_job_count += 1;
+            snap.cpu_nanos_reserved = snap
+                .cpu_nanos_reserved
+                .saturating_add(job.spec.cpu_limit_nanos().unwrap_or(0));
+            snap.memory_bytes_reserved = snap
+                .memory_bytes_reserved
+                .saturating_add(job.spec.memory_limit_bytes().unwrap_or(0));
+        }
+        snap
+    }
+
     pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         self.ensure_active()?;
         validate_job(&spec)?;
@@ -1224,8 +1443,9 @@ impl Coordinator {
             });
         }
 
-        // Admission control: return early if the queue manager holds the job.
-        let outcome = self.queue_manager.admit(&spec);
+        // Admission control: compute live quota snapshot then ask the queue manager.
+        let quota = self.namespace_quota_snapshot(spec.namespace_id());
+        let outcome = self.queue_manager.admit(&spec, &quota);
         if let SubmitOutcome::Queued { .. } = &outcome {
             return Ok(outcome);
         }
@@ -1990,6 +2210,8 @@ pub struct JobRecord {
     /// Shuffle partition availability metadata per producing stage.
     /// Updated when tasks report ShufflePartitionOutput in TaskOutputMetadata.
     shuffle_output: HashMap<StageId, ShuffleMetadata>,
+    /// Accumulated resource consumption from completed tasks.
+    resource_usage: ResourceUsage,
 }
 
 impl JobRecord {
@@ -2006,7 +2228,13 @@ impl JobRecord {
             max_stage_retries,
             stages,
             shuffle_output: HashMap::new(),
+            resource_usage: ResourceUsage::zero(),
         }
+    }
+
+    /// Accumulated resource consumption reported by completed tasks.
+    pub fn resource_usage(&self) -> &ResourceUsage {
+        &self.resource_usage
     }
 
     /// Job id.
@@ -2143,6 +2371,12 @@ impl JobRecord {
             .map(|m| m.shuffle_partitions().to_vec())
             .unwrap_or_default();
 
+        // Capture stats before consuming the update.
+        let runtime_stats = update
+            .output_metadata()
+            .and_then(|m| m.runtime_stats())
+            .map(|s| (s.cpu_nanos, 0u64));
+
         let stage = self
             .stages
             .iter_mut()
@@ -2152,6 +2386,13 @@ impl JobRecord {
             })?;
 
         let outcome = stage.apply_task_update(update, self.max_stage_retries)?;
+
+        // Accumulate resource stats from successfully-completed tasks.
+        if outcome != TaskUpdateOutcome::Duplicate {
+            if let Some((cpu_nanos, memory_bytes)) = runtime_stats {
+                self.resource_usage.add_task_stats(cpu_nanos, memory_bytes);
+            }
+        }
 
         // If the task succeeded with shuffle output, record partition availability.
         if !shuffle_partitions.is_empty() {
@@ -3410,6 +3651,7 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
             // Shuffle output metadata is not persisted; it is rebuilt from
             // executor task status updates after coordinator restart.
             shuffle_output: HashMap::new(),
+            resource_usage: ResourceUsage::zero(),
         })
     }
 }
@@ -3723,10 +3965,10 @@ mod tests {
     use super::{
         CheckpointCoordinator, CheckpointCoordinatorState, Coordinator, CoordinatorConfig,
         CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryMetadataStore,
-        InMemoryQueueManager, JsonFileMetadataStore, LeaderElection, MetadataStore, QueueManager,
-        SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
-        TaskUpdateOutcome, job_spec_from_logical_plan,
-        serve_coordinator_executor_grpc_with_listener,
+        InMemoryQueueManager, JsonFileMetadataStore, LeaderElection, MetadataStore,
+        NamespaceQuotaSnapshot, QueueManager, SchedulerError, SharedCoordinator,
+        SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
+        job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
 
     #[derive(Debug, Clone, Default)]
@@ -6511,7 +6753,8 @@ mod tests {
     fn in_memory_queue_manager_always_accepts() {
         let qm = InMemoryQueueManager;
         let spec = demo_job();
-        assert_eq!(qm.admit(&spec), SubmitOutcome::Accepted);
+        let quota = NamespaceQuotaSnapshot::default();
+        assert_eq!(qm.admit(&spec, &quota), SubmitOutcome::Accepted);
     }
 
     #[test]
@@ -6533,7 +6776,7 @@ mod tests {
         #[derive(Debug)]
         struct BlockAllQueueManager;
         impl QueueManager for BlockAllQueueManager {
-            fn admit(&self, _spec: &JobSpec) -> SubmitOutcome {
+            fn admit(&self, _spec: &JobSpec, _quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
                 SubmitOutcome::Queued { position: 0 }
             }
         }
