@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**R10 Sprint 2 complete.** Data quality rules, dead-letter sink, upgrade compatibility tests, and connector certification suite delivered. Sprint 0 architecture deliverables remain committed on branch `claude/plan-r10-architecture-GnRvo`.
+**R10 Sprint 3 complete.** CDC-to-lakehouse pipeline template (`cdc.rs` in `krishiv-connectors`) and materialized views baseline (`MaterializedViewRegistry` in `krishiv-sql`) delivered. Sprint 0–2 architecture deliverables remain committed on branch `claude/plan-r10-architecture-GnRvo`.
 
 ## Active Task
 
-**R10 Sprint 3** — CDC-to-lakehouse pipeline template, materialized views baseline, chaos test suite, and benchmark suites.
+**R10 Sprint 4** — benchmarks (TPC-H, TPC-DS, Nexmark), chaos test suite, and GA API freeze.
 
 ### Completed (committed to branch)
 
@@ -47,20 +47,21 @@
 
 ## Next Steps
 
-1. Sprint 3: Add CDC-to-lakehouse pipeline template (`crates/krishiv-connectors` or new crate)
-2. Sprint 3: Add materialized views baseline (`crates/krishiv-sql` or dedicated crate)
-3. Sprint 3: Add chaos test suite
-4. Sprint 3: Add TPC-H, TPC-DS, Nexmark benchmark suites
-5. Sprint 3: Freeze GA-supported API and connector surfaces
+1. Sprint 4: Add TPC-H, TPC-DS, Nexmark benchmark suites
+2. Sprint 4: Add chaos test suite
+3. Sprint 4: Freeze GA-supported API and connector surfaces
+4. Sprint 4: Implement JDBC/ODBC gateway stubs
+5. Sprint 4: Publish SQL/function compatibility matrix
 
 ## Last Validation
 
-- `cargo test -p krishiv-connectors`: 43 passed (41 unit + 2 certification)
+- `cargo test -p krishiv-connectors`: 47 passed (45 unit + 2 certification) — includes 6 new CDC tests
+- `cargo test -p krishiv-sql`: 15 passed — includes 5 new matview tests
 - `cargo test -p krishiv-upgrade-tests`: 6 passed
 - `cargo check --workspace`: clean (no errors)
 - Branch: `claude/plan-r10-architecture-GnRvo`
-- Sprint 2 deliverables: `DataQualityRule`, `QualityAction`, `DataQualityConfig`, `RejectedRow`, `DataQualityCheckResult`, `check_batch`, `DeadLetterSink` in `crates/krishiv-connectors/src/lib.rs`; `crates/krishiv-upgrade-tests` crate; `crates/krishiv-connectors/tests/certification.rs`
-- R10 tracker: 12/12 architecture, 3/11 API, 4/15 runtime, 4/16 test checklist items checked off
+- Sprint 3 deliverables: `CdcOp`, `CdcEvent`, `parse_debezium_envelope`, `CdcToLakehousePipeline` in `crates/krishiv-connectors/src/cdc.rs`; `MaterializedViewDefinition`, `RefreshPolicy`, `MaterializedViewRegistry` in `crates/krishiv-sql/src/lib.rs`
+- R10 tracker: 12/12 architecture, 5/11 API, 6/15 runtime, 6/16 test checklist items checked off
 
 ## Architectural Inputs To Preserve
 

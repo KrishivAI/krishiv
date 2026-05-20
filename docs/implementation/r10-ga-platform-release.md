@@ -69,8 +69,8 @@ Out of scope:
 - [ ] Publish connector certification matrix.
 - [ ] Add JDBC gateway.
 - [ ] Add ODBC gateway.
-- [ ] Add CDC-to-lakehouse pipeline template.
-- [ ] Add materialized view declaration interface.
+- [x] Add CDC-to-lakehouse pipeline template.
+- [x] Add materialized view declaration interface.
 - [x] Add data quality expectation interface.
 - [x] Add rejected-row output configuration.
 - [x] Add dead-letter sink configuration.
@@ -80,8 +80,8 @@ Out of scope:
 
 - [ ] Implement JDBC gateway.
 - [ ] Implement ODBC gateway.
-- [ ] Implement CDC-to-lakehouse template.
-- [ ] Implement materialized views baseline.
+- [x] Implement CDC-to-lakehouse template.
+- [x] Implement materialized views baseline.
 - [x] Implement data quality expectation rules.
 - [x] Implement rejected-row output.
 - [x] Implement dead-letter sink support.
@@ -102,8 +102,8 @@ Out of scope:
 - [ ] Connector certification matrix passes.
 - [ ] JDBC smoke tests pass.
 - [ ] ODBC smoke tests pass.
-- [ ] CDC-to-lakehouse tests pass.
-- [ ] Materialized view tests pass.
+- [x] CDC-to-lakehouse tests pass.
+- [x] Materialized view tests pass.
 - [x] Data quality rule tests pass.
 - [x] Rejected-row output tests pass.
 - [x] Dead-letter sink tests pass.
@@ -150,6 +150,16 @@ Sprint 2 delivered data quality rules, dead-letter sink, upgrade compatibility t
 - **Connector Certification (Task 3)**: Created `crates/krishiv-connectors/tests/certification.rs` and `tests/certification/mod.rs` with 2 certification tests — capability declaration and dead-letter null split.
 
 Validation: `cargo test -p krishiv-connectors` → 43 passed (41 unit + 2 cert); `cargo test -p krishiv-upgrade-tests` → 6 passed; `cargo check --workspace` → clean.
+
+## Sprint 3 Progress (2026-05-20)
+
+Sprint 3 delivered CDC-to-lakehouse pipeline template and materialized views baseline.
+
+- **CDC-to-lakehouse (Task 1)**: `crates/krishiv-connectors/src/cdc.rs` — `CdcOp`, `CdcEvent`, `parse_debezium_envelope`, and `CdcToLakehousePipeline` with full validation. 6 CDC tests pass.
+
+- **Materialized views baseline (Task 2)**: `MaterializedViewDefinition`, `RefreshPolicy`, and `MaterializedViewRegistry` added to `crates/krishiv-sql/src/lib.rs`. LSN-based staleness tracking with `mark_table_committed`/`set_cached`/`get_if_fresh`. 5 matview tests pass.
+
+Validation: `cargo test -p krishiv-connectors` → 47 passed; `cargo test -p krishiv-sql` → 15 passed; `cargo check --workspace` → clean.
 
 ## Risks And Mitigations
 
