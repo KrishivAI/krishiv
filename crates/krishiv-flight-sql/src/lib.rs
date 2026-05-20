@@ -7,14 +7,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::{
-    CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery,
-};
+use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
-    Ticket,
-    flight_service_server::FlightService,
+    Ticket, flight_service_server::FlightService,
 };
 use futures::{Stream, stream};
 use prost::Message as _; // brings encode_to_vec() into scope
@@ -126,8 +123,7 @@ impl FlightSqlService for KrishivFlightSqlService {
 ///
 /// **Beta API**: may change between minor releases.
 pub fn make_flight_sql_server()
-    -> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService>
-{
+-> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService> {
     arrow_flight::flight_service_server::FlightServiceServer::new(KrishivFlightSqlService::new())
 }
 

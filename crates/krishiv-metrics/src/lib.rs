@@ -64,11 +64,7 @@ impl Drop for MetricsHandle {
 /// subscriber (which is ignored) but the returned [`MetricsHandle`] still owns a valid
 /// tracer provider.
 pub fn init(config: MetricsConfig) -> MetricsHandle {
-    let filter_str = config
-        .log_filter
-        .as_deref()
-        .unwrap_or("info")
-        .to_string();
+    let filter_str = config.log_filter.as_deref().unwrap_or("info").to_string();
 
     let filter = tracing_subscriber::EnvFilter::new(&filter_str);
 

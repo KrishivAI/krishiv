@@ -265,18 +265,15 @@ impl ScalarUdf for MultiplyScalarUdf {
                 })?;
 
         let array = batch.column(col_idx);
-        let int_array = array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| UdfError::InvalidArgument {
+        let int_array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+            UdfError::InvalidArgument {
                 message: format!("column '{}' is not Int64", self.column),
-            })?;
+            }
+        })?;
 
         let factor = self.factor;
-        let result: PrimitiveArray<Int64Type> = int_array
-            .iter()
-            .map(|v| v.map(|x| x * factor))
-            .collect();
+        let result: PrimitiveArray<Int64Type> =
+            int_array.iter().map(|v| v.map(|x| x * factor)).collect();
 
         Ok(Arc::new(result))
     }
@@ -307,8 +304,7 @@ mod tests {
 
     impl SumAggUdf {
         fn new() -> Self {
-            let input_schema =
-                Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+            let input_schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
             let output_field = Field::new("sum", DataType::Int64, false);
             Self {
                 input_schema,
@@ -330,11 +326,7 @@ mod tests {
             &self.output_field
         }
 
-        fn accumulate(
-            &self,
-            state: &mut AggState,
-            batch: &RecordBatch,
-        ) -> Result<(), UdfError> {
+        fn accumulate(&self, state: &mut AggState, batch: &RecordBatch) -> Result<(), UdfError> {
             let col = batch
                 .column(0)
                 .as_any()
@@ -426,14 +418,15 @@ mod tests {
         let udf = Arc::new(MultiplyScalarUdf::new("double", "x", 2));
         registry.register_scalar(udf);
 
-        let found = registry.get_scalar("double").expect("UDF must be registered");
+        let found = registry
+            .get_scalar("double")
+            .expect("UDF must be registered");
         assert_eq!(found.name(), "double");
 
         // Build a batch with column "x" = [1, 2, 3]
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
         let array = Int64Array::from(vec![1_i64, 2, 3]);
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("valid batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("valid batch");
 
         let result = found.call(&batch).expect("call must succeed");
         let result_array = result
@@ -458,8 +451,7 @@ mod tests {
             true,
         )]));
         let array = Int64Array::from(vec![10_i64, 20]);
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("valid batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("valid batch");
 
         let mut state = AggState::default();
         udf.accumulate(&mut state, &batch).expect("accumulate ok");

@@ -454,10 +454,8 @@ impl PlanDiff {
 pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
     use std::collections::HashMap;
 
-    let before_map: HashMap<&str, &PlanNode> =
-        before.nodes().iter().map(|n| (n.id(), n)).collect();
-    let after_map: HashMap<&str, &PlanNode> =
-        after.nodes().iter().map(|n| (n.id(), n)).collect();
+    let before_map: HashMap<&str, &PlanNode> = before.nodes().iter().map(|n| (n.id(), n)).collect();
+    let after_map: HashMap<&str, &PlanNode> = after.nodes().iter().map(|n| (n.id(), n)).collect();
 
     let mut added = Vec::new();
     let mut removed = Vec::new();
@@ -467,8 +465,7 @@ pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
         match before_map.get(id) {
             None => added.push((*id).to_owned()),
             Some(before_node) => {
-                if before_node.label() != after_node.label()
-                    || before_node.op() != after_node.op()
+                if before_node.label() != after_node.label() || before_node.op() != after_node.op()
                 {
                     changed.push((*id).to_owned());
                 }
@@ -485,7 +482,11 @@ pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
     removed.sort();
     changed.sort();
 
-    PlanDiff { added, removed, changed }
+    PlanDiff {
+        added,
+        removed,
+        changed,
+    }
 }
 
 #[cfg(test)]

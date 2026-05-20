@@ -1419,8 +1419,8 @@ impl OperatorQueueReceiver {
             // the barrier immediately on the next recv() call.
             // For R7.2 simplicity: return data, barrier will be first next call.
             let _ = epoch; // barrier is still in the channel for next recv()
-                           // Actually we need to put it back — use a 1-item slot.
-                           // Simplified: just return data; barrier drains first next time.
+            // Actually we need to put it back — use a 1-item slot.
+            // Simplified: just return data; barrier drains first next time.
         }
         Some(OperatorMessage::Data(batch))
     }
@@ -1453,12 +1453,13 @@ impl std::error::Error for OperatorQueueError {}
 /// Create a bounded operator queue with `capacity` data slots.
 ///
 /// Barriers bypass the bounded channel and are never subject to backpressure.
-pub fn operator_queue(
-    capacity: usize,
-) -> (OperatorQueueSender, OperatorQueueReceiver) {
+pub fn operator_queue(capacity: usize) -> (OperatorQueueSender, OperatorQueueReceiver) {
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(capacity.max(1));
     let (barrier_tx, barrier_rx) = tokio::sync::mpsc::unbounded_channel();
-    let sender = OperatorQueueSender { data_tx, barrier_tx };
+    let sender = OperatorQueueSender {
+        data_tx,
+        barrier_tx,
+    };
     let receiver = OperatorQueueReceiver {
         data_rx,
         barrier_rx,
@@ -2670,10 +2671,16 @@ mod tests {
         let top = tracker.top_k();
         // Both entries should have estimated_count >= 2.
         for entry in &top {
-            assert!(entry.estimated_count >= 2, "entry count must be >= eviction threshold");
+            assert!(
+                entry.estimated_count >= 2,
+                "entry count must be >= eviction threshold"
+            );
         }
         // "b" should no longer be tracked.
-        assert!(!top.iter().any(|e| e.key == "b"), "b must have been evicted");
+        assert!(
+            !top.iter().any(|e| e.key == "b"),
+            "b must have been evicted"
+        );
         assert_eq!(tracker.total(), 4);
     }
 
@@ -2739,7 +2746,10 @@ mod tests {
         let _ = rl.try_consume(1000, 0); // drain
         // 500ms later → 500 new tokens added.
         let wait = rl.try_consume(400, 500);
-        assert!(wait.is_none(), "500ms refill must cover a 400-token request");
+        assert!(
+            wait.is_none(),
+            "500ms refill must cover a 400-token request"
+        );
     }
 
     #[test]
@@ -2786,10 +2796,19 @@ mod tests {
 
     #[test]
     fn adaptive_decision_kind_display() {
-        assert_eq!(AdaptiveDecisionKind::HotKeySplit.to_string(), "hot-key-split");
+        assert_eq!(
+            AdaptiveDecisionKind::HotKeySplit.to_string(),
+            "hot-key-split"
+        );
         assert_eq!(AdaptiveDecisionKind::Repartition.to_string(), "repartition");
-        assert_eq!(AdaptiveDecisionKind::SourceThrottle.to_string(), "source-throttle");
-        assert_eq!(AdaptiveDecisionKind::SlowSinkDetected.to_string(), "slow-sink");
+        assert_eq!(
+            AdaptiveDecisionKind::SourceThrottle.to_string(),
+            "source-throttle"
+        );
+        assert_eq!(
+            AdaptiveDecisionKind::SlowSinkDetected.to_string(),
+            "slow-sink"
+        );
     }
 
     #[test]

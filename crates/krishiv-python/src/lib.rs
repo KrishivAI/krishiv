@@ -20,13 +20,12 @@ use pyo3::types::{PyDict, PyList};
 
 /// Embedded Tokio runtime used by `sql_async` and `call_python_udf`.
 /// GIL is never held on a worker thread of this runtime.
-static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
-    std::sync::LazyLock::new(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build embedded Krishiv Tokio runtime")
-    });
+static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build embedded Krishiv Tokio runtime")
+});
 
 // ---------------------------------------------------------------------------
 // PySession
@@ -50,9 +49,7 @@ impl PySession {
     pub fn new() -> PyResult<Self> {
         krishiv_api::SessionBuilder::new()
             .build()
-            .map(|s| Self {
-                inner: Arc::new(s),
-            })
+            .map(|s| Self { inner: Arc::new(s) })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -174,51 +171,57 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                 let col = batch.column(idx);
                 let py_list = match field.data_type() {
                     DataType::Int64 => {
-                        let arr = col
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .ok_or_else(|| krishiv_udf::UdfError::InvalidArgument {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                            krishiv_udf::UdfError::InvalidArgument {
                                 message: format!(
                                     "column '{}' declared Int64 but downcast failed",
                                     field.name()
                                 ),
-                            })?;
-                        let list = PyList::new(py, arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())))
-                            .map_err(|e| krishiv_udf::UdfError::Execution {
-                                message: e.to_string(),
-                            })?;
+                            }
+                        })?;
+                        let list = PyList::new(
+                            py,
+                            arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())),
+                        )
+                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                            message: e.to_string(),
+                        })?;
                         list.into_any()
                     }
                     DataType::Float64 => {
-                        let arr = col
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .ok_or_else(|| krishiv_udf::UdfError::InvalidArgument {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                            krishiv_udf::UdfError::InvalidArgument {
                                 message: format!(
                                     "column '{}' declared Float64 but downcast failed",
                                     field.name()
                                 ),
-                            })?;
-                        let list = PyList::new(py, arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())))
-                            .map_err(|e| krishiv_udf::UdfError::Execution {
-                                message: e.to_string(),
-                            })?;
+                            }
+                        })?;
+                        let list = PyList::new(
+                            py,
+                            arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())),
+                        )
+                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                            message: e.to_string(),
+                        })?;
                         list.into_any()
                     }
                     DataType::Utf8 => {
-                        let arr = col
-                            .as_any()
-                            .downcast_ref::<StringArray>()
-                            .ok_or_else(|| krishiv_udf::UdfError::InvalidArgument {
+                        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                            krishiv_udf::UdfError::InvalidArgument {
                                 message: format!(
                                     "column '{}' declared Utf8 but downcast failed",
                                     field.name()
                                 ),
-                            })?;
-                        let list = PyList::new(py, arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())))
-                            .map_err(|e| krishiv_udf::UdfError::Execution {
-                                message: e.to_string(),
-                            })?;
+                            }
+                        })?;
+                        let list = PyList::new(
+                            py,
+                            arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())),
+                        )
+                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                            message: e.to_string(),
+                        })?;
                         list.into_any()
                     }
                     dt => {
@@ -227,30 +230,31 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                         });
                     }
                 };
-                dict.set_item(field.name(), py_list)
-                    .map_err(|e| krishiv_udf::UdfError::Execution {
+                dict.set_item(field.name(), py_list).map_err(|e| {
+                    krishiv_udf::UdfError::Execution {
                         message: e.to_string(),
-                    })?;
+                    }
+                })?;
             }
 
             // Call the Python UDF with the dict
-            let result = self
-                .callable
-                .call1(py, (dict,))
-                .map_err(|e| krishiv_udf::UdfError::Execution {
-                    message: e.to_string(),
-                })?;
+            let result =
+                self.callable
+                    .call1(py, (dict,))
+                    .map_err(|e| krishiv_udf::UdfError::Execution {
+                        message: e.to_string(),
+                    })?;
 
             // Convert the returned Python list to an Arrow array based on the
             // declared output type.
             let nrows = batch.num_rows();
             match self.output_field.data_type() {
                 DataType::Int64 => {
-                    let list = result
-                        .cast_bound::<PyList>(py)
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                    let list = result.cast_bound::<PyList>(py).map_err(|e| {
+                        krishiv_udf::UdfError::Execution {
                             message: format!("UDF must return a list for Int64 output: {e}"),
-                        })?;
+                        }
+                    })?;
                     let mut values: Vec<Option<i64>> = Vec::with_capacity(nrows);
                     for item in list.iter() {
                         let v: Option<i64> = if item.is_none() {
@@ -268,11 +272,11 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                     Ok(Arc::new(array) as ArrayRef)
                 }
                 DataType::Float64 => {
-                    let list = result
-                        .cast_bound::<PyList>(py)
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                    let list = result.cast_bound::<PyList>(py).map_err(|e| {
+                        krishiv_udf::UdfError::Execution {
                             message: format!("UDF must return a list for Float64 output: {e}"),
-                        })?;
+                        }
+                    })?;
                     let mut values: Vec<Option<f64>> = Vec::with_capacity(nrows);
                     for item in list.iter() {
                         let v: Option<f64> = if item.is_none() {
@@ -290,11 +294,11 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                     Ok(Arc::new(array) as ArrayRef)
                 }
                 DataType::Utf8 => {
-                    let list = result
-                        .cast_bound::<PyList>(py)
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                    let list = result.cast_bound::<PyList>(py).map_err(|e| {
+                        krishiv_udf::UdfError::Execution {
                             message: format!("UDF must return a list for Utf8 output: {e}"),
-                        })?;
+                        }
+                    })?;
                     let mut values: Vec<Option<String>> = Vec::with_capacity(nrows);
                     for item in list.iter() {
                         let v: Option<String> = if item.is_none() {
@@ -396,10 +400,7 @@ mod tests {
             fn output_field(&self) -> &Field {
                 todo!()
             }
-            fn call(
-                &self,
-                _batch: &RecordBatch,
-            ) -> Result<ArrayRef, krishiv_udf::UdfError> {
+            fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
                 panic!("intentional panic from test")
             }
         }
