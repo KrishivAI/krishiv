@@ -704,6 +704,32 @@ pub struct ConnectorCapabilityFlags {
     pub idempotent: bool,
 }
 
+// ── R4a Shuffle configs ────────────────────────────────────────────────────────
+
+/// Configuration for a task that writes its output to the shuffle store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleWriteConfig {
+    /// Stage whose output is being written.
+    pub stage_id: StageId,
+    /// Total number of output partitions.
+    pub num_partitions: usize,
+    /// Column names used as hash partitioning keys. Empty = round-robin.
+    pub key_columns: Vec<String>,
+    /// Lease token for fencing.
+    pub lease_token: u64,
+}
+
+/// Configuration for a task that reads its input from the shuffle store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShuffleReadConfig {
+    /// Stage whose shuffle output to read from.
+    pub stage_id: StageId,
+    /// Partition index this task should read.
+    pub partition_id: usize,
+    /// Lease token for fencing.
+    pub lease_token: u64,
+}
+
 /// Task contract inside a stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
@@ -714,6 +740,8 @@ pub struct TaskSpec {
     pub source_capabilities: Option<ConnectorCapabilityFlags>,
     /// Capability flags declared by the sink connector for this task, if known.
     pub sink_capabilities: Option<ConnectorCapabilityFlags>,
+    shuffle_write: Option<ShuffleWriteConfig>,
+    shuffle_read: Option<ShuffleReadConfig>,
 }
 
 impl TaskSpec {
@@ -725,6 +753,8 @@ impl TaskSpec {
             task_timeout_secs: None,
             source_capabilities: None,
             sink_capabilities: None,
+            shuffle_write: None,
+            shuffle_read: None,
         }
     }
 
@@ -762,6 +792,30 @@ impl TaskSpec {
     /// Per-task execution timeout in seconds, if set.
     pub fn task_timeout_secs(&self) -> Option<u64> {
         self.task_timeout_secs
+    }
+
+    /// Attach a shuffle write configuration.
+    #[must_use]
+    pub fn with_shuffle_write(mut self, config: ShuffleWriteConfig) -> Self {
+        self.shuffle_write = Some(config);
+        self
+    }
+
+    /// Attach a shuffle read configuration.
+    #[must_use]
+    pub fn with_shuffle_read(mut self, config: ShuffleReadConfig) -> Self {
+        self.shuffle_read = Some(config);
+        self
+    }
+
+    /// Shuffle write configuration, if this task writes to the shuffle store.
+    pub fn shuffle_write(&self) -> Option<&ShuffleWriteConfig> {
+        self.shuffle_write.as_ref()
+    }
+
+    /// Shuffle read configuration, if this task reads from the shuffle store.
+    pub fn shuffle_read(&self) -> Option<&ShuffleReadConfig> {
+        self.shuffle_read.as_ref()
     }
 }
 
@@ -1112,7 +1166,10 @@ pub struct TraceContext {
 impl TraceContext {
     /// Create a trace context with the given traceparent.
     pub fn new(traceparent: impl Into<String>) -> Self {
-        Self { traceparent: traceparent.into(), tracestate: String::new() }
+        Self {
+            traceparent: traceparent.into(),
+            tracestate: String::new(),
+        }
     }
 
     /// Whether this context carries a real trace (non-empty traceparent).
@@ -2142,6 +2199,8 @@ pub struct ExecutorTaskAssignment {
     task_timeout_secs: Option<u64>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
+    shuffle_write: Option<ShuffleWriteConfig>,
+    shuffle_read: Option<ShuffleReadConfig>,
 }
 
 impl ExecutorTaskAssignment {
@@ -2166,6 +2225,8 @@ impl ExecutorTaskAssignment {
             output_contract,
             task_timeout_secs: None,
             trace_context: None,
+            shuffle_write: None,
+            shuffle_read: None,
         }
     }
 
@@ -2255,6 +2316,30 @@ impl ExecutorTaskAssignment {
     /// W3C trace context, if provided by the scheduler.
     pub fn trace_context(&self) -> Option<&TraceContext> {
         self.trace_context.as_ref()
+    }
+
+    /// Attach a shuffle write configuration.
+    #[must_use]
+    pub fn with_shuffle_write(mut self, config: ShuffleWriteConfig) -> Self {
+        self.shuffle_write = Some(config);
+        self
+    }
+
+    /// Attach a shuffle read configuration.
+    #[must_use]
+    pub fn with_shuffle_read(mut self, config: ShuffleReadConfig) -> Self {
+        self.shuffle_read = Some(config);
+        self
+    }
+
+    /// Shuffle write configuration, if this task writes to the shuffle store.
+    pub fn shuffle_write(&self) -> Option<&ShuffleWriteConfig> {
+        self.shuffle_write.as_ref()
+    }
+
+    /// Shuffle read configuration, if this task reads from the shuffle store.
+    pub fn shuffle_read(&self) -> Option<&ShuffleReadConfig> {
+        self.shuffle_read.as_ref()
     }
 }
 
@@ -3837,5 +3922,72 @@ mod tests {
         )
         .with_trace_context(super::TraceContext::new("00-trace-01-span-01-01"));
         assert!(req.trace_context().unwrap().is_active());
+    }
+
+    // ── R4a shuffle config tests ───────────────────────────────────────────────
+
+    use super::{ShuffleReadConfig, ShuffleWriteConfig};
+
+    #[test]
+    fn test_shuffle_write_config_round_trip() {
+        let write_cfg = ShuffleWriteConfig {
+            stage_id: StageId::try_new("stage-write").unwrap(),
+            num_partitions: 4,
+            key_columns: vec![String::from("user_id")],
+            lease_token: 99,
+        };
+        let task = TaskSpec::new(TaskId::try_new("task-write-rt").unwrap(), "sql: select 1")
+            .with_shuffle_write(write_cfg.clone());
+        let cfg = task.shuffle_write().expect("shuffle_write must be set");
+        assert_eq!(cfg.num_partitions, 4);
+        assert_eq!(cfg.lease_token, 99);
+        assert_eq!(cfg, &write_cfg);
+    }
+
+    #[test]
+    fn test_shuffle_read_config_round_trip() {
+        let read_cfg = ShuffleReadConfig {
+            stage_id: StageId::try_new("stage-read").unwrap(),
+            partition_id: 7,
+            lease_token: 42,
+        };
+        let task = TaskSpec::new(TaskId::try_new("task-read-rt").unwrap(), "shuffle-read")
+            .with_shuffle_read(read_cfg.clone());
+        let cfg = task.shuffle_read().expect("shuffle_read must be set");
+        assert_eq!(cfg.partition_id, 7);
+        assert_eq!(cfg, &read_cfg);
+    }
+
+    #[test]
+    fn task_spec_with_no_shuffle_configs_has_none() {
+        let task = TaskSpec::new(TaskId::try_new("task-plain").unwrap(), "sql: select 1");
+        assert!(task.shuffle_write().is_none());
+        assert!(task.shuffle_read().is_none());
+    }
+
+    #[test]
+    fn executor_task_assignment_carries_shuffle_write_config() {
+        let write_cfg = ShuffleWriteConfig {
+            stage_id: StageId::try_new("stage-sw").unwrap(),
+            num_partitions: 3,
+            key_columns: vec![String::from("id")],
+            lease_token: 1,
+        };
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-sw-assign").unwrap(),
+                StageId::try_new("stage-sw").unwrap(),
+                TaskId::try_new("task-sw-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select id from t"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        )
+        .with_shuffle_write(write_cfg.clone());
+
+        assert_eq!(assignment.shuffle_write().unwrap().num_partitions, 3);
+        assert!(assignment.shuffle_read().is_none());
     }
 }
