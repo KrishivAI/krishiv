@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**R4/R5/R6 IMPLEMENTED.** R8 and R9 are complete. R4 (shuffle executor wiring), R5 (durable state backend), and R6 (checkpoint barrier + 2PC sink) are now implemented on branch `claude/plan-r7-implementation-lt3n3`.
+**R10 Sprint 0 complete.** All 12 architecture deliverables written and committed on branch `claude/plan-r10-architecture-GnRvo`. R1–R9 are complete on branch `claude/plan-r7-implementation-lt3n3`.
 
 ## Active Task
 
-**R4/R5/R6 complete** — streaming core stack implemented.
+**R10 Sprint 1** — deferred R9 items: live K8s Lease API, policy hooks at DataFusion scan layer, OTLP integration test, kind failover e2e CI workflow.
 
 ### Completed (committed to branch)
 
@@ -46,18 +46,19 @@
 
 ## Next Steps
 
-1. Commit R6c (LocalParquetTwoPhaseCommitSink) to branch and push
-2. Run full workspace test suite: `cargo test --workspace`
-3. Begin R10 planning (GA platform, stable API, OIDC, kind e2e tests, benchmarks)
+1. Sprint 1a: Wire `AuthProvider` + `PolicyHook` enforcement at DataFusion scan layer in `krishiv-sql`
+2. Sprint 1b: Replace simulated `K8sLeaseElection` with live async K8s Lease API calls in `krishiv-operator`
+3. Sprint 1c: Add OTLP integration test (feature-gated, skipped without live collector) in `krishiv-metrics`
+4. Sprint 1d: Add `.github/workflows/kind-e2e.yml` for `kind` cluster failover CI
+5. Sprint 2: Wire `AuthProvider` + `PolicyHook` through `KrishivFlightSqlService` in `krishiv-flight-sql`
+6. Sprint 2+: Data quality rules, dead-letter sink, upgrade tests, CDC pipeline, materialized views, benchmarks
 
 ## Last Validation
 
-- `cargo test -p krishiv-executor`: 49 passed (includes 2 R4a shuffle tests)
-- `cargo test -p krishiv-state`: 40 passed (includes redb tests)
-- `cargo test -p krishiv-scheduler`: 93 passed (includes 3 R6a barrier tests)
-- `cargo test -p krishiv-connectors`: 37 passed (includes 3 Parquet 2PC tests)
-- `cargo test -p krishiv-proto`: 28 passed (includes 4 R4a config tests)
-- Branch: `claude/plan-r7-implementation-lt3n3`
+- `cargo check --workspace`: clean (one unused import warning in krishiv-executor)
+- Branch: `claude/plan-r10-architecture-GnRvo`
+- Sprint 0 docs: `docs/architecture/stability-policy.md`, `compatibility-matrices.md`, `jdbc-odbc-architecture.md`, `cdc-reference.md`, `materialized-views.md`, `data-quality-model.md`, `upgrade-compatibility-policy.md`, `benchmark-targets.md`
+- R10 tracker: 12/12 architecture deliverables checked off
 
 ## Architectural Inputs To Preserve
 

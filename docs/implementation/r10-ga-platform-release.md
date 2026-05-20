@@ -48,18 +48,18 @@ Out of scope:
 
 ## Architecture Deliverables
 
-- [ ] Define GA stability policy.
-- [ ] Define compatibility matrix format.
-- [ ] Define connector certification matrix format.
-- [ ] Define JDBC gateway architecture.
-- [ ] Define ODBC gateway architecture.
-- [ ] Define CDC-to-lakehouse reference architecture.
-- [ ] Define materialized views baseline architecture.
-- [ ] Define data quality rule model.
-- [ ] Define upgrade compatibility policy.
-- [ ] Define metadata schema compatibility policy for every persisted metadata family.
-- [ ] Define benchmark performance targets (TPC-H SF100 per-query time limits, TPC-DS SF100 limits, Nexmark minimum events/second on reference hardware) before R10 implementation begins.
-- [ ] Define benchmark reporting policy.
+- [x] Define GA stability policy.
+- [x] Define compatibility matrix format.
+- [x] Define connector certification matrix format.
+- [x] Define JDBC gateway architecture.
+- [x] Define ODBC gateway architecture.
+- [x] Define CDC-to-lakehouse reference architecture.
+- [x] Define materialized views baseline architecture.
+- [x] Define data quality rule model.
+- [x] Define upgrade compatibility policy.
+- [x] Define metadata schema compatibility policy for every persisted metadata family.
+- [x] Define benchmark performance targets (TPC-H SF10 per-query time limits, TPC-DS SF10 limits, Nexmark minimum events/second on reference hardware) before R10 implementation begins.
+- [x] Define benchmark reporting policy.
 
 ## API And Interface Deliverables
 
