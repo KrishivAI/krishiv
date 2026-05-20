@@ -2,536 +2,76 @@
 
 ## Current Phase
 
-**R6 COMPLETE.** All R6 groups (A–E) implemented. Branch `claude/track-skills-slices-MSvac`. Zero failures across full workspace (`cargo test --workspace`).
+**R9 IN PROGRESS (core items delivered).** R8 is complete. R9.1 (observability + governance) and R9.2 (HA + operations) core items are implemented on branch `claude/plan-r7-implementation-lt3n3`.
 
 ## Active Task
 
-**R6 — Checkpoints and Savepoints** — all groups complete:
+**R9** — implementing governance and operations.
 
-### Group A: Proto + Config Foundation
-- A1: `checkpoint_interval_ms`/`checkpoint_storage_path` fields + builder `with_checkpoint()` + accessors added to `JobSpec` in `krishiv-proto`.
-- A2: Checkpoint control-plane messages added to `krishiv-proto`: `CheckpointSourceOffset`, `InitiateCheckpointRequest`, `CheckpointAckRequest`, `AbortCheckpointRequest`, `CheckpointInitiateResponse`, `CheckpointAckResponse`.
-- A3: `is_savepoint: bool` + `savepoint_label: Option<String>` added to `CheckpointMetadata`; existing test fixtures updated.
-- A4: `fencing_token: u64` already present in `CheckpointMetadata`; `base_dir()` accessor added to `LocalFsCheckpointStorage`.
-- A5: `supports_checkpoint` + `supports_two_phase_commit` flags added to `ConnectorCapabilities` with `with_checkpoint()`, `with_two_phase_commit()`, `is_checkpoint_capable()`, `is_two_phase_commit_capable()` methods; 2 new tests pass.
+### Completed (committed to branch)
 
-### Group B: CheckpointCoordinator in krishiv-scheduler
-- B1: `CheckpointCoordinator` struct added with `CheckpointCoordinatorState` enum; `krishiv-checkpoint` dep added to `krishiv-scheduler/Cargo.toml`.
-- B2: Core methods: `new()`, `initiate()`, `initiate_savepoint()`, `receive_ack()`, `commit_epoch()`, `abort_epoch()`, `recover_from_storage()`, `list_epochs()`, accessors.
-- B3: `checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>` added to `Coordinator`; `submit_job` creates coordinator for streaming jobs with checkpoint config; `checkpoint_coordinator()`, `checkpoint_coordinator_mut()`, `handle_checkpoint_ack()` added.
-- B4: `recover_from_store` calls `checkpoint_coordinator.recover_from_storage()` for all registered coordinators.
-- B5: 7 tests: `checkpoint_coordinator_initiates_and_collects_acks`, `checkpoint_coordinator_rejects_stale_epoch_ack`, `checkpoint_coordinator_abort_resets_state`, `checkpoint_coordinator_recover_finds_latest_epoch`, `checkpoint_coordinator_savepoint_sets_flag`, `coordinator_creates_checkpoint_coordinator_for_streaming_job_with_config`, `coordinator_routes_ack_to_correct_job`.
+| Commit | Content |
+|--------|---------|
+| `0618c61` | R7.1: Resource governance foundation (quotas, admission, cost metrics) |
+| `b5570bb` | R7.2: Backpressure and adaptive governance (SpaceSaving, RateLimiter, barriers) |
+| `3dec2a1` | docs: R7 tracker + status updated |
+| `8509663` | pre-R8: HashMap job index, auth interceptor skeleton, R7 roadmap sync, R8 ADR |
+| `6a1fc17` | pre-R8: TraceContext in proto + OperatorQueue wiring in streaming executor |
+| `c867a62` | R8.1 Group A: `krishiv-udf` — ScalarUdf, AggregateUdf, TableUdf, UdfRegistry |
+| `931c824` | R8.2: `krishiv-lakehouse` — Iceberg read/write beta, snapshot reads, optimistic concurrency |
+| `63a8ae2` | R8.1 Group C: `krishiv-flight-sql` — Flight SQL thin adapter over Session |
+| `c1af99e` | docs(R8): sync roadmap R8.1 and R8.2 checklists |
+| `27e8c5c` | docs(R8): update status.md and R8 tracker |
+| `1611103` | R8.1 Group B: `krishiv-python` — PyO3 Session/DataFrame/UDF via spawn_blocking |
+| `0105392` | docs(R8): mark R8 complete |
+| `ccbda47` | R9.1: `krishiv-governance` — RBAC, audit log, OpenLineage, policy hooks |
+| `496504c` | R9.1: `krishiv-metrics` — OTel tracing init, tracing bridge, structured logs |
+| `(pending)` | R9.2: workspace deps, fencing enforcement, LeaderElection extension, K8sLeaseElection, plan diff, replay bundle, TLS config, auth completion, Helm chart |
 
-### Group C: Executor Checkpoint Participation
-- C1/C2: `TaskRunner` struct added to `krishiv-executor` with `last_acked_epoch`, `operator_id`, `task_id`, `kafka_source_offset` fields; `handle_initiate_checkpoint()` method.
-- C3/C4: 4 tests: `executor_checkpoint_takes_state_snapshot_and_writes_to_storage`, `executor_checkpoint_ack_includes_snapshot_path`, `executor_checkpoint_ack_includes_source_offset`, `executor_rejects_stale_checkpoint_epoch`.
+### In Progress
 
-### Group D: Savepoint/Restore CLI + UI + Coordinator Methods
-- D1: `Coordinator::savepoint_job()`, `list_job_checkpoints()`, `restore_job_from_checkpoint()` added to `krishiv-scheduler`; restore validates epoch integrity and rejects mismatched parallelism; 3 tests pass.
-- D2: `krishiv savepoint --job <id> [--label <str>]` CLI command added to `krishiv-cli`; 4 tests pass.
-- D3: `krishiv restore --job <id> --epoch <n> [--storage-path <p>]` CLI command added; 4 tests pass.
-- D4: `krishiv checkpoints list --job <id>` CLI command added; 3 tests pass.
-- D5: `GET /api/v1/jobs/{job_id}/checkpoints` endpoint added to `krishiv-ui`; returns `JobCheckpointsResponse` JSON with `job_id`, `epochs`, `latest_epoch`; 2 tests pass.
+- R9.2 commit being prepared (all code done, pending commit + push)
 
-### Group E: Chaos Tests
-- E1 (`chaos_1`): Coordinator kill mid-checkpoint — new coordinator rejects stale-epoch acks; no duplicate commit.
-- E2 (`chaos_1a`): Coordinator restart from durable metadata — `recover_from_storage` resumes epoch sequence.
-- E3 (`chaos_2`): Executor kill mid-checkpoint — abort path is clean; fencing token prevents stale ack acceptance.
-- E4 (`chaos_3`): Sink kill mid-write — `abort()` discards staged output; no partial records visible.
-- E5 (`chaos_4`): Corrupt checkpoint fallback — `list_valid_epochs` returns only manifest-validated epochs; corrupt epoch excluded.
-- E6 (`chaos_e6`): Rolling upgrade via savepoint — `is_savepoint=true` epoch preserved; restore on new coordinator resumes epoch sequence.
+## R9 Architecture Decisions (locked)
 
-**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures across all crates (68 tests in `krishiv-scheduler` alone).
+- **OTel transport**: `tracing` facade + `tracing-opentelemetry` bridge; stdout exporter default; OTLP HTTP/proto for production (avoids tonic 0.12 conflict)
+- **RBAC (R9 beta)**: static API key → role mapping; OIDC/JWT deferred to R10
+- **Leader election**: `LeaderElection` trait extended with `try_acquire/renew/release/fencing_token`; K8s Lease-backed `K8sLeaseElection` in `krishiv-operator`
+- **Fencing enforcement**: `validate_fencing_token()` in `krishiv-checkpoint`; stale token → `StaleFencingToken` error
+- **Live K8s Lease API calls**: simulated in R9 (test-safe); wired to real K8s API in R10
+- **Helm chart**: `k8s/helm/krishiv/` with coordinator (Recreate), executor (RollingUpdate), headless service, RBAC
 
-## Previous Active Task
+## R9 Deferred Items (not blocking acceptance gate)
 
-**R6 startup sequence** — all six pre-implementation decisions delivered:
-
-- Workspace bug-sweep: cleared compiler warning bugs in tests (`unused import`, `unused mut`, `unused variable`, `dead code`) across executor/shuffle/connectors/state crates; revalidated targeted crates with `cargo test -p krishiv-state -p krishiv-executor -p krishiv-shuffle -p krishiv-connectors` (0 failures).
-- `FencingToken(u64)` added to `krishiv-proto`: `initial()`, `next()`, `as_u64()`, ordering — 4 tests pass.
-- `StateBackend::snapshot()` + `load_snapshot()` added: implemented for `InMemoryStateBackend` (length-prefixed binary format, version=1); stubbed `SnapshotUnsupported` for `RocksDbStateBackend`; delegating for `TtlStateBackend<B>` — 4 new tests pass.
-- `TwoPhaseCommitSink` trait + `InMemoryTwoPhaseCommitSink` added to `krishiv-connectors`: `prepare/commit/abort` protocol with handle-based staging — 3 new tests pass.
-- `crates/krishiv-checkpoint` created: `CheckpointStorage` trait, `LocalFsCheckpointStorage` (atomic write, path traversal guard), `CheckpointMetadata` (versioned JSON), `IntegrityManifest` (SHA-256), higher-level helpers (`write_epoch_metadata`, `validate_epoch`, `list_valid_epochs`, `latest_valid_epoch`, `delete_epoch`, corrupt-checkpoint fallback) — 21 tests pass.
-- `docs/architecture/checkpoint-storage.md` written: key schema, snapshot binary format, integrity manifest format, two-phase commit API shape, rolling upgrade protocol, risks/mitigations.
-- `docs/architecture/rescaling-model.md` written: rescaling decision (savepoint+repartition only; live rescaling post-R6; restore rejects mismatched parallelism); state schema evolution baseline (reject unknown versions immediately — already enforced in `InMemoryStateBackend::load_snapshot` and `CheckpointMetadata::validate`; version increment policy; RocksDB schema evolution deferred). R6 tracker updated: rescaling model and schema evolution baseline marked complete.
-
-## Previous Task: R5.2 implementation complete — all slices including durable backend:
-
-**R5.2 `RocksDbStateBackend`** (NEW — completes R5.2)
-- `RocksDbStateBackend::open(base_dir)` / `RocksDbStateBackend::ephemeral()` — filesystem-backed durable state using `std::fs`
-- Atomic write: temp-file → rename per key (same staging model as shuffle store)
-- Key encoding: `base_dir/<operator_id>/<state_name>/<hex_key>` (matches `rocksdb-state-backend.md` §5)
-- `hex_encode`/`hex_decode` helpers (no external deps)
-- `Send` trait satisfied — safe to move to `spawn_blocking` thread
-- 10 new tests: CRUD, `list_namespaces/list_keys`, `rocks_survives_reopen` (durability), `rocks_ttl_wrapper_expires_on_reopen`, `rocks_deterministic_replay`, `rocks_state_inspector_reads_without_mutation`, `rocks_spawn_blocking_compatible`
-
-**R5.2 Architecture**
-- `docs/architecture/rocksdb-state-backend.md`: `spawn_blocking` isolation boundary, compaction thread budget `min(4, cpus/4)`, `Deployment` pod deployment model, key encoding, TTL cleanup policy, state inspection safety boundaries.
-
-**R5.2 `krishiv-state` additions**
-- `StateBackend` trait extended: `list_namespaces()`, `list_keys(namespace)`
-- `ProcessingTimeTimerKey`, `ProcessingTimeTimerService` trait, `InMemoryProcessingTimeTimerService`
-- `TtlConfig`, `TtlStateBackend<B: StateBackend>` (lazy expiry: 8-byte LE `expires_at_ms` prefix)
-- `StateInspector<'a, B>`: read-only access, `list_namespaces`, `key_count`, `key_size_bytes`, `is_read_only`
-- 12 new tests; 22 total in crate.
-
-**R5.2 `krishiv-exec` additions**
-- `MultiSourceWatermarkState`: tracks N sources, effective watermark = min of all
-- `SlidingWindowSpec` + `SlidingWindowOperator`: event at T belongs to `ceil(size/slide)` windows
-- `SessionWindowSpec` + `SessionWindowOperator`: dynamic session boundaries, closes when watermark passes `last_event + gap`
-- `StreamTableJoin`: stream-side nested-loop join against static `RecordBatch`
-- 8 new tests; 33 total in crate.
-
-**R5.2 `krishiv-api` additions**
-- `MultiSourceWatermarkSpec`: builder pattern, per-source `WatermarkSpec`
-- `StateTtlConfig`: `ttl_ms` accessor
-- `SlidingWindowedStream`: `window_size_ms`, `slide_ms` accessors
-- `SessionWindowedStream`: `session_gap_ms` accessor
-- `KeyedStream::sliding_window(size, slide)` and `session_window(gap)` builders
-- 4 new tests; 15 total in crate.
-
-**R5.2 `krishiv-cli` additions**
-- `state` command with `inspect` subcommand (`--job`, `--operator` flags)
-- Skeleton response noting executor-side RPC is R6
-- 4 new tests; `state_help_command_exits_zero`, `state_inspect_requires_job_and_operator`, `state_inspect_returns_skeleton_output`, `state_unknown_subcommand_exits_nonzero`
-
-**Validation**: `cargo test --workspace` — 0 failures across all crates.
-
-**Deferred** (RocksDB crate integration — no external crate dependency added yet):
-- `RocksDbStateBackend` implementation
-- RocksDB blocking-under-load test
-- Deterministic replay with RocksDB backend
-
-## R5.1 Implementation (completed prior session)
-
-R5.1 full implementation complete (270→~350 tests, 0 failures):
-
-**Slice A — `krishiv-state` crate** (NEW)
-- `StateBackend` trait: `get`, `put`, `delete`, `clear_namespace`
-- `InMemoryStateBackend`: BTreeMap-backed, keyed by `(operator_id, state_name, key)`
-- `Namespace`: column-family model (`operator_id:state_name`)
-- `TimerService` trait: event-time timer registration/cancellation/drain
-- `InMemoryTimerService`: BTreeMap-ordered by `(deadline_ms, namespace, key)` with O(log n) `split_off` drain
-- 12 tests pass
-
-**Slice B — `krishiv-api` streaming builder API**
-- `WatermarkSpec::fixed_lag_ms(lag_ms)` 
-- `Stream::key_by(column)` → `KeyedStream`
-- `KeyedStream::with_event_time(col).watermark(spec).tumbling_window(ms)` → `WindowedStream`
-- Accessor methods for all fields; 4 new tests pass
-
-**Slice C — `WatermarkState` in `krishiv-exec`**
-- `advance(event_time_ms)`, `current_watermark_ms()` (max - lag, `i64::MIN` if no events), `is_late(event_time_ms)`
-- Monotonic guarantees; 4 new tests pass
-
-**Slice D — `execute_streaming_fragment` in `krishiv-executor`**
-- Parses `stream:tw:key=<col>:time=<col>:win=<ms>:lag=<ms>[:agg=count|sum:col=<col>]`
-- Parses `stream-kafka:<topic>:<partition>:<start_offset>:key=k,ts=t,val=v|...` input partitions
-- Calls `WatermarkState` + `TumblingWindowOperator`; returns `ExecutorTaskOutput::streaming_window(...)`
-
-**Slice E — `TumblingWindowOperator` in `krishiv-exec`**
-- `TumblingWindowSpec`: `key_column`, `event_time_column`, `window_size_ms`, `agg_exprs`
-- `process_batch(batch, new_watermark_ms)`: uses `prev_watermark_ms` for late-event detection (events are late relative to the PREVIOUS batch's watermark); flushes closed windows
-- `flush_closed_windows(watermark_ms)`: emits `(key, window_start_ms, window_end_ms, ...agg)` batches
-- 9 tests pass including `deterministic_replay_produces_identical_output`
-
-**Slice F — `BarrierSimulator` + `BarrierSnapshot` in `krishiv-executor`**
-- `BarrierSimulator::process_barrier(epoch, watermark_ms, open_windows)`: enforces monotonically increasing epoch
-- `BarrierSnapshot`: records epoch, watermark_ms, open_windows count
-- 5 barrier tests pass
-
-**Slice G — `deterministic_replay_end_to_end` test in `krishiv-executor`**
-- Two independent executor instances; same `stream-kafka:` input; outputs compared for identity
-
-## Completed
-
-- R4 full implementation complete across all three tiers (122→270 tests, 0 failures):
-
-**Tier 1 (Foundation)**
-- Proto extensions: `StageSpec.upstream_stage_ids`, `output_partition_count`, `ShufflePartitionOutput`, `TaskRuntimeStats`, `InputPartitionDescriptor::ShuffleFlight`
-- Arrow IPC shuffle server (`krishiv-shuffle::flight`): TCP `<job/stage/partition>\n` → 4-byte length + IPC bytes; `FlightShuffleClient::fetch`
-- Stage N+1 wait in coordinator: checks `upstream_stage_ids` before launching
-- Shuffle GC: `Coordinator::take_gc_ready_jobs()` + coordinator binary `--shuffle-dir` GC loop
-- Executor shuffle read path: `read_shuffle_flight_partitions` → registers as DataFusion tables
-- Executor shuffle write path: `shuffle-write:hash:<key>:<N>` fragment via `HashPartitioner` + `LocalDiskShuffleStore`
-
-**Tier 2 (TPC-H gate correctness)**
-- Pre-aggregation: `pre-agg:sql:` fragments auto-route through existing SQL path
-- Runtime statistics: `SqlDataFrame::collect_with_stats` reads DataFusion `output_rows`/`elapsed_compute`; executor wires into `TaskOutputMetadata`
-- Distributed joins: two-stage (shuffle + local DataFusion JOIN) works with current `ShuffleFlight` + SQL execution path
-
-**Tier 3 (AQE / observability)**
-- Health/metrics HTTP: `--http-addr` on coordinator + executor; `/healthz`, `/readyz`, `/metrics` (Prometheus)
-- EXPLAIN annotations: `describe_plan` shows `[broadcast-eligible]` and `[est-rows: N]`
-- `SmallFilePlanner`: greedy file grouper for scan parallelism (4 tests)
-- `ObjectStoreShuffleStore`: `ShuffleStore` impl backed by `Arc<dyn ObjectStore>` (3 tests)
-
-Architecture docs: `shuffle-retry-lineage.md` (Option B retry policy), `shuffle-recovery-expectations.md` (per-failure-point recovery matrix)
-
-## Completed
-
-- Hardened R3 practical remaining slices: exact shuffle lease registration/rejection before commit, operator pod-launch failure executor fencing/requeue, typed task I/O descriptors, JSON metadata schema envelopes, streaming-execution-model roadmap reconciliation, R1/R2 roadmap reconciliation, and R3 tracker reconciliation.
-- Created `docs/architecture/krishiv-roadmap.md`.
-- Created `AGENTS.md`.
-- Created `docs/engineering/standards.md`.
-- Created `docs/implementation/r1-foundation-alpha.md`.
-- Created repo-local `codex/skills/krishiv-engine/SKILL.md`.
-- Installed the `krishiv-engine` skill globally under `/Users/gopal/.agents/skills/krishiv-engine`.
-- Added Codex rate-limit and resumability workflow documentation.
-- Expanded the agent workflow so Codex and Claude Code share rate-limit, resume, and cross-agent handoff protocols.
-- Added a Claude Code project-skill shim under `.claude/skills/krishiv-engine/SKILL.md` so Claude can use the existing canonical Krishiv skill through `/krishiv-engine`.
-- Synced the updated `krishiv-engine` resume protocol into the global skill install.
-- Added `docs/implementation/README.md` as the implementation tracker index.
-- Added implementation trackers for R2 through R10.
-- Synced the updated tracker-index guidance into the global `krishiv-engine` skill install.
-- Created the root Rust workspace.
-- Created R1 bootstrap crates: `krishiv-api`, `krishiv-cli`, `krishiv-sql`, `krishiv-plan`, `krishiv-exec`, and `krishiv-runtime`.
-- Added public API stubs for `Session`, `SessionBuilder`, `DataFrame`, `Stream`, `ExecutionMode`, `QueryResult`, and `StreamBatch`.
-- Added plan, runtime, SQL, execution, and CLI stubs.
-- Added R1 bootstrap architecture docs, crate map, SQL compatibility placeholder, and example/test placeholders.
-- Added `docs/architecture/file-guide.md` to explain each bootstrap file.
-- Added `.gitignore` for local build artifacts.
-- Added Arrow/DataFusion dependencies behind `krishiv-sql`.
-- Implemented DataFusion-backed local SQL execution and `EXPLAIN`.
-- Implemented local Parquet registration and direct Parquet reads.
-- Replaced bootstrap result placeholders with Arrow `RecordBatch` results.
-- Implemented bounded and unbounded local memory stream API shapes with bounded map/filter/collect support.
-- Routed embedded and single-node local execution through the runtime backend seam.
-- Implemented `krishiv sql`, `krishiv explain`, and `krishiv jobs`.
-- Added embedded/single-node SQL-over-Parquet parity coverage.
-- Added R1 CLI golden tests for `sql` and `explain`.
-- Updated R1 SQL compatibility, crate map, file guide, and tracker docs.
-- Created R1 checkpoint commit `dd19774`.
-- Added runnable Cargo examples for embedded SQL over Parquet and bounded memory streams.
-- Added batch SQL README commands for `krishiv sql`, `krishiv explain`, and Parquet registration.
-- Added broader R1 CLI contract tests for projection, filter, aggregate, limit, invalid SQL, and missing Parquet files.
-- Added Parquet aggregate golden output.
-- Added R1 Foundation Alpha release notes.
-- Updated R1 tracker with the R1.1 hardening checklist.
-- Added `crates/krishiv-proto` for R2 control-plane contracts.
-- Added typed coordinator, job, stage, task, and executor identifiers.
-- Added coordinator, job, stage, task, and executor lifecycle states.
-- Added R2 job/stage/task specs, executor heartbeat, task assignment, and task status update contracts.
-- Added `crates/krishiv-scheduler` for the R2 in-process active coordinator skeleton.
-- Added executor registry, heartbeat handling, lost-executor marking, static task placement, task launch, task completion/failure updates, and job snapshots.
-- Documented the R2 control-plane skeleton and limitations.
-- Updated R2 tracker, crate map, and file guide.
-- Added `krishiv submit` CLI skeleton backed by the R2 scheduler/proto model.
-- Added `krishiv jobs --distributed` status output while preserving R1 `krishiv jobs`.
-- Added CLI output for distributed job, stage, task, and executor status in the submit path.
-- Added scheduler detail snapshots for job/stage/task status consumers.
-- Added CLI tests for submit, distributed jobs, and submit validation.
-- Updated R2 control-plane docs and examples with the new CLI surface.
-- Added the first `krishiv.io/v1alpha1` `KrishivJob` CRD.
-- Added minimal static Kubernetes manifests under `k8s/` for namespace, service account, RBAC, coordinator service, operator-owned coordinator runtime, executors, and a sample job.
-- Added offline manifest validation tests for the CRD, kustomization, coordinator service, operator runtime, executor, RBAC, and sample job.
-- Updated R2 tracker, control-plane docs, file guide, and Kubernetes README.
-- Added coordinator configuration for stage retry and deterministic heartbeat timeout ticks.
-- Implemented stage-level retry before terminal job failure.
-- Implemented heartbeat timeout handling that marks stale executors lost.
-- Added scheduler tests for stage retry and heartbeat timeout behavior.
-- Updated R2 tracker and control-plane docs for retry and timeout semantics.
-- Added conversion from Krishiv logical/physical plans into R2 scheduler job specs.
-- Added coordinator APIs to submit logical and physical DAGs through the scheduler.
-- Routed batch DAGs as `JobKind::Batch` and streaming DAGs as `JobKind::Streaming` with R1-level local state semantics.
-- Added scheduler tests for batch logical DAG routing, streaming physical DAG routing, and empty-plan routing.
-- Updated R2 tracker, crate map, file guide, and control-plane docs for DAG routing.
-- Added `crates/krishiv-ui` as a Rust-native R2 status API and server-rendered Web UI using `axum` and `askama`.
-- Added `/healthz`, `/readyz`, `/api/v1/jobs`, `/api/v1/jobs/{job_id}`, `/api/v1/executors`, `/ui`, and `/ui/jobs/{job_id}` routes.
-- Added deterministic UI demo state with one local coordinator, executor, and running job.
-- Added UI route tests for health, job listing, job detail, missing job, and HTML rendering.
-- Updated R2 tracker, crate map, file guide, and control-plane docs for the status API/Web UI.
-- Added `crates/krishiv-operator` for typed `KrishivJob` resource models, validation, scheduler job conversion, and status reconciliation.
-- Added `KrishivJobReconciler` to submit resources into the active R2 coordinator or return an accepted `NoExecutors` status when placement cannot happen yet.
-- Added `KrishivJob/status` models for phase, coordinator, observed generation, stage count, task counters, and conditions.
-- Added operator tests for batch/streaming resource conversion, invalid resources, waiting for executors, submit/observe reconciliation, running task counters, and succeeded status.
-- Updated R2 tracker, crate map, file guide, Kubernetes README, and control-plane docs for the operator reconciliation model.
-- Added live Kubernetes watch/controller support to `krishiv-operator` using `kube` dynamic objects and watcher events.
-- Added `KrishivJob/status` merge patching through the Kubernetes status subresource.
-- Added the `krishiv-operator` binary entrypoint with namespace/all-namespace watching, selectors, coordinator id, and optional R2 bootstrap executor flags.
-- Added `k8s/manifests/operator-deployment.yaml` and included it in the R2 kustomization.
-- Added tests for dynamic object conversion, explicit API resource plural, status patch shape, operator CLI parsing, and operator manifest validation.
-- Added sample early streaming `KrishivJob` manifest and included it in the R2 kustomization.
-- Added Docker image build support for the R2 binaries with `Dockerfile` and `.dockerignore`.
-- Added opt-in `kind` smoke tests for batch and early streaming `KrishivJob` status reconciliation, gated by `KRISHIV_KIND_E2E=1`.
-- Applied roadmap review: added executor binary, gRPC transport, `MetadataStore` trait, and typed plan node items to R3; added minimal `FencingToken` to R6; split R7 into R7.1/R7.2 sub-milestones; split R8 into R8.1/R8.2 sub-milestones; added numeric benchmark target requirement to R10; updated `docs/architecture/krishiv-roadmap.md` and all affected tracker files.
-- Applied reliability pull-forward review: added R3.1 task attempts, idempotent task updates, executor leases, coordinator restart recovery, durable job event log, Kubernetes finalizer cleanup, and basic stability metrics; added R4 shuffle orphan cleanup; added R5 checkpoint-barrier/watermark protocol design; added R6 versioned checkpoint/savepoint metadata and coordinator restart recovery; added R9 stale-coordinator rejection; added R10 metadata schema upgrade tests.
-- Added a shared R2 coordinator handle so the live operator reconciler and status API read/write the same scheduler state.
-- Added optional scheduler-backed status serving to `krishiv-operator` with `--status-addr`.
-- Updated Kubernetes manifests so the single operator replica owns the active R2 coordinator runtime and the `krishiv-coordinator` service exposes that runtime's HTTP status surface.
-- Added `docs/architecture/stage-local-execution.md` for the R3.1 stage-local coordinator/executor execution contract, including task attempts, executor leases, `MetadataStore` recovery, event-log expectations, failure handling, status metrics, and R4-R6 handoff boundaries.
-- Updated the R3.1 and R4 trackers, roadmap, and file guide to mark the Stage-Local Execution Model as written while keeping review/approval and runtime acceptance gates open.
-- Added `crates/krishiv-executor` with an executor startup config, minimal runtime facade, CLI skeleton, and construction of versioned registration/heartbeat requests.
-- Added R3.1 versioned coordinator/executor transport contracts to `krishiv-proto`: `TransportVersion`, `AttemptId`, `LeaseGeneration`, registration, heartbeat, task assignment, task status, input partition, plan fragment, output contract, and response disposition types.
-- Updated the runtime image build to include `krishiv-executor`.
-- Updated R3.1 roadmap/tracker/docs to mark the executor crate and transport contracts complete while leaving real gRPC, scheduler idempotency, and lease-expiry behavior open.
-- Added tonic as the R3.1 coordinator/executor service-boundary dependency.
-- Added tonic-shaped coordinator/executor service traits to `krishiv-proto`.
-- Added `CoordinatorExecutorTonicService` in `krishiv-scheduler` to apply executor registration, heartbeat, and task-status requests to the shared active coordinator.
-- Added executor runtime helpers to call coordinator registration and heartbeat through the tonic-shaped service boundary.
-- Updated the executor Kubernetes deployment to run `krishiv-executor` directly before the networked gRPC path landed.
-- Added generated protobuf/tonic contracts for the R3.1 `CoordinatorExecutor` service in `krishiv-proto`.
-- Added domain-to-wire conversion helpers for registration, heartbeat, and task-status messages.
-- Added a scheduler-backed networked coordinator/executor gRPC server in `krishiv-scheduler`.
-- Added executor gRPC client helpers and CLI modes for one-shot registration and long-running heartbeat loops.
-- Wired the operator binary to optionally serve the coordinator/executor gRPC endpoint alongside the status API.
-- Updated Kubernetes manifests so the coordinator service exposes gRPC on port 9090 and executor pods connect with `krishiv-executor --connect`.
-- Added networked registration, heartbeat, and task-status smoke coverage.
-- Added executor lease generation storage to scheduler executor records.
-- Added stale executor lease rejection for heartbeats and task-status updates.
-- Added lease generation bumping when executors are marked lost or time out.
-- Added same-id executor re-registration after loss with the next valid lease generation.
-- Added stale task-attempt rejection and duplicate terminal task-status idempotency.
-- Mapped stale lease, stale attempt, duplicate status, and unknown executor outcomes to transport dispositions.
-- Added the `ExecutorTask.AssignTask` gRPC service and wire conversions for task assignments.
-- Added scheduler assignment emission with job/stage/task ids, attempt id, executor lease generation, input partitions, plan fragment, and output contract.
-- Added an executor-side assignment inbox and networked task receiver service.
-- Added a minimal executor task runner skeleton that consumes one assignment, reports `Running`, validates placeholder fragment metadata, and reports terminal status.
-- Reviewed the pending deployment, shuffle, data-plane transport, and security architecture docs and folded their constraints into the active R3.1 handoff.
-- Aligned R4 shuffle docs around local executor disk as the default durability mode and object-store durability as opt-in.
-- Added the first narrow R3.1 executor SQL fragment execution path for `sql: SELECT 1`-style assignments, returning lightweight output metadata without Arrow payloads in control-plane Protobuf.
-- Added lifecycle coverage that sends a task assignment to an executor inbox over gRPC, executes the local SQL fragment, and reports status back to the scheduler-backed coordinator over gRPC.
-- Added bootstrap R3.1 `local-parquet:<table>:<path>` input partition registration for executor-local `sql:` fragments without starting R3.2 connector certification.
-- Added executor tests for local Parquet partition descriptor validation, scheduler-backed Parquet scan execution, and networked assignment/status Parquet scan execution with row/batch/column output metadata.
-- Added `EventLogEvent` enum (JobSubmitted, StagePlanned, TaskAssigned, TaskStarted, TaskSucceeded, TaskFailed, ExecutorLost, JobCancelled) to `krishiv-scheduler`.
-- Added `MetadataStore` trait + `InMemoryMetadataStore` to `krishiv-scheduler`.
-- Added `LeaderElection` trait + `SingleNodeElection` (no-op) to `krishiv-scheduler`.
-- Added `JobSubmitter` trait to `krishiv-scheduler`.
-- Added `Coordinator::recover_from_store` for restart recovery from a `MetadataStore`.
-- Added `ExecutorRuntime::deregister_with_grpc_endpoint` (best-effort `Draining` heartbeat) to `krishiv-executor`.
-- Added SIGTERM handler to executor `heartbeat_loop`: on signal, sends deregistration heartbeat and exits cleanly.
-- Added `terminationGracePeriodSeconds: 30` to `k8s/manifests/executor-deployment.yaml`.
-- Added `deletion_timestamp` field to `ObjectMeta` in `krishiv-operator`.
-- Added `has_finalizer` and `is_being_deleted` helpers to `ObjectMeta`.
-- Added `FinalizerAdded` and `FinalizerRemoved` variants to `ReconcileAction`.
-- Wired finalizer lifecycle logic at the top of `KrishivJobReconciler::reconcile`.
-- Added `Coordinator::with_store` builder; wired `MetadataStore` write-through into `submit_job` and `apply_task_update` (Slice 1).
-- `advance_heartbeat_clock` now resets Running tasks on lost executors to `Assigned` for automatic reassignment (Slice 3).
-- Added `Coordinator::push_cancel_job` async method that sends `CancelTask` gRPC to all executors owning running tasks (Slice 4).
-- Added `NodeOp` typed operator enum, `PlanSchema`/`SchemaField`/`FieldType` types, and optional `op`/`output_schema` fields to `PlanNode` in `krishiv-plan` (Slice 5).
-- Added `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` to `ExecutorHeartbeatRequest` and `ExecutorHeartbeat`; stored as `ExecutorHealthSnapshot` per `ExecutorRecord`; memory-aware placement skips over-threshold executors (Slice 6).
-- Added `operator_restart_does_not_duplicate_scheduler_jobs` test confirming idempotent reconciliation (Slice 7).
-- Added dedicated `DeregisterExecutor` RPC: `DeregisterExecutorRequest`/`DeregisterExecutorResponse` in `krishiv-proto`, `Coordinator::deregister_executor`, gRPC service handler in `krishiv-scheduler`, wire helpers, and `grpc_deregister_transitions_executor_to_removed` test.
-- Wired `cancel_job` into `KrishivJobReconciler` delete path before stripping finalizer; added `reconcile_delete_calls_cancel_job_before_removing_finalizer` test.
-- Added `task_timeout_secs` to `TaskSpec` and `ExecutorTaskAssignment`; wired through proto (`uint64 task_timeout_secs = 11`); executor enforces with `tokio::time::timeout` reporting `TaskFailed` on expiry.
-- Added `last_failure_reason` to `TaskRecord` and `TaskSnapshot`; propagated to `TaskView` in status API.
-- Added `lease_generation`, `memory_used_bytes`, `memory_limit_bytes`, `active_task_count` to `ExecutorView` in status API.
-- Added `k8s/manifests/network-policy.yaml` restricting coordinator gRPC (port 9090) to `krishiv-system` namespace; added to kustomization; validated by `network_policy_restricts_coordinator_grpc_to_krishiv_namespace` test.
-- Wired `ExecutorRuntime::deregister_with_grpc_endpoint` to call the real `DeregisterExecutor` gRPC RPC; SIGTERM handler in `heartbeat_loop` calls this path; added `deregister_via_grpc_endpoint_transitions_executor_to_removed` test.
-- Added `CancelTask` running-task handler: `cancel_task` now marks tasks in a `cancelled_tasks` set; runner checks after `Running` status and sends `TaskCancelled` instead of executing; added `task_runner_reports_cancelled_when_inbox_cancel_received` test.
-- Wired live `StabilityMetrics` to `/metrics` endpoint in `krishiv-ui`; replaces hardcoded zeros with running task count, retry count, failed assignments, and max heartbeat age in Prometheus text format.
-- Added `StabilityMetrics::empty()` constructor for lock-unavailable fallback.
-- Added standalone `krishiv-coordinator` binary to `krishiv-scheduler` (`--coordinator-id`, `--grpc-addr`, `--help`); starts gRPC server for bare-metal / VM deployments without Kubernetes; 5 CLI tests pass.
-
-## In Progress
-
-- None. R6 fully closed. Pre-R7 hardening complete. Ready for R7.1.
+- Live K8s Lease API calls in `K8sLeaseElection` (R9 uses simulated lease; wired in R10)
+- Policy hook enforcement at DataFusion scan layer (deferred to R10)
+- OTLP gRPC transport (HTTP/proto used in R9; gRPC deferred to avoid tonic conflict)
+- OIDC/JWT token validation (static API key in R9; OIDC in R10)
+- `kind` cluster e2e failover test (deferred — requires kind cluster in CI)
+- Row-level enforcement inside DataFusion operators (policy hook interface defined; enforcement in R10)
 
 ## Next Steps
 
-1. **R7.1 resource manager**: Implement `CrdQueueManager` (K8s) and `ConfigFileQueueManager` (process mode); add `KrishivQueue` CRD; wire quota enforcement into `submit_job` via `QueueManager`.
-2. **R7.1 admission tests**: Jobs above quota queued, cost metrics visible in status API.
-3. **R7.2 backpressure**: Credit-based flow control, bounded operator queues, source throttling.
+1. Complete R9 commit + push
+2. Run full workspace test suite
+3. Begin R10 planning (GA platform, stable API policy, benchmarks, connector certification)
 
-## Pre-R7 Hardening (completed this session)
+## Last Validation (R9 in-progress)
 
-- **Exactly-once certification doc**: `docs/architecture/exactly-once-certification.md` written — names the certified triple, marks all other combinations at-least-once, cross-references chaos tests. R6 acceptance gate now fully closed.
-- **Checkpoint timer wired**: `CheckpointCoordinator::try_tick(elapsed_ms)` added; `advance_heartbeat_clock` drives per-job checkpoint interval timers automatically. `CoordinatorConfig::tick_period_ms` (default 1 000 ms) controls the tick-to-ms conversion. 3 new tests.
-- **`QueueManager` trait stabilized**: `QueueManager` + `InMemoryQueueManager` + `SubmitOutcome { Accepted, Queued }` added to `krishiv-scheduler`. `Coordinator::with_queue_manager` builder wired. `submit_job` returns `SchedulerResult<SubmitOutcome>`. 3 new tests.
-- **R7 tracker updated**: Pre-R7 architectural decisions documented in `docs/implementation/r7-resource-governance-and-adaptivity.md`.
-
-**Validation**: `cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace` — 0 failures (74 scheduler tests).
-
-## Known Blockers
-
-- R2 `kind` smoke validation is deferred because local Podman image build hit a TLS certificate trust issue while pulling the Rust base image.
+- `cargo test --lib -p krishiv-metrics`: 5 passed
+- `cargo test --lib -p krishiv-governance`: 10 passed
+- `cargo test --lib -p krishiv-checkpoint`: 27 passed (includes fencing + replay bundle tests)
+- `cargo test --lib -p krishiv-plan`: 17 passed (includes plan diff tests)
+- `cargo test --lib -p krishiv-operator`: 34 passed (includes K8sLeaseElection + failover tests)
+- `cargo test --lib -p krishiv-scheduler`: 90 passed
+- Branch: `claude/plan-r7-implementation-lt3n3`
 
 ## Architectural Inputs To Preserve
 
-- Distributed mode has two targets: Kubernetes is primary, and bare metal / VM is secondary. Core runtime crates must remain deploy-target neutral; Kubernetes API access belongs in `krishiv-operator`, Kubernetes packaging under `k8s/`, and narrowly scoped CLI paths.
-- Control-plane traffic stays on tonic gRPC + Protobuf for registration, heartbeat, task assignment, task status, cancellation, and deregistration.
-- Bulk Arrow data must not be added to control-plane Protobuf messages. R4 uses Arrow IPC for shuffle writes and Arrow Flight for shuffle reads/query result transfer.
-- R4 shuffle defaults to local executor disk with optional object-store durability. Do not assume S3/object storage is required for distributed execution.
-- Pre-R9 coordinator/executor gRPC has no mTLS or application-level auth. Task specs must not contain credentials or secret values; shared Kubernetes deployments require namespace isolation, NetworkPolicy, and component-specific service accounts.
-
-## Last Validation
-
-- `cargo fmt --all` applied and `cargo fmt --check` passed (branch `claude/analyze-recommend-slices-Ai5GY`).
-- `cargo check --workspace` passed.
-- `cargo test -p krishiv-catalog -p krishiv-connectors` passed — 28 tests, 0 failures (S3: 3, Kafka: 7, Parquet: 4, lib: 5, DataFusion bridge: 3, CertificationSuite new: 2).
-- `cargo fmt --all --check` passed (branch `claude/analyze-codebase-recommendations-5vvXH`).
-- `cargo check --workspace` passed.
-- `cargo test --workspace` passed — 0 failures across all crates.
-- `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py codex/skills/krishiv-engine` passed.
-- `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/gopal/.agents/skills/krishiv-engine` passed.
-- `find docs/implementation -maxdepth 1 -type f -print | sort` shows R1-R10 trackers, README, and status files.
-- `wc -l docs/implementation/*.md` completed successfully.
-- `python3 /Users/gopal/.codex/skills/.system/skill-creator/scripts/quick_validate.py /Users/gopal/.agents/skills/krishiv-engine` passed after tracker-index sync.
-- `cargo fmt --all --check` passed.
-- `cargo check --workspace` passed.
-- `cargo test --workspace` passed.
-- `cargo run -p krishiv-cli -- sql --query "select 1 as value"` passed.
-- `cargo run -p krishiv-cli -- explain --query "select 1 as value"` passed.
-- `cargo run -p krishiv-cli -- jobs` passed.
-- `cargo run -p krishiv-cli -- submit --job-id job-demo --name demo --tasks 2 --launch` passed.
-- `cargo run -p krishiv-cli -- jobs --distributed` passed.
-- `cargo test -p krishiv-scheduler` passed, including offline R2 manifest validation tests.
-- `cargo test -p krishiv-scheduler --test r2_k8s_manifests` passed.
-- `cargo test -p krishiv-ui` passed.
-- `cargo test -p krishiv-operator` passed.
-- `cargo test -p krishiv-operator --test r2_kind_smoke` passed with the default skip path.
-- `cargo check -p krishiv-operator` passed.
-- `cargo test -p krishiv-cli` passed.
-- `cargo run -p krishiv-operator -- --help` passed and listed `--status-addr`.
-- `cargo run -p krishiv-ui -- --help` passed.
-- `cargo run -p krishiv-ui -- --demo --addr 127.0.0.1:18080` started the demo status server.
-- `curl http://127.0.0.1:18080/healthz` returned `ok`.
-- `curl http://127.0.0.1:18080/api/v1/jobs` returned the demo `job-demo` status.
-- `curl http://127.0.0.1:18080/ui` rendered the R2 status HTML page.
-- `cargo run -p krishiv-api --example local_sql_parquet` passed.
-- `cargo run -p krishiv-api --example memory_stream` passed.
-- `cargo run -p krishiv-cli -- --help` passed.
-- `cargo run -p krishiv-cli -- explain --help` passed.
-- `find . -path './target' -prune -o -type f -print | sort` confirmed the bootstrap file inventory.
-- `cargo test -p krishiv-executor` passed after the first narrow executor SQL fragment execution path landed.
-- Placeholder scan across repo docs and crates returned no actionable markers.
-- `git diff --check` passed after the R3.1 Stage-Local Execution Model document update.
-- Placeholder scan across the updated R3.1/R4 roadmap and tracker docs returned no actionable markers.
-- `cargo fmt --all --check` passed after adding `krishiv-executor` and R3.1 transport contracts.
-- `cargo check --workspace` passed.
-- `cargo test -p krishiv-proto -p krishiv-executor` passed.
-- `cargo run -p krishiv-executor -- --help` passed.
-- `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:8080` passed and printed registration/heartbeat contract summaries.
-- `git diff --check` passed after the R3.1 executor/transport contract slice.
-- Placeholder scan across the R3.1 executor/transport contract files and updated docs returned no actionable markers.
-- `cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after adding tonic-shaped services.
-- `cargo fmt --all --check` passed after adding tonic-shaped services.
-- `cargo check --workspace` passed after adding tonic-shaped services.
-- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed.
-- `cargo test -p krishiv-scheduler --test r2_k8s_manifests` passed after updating the executor manifest command.
-- `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:8080` passed after adding the tonic-shaped service helpers.
-- `git diff --check` passed after the tonic-shaped service boundary slice.
-- Placeholder scan across the tonic-shaped service boundary files and updated docs returned no actionable markers.
-- `cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-operator` passed after adding the networked gRPC server/client path.
-- `cargo test -p krishiv-scheduler grpc_service_registers_and_heartbeats_over_network` passed; the test skips only when the local sandbox denies loopback sockets.
-- `cargo test -p krishiv-scheduler grpc_service_registers_and_heartbeats_over_network -- --nocapture` passed with elevated loopback-socket permission and exercised the real networked gRPC path.
-- `cargo fmt --all --check` passed after formatting the gRPC transport slice.
-- `cargo check --workspace` passed after adding protobuf generation and tonic transport dependencies.
-- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-operator` passed.
-- `cargo test -p krishiv-executor` passed after the executor heartbeat-loop polish.
-- `cargo fmt --all --check` passed after adding bootstrap local Parquet partition execution.
-- `cargo check -p krishiv-executor` passed after adding bootstrap local Parquet partition execution.
-- `cargo test -p krishiv-executor` passed after adding descriptor validation plus scheduler-backed and networked local Parquet scan coverage.
-- `cargo check --workspace` passed after the R3.1 local Parquet executor slice.
-- `git diff --check` passed after the R3.1 local Parquet executor slice.
-- `cargo check --workspace` passed again after final code/doc updates.
-- `cargo run -p krishiv-executor -- --help` passed and listed `--register-once`, `--connect`, and `--heartbeat-interval-secs`.
-- `cargo run -p krishiv-operator -- --help` passed and listed `--executor-grpc-addr`.
-- `cargo run -p krishiv-executor -- --executor-id exec-demo --host demo-pod --slots 2 --coordinator http://coordinator:9090` passed and printed dry-run registration/heartbeat summaries.
-- `git diff --check` passed after the networked gRPC transport slice.
-- Stale network-placeholder scan across `crates`, `docs`, and `k8s` returned no matches.
-- `cargo test -p krishiv-scheduler --lib` passed after adding scheduler-side lease and attempt validation.
-- `cargo fmt --all --check` passed after the scheduler-side lease/attempt validation slice.
-- `cargo check --workspace` passed after the scheduler-side lease/attempt validation slice.
-- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-cli -p krishiv-ui -p krishiv-operator` passed after the scheduler-side lease/attempt validation slice.
-- `git diff --check` passed after the scheduler-side lease/attempt validation slice.
-- `cargo fmt --all --check` passed after the task-assignment RPC/receiver slice.
-- `cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after the task-assignment RPC/receiver slice.
-- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed, including the executor assignment gRPC loopback test.
-- `cargo check --workspace` passed after the task-assignment RPC/receiver slice.
-- `git diff --check` passed after the task-assignment RPC/receiver slice.
-- `git diff --check` passed after reconciling pending architecture/security roadmap docs.
-- Search for stale S3-default shuffle and old Kubernetes-isolation wording returned no matches in `docs/architecture`, `docs/implementation`, or `docs/security`.
-- `cargo check -p krishiv-executor` passed after the minimal task runner skeleton.
-- `cargo fmt --all --check` passed after the minimal task runner skeleton.
-- `cargo check --workspace` passed after the minimal task runner skeleton.
-- `cargo test -p krishiv-proto -p krishiv-scheduler -p krishiv-executor` passed after the minimal task runner skeleton.
-- `git diff --check` passed after the minimal task runner skeleton.
-- `git diff --check` passed after the shared Codex/Claude Code agent workflow update.
-- `python3 - <<'PY' ...` verified both agent interface YAML files include display, default prompt, resume prompt, rate-limit strategy, and supported-agent metadata.
-- `rg -n "Codex|Claude Code|rate-limit|resume|status.md" ...` confirmed the shared workflow, skill, Claude entrypoint, interface configs, and status handoff all reference the rate-limit/resume paths.
-- `git diff --check` passed after adding the Claude Code project-skill shim and correcting Claude skill invocation docs.
-- `test -f .claude/skills/krishiv-engine/SKILL.md && rg -n "/krishiv-engine|codex/skills/krishiv-engine/SKILL.md|Claude Code" .claude/skills/krishiv-engine/SKILL.md CLAUDE.md docs/engineering/codex-workflow.md codex/skills/krishiv-engine/SKILL.md codex/skills/krishiv-engine/agents/claude.yaml` confirmed Claude Code project-skill discovery and canonical-skill references.
-- `cargo test -p krishiv-scheduler --lib` passed (32 tests, including `in_memory_metadata_store_round_trips`, `single_node_election_is_always_leader`, `coordinator_recovers_jobs_from_store`).
-- `cargo test -p krishiv-operator --lib` passed (17 tests, including `reconcile_adds_finalizer_on_first_observe`, `reconcile_removes_finalizer_on_deletion`).
-- `cargo test -p krishiv-executor --lib` passed (7 tests).
-- `cargo fmt --all --check` passed after R3.1 remaining slices.
-- `cargo fmt --all` applied; `cargo check --workspace` passed after R3.1 deregister/cancel/timeout/NetworkPolicy/UI-status slices.
-- `cargo test --workspace` passed — 0 failures across all crates (all test result lines `ok`).
-- `cargo run -p krishiv-scheduler --bin krishiv-coordinator -- --help` passed and listed `--coordinator-id` and `--grpc-addr`.
-- `cargo fmt --all` applied; `cargo check --workspace` passed after A–D slices.
-- `cargo test --workspace` passed — 0 failures (executor: 10 tests; ui: 8 tests; scheduler: 42 tests).
-- R3.2 Slices 1–3: `crates/krishiv-connectors` (connector traits + Parquet reader/writer, 9 tests) and `crates/krishiv-catalog` (catalog types + InMemoryCatalog, 4 tests) created.
-- `cargo fmt --all` applied; `cargo check --workspace` passed; `cargo test -p krishiv-catalog -p krishiv-connectors` passed — 13 tests, 0 failures.
-- R3.2 Slices 4–7: S3 connector (`s3.rs`), Kafka stubs (`kafka.rs`), DataFusion catalog bridge (`datafusion_bridge` module in `krishiv-catalog`), and expanded `CertificationSuite` (`run_bounded_exhaustion_test`, `run_idempotent_sink_test`) implemented.
-- `object_store = "0.12"`, `bytes = "1"`, `async-trait = "0.1"` added to workspace dependencies.
-- `cargo fmt --all` applied; `cargo check --workspace` passed; `cargo test -p krishiv-catalog -p krishiv-connectors` passed — 28 tests, 0 failures.
-- **R3.2 Slice A**: At-least-once sink contract (`AtLeastOnceSinkContract` doc struct), `ParquetOffset` implementing `Offset` with encode/decode, `CertificationSuite::run_offset_round_trip_test`, and 3 new tests added to `krishiv-connectors`. `ParquetSource::current_offset()` returns typed `ParquetOffset`.
-- **R3.2 Slice B**: CDC design document written at `docs/rfcs/cdc-design.md` covering log-based/poll-based capture, `_cdc_op/_cdc_ts_ms/_cdc_lsn/_cdc_table` column model, offset model for PostgreSQL/MySQL/poll-based, Krishiv integration points, and R3 limitations.
-- **R3.2 Slice C**: `SchemaRegistry` trait and `InMemorySchemaRegistry` backed by `BTreeMap` added to `krishiv-catalog`; 3 new tests pass.
-- **R3.2 Slice D**: `ConnectorCapabilityFlags` struct added to `krishiv-proto`; `TaskSpec` extended with `source_capabilities`/`sink_capabilities` builder methods; `TaskSnapshot` in `krishiv-scheduler` propagates fields; `ConnectorCapabilityView` added to `krishiv-ui` `TaskView`.
-- **R4 Bootstrap Slice E**: `register_record_batches()` added to `SqlEngine` in `krishiv-sql`; `krishiv-connectors` dep added to `krishiv-executor`; `CONNECTOR_PARQUET_PARTITION_PREFIX` + `read_connector_parquet_partitions()` wired into `execute_stage_fragment()`; new test `executor_runs_parquet_task_via_connector_source` passes.
-- **R4 Bootstrap Slice F**: `ShuffleStore` trait, `InMemoryShuffleStore`, and `LocalDiskShuffleStore` added to `krishiv-shuffle` with lease-token zombie-executor rejection; `parquet` and `bytes` deps added to `krishiv-shuffle/Cargo.toml`; 8 new tokio async tests pass.
-
-- **R3 closure slices (previous session)**: Added `PostWriteOffsetCommitProtocol` and `OffsetCommitter` to enforce write → flush → offset commit ordering; added deterministic in-memory Kafka-compatible source and commit log; added executor Kafka → Parquet pipeline support using `ParquetSink`; added real-runner tests for the pipeline and connector-Parquet path; added assignment lease-generation → shuffle stale-token rejection proof.
-- **R3 hardening slices (previous session)**: Added object-store Parquet source/sink execution descriptors on the real executor runner, `JsonFileMetadataStore` for durable local metadata/event-log recovery, and operator-side executor pod launch failure detection/status reporting.
-- **R3 practical remaining slices (previous session)**: Hardened `ShuffleStore` with registered exact lease-token validation before commit, extended the zombie-executor proof so stale writes cannot win before fresh output commits, and made operator pod-launch failure handling mark associated executors lost/requeue running tasks.
-- **R1–R3 architecture remediation (this session)**: Added typed task input/output descriptors and wire round trips while keeping legacy string compatibility; migrated executor connector/object/Kafka tests to typed descriptors; added JSON metadata `schema_version`/`store_kind` envelope validation; reconciled R1/R2 roadmap checklist state; documented the R1–R3 architecture review and reconciled the already-approved streaming execution model in the roadmap.
-
-## Last Validation (post-R4 bug sweep, branch `claude/analyze-r3-plan-r4-0QYyr`)
-
-- `cargo fmt --all` applied.
-- `cargo build --workspace` passed (clean, 0 errors).
-- `cargo test --workspace` passed — 0 failures across all crates and doc tests.
-- Commits: `f2d8b6d` (Tier 1), `9add4f3` (Tier 2), `98f9c59` (Tier 3), `e328e89` (TPC-H correctness gate), `1492fac` (fmt), `bea4f03` (post-R4 bug sweep).
-- Branch pushed to remote: `origin/claude/analyze-r3-plan-r4-0QYyr`.
-
-## Last Validation (Pre-R5 hardening, branch `claude/analyze-r3-plan-r4-0QYyr`)
-
-- `cargo fmt --all` applied.
-- `cargo test --workspace` passed — 0 failures (scheduler: 48 lib tests including 4 new streaming tests; all other crates clean).
-
-## Pre-R5 Hardening Summary
-
-- **`refresh_state()` streaming guard**: `JobRecord::refresh_state()` in `krishiv-scheduler` now guards `JobKind::Streaming` jobs from ever transitioning to `JobState::Succeeded`. Tests: `streaming_job_does_not_succeed_when_all_stages_succeed` and `batch_job_succeeds_when_all_stages_succeed` both pass.
-- **Streaming re-attach protocol**: `CoordinatorConfig::streaming_reattach_grace_ticks` (default 5), `Coordinator::recovering` flag, and grace-period eviction guard added to `advance_heartbeat_clock`. `recover_from_store` now sets `ticks_since_restart = 0` and `recovering = true`. Tests: `streaming_executor_not_evicted_within_grace_period` and `streaming_executor_evicted_after_grace_period` both pass.
-- **Executor `ExecutionModel` dispatch**: `ExecutionModel` enum (`Batch` / `Streaming`) added to `krishiv-executor`; dispatch on `stream:` fragment prefix; `execute_stage_fragment` renamed to `execute_batch_fragment`; `execute_streaming_fragment` stub added returning `StreamingNotImplemented`. 6 new executor tests pass.
-- **`StreamingAqeGuard` and `AqeOptimizer`**: Added to `krishiv-optimizer`; `AqeOptimizer::guarded_rules` are skipped for streaming plans; 3 new optimizer tests pass.
-- **`StreamingTaskState` proto type**: Added to `krishiv-proto` with `task_id`, `watermark_ms`, `source_offset`; attached to `ExecutorHeartbeat` via `streaming_task_states` field.
-- **Architecture docs**: `docs/architecture/checkpoint-protocol.md` and `docs/architecture/keyed-distribution-stability.md` written and committed.
-
-## Last Validation (R5 complete + code quality sweep, branch `claude/plan-r5-implementation-NXiWo`)
-
-- `cargo clippy --workspace -- -D warnings`: 0 errors.
-- `cargo test --workspace`: 0 failures across all crates.
-- Fixes applied: `SlidingWindowOperator::build_output_batch` now delegates to shared `build_window_record_batch` helper (same as `TumblingWindowOperator`); executor parquet-read loop converted from `loop/match` to `while let`; scheduler `or_insert_with(ShuffleMetadata::new)` → `or_default()`; shuffle crate: type aliases for complex types, `async fn` conversion, `while let` loop, IPC serialization bug, 256 MiB client read guard; executor: silent watermark downcast failure → propagated error; dead constant removed.
-- Commit: `f3c8eb7`.
-
-## Last Validation (R5.1 complete, branch `claude/plan-r5-implementation-NXiWo`)
-
-- `cargo fmt --all` applied; `cargo test --workspace` passed — 0 failures across all crates (~355 tests).
-- New crate `krishiv-state`: 12 tests pass.
-- `krishiv-api` streaming builder: 4 new tests pass.
-- `krishiv-exec` `WatermarkState` + `TumblingWindowOperator`: 9 + 4 tests pass.
-- `krishiv-executor` `execute_streaming_fragment` + `BarrierSimulator`: 10 new tests pass.
-- `krishiv-scheduler` streaming re-attach protocol: 2 new tests pass (`streaming_reattach_updates_task_watermark_and_offset`, `streaming_reattach_does_not_affect_batch_tasks`).
-- `docs/architecture/streaming-execution-model.md` expanded with re-attach protocol (§6), `prev_watermark_ms` semantics (§7.2), and clock skew policy (§7.3).
-
-## Resume Instructions
-
-For a new Codex session:
-
-1. Read `AGENTS.md`.
-2. Read this file.
-3. Read `docs/implementation/r5-stateful-streaming-core.md`.
-4. R5.1 implementation (slices A–G) is complete. Next: R5.1 acceptance gate (live Kafka path), then R5.2.
-
-For a new Claude Code session:
-
-Start with `/krishiv-engine resume`, then:
-
-1. Read `AGENTS.md`.
-2. Read `CLAUDE.md`.
-3. Read this file.
-4. Read `docs/implementation/r5-stateful-streaming-core.md`.
-5. Continue from the Next Steps list above; do not rely on Codex-only or Claude-only chat history.
+- Distributed mode targets: Kubernetes (primary), bare-metal/VM (secondary).
+- Control-plane: tonic gRPC + Protobuf. Bulk Arrow data uses Arrow IPC/Flight.
+- R7.2 backpressure: intra-stage only. Cross-stage via `ThrottleCommand`. Full credit propagation deferred to R9/R10.
+- `LeaderElection` trait in `krishiv-scheduler`; K8s implementation in `krishiv-operator`. Zero K8s API in core runtime.
+- Python UDF thread model: `spawn_blocking` — never hold GIL on Tokio worker.
+- Flight SQL: thin adapter over `Session::sql_async()` — same planner/runtime as CLI.
+- Fencing tokens: every coordinator that writes checkpoint metadata must hold the current leader lease; stale writes rejected by `validate_fencing_token()`.

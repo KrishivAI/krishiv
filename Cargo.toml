@@ -16,7 +16,13 @@ members = [
     "crates/krishiv-shuffle",
     "crates/krishiv-sql",
     "crates/krishiv-state",
+    "crates/krishiv-udf",
     "crates/krishiv-ui",
+    "crates/krishiv-python",
+    "crates/krishiv-lakehouse",
+    "crates/krishiv-flight-sql",
+    "crates/krishiv-metrics",
+    "crates/krishiv-governance",
 ]
 resolver = "3"
 
@@ -29,6 +35,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arrow = { version = "55.1.0", features = ["prettyprint"] }
 arrow-flight = { version = "55.1.0", features = ["flight-sql-experimental"] }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+iceberg = "0.9"
 async-trait = "0.1"
 bytes = "1"
 object_store = "0.12"
@@ -52,6 +60,14 @@ tonic = { version = "0.14.5", features = ["transport"] }
 tonic-prost = "0.14.5"
 tonic-prost-build = "0.14.5"
 tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace"] }
+opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

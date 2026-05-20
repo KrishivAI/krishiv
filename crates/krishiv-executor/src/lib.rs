@@ -922,7 +922,8 @@ impl ExecutorTaskRunner {
     ) -> ExecutorResult<ExecutorTaskOutput> {
         use arrow::array::Int64Array;
         use krishiv_exec::{
-            AggExpr, AggFunction, TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
+            AggExpr, AggFunction, OperatorMessage, TumblingWindowOperator, TumblingWindowSpec,
+            WatermarkState, operator_queue,
         };
 
         let fragment = assignment.plan_fragment().description().trim();
@@ -955,38 +956,62 @@ impl ExecutorTaskRunner {
         let mut total_batches: usize = 0;
         let mut column_count: usize = 0;
 
-        for batch in &batches {
-            // Advance watermark from event times in this batch.
-            let time_idx = batch.schema().index_of(&spec.time_col).map_err(|_| {
-                ExecutorError::LocalExecution {
-                    message: format!(
-                        "event_time column '{}' not found in stream-kafka batch",
-                        spec.time_col
-                    ),
-                }
-            })?;
-            let arr = batch
-                .column(time_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| ExecutorError::LocalExecution {
-                    message: format!("event_time column '{}' must be Int64", spec.time_col),
-                })?;
-            for row in 0..arr.len() {
-                watermark.advance(arr.value(row));
+        // Wire batches through the bounded backpressure OperatorQueue (R7.2 Group B).
+        // The producer task feeds all parsed batches into the queue then drops the
+        // sender so the receiver loop terminates naturally.
+        let (tx, mut rx) = operator_queue(64);
+        tokio::spawn(async move {
+            for batch in batches {
+                // Ignore send errors: the receiver may have dropped on cancellation.
+                let _ = tx.send_data(batch).await;
             }
+            // tx drops here, closing the data channel.
+        });
 
-            let new_wm = watermark.current_watermark_ms();
-            let output = window_op.process_batch(batch, new_wm).map_err(|e| {
-                ExecutorError::LocalExecution {
-                    message: format!("streaming window process_batch failed: {e}"),
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                OperatorMessage::Data(batch) => {
+                    // Advance watermark from event times in this batch.
+                    let time_idx =
+                        batch.schema().index_of(&spec.time_col).map_err(|_| {
+                            ExecutorError::LocalExecution {
+                                message: format!(
+                                    "event_time column '{}' not found in stream-kafka batch",
+                                    spec.time_col
+                                ),
+                            }
+                        })?;
+                    let arr = batch
+                        .column(time_idx)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| ExecutorError::LocalExecution {
+                            message: format!(
+                                "event_time column '{}' must be Int64",
+                                spec.time_col
+                            ),
+                        })?;
+                    for row in 0..arr.len() {
+                        watermark.advance(arr.value(row));
+                    }
+
+                    let new_wm = watermark.current_watermark_ms();
+                    let output = window_op.process_batch(&batch, new_wm).map_err(|e| {
+                        ExecutorError::LocalExecution {
+                            message: format!("streaming window process_batch failed: {e}"),
+                        }
+                    })?;
+
+                    for ob in &output {
+                        total_rows += ob.num_rows();
+                        total_batches += 1;
+                        column_count = ob.num_columns();
+                    }
                 }
-            })?;
-
-            for ob in &output {
-                total_rows += ob.num_rows();
-                total_batches += 1;
-                column_count = ob.num_columns();
+                OperatorMessage::Barrier { epoch } => {
+                    // Barrier received: checkpoint handling is deferred to R8.
+                    let _ = epoch;
+                }
             }
         }
 
@@ -2539,8 +2564,8 @@ mod tests {
         JobState, LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
         OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
         StageId, StageSpec, StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId,
-        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
-        TransportVersion, wire,
+        TaskSpec, TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
+        wire,
     };
 
     use super::ExecutionModel;
@@ -4246,6 +4271,34 @@ mod tests {
             matches!(err, super::ExecutorError::InvalidAssignment { .. }),
             "expected InvalidAssignment, got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_fragment_routes_data_through_operator_queue() {
+        // Verify that the OperatorQueue-wired path produces the same output as
+        // the previous direct-iteration path.  Uses a 1-second tumbling window
+        // with a count aggregation over two keys so we can assert the row and
+        // batch counts are preserved end-to-end.
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let assignment = make_streaming_assignment(
+            "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count",
+            vec![
+                "stream-kafka:events:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1",
+            ],
+        );
+        let output = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .unwrap();
+
+        // Same expected result as streaming_tumbling_window_count_produces_correct_output:
+        // 2 unique keys → 2 output window rows across 2 batches.
+        assert_eq!(
+            output.kind(),
+            super::ExecutorTaskOutputKind::StreamingWindow
+        );
+        assert_eq!(output.row_count(), 2);
+        assert_eq!(output.batch_count(), 2);
     }
 
     // Slice F: checkpoint-barrier simulation tests.

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 futures.workspace = true
 k8s-openapi.workspace = true
+krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-ui = { path = "../krishiv-ui" }
