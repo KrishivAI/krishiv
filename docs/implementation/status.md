@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**R10 Sprint 0 complete.** All 12 architecture deliverables written and committed on branch `claude/plan-r10-architecture-GnRvo`. R1–R9 are complete on branch `claude/plan-r7-implementation-lt3n3`.
+**R10 Sprint 1a + Sprint 2a complete.** Auth and policy governance wired into `krishiv-sql` and `krishiv-flight-sql`. Sprint 0 architecture deliverables remain committed on branch `claude/plan-r10-architecture-GnRvo`.
 
 ## Active Task
 
-**R10 Sprint 1** — deferred R9 items: live K8s Lease API, policy hooks at DataFusion scan layer, OTLP integration test, kind failover e2e CI workflow.
+**R10 Sprint 1b/1c/1d** — live K8s Lease API, OTLP integration test, kind failover e2e CI workflow (pre-existing uncommitted changes in krishiv-operator and krishiv-metrics require API fixes before committing).
 
 ### Completed (committed to branch)
 
@@ -29,6 +29,7 @@
 | `4ae8a82` | R4a+R5a: typed shuffle wiring (ShuffleWriteConfig/ReadConfig) + redb state backend |
 | `6266f8a` | R6a: out-of-band checkpoint barrier (trigger_checkpoint_for_job, checkpoint_ack RPC) |
 | `(pending)` | R6c: LocalParquetTwoPhaseCommitSink in krishiv-connectors |
+| `(this session)` | R10 Sprint 1a+2a: `PolicyEnforcingSqlEngine` in krishiv-sql + auth/policy wiring in KrishivFlightSqlService |
 
 ## R4/R5/R6 Architecture Decisions (locked)
 
@@ -46,16 +47,17 @@
 
 ## Next Steps
 
-1. Sprint 1a: Wire `AuthProvider` + `PolicyHook` enforcement at DataFusion scan layer in `krishiv-sql`
-2. Sprint 1b: Replace simulated `K8sLeaseElection` with live async K8s Lease API calls in `krishiv-operator`
-3. Sprint 1c: Add OTLP integration test (feature-gated, skipped without live collector) in `krishiv-metrics`
-4. Sprint 1d: Add `.github/workflows/kind-e2e.yml` for `kind` cluster failover CI
-5. Sprint 2: Wire `AuthProvider` + `PolicyHook` through `KrishivFlightSqlService` in `krishiv-flight-sql`
-6. Sprint 2+: Data quality rules, dead-letter sink, upgrade tests, CDC pipeline, materialized views, benchmarks
+1. Sprint 1b: Replace simulated `K8sLeaseElection` with live async K8s Lease API calls in `krishiv-operator` (has pre-existing Patch::MergePatch API mismatch to fix)
+2. Sprint 1c: Add OTLP integration test in `krishiv-metrics` (has pre-existing `SdkTracerProvider`/`with_endpoint` API mismatch to fix)
+3. Sprint 1d: Add `.github/workflows/kind-e2e.yml` for `kind` cluster failover CI
+4. Sprint 2+: Data quality rules, dead-letter sink, upgrade tests, CDC pipeline, materialized views, benchmarks
 
 ## Last Validation
 
-- `cargo check --workspace`: clean (one unused import warning in krishiv-executor)
+- `cargo test -p krishiv-sql`: 10/10 passed (includes 4 policy engine tests)
+- `cargo test -p krishiv-flight-sql`: 13/13 passed (includes 7 auth/governance tests)
+- `cargo check -p krishiv-sql -p krishiv-flight-sql -p krishiv-governance`: clean
+- `cargo check --workspace`: krishiv-metrics and krishiv-operator fail due to pre-existing API version mismatches (opentelemetry-otlp SdkTracerProvider rename, kube Patch::MergePatch variant removal) — unrelated to Sprint 1a/2a
 - Branch: `claude/plan-r10-architecture-GnRvo`
 - Sprint 0 docs: `docs/architecture/stability-policy.md`, `compatibility-matrices.md`, `jdbc-odbc-architecture.md`, `cdc-reference.md`, `materialized-views.md`, `data-quality-model.md`, `upgrade-compatibility-policy.md`, `benchmark-targets.md`
 - R10 tracker: 12/12 architecture deliverables checked off

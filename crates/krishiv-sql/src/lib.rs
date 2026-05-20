@@ -31,6 +31,8 @@ pub enum SqlError {
     Unsupported { feature: String },
     /// DataFusion returned an error.
     DataFusion { message: String },
+    /// Access denied by auth or policy check.
+    AccessDenied { reason: String },
 }
 
 impl fmt::Display for SqlError {
@@ -40,6 +42,7 @@ impl fmt::Display for SqlError {
             Self::EmptyTableName => f.write_str("table name is empty"),
             Self::Unsupported { feature } => write!(f, "unsupported SQL feature: {feature}"),
             Self::DataFusion { message } => write!(f, "DataFusion error: {message}"),
+            Self::AccessDenied { reason } => write!(f, "access denied: {reason}"),
         }
     }
 }
@@ -326,6 +329,269 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
             message: error.to_string(),
         })?
         .to_string())
+}
+
+// ─── Policy-Enforcing SQL Engine ──────────────────────────────────────────────
+
+use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
+
+/// Wraps [`SqlEngine`] and enforces table-access and column-masking policy.
+pub struct PolicyEnforcingSqlEngine {
+    inner: SqlEngine,
+    auth: std::sync::Arc<dyn AuthProvider>,
+    policy: std::sync::Arc<dyn PolicyHook>,
+}
+
+impl PolicyEnforcingSqlEngine {
+    /// Create a new `PolicyEnforcingSqlEngine` wrapping `inner`.
+    pub fn new(
+        inner: SqlEngine,
+        auth: std::sync::Arc<dyn AuthProvider>,
+        policy: std::sync::Arc<dyn PolicyHook>,
+    ) -> Self {
+        Self { inner, auth, policy }
+    }
+
+    /// Authenticate `api_key`. Returns [`SqlError::AccessDenied`] if invalid.
+    pub fn authenticate(&self, api_key: &str) -> SqlResult<Principal> {
+        self.auth
+            .authenticate(api_key)
+            .ok_or_else(|| SqlError::AccessDenied {
+                reason: "invalid or missing API key".into(),
+            })
+    }
+
+    /// Execute a query as `principal`, applying table-access check and column masking.
+    ///
+    /// `table_name` is the logical table being queried — used for the access check and
+    /// as the table context for the column-masking hook.
+    pub async fn execute_as(
+        &self,
+        principal: &Principal,
+        query: &str,
+        table_name: &str,
+    ) -> SqlResult<Vec<RecordBatch>> {
+        // Table access check
+        if !self.policy.check_table_access(principal, table_name) {
+            return Err(SqlError::AccessDenied {
+                reason: format!(
+                    "principal '{}' denied access to table '{}'",
+                    principal.subject, table_name
+                ),
+            });
+        }
+
+        // Execute query via inner engine
+        let df = self.inner.sql(query).await?;
+        let batches = df.collect().await?;
+
+        // Apply column masking
+        let masked = batches
+            .iter()
+            .map(|batch| apply_masking(batch, principal, table_name, self.policy.as_ref()))
+            .collect::<SqlResult<Vec<_>>>()?;
+
+        Ok(masked)
+    }
+}
+
+/// Apply column-masking rules from `policy` to a single [`RecordBatch`].
+fn apply_masking(
+    batch: &RecordBatch,
+    principal: &Principal,
+    table_name: &str,
+    policy: &dyn PolicyHook,
+) -> SqlResult<RecordBatch> {
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::array::Array;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let schema = batch.schema();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        match policy.column_masking_rule(principal, table_name, field.name()) {
+            None => columns.push(col.clone()),
+            Some(MaskingRule::Nullify) => {
+                // Rebuild the column as a null array cast to the same type.
+                // Using arrow's NullArray directly changes the data type, so we
+                // cast a NullArray back to the original type so the schema stays
+                // consistent.
+                use arrow::array::new_null_array;
+                columns.push(new_null_array(col.data_type(), batch.num_rows()));
+            }
+            Some(MaskingRule::Redact) => {
+                let redacted: StringArray = (0..batch.num_rows())
+                    .map(|_| Some("REDACTED"))
+                    .collect();
+                columns.push(std::sync::Arc::new(redacted));
+            }
+            Some(MaskingRule::Hash) => {
+                let options = FormatOptions::default();
+                let formatter = ArrayFormatter::try_new(col.as_ref(), &options)
+                    .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+                let hashed: StringArray = (0..batch.num_rows())
+                    .map(|row| {
+                        use std::hash::{Hash, Hasher};
+                        let val = formatter.value(row).to_string();
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        val.hash(&mut h);
+                        Some(format!("{:016x}", h.finish()))
+                    })
+                    .collect();
+                columns.push(std::sync::Arc::new(hashed));
+            }
+        }
+    }
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| SqlError::DataFusion { message: e.to_string() })
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use krishiv_governance::{MaskingRule, Principal, Role, StaticApiKeyAuthProvider};
+    use std::sync::Arc;
+
+    struct DenyTablePolicy {
+        denied_table: String,
+    }
+    impl PolicyHook for DenyTablePolicy {
+        fn check_table_access(&self, _p: &Principal, table: &str) -> bool {
+            table != self.denied_table
+        }
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _table: &str,
+            _col: &str,
+        ) -> Option<MaskingRule> {
+            None
+        }
+    }
+
+    struct RedactColumnPolicy {
+        column: String,
+    }
+    impl PolicyHook for RedactColumnPolicy {
+        fn check_table_access(&self, _p: &Principal, _table: &str) -> bool {
+            true
+        }
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _table: &str,
+            col: &str,
+        ) -> Option<MaskingRule> {
+            if col == self.column {
+                Some(MaskingRule::Redact)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn make_engine_with_policy(
+        policy: Arc<dyn PolicyHook>,
+    ) -> PolicyEnforcingSqlEngine {
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key1".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
+        PolicyEnforcingSqlEngine::new(SqlEngine::new(), auth, policy)
+    }
+
+    #[test]
+    fn authenticate_valid_key_returns_principal() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        assert_eq!(p.subject, "alice");
+    }
+
+    #[test]
+    fn authenticate_invalid_key_returns_access_denied() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let err = engine.authenticate("bad_key").unwrap_err();
+        assert!(matches!(err, SqlError::AccessDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn denied_table_returns_access_denied() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        let err = engine
+            .execute_as(&p, "SELECT 1", "secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SqlError::AccessDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn allowed_table_returns_results() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        let batches = engine
+            .execute_as(&p, "SELECT 42 AS val", "public")
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn redact_policy_replaces_column_values() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = make_engine_with_policy(Arc::new(RedactColumnPolicy {
+            column: "name".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+
+        // Register an in-memory table with a "name" column
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        use arrow::array::{Int64Array, StringArray as SA};
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1_i64])),
+                std::sync::Arc::new(SA::from(vec!["alice"])),
+            ],
+        )
+        .unwrap();
+        engine
+            .inner
+            .register_record_batches("people", vec![batch])
+            .await
+            .unwrap();
+
+        let batches = engine
+            .execute_as(&p, "SELECT id, name FROM people", "people")
+            .await
+            .unwrap();
+
+        assert!(!batches.is_empty());
+        let name_col = batches[0]
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "REDACTED");
+    }
 }
 
 #[cfg(test)]
