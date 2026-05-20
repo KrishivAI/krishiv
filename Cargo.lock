@@ -2941,6 +2941,7 @@ name = "krishiv-api"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",

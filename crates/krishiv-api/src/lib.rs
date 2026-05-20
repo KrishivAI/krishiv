@@ -13,9 +13,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend};
-use krishiv_sql::{SqlDataFrame, SqlEngine};
+use krishiv_sql::{PolicyEnforcingSqlEngine, SqlDataFrame, SqlEngine};
 
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
@@ -34,6 +35,8 @@ pub enum KrishivError {
     InvalidConfig { message: String },
     /// Runtime error surfaced through the public API.
     Runtime { message: String },
+    /// Access denied by auth or policy.
+    AccessDenied { reason: String },
 }
 
 impl KrishivError {
@@ -51,6 +54,7 @@ impl fmt::Display for KrishivError {
             Self::Unsupported { feature } => write!(f, "unsupported Krishiv feature: {feature}"),
             Self::InvalidConfig { message } => write!(f, "invalid Krishiv config: {message}"),
             Self::Runtime { message } => write!(f, "Krishiv runtime error: {message}"),
+            Self::AccessDenied { reason } => write!(f, "access denied: {reason}"),
         }
     }
 }
@@ -165,15 +169,29 @@ impl fmt::Display for StreamMode {
 }
 
 /// Builder for Krishiv sessions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionBuilder {
     mode: ExecutionMode,
+    auth: Option<Arc<dyn AuthProvider>>,
+    policy: Option<Arc<dyn PolicyHook>>,
+}
+
+impl fmt::Debug for SessionBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionBuilder")
+            .field("mode", &self.mode)
+            .field("auth", &self.auth.as_ref().map(|_| "<AuthProvider>"))
+            .field("policy", &self.policy.as_ref().map(|_| "<PolicyHook>"))
+            .finish()
+    }
 }
 
 impl Default for SessionBuilder {
     fn default() -> Self {
         Self {
             mode: ExecutionMode::Embedded,
+            auth: None,
+            policy: None,
         }
     }
 }
@@ -191,11 +209,32 @@ impl SessionBuilder {
         self
     }
 
+    /// Attach an [`AuthProvider`] for API-key authentication.
+    #[must_use]
+    pub fn with_auth(mut self, auth: Arc<dyn AuthProvider>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Attach a [`PolicyHook`] for table-access control and column masking.
+    #[must_use]
+    pub fn with_policy(mut self, policy: Arc<dyn PolicyHook>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     /// Build a session.
     pub fn build(self) -> Result<Session> {
+        let policy_engine = match (self.auth, self.policy) {
+            (Some(auth), Some(policy)) => {
+                Some(PolicyEnforcingSqlEngine::new(SqlEngine::new(), auth, policy))
+            }
+            _ => None,
+        };
         Ok(Session {
             mode: self.mode,
             sql_engine: SqlEngine::new(),
+            policy_engine,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
         })
@@ -203,12 +242,26 @@ impl SessionBuilder {
 }
 
 /// User-facing Krishiv session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Session {
     mode: ExecutionMode,
     sql_engine: SqlEngine,
+    policy_engine: Option<PolicyEnforcingSqlEngine>,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("mode", &self.mode)
+            .field("sql_engine", &self.sql_engine)
+            .field(
+                "policy_engine",
+                &self.policy_engine.as_ref().map(|_| "<PolicyEnforcingSqlEngine>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Session {
@@ -279,6 +332,32 @@ impl Session {
         ))
     }
 
+    /// Execute SQL authenticated as the principal identified by `api_key`.
+    ///
+    /// Applies the configured [`PolicyHook`]: denies access to prohibited tables
+    /// and masks columns per the masking rules before returning results.
+    /// Returns [`KrishivError::AccessDenied`] if the session has no policy engine or
+    /// if authentication fails.
+    pub async fn sql_as(
+        &self,
+        api_key: &str,
+        query: impl AsRef<str>,
+    ) -> Result<DataFrame> {
+        let engine = self.policy_engine.as_ref().ok_or_else(|| KrishivError::AccessDenied {
+            reason: "session was not built with an AuthProvider and PolicyHook".into(),
+        })?;
+        let principal = engine.authenticate(api_key).map_err(|e| KrishivError::AccessDenied {
+            reason: e.to_string(),
+        })?;
+        let query_str = query.as_ref();
+        let table_hint = extract_table_hint(query_str);
+        let batches = engine
+            .execute_as(&principal, query_str, &table_hint)
+            .await
+            .map_err(|e| KrishivError::AccessDenied { reason: e.to_string() })?;
+        Ok(DataFrame::from_batches(batches))
+    }
+
     /// Create a DataFrame by reading a local Parquet path directly.
     pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;
@@ -300,6 +379,7 @@ impl Session {
 
     /// Create a bounded local memory stream.
     pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Stream {
+
         Stream::for_session(name, StreamMode::Bounded, batches, self.mode)
     }
 
@@ -309,11 +389,27 @@ impl Session {
     }
 }
 
+/// Extract the first table name after FROM in a SQL query (best-effort).
+fn extract_table_hint(query: &str) -> String {
+    let lower = query.to_lowercase();
+    if let Some(pos) = lower.find(" from ") {
+        let after = query[pos + 6..].trim_start();
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+            .unwrap_or(after.len());
+        return after[..end].to_string();
+    }
+    String::new()
+}
+
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Debug, Clone)]
 pub struct DataFrame {
     logical_plan: LogicalPlan,
     sql_dataframe: Option<SqlDataFrame>,
+    /// Pre-collected batches — set when the DataFrame is constructed from
+    /// already-executed results (e.g. [`Session::sql_as`]).
+    pre_collected: Option<Vec<RecordBatch>>,
     mode: ExecutionMode,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
@@ -325,6 +421,7 @@ impl DataFrame {
         Self {
             logical_plan,
             sql_dataframe: None,
+            pre_collected: None,
             mode: ExecutionMode::Embedded,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
@@ -341,9 +438,22 @@ impl DataFrame {
         Self {
             logical_plan,
             sql_dataframe: Some(sql_dataframe),
+            pre_collected: None,
             mode,
             jobs,
             next_job_id,
+        }
+    }
+
+    /// Construct a DataFrame from pre-collected record batches (e.g. from `Session::sql_as`).
+    pub fn from_batches(batches: Vec<RecordBatch>) -> Self {
+        Self {
+            logical_plan: LogicalPlan::new("pre-collected", krishiv_plan::ExecutionKind::Batch),
+            sql_dataframe: None,
+            pre_collected: Some(batches),
+            mode: ExecutionMode::Embedded,
+            jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
+            next_job_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -385,7 +495,9 @@ impl DataFrame {
         let job_id = self.start_job("local-dataframe");
         self.update_job(&job_id, "local-dataframe", JobState::Running);
 
-        let result = if let Err(error) = accept_plan_with_backend(
+        let result = if let Some(batches) = &self.pre_collected {
+            Ok(QueryResult::new(batches.clone()))
+        } else if let Err(error) = accept_plan_with_backend(
             self.mode,
             self.logical_plan.name(),
             self.logical_plan.kind(),
@@ -843,7 +955,10 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use tempfile::tempdir;
 
-    use super::{DataType, ExecutionMode, Field, RecordBatch, Schema, Session, StreamBatch};
+    use super::{
+        DataFrame, DataType, ExecutionMode, Field, KrishivError, RecordBatch, Schema, Session,
+        SessionBuilder, StreamBatch,
+    };
 
     #[test]
     fn session_builder_defaults_to_embedded() {
@@ -1112,5 +1227,66 @@ mod tests {
         writer
             .close()
             .unwrap_or_else(|error| panic!("unexpected parquet close error: {error}"));
+    }
+
+    #[tokio::test]
+    async fn session_sql_as_valid_key_executes_query() {
+        use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+        use std::sync::Arc;
+
+        struct AllowAll;
+        impl PolicyHook for AllowAll {
+            fn check_table_access(&self, _p: &Principal, _t: &str) -> bool { true }
+            fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> { None }
+        }
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![
+            (String::from("key123"), String::from("alice"), Role::Reader),
+        ]));
+        let session = SessionBuilder::new()
+            .with_auth(auth)
+            .with_policy(Arc::new(AllowAll))
+            .build()
+            .unwrap();
+        let df: DataFrame = session.sql_as("key123", "SELECT 42 AS v").await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_sql_as_invalid_key_returns_access_denied() {
+        use krishiv_governance::{MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+        use std::sync::Arc;
+
+        struct AllowAll;
+        impl PolicyHook for AllowAll {
+            fn check_table_access(&self, _p: &Principal, _t: &str) -> bool { true }
+            fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> { None }
+        }
+
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![
+            (String::from("key123"), String::from("alice"), Role::Reader),
+        ]));
+        let session = SessionBuilder::new()
+            .with_auth(auth)
+            .with_policy(Arc::new(AllowAll))
+            .build()
+            .unwrap();
+        let result: Result<DataFrame, KrishivError> = session.sql_as("wrong_key", "SELECT 1").await;
+        assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
+    }
+
+    #[tokio::test]
+    async fn session_without_policy_sql_as_returns_access_denied() {
+        let session = SessionBuilder::new().build().unwrap();
+        let result: Result<DataFrame, KrishivError> = session.sql_as("any_key", "SELECT 1").await;
+        assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
+    }
+
+    #[test]
+    fn extract_table_hint_finds_table_name() {
+        use crate::extract_table_hint;
+        assert_eq!(extract_table_hint("SELECT * FROM orders"), "orders");
+        assert_eq!(extract_table_hint("SELECT * FROM orders WHERE id = 1"), "orders");
+        assert_eq!(extract_table_hint("SELECT 1"), "");
     }
 }

@@ -338,6 +338,7 @@ pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
 use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
 
 /// Wraps [`SqlEngine`] and enforces table-access and column-masking policy.
+#[derive(Clone)]
 pub struct PolicyEnforcingSqlEngine {
     inner: SqlEngine,
     auth: std::sync::Arc<dyn AuthProvider>,
