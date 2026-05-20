@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**R10 Sprint 1a + Sprint 2a complete.** Auth and policy governance wired into `krishiv-sql` and `krishiv-flight-sql`. Sprint 0 architecture deliverables remain committed on branch `claude/plan-r10-architecture-GnRvo`.
+**R10 Sprint 2 complete.** Data quality rules, dead-letter sink, upgrade compatibility tests, and connector certification suite delivered. Sprint 0 architecture deliverables remain committed on branch `claude/plan-r10-architecture-GnRvo`.
 
 ## Active Task
 
-**R10 Sprint 1b/1c/1d** — live K8s Lease API, OTLP integration test, kind failover e2e CI workflow (pre-existing uncommitted changes in krishiv-operator and krishiv-metrics require API fixes before committing).
+**R10 Sprint 3** — CDC-to-lakehouse pipeline template, materialized views baseline, chaos test suite, and benchmark suites.
 
 ### Completed (committed to branch)
 
@@ -47,20 +47,20 @@
 
 ## Next Steps
 
-1. Sprint 1b: Replace simulated `K8sLeaseElection` with live async K8s Lease API calls in `krishiv-operator` (has pre-existing Patch::MergePatch API mismatch to fix)
-2. Sprint 1c: Add OTLP integration test in `krishiv-metrics` (has pre-existing `SdkTracerProvider`/`with_endpoint` API mismatch to fix)
-3. Sprint 1d: Add `.github/workflows/kind-e2e.yml` for `kind` cluster failover CI
-4. Sprint 2+: Data quality rules, dead-letter sink, upgrade tests, CDC pipeline, materialized views, benchmarks
+1. Sprint 3: Add CDC-to-lakehouse pipeline template (`crates/krishiv-connectors` or new crate)
+2. Sprint 3: Add materialized views baseline (`crates/krishiv-sql` or dedicated crate)
+3. Sprint 3: Add chaos test suite
+4. Sprint 3: Add TPC-H, TPC-DS, Nexmark benchmark suites
+5. Sprint 3: Freeze GA-supported API and connector surfaces
 
 ## Last Validation
 
-- `cargo test -p krishiv-sql`: 10/10 passed (includes 4 policy engine tests)
-- `cargo test -p krishiv-flight-sql`: 13/13 passed (includes 7 auth/governance tests)
-- `cargo check -p krishiv-sql -p krishiv-flight-sql -p krishiv-governance`: clean
-- `cargo check --workspace`: krishiv-metrics and krishiv-operator fail due to pre-existing API version mismatches (opentelemetry-otlp SdkTracerProvider rename, kube Patch::MergePatch variant removal) — unrelated to Sprint 1a/2a
+- `cargo test -p krishiv-connectors`: 43 passed (41 unit + 2 certification)
+- `cargo test -p krishiv-upgrade-tests`: 6 passed
+- `cargo check --workspace`: clean (no errors)
 - Branch: `claude/plan-r10-architecture-GnRvo`
-- Sprint 0 docs: `docs/architecture/stability-policy.md`, `compatibility-matrices.md`, `jdbc-odbc-architecture.md`, `cdc-reference.md`, `materialized-views.md`, `data-quality-model.md`, `upgrade-compatibility-policy.md`, `benchmark-targets.md`
-- R10 tracker: 12/12 architecture deliverables checked off
+- Sprint 2 deliverables: `DataQualityRule`, `QualityAction`, `DataQualityConfig`, `RejectedRow`, `DataQualityCheckResult`, `check_batch`, `DeadLetterSink` in `crates/krishiv-connectors/src/lib.rs`; `crates/krishiv-upgrade-tests` crate; `crates/krishiv-connectors/tests/certification.rs`
+- R10 tracker: 12/12 architecture, 3/11 API, 4/15 runtime, 4/16 test checklist items checked off
 
 ## Architectural Inputs To Preserve
 

@@ -71,9 +71,9 @@ Out of scope:
 - [ ] Add ODBC gateway.
 - [ ] Add CDC-to-lakehouse pipeline template.
 - [ ] Add materialized view declaration interface.
-- [ ] Add data quality expectation interface.
-- [ ] Add rejected-row output configuration.
-- [ ] Add dead-letter sink configuration.
+- [x] Add data quality expectation interface.
+- [x] Add rejected-row output configuration.
+- [x] Add dead-letter sink configuration.
 - [x] Publish production hardening guide.
 
 ## Runtime Deliverables
@@ -82,10 +82,10 @@ Out of scope:
 - [ ] Implement ODBC gateway.
 - [ ] Implement CDC-to-lakehouse template.
 - [ ] Implement materialized views baseline.
-- [ ] Implement data quality expectation rules.
-- [ ] Implement rejected-row output.
-- [ ] Implement dead-letter sink support.
-- [ ] Implement upgrade test suite.
+- [x] Implement data quality expectation rules.
+- [x] Implement rejected-row output.
+- [x] Implement dead-letter sink support.
+- [x] Implement upgrade test suite.
 - [ ] Implement metadata schema upgrade tests for job, event-log, checkpoint, savepoint, connector, and catalog metadata.
 - [ ] Implement chaos test suite.
 - [ ] Implement TPC-H benchmark suite.
@@ -104,10 +104,10 @@ Out of scope:
 - [ ] ODBC smoke tests pass.
 - [ ] CDC-to-lakehouse tests pass.
 - [ ] Materialized view tests pass.
-- [ ] Data quality rule tests pass.
-- [ ] Rejected-row output tests pass.
-- [ ] Dead-letter sink tests pass.
-- [ ] Upgrade tests pass.
+- [x] Data quality rule tests pass.
+- [x] Rejected-row output tests pass.
+- [x] Dead-letter sink tests pass.
+- [x] Upgrade tests pass.
 - [ ] Metadata schema upgrade tests pass for every GA-supported persisted metadata family.
 - [ ] Chaos suite passes.
 - [ ] TPC-H benchmark gate passes.
@@ -138,6 +138,18 @@ Sprint 1b delivered three deferred R9 items:
 - **kind e2e CI (Task 3)**: Created `.github/workflows/kind-e2e.yml` with full kind cluster lifecycle, failover test, and log artifact upload on failure. Triggered on push to main/release/** and PRs touching operator/scheduler/checkpoint.
 
 `cargo check --workspace` passes cleanly.
+
+## Sprint 2 Progress (2026-05-20)
+
+Sprint 2 delivered data quality rules, dead-letter sink, upgrade compatibility tests, and connector certification suite.
+
+- **Data Quality (Task 1)**: Added `DataQualityRule`, `QualityAction`, `DataQualityConfig`, `RejectedRow`, `DataQualityCheckResult`, `check_batch`, `find_violations`, and `DeadLetterSink` to `crates/krishiv-connectors/src/lib.rs`. 4 quality tests pass (notnull reject, range reject, fail flag, dead-letter split).
+
+- **Upgrade Tests (Task 2)**: Created `crates/krishiv-upgrade-tests` crate with 6 integration tests covering v0 offset round-trip, schema_version=1 job/catalog/event blobs, missing-version defaulting, and too-new version rejection.
+
+- **Connector Certification (Task 3)**: Created `crates/krishiv-connectors/tests/certification.rs` and `tests/certification/mod.rs` with 2 certification tests — capability declaration and dead-letter null split.
+
+Validation: `cargo test -p krishiv-connectors` → 43 passed (41 unit + 2 cert); `cargo test -p krishiv-upgrade-tests` → 6 passed; `cargo check --workspace` → clean.
 
 ## Risks And Mitigations
 
