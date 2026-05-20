@@ -23,6 +23,7 @@ members = [
     "crates/krishiv-flight-sql",
     "crates/krishiv-metrics",
     "crates/krishiv-governance",
+    "crates/krishiv-upgrade-tests",
 ]
 resolver = "3"
 

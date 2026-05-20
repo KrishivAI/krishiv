@@ -3072,6 +3072,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-upgrade-tests"
+version = "0.1.0"
+dependencies = [
+ "krishiv-catalog",
+ "krishiv-checkpoint",
+ "krishiv-connectors",
+ "serde_json",
+]
+
+[[package]]
 name = "kube"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
