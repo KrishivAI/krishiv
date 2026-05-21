@@ -27,8 +27,8 @@ fn checkpoint_prepare_failure_leaves_no_committed_state() {
 }
 
 /// A Fail-action data quality violation returns an error with no partial write.
-#[test]
-fn dead_letter_sink_fail_action_returns_error() {
+#[tokio::test]
+async fn dead_letter_sink_fail_action_returns_error() {
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -43,9 +43,9 @@ fn dead_letter_sink_fail_action_returns_error() {
         DataQualityRule::NotNull { column: "v".into() },
         QualityAction::Fail,
     );
-    let sink = DeadLetterSink::new("chaos_test", config);
+    let mut sink = DeadLetterSink::new("chaos_test", config);
     assert!(
-        sink.process_batch(&batch).is_err(),
+        sink.process_batch(&batch).await.is_err(),
         "Fail action must return Err"
     );
 }

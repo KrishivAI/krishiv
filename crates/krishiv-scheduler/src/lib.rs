@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_checkpoint::{
-    CheckpointMetadata, CheckpointResult, IntegrityManifest, LocalFsCheckpointStorage,
-    OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
-    read_epoch_metadata, read_operator_snapshot, validate_epoch, write_epoch_metadata,
-    write_manifest,
+    CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
+    LocalFsCheckpointStorage, OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch,
+    list_valid_epochs, read_epoch_metadata, read_operator_snapshot, validate_epoch,
+    write_epoch_metadata, write_manifest,
 };
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
@@ -459,6 +459,8 @@ pub enum SchedulerError {
     InvalidPlan { message: String },
     /// Coordinator/executor transport failed.
     Transport { message: String },
+    /// Executor endpoint is unavailable for task dispatch.
+    ExecutorUnavailable { endpoint: String, reason: String },
 }
 
 impl fmt::Display for SchedulerError {
@@ -499,6 +501,9 @@ impl fmt::Display for SchedulerError {
             Self::InvalidJob { message } => write!(f, "invalid job: {message}"),
             Self::InvalidPlan { message } => write!(f, "invalid plan: {message}"),
             Self::Transport { message } => write!(f, "transport error: {message}"),
+            Self::ExecutorUnavailable { endpoint, reason } => {
+                write!(f, "executor endpoint {endpoint} unavailable: {reason}")
+            }
         }
     }
 }
@@ -528,7 +533,7 @@ pub enum CheckpointCoordinatorState {
 #[derive(Clone)]
 pub struct CheckpointCoordinator {
     job_id: JobId,
-    storage: Arc<LocalFsCheckpointStorage>,
+    storage: Arc<dyn CheckpointStorage>,
     interval_ms: u64,
     current_epoch: u64,
     fencing_token: FencingToken,
@@ -561,7 +566,7 @@ impl CheckpointCoordinator {
     /// Create a new checkpoint coordinator for `job_id`.
     pub fn new(
         job_id: JobId,
-        storage: Arc<LocalFsCheckpointStorage>,
+        storage: Arc<dyn CheckpointStorage>,
         interval_ms: u64,
         expected_task_count: usize,
     ) -> Self {
@@ -853,6 +858,12 @@ pub struct Coordinator {
     adaptive_decision_log: HashMap<JobId, Vec<AdaptiveDecisionLog>>,
     /// Manual override config for adaptive behaviors.
     adaptive_override: AdaptiveOverrideConfig,
+    /// P1.1: O(1) index from streaming task id to (job_id, stage_id) for heartbeat lookup.
+    /// Populated when tasks are assigned; entries removed on task completion/failure.
+    streaming_task_index: HashMap<TaskId, (JobId, StageId)>,
+    /// P1.2: Cached gRPC channels keyed by executor endpoint string.
+    /// Avoids a full TCP+TLS handshake per task assignment push.
+    executor_channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -864,6 +875,7 @@ impl fmt::Debug for Coordinator {
             .field("executors", &self.executors)
             .field("jobs", &self.jobs)
             .field("store", &self.store.as_ref().map(|_| "<store>"))
+            .field("streaming_task_index_len", &self.streaming_task_index.len())
             .finish()
     }
 }
@@ -1357,7 +1369,9 @@ fn status_from_scheduler_error(error: SchedulerError) -> tonic::Status {
         SchedulerError::NoExecutors
         | SchedulerError::InvalidJob { .. }
         | SchedulerError::InvalidPlan { .. } => tonic::Status::invalid_argument(error.to_string()),
-        SchedulerError::Transport { .. } => tonic::Status::unavailable(error.to_string()),
+        SchedulerError::Transport { .. } | SchedulerError::ExecutorUnavailable { .. } => {
+            tonic::Status::unavailable(error.to_string())
+        }
     }
 }
 
@@ -1390,7 +1404,21 @@ impl Coordinator {
             recovering: false,
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
+            streaming_task_index: HashMap::new(),
+            executor_channels: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Create a new active coordinator (P3.11: canonical two-constructor form).
+    pub fn new_active(config: Option<CoordinatorConfig>) -> Self {
+        let id = CoordinatorId::try_new("coordinator-1").expect("static coordinator id");
+        Self::build(id, config.unwrap_or_default(), CoordinatorState::Active)
+    }
+
+    /// Create a new standby coordinator (P3.11: canonical two-constructor form).
+    pub fn new_standby(config: Option<CoordinatorConfig>) -> Self {
+        let id = CoordinatorId::try_new("coordinator-1").expect("static coordinator id");
+        Self::build(id, config.unwrap_or_default(), CoordinatorState::Standby)
     }
 
     pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
@@ -1540,16 +1568,52 @@ impl Coordinator {
     }
 
     /// Update a task record's last-known watermark and source offset from executor-reported state.
+    ///
+    /// P1.1: Uses `streaming_task_index` for O(1) lookup instead of O(jobs×stages×tasks) scan.
     fn apply_streaming_task_state(&mut self, state: &StreamingTaskState) {
-        for job in self.jobs.values_mut() {
-            for stage in &mut job.stages {
-                for task in stage.tasks_mut() {
-                    if task.task_id() == &state.task_id {
-                        task.apply_streaming_state(state);
-                        return;
-                    }
+        let (job_id, stage_id) = match self.streaming_task_index.get(&state.task_id) {
+            Some(entry) => (entry.0.clone(), entry.1.clone()),
+            None => return,
+        };
+        if let Some(job) = self.jobs.get_mut(&job_id)
+            && let Some(stage) = job.stages.iter_mut().find(|s| s.stage_id() == &stage_id)
+        {
+            for task in stage.tasks_mut() {
+                if task.task_id() == &state.task_id {
+                    task.apply_streaming_state(state);
+                    return;
                 }
             }
+        }
+    }
+
+    /// Populate `streaming_task_index` for all tasks in a job after assignment.
+    ///
+    /// Called after `apply_assignments` so that streaming heartbeats can use the O(1) index.
+    fn index_streaming_tasks(&mut self, job_id: &JobId) {
+        let job = match self.jobs.get(job_id) {
+            Some(j) => j,
+            None => return,
+        };
+        for stage in &job.stages {
+            let stage_id = stage.stage_id().clone();
+            for task in stage.tasks() {
+                self.streaming_task_index
+                    .insert(task.task_id().clone(), (job_id.clone(), stage_id.clone()));
+            }
+        }
+    }
+
+    /// Remove `streaming_task_index` entries for a completed/failed/cancelled job.
+    fn remove_streaming_task_index(&mut self, job_id: &JobId) {
+        let task_ids: Vec<TaskId> = self
+            .streaming_task_index
+            .iter()
+            .filter(|(_, (jid, _))| jid == job_id)
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        for tid in task_ids {
+            self.streaming_task_index.remove(&tid);
         }
     }
 
@@ -1622,10 +1686,9 @@ impl Coordinator {
     /// For streaming jobs with checkpoint config, checkpoint state is recovered
     /// via `CheckpointCoordinator::recover_from_storage`.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
+        // P1.23: Always use the store version to win over any partial in-memory state.
         for record in store.jobs() {
-            self.jobs
-                .entry(record.job_id().clone())
-                .or_insert_with(|| record.clone());
+            self.jobs.insert(record.job_id().clone(), record.clone());
         }
         // Recover checkpoint coordinators from storage.
         for coord in self.checkpoint_coordinators.values_mut() {
@@ -1715,10 +1778,27 @@ impl Coordinator {
         record.apply_assignments(assignments);
         if let Some(store) = &self.store {
             let mut s = store.lock().unwrap();
-            s.save_job(&record).ok();
-            s.append_event(EventLogEvent::JobSubmitted { job_id }).ok();
+            if let Err(e) = s.save_job(&record) {
+                tracing::warn!(
+                    error = %e,
+                    job_id = %record.job_id(),
+                    "failed to persist job to store"
+                );
+            }
+            if let Err(e) = s.append_event(EventLogEvent::JobSubmitted {
+                job_id: job_id.clone(),
+            }) {
+                tracing::warn!(
+                    error = %e,
+                    job_id = %job_id,
+                    "failed to append JobSubmitted event to store"
+                );
+            }
         }
-        self.jobs.insert(record.job_id().clone(), record);
+        let inserted_job_id = record.job_id().clone();
+        self.jobs.insert(inserted_job_id.clone(), record);
+        // P1.1: Index streaming tasks for O(1) heartbeat lookup.
+        self.index_streaming_tasks(&inserted_job_id);
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1913,22 +1993,48 @@ impl Coordinator {
     }
 
     /// Basic scheduler/executor stability metrics.
+    ///
+    /// P2.6: Single-pass over jobs/stages/tasks instead of six separate iterations.
     pub fn stability_metrics(&self) -> StabilityMetrics {
+        let mut failed_assignments: usize = 0;
+        let mut retry_count: usize = 0;
+        let mut running_task_count: usize = 0;
+        let mut shuffle_partitions_available: usize = 0;
+        let mut shuffle_bytes_written: u64 = 0;
+
+        for job in self.jobs.values() {
+            // Stage retry counts.
+            for stage in job.stages() {
+                retry_count = retry_count.saturating_add(stage.retry_count() as usize);
+            }
+            // Per-task counters and shuffle partition output bytes.
+            for stage in job.stages() {
+                for task in stage.tasks() {
+                    match task.state() {
+                        TaskState::Failed => failed_assignments += 1,
+                        TaskState::Running => running_task_count += 1,
+                        _ => {}
+                    }
+                    if let Some(meta) = task.output_metadata() {
+                        for p in meta.shuffle_partitions() {
+                            shuffle_bytes_written =
+                                shuffle_bytes_written.saturating_add(p.size_bytes);
+                        }
+                    }
+                }
+            }
+            // Shuffle partition availability from the job's shuffle_output map.
+            shuffle_partitions_available = shuffle_partitions_available
+                .saturating_add(job.shuffle_partitions_available_count());
+        }
+
         StabilityMetrics {
             heartbeat_ages: self.executors.heartbeat_ages(),
-            failed_assignments: self.jobs.values().map(JobRecord::failed_task_count).sum(),
-            retry_count: self.jobs.values().map(JobRecord::retry_count).sum(),
-            running_task_count: self.jobs.values().map(JobRecord::running_task_count).sum(),
-            shuffle_partitions_available: self
-                .jobs
-                .values()
-                .map(JobRecord::shuffle_partitions_available_count)
-                .sum(),
-            shuffle_bytes_written: self
-                .jobs
-                .values()
-                .map(JobRecord::shuffle_bytes_written)
-                .sum(),
+            failed_assignments,
+            retry_count,
+            running_task_count,
+            shuffle_partitions_available,
+            shuffle_bytes_written,
         }
     }
 
@@ -1957,11 +2063,9 @@ impl Coordinator {
 
         let mut responses = Vec::with_capacity(targets.len());
         for (endpoint, assignment) in targets {
-            let mut client = wire::v1::executor_task_client::ExecutorTaskClient::connect(endpoint)
-                .await
-                .map_err(|error| SchedulerError::Transport {
-                    message: error.to_string(),
-                })?;
+            // P1.2: Reuse cached gRPC channel; avoid TCP+TLS handshake per task.
+            let channel = self.get_or_connect_channel(&endpoint).await?;
+            let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
             let response = client
                 .assign_task(wire::executor_task_assignment_to_wire(assignment))
                 .await
@@ -2063,7 +2167,22 @@ impl Coordinator {
             && let Some(store) = &self.store
         {
             let mut s = store.lock().unwrap();
-            s.save_job(record).ok();
+            if let Err(e) = s.save_job(record) {
+                tracing::warn!(
+                    error = %e,
+                    job_id = %job_id,
+                    "failed to persist job to store after task update"
+                );
+            }
+        }
+        // P1.1: Remove streaming task index entries when job reaches a terminal state.
+        let is_terminal = self
+            .jobs
+            .get(&job_id)
+            .map(|r| r.state().is_terminal())
+            .unwrap_or(false);
+        if is_terminal {
+            self.remove_streaming_task_index(&job_id);
         }
         Ok(outcome)
     }
@@ -2121,6 +2240,37 @@ impl Coordinator {
                 job.refresh_state();
             }
         }
+    }
+
+    /// P1.2: Get or create a cached gRPC channel for the given executor endpoint.
+    ///
+    /// On a cache hit, clones the existing `Channel` (pointer-only cost).
+    /// On a miss, establishes a new TCP+TLS connection and stores it for reuse.
+    async fn get_or_connect_channel(
+        &self,
+        endpoint: &str,
+    ) -> SchedulerResult<tonic::transport::Channel> {
+        {
+            let map = self.executor_channels.lock().unwrap();
+            if let Some(ch) = map.get(endpoint) {
+                return Ok(ch.clone());
+            }
+        }
+        let ch = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: e.to_string(),
+            })?
+            .connect()
+            .await
+            .map_err(|e| SchedulerError::ExecutorUnavailable {
+                endpoint: endpoint.to_string(),
+                reason: e.to_string(),
+            })?;
+        self.executor_channels
+            .lock()
+            .unwrap()
+            .insert(endpoint.to_owned(), ch.clone());
+        Ok(ch)
     }
 
     fn ensure_active(&self) -> SchedulerResult<()> {
@@ -2340,7 +2490,8 @@ impl ExecutorRegistry {
             .collect()
     }
 
-    fn schedulable_executors(&self) -> Vec<ExecutorDescriptor> {
+    /// P2.5: Return borrowed references instead of cloning every descriptor.
+    fn schedulable_executors(&self) -> Vec<&ExecutorDescriptor> {
         self.executors
             .iter()
             .filter(|executor| {
@@ -2356,7 +2507,7 @@ impl ExecutorRegistry {
                 }
                 true
             })
-            .map(|executor| executor.descriptor().clone())
+            .map(|executor| executor.descriptor())
             .collect()
     }
 
@@ -2467,9 +2618,12 @@ pub struct StaticScheduler;
 
 impl StaticScheduler {
     /// Place tasks round-robin across schedulable executors.
+    ///
+    /// P2.5: Accepts borrowed descriptors so callers avoid cloning the full
+    /// descriptor vec on every `submit_job` call.
     pub fn place(
         spec: &JobSpec,
-        executors: &[ExecutorDescriptor],
+        executors: &[&ExecutorDescriptor],
     ) -> SchedulerResult<Vec<TaskAssignment>> {
         if executors.is_empty() {
             return Err(SchedulerError::NoExecutors);
@@ -2477,7 +2631,7 @@ impl StaticScheduler {
 
         let mut assignments = Vec::with_capacity(spec.task_count());
         for (idx, task) in spec.stages().iter().flat_map(StageSpec::tasks).enumerate() {
-            let executor = &executors[idx % executors.len()];
+            let executor = executors[idx % executors.len()];
             assignments.push(TaskAssignment::new(
                 task.task_id().clone(),
                 executor.executor_id().clone(),
@@ -2563,9 +2717,9 @@ impl JobRecord {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
 
-        // Collect the set of stage ids whose shuffle output is fully available.
-        // A stage's output is available when all tasks in it have Succeeded.
-        let succeeded_stage_ids: Vec<StageId> = self
+        // P2.10: Build a HashSet once for O(1) upstream-ready checks instead of
+        // O(stages²) Vec::contains per stage in the outer loop.
+        let succeeded_stage_ids: std::collections::HashSet<StageId> = self
             .stages
             .iter()
             .filter(|s| s.state == StageState::Succeeded)
@@ -2706,14 +2860,14 @@ impl JobRecord {
         }
     }
 
-    fn retry_count(&self) -> usize {
+    pub fn retry_count(&self) -> usize {
         self.stages
             .iter()
             .map(|stage| stage.retry_count() as usize)
             .sum()
     }
 
-    fn failed_task_count(&self) -> usize {
+    pub fn failed_task_count(&self) -> usize {
         self.stages
             .iter()
             .flat_map(StageRecord::tasks)
@@ -2721,7 +2875,7 @@ impl JobRecord {
             .count()
     }
 
-    fn running_task_count(&self) -> usize {
+    pub fn running_task_count(&self) -> usize {
         self.stages
             .iter()
             .flat_map(StageRecord::tasks)
@@ -2912,34 +3066,45 @@ impl StageRecord {
         }
     }
 
+    /// P2.7: Single-pass over tasks instead of four separate iterator passes.
     fn refresh_state(&mut self) {
-        if self
-            .tasks
-            .iter()
-            .all(|task| task.state == TaskState::Succeeded)
-        {
-            self.state = StageState::Succeeded;
-        } else if self
-            .tasks
-            .iter()
-            .any(|task| task.state == TaskState::Failed)
-        {
-            self.state = StageState::Failed;
-        } else if self
-            .tasks
-            .iter()
-            .any(|task| task.state == TaskState::Running)
-        {
-            self.state = StageState::Running;
-        } else if self
-            .tasks
-            .iter()
-            .any(|task| task.state == TaskState::Assigned)
-        {
-            self.state = StageState::Scheduling;
-        } else {
-            self.state = StageState::Pending;
+        let mut all_succeeded = true;
+        let mut any_failed = false;
+        let mut any_running = false;
+        let mut any_assigned = false;
+
+        for task in &self.tasks {
+            match task.state {
+                TaskState::Succeeded => {}
+                TaskState::Failed => {
+                    all_succeeded = false;
+                    any_failed = true;
+                }
+                TaskState::Running => {
+                    all_succeeded = false;
+                    any_running = true;
+                }
+                TaskState::Assigned => {
+                    all_succeeded = false;
+                    any_assigned = true;
+                }
+                _ => {
+                    all_succeeded = false;
+                }
+            }
         }
+
+        self.state = if all_succeeded {
+            StageState::Succeeded
+        } else if any_failed {
+            StageState::Failed
+        } else if any_running {
+            StageState::Running
+        } else if any_assigned {
+            StageState::Scheduling
+        } else {
+            StageState::Pending
+        };
     }
 
     fn snapshot(&self) -> StageSnapshot {
@@ -4369,8 +4534,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use krishiv_checkpoint::{
-        CheckpointMetadata, IntegrityManifest, LocalFsCheckpointStorage, list_valid_epochs,
-        write_epoch_metadata, write_manifest,
+        CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
+        list_valid_epochs, write_epoch_metadata, write_manifest,
     };
     use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
@@ -5272,10 +5437,9 @@ mod tests {
     #[test]
     fn static_scheduler_places_tasks_round_robin() {
         let job = demo_job();
-        let executors = vec![
-            ExecutorDescriptor::new(ExecutorId::try_new("exec-a").unwrap(), "pod-a", 1),
-            ExecutorDescriptor::new(ExecutorId::try_new("exec-b").unwrap(), "pod-b", 1),
-        ];
+        let exec_a = ExecutorDescriptor::new(ExecutorId::try_new("exec-a").unwrap(), "pod-a", 1);
+        let exec_b = ExecutorDescriptor::new(ExecutorId::try_new("exec-b").unwrap(), "pod-b", 1);
+        let executors = vec![&exec_a, &exec_b];
 
         let assignments = StaticScheduler::place(&job, &executors).unwrap();
 
@@ -6509,7 +6673,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_initiates_and_collects_acks() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-1").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 5000, 2);
 
@@ -6581,7 +6746,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_rejects_stale_epoch_ack() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-stale").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 1);
         let _ = coord.initiate().unwrap(); // epoch = 1
@@ -6594,7 +6760,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_abort_resets_state() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-abort").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 2);
         let _ = coord.initiate().unwrap();
@@ -6614,7 +6781,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_recover_finds_latest_epoch() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-recover").unwrap();
 
         // Write two complete epochs manually.
@@ -6645,7 +6813,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_savepoint_sets_flag() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-sp").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 5000, 1);
 
@@ -6875,7 +7044,8 @@ mod tests {
 
     #[test]
     fn chaos_1a_coordinator_restart_recovers_from_durable_metadata() {
-        let storage = std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: std::sync::Arc<dyn CheckpointStorage> =
+            std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-chaos1a").unwrap();
 
         // Coordinator A: commit epoch 1.
@@ -6901,7 +7071,8 @@ mod tests {
 
     #[test]
     fn chaos_2_executor_kill_mid_checkpoint_abort_is_clean() {
-        let storage = std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: std::sync::Arc<dyn CheckpointStorage> =
+            std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-chaos2").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 2);
 
@@ -7031,7 +7202,8 @@ mod tests {
     fn chaos_e6_rolling_upgrade_savepoint_restore_preserves_epoch_sequence() {
         use krishiv_checkpoint::read_epoch_metadata;
 
-        let storage = std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: std::sync::Arc<dyn CheckpointStorage> =
+            std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-chaos-e6").unwrap();
 
         // Coordinator A: normal epoch 1, then savepoint epoch 2.
@@ -7094,7 +7266,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_try_tick_fires_after_interval() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-tick").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id, storage, 5_000, 0);
 
@@ -7110,7 +7283,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_try_tick_skips_while_awaiting_acks() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-tick-busy").unwrap();
         // expected_task_count = 1 so the coordinator will wait for an ack.
         let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 1);

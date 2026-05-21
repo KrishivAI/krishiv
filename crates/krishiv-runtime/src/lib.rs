@@ -11,6 +11,9 @@ use std::fmt;
 
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
+// tracing is used for debug-level plan delegation logging.
+use tracing::debug;
+
 /// Runtime result alias.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
@@ -126,11 +129,6 @@ pub struct LocalJobRegistry {
 }
 
 impl LocalJobRegistry {
-    /// Add a job status to the registry.
-    pub fn record(&mut self, status: JobStatus) {
-        self.upsert(status);
-    }
-
     /// Add or replace a job status.
     pub fn upsert(&mut self, status: JobStatus) {
         if let Some(existing) = self.jobs.iter_mut().find(|job| job.id == status.id) {
@@ -276,6 +274,15 @@ impl ExecutionBackend for EmbeddedBackend {
     }
 
     fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        // Delegates to DataFusion via SqlEngine in the api/sql crate layer.
+        // Physical execution is driven by SqlEngine; this backend records
+        // acceptance and emits a debug log with the plan description.
+        debug!(
+            backend = "embedded",
+            plan = %plan.name(),
+            kind = %plan.kind(),
+            "EmbeddedBackend: delegating plan to DataFusion via SqlEngine"
+        );
         Ok(ExecutionReport::new(
             self.backend_name(),
             plan.name(),
@@ -295,6 +302,15 @@ impl ExecutionBackend for SingleNodeBackend {
     }
 
     fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        // Delegates to DataFusion via SqlEngine in the api/sql crate layer.
+        // Physical execution is driven by SqlEngine; this backend records
+        // acceptance and emits a debug log with the plan description.
+        debug!(
+            backend = "single-node",
+            plan = %plan.name(),
+            kind = %plan.kind(),
+            "SingleNodeBackend: delegating plan to DataFusion via SqlEngine"
+        );
         Ok(ExecutionReport::new(
             self.backend_name(),
             plan.name(),

@@ -16,7 +16,7 @@
 //!   source compatibility; the old filesystem-based placeholder is removed).
 
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ── redb table definition ─────────────────────────────────────────────────────
 
@@ -124,6 +124,33 @@ pub trait StateBackend: Send + Sync {
     ///
     /// The backend is cleared before loading; partial failures leave the backend empty.
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()>;
+
+    /// Store multiple `(namespace_op_id, namespace_state_name, key, value)` entries.
+    ///
+    /// The default implementation calls `put` for each entry individually.
+    /// Backends that support batch writes should override this for efficiency —
+    /// `RedbStateBackend` overrides this to open a single write transaction for all entries.
+    fn put_batch(&mut self, entries: &[(&str, &str, &[u8], &[u8])]) -> StateResult<()> {
+        for (op_id, name, key, value) in entries {
+            let ns = Namespace::new(*op_id, *name);
+            self.put(&ns, key.to_vec(), value.to_vec())?;
+        }
+        Ok(())
+    }
+
+    /// Retrieve multiple values for `(namespace_op_id, namespace_state_name, key)` triples.
+    ///
+    /// The default implementation calls `get` for each entry individually.
+    /// Backends that support batch reads should override this for efficiency —
+    /// `RedbStateBackend` overrides this to open a single read transaction for all keys.
+    fn get_batch(&self, keys: &[(&str, &str, &[u8])]) -> StateResult<Vec<Option<Vec<u8>>>> {
+        keys.iter()
+            .map(|(op_id, name, key)| {
+                let ns = Namespace::new(*op_id, *name);
+                self.get(&ns, key)
+            })
+            .collect()
+    }
 }
 
 // ── InMemoryStateBackend ──────────────────────────────────────────────────────
@@ -220,39 +247,11 @@ impl StateBackend for InMemoryStateBackend {
     }
 
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
-        let corrupt = |msg: &str| StateError::SnapshotCorrupt {
-            message: msg.to_owned(),
-        };
-        if bytes.len() < 12 {
-            return Err(corrupt("too short"));
-        }
-        let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if version != 1 {
-            return Err(corrupt(&format!("unsupported snapshot version {version}")));
-        }
-        let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
-        let mut pos = 12usize;
+        let entries = decode_snapshot_entries(bytes)?;
         let mut new_store = BTreeMap::new();
-
-        for _ in 0..count {
-            let op_id_b = read_lp_bytes(bytes, &mut pos)
-                .ok_or_else(|| corrupt("truncated op_id"))?
-                .to_vec();
-            let op_id = String::from_utf8(op_id_b).map_err(|_| corrupt("op_id not utf8"))?;
-            let name_b = read_lp_bytes(bytes, &mut pos)
-                .ok_or_else(|| corrupt("truncated state_name"))?
-                .to_vec();
-            let state_name =
-                String::from_utf8(name_b).map_err(|_| corrupt("state_name not utf8"))?;
-            let key = read_lp_bytes(bytes, &mut pos)
-                .ok_or_else(|| corrupt("truncated key"))?
-                .to_vec();
-            let value = read_lp_bytes(bytes, &mut pos)
-                .ok_or_else(|| corrupt("truncated value"))?
-                .to_vec();
+        for (op_id, state_name, key, value) in entries {
             new_store.insert((op_id, state_name, key), value);
         }
-
         self.store = new_store;
         Ok(())
     }
@@ -308,9 +307,18 @@ pub trait TimerService: Send + Sync {
 ///
 /// Timers are stored in a `BTreeMap` ordered by `(deadline_ms, namespace, key)`
 /// so that `drain_fired_timers` is an efficient prefix split.
+///
+/// A secondary `HashMap<(namespace, key), deadline_ms>` index enables O(log N)
+/// cancel by identity without scanning the full `BTreeMap`.  Both structures are
+/// kept in sync by `register_event_time_timer`, `cancel_timer`, and
+/// `drain_fired_timers`.
 #[derive(Debug, Default)]
 pub struct InMemoryTimerService {
+    /// Primary ordered index: `TimerKey → ()`.  Drives deadline-ordered drain.
     timers: BTreeMap<TimerKey, ()>,
+    /// Secondary identity index: `(namespace, key) → deadline_ms`.
+    /// Enables O(1) lookup of the deadline when cancelling by identity.
+    identity_index: HashMap<(Namespace, Vec<u8>), i64>,
 }
 
 impl InMemoryTimerService {
@@ -322,15 +330,33 @@ impl InMemoryTimerService {
 
 impl TimerService for InMemoryTimerService {
     fn register_event_time_timer(&mut self, timer: TimerKey) -> StateResult<()> {
+        // If a timer for the same (namespace, key) already exists, remove the old
+        // primary-index entry first so the two indexes stay in sync.
+        let identity = (timer.namespace.clone(), timer.key.clone());
+        if let Some(old_deadline) = self.identity_index.get(&identity).copied() {
+            let old_key = TimerKey {
+                deadline_ms: old_deadline,
+                namespace: timer.namespace.clone(),
+                key: timer.key.clone(),
+            };
+            self.timers.remove(&old_key);
+        }
+        self.identity_index.insert(identity, timer.deadline_ms);
         self.timers.insert(timer, ());
         Ok(())
     }
 
     fn cancel_timer(&mut self, namespace: &Namespace, key: &[u8]) -> StateResult<()> {
-        // A timer is identified by (namespace, key) regardless of deadline_ms.
-        // Scan is O(n) but timer counts per operator are small in practice.
-        self.timers
-            .retain(|t, _| !(t.namespace == *namespace && t.key == key));
+        // O(1) lookup via the secondary identity index instead of a full scan.
+        let identity = (namespace.clone(), key.to_vec());
+        if let Some(deadline_ms) = self.identity_index.remove(&identity) {
+            let timer_key = TimerKey {
+                deadline_ms,
+                namespace: namespace.clone(),
+                key: key.to_vec(),
+            };
+            self.timers.remove(&timer_key);
+        }
         Ok(())
     }
 
@@ -344,9 +370,15 @@ impl TimerService for InMemoryTimerService {
             key: vec![],
         };
         let pending = self.timers.split_off(&sentinel);
-        std::mem::replace(&mut self.timers, pending)
+        let fired: Vec<TimerKey> = std::mem::replace(&mut self.timers, pending)
             .into_keys()
-            .collect()
+            .collect();
+        // Evict fired timers from the identity index.
+        for t in &fired {
+            self.identity_index
+                .remove(&(t.namespace.clone(), t.key.clone()));
+        }
+        fired
     }
 
     fn pending_count(&self) -> usize {
@@ -411,26 +443,20 @@ impl RedbStateBackend {
 
     /// Build the composite redb key for `(namespace, key)`.
     fn redb_key(namespace: &Namespace, key: &[u8]) -> Vec<u8> {
-        let op = namespace.operator_id().as_bytes();
-        let name = namespace.state_name().as_bytes();
+        let op = namespace.operator_id();
+        let name = namespace.state_name();
         let mut out = Vec::with_capacity(16 + op.len() + name.len() + key.len());
-        out.extend_from_slice(&(op.len() as u64).to_le_bytes());
-        out.extend_from_slice(op);
-        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        out.extend_from_slice(name);
+        write_prefix(&mut out, op, name);
         out.extend_from_slice(key);
         out
     }
 
     /// Build the namespace prefix (without the trailing raw key).
     fn redb_prefix(namespace: &Namespace) -> Vec<u8> {
-        let op = namespace.operator_id().as_bytes();
-        let name = namespace.state_name().as_bytes();
+        let op = namespace.operator_id();
+        let name = namespace.state_name();
         let mut out = Vec::with_capacity(16 + op.len() + name.len());
-        out.extend_from_slice(&(op.len() as u64).to_le_bytes());
-        out.extend_from_slice(op);
-        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
-        out.extend_from_slice(name);
+        write_prefix(&mut out, op, name);
         out
     }
 
@@ -511,7 +537,11 @@ impl StateBackend for RedbStateBackend {
         let wtxn = self.db.begin_write().map_err(db_err)?;
         {
             let mut table = wtxn.open_table(STATE_TABLE).map_err(db_err)?;
-            // Collect keys to delete (redb range yields guards, collect first).
+            // Collect keys to delete inside a single write transaction.
+            // The intermediate Vec is unavoidable: redb AccessGuard values hold
+            // an immutable borrow on `table`, preventing the subsequent mutable
+            // `table.remove()` calls until all guards are dropped.  A single
+            // transaction still amortises the write overhead across all deletes.
             let keys_to_delete: Vec<Vec<u8>> = table
                 .range(prefix.as_slice()..)
                 .map_err(db_err)?
@@ -561,7 +591,8 @@ impl StateBackend for RedbStateBackend {
             let raw_key = kb[prefix.len()..].to_vec();
             keys.push(raw_key);
         }
-        keys.sort();
+        // No sort needed: redb range scans already return keys in B-tree
+        // (ascending) order, so the result is already sorted.
         Ok(keys)
     }
 
@@ -596,18 +627,7 @@ impl StateBackend for RedbStateBackend {
     }
 
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
-        let corrupt = |msg: &str| StateError::SnapshotCorrupt {
-            message: msg.to_owned(),
-        };
-        if bytes.len() < 12 {
-            return Err(corrupt("too short"));
-        }
-        let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if version != 1 {
-            return Err(corrupt(&format!("unsupported snapshot version {version}")));
-        }
-        let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
-        let mut pos = 12usize;
+        let entries = decode_snapshot_entries(bytes)?;
 
         let wtxn = self.db.begin_write().map_err(db_err)?;
         {
@@ -624,23 +644,7 @@ impl StateBackend for RedbStateBackend {
             }
 
             // Load snapshot entries.
-            for _ in 0..count {
-                let op_b = read_lp_bytes(bytes, &mut pos)
-                    .ok_or_else(|| corrupt("truncated op_id"))?
-                    .to_vec();
-                let op_id = String::from_utf8(op_b).map_err(|_| corrupt("op_id not utf8"))?;
-                let name_b = read_lp_bytes(bytes, &mut pos)
-                    .ok_or_else(|| corrupt("truncated state_name"))?
-                    .to_vec();
-                let state_name =
-                    String::from_utf8(name_b).map_err(|_| corrupt("state_name not utf8"))?;
-                let raw_key = read_lp_bytes(bytes, &mut pos)
-                    .ok_or_else(|| corrupt("truncated key"))?
-                    .to_vec();
-                let value = read_lp_bytes(bytes, &mut pos)
-                    .ok_or_else(|| corrupt("truncated value"))?
-                    .to_vec();
-
+            for (op_id, state_name, raw_key, value) in entries {
                 let ns = Namespace::new(&op_id, &state_name);
                 let rk = Self::redb_key(&ns, &raw_key);
                 table
@@ -650,6 +654,35 @@ impl StateBackend for RedbStateBackend {
         }
         wtxn.commit().map_err(db_err)?;
         Ok(())
+    }
+
+    fn put_batch(&mut self, entries: &[(&str, &str, &[u8], &[u8])]) -> StateResult<()> {
+        let write_txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = write_txn.open_table(STATE_TABLE).map_err(db_err)?;
+            for (op_id, name, key, value) in entries {
+                let ns = Namespace::new(*op_id, *name);
+                let rk = Self::redb_key(&ns, key);
+                table.insert(rk.as_slice(), *value).map_err(db_err)?;
+            }
+        }
+        write_txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    fn get_batch(&self, keys: &[(&str, &str, &[u8])]) -> StateResult<Vec<Option<Vec<u8>>>> {
+        let rtxn = self.db.begin_read().map_err(db_err)?;
+        let table = rtxn.open_table(STATE_TABLE).map_err(db_err)?;
+        let mut results = Vec::with_capacity(keys.len());
+        for (op_id, name, key) in keys {
+            let ns = Namespace::new(*op_id, *name);
+            let rk = Self::redb_key(&ns, key);
+            match table.get(rk.as_slice()).map_err(db_err)? {
+                None => results.push(None),
+                Some(v) => results.push(Some(v.value().to_vec())),
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -671,6 +704,67 @@ fn read_lp_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
     let v = &buf[*pos..*pos + len];
     *pos += len;
     Some(v)
+}
+
+/// Write two length-prefixed segments (`op_id` and `name`) into `buf`.
+///
+/// Each segment is encoded as an 8-byte little-endian length followed by the
+/// UTF-8 bytes of the string.  This is the shared prefix encoding used by
+/// both `RedbStateBackend::redb_key` and `RedbStateBackend::redb_prefix`.
+fn write_prefix(buf: &mut Vec<u8>, op_id: &str, name: &str) {
+    let op = op_id.as_bytes();
+    let nm = name.as_bytes();
+    buf.extend_from_slice(&(op.len() as u64).to_le_bytes());
+    buf.extend_from_slice(op);
+    buf.extend_from_slice(&(nm.len() as u64).to_le_bytes());
+    buf.extend_from_slice(nm);
+}
+
+/// `(op_id, state_name, key, value)` tuple produced by snapshot decoding.
+type SnapshotEntry = (String, String, Vec<u8>, Vec<u8>);
+
+/// Decode a snapshot byte buffer into `(op_id, state_name, key, value)` tuples.
+///
+/// Both `InMemoryStateBackend::load_snapshot` and `RedbStateBackend::load_snapshot`
+/// share this parsing logic to avoid duplication.
+///
+/// Expected format:
+/// `[4-byte LE version=1][8-byte LE entry_count][entries...]`
+/// where each entry is `[8-byte LE op_id_len][op_id][8-byte LE name_len][name][8-byte LE key_len][key][8-byte LE val_len][val]`
+fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> {
+    let corrupt = |msg: &str| StateError::SnapshotCorrupt {
+        message: msg.to_owned(),
+    };
+    if bytes.len() < 12 {
+        return Err(corrupt("too short"));
+    }
+    let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if version != 1 {
+        return Err(corrupt(&format!("unsupported snapshot version {version}")));
+    }
+    let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
+    let mut pos = 12usize;
+    let mut entries = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let op_id_b = read_lp_bytes(bytes, &mut pos)
+            .ok_or_else(|| corrupt("truncated op_id"))?
+            .to_vec();
+        let op_id = String::from_utf8(op_id_b).map_err(|_| corrupt("op_id not utf8"))?;
+        let name_b = read_lp_bytes(bytes, &mut pos)
+            .ok_or_else(|| corrupt("truncated state_name"))?
+            .to_vec();
+        let state_name = String::from_utf8(name_b).map_err(|_| corrupt("state_name not utf8"))?;
+        let key = read_lp_bytes(bytes, &mut pos)
+            .ok_or_else(|| corrupt("truncated key"))?
+            .to_vec();
+        let value = read_lp_bytes(bytes, &mut pos)
+            .ok_or_else(|| corrupt("truncated value"))?
+            .to_vec();
+        entries.push((op_id, state_name, key, value));
+    }
+
+    Ok(entries)
 }
 
 // ── ProcessingTimeTimerKey ────────────────────────────────────────────────────
@@ -1213,6 +1307,97 @@ mod tests {
         assert_eq!(inspector.list_namespaces().unwrap(), vec![n.clone()]);
         assert_eq!(inspector.key_count(&n).unwrap(), 2);
         assert_eq!(inspector.key_size_bytes(&n).unwrap(), 2); // "a" + "b"
+    }
+
+    // ── put_batch / get_batch ─────────────────────────────────────────────────
+
+    #[test]
+    fn in_memory_put_batch_get_batch_roundtrip() {
+        let mut b = InMemoryStateBackend::new();
+        let entries: &[(&str, &str, &[u8], &[u8])] = &[
+            ("op1", "counts", b"k1", b"v1"),
+            ("op1", "counts", b"k2", b"v2"),
+            ("op2", "window", b"k3", b"v3"),
+        ];
+        b.put_batch(entries).unwrap();
+
+        let keys: &[(&str, &str, &[u8])] = &[
+            ("op1", "counts", b"k1"),
+            ("op1", "counts", b"k2"),
+            ("op2", "window", b"k3"),
+            ("op1", "counts", b"missing"),
+        ];
+        let results = b.get_batch(keys).unwrap();
+        assert_eq!(results[0], Some(b"v1".to_vec()));
+        assert_eq!(results[1], Some(b"v2".to_vec()));
+        assert_eq!(results[2], Some(b"v3".to_vec()));
+        assert_eq!(results[3], None);
+    }
+
+    #[test]
+    fn redb_put_batch_get_batch_roundtrip() {
+        let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+        let entries: &[(&str, &str, &[u8], &[u8])] = &[
+            ("op1", "counts", b"k1", b"v1"),
+            ("op1", "counts", b"k2", b"v2"),
+            ("op2", "window", b"k3", b"v3"),
+        ];
+        b.put_batch(entries).unwrap();
+
+        let keys: &[(&str, &str, &[u8])] = &[
+            ("op1", "counts", b"k1"),
+            ("op1", "counts", b"k2"),
+            ("op2", "window", b"k3"),
+            ("op1", "counts", b"missing"),
+        ];
+        let results = b.get_batch(keys).unwrap();
+        assert_eq!(results[0], Some(b"v1".to_vec()));
+        assert_eq!(results[1], Some(b"v2".to_vec()));
+        assert_eq!(results[2], Some(b"v3".to_vec()));
+        assert_eq!(results[3], None);
+    }
+
+    #[test]
+    fn timer_cancel_o1_dual_index() {
+        // Register many timers and verify cancel still works correctly
+        // (exercises the dual-index path).
+        let mut svc = InMemoryTimerService::new();
+        let n = ns("tw", "timers");
+        for i in 0..100i64 {
+            svc.register_event_time_timer(TimerKey::new(
+                n.clone(),
+                format!("k{i}").into_bytes(),
+                i * 100,
+            ))
+            .unwrap();
+        }
+        assert_eq!(svc.pending_count(), 100);
+        // Cancel a timer in the middle.
+        svc.cancel_timer(&n, b"k50").unwrap();
+        assert_eq!(svc.pending_count(), 99);
+        // The cancelled key must not appear in the drain.
+        let fired = svc.drain_fired_timers(9999);
+        assert_eq!(fired.len(), 99);
+        assert!(!fired.iter().any(|t| t.key == b"k50"));
+    }
+
+    #[test]
+    fn timer_re_register_updates_deadline() {
+        // Re-registering a timer with a new deadline must update both indexes.
+        let mut svc = InMemoryTimerService::new();
+        let n = ns("tw", "timers");
+        svc.register_event_time_timer(TimerKey::new(n.clone(), b"k1".to_vec(), 500))
+            .unwrap();
+        // Re-register with a later deadline.
+        svc.register_event_time_timer(TimerKey::new(n.clone(), b"k1".to_vec(), 1000))
+            .unwrap();
+        assert_eq!(svc.pending_count(), 1);
+        // The timer must not fire at the old deadline.
+        assert!(svc.drain_fired_timers(500).is_empty());
+        // It must fire at the new deadline.
+        let fired = svc.drain_fired_timers(1000);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].deadline_ms, 1000);
     }
 
     // ── RocksDbStateBackend (now RedbStateBackend via type alias) ─────────────

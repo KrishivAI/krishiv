@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 krishiv-plan = { path = "../krishiv-plan" }
+tracing = { workspace = true }

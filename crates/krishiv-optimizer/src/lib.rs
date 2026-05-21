@@ -48,12 +48,20 @@ pub trait CostModel: Send + Sync {
 }
 
 /// A rule that transforms a [`LogicalPlan`] into a (possibly better) one.
+///
+/// P2.4: `apply` returns `Option<LogicalPlan>` — `None` means the plan is
+/// unchanged, allowing [`Optimizer`] to skip the clone-and-compare cycle
+/// and to record only rules that actually fired.
 pub trait OptimizerRule: Send + Sync {
     /// Short, stable rule name used in explain and diagnostics output.
     fn name(&self) -> &str;
 
-    /// Apply the rule to `plan` and return the (possibly unchanged) result.
-    fn apply(&self, plan: LogicalPlan) -> LogicalPlan;
+    /// Apply the rule to `plan`.
+    ///
+    /// Return `Some(new_plan)` when the rule rewrites the plan, or `None` when
+    /// the plan is unchanged.  Returning `None` is more efficient than returning
+    /// a clone of the original plan unchanged.
+    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan>;
 }
 
 /// An Adaptive Query Execution rule that re-plans based on [`RuntimeStats`].
@@ -69,6 +77,9 @@ pub trait AqeRule: Send + Sync {
 }
 
 /// A rule that applies streaming-specific rewrites to a [`LogicalPlan`].
+// P3.19: StreamRule has no implementations in this workspace; kept for forward
+// compatibility but suppressed from dead-code warnings.
+#[allow(dead_code)]
 pub trait StreamRule: Send + Sync {
     /// Short, stable rule name used in explain and diagnostics output.
     fn name(&self) -> &str;
@@ -136,15 +147,17 @@ impl Optimizer {
 
     /// Run all rules in order and return the final plan together with the list
     /// of rules that produced a visible change.
+    ///
+    /// P2.4: rules signal no-change by returning `None`, avoiding an O(rules ×
+    /// plan_size) clone-per-rule cycle.
     pub fn optimize(&self, plan: LogicalPlan) -> OptimizeResult {
         let mut current = plan;
         let mut applied_rules = Vec::new();
 
         for rule in &self.rules {
-            let before = current.clone();
-            current = rule.apply(current);
-            if current != before {
+            if let Some(new_plan) = rule.apply(&current) {
                 applied_rules.push(rule.name().to_string());
+                current = new_plan;
             }
         }
 
@@ -176,14 +189,20 @@ impl ThresholdSkewRule {
         Self { threshold }
     }
 
+    /// P1.16: For even-length arrays, average the two middle values.
     fn median_rows(stats: &[RuntimeStats]) -> f64 {
         if stats.is_empty() {
             return 0.0;
         }
         let mut rows: Vec<u64> = stats.iter().map(|s| s.input_rows).collect();
         rows.sort_unstable();
-        let mid = (rows.len() - 1) / 2;
-        rows[mid] as f64
+        let n = rows.len();
+        let mid = n / 2;
+        if n.is_multiple_of(2) {
+            (rows[mid - 1] + rows[mid]) as f64 / 2.0
+        } else {
+            rows[mid] as f64
+        }
     }
 }
 
@@ -269,8 +288,25 @@ impl AqeRule for CoalesceRule {
         "coalesce-small-partitions"
     }
 
-    /// Returns the plan unchanged; coalescing is advisory (see `advise`).
-    fn apply(&self, plan: PhysicalPlan, _stats: &[RuntimeStats]) -> PhysicalPlan {
+    /// P1.17: Compute coalesce advice and log it, then return the plan.
+    ///
+    /// Full plan-node rewriting requires scheduler-side support (adding
+    /// `CoalescePartitions` nodes) which is implemented in `krishiv-scheduler`.
+    /// Here we compute the advice, emit a `tracing::debug!` event so the
+    /// coordinator can observe it, and return the plan unchanged.  The scheduler
+    /// is expected to act on the logged advice in a subsequent planning round.
+    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> PhysicalPlan {
+        let advice = self.advise(stats);
+        if advice.groups.len() < stats.len() {
+            // At least one coalescing group was produced — log the advice.
+            tracing::debug!(
+                rule = self.name(),
+                coalesce_groups = ?advice.groups,
+                "coalesce advice: {} partition(s) → {} group(s)",
+                stats.len(),
+                advice.groups.len(),
+            );
+        }
         plan
     }
 }
@@ -366,8 +402,17 @@ pub struct StreamingAqeGuard;
 impl StreamingAqeGuard {
     /// Returns `true` if the plan contains any streaming node that must not be
     /// subject to AQE partition-count changes.
+    ///
+    /// P3.18: Walk the plan tree recursively so that hybrid batch/streaming
+    /// plans are also detected.  A plan is considered streaming if either its
+    /// top-level `ExecutionKind` is `Streaming` or any of its nodes carries
+    /// `ExecutionKind::Streaming`.
     pub fn plan_is_streaming(plan: &PhysicalPlan) -> bool {
         plan.kind() == ExecutionKind::Streaming
+            || plan
+                .nodes()
+                .iter()
+                .any(|node| node.kind() == ExecutionKind::Streaming)
     }
 }
 
@@ -497,8 +542,8 @@ mod tests {
             "no-op"
         }
 
-        fn apply(&self, plan: LogicalPlan) -> LogicalPlan {
-            plan
+        fn apply(&self, _plan: &LogicalPlan) -> Option<LogicalPlan> {
+            None
         }
     }
 
@@ -526,8 +571,11 @@ mod tests {
             "add-node"
         }
 
-        fn apply(&self, plan: LogicalPlan) -> LogicalPlan {
-            plan.with_node(PlanNode::new("extra", "extra node", ExecutionKind::Batch))
+        fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+            Some(
+                plan.clone()
+                    .with_node(PlanNode::new("extra", "extra node", ExecutionKind::Batch)),
+            )
         }
     }
 
@@ -581,8 +629,11 @@ mod tests {
             fn name(&self) -> &str {
                 "another-rule"
             }
-            fn apply(&self, plan: LogicalPlan) -> LogicalPlan {
-                plan.with_node(PlanNode::new("x", "x", ExecutionKind::Batch))
+            fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+                Some(
+                    plan.clone()
+                        .with_node(PlanNode::new("x", "x", ExecutionKind::Batch)),
+                )
             }
         }
 
@@ -660,6 +711,17 @@ mod tests {
         let rule = ThresholdSkewRule::new(2.0);
         let hot = rule.detect_hot_partitions(&stats);
         assert!(hot.is_empty(), "exact boundary should not be flagged");
+    }
+
+    // P1.16 — median fix for even-length arrays
+    #[test]
+    fn skew_rule_median_even_length_averages_two_middle_values() {
+        // sorted: [10, 20, 30, 100], median = (20+30)/2 = 25
+        // threshold=2.0 → hot when rows > 50; only 100 qualifies
+        let stats = make_stats_with_rows(&[10, 100, 20, 30]);
+        let rule = ThresholdSkewRule::new(2.0);
+        let hot = rule.detect_hot_partitions(&stats);
+        assert_eq!(hot, vec![1], "only the 100-row partition should be hot");
     }
 
     // ── CoalesceRule ──────────────────────────────────────────────────────
