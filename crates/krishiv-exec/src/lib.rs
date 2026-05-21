@@ -119,6 +119,7 @@ pub enum JoinType {
 
 // ── Shared helper ─────────────────────────────────────────────────────────────
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -126,6 +127,19 @@ use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt32A
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+
+/// Compare two group-key string parts with numeric-first ordering.
+///
+/// When both parts parse as `i64` they are ordered numerically; a
+/// lexicographic tiebreaker (`ai.cmp(bi)`) ensures that distinct
+/// representations of the same integer (e.g. `"1"` vs `"01"`) still produce a
+/// stable, deterministic sort order across runs.
+fn compare_key_parts(ai: &str, bi: &str) -> Ordering {
+    match (ai.parse::<i64>(), bi.parse::<i64>()) {
+        (Ok(an), Ok(bn)) => an.cmp(&bn).then_with(|| ai.cmp(bi)),
+        _ => ai.cmp(bi),
+    }
+}
 
 /// Serialize a single row value from the given column to a `String` for use as
 /// a hash-map key.  Supported types: `Int32`, `Int64`, `Utf8`.
@@ -503,9 +517,15 @@ impl LocalAggregator {
             state.update(&self.agg_exprs, batch, row)?;
         }
 
-        // Sort entries for deterministic output.
+        // Sort entries for deterministic output using numeric-aware key comparison.
         let mut sorted_entries: Vec<(Vec<String>, AggState)> = groups.into_iter().collect();
-        sorted_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        sorted_entries.sort_by(|(a, _), (b, _)| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(ai, bi)| compare_key_parts(ai, bi))
+                .find(|&o| o != Ordering::Equal)
+                .unwrap_or_else(|| a.len().cmp(&b.len()))
+        });
 
         // Build output schema.
         let mut fields: Vec<Field> = Vec::new();

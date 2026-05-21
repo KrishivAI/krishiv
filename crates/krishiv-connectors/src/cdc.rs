@@ -1,5 +1,6 @@
 //! CDC-to-lakehouse pipeline: Debezium 2.x over Kafka → Iceberg.
 
+use arrow::array::Array as _;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -171,6 +172,138 @@ impl CdcToLakehousePipeline {
         }
         Ok(())
     }
+}
+
+/// Metadata column names injected by `build_batch_from_events`.
+///
+/// Source payload fields that collide with any of these names are renamed by
+/// appending `_src` so that metadata values are never silently overwritten.
+const RESERVED_CDC_COLUMNS: &[&str] = &["_op", "_table", "_lsn", "_ts_ms", "_partition", "_offset"];
+
+/// Map a source payload column name to a safe output name.
+///
+/// If the name collides with a reserved CDC metadata column it is renamed to
+/// `{name}_src`; otherwise the name is used as-is.
+fn safe_payload_column(name: &str) -> String {
+    if RESERVED_CDC_COLUMNS.contains(&name) {
+        format!("{name}_src")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Build a columnar `RecordBatch` from a slice of `CdcEvent` values.
+///
+/// The output schema contains:
+/// - Metadata columns: `_op`, `_table`, `_lsn`, `_ts_ms`, `_partition`, `_offset`
+/// - Payload columns: all fields present in any event's `after` batch
+///
+/// Payload field names that collide with the reserved metadata names are
+/// renamed with a `_src` suffix to prevent silent overwrite.
+pub fn build_batch_from_events(
+    events: &[CdcEvent],
+) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::array::{Int64Array, Int64Builder, StringArray, UInt32Array, UInt64Builder};
+
+    // Collect the union of all payload field names (in stable order).
+    let mut payload_field_names: Vec<String> = Vec::new();
+    for event in events {
+        if let Some(after) = &event.after {
+            for field in after.schema().fields() {
+                let safe_name = safe_payload_column(field.name());
+                if !payload_field_names.contains(&safe_name) {
+                    payload_field_names.push(safe_name);
+                }
+            }
+        }
+    }
+
+    let n = events.len();
+
+    // Metadata columns.
+    let op_col: StringArray = events.iter().map(|e| Some(format!("{:?}", e.op))).collect();
+    let table_col: StringArray = events.iter().map(|e| Some(e.table.as_str())).collect();
+    let mut lsn_builder = UInt64Builder::with_capacity(n);
+    let mut ts_ms_builder = Int64Builder::with_capacity(n);
+    for e in events {
+        match e.source_lsn {
+            Some(v) => lsn_builder.append_value(v),
+            None => lsn_builder.append_null(),
+        }
+        match e.source_ts_ms {
+            Some(v) => ts_ms_builder.append_value(v),
+            None => ts_ms_builder.append_null(),
+        }
+    }
+    let partition_col: UInt32Array = events.iter().map(|e| Some(e.partition_id)).collect();
+    let offset_col: Int64Array = events.iter().map(|e| Some(e.offset)).collect();
+
+    // Payload columns (one column per discovered field; None when event has no `after`).
+    let mut payload_cols: Vec<Arc<dyn arrow::array::Array>> = payload_field_names
+        .iter()
+        .map(|safe_name| {
+            // Reverse-map safe name back to original to look up in after batch.
+            let orig_name = if safe_name.ends_with("_src")
+                && RESERVED_CDC_COLUMNS.contains(&safe_name[..safe_name.len() - 4].as_ref())
+            {
+                &safe_name[..safe_name.len() - 4]
+            } else {
+                safe_name.as_str()
+            };
+            let arr: arrow::array::StringArray = events
+                .iter()
+                .map(|e| {
+                    let after = e.after.as_ref()?;
+                    let col_idx = after.schema().index_of(orig_name).ok()?;
+                    let col = after.column(col_idx);
+                    if col.is_null(0) {
+                        None
+                    } else {
+                        col.as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                            .and_then(|s| {
+                                if s.is_null(0) {
+                                    None
+                                } else {
+                                    Some(s.value(0).to_string())
+                                }
+                            })
+                    }
+                })
+                .collect();
+            Arc::new(arr) as Arc<dyn arrow::array::Array>
+        })
+        .collect();
+
+    // Assemble schema.
+    let mut fields = vec![
+        arrow::datatypes::Field::new("_op", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("_table", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("_lsn", arrow::datatypes::DataType::UInt64, true),
+        arrow::datatypes::Field::new("_ts_ms", arrow::datatypes::DataType::Int64, true),
+        arrow::datatypes::Field::new("_partition", arrow::datatypes::DataType::UInt32, false),
+        arrow::datatypes::Field::new("_offset", arrow::datatypes::DataType::Int64, false),
+    ];
+    for name in &payload_field_names {
+        fields.push(arrow::datatypes::Field::new(
+            name,
+            arrow::datatypes::DataType::Utf8,
+            true,
+        ));
+    }
+
+    let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![
+        Arc::new(op_col),
+        Arc::new(table_col),
+        Arc::new(lsn_builder.finish()),
+        Arc::new(ts_ms_builder.finish()),
+        Arc::new(partition_col),
+        Arc::new(offset_col),
+    ];
+    columns.append(&mut payload_cols);
+
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 #[cfg(test)]

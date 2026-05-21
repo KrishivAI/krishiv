@@ -9,6 +9,8 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 pub mod cdc;
 pub mod kafka;
@@ -241,6 +243,19 @@ pub trait Source {
     /// The returned value is connector-specific and should be downcast by the
     /// caller if it needs the concrete offset type.
     fn current_offset(&self) -> Option<Box<dyn Any + Send>>;
+
+    /// Rewind the source to its initial position.
+    ///
+    /// The default implementation is a no-op; sources that advertise
+    /// [`ConnectorCapabilities::is_rewindable`] **must** override this method.
+    /// A debug-mode assertion fires if a rewindable source does not override,
+    /// catching capability mismatches during development.
+    fn reset(&mut self) {
+        debug_assert!(
+            !self.capabilities().is_rewindable(),
+            "source advertises rewindable capability but does not override reset()"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +277,33 @@ pub trait Sink {
 
     /// Flush any buffered data and close the sink.
     fn flush(&mut self) -> impl Future<Output = ConnectorResult<()>> + Send;
+}
+
+/// Dyn-compatible version of [`Sink`] that boxes the async return types.
+///
+/// Because [`Sink`] uses `impl Future` returns it is not object-safe.  This
+/// trait provides a blanket implementation over every `T: Sink + Send` and can
+/// be used as `Box<dyn DynSink>` wherever dynamic dispatch is needed.
+pub trait DynSink: Send {
+    fn write_batch_dyn(
+        &mut self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Pin<Box<dyn Future<Output = ConnectorResult<()>> + Send + '_>>;
+
+    fn flush_dyn(&mut self) -> Pin<Box<dyn Future<Output = ConnectorResult<()>> + Send + '_>>;
+}
+
+impl<T: Sink + Send> DynSink for T {
+    fn write_batch_dyn(
+        &mut self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Pin<Box<dyn Future<Output = ConnectorResult<()>> + Send + '_>> {
+        Box::pin(self.write_batch(batch))
+    }
+
+    fn flush_dyn(&mut self) -> Pin<Box<dyn Future<Output = ConnectorResult<()>> + Send + '_>> {
+        Box::pin(self.flush())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,12 +539,6 @@ impl CertificationSuite {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Re-export std::future::Future so trait impls compile without extra imports
-// ---------------------------------------------------------------------------
-
-use std::future::Future;
 
 // ---------------------------------------------------------------------------
 // TwoPhaseCommitSink
@@ -972,12 +1008,22 @@ fn find_violations(
 ///
 /// The primary output receives only accepted rows. Rejected rows are written
 /// to the dead-letter output with error metadata appended as extra columns.
-#[derive(Debug)]
 pub struct DeadLetterSink {
     /// Name of the dead-letter sink (used in metrics/logs).
     pub name: String,
     /// Quality configuration applied before writing to the primary sink.
     pub quality_config: DataQualityConfig,
+    /// Optional secondary sink that receives rejected rows with error metadata.
+    secondary: Option<Box<dyn DynSink>>,
+}
+
+impl std::fmt::Debug for DeadLetterSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeadLetterSink")
+            .field("name", &self.name)
+            .field("has_secondary", &self.secondary.is_some())
+            .finish()
+    }
 }
 
 impl DeadLetterSink {
@@ -985,15 +1031,29 @@ impl DeadLetterSink {
         Self {
             name: name.into(),
             quality_config,
+            secondary: None,
         }
     }
 
-    /// Process a batch: run quality checks, return (accepted_batch, rejected_rows).
-    pub fn process_batch(
-        &self,
+    /// Attach a secondary sink that receives rejected rows with an appended
+    /// `_error: Utf8` column containing the violation reason.
+    #[must_use]
+    pub fn with_secondary_sink(mut self, sink: impl Sink + Send + 'static) -> Self {
+        self.secondary = Some(Box::new(sink));
+        self
+    }
+
+    /// Run quality checks and return `(accepted_batch, rejected_rows)`.
+    ///
+    /// If a secondary sink is attached, rejected rows are written to it with an
+    /// additional `_error` column.  Because that forwarding is async, the whole
+    /// method is `async`.
+    pub async fn process_batch(
+        &mut self,
         batch: &arrow::record_batch::RecordBatch,
     ) -> ConnectorResult<(arrow::record_batch::RecordBatch, Vec<RejectedRow>)> {
-        use arrow::array::BooleanArray;
+        use arrow::array::{BooleanArray, StringArray};
+        use arrow::datatypes::{DataType, Field};
 
         let result = check_batch(batch, &self.quality_config)?;
 
@@ -1003,7 +1063,7 @@ impl DeadLetterSink {
             });
         }
 
-        // Build accepted batch (rows not in rejected set)
+        // Build accepted batch (rows not in the rejected set).
         let keep_mask: BooleanArray = (0..batch.num_rows())
             .map(|i| Some(result.accepted_indices.contains(&i)))
             .collect();
@@ -1012,6 +1072,61 @@ impl DeadLetterSink {
                 message: e.to_string(),
             }
         })?;
+
+        // Forward rejected rows to the secondary (dead-letter) sink if present.
+        if let Some(ref mut secondary) = self.secondary
+            && !result.rejected.is_empty()
+        {
+            let reject_mask: BooleanArray = (0..batch.num_rows())
+                .map(|i| Some(!result.accepted_indices.contains(&i)))
+                .collect();
+            let rejected_batch =
+                arrow::compute::filter_record_batch(batch, &reject_mask).map_err(|e| {
+                    ConnectorError::Io {
+                        message: e.to_string(),
+                    }
+                })?;
+
+            // Build _error column keyed by original row index so the error string
+            // is always attached to the correct rejected row even when multiple
+            // rules fire on different rows in non-contiguous order (RC2).
+            let mut error_by_row: std::collections::HashMap<usize, &str> =
+                std::collections::HashMap::new();
+            for meta in &result.rejected {
+                error_by_row.insert(meta.batch_row_index, meta.rule_violated.as_str());
+            }
+            // Rejected rows appear in original row order because filter_record_batch
+            // preserves order; walk the original indices to assign errors.
+            let mut rejected_row_cursor = 0usize;
+            let mut error_strings: Vec<Option<&str>> = vec![None; rejected_batch.num_rows()];
+            for orig_row in 0..batch.num_rows() {
+                if !result.accepted_indices.contains(&orig_row) {
+                    if rejected_row_cursor < error_strings.len() {
+                        error_strings[rejected_row_cursor] = error_by_row.get(&orig_row).copied();
+                    }
+                    rejected_row_cursor += 1;
+                }
+            }
+            let error_col: StringArray = error_strings.into_iter().collect();
+
+            let mut new_fields: Vec<Field> = rejected_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            new_fields.push(Field::new("_error", DataType::Utf8, true));
+            let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields));
+            let mut new_cols: Vec<std::sync::Arc<dyn arrow::array::Array>> =
+                rejected_batch.columns().to_vec();
+            new_cols.push(std::sync::Arc::new(error_col));
+            let dlq_batch = arrow::record_batch::RecordBatch::try_new(new_schema, new_cols)
+                .map_err(|e| ConnectorError::Io {
+                    message: format!("failed to build dead-letter batch: {e}"),
+                })?;
+
+            secondary.write_batch_dyn(dlq_batch).await?;
+        }
 
         Ok((accepted, result.rejected))
     }
@@ -1567,8 +1682,8 @@ mod quality_tests {
         assert!(result.failed);
     }
 
-    #[test]
-    fn dead_letter_sink_splits_accepted_and_rejected() {
+    #[tokio::test]
+    async fn dead_letter_sink_splits_accepted_and_rejected() {
         let batch = make_batch();
         let config = DataQualityConfig::new().with_rule(
             DataQualityRule::NotNull {
@@ -1576,8 +1691,8 @@ mod quality_tests {
             },
             QualityAction::Reject,
         );
-        let sink = DeadLetterSink::new("test_sink", config);
-        let (accepted, rejected) = sink.process_batch(&batch).unwrap();
+        let mut sink = DeadLetterSink::new("test_sink", config);
+        let (accepted, rejected) = sink.process_batch(&batch).await.unwrap();
         assert_eq!(accepted.num_rows(), 3); // rows 0, 2, 3
         assert_eq!(rejected.len(), 1); // row 1 (null score)
     }

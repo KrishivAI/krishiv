@@ -595,7 +595,7 @@ impl ShuffleStore for InMemoryShuffleStore {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = self.lease_tokens.write().unwrap();
         if let Some(&expected) = leases.get(&key)
-            && lease_token < expected
+            && lease_token != expected
         {
             return Err(StoreError::StaleLeaseToken {
                 expected,
@@ -695,7 +695,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = self.lease_tokens.write().unwrap();
         if let Some(&expected) = leases.get(&key)
-            && lease_token < expected
+            && lease_token != expected
         {
             return Err(StoreError::StaleLeaseToken {
                 expected,
