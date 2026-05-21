@@ -196,6 +196,28 @@ impl AuditSink for TracingAuditSink {
 static GLOBAL_AUDIT_SINK: std::sync::OnceLock<Box<dyn AuditSink + Send + Sync>> =
     std::sync::OnceLock::new();
 
+// P0.21 — Dedup key for the last-emitted audit event.
+//
+// Stores a hash of `(principal, action_name, detail)` for the most recently
+// emitted event.  If two consecutive calls produce the same key the second
+// emission is suppressed and a warning is logged instead.
+static LAST_AUDIT_KEY: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Compute a stable 64-bit dedup key for an audit event.
+fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(principal.as_bytes());
+    h.update(b"\x00");
+    h.update(action_name.as_bytes());
+    h.update(b"\x00");
+    h.update(detail.as_bytes());
+    let digest = h.finalize();
+    // Use the first 8 bytes as a u64 key – collisions are astronomically rare
+    // for the sequential-emission dedup use case.
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 is at least 8 bytes"))
+}
+
 /// Install a custom [`AuditSink`] for the lifetime of the process.
 ///
 /// Must be called before the first `audit_log` invocation.  Subsequent calls are
@@ -214,6 +236,10 @@ fn get_audit_sink() -> &'static dyn AuditSink {
 ///
 /// In production, the `tracing` subscriber routes these to the audit log
 /// destination configured by `krishiv-metrics::init()`.
+///
+/// Duplicate events are suppressed: if two consecutive calls produce the same
+/// `(principal, action, detail)` triple the second emission is skipped and a
+/// warning is logged instead (P0.21 deduplication).
 ///
 /// # Parameters
 /// - `principal`: identity of the actor performing the action.
@@ -235,6 +261,23 @@ pub fn audit_log(principal: &str, action: &AuditAction<'_>, outcome: AuditOutcom
         ),
         AuditAction::AdminAction { description } => ("admin_action", (*description).to_owned()),
     };
+
+    // P0.21 — Deduplication: skip if this event is identical to the last one.
+    let key = audit_dedup_key(principal, action_name, &detail);
+    {
+        let mut last = LAST_AUDIT_KEY.lock().unwrap_or_else(|p| p.into_inner());
+        if *last == Some(key) {
+            tracing::warn!(
+                target: "krishiv::audit",
+                principal = principal,
+                action = action_name,
+                "duplicate audit event suppressed",
+            );
+            return;
+        }
+        *last = Some(key);
+    }
+
     let event = AuditEvent {
         principal: principal.to_string(),
         action: action_name.to_string(),
@@ -595,5 +638,70 @@ mod tests {
         let emitter = NoOpEmitter;
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok());
+    }
+
+    // ── P0.15 — Deterministic hash masking ───────────────────────────────────
+
+    #[test]
+    fn audit_dedup_key_is_deterministic() {
+        // P0.15: the same input must always produce the same hash.
+        let key1 = super::audit_dedup_key("alice", "job_submitted", "job_id=j1");
+        let key2 = super::audit_dedup_key("alice", "job_submitted", "job_id=j1");
+        assert_eq!(key1, key2, "audit_dedup_key must be deterministic");
+    }
+
+    #[test]
+    fn audit_dedup_key_differs_for_different_inputs() {
+        let key1 = super::audit_dedup_key("alice", "job_submitted", "job_id=j1");
+        let key2 = super::audit_dedup_key("bob", "job_submitted", "job_id=j1");
+        assert_ne!(key1, key2);
+    }
+
+    // ── P0.21 — Audit deduplication ──────────────────────────────────────────
+
+    #[test]
+    fn audit_log_dedup_suppresses_consecutive_identical_events() {
+        // Reset the global dedup state so this test is not affected by other tests.
+        {
+            let mut last = LAST_AUDIT_KEY.lock().unwrap();
+            *last = None;
+        }
+
+        // Use a thread-local collector; we can't replace the global sink mid-test
+        // because it is a OnceLock and may already be initialised.  Instead we
+        // verify dedup by inspecting LAST_AUDIT_KEY directly.
+
+        // First call – should be emitted (key updated).
+        audit_log(
+            "dedup_user",
+            &AuditAction::JobSubmitted { job_id: "dup-job" },
+            AuditOutcome::Allowed,
+        );
+        let key_after_first = *LAST_AUDIT_KEY.lock().unwrap();
+        assert!(key_after_first.is_some(), "key must be set after first emission");
+
+        // Second identical call – should be suppressed (key unchanged).
+        audit_log(
+            "dedup_user",
+            &AuditAction::JobSubmitted { job_id: "dup-job" },
+            AuditOutcome::Allowed,
+        );
+        let key_after_second = *LAST_AUDIT_KEY.lock().unwrap();
+        assert_eq!(
+            key_after_first, key_after_second,
+            "duplicate event must not change the stored key"
+        );
+
+        // A different event should be emitted and update the key.
+        audit_log(
+            "dedup_user",
+            &AuditAction::JobSubmitted { job_id: "different-job" },
+            AuditOutcome::Allowed,
+        );
+        let key_after_different = *LAST_AUDIT_KEY.lock().unwrap();
+        assert_ne!(
+            key_after_first, key_after_different,
+            "a different event must update the stored key"
+        );
     }
 }

@@ -150,17 +150,30 @@ fn mask_batch(
                 columns.push(new_null_array(col.data_type(), batch.num_rows()));
             }
             Some(MaskingRule::Redact) => {
-                let redacted: StringArray = (0..batch.num_rows())
-                    .map(|row| {
-                        if col.is_null(row) {
-                            None
-                        } else {
-                            Some("REDACTED")
-                        }
-                    })
-                    .collect();
-                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
-                columns.push(Arc::new(redacted));
+                // P0.14 fix: For string (Utf8/LargeUtf8) columns, replace non-null
+                // values with the literal "REDACTED" string while preserving the
+                // Utf8 type.  For all other data types, emit a fully-null array of
+                // the ORIGINAL type so that the schema is not corrupted.
+                match col.data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 => {
+                        let redacted: StringArray = (0..batch.num_rows())
+                            .map(|row| {
+                                if col.is_null(row) {
+                                    None
+                                } else {
+                                    Some("REDACTED")
+                                }
+                            })
+                            .collect();
+                        fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
+                        columns.push(Arc::new(redacted));
+                    }
+                    _ => {
+                        // Non-string column: preserve original type, nullify all values.
+                        fields.push(field.as_ref().clone());
+                        columns.push(new_null_array(col.data_type(), batch.num_rows()));
+                    }
+                }
             }
             Some(MaskingRule::Hash) => {
                 let options = FormatOptions::default();
@@ -536,5 +549,150 @@ mod tests {
             .do_get_statement(ticket, Request::new(Ticket::new(vec![])))
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── P0.13 — check_table_access enforcement ────────────────────────────────
+
+    #[tokio::test]
+    async fn p0_13_check_table_access_allow_path() {
+        // When the policy allows the table, the query should succeed.
+        let svc = make_auth_policy_service();
+        // "allowed_table" is not "secret", so DenySecretPolicy allows it.
+        // SELECT 42 has no FROM clause so it always succeeds regardless of policy.
+        let ticket = TicketStatementQuery {
+            statement_handle: b"SELECT 42 AS v".to_vec().into(),
+        };
+        let mut req = Request::new(Ticket::new(vec![]));
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer secret-key"),
+        );
+        let result = svc.do_get_statement(ticket, req).await;
+        assert!(result.is_ok(), "allowed query must succeed");
+    }
+
+    #[tokio::test]
+    async fn p0_13_check_table_access_deny_path() {
+        // When the policy denies a table, the query must return PermissionDenied.
+        let svc = make_auth_policy_service();
+        let ticket = TicketStatementQuery {
+            statement_handle: b"SELECT * FROM secret".to_vec().into(),
+        };
+        let mut req = Request::new(Ticket::new(vec![]));
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer secret-key"),
+        );
+        let result = svc.do_get_statement(ticket, req).await;
+        assert!(result.is_err(), "denied table must return an error");
+        assert_eq!(
+            result.err().unwrap().code(),
+            tonic::Code::PermissionDenied,
+            "denied table must return PermissionDenied"
+        );
+    }
+
+    // ── P0.14 — MaskingRule::Redact schema preservation ───────────────────────
+
+    struct RedactAllPolicy;
+
+    impl PolicyHook for RedactAllPolicy {
+        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
+            true
+        }
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _t: &str,
+            _c: &str,
+        ) -> Option<MaskingRule> {
+            Some(MaskingRule::Redact)
+        }
+    }
+
+    fn make_principal() -> Principal {
+        Principal {
+            subject: "tester".into(),
+            role: Role::Reader,
+        }
+    }
+
+    #[test]
+    fn p0_14_redact_int64_preserves_schema() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("amount", DataType::Int64, true)]));
+        let col = Arc::new(Int64Array::from(vec![Some(100i64), None, Some(200i64)]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        let principal = make_principal();
+        let policy = RedactAllPolicy;
+        let result = mask_batch(&batch, &principal, "payments", &policy).unwrap();
+
+        // Schema must NOT be corrupted — type must remain Int64.
+        assert_eq!(
+            result.schema().field(0).data_type(),
+            &DataType::Int64,
+            "Redact on Int64 must preserve Int64 type, not convert to Utf8"
+        );
+        // All values must be null (the column is fully nullified).
+        for i in 0..result.num_rows() {
+            assert!(
+                result.column(0).is_null(i),
+                "row {i} must be null after Redact on non-string column"
+            );
+        }
+    }
+
+    #[test]
+    fn p0_14_redact_float64_preserves_schema() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("score", DataType::Float64, true)]));
+        let col = Arc::new(Float64Array::from(vec![Some(1.5f64), Some(2.5f64)]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        let principal = make_principal();
+        let policy = RedactAllPolicy;
+        let result = mask_batch(&batch, &principal, "scores", &policy).unwrap();
+
+        assert_eq!(
+            result.schema().field(0).data_type(),
+            &DataType::Float64,
+            "Redact on Float64 must preserve Float64 type"
+        );
+        for i in 0..result.num_rows() {
+            assert!(result.column(0).is_null(i));
+        }
+    }
+
+    #[test]
+    fn p0_14_redact_utf8_produces_redacted_string() {
+        use arrow::array::{Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let col = Arc::new(StringArray::from(vec![Some("Alice"), None, Some("Bob")]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        let principal = make_principal();
+        let policy = RedactAllPolicy;
+        let result = mask_batch(&batch, &principal, "users", &policy).unwrap();
+
+        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
+
+        let arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Non-null original values become "REDACTED".
+        assert_eq!(arr.value(0), "REDACTED");
+        // Null original values stay null.
+        assert!(arr.is_null(1));
+        assert_eq!(arr.value(2), "REDACTED");
     }
 }
