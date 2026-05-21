@@ -392,10 +392,10 @@ pub fn list_valid_epochs(
     let epoch_dirs = storage.list_dir(&checkpoint_prefix)?;
     let mut valid = Vec::new();
     for name in epoch_dirs {
-        if let Ok(epoch) = name.parse::<u64>() {
-            if validate_epoch(storage, job_id, epoch).unwrap_or(false) {
-                valid.push(epoch);
-            }
+        if let Ok(epoch) = name.parse::<u64>()
+            && validate_epoch(storage, job_id, epoch).unwrap_or(false)
+        {
+            valid.push(epoch);
         }
     }
     valid.sort_unstable();

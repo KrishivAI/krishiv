@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use object_store::{ObjectStore, PutPayload, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, path::Path};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

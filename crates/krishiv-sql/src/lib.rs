@@ -133,10 +133,10 @@ impl SqlEngine {
         self.context
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await?;
-        if let Some(ref reg) = self.view_registry {
-            if let Ok(mut r) = reg.lock() {
-                r.mark_table_committed();
-            }
+        if let Some(ref reg) = self.view_registry
+            && let Ok(mut r) = reg.lock()
+        {
+            r.mark_table_committed();
         }
         Ok(())
     }
@@ -181,10 +181,10 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
-        if let Some(ref reg) = self.view_registry {
-            if let Ok(mut r) = reg.lock() {
-                r.mark_table_committed();
-            }
+        if let Some(ref reg) = self.view_registry
+            && let Ok(mut r) = reg.lock()
+        {
+            r.mark_table_committed();
         }
         Ok(())
     }
@@ -204,32 +204,26 @@ impl SqlEngine {
     ///
     /// If the query targets a registered, fresh view, returns cached batches directly.
     /// Otherwise executes normally and caches the result for `OnCommit` views.
-    pub async fn sql_with_view_cache(
-        &self,
-        query: impl AsRef<str>,
-    ) -> SqlResult<Vec<RecordBatch>> {
+    pub async fn sql_with_view_cache(&self, query: impl AsRef<str>) -> SqlResult<Vec<RecordBatch>> {
         let q = query.as_ref().trim();
         let view_name_candidate = extract_simple_view_name(q);
 
-        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
-            if let Ok(r) = reg.lock() {
-                if let Some(cached) = r.get_if_fresh(name) {
-                    return Ok(cached.clone());
-                }
-            }
+        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate)
+            && let Ok(r) = reg.lock()
+            && let Some(cached) = r.get_if_fresh(name)
+        {
+            return Ok(cached.clone());
         }
 
         let df = self.sql(q).await?;
         let batches = df.collect().await?;
 
-        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate) {
-            if let Ok(mut r) = reg.lock() {
-                if let Some(def) = r.definition(name).cloned() {
-                    if def.refresh_policy == RefreshPolicy::OnCommit {
-                        r.set_cached(name, batches.clone());
-                    }
-                }
-            }
+        if let (Some(reg), Some(name)) = (&self.view_registry, &view_name_candidate)
+            && let Ok(mut r) = reg.lock()
+            && let Some(def) = r.definition(name).cloned()
+            && def.refresh_policy == RefreshPolicy::OnCommit
+        {
+            r.set_cached(name, batches.clone());
         }
 
         Ok(batches)
@@ -432,7 +426,11 @@ impl PolicyEnforcingSqlEngine {
         auth: std::sync::Arc<dyn AuthProvider>,
         policy: std::sync::Arc<dyn PolicyHook>,
     ) -> Self {
-        Self { inner, auth, policy }
+        Self {
+            inner,
+            auth,
+            policy,
+        }
     }
 
     /// Authenticate `api_key`. Returns [`SqlError::AccessDenied`] if invalid.
@@ -485,8 +483,8 @@ fn apply_masking(
     table_name: &str,
     policy: &dyn PolicyHook,
 ) -> SqlResult<RecordBatch> {
-    use arrow::array::{ArrayRef, StringArray};
     use arrow::array::Array;
+    use arrow::array::{ArrayRef, StringArray};
     use arrow::util::display::{ArrayFormatter, FormatOptions};
 
     let schema = batch.schema();
@@ -505,15 +503,17 @@ fn apply_masking(
                 columns.push(new_null_array(col.data_type(), batch.num_rows()));
             }
             Some(MaskingRule::Redact) => {
-                let redacted: StringArray = (0..batch.num_rows())
-                    .map(|_| Some("REDACTED"))
-                    .collect();
+                let redacted: StringArray =
+                    (0..batch.num_rows()).map(|_| Some("REDACTED")).collect();
                 columns.push(std::sync::Arc::new(redacted));
             }
             Some(MaskingRule::Hash) => {
                 let options = FormatOptions::default();
-                let formatter = ArrayFormatter::try_new(col.as_ref(), &options)
-                    .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+                let formatter = ArrayFormatter::try_new(col.as_ref(), &options).map_err(|e| {
+                    SqlError::DataFusion {
+                        message: e.to_string(),
+                    }
+                })?;
                 let hashed: StringArray = (0..batch.num_rows())
                     .map(|row| {
                         use std::hash::{Hash, Hasher};
@@ -528,8 +528,9 @@ fn apply_masking(
         }
     }
 
-    RecordBatch::try_new(schema, columns)
-        .map_err(|e| SqlError::DataFusion { message: e.to_string() })
+    RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
+        message: e.to_string(),
+    })
 }
 
 // ─── Materialized Views Baseline ─────────────────────────────────────────────
@@ -629,7 +630,8 @@ impl MaterializedViewRegistry {
     /// Store refreshed results for a view.
     pub fn set_cached(&mut self, view_name: &str, batches: Vec<RecordBatch>) {
         self.cache.insert(view_name.to_string(), batches);
-        self.view_lsn.insert(view_name.to_string(), self.current_lsn);
+        self.view_lsn
+            .insert(view_name.to_string(), self.current_lsn);
     }
 
     /// Get cached results if the view is fresh.
@@ -720,9 +722,15 @@ mod view_cache_tests {
         ]));
         let col = arrow::array::Int64Array::from(vec![1i64]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
-        engine.register_record_batches("t1", vec![batch]).await.unwrap();
+        engine
+            .register_record_batches("t1", vec![batch])
+            .await
+            .unwrap();
 
-        assert!(registry.lock().unwrap().is_stale("v1"), "commit must mark view stale");
+        assert!(
+            registry.lock().unwrap().is_stale("v1"),
+            "commit must mark view stale"
+        );
     }
 
     #[tokio::test]
@@ -798,9 +806,7 @@ mod policy_tests {
         }
     }
 
-    fn make_engine_with_policy(
-        policy: Arc<dyn PolicyHook>,
-    ) -> PolicyEnforcingSqlEngine {
+    fn make_engine_with_policy(policy: Arc<dyn PolicyHook>) -> PolicyEnforcingSqlEngine {
         let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
             "key1".into(),
             "alice".into(),

@@ -687,10 +687,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             let result = check_batch(batch, qc)?;
             if result.failed {
                 return Err(ConnectorError::Io {
-                    message: format!(
-                        "data quality Fail action triggered at epoch {}",
-                        epoch
-                    ),
+                    message: format!("data quality Fail action triggered at epoch {}", epoch),
                 });
             }
             if result.accepted_indices.len() == batch.num_rows() {
@@ -699,8 +696,11 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 let keep_mask: BooleanArray = (0..batch.num_rows())
                     .map(|i| Some(result.accepted_indices.contains(&i)))
                     .collect();
-                filtered = arrow::compute::filter_record_batch(batch, &keep_mask)
-                    .map_err(|e| ConnectorError::Io { message: e.to_string() })?;
+                filtered = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
+                    ConnectorError::Io {
+                        message: e.to_string(),
+                    }
+                })?;
                 &filtered
             }
         } else {
@@ -882,9 +882,7 @@ pub fn check_batch(
         }
     }
 
-    let accepted_indices: Vec<usize> = (0..nrows)
-        .filter(|i| !rejected_rows.contains(i))
-        .collect();
+    let accepted_indices: Vec<usize> = (0..nrows).filter(|i| !rejected_rows.contains(i)).collect();
 
     Ok(DataQualityCheckResult {
         accepted_indices,
@@ -901,36 +899,30 @@ fn find_violations(
 
     match rule {
         DataQualityRule::NotNull { column } => {
-            let col_idx =
-                batch
-                    .schema()
-                    .index_of(column)
-                    .map_err(|e| ConnectorError::Schema {
-                        message: format!("column '{}' not found: {}", column, e),
-                    })?;
+            let col_idx = batch
+                .schema()
+                .index_of(column)
+                .map_err(|e| ConnectorError::Schema {
+                    message: format!("column '{}' not found: {}", column, e),
+                })?;
             let col = batch.column(col_idx);
             let violations: Vec<usize> =
                 (0..batch.num_rows()).filter(|&i| col.is_null(i)).collect();
             Ok((column.clone(), violations))
         }
         DataQualityRule::Range { column, min, max } => {
-            let col_idx =
-                batch
-                    .schema()
-                    .index_of(column)
-                    .map_err(|e| ConnectorError::Schema {
-                        message: format!("column '{}' not found: {}", column, e),
-                    })?;
+            let col_idx = batch
+                .schema()
+                .index_of(column)
+                .map_err(|e| ConnectorError::Schema {
+                    message: format!("column '{}' not found: {}", column, e),
+                })?;
             let col = batch.column(col_idx);
-            let float_col =
-                col.as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| ConnectorError::Schema {
-                        message: format!(
-                            "column '{}' is not Float64 for Range rule",
-                            column
-                        ),
-                    })?;
+            let float_col = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                ConnectorError::Schema {
+                    message: format!("column '{}' is not Float64 for Range rule", column),
+                }
+            })?;
             let violations: Vec<usize> = (0..batch.num_rows())
                 .filter(|&i| {
                     if float_col.is_null(i) {
@@ -947,9 +939,12 @@ fn find_violations(
             let re = regex::Regex::new(pattern).map_err(|e| ConnectorError::Config {
                 message: format!("invalid regex pattern '{}': {}", pattern, e),
             })?;
-            let col_idx = batch.schema().index_of(column).map_err(|e| ConnectorError::Schema {
-                message: format!("column '{}' not found: {}", column, e),
-            })?;
+            let col_idx = batch
+                .schema()
+                .index_of(column)
+                .map_err(|e| ConnectorError::Schema {
+                    message: format!("column '{}' not found: {}", column, e),
+                })?;
             let col = batch.column(col_idx);
             let str_col = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
                 ConnectorError::Schema {
@@ -1004,10 +999,7 @@ impl DeadLetterSink {
 
         if result.failed {
             return Err(ConnectorError::Io {
-                message: format!(
-                    "sink '{}': data quality Fail action triggered",
-                    self.name
-                ),
+                message: format!("sink '{}': data quality Fail action triggered", self.name),
             });
         }
 
@@ -1015,10 +1007,11 @@ impl DeadLetterSink {
         let keep_mask: BooleanArray = (0..batch.num_rows())
             .map(|i| Some(result.accepted_indices.contains(&i)))
             .collect();
-        let accepted = arrow::compute::filter_record_batch(batch, &keep_mask)
-            .map_err(|e| ConnectorError::Io {
+        let accepted = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
+            ConnectorError::Io {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok((accepted, result.rejected))
     }
@@ -1591,9 +1584,7 @@ mod quality_tests {
 
     #[test]
     fn regex_rule_rejects_non_matching_values() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("email", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("email", DataType::Utf8, true)]));
         let emails = StringArray::from(vec![
             Some("alice@example.com"),
             Some("not-an-email"),
@@ -1612,7 +1603,8 @@ mod quality_tests {
         let result = check_batch(&batch, &config).unwrap();
         // "not-an-email" (idx 1) and None (idx 2) should be rejected
         assert_eq!(result.rejected.len(), 2);
-        let rejected_indices: Vec<usize> = result.rejected.iter().map(|r| r.batch_row_index).collect();
+        let rejected_indices: Vec<usize> =
+            result.rejected.iter().map(|r| r.batch_row_index).collect();
         assert!(rejected_indices.contains(&1));
         assert!(rejected_indices.contains(&2));
     }
@@ -1623,7 +1615,10 @@ mod quality_tests {
         let col = StringArray::from(vec!["hello"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
         let config = DataQualityConfig::new().with_rule(
-            DataQualityRule::Regex { column: "v".into(), pattern: "[invalid((".into() },
+            DataQualityRule::Regex {
+                column: "v".into(),
+                pattern: "[invalid((".into(),
+            },
             QualityAction::Reject,
         );
         assert!(check_batch(&batch, &config).is_err());
@@ -1639,10 +1634,11 @@ mod quality_tests {
         let col = Float64Array::from(vec![Some(1.0), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
-        let config = DataQualityConfig::new()
-            .with_rule(DataQualityRule::NotNull { column: "v".into() }, QualityAction::Reject);
-        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path())
-            .with_quality_config(config);
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::NotNull { column: "v".into() },
+            QualityAction::Reject,
+        );
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path()).with_quality_config(config);
 
         let handle = sink.prepare(1, &batch).unwrap();
         sink.commit(handle).unwrap();
@@ -1678,10 +1674,11 @@ mod quality_tests {
         let col = Float64Array::from(vec![None::<f64>]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
-        let config = DataQualityConfig::new()
-            .with_rule(DataQualityRule::NotNull { column: "v".into() }, QualityAction::Fail);
-        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path())
-            .with_quality_config(config);
+        let config = DataQualityConfig::new().with_rule(
+            DataQualityRule::NotNull { column: "v".into() },
+            QualityAction::Fail,
+        );
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path()).with_quality_config(config);
 
         let result = sink.prepare(1, &batch);
         assert!(result.is_err(), "Fail action must abort prepare");

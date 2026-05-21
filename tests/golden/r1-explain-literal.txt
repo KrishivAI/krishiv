@@ -2,7 +2,7 @@
 | plan_type     | plan                              |
 +---------------+-----------------------------------+
 | logical_plan  | Projection: Int64(1) AS value     |
-|               |   EmptyRelation                   |
+|               |   EmptyRelation: rows=1           |
 | physical_plan | ProjectionExec: expr=[1 as value] |
 |               |   PlaceholderRowExec              |
 |               |                                   |

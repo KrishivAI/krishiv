@@ -476,6 +476,14 @@ fn build_session(command: &QueryCommand) -> Result<Session, String> {
         .map_err(|error| error.to_string())?;
 
     for (table, path) in &command.parquet_tables {
+        // DataFusion 53+ silently returns empty results for missing files;
+        // validate existence here so users get a clear error.
+        if !path.exists() {
+            return Err(format!(
+                "DataFusion error: parquet file not found: {}",
+                path.display()
+            ));
+        }
         session
             .register_parquet(table, path)
             .map_err(|error| error.to_string())?;

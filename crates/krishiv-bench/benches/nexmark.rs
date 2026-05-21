@@ -15,7 +15,11 @@ fn nexmark_q1_logic(events: &[u64]) -> Vec<u64> {
 
 /// Simulate Nexmark Q2: item ID filter.
 fn nexmark_q2_logic(events: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    events.iter().filter(|(id, _)| id % 123 == 0).cloned().collect()
+    events
+        .iter()
+        .filter(|(id, _)| id % 123 == 0)
+        .cloned()
+        .collect()
 }
 
 fn bench_nexmark_q1(c: &mut Criterion) {
