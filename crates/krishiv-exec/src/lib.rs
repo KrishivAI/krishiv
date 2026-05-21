@@ -85,6 +85,10 @@ pub enum ExecError {
     ColumnNotFound(String),
     /// A data type is not supported for this operation.
     UnsupportedType(String),
+    /// A `RecordBatch` did not match the expected schema for a physical operator.
+    UnexpectedBatchSchema,
+    /// A window operator was constructed with an invalid configuration.
+    InvalidWindowConfig(String),
 }
 
 impl fmt::Display for ExecError {
@@ -93,6 +97,8 @@ impl fmt::Display for ExecError {
             Self::Arrow(msg) => write!(f, "arrow error: {msg}"),
             Self::ColumnNotFound(col) => write!(f, "column not found: {col}"),
             Self::UnsupportedType(msg) => write!(f, "unsupported type: {msg}"),
+            Self::UnexpectedBatchSchema => write!(f, "unexpected record batch schema"),
+            Self::InvalidWindowConfig(msg) => write!(f, "invalid window config: {msg}"),
         }
     }
 }
@@ -409,6 +415,7 @@ pub struct AggExpr {
 }
 
 /// Running aggregation state for one group.
+#[derive(Debug)]
 struct AggState {
     /// One running value per `AggExpr`: count, sum, min, or max.
     values: Vec<i64>,
@@ -976,6 +983,7 @@ pub struct SlidingWindowSpec {
 ///
 /// Each event is placed into every window `[w, w + size)` where
 /// `w` is a multiple of `slide_ms` and `w ≤ event_time_ms < w + size`.
+#[derive(Debug)]
 pub struct SlidingWindowOperator {
     spec: SlidingWindowSpec,
     // (serialised_key, window_start_ms) → aggregate accumulator
@@ -985,12 +993,20 @@ pub struct SlidingWindowOperator {
 
 impl SlidingWindowOperator {
     /// Create a new sliding window operator.
-    pub fn new(spec: SlidingWindowSpec) -> Self {
-        Self {
+    ///
+    /// Returns `Err(ExecError::InvalidWindowConfig)` if `spec.slide_ms == 0`,
+    /// which would cause an infinite loop in `window_starts`.
+    pub fn new(spec: SlidingWindowSpec) -> ExecResult<Self> {
+        if spec.slide_ms == 0 {
+            return Err(ExecError::InvalidWindowConfig(
+                "slide_ms must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
             spec,
             accumulators: HashMap::new(),
             prev_watermark_ms: i64::MIN,
-        }
+        })
     }
 
     /// Number of open (not yet flushed) window buckets.
@@ -1454,32 +1470,44 @@ pub struct OperatorQueueReceiver {
     data_rx: tokio::sync::mpsc::Receiver<arrow::record_batch::RecordBatch>,
     barrier_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
     capacity: usize,
+    /// P0.5: a barrier epoch that was deferred because a data item arrived
+    /// at the same time.  This is drained before the next data receive.
+    pending_barrier: Option<u64>,
 }
 
 impl OperatorQueueReceiver {
     /// Receive the next message.
     ///
-    /// After each data item is returned, any pending barriers are drained and
-    /// returned first on the next call, so barriers always arrive before
-    /// subsequent data items.
+    /// Priority order:
+    /// 1. A barrier epoch stored in `pending_barrier` (deferred from a
+    ///    previous call where data and a barrier arrived simultaneously).
+    /// 2. A barrier available right now on `barrier_rx`.
+    /// 3. The next data batch from `data_rx` (async wait).
+    ///    If a barrier also arrives after the data batch is dequeued, the
+    ///    epoch is saved to `pending_barrier` and returned on the *next* call.
     pub async fn recv(&mut self) -> Option<OperatorMessage> {
-        // Drain any pending barriers first.
+        // 1. Drain any previously deferred barrier first.
+        if let Some(epoch) = self.pending_barrier.take() {
+            return Some(OperatorMessage::Barrier { epoch });
+        }
+
+        // 2. Drain any barrier that is already in the channel before blocking.
         match self.barrier_rx.try_recv() {
             Ok(epoch) => return Some(OperatorMessage::Barrier { epoch }),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
         }
-        // Then receive next data item.
+
+        // 3. Wait for the next data item.
         let batch = self.data_rx.recv().await?;
-        // Check for a barrier that arrived between the last drain and now.
+
+        // 4. If a barrier arrived simultaneously (between the try_recv above
+        //    and the data recv), save it so it is delivered on the next call
+        //    — before the subsequent data item, preserving ordering.
         if let Ok(epoch) = self.barrier_rx.try_recv() {
-            // Re-buffer the data item is not possible here; instead we process
-            // the barrier immediately on the next recv() call.
-            // For R7.2 simplicity: return data, barrier will be first next call.
-            let _ = epoch; // barrier is still in the channel for next recv()
-            // Actually we need to put it back — use a 1-item slot.
-            // Simplified: just return data; barrier drains first next time.
+            self.pending_barrier = Some(epoch);
         }
+
         Some(OperatorMessage::Data(batch))
     }
 
@@ -1488,7 +1516,8 @@ impl OperatorQueueReceiver {
         OperatorQueueMetrics {
             len: self.capacity - self.data_rx.capacity(),
             capacity: self.capacity,
-            pending_barriers: self.barrier_rx.len(),
+            pending_barriers: self.barrier_rx.len()
+                + if self.pending_barrier.is_some() { 1 } else { 0 },
         }
     }
 }
@@ -1522,6 +1551,7 @@ pub fn operator_queue(capacity: usize) -> (OperatorQueueSender, OperatorQueueRec
         data_rx,
         barrier_rx,
         capacity: capacity.max(1),
+        pending_barrier: None,
     };
     (sender, receiver)
 }
@@ -2514,7 +2544,7 @@ mod tests {
     #[test]
     fn sliding_window_event_belongs_to_two_windows() {
         // window_size=1000, slide=500: event at t=600 belongs to [0,1000) and [500,1500).
-        let mut op = SlidingWindowOperator::new(sliding_spec());
+        let mut op = SlidingWindowOperator::new(sliding_spec()).unwrap();
         let batch = make_stream_batch_i64(vec!["a"], vec![600], vec![1]);
         // watermark high enough to close both windows
         let out = op.process_batch(&batch, 2000).unwrap();
@@ -2529,7 +2559,7 @@ mod tests {
     #[test]
     fn sliding_window_late_events_dropped() {
         // size=1000, slide=500: event at t=1500 belongs to [1000,2000) and [1500,2500).
-        let mut op = SlidingWindowOperator::new(sliding_spec());
+        let mut op = SlidingWindowOperator::new(sliding_spec()).unwrap();
         let b1 = make_stream_batch_i64(vec!["a"], vec![1500], vec![1]);
         op.process_batch(&b1, 1500).unwrap();
 
@@ -2716,6 +2746,99 @@ mod tests {
         assert_eq!(metrics.len, 0);
         assert!(!metrics.is_full());
         drop(tx);
+    }
+
+    // ── P0.5: pending_barrier test ────────────────────────────────────────────
+
+    /// Verify that a barrier injected when the data channel is empty is
+    /// delivered on the very next `recv()` call (not lost).
+    #[tokio::test]
+    async fn operator_queue_barrier_at_empty_queue_delivered_next_recv() {
+        let (tx, mut rx) = operator_queue(8);
+
+        // Inject a barrier while the data channel is empty.
+        tx.send_barrier(42).unwrap();
+
+        // First recv must be the barrier.
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(first, OperatorMessage::Barrier { epoch: 42 }),
+            "barrier injected at empty queue must be delivered immediately: got {first:?}"
+        );
+
+        // Now send data and a barrier together to exercise the pending_barrier path.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as Arc<dyn arrow::array::Array>],
+        )
+        .unwrap();
+        tx.send_data(batch).await.unwrap();
+        tx.send_barrier(99).unwrap();
+
+        // The barrier channel is drained before data, so we get the barrier first.
+        let second = rx.recv().await.unwrap();
+        assert!(
+            matches!(second, OperatorMessage::Barrier { epoch: 99 }),
+            "barrier must arrive before data when both are queued: got {second:?}"
+        );
+
+        // Then the data item.
+        let third = rx.recv().await.unwrap();
+        assert!(
+            matches!(third, OperatorMessage::Data(_)),
+            "data must follow the barrier: got {third:?}"
+        );
+    }
+
+    // ── P0.10: UnexpectedBatchSchema test ─────────────────────────────────────
+
+    /// Feed a batch whose event-time column is Float64 (not Int64) to
+    /// `TumblingWindowOperator::process_batch` and verify an error is returned
+    /// (not a panic).
+    #[test]
+    fn tumbling_window_wrong_schema_returns_error_not_panic() {
+        use arrow::array::Float64Array;
+
+        let bad_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Float64, false), // wrong: should be Int64
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let bad_batch = RecordBatch::try_new(
+            bad_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.0_f64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mut op = TumblingWindowOperator::new(count_window_spec());
+        let result = op.process_batch(&bad_batch, 1000);
+        assert!(
+            result.is_err(),
+            "wrong column type must return Err, not panic"
+        );
+    }
+
+    // ── P0.18: SlidingWindowOperator slide_ms == 0 guard test ─────────────────
+
+    #[test]
+    fn sliding_window_zero_slide_returns_error() {
+        let bad_spec = SlidingWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            slide_ms: 0, // invalid — would cause infinite loop
+            agg_exprs: vec![],
+        };
+        let result = SlidingWindowOperator::new(bad_spec);
+        assert!(
+            matches!(result, Err(ExecError::InvalidWindowConfig(_))),
+            "slide_ms == 0 must return Err(InvalidWindowConfig), got {result:?}"
+        );
     }
 
     // ── R7.2 HeavyHittersTracker tests ──────────────────────────────────────
