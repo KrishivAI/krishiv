@@ -10,9 +10,11 @@ path = "src/lib.rs"
 
 [dependencies]
 redb.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true
