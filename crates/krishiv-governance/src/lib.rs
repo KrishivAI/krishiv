@@ -359,11 +359,21 @@ pub struct LineageDataset {
 
 /// **Beta API**: Error emitting an OpenLineage event.
 #[derive(Debug)]
-pub struct EmitError(pub String);
+pub enum EmitError {
+    /// The HTTP transport failed (connection error, timeout, etc.).
+    Transport(String),
+    /// The server rejected the event with a 4xx or 5xx status.
+    SinkRejected { status: u16, message: String },
+}
 
 impl std::fmt::Display for EmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "emit error: {}", self.0)
+        match self {
+            EmitError::Transport(msg) => write!(f, "emit transport error: {msg}"),
+            EmitError::SinkRejected { status, message } => {
+                write!(f, "emit rejected by sink: HTTP {status} — {message}")
+            }
+        }
     }
 }
 
@@ -392,7 +402,8 @@ pub struct LoggingEmitter;
 #[async_trait::async_trait]
 impl OpenLineageEmitter for LoggingEmitter {
     async fn emit(&self, event: RunEvent) -> Result<(), EmitError> {
-        let json = serde_json::to_string(&event).map_err(|e| EmitError(e.to_string()))?;
+        let json =
+            serde_json::to_string(&event).map_err(|e| EmitError::Transport(e.to_string()))?;
         tracing::info!(target: "krishiv::lineage", event = json.as_str(), "openlineage event");
         Ok(())
     }
@@ -417,12 +428,21 @@ impl HttpEmitter {
 #[async_trait::async_trait]
 impl OpenLineageEmitter for HttpEmitter {
     async fn emit(&self, event: RunEvent) -> Result<(), EmitError> {
-        self.client
+        let response = self
+            .client
             .post(&self.endpoint)
             .json(&event)
             .send()
             .await
-            .map_err(|e| EmitError(e.to_string()))?;
+            .map_err(|e| EmitError::Transport(e.to_string()))?;
+
+        // P0.20: propagate 4xx/5xx instead of silently ignoring them.
+        if let Err(e) = response.error_for_status_ref() {
+            let status = e.status().map_or(0, |s| s.as_u16());
+            let message = e.to_string();
+            return Err(EmitError::SinkRejected { status, message });
+        }
+
         Ok(())
     }
 }
@@ -703,5 +723,84 @@ mod tests {
             key_after_first, key_after_different,
             "a different event must update the stored key"
         );
+    }
+
+    // ── P0.20: HttpEmitter error-for-status tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn http_emitter_400_returns_sink_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(400)
+            .with_body("bad request")
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        let result = emitter.emit(event).await;
+        assert!(result.is_err(), "400 must be an error");
+        if let Err(EmitError::SinkRejected { status, .. }) = result {
+            assert_eq!(status, 400);
+        } else {
+            panic!("expected SinkRejected, got: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_emitter_429_returns_sink_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(429)
+            .with_body("rate limited")
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        let result = emitter.emit(event).await;
+        assert!(result.is_err(), "429 must be an error");
+        if let Err(EmitError::SinkRejected { status, .. }) = result {
+            assert_eq!(status, 429);
+        } else {
+            panic!("expected SinkRejected, got: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_emitter_500_returns_sink_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(500)
+            .with_body("internal server error")
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        let result = emitter.emit(event).await;
+        assert!(result.is_err(), "500 must be an error");
+        if let Err(EmitError::SinkRejected { status, .. }) = result {
+            assert_eq!(status, 500);
+        } else {
+            panic!("expected SinkRejected, got: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_emitter_200_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        assert!(emitter.emit(event).await.is_ok(), "200 must succeed");
     }
 }

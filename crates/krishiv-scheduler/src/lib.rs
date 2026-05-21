@@ -1705,7 +1705,10 @@ impl Coordinator {
     /// For streaming jobs with checkpoint config, checkpoint state is recovered
     /// via `CheckpointCoordinator::recover_from_storage`.
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
-        // P1.23: Always use the store version to win over any partial in-memory state.
+        // P1.23: Clear in-memory state first so stale phantom jobs cannot survive.
+        // Always prefer the persisted store as the authoritative source of truth.
+        self.jobs.clear();
+        self.streaming_task_index.clear();
         for record in store.jobs() {
             self.jobs.insert(record.job_id().clone(), record.clone());
         }
@@ -1993,6 +1996,39 @@ impl Coordinator {
         plan: &PhysicalPlan,
     ) -> SchedulerResult<SubmitOutcome> {
         self.submit_job(job_spec_from_physical_plan(job_id, plan)?)
+    }
+
+    /// Re-assign all `Pending` tasks in a job to available executors.
+    ///
+    /// Called after a stage retry (P1.24) to move tasks from `Pending` back to
+    /// `Assigned` so `launch_assigned_tasks` can launch them.
+    pub fn assign_pending_tasks(&mut self, job_id: &JobId) -> SchedulerResult<usize> {
+        self.ensure_active()?;
+        // Collect executor ids first to avoid a simultaneous immutable + mutable borrow.
+        let executor_ids: Vec<ExecutorId> = self
+            .executors
+            .schedulable_executors()
+            .into_iter()
+            .map(|d| d.executor_id().clone())
+            .collect();
+        if executor_ids.is_empty() {
+            return Err(SchedulerError::NoExecutors);
+        }
+        let job = self.find_job_mut(job_id)?;
+        let pending_task_ids: Vec<TaskId> = job
+            .stages
+            .iter()
+            .flat_map(|s| s.tasks())
+            .filter(|t| t.state() == TaskState::Pending)
+            .map(|t| t.task_id().clone())
+            .collect();
+        let count = pending_task_ids.len();
+        for (idx, task_id) in pending_task_ids.into_iter().enumerate() {
+            let executor_id = executor_ids[idx % executor_ids.len()].clone();
+            let assignment = TaskAssignment::new(task_id, executor_id);
+            job.apply_assignments(vec![assignment]);
+        }
+        Ok(count)
     }
 
     /// Launch all assigned tasks for a job.
@@ -3084,12 +3120,11 @@ impl StageRecord {
         self.retry_count = self.retry_count.saturating_add(1);
         self.state = StageState::Retrying;
 
+        // P1.24: Always reset to Pending so the scheduler can re-queue and re-assign.
+        // Using Assigned here would bypass the placement logic on the next schedule pass.
         for task in &mut self.tasks {
-            task.state = if task.assigned_executor.is_some() {
-                TaskState::Assigned
-            } else {
-                TaskState::Pending
-            };
+            task.state = TaskState::Pending;
+            task.assigned_executor = None;
         }
     }
 
@@ -3587,6 +3622,22 @@ fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
                         "stage {} declares upstream dependency on unknown stage {}",
                         stage.stage_id(),
                         upstream_id
+                    ),
+                });
+            }
+        }
+    }
+    // P0.19: O(n) duplicate task-id detection using a HashSet instead of O(n²) Vec scan.
+    let mut seen_task_ids: std::collections::HashSet<&TaskId> =
+        std::collections::HashSet::with_capacity(spec.task_count());
+    for stage in spec.stages() {
+        for task in stage.tasks() {
+            if !seen_task_ids.insert(task.task_id()) {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "duplicate task id {} in job {}",
+                        task.task_id(),
+                        spec.job_id()
                     ),
                 });
             }
@@ -5712,14 +5763,18 @@ mod tests {
 
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Running);
-        assert_eq!(snapshot.assigned_task_count(), 2);
+        // P1.24: After retry, tasks are Pending (not Assigned), so assigned_task_count = 0.
+        assert_eq!(snapshot.assigned_task_count(), 0);
         assert_eq!(snapshot.failed_task_count(), 0);
 
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
         assert_eq!(detail.stages()[0].retry_count(), 1);
-        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Assigned);
-        assert_eq!(detail.stages()[0].tasks()[1].state(), TaskState::Assigned);
+        // P1.24: Retried tasks must be Pending so the scheduler can re-queue them.
+        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Pending);
+        assert_eq!(detail.stages()[0].tasks()[1].state(), TaskState::Pending);
 
+        // Re-assign then launch (simulates the scheduler's next planning cycle).
+        assert_eq!(coordinator.assign_pending_tasks(&job_id).unwrap(), 2);
         assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 2);
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
         assert_eq!(detail.stages()[0].tasks()[0].attempt(), 2);
@@ -5749,6 +5804,62 @@ mod tests {
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 2);
+    }
+
+    // ── P1.24: retry_stage sets Pending (not Assigned) ───────────────────────
+
+    #[test]
+    fn retried_tasks_are_pending_and_become_schedulable() {
+        // P1.24: Verify that after a stage retry all tasks transition to Pending
+        // so the scheduler can re-queue them through the normal placement path.
+        let mut coordinator = Coordinator::active_with_config(
+            CoordinatorId::try_new("coord-p124").unwrap(),
+            CoordinatorConfig::new(1, 3),
+        );
+        let executor_id = ExecutorId::try_new("exec-p124").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        // Report task failure to trigger a retry.
+        coordinator
+            .apply_task_update(TaskStatusUpdate::new(
+                job_id.clone(),
+                stage_id.clone(),
+                task_id.clone(),
+                executor_id.clone(),
+                TaskState::Failed,
+                1,
+            ))
+            .unwrap();
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        assert_eq!(detail.stages()[0].retry_count(), 1);
+
+        // All tasks must be Pending — not Assigned — so placement runs again.
+        for task in detail.stages()[0].tasks() {
+            assert_eq!(
+                task.state(),
+                TaskState::Pending,
+                "retried task {} must be Pending, got {:?}",
+                task.task_id(),
+                task.state()
+            );
+        }
+
+        // assign_pending_tasks + launch confirms tasks are re-schedulable.
+        let assigned = coordinator.assign_pending_tasks(&job_id).unwrap();
+        assert_eq!(assigned, 2, "both tasks must be re-assigned after retry");
+        let launched = coordinator.launch_assigned_tasks(&job_id).unwrap();
+        assert_eq!(launched, 2, "both tasks must be launchable after re-assignment");
     }
 
     #[test]
@@ -5933,7 +6044,11 @@ mod tests {
             .unwrap();
 
         // Simulate coordinator restart via recover_from_store.
-        let store = InMemoryMetadataStore::default();
+        // P1.23: the store must contain the streaming job so recovery can restore it.
+        let mut store = InMemoryMetadataStore::default();
+        store
+            .save_job(coordinator.jobs.values().next().unwrap())
+            .unwrap();
         coordinator.recover_from_store(&store).unwrap();
 
         // Advance 3 ticks (> timeout of 2, but < grace period of 10).
@@ -6051,10 +6166,13 @@ mod tests {
             JobState::Running
         );
 
-        // Simulate coordinator restart: recover from an empty store (the task
-        // records are already in-memory from the submit; in a real restart they
-        // would be loaded from a durable store).
-        let store = InMemoryMetadataStore::default();
+        // Simulate coordinator restart: persist the streaming job to the store
+        // so recovery (P1.23) can restore it (in a real restart the store
+        // would have been written before the coordinator process exited).
+        let mut store = InMemoryMetadataStore::default();
+        store
+            .save_job(coordinator.jobs.values().next().unwrap())
+            .unwrap();
         coordinator.recover_from_store(&store).unwrap();
 
         // Executor sends its first post-restart heartbeat carrying streaming state.
@@ -6192,6 +6310,65 @@ mod tests {
         assert!(coordinator.submit_job(spec).is_ok());
     }
 
+    // ── P0.19: O(1) duplicate task-id detection tests ─────────────────────────
+
+    #[test]
+    fn validate_job_rejects_duplicate_task_ids() {
+        let job_id = JobId::try_new("job-dup").unwrap();
+        // Two stages both containing task-1 — duplicate across stages.
+        let spec = JobSpec::new(job_id, "duplicate task ids", JobKind::Batch)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "s1")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+            )
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-2").unwrap(), "s2")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1-dup")),
+            );
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-dup").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                2,
+            ))
+            .unwrap();
+        let result = coordinator.submit_job(spec);
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidJob { .. })),
+            "expected InvalidJob for duplicate task id, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_job_accepts_large_unique_task_set() {
+        // P0.19: Verify correct behaviour with 1000+ tasks using the HashSet path.
+        let job_id = JobId::try_new("job-large").unwrap();
+        const TASK_COUNT: usize = 1024;
+        let mut stage =
+            StageSpec::new(StageId::try_new("stage-big").unwrap(), "big stage");
+        for i in 0..TASK_COUNT {
+            stage = stage.with_task(TaskSpec::new(
+                TaskId::try_new(format!("task-{i}")).unwrap(),
+                format!("task {i}"),
+            ));
+        }
+        let spec = JobSpec::new(job_id, "large unique task set", JobKind::Batch).with_stage(stage);
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-large").unwrap());
+        // Register enough slots for all tasks.
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                TASK_COUNT,
+            ))
+            .unwrap();
+        assert!(
+            coordinator.submit_job(spec).is_ok(),
+            "1024 unique task ids must be accepted"
+        );
+    }
+
     #[test]
     fn in_memory_metadata_store_round_trips() {
         let coord_id = CoordinatorId::try_new("coord-1").unwrap();
@@ -6252,6 +6429,61 @@ mod tests {
         coordinator.recover_from_store(&store).unwrap();
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Running);
+    }
+
+    // ── P1.23: recover_from_store clears stale in-memory state ───────────────
+
+    #[test]
+    fn recover_from_store_removes_phantom_stale_jobs() {
+        // Pre-populate the coordinator with a stale job that is NOT in the store.
+        let coord_id = CoordinatorId::try_new("coord-p123").unwrap();
+        let stale_job_id = JobId::try_new("stale-job").unwrap();
+        let store_job_id = JobId::try_new("stored-job").unwrap();
+
+        let mut coordinator = Coordinator::active(coord_id.clone());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-1").unwrap(),
+                "pod-a",
+                2,
+            ))
+            .unwrap();
+
+        // Submit a job so it lands in-memory but NOT in the store.
+        let stale_spec = JobSpec::new(stale_job_id.clone(), "stale", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "s1")
+                .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+        );
+        coordinator.submit_job(stale_spec).unwrap();
+        assert!(coordinator.job_snapshot(&stale_job_id).is_ok(), "stale job must be in-memory");
+
+        // Build a store that only has a different job.
+        let mut store = InMemoryMetadataStore::default();
+        let mut prev = Coordinator::active(coord_id);
+        prev.register_executor(ExecutorDescriptor::new(
+            ExecutorId::try_new("exec-2").unwrap(),
+            "pod-b",
+            2,
+        ))
+        .unwrap();
+        let stored_spec =
+            JobSpec::new(store_job_id.clone(), "stored", JobKind::Batch).with_stage(
+                StageSpec::new(StageId::try_new("stage-s").unwrap(), "ss")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-s1").unwrap(), "ts1")),
+            );
+        prev.submit_job(stored_spec).unwrap();
+        store.save_job(prev.jobs.values().next().unwrap()).unwrap();
+
+        // Recovery must discard the stale in-memory job and load only the stored one.
+        coordinator.recover_from_store(&store).unwrap();
+        assert!(
+            coordinator.job_snapshot(&stale_job_id).is_err(),
+            "stale phantom job must be removed after recovery"
+        );
+        assert!(
+            coordinator.job_snapshot(&store_job_id).is_ok(),
+            "store-persisted job must be present after recovery"
+        );
     }
 
     // --- Slice 1: MetadataStore write-through tests ---

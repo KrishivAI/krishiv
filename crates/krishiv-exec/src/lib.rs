@@ -2957,6 +2957,57 @@ mod tests {
         assert!(wait.is_some(), "tokens clamped to 100, cannot consume 101");
     }
 
+    // ── P1.28: RateLimiter first-call must not over-refill ───────────────────
+
+    #[test]
+    fn rate_limiter_does_not_burst_past_ceiling_on_first_call() {
+        // P1.28: After the initial full bucket is drained, the first call with a
+        // large elapsed time must not grant MORE than `capacity` tokens in total
+        // (the min-cap in try_consume ensures this).
+        let mut rl = RateLimiter::new(500);
+        // Drain the bucket fully at t=0.
+        let wait = rl.try_consume(500, 0);
+        assert!(wait.is_none(), "initial full-capacity consume must succeed");
+
+        // At t=10_000ms (10s later) try to consume the whole capacity again.
+        // Due to 500 tokens/sec × 10s = 5000 tokens would be added, but the
+        // bucket is capped at capacity (500).  The result must be <= capacity.
+        let wait = rl.try_consume(501, 10_000);
+        assert!(
+            wait.is_some(),
+            "consuming 501 when bucket is capped at 500 must be blocked"
+        );
+
+        // Consuming exactly capacity after a long refill window must succeed.
+        let _ = rl.try_consume(1, 10_001); // consume the previous blocking amount's wait
+        let wait2 = rl.try_consume(500, 11_000);
+        assert!(
+            wait2.is_none(),
+            "consuming exactly capacity after 1s refill must succeed immediately"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_no_double_refill_across_window() {
+        // P1.28: Verify tokens never exceed capacity even after a very long idle period.
+        let mut rl = RateLimiter::new(100);
+        // Drain fully at t=0.
+        rl.try_consume(100, 0);
+        // 1 000 000 ms later — would add 100_000 tokens without the cap.
+        // With the cap, tokens must be clamped to 100.
+        let wait = rl.try_consume(101, 1_000_000);
+        assert!(
+            wait.is_some(),
+            "tokens must be capped at capacity regardless of idle duration"
+        );
+        // But consuming exactly capacity must succeed.
+        let wait = rl.try_consume(100, 1_000_000);
+        assert!(
+            wait.is_none(),
+            "capacity-sized consume after long idle must succeed"
+        );
+    }
+
     // ── R7.2 SinkLatencyTracker tests ───────────────────────────────────────
 
     #[test]
