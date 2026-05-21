@@ -1,40 +1,37 @@
 # Batch SQL Examples
 
-R1 supports local SQL through `krishiv sql` and `krishiv explain`.
-
 Run a literal query:
 
 ```bash
-cargo run -p krishiv-cli -- sql --query "select 1 as value"
+cargo run -p krishiv -- sql --query "select 1 as value"
 ```
 
 Explain the logical and physical plan:
 
 ```bash
-cargo run -p krishiv-cli -- explain --query "select 1 as value"
+cargo run -p krishiv -- explain --query "select 1 as value"
 ```
 
-Submit a synthetic R2 distributed job to the local scheduler skeleton:
+Submit a distributed job to the local scheduler:
 
 ```bash
-cargo run -p krishiv-cli -- submit --job-id job-demo --name demo --tasks 2 --launch
+cargo run -p krishiv -- submit --job-id job-demo --name demo --tasks 2 --launch
 ```
 
-Show the R2 distributed status shape for the current process:
+Show distributed status for the current process:
 
 ```bash
-cargo run -p krishiv-cli -- jobs --distributed
+cargo run -p krishiv -- jobs --distributed
 ```
 
-Run the embedded Parquet example to generate a small Parquet-backed query using
-the same public API:
+Run the embedded Parquet example using the unified `krishiv` crate:
 
 ```bash
-cargo run -p krishiv-api --example local_sql_parquet
+cargo run -p krishiv --example batch_sql
 ```
 
-For CLI Parquet registration, use:
+For CLI Parquet registration:
 
 ```bash
-cargo run -p krishiv-cli -- sql --parquet people=./people.parquet --query "select count(*) from people"
+cargo run -p krishiv -- sql --parquet people=./people.parquet --query "select count(*) from people"
 ```

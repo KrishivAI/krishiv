@@ -49,8 +49,8 @@ Goal: create a compiling workspace with crate boundaries, API stubs, runtime stu
 - [x] Add example/test directory placeholders.
 - [x] Validate with `cargo check --workspace`.
 - [x] Validate with `cargo test --workspace`.
-- [x] Validate CLI help with `cargo run -p krishiv-cli -- --help`.
-- [x] Validate explain help with `cargo run -p krishiv-cli -- explain --help`.
+- [x] Validate CLI help with `cargo run -p krishiv -- --help`.
+- [x] Validate explain help with `cargo run -p krishiv -- explain --help`.
 
 ## Architecture Deliverables
 

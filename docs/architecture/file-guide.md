@@ -20,13 +20,16 @@ meant for humans and Codex sessions resuming implementation work.
 |---|---|
 | `crates/krishiv-api/Cargo.toml` | Defines the public API crate, local dependencies, and Arrow/Tokio integration. |
 | `crates/krishiv-api/src/lib.rs` | Exposes `Session`, `SessionBuilder`, `DataFrame`, `Stream`, `ExecutionMode`, Arrow-backed `QueryResult`, and `StreamBatch`. |
-| `crates/krishiv-api/examples/local_sql_parquet.rs` | Runnable embedded example that writes a small Parquet file, registers it, and runs SQL. |
-| `crates/krishiv-api/examples/memory_stream.rs` | Runnable embedded example for bounded local memory stream collection. |
-| `crates/krishiv-cli/Cargo.toml` | Defines the CLI crate and `krishiv` binary target. |
-| `crates/krishiv-cli/src/lib.rs` | Owns help text, command parsing, `sql`, `explain`, `submit`, and `jobs` dispatch. |
-| `crates/krishiv-cli/src/main.rs` | Thin binary entrypoint that forwards arguments to `krishiv-cli` dispatch. |
-| `crates/krishiv-cli/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
-| `crates/krishiv-cli/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |
+| `crates/krishiv/Cargo.toml` | Defines the user-facing façade crate and the `krishiv` binary target. |
+| `crates/krishiv/src/lib.rs` | Re-exports all public API types from internal crates; `pub mod cli` exposes CLI dispatch. |
+| `crates/krishiv/src/cli.rs` | Owns help text, command parsing, and dispatch for `sql`, `explain`, `submit`, `jobs`, `state`, `savepoint`, `restore`, and `checkpoints`. |
+| `crates/krishiv/src/main.rs` | Thin binary entrypoint that initialises telemetry and delegates to `krishiv::cli::dispatch`. |
+| `crates/krishiv/examples/batch_sql.rs` | Runnable embedded example using the unified `krishiv` crate for Parquet-backed SQL. |
+| `crates/krishiv/examples/memory_stream.rs` | Runnable embedded example for bounded local memory stream collection using the `krishiv` crate. |
+| `crates/krishiv/tests/r1_cli_golden.rs` | Validates stable R1 CLI output against golden fixtures. |
+| `crates/krishiv/tests/r1_cli_contract.rs` | Validates R1 CLI Parquet query behavior and user-facing error paths. |
+| `crates/krishiv-api/Cargo.toml` | Defines the core API crate used internally by `krishiv-python`, `krishiv-flight-sql`, and `krishiv-bench`. |
+| `crates/krishiv-api/src/lib.rs` | Exposes `Session`, `SessionBuilder`, `DataFrame`, `Stream`, `ExecutionMode`, Arrow-backed `QueryResult`, and `StreamBatch`. |
 | `crates/krishiv-executor/Cargo.toml` | Defines the R3.1 executor crate and `krishiv-executor` binary target. |
 | `crates/krishiv-executor/src/lib.rs` | Owns executor startup configuration, the minimal runtime facade, construction of versioned registration/heartbeat requests, tonic-shaped coordinator service calls, the networked gRPC client path, the executor-side task assignment receiver, and the first task runner skeleton. |
 | `crates/krishiv-executor/src/main.rs` | Runs the R3.1 executor CLI in dry-run, one-shot registration, or heartbeat-loop mode. |

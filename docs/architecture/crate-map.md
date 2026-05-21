@@ -10,8 +10,8 @@ while keeping public Krishiv APIs stable.
 
 | Crate | Owns | Must Not Own |
 |---|---|---|
-| `krishiv-api` | Public Rust `Session`, `DataFrame`, `Stream`, `ExecutionMode`, Arrow-backed query results, and local stream APIs | Kubernetes, RocksDB, connector-specific implementations, long-term DataFusion internals |
-| `krishiv-cli` | `krishiv sql`, `krishiv explain`, `krishiv jobs`, command parsing, and user-facing output | Engine logic, SQL planning, runtime execution internals |
+| `krishiv` | **User-facing façade**: re-exports all public API types, owns the `krishiv` binary and CLI dispatch (`src/cli.rs`), and is the single crate users add to `Cargo.toml` | Engine internals — all heavy logic stays in the crates below |
+| `krishiv-api` | Core public Rust types: `Session`, `DataFrame`, `Stream`, `ExecutionMode`, Arrow-backed query results, and local stream APIs. Used directly by `krishiv-python`, `krishiv-flight-sql`, and `krishiv-bench`. | Kubernetes, RocksDB, connector-specific implementations, long-term DataFusion internals |
 | `krishiv-sql` | DataFusion session integration, local SQL execution, Parquet registration, and SQL explain formatting | Public user session state, runtime scheduling |
 | `krishiv-plan` | Krishiv logical/physical plan wrappers and DAG-level concepts | SQL parser details, physical operator execution |
 | `krishiv-exec` | Physical operator descriptors and future Arrow execution operators | User-facing API, distributed scheduling |
@@ -27,7 +27,15 @@ while keeping public Krishiv APIs stable.
 Current dependency direction:
 
 ```text
-krishiv-cli
+krishiv  (facade + binary)
+  -> krishiv-api
+  -> krishiv-checkpoint
+  -> krishiv-connectors
+  -> krishiv-lakehouse
+  -> krishiv-metrics
+  -> krishiv-proto
+  -> krishiv-scheduler
+  -> krishiv-udf
 
 krishiv-api
   -> krishiv-plan
@@ -72,7 +80,7 @@ krishiv-proto
 krishiv-plan
 ```
 
-Future dependencies should preserve a simple rule: user-facing crates can depend on lower-level crates, but low-level crates should not depend on `krishiv-api` or `krishiv-cli`.
+Future dependencies should preserve a simple rule: user-facing crates can depend on lower-level crates, but low-level crates should not depend on `krishiv-api` or `krishiv`.
 
 ## R1 Bootstrap Notes
 
@@ -80,7 +88,7 @@ Future dependencies should preserve a simple rule: user-facing crates can depend
 - `krishiv-sql` owns the DataFusion integration and keeps DataFusion types out of the public API.
 - `krishiv-exec::lower_to_physical` is not an optimizer.
 - `krishiv-runtime::{EmbeddedBackend, SingleNodeBackend}` accept R1 physical-plan wrappers before local execution.
-- `krishiv-cli` executes local SQL and explain commands through `krishiv-api`.
+- CLI dispatch lives in `krishiv/src/cli.rs` and is called by the `krishiv` binary.
 
 ## Next Expected Slice
 

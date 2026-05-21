@@ -4,7 +4,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
-use krishiv_cli::dispatch;
+use krishiv::cli::dispatch;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 

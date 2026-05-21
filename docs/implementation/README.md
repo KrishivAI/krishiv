@@ -27,6 +27,17 @@ Each tracker is intentionally checklist-oriented. R1-R3 are more concrete becaus
 | R9 Governance And Operations | [r9-governance-and-operations.md](r9-governance-and-operations.md) |
 | R10 GA Platform Release | [r10-ga-platform-release.md](r10-ga-platform-release.md) |
 | R11 Stability, Correctness, and CLI Completeness | [r11-stability-correctness-cli.md](r11-stability-correctness-cli.md) |
+| R12 Foundation Completeness & Real Connectivity | [r12-foundation-completeness.md](r12-foundation-completeness.md) |
+| R13 Python-First Streaming API | [r13-python-streaming-api.md](r13-python-streaming-api.md) |
+| R14 Incremental Computation & CDC Lakehouse | [r14-incremental-cdc-lakehouse.md](r14-incremental-cdc-lakehouse.md) |
+| R15 Spark SQL & Ecosystem Compatibility | [r15-spark-ecosystem-compat.md](r15-spark-ecosystem-compat.md) |
+| R16 Advanced Stateful Streaming & Exactly-Once | [r16-advanced-streaming-exactly-once.md](r16-advanced-streaming-exactly-once.md) |
+| R17 AI/ML Native Data Platform | [r17-ai-ml-data-platform.md](r17-ai-ml-data-platform.md) |
+| R18 Storage Format Unification & Time Travel | [r18-storage-format-unification.md](r18-storage-format-unification.md) |
+| R19 Multi-Region, Autoscaling & Cloud-Native | [r19-multi-region-cloud-native.md](r19-multi-region-cloud-native.md) |
+| R20 Enterprise Platform & Ecosystem | [r20-enterprise-platform.md](r20-enterprise-platform.md) |
+| R12–R20 Strategic Roadmap (planning doc) | [../architecture/r12-r20-roadmap.md](../architecture/r12-r20-roadmap.md) |
+| Architectural Decisions R12–R20 (ADR master) | [../architecture/architectural-decisions-r12-r20.md](../architecture/architectural-decisions-r12-r20.md) |
 
 ## Tracker Template
 

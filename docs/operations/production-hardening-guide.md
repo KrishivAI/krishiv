@@ -270,7 +270,7 @@ kubectl rollout status deployment/krishiv-executor
 2. Drain executors and wait for idle.
 3. Run migration tool on the new version binary:
    ```bash
-   krishiv-cli migrate --from v1.x --to v2.0
+   krishiv migrate --from v1.x --to v2.0
    ```
 4. Deploy new version images.
 5. Run `cargo test -p krishiv-upgrade-tests` on the new deployment before routing traffic.

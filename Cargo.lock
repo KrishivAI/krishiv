@@ -3076,6 +3076,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "krishiv-api",
+ "krishiv-checkpoint",
+ "krishiv-connectors",
+ "krishiv-lakehouse",
+ "krishiv-metrics",
+ "krishiv-proto",
+ "krishiv-scheduler",
+ "krishiv-udf",
+ "parquet 58.3.0",
+ "tempfile",
+]
+
+[[package]]
 name = "krishiv-api"
 version = "0.1.0"
 dependencies = [
@@ -3129,20 +3146,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "krishiv-cli"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "krishiv-api",
- "krishiv-checkpoint",
- "krishiv-metrics",
- "krishiv-proto",
- "krishiv-scheduler",
- "parquet 58.3.0",
  "tempfile",
 ]
 

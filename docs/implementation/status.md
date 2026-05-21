@@ -36,7 +36,7 @@ cargo test --workspace          → all suites pass (0 failures)
 cargo clippy --workspace -- -D warnings → 0 errors, 0 warnings
 ```
 
-Next: begin R12 planning (remote coordinator gRPC for CLI, rdkafka Kafka source, AQE coalescing).
+Next: implement R12 — fix all 21 P0 audit items, wire rdkafka, enable remote coordinator CLI, implement AQE coalescing. See `docs/architecture/r12-r20-roadmap.md` for full nine-release strategic plan.
 
 ## Bug-Fix Sweep Complete (2026-05-21)
 
@@ -69,7 +69,7 @@ Applied across all crates in commit `4b3314c`:
 - **krishiv-scheduler**: Added `tracing` dep; `CoordinatorId::try_new()` replaces `initial()`; borrow conflict at stage iteration fixed (owned `HashSet<StageId>`); `CheckpointCoordinator` storage changed to `Arc<dyn CheckpointStorage>` for `EphemeralCheckpointStorage` compatibility; `retry_count`/`failed_task_count`/`running_task_count` made `pub`
 - **krishiv-shuffle**: Removed unused `TryStreamExt` import; `fill_buckets` param changed to `&mut [Vec<u32>]`
 - **krishiv-optimizer**: `n % 2 == 0` → `n.is_multiple_of(2)`
-- **krishiv-cli**: `run_restore` and `run_checkpoints_list` return stub success (exit 0) matching test expectations
+- **krishiv**: `run_restore` and `run_checkpoints_list` return stub success (exit 0) matching test expectations
 - **tests**: `dead_letter_sink` tests updated to `#[tokio::test]` + `.await`
 
 Validation:
@@ -105,7 +105,7 @@ cargo fmt --check          → clean
    - `QualityAction::Warn` uses `tracing::warn!` with structured fields
    - 4 new tests pass
 
-4. **OTLP initialized at CLI startup** (`crates/krishiv-cli`, `crates/krishiv-metrics`):
+4. **OTLP initialized at CLI startup** (`crates/krishiv`, `crates/krishiv-metrics`):
    - `MetricsHandle::noop()` added for graceful degradation
    - `main()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and calls `krishiv_metrics::init()` at startup
 

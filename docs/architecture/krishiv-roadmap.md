@@ -120,8 +120,8 @@ later work is not built on a fragile base:
 krishiv/
   Cargo.toml
   crates/
-    krishiv-api/          # public Rust Session/DataFrame/Stream APIs
-    krishiv-cli/          # sql, submit, explain, jobs, savepoint, restore
+    krishiv/              # user-facing façade + binary (sql, explain, jobs, savepoint, restore)
+    krishiv-api/          # core Session/DataFrame/Stream APIs (internal)
     krishiv-sql/          # DataFusion integration and SQL compatibility
     krishiv-plan/         # logical/physical hybrid DAG model
     krishiv-optimizer/    # CBO, AQE, stream planning, skew rules
@@ -197,6 +197,15 @@ Public interfaces to define early:
 | R9 Governance And Operations | Enterprise operations | Control-plane correctness under failover | Lease leadership, fencing tokens, durable ownership metadata |
 | R10 GA Platform Release | Stable public platform | Performance gaps vs Spark/Flink | Publish benchmark matrix and optimize top regressions |
 | R11 Stability, Correctness, and CLI Completeness | Harden correctness on GA platform | Lock-poisoning crashes, split-brain fencing bypass, stubbed CLI | Fix all confirmed audit bugs; implement four previously-stubbed CLI commands |
+| R12 Foundation Completeness & Real Connectivity | Eliminate P0 bugs; wire real Kafka; remote CLI; AQE coalescing | Audit debt blocks enterprise adoption | All 21 P0 items fixed before any new feature work |
+| R13 Python-First Streaming API | Pathway-competitive Python streaming; PyPI wheels; asyncio-native | Poor Python DX prevents data-scientist adoption | Schema-declared API; maturin manylinux2014 wheels; Jupyter display |
+| R14 Incremental Computation & CDC Lakehouse | CocoIndex-competitive live tables; function memoization; schema evolution | Stale data feeding dashboards and LLMs | Exactly-once Kafka→Iceberg CDC pipeline; `CREATE LIVE TABLE` SQL |
+| R15 Spark SQL & Ecosystem Compatibility | Sail-competitive SparkSession shim; dbt adapter; Airflow operator | 70% of enterprise teams use Spark — migration friction | PySpark API compat via Spark Connect; Spark 3.5 function coverage |
+| R16 Advanced Stateful Streaming & Exactly-Once | Flink-competitive CEP; temporal joins; exactly-once all pairs; state rescaling | Fraud/IoT workloads require Flink-level correctness | Full gRPC barrier; RocksDB incremental checkpoints; certified exactly-once matrix |
+| R17 AI/ML Native Data Platform | Vector store sinks; embedding UDFs; RAG pipelines; LLM UDFs | LLM data pipelines are the fastest-growing enterprise workload | `ks.rag_index()` high-level API; Qdrant/Pinecone/pgvector connectors |
+| R18 Storage Format Unification & Time Travel | Delta Lake; Hudi; Iceberg REST catalog; time travel SQL; MERGE INTO | Multi-format lakehouses block single-engine adoption | `delta-rs` integration; `VERSION AS OF` / `TIMESTAMP AS OF` SQL |
+| R19 Multi-Region, Autoscaling & Cloud-Native | Multi-region federation; KEDA; spot recovery; bare-metal HA; cost-aware placement | Global-scale workloads require multi-region and elastic scaling | etcd-backed bare-metal HA; autoscale on Kafka lag metric |
+| R20 Enterprise Platform & Ecosystem | Self-serve portal; data catalog; GDPR; SLA; dbt-native; managed service | Enterprise requires governance, compliance, and operational tooling | GDPR erasure pipeline; tamper-evident audit trail; Helm+Terraform packaging |
 
 ## Phase Checklists
 
@@ -812,7 +821,7 @@ Checklist:
 - [ ] Replace `.expect()` calls in `DataFusionSchemaBridge` with `unwrap_or_else`.
 - [ ] Add `CdcEventSource` trait and `InMemoryCdcEventSource` to `krishiv-connectors`.
 - [ ] Implement `CdcToLakehousePipeline::run_with_source` with real poll/parse/batch/write loop.
-- [ ] Add `krishiv-checkpoint` dependency to `krishiv-cli`.
+- [x] CLI dispatch merged into `krishiv/src/cli.rs`; `krishiv-checkpoint` is a direct dep of `krishiv`.
 - [ ] Implement `krishiv checkpoints list` using `LocalFsCheckpointStorage`.
 - [ ] Implement `krishiv restore` with structured restore-plan output.
 - [ ] Implement `krishiv savepoint` against in-process coordinator API.
@@ -887,12 +896,39 @@ Global acceptance rules:
 - Krishiv uses active-active API servers with exactly one active leader per job.
 - The roadmap is architecture-level but checklist-ready for future implementation work.
 
-## Deferred Scope
+## R12–R20 Detailed Roadmap
 
-- Spark-compatible API.
-- Flink-compatible API.
-- Delta Lake parity with Iceberg.
-- GPU execution.
-- Cost-based autoscaling across cloud providers.
-- Managed cloud service packaging.
-- Global multi-region active-active job execution.
+See [`docs/architecture/r12-r20-roadmap.md`](r12-r20-roadmap.md) for the full
+nine-release strategic plan including feature scope, Python API design, audit
+item assignments, competitive positioning, and acceptance gates.
+
+See [`docs/architecture/architectural-decisions-r12-r20.md`](architectural-decisions-r12-r20.md)
+for the 18 architectural decision records (ADRs) that must be resolved before
+implementation can begin for each release. Each ADR documents the problem,
+options, recommendation, and consequence of deferral.
+
+Per-release implementation checklists live in `docs/implementation/`:
+[R12](../implementation/r12-foundation-completeness.md) ·
+[R13](../implementation/r13-python-streaming-api.md) ·
+[R14](../implementation/r14-incremental-cdc-lakehouse.md) ·
+[R15](../implementation/r15-spark-ecosystem-compat.md) ·
+[R16](../implementation/r16-advanced-streaming-exactly-once.md) ·
+[R17](../implementation/r17-ai-ml-data-platform.md) ·
+[R18](../implementation/r18-storage-format-unification.md) ·
+[R19](../implementation/r19-multi-region-cloud-native.md) ·
+[R20](../implementation/r20-enterprise-platform.md)
+
+## Deferred Scope (addressed in R12–R20)
+
+| Item | Addressed In |
+|------|-------------|
+| Spark-compatible API | R15 |
+| Flink-compatible API (CEP, exactly-once, temporal joins) | R16 |
+| Delta Lake parity with Iceberg | R18 |
+| GPU execution | Post-R20 |
+| Cost-based autoscaling across cloud providers | R19 |
+| Managed cloud service packaging | R20 |
+| Global multi-region active-active job execution | R19 |
+| AI/ML native pipelines (vector stores, RAG, LLM UDFs) | R17 |
+| Incremental computation / live tables | R14 |
+| Python-first streaming API (PyPI, asyncio) | R13 |

@@ -346,9 +346,11 @@ pub async fn call_python_udf(
 
 /// **Beta API**: may change between minor releases.
 ///
-/// Python module `krishiv_python` — exposes `Session` and `DataFrame`.
+/// Python module `krishiv` — exposes `Session` and `DataFrame`.
+///
+/// Users install via `pip install krishiv` and import as `import krishiv`.
 #[pymodule]
-fn krishiv_python(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySession>()?;
     m.add_class::<PyDataFrame>()?;
     Ok(())

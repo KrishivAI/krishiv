@@ -1,28 +1,35 @@
 [package]
-name = "krishiv-cli"
+name = "krishiv"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Krishiv — hybrid batch and streaming compute engine"
+keywords = ["sql", "streaming", "arrow", "datafusion", "compute"]
+categories = ["database", "data-structures"]
 
-[dependencies]
-krishiv-api = { path = "../krishiv-api" }
-krishiv-checkpoint = { path = "../krishiv-checkpoint" }
-krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
-
-[dev-dependencies]
-arrow = { workspace = true }
-parquet = { workspace = true }
-tempfile = { workspace = true }
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "krishiv"
 path = "src/main.rs"
 
-[lib]
-path = "src/lib.rs"
+[dependencies]
+krishiv-api = { path = "../krishiv-api" }
+krishiv-checkpoint = { path = "../krishiv-checkpoint" }
+krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-lakehouse = { path = "../krishiv-lakehouse" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-proto = { path = "../krishiv-proto" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-udf = { path = "../krishiv-udf" }
+arrow = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

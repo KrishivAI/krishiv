@@ -52,8 +52,8 @@ The Claude Code skill shim points to the canonical shared skill source at [`code
 
 | Crate | Responsibility |
 |-------|---------------|
-| `krishiv-api` | Public Rust APIs: `Session`, `DataFrame`, `Stream` |
-| `krishiv-cli` | CLI binary: `sql`, `explain`, `jobs`, `submit` |
+| `krishiv` | **User-facing façade**: re-exports all public types + owns the `krishiv` binary and CLI dispatch (`src/cli.rs`) |
+| `krishiv-api` | Core internal APIs: `Session`, `DataFrame`, `Stream` — used by `krishiv-python`, `krishiv-flight-sql`, `krishiv-bench` |
 | `krishiv-sql` | DataFusion integration and SQL compatibility |
 | `krishiv-plan` | Logical/physical plan DAG structures |
 | `krishiv-exec` | Arrow physical operator descriptors |

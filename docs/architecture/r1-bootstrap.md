@@ -75,8 +75,8 @@ The bootstrap slice is complete when:
 
 - `cargo check --workspace` passes.
 - `cargo test --workspace` passes.
-- `cargo run -p krishiv-cli -- --help` prints top-level help.
-- `cargo run -p krishiv-cli -- explain --help` prints explain help.
+- `cargo run -p krishiv -- --help` prints top-level help.
+- `cargo run -p krishiv -- explain --help` prints explain help.
 - Crate ownership is documented in `docs/architecture/crate-map.md`.
 - R1 tracker and status ledger reflect the completed bootstrap work.
 

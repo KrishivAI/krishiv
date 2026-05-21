@@ -28,9 +28,9 @@ Python bindings, and lakehouse table support remain later-roadmap work.
 ## Example Commands
 
 ```bash
-cargo run -p krishiv-cli -- sql --query "select 1 as value"
-cargo run -p krishiv-cli -- explain --query "select 1 as value"
-cargo run -p krishiv-cli -- jobs
+cargo run -p krishiv -- sql --query "select 1 as value"
+cargo run -p krishiv -- explain --query "select 1 as value"
+cargo run -p krishiv -- jobs
 cargo run -p krishiv-api --example local_sql_parquet
 cargo run -p krishiv-api --example memory_stream
 ```
@@ -56,6 +56,6 @@ contract.
 - `cargo fmt --all --check`
 - `cargo check --workspace`
 - `cargo test --workspace`
-- `cargo run -p krishiv-cli -- sql --query "select 1 as value"`
-- `cargo run -p krishiv-cli -- explain --query "select 1 as value"`
-- `cargo run -p krishiv-cli -- jobs`
+- `cargo run -p krishiv -- sql --query "select 1 as value"`
+- `cargo run -p krishiv -- explain --query "select 1 as value"`
+- `cargo run -p krishiv -- jobs`

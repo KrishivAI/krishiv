@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use krishiv_cli::dispatch;
+use krishiv::cli::dispatch;
 
 #[test]
 fn sql_literal_matches_golden_output() {

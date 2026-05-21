@@ -1,6 +1,4 @@
-#![forbid(unsafe_code)]
-
-//! Command-line shell for Krishiv R1/R2.
+//! CLI dispatch for the `krishiv` binary.
 
 use std::path::PathBuf;
 
@@ -1096,7 +1094,6 @@ mod tests {
             "--storage-path",
             "./krishiv-checkpoints",
         ]);
-        // With no prior checkpoints the command succeeds with an informative message.
         assert_eq!(response.exit_code, 0, "{:?}", response);
         assert!(response.stdout.contains("job-123"));
         assert!(
@@ -1115,8 +1112,6 @@ mod tests {
         assert!(response.stderr.contains("unknown state subcommand"));
     }
 
-    // ── R6: savepoint tests ───────────────────────────────────────────────────
-
     #[test]
     fn savepoint_help_command_exits_zero() {
         let response = dispatch(&["savepoint", "--help"]);
@@ -1134,7 +1129,6 @@ mod tests {
     #[test]
     fn savepoint_local_mode_fails_with_no_running_job() {
         let response = dispatch(&["savepoint", "--job", "job-1"]);
-        // In local mode the coordinator has no running jobs; a structured error is returned.
         assert_eq!(response.exit_code, 1, "{:?}", response);
         assert!(response.stderr.contains("job-1"));
         assert!(
@@ -1150,8 +1144,6 @@ mod tests {
         assert_eq!(response.exit_code, 1, "{:?}", response);
         assert!(response.stderr.contains("job-2"));
     }
-
-    // ── R6: restore tests ─────────────────────────────────────────────────────
 
     #[test]
     fn restore_help_command_exits_zero() {
@@ -1182,7 +1174,6 @@ mod tests {
             "--storage-path",
             "./krishiv-checkpoints",
         ]);
-        // Epoch 3 does not exist; command must report an error, not panic.
         assert_eq!(response.exit_code, 1, "{:?}", response);
         assert!(
             response.stderr.contains("job-1") || response.stderr.contains("epoch"),
@@ -1197,8 +1188,6 @@ mod tests {
         assert_eq!(response.exit_code, 2);
         assert!(response.stderr.contains("non-negative integer"));
     }
-
-    // ── R6: checkpoints tests ─────────────────────────────────────────────────
 
     #[test]
     fn checkpoints_help_exits_zero() {
