@@ -121,6 +121,42 @@ pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Op
     })
 }
 
+/// A source of raw Debezium JSON strings for a CDC pipeline.
+///
+/// Implement this trait to plug any Kafka client (or test fixture) into
+/// [`CdcToLakehousePipeline::run_with_source`].
+pub trait CdcEventSource: Send {
+    /// Poll up to `max` raw Debezium JSON event strings.
+    ///
+    /// Returns an empty `Vec` when the source is exhausted (signals pipeline
+    /// shutdown). Returns `Err` on unrecoverable source failures.
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String>;
+}
+
+/// In-memory [`CdcEventSource`] backed by a pre-loaded `Vec<String>`.
+///
+/// Drains from the front; returns empty when exhausted. Intended for tests
+/// and local development without a live Kafka cluster.
+pub struct InMemoryCdcEventSource {
+    events: std::collections::VecDeque<String>,
+}
+
+impl InMemoryCdcEventSource {
+    /// Create a source pre-loaded with `events`.
+    pub fn new(events: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            events: events.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl CdcEventSource for InMemoryCdcEventSource {
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+        let n = max.min(self.events.len());
+        Ok(self.events.drain(..n).collect())
+    }
+}
+
 /// Configuration for a CDC-to-lakehouse pipeline.
 #[derive(Debug, Clone)]
 pub struct CdcToLakehousePipeline {
@@ -193,21 +229,59 @@ impl CdcToLakehousePipeline {
         Ok(())
     }
 
-    /// Run the pipeline.
+    /// Run the pipeline with an external event source.
     ///
-    /// 1. Validates the configuration.
-    /// 2. Sets up the event processing loop structure.
-    /// 3. TODO: wire Kafka consumer here — currently returns `Ok(())` after setup.
+    /// Polls `source` for up to `batch_size` raw Debezium JSON strings per
+    /// iteration, parses them with [`parse_debezium_envelope`], builds an Arrow
+    /// batch with [`build_batch_from_events`], and passes it to `on_batch`.
+    /// Stops when `source.poll_events` returns an empty slice (source
+    /// exhausted) or the provided `shutdown` channel fires.
+    pub async fn run_with_source<S, F>(
+        &self,
+        mut source: S,
+        mut on_batch: F,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), String>
+    where
+        S: CdcEventSource,
+        F: FnMut(RecordBatch) -> Result<(), String>,
+    {
+        self.validate()?;
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let raw = source.poll_events(self.batch_size)?;
+            if raw.is_empty() {
+                break;
+            }
+            let events: Vec<CdcEvent> = raw
+                .iter()
+                .enumerate()
+                .filter_map(|(i, json)| parse_debezium_envelope(json, 0, i as i64))
+                .collect();
+            if events.is_empty() {
+                continue;
+            }
+            let batch =
+                build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
+            on_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Run the pipeline against a live Kafka cluster.
+    ///
+    /// Requires a `CdcEventSource` implementation backed by a real Kafka
+    /// consumer (e.g. `rdkafka`). Use [`run_with_source`] directly with a
+    /// `KafkaCdcEventSource` once that feature is enabled.
     pub async fn run(&self) -> Result<(), String> {
         self.validate()?;
-        // TODO: wire Kafka consumer here.
-        // When a live Kafka client is available:
-        //   - Create a consumer subscribed to `self.source_topic`.
-        //   - Loop: poll for up to `self.batch_size` messages, parse each with
-        //     `parse_debezium_envelope`, call `build_batch_from_events`, and write
-        //     to the target table sink.
-        //   - On shutdown signal, flush and commit the sink.
-        Ok(())
+        Err(
+            "direct Kafka execution requires a CdcEventSource implementation; \
+             call run_with_source with a live source (rdkafka feature planned for R12)"
+                .to_string(),
+        )
     }
 }
 
@@ -282,24 +356,10 @@ pub fn build_batch_from_events(events: &[CdcEvent]) -> Result<RecordBatch, CdcBa
                     } else {
                         user_col
                     };
-                    payload.and_then(|batch| {
-                        let schema = batch.schema();
-                        schema.index_of(orig_col).ok().and_then(|idx| {
-                            use arrow::array::{Array, StringArray};
-                            let col = batch.column(idx);
-                            if col.is_null(0) {
-                                None
-                            } else {
-                                col.as_any().downcast_ref::<StringArray>().and_then(|s| {
-                                    if s.is_null(0) {
-                                        None
-                                    } else {
-                                        Some(s.value(0).to_string())
-                                    }
-                                })
-                            }
-                        })
-                    })
+                    match payload {
+                        Some(batch) => payload_value_to_string(batch, orig_col)?,
+                        None => None,
+                    }
                 }
             };
             column_data[col_idx].push(value);
@@ -322,6 +382,26 @@ pub fn build_batch_from_events(events: &[CdcEvent]) -> Result<RecordBatch, CdcBa
         .collect();
 
     RecordBatch::try_new(schema, columns).map_err(|e| CdcBatchError(e.to_string()))
+}
+
+fn payload_value_to_string(
+    batch: &RecordBatch,
+    column_name: &str,
+) -> Result<Option<String>, CdcBatchError> {
+    use arrow::array::Array;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let Ok(idx) = batch.schema().index_of(column_name) else {
+        return Ok(None);
+    };
+    let col = batch.column(idx);
+    if col.is_null(0) {
+        return Ok(None);
+    }
+    let options = FormatOptions::default();
+    let formatter = ArrayFormatter::try_new(col.as_ref(), &options)
+        .map_err(|e| CdcBatchError(e.to_string()))?;
+    Ok(Some(formatter.value(0).to_string()))
 }
 
 /// Metadata column names injected by `build_batch_from_events`.
@@ -462,5 +542,121 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(src_arr.value(0), "payload_op_value");
+    }
+
+    #[test]
+    fn build_batch_stringifies_non_utf8_payload_columns() {
+        use arrow::array::{BooleanArray, Int64Array, StringArray};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let after_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(42_i64)])),
+                Arc::new(BooleanArray::from(vec![Some(true)])),
+            ],
+        )
+        .unwrap();
+        let event = CdcEvent {
+            op: CdcOp::Insert,
+            before: None,
+            after: Some(after_batch),
+            source_lsn: Some(1),
+            source_ts_ms: Some(1716201600000),
+            partition_id: 0,
+            offset: 0,
+            table: "orders".to_string(),
+        };
+
+        let batch = build_batch_from_events(&[event]).unwrap();
+        let id_idx = batch.schema().index_of("id").unwrap();
+        let active_idx = batch.schema().index_of("active").unwrap();
+        let id = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let active = batch
+            .column(active_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id.value(0), "42");
+        assert_eq!(active.value(0), "true");
+    }
+
+    #[tokio::test]
+    async fn run_with_source_processes_events() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+
+        let json = r#"{"op":"c","source":{"lsn":1,"ts_ms":1716201600000,"partition":0,"offset":0,"table":"orders"},"after":{"id":1,"name":"alice"}}"#;
+        let source = InMemoryCdcEventSource::new([json]);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut batches_received = Vec::new();
+
+        pipeline
+            .run_with_source(
+                source,
+                |batch| {
+                    batches_received.push(batch);
+                    Ok(())
+                },
+                shutdown_rx,
+            )
+            .await
+            .expect("pipeline run failed");
+
+        drop(shutdown_tx);
+        assert_eq!(batches_received.len(), 1, "expected one batch");
+        let schema = batches_received[0].schema();
+        assert!(schema.index_of("_op").is_ok(), "expected _op column");
+    }
+
+    #[tokio::test]
+    async fn run_with_source_shutdown_stops_loop() {
+        struct InfiniteSource;
+        impl CdcEventSource for InfiniteSource {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+        }
+
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        drop(shutdown_tx);
+
+        let result = pipeline
+            .run_with_source(InfiniteSource, |_| Ok(()), shutdown_rx)
+            .await;
+        assert!(result.is_ok(), "shutdown via empty source should succeed");
+    }
+
+    #[tokio::test]
+    async fn run_returns_err_without_source() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+        let result = pipeline.run().await;
+        assert!(result.is_err(), "run() without source must return Err");
     }
 }

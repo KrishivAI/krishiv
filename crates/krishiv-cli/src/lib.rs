@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use krishiv_api::{ExecutionMode, Session};
+use krishiv_checkpoint::{LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata};
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
     JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
@@ -299,6 +300,7 @@ fn run_state(args: &[&str]) -> CliResponse {
 fn run_state_inspect(args: &[&str]) -> CliResponse {
     let mut job_id: Option<&str> = None;
     let mut operator_id: Option<&str> = None;
+    let mut storage_path: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i] {
@@ -310,9 +312,13 @@ fn run_state_inspect(args: &[&str]) -> CliResponse {
                 operator_id = Some(args[i + 1]);
                 i += 2;
             }
-            _ => {
+            "--storage-path" if i + 1 < args.len() => {
+                storage_path = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
                 return CliResponse::err(
-                    format!("unexpected argument '{}'\n\n{}", args[i], state_help()),
+                    format!("unexpected argument '{other}'\n\n{}", state_help()),
                     2,
                 );
             }
@@ -324,18 +330,48 @@ fn run_state_inspect(args: &[&str]) -> CliResponse {
     let Some(operator_id) = operator_id else {
         return CliResponse::err(format!("--operator is required\n\n{}", state_help()), 2);
     };
-    // In R5.2 this is a skeleton: state lives on executor nodes and is not
-    // accessible from the coordinator without an executor RPC.  The full
-    // implementation arrives with the executor state-inspection RPC in R6.
-    CliResponse::err(
-        format!(
-            "krishiv state inspect: not yet implemented (planned for R6)\n\
-             Job:      {job_id}\n\
-             Operator: {operator_id}\n\
-             Executor-side state inspection RPC has not been wired."
-        ),
-        1,
-    )
+    let path = storage_path.unwrap_or("./krishiv-checkpoints");
+    let storage = match LocalFsCheckpointStorage::new(path) {
+        Ok(s) => s,
+        Err(e) => return CliResponse::err(format!("storage error: {e}\n"), 1),
+    };
+    let epochs = match list_valid_epochs(&storage, job_id) {
+        Ok(e) => e,
+        Err(e) => return CliResponse::err(format!("checkpoint error: {e}\n"), 1),
+    };
+    let Some(&latest_epoch) = epochs.last() else {
+        return CliResponse::ok(format!(
+            "No checkpoints found for job {job_id} in {path}.\n\
+             State inspection requires at least one committed checkpoint.\n"
+        ));
+    };
+    let meta = match read_epoch_metadata(&storage, job_id, latest_epoch) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return CliResponse::ok(format!(
+                "No metadata for epoch {latest_epoch} of job {job_id}.\n"
+            ))
+        }
+        Err(e) => return CliResponse::err(format!("metadata read error: {e}\n"), 1),
+    };
+    let snapshots: Vec<_> = meta
+        .operator_snapshots
+        .iter()
+        .filter(|s| s.operator_id == operator_id)
+        .collect();
+    if snapshots.is_empty() {
+        return CliResponse::ok(format!(
+            "No state snapshots found for operator {operator_id} in epoch {latest_epoch}.\n"
+        ));
+    }
+    let mut out = format!(
+        "State snapshot(s) for operator {operator_id} (job {job_id}, epoch {latest_epoch}):\n\n\
+         TASK\tSNAPSHOT PATH\n"
+    );
+    for s in &snapshots {
+        out.push_str(&format!("{}\t{}\n", s.task_id, s.snapshot_path));
+    }
+    CliResponse::ok(out)
 }
 
 fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> {
@@ -702,18 +738,36 @@ fn run_savepoint(args: &[&str]) -> CliResponse {
             }
         }
     }
-    let Some(job_id) = job_id else {
+    let Some(job_id_str) = job_id else {
         return CliResponse::err(format!("--job is required\n\n{}", savepoint_help()), 2);
     };
-    let label_display = label.unwrap_or("(none)");
-    CliResponse::err(
-        format!(
-            "krishiv savepoint: not yet implemented (planned for R6)\n\
-             Job:   {job_id}\n\
-             Label: {label_display}"
+    let job_id = match JobId::try_new(job_id_str) {
+        Ok(id) => id,
+        Err(e) => return CliResponse::err(format!("invalid job id: {e}\n"), 2),
+    };
+    let label_opt = label.map(String::from);
+    let mut coordinator = match active_local_coordinator() {
+        Ok(c) => c,
+        Err(e) => return CliResponse::err(format!("{e}\n"), 1),
+    };
+    match coordinator.trigger_checkpoint_for_job(&job_id) {
+        Ok(_) => {
+            let label_display = label_opt.as_deref().unwrap_or("(none)");
+            CliResponse::ok(format!(
+                "Savepoint initiated\nJob:   {job_id}\nLabel: {label_display}\n\
+                 Note: in local mode the coordinator holds no running jobs.\n\
+                 For distributed jobs, use a remote coordinator (--coordinator planned for R12).\n"
+            ))
+        }
+        Err(e) => CliResponse::err(
+            format!(
+                "Savepoint failed for job {job_id}: {e}\n\
+                 Ensure the job is a running streaming job with checkpoint_interval_ms set.\n\
+                 For distributed jobs, connect to the coordinator (--coordinator planned for R12).\n"
+            ),
+            1,
         ),
-        1,
-    )
+    }
 }
 
 // ── R6: restore ───────────────────────────────────────────────────────────────
@@ -782,10 +836,42 @@ fn run_restore(args: &[&str]) -> CliResponse {
             );
         }
     };
-    let path_display = storage_path.unwrap_or("(job default)");
+    let path = storage_path.unwrap_or("./krishiv-checkpoints");
+    let storage = match LocalFsCheckpointStorage::new(path) {
+        Ok(s) => s,
+        Err(e) => return CliResponse::err(format!("storage error: {e}\n"), 1),
+    };
+    let meta = match read_epoch_metadata(&storage, job_id, epoch_num) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return CliResponse::err(
+                format!("epoch {epoch_num} not found for job {job_id} in {path}\n"),
+                1,
+            )
+        }
+        Err(e) => return CliResponse::err(format!("checkpoint read error: {e}\n"), 1),
+    };
+    let snapshot_count = meta.operator_snapshots.len();
+    let source_count = meta.source_offsets.len();
+    let kind = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
+    let label = meta
+        .savepoint_label
+        .as_deref()
+        .map(|l| format!(" ({l})"))
+        .unwrap_or_default();
     CliResponse::ok(format!(
-        "Restore initiated\nJob:     {job_id}\nEpoch:   {epoch_num}\nStorage: {path_display}\n\
-         Note: full restore not yet implemented (planned for R6)"
+        "Restore plan\n\
+         Job:              {job_id}\n\
+         Epoch:            {epoch_num}\n\
+         Type:             {kind}{label}\n\
+         Storage:          {path}\n\
+         Source partitions:{source_count}\n\
+         Operator snapshots:{snapshot_count}\n\
+         Fencing token:    {ft}\n\
+         \n\
+         To apply: signal the running coordinator to restore from epoch {epoch_num}.\n\
+         Remote coordinator restore (--coordinator) planned for R12.\n",
+        ft = meta.fencing_token,
     ))
 }
 
@@ -820,11 +906,16 @@ fn run_checkpoints(args: &[&str]) -> CliResponse {
 
 fn run_checkpoints_list(args: &[&str]) -> CliResponse {
     let mut job_id: Option<&str> = None;
+    let mut storage_path: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i] {
             "--job" if i + 1 < args.len() => {
                 job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--storage-path" if i + 1 < args.len() => {
+                storage_path = Some(args[i + 1]);
                 i += 2;
             }
             other => {
@@ -838,10 +929,35 @@ fn run_checkpoints_list(args: &[&str]) -> CliResponse {
     let Some(job_id) = job_id else {
         return CliResponse::err(format!("--job is required\n\n{}", checkpoints_help()), 2);
     };
-    CliResponse::ok(format!(
-        "No checkpoints found for job {job_id}\n\
-         Note: full checkpoint listing not yet implemented (planned for R6)"
-    ))
+    let path = storage_path.unwrap_or("./krishiv-checkpoints");
+    let storage = match LocalFsCheckpointStorage::new(path) {
+        Ok(s) => s,
+        Err(e) => return CliResponse::err(format!("storage error: {e}\n"), 1),
+    };
+    let epochs = match list_valid_epochs(&storage, job_id) {
+        Ok(e) => e,
+        Err(e) => return CliResponse::err(format!("checkpoint error: {e}\n"), 1),
+    };
+    if epochs.is_empty() {
+        return CliResponse::ok(format!(
+            "No checkpoints found for job {job_id} in {path}\n"
+        ));
+    }
+    let mut out = format!(
+        "Checkpoints for job {job_id} in {path}\n\nEPOCH\tTYPE\tLABEL\n"
+    );
+    for &epoch in &epochs {
+        let (kind, label) = match read_epoch_metadata(&storage, job_id, epoch) {
+            Ok(Some(meta)) => {
+                let k = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
+                let l = meta.savepoint_label.unwrap_or_default();
+                (k, l)
+            }
+            _ => ("unknown", String::new()),
+        };
+        out.push_str(&format!("{epoch}\t{kind}\t{label}\n"));
+    }
+    CliResponse::ok(out)
 }
 
 #[cfg(test)]
@@ -969,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn state_inspect_returns_skeleton_output() {
+    fn state_inspect_with_no_checkpoints_reports_none_found() {
         let response = dispatch(&[
             "state",
             "inspect",
@@ -977,11 +1093,19 @@ mod tests {
             "job-123",
             "--operator",
             "tumbling-1",
+            "--storage-path",
+            "./krishiv-checkpoints",
         ]);
-        assert_eq!(response.exit_code, 1, "{:?}", response);
-        assert!(response.stderr.contains("job-123"));
-        assert!(response.stderr.contains("tumbling-1"));
-        assert!(response.stderr.contains("not yet implemented"));
+        // With no prior checkpoints the command succeeds with an informative message.
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        assert!(response.stdout.contains("job-123"));
+        assert!(
+            response.stdout.contains("No checkpoints found")
+                || response.stdout.contains("No state snapshots found")
+                || response.stdout.contains("No metadata"),
+            "expected informative message, got: {:?}",
+            response.stdout
+        );
     }
 
     #[test]
@@ -1008,18 +1132,23 @@ mod tests {
     }
 
     #[test]
-    fn savepoint_returns_skeleton_output() {
+    fn savepoint_local_mode_fails_with_no_running_job() {
         let response = dispatch(&["savepoint", "--job", "job-1"]);
+        // In local mode the coordinator has no running jobs; a structured error is returned.
         assert_eq!(response.exit_code, 1, "{:?}", response);
-        assert!(response.stderr.contains("not yet implemented"));
         assert!(response.stderr.contains("job-1"));
+        assert!(
+            response.stderr.contains("Savepoint failed") || response.stderr.contains("Savepoint initiated"),
+            "expected savepoint result, got: {:?}",
+            response.stderr
+        );
     }
 
     #[test]
-    fn savepoint_with_label_includes_label_in_output() {
+    fn savepoint_with_label_includes_job_in_output() {
         let response = dispatch(&["savepoint", "--job", "job-2", "--label", "pre-upgrade"]);
         assert_eq!(response.exit_code, 1, "{:?}", response);
-        assert!(response.stderr.contains("pre-upgrade"));
+        assert!(response.stderr.contains("job-2"));
     }
 
     // ── R6: restore tests ─────────────────────────────────────────────────────
@@ -1043,12 +1172,23 @@ mod tests {
     }
 
     #[test]
-    fn restore_returns_skeleton_output() {
-        let response = dispatch(&["restore", "--job", "job-1", "--epoch", "3"]);
-        assert_eq!(response.exit_code, 0, "{}", response.stderr);
-        assert!(response.stdout.contains("Restore initiated"));
-        assert!(response.stdout.contains("job-1"));
-        assert!(response.stdout.contains("3"));
+    fn restore_with_missing_epoch_returns_error() {
+        let response = dispatch(&[
+            "restore",
+            "--job",
+            "job-1",
+            "--epoch",
+            "3",
+            "--storage-path",
+            "./krishiv-checkpoints",
+        ]);
+        // Epoch 3 does not exist; command must report an error, not panic.
+        assert_eq!(response.exit_code, 1, "{:?}", response);
+        assert!(
+            response.stderr.contains("job-1") || response.stderr.contains("epoch"),
+            "expected epoch/job in error, got: {:?}",
+            response.stderr
+        );
     }
 
     #[test]

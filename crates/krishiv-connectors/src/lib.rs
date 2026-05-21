@@ -741,9 +741,6 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         epoch: u64,
         batch: &arrow::record_batch::RecordBatch,
     ) -> ConnectorResult<Self::Handle> {
-        let handle_id = self.next_handle;
-        self.next_handle += 1;
-
         // Run quality checks if a config is attached.
         let filtered: arrow::record_batch::RecordBatch;
         let batch = if let Some(ref qc) = self.quality_config {
@@ -771,14 +768,30 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             batch
         };
 
-        let staging_name = format!("{epoch}-{handle_id}.parquet.tmp");
-        let final_name = format!("{epoch}-{handle_id}.parquet");
-        let staging_path = self.output_dir.join(&staging_name);
-        let final_path = self.output_dir.join(&final_name);
-
-        let file = std::fs::File::create(&staging_path).map_err(|e| ConnectorError::Io {
-            message: format!("parquet 2pc prepare: cannot create {staging_name}: {e}"),
-        })?;
+        let (staging_path, final_path, file) = loop {
+            let handle_id = self.next_handle;
+            self.next_handle += 1;
+            let staging_name = format!("{epoch}-{handle_id}.parquet.tmp");
+            let final_name = format!("{epoch}-{handle_id}.parquet");
+            let staging_path = self.output_dir.join(&staging_name);
+            let final_path = self.output_dir.join(&final_name);
+            if final_path.exists() {
+                continue;
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging_path)
+            {
+                Ok(file) => break (staging_path, final_path, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(ConnectorError::Io {
+                        message: format!("parquet 2pc prepare: cannot create {staging_name}: {e}"),
+                    });
+                }
+            }
+        };
 
         let mut writer = ::parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
             .map_err(|e| ConnectorError::Io {
@@ -799,12 +812,27 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        std::fs::rename(&handle.staging_path, &handle.final_path).map_err(|e| ConnectorError::Io {
-            message: format!(
-                "parquet 2pc commit: rename {:?} → {:?}: {e}",
-                handle.staging_path, handle.final_path
-            ),
-        })
+        match std::fs::hard_link(&handle.staging_path, &handle.final_path) {
+            Ok(()) => std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::Io {
+                message: format!(
+                    "parquet 2pc commit: remove staging {:?}: {e}",
+                    handle.staging_path
+                ),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&handle.staging_path);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && handle.final_path.exists() => {
+                Ok(())
+            }
+            Err(e) => Err(ConnectorError::Io {
+                message: format!(
+                    "parquet 2pc commit: link {:?} to {:?}: {e}",
+                    handle.staging_path, handle.final_path
+                ),
+            }),
+        }
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
@@ -1840,6 +1868,31 @@ mod tests {
 
         // abort on a missing file must not error.
         sink.abort(handle).unwrap();
+    }
+
+    #[test]
+    fn parquet_2pc_restart_does_not_overwrite_existing_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = make_int32_batch(vec![1]);
+        let first_final = {
+            let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+            let handle = sink.prepare(7, &batch).unwrap();
+            let final_path = handle.final_path.clone();
+            sink.commit(handle).unwrap();
+            final_path
+        };
+
+        let mut restarted = LocalParquetTwoPhaseCommitSink::new(dir.path());
+        let handle = restarted.prepare(7, &make_int32_batch(vec![2])).unwrap();
+        assert_ne!(handle.final_path, first_final);
+        restarted.commit(handle).unwrap();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect();
+        assert_eq!(files.len(), 2, "restart must allocate a fresh final path");
     }
 }
 

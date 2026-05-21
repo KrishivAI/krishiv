@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
+krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }

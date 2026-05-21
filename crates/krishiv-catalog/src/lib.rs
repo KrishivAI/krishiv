@@ -569,7 +569,7 @@ pub mod datafusion_bridge {
         }
 
         fn table_names(&self) -> Vec<String> {
-            let catalog = self.catalog.read().expect("catalog read lock poisoned");
+            let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use crate::CatalogProvider as KrishivCatalogProvider;
             catalog.list_tables()
         }
@@ -578,7 +578,7 @@ pub mod datafusion_bridge {
             &self,
             name: &str,
         ) -> DfResult<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
-            let catalog = self.catalog.read().expect("catalog read lock poisoned");
+            let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use crate::CatalogProvider as KrishivCatalogProvider;
             match catalog.get_table(name) {
                 Ok(table_provider) => {
@@ -594,7 +594,7 @@ pub mod datafusion_bridge {
         }
 
         fn table_exist(&self, name: &str) -> bool {
-            let catalog = self.catalog.read().expect("catalog read lock poisoned");
+            let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use crate::CatalogProvider as KrishivCatalogProvider;
             catalog.get_table(name).is_ok()
         }

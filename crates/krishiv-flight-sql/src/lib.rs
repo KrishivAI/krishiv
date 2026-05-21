@@ -5,7 +5,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::StringArray;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::sql::server::FlightSqlService;
@@ -64,9 +63,28 @@ impl KrishivFlightSqlService {
 
     #[allow(clippy::result_large_err)]
     fn make_session(&self) -> Result<krishiv_api::Session, Status> {
-        SessionBuilder::new()
-            .build()
-            .map_err(|e| Status::internal(e.to_string()))
+        let mut builder = SessionBuilder::new();
+        if let Some(auth) = &self.auth {
+            builder = builder.with_auth(auth.clone());
+        }
+        if let Some(policy) = &self.policy {
+            builder = builder.with_policy(policy.clone());
+        }
+        builder.build().map_err(|e| Status::internal(e.to_string()))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn bearer_token<B>(&self, req: &Request<B>) -> Result<Option<String>, Status> {
+        let Some(_auth) = &self.auth else {
+            return Ok(None);
+        };
+        req.metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| Status::unauthenticated("missing Bearer token"))
     }
 
     /// Validate the `authorization: Bearer <token>` header.
@@ -79,13 +97,8 @@ impl KrishivFlightSqlService {
         let Some(auth) = &self.auth else {
             return Ok(None);
         };
-        let token = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
-        auth.authenticate(token)
+        let token = self.bearer_token(req)?.expect("auth is configured");
+        auth.authenticate(&token)
             .map(Some)
             .ok_or_else(|| Status::unauthenticated("invalid API key"))
     }
@@ -116,22 +129,37 @@ fn mask_batch(
     table_name: &str,
     policy: &dyn PolicyHook,
 ) -> Result<RecordBatch, Status> {
-    use arrow::array::{Array, ArrayRef, new_null_array};
+    use arrow::array::{Array, ArrayRef, StringArray, new_null_array};
+    use arrow::datatypes::{DataType, Field};
     use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use sha2::{Digest, Sha256};
 
     let schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
 
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
         match policy.column_masking_rule(principal, table_name, field.name()) {
-            None => columns.push(col.clone()),
+            None => {
+                fields.push(field.as_ref().clone());
+                columns.push(col.clone());
+            }
             Some(MaskingRule::Nullify) => {
+                fields.push(field.as_ref().clone());
                 columns.push(new_null_array(col.data_type(), batch.num_rows()));
             }
             Some(MaskingRule::Redact) => {
-                let redacted: StringArray =
-                    (0..batch.num_rows()).map(|_| Some("REDACTED")).collect();
+                let redacted: StringArray = (0..batch.num_rows())
+                    .map(|row| {
+                        if col.is_null(row) {
+                            None
+                        } else {
+                            Some("REDACTED")
+                        }
+                    })
+                    .collect();
+                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
                 columns.push(Arc::new(redacted));
             }
             Some(MaskingRule::Hash) => {
@@ -140,19 +168,22 @@ fn mask_batch(
                     .map_err(|e| Status::internal(e.to_string()))?;
                 let hashed: StringArray = (0..batch.num_rows())
                     .map(|row| {
-                        use std::hash::{Hash, Hasher};
+                        if col.is_null(row) {
+                            return None;
+                        }
                         let val = formatter.value(row).to_string();
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        val.hash(&mut h);
-                        Some(format!("{:016x}", h.finish()))
+                        let digest = Sha256::digest(val.as_bytes());
+                        Some(format!("{digest:x}"))
                     })
                     .collect();
+                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
                 columns.push(Arc::new(hashed));
             }
         }
     }
 
-    RecordBatch::try_new(schema, columns).map_err(|e| Status::internal(e.to_string()))
+    let output_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(output_schema, columns).map_err(|e| Status::internal(e.to_string()))
 }
 
 #[tonic::async_trait]
@@ -206,26 +237,48 @@ impl FlightSqlService for KrishivFlightSqlService {
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         // Authenticate if an auth provider is configured.
+        let token = self.bearer_token(&request)?;
         let principal = self.authenticate_request(&request)?;
 
         let query = std::str::from_utf8(&ticket.statement_handle)
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
 
         let session = self.make_session()?;
-        // Use async — do_get_statement is async, sync Session::sql() would panic inside a runtime
-        let df = session
-            .sql_async(query)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let result = df
-            .collect_async()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let result = if self.auth.is_some() && self.policy.is_some() {
+            let token = token
+                .as_deref()
+                .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
+            session
+                .sql_as(token, query)
+                .await
+                .map_err(|e| match e {
+                    krishiv_api::KrishivError::AccessDenied { reason } => {
+                        Status::permission_denied(reason)
+                    }
+                    other => Status::internal(other.to_string()),
+                })?
+                .collect_async()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        } else {
+            // Use async — do_get_statement is async, sync Session::sql() would panic inside a runtime.
+            let df = session
+                .sql_async(query)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            df.collect_async()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        };
 
-        // Apply column-masking policy (table context defaults to empty for
-        // ad-hoc SQL queries where no single table name is available).
+        // `sql_as` already applies policy checks and masking. The local helper is
+        // retained for auth-only/no-auth beta flows.
         let raw_batches = result.batches().to_vec();
-        let batches = self.apply_policy_masking(&principal, "", raw_batches)?;
+        let batches = if self.auth.is_some() && self.policy.is_some() {
+            raw_batches
+        } else {
+            self.apply_policy_masking(&principal, "", raw_batches)?
+        };
 
         let schema: Arc<Schema> = if batches.is_empty() {
             Arc::new(Schema::empty())
@@ -259,7 +312,7 @@ pub fn make_flight_sql_server()
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use krishiv_governance::{Role, StaticApiKeyAuthProvider};
+    use krishiv_governance::{MaskingRule, PolicyHook, Role, StaticApiKeyAuthProvider};
     use tonic::metadata::MetadataValue;
 
     fn make_auth_service() -> KrishivFlightSqlService {
@@ -269,6 +322,27 @@ mod tests {
             Role::Reader,
         )]));
         KrishivFlightSqlService::new().with_auth(auth)
+    }
+
+    struct DenySecretPolicy;
+
+    impl PolicyHook for DenySecretPolicy {
+        fn check_table_access(&self, _principal: &Principal, table_name: &str) -> bool {
+            table_name != "secret"
+        }
+
+        fn column_masking_rule(
+            &self,
+            _principal: &Principal,
+            _table_name: &str,
+            _column_name: &str,
+        ) -> Option<MaskingRule> {
+            None
+        }
+    }
+
+    fn make_auth_policy_service() -> KrishivFlightSqlService {
+        make_auth_service().with_policy(Arc::new(DenySecretPolicy))
     }
 
     #[test]
@@ -433,6 +507,22 @@ mod tests {
         let items: Vec<_> = result.unwrap().into_inner().collect().await;
         assert!(!items.is_empty());
         assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn auth_policy_rejects_denied_table_on_do_get() {
+        let svc = make_auth_policy_service();
+        let ticket = TicketStatementQuery {
+            statement_handle: b"SELECT * FROM secret".to_vec().into(),
+        };
+        let mut req = Request::new(Ticket::new(vec![]));
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer secret-key"),
+        );
+        let result = svc.do_get_statement(ticket, req).await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

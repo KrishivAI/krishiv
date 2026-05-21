@@ -71,8 +71,11 @@ impl From<krishiv_runtime::RuntimeError> for KrishivError {
 
 impl From<krishiv_sql::SqlError> for KrishivError {
     fn from(value: krishiv_sql::SqlError) -> Self {
-        Self::Runtime {
-            message: value.to_string(),
+        match value {
+            krishiv_sql::SqlError::AccessDenied { reason } => Self::AccessDenied { reason },
+            other => Self::Runtime {
+                message: other.to_string(),
+            },
         }
     }
 }
@@ -225,9 +228,10 @@ impl SessionBuilder {
 
     /// Build a session.
     pub fn build(self) -> Result<Session> {
+        let sql_engine = SqlEngine::new();
         let policy_engine = match (self.auth, self.policy) {
             (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
-                SqlEngine::new(),
+                sql_engine.clone(),
                 auth,
                 policy,
             )),
@@ -235,7 +239,7 @@ impl SessionBuilder {
         };
         Ok(Session {
             mode: self.mode,
-            sql_engine: SqlEngine::new(),
+            sql_engine,
             policy_engine,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
@@ -284,8 +288,8 @@ impl Session {
     pub fn jobs(&self) -> Vec<JobStatus> {
         self.jobs
             .lock()
-            .map(|jobs| jobs.snapshot())
-            .unwrap_or_default()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
     }
 
     /// Register a local Parquet path as a SQL table.
@@ -356,13 +360,10 @@ impl Session {
                 reason: e.to_string(),
             })?;
         let query_str = query.as_ref();
-        let table_hint = extract_table_hint(query_str);
         let batches = engine
-            .execute_as(&principal, query_str, &table_hint)
+            .execute_as(&principal, query_str)
             .await
-            .map_err(|e| KrishivError::AccessDenied {
-                reason: e.to_string(),
-            })?;
+            .map_err(KrishivError::from)?;
         Ok(DataFrame::from_batches(
             self.mode,
             batches,
@@ -399,19 +400,6 @@ impl Session {
     pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Stream {
         Stream::for_session(name, StreamMode::Unbounded, Vec::new(), self.mode)
     }
-}
-
-/// Extract the first table name after FROM in a SQL query (best-effort).
-fn extract_table_hint(query: &str) -> String {
-    let lower = query.to_lowercase();
-    if let Some(pos) = lower.find(" from ") {
-        let after = query[pos + 6..].trim_start();
-        let end = after
-            .find(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
-            .unwrap_or(after.len());
-        return after[..end].to_string();
-    }
-    String::new()
 }
 
 /// DataFrame API backed by DataFusion for R1 local execution.
@@ -981,8 +969,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DataFrame, DataType, ExecutionMode, Field, KrishivError, RecordBatch, Schema, Session,
-        SessionBuilder, StreamBatch,
+        DataType, ExecutionMode, Field, KrishivError, RecordBatch, Schema, Session, SessionBuilder,
+        StreamBatch,
     };
 
     #[test]
@@ -1314,14 +1302,32 @@ mod tests {
         assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
     }
 
-    #[test]
-    fn extract_table_hint_parses_from_clause() {
-        use super::extract_table_hint;
-        assert_eq!(
-            extract_table_hint("SELECT * FROM orders WHERE id=1"),
-            "orders"
-        );
-        assert_eq!(extract_table_hint("SELECT 42 AS v"), "");
-        assert_eq!(extract_table_hint("select a from users limit 10"), "users");
+    #[tokio::test]
+    async fn session_sql_as_can_read_registered_session_tables() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key123".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
+        let session = SessionBuilder::new()
+            .with_auth(auth)
+            .with_policy(Arc::new(AllowAllPolicy))
+            .build()
+            .unwrap();
+
+        session
+            .register_parquet_async("people", &parquet_path)
+            .await
+            .unwrap();
+        let df = session
+            .sql_as("key123", "SELECT city FROM people ORDER BY city")
+            .await
+            .unwrap();
+        let result = df.collect_async().await.unwrap();
+
+        assert_eq!(result.row_count(), 3);
     }
 }

@@ -3138,6 +3138,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-api",
+ "krishiv-checkpoint",
  "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
@@ -3204,6 +3205,7 @@ dependencies = [
  "krishiv-api",
  "krishiv-governance",
  "prost",
+ "sha2",
  "tokio",
  "tonic",
 ]
@@ -3351,6 +3353,7 @@ dependencies = [
  "krishiv-governance",
  "krishiv-optimizer",
  "krishiv-plan",
+ "sha2",
  "tokio",
 ]
 

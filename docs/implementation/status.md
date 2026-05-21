@@ -2,15 +2,64 @@
 
 ## Current Phase
 
-**R10 COMPLETE + Post-GA Gap Fixes Applied.** All stubs and deferred items resolved.
-GA platform release on branch `claude/plan-r10-architecture-GnRvo`.
+**R11 COMPLETE — Stability, Correctness, and CLI Completeness (2026-05-21).**
+Release tracker: `docs/implementation/r11-stability-correctness-cli.md`
 
-## Active Task
+## R11 Completion Summary
 
-**Cross-codebase P1–P3 audit fixes complete (2026-05-21). Workspace builds clean, all tests pass.**  
-Full plan: `docs/implementation/audit-and-fix-plan.md`  
-Next task: **P0.1** — fix dual `SqlEngine` split in `SessionBuilder` (`krishiv-api/src/lib.rs:228–242`).  
-Validation: `cargo test -p krishiv-api --lib && cargo test -p krishiv-sql --lib`
+All four sprints completed and validated.
+
+**Sprint 1 (S1)** — Critical lock-safety + fencing fixes:
+- `krishiv-checkpoint`: fencing token `!=` guard (rejects future-generation tokens, prevents split-brain)
+- `krishiv-scheduler`: `unwrap_or_else` on store mutexes + `tokio::sync::Mutex` for channel cache (eliminates double-connect race)
+- `krishiv-api`: `jobs()` lock-recovery via `unwrap_or_else(|p| p.into_inner())`
+- `krishiv-catalog`: `DataFusionSchemaBridge` `.expect()` → `unwrap_or_else`
+
+**Sprint 2 (S2)** — CDC real event loop:
+- `CdcEventSource` trait + `InMemoryCdcEventSource` for testable injection
+- `run_with_source<S, F>` real loop with shutdown signal support
+- `run()` returns structured error directing callers to `run_with_source`
+
+**Sprint 3 (S3)** — CLI stub replacements:
+- `krishiv checkpoints list`: real epoch listing via `LocalFsCheckpointStorage`
+- `krishiv restore`: real epoch restore plan from checkpoint metadata
+- `krishiv savepoint`: real coordinator call with context-rich failure message
+- `krishiv state inspect`: real state inspection with informative "none found" responses
+
+**Sprint 4 (S4)** — Medium-priority hardening:
+- `ShuffleMetadata::mark_pending` now returns `ShuffleResult<()>`; enforces `max_partitions` cap (default 65536); `with_max_partitions` builder added
+- `K8sLeaseElection`: `last_renewed_at` TTL field; `is_leader()` auto-evicts stale `true` state when past `lease_duration_s`; all `.unwrap()` → `unwrap_or_else(|p| p.into_inner())`
+
+Validation (2026-05-21):
+```
+cargo test --workspace          → all suites pass (0 failures)
+cargo clippy --workspace -- -D warnings → 0 errors, 0 warnings
+```
+
+Next: begin R12 planning (remote coordinator gRPC for CLI, rdkafka Kafka source, AQE coalescing).
+
+## Bug-Fix Sweep Complete (2026-05-21)
+
+Completed:
+
+- `krishiv-api` / `krishiv-sql`: `Session::sql_as` now uses the same registered `SqlEngine` as the session, checks every referenced SQL relation across joins and subqueries, and preserves access-denied errors.
+- `krishiv-flight-sql`: authenticated statement execution now routes through policy-enforced session SQL.
+- `krishiv-sql` / `krishiv-flight-sql`: redaction and hash masking now produce schema-safe UTF-8 columns for masked values, preserve nulls, and use SHA-256 for hash rules.
+- `krishiv-connectors`: local Parquet 2PC commit avoids restart filename collisions and final-file overwrite; CDC batch building stringifies non-UTF8 Arrow payload columns instead of silently emitting nulls.
+- `krishiv-exec` / `krishiv-state`: removed production unwrap/expect paths from key, aggregate, and TTL decoding logic; corrupt TTL state now returns a structured error.
+- `krishiv-scheduler`: cleaned stale test imports so warning-deny validation stays clean.
+
+Validation:
+
+- `cargo fmt --check`
+- `cargo check --workspace`
+- `cargo clippy --workspace -- -D warnings`
+- `cargo test --workspace` (passed after rerun with local socket permissions for Flight tests)
+- Focused crate tests for `krishiv-api`, `krishiv-sql`, `krishiv-flight-sql`, `krishiv-connectors`, `krishiv-exec`, `krishiv-state`, and `krishiv-scheduler`
+
+Blockers: none for this sweep.
+
+Next task: continue the architectural-bottleneck track from the audit, especially crate-size decomposition, durable metadata boundaries, and replacing in-memory policy/auth registries where roadmap phase requirements call for durable behavior.
 
 ## P1–P3 Audit Fixes Applied (2026-05-21)
 

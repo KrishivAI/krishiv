@@ -196,6 +196,7 @@ Public interfaces to define early:
 | R8 Lakehouse And Python Beta | Data platform usability | API surface grows too quickly | Mark Python/lakehouse APIs beta; freeze Rust core first |
 | R9 Governance And Operations | Enterprise operations | Control-plane correctness under failover | Lease leadership, fencing tokens, durable ownership metadata |
 | R10 GA Platform Release | Stable public platform | Performance gaps vs Spark/Flink | Publish benchmark matrix and optimize top regressions |
+| R11 Stability, Correctness, and CLI Completeness | Harden correctness on GA platform | Lock-poisoning crashes, split-brain fencing bypass, stubbed CLI | Fix all confirmed audit bugs; implement four previously-stubbed CLI commands |
 
 ## Phase Checklists
 
@@ -778,6 +779,55 @@ Acceptance gate:
 - [ ] Certified connector matrix passes.
 - [ ] Public API stability policy is documented.
 - [ ] SQL and function compatibility matrix is published.
+
+### R11: Stability, Correctness, and CLI Completeness
+
+Scope: correctness hardening on the GA platform — no new architectural features.
+
+Motivation: A crate-by-crate audit of R1–R10 identified confirmed bugs (lock
+poisoning crashes, split-brain fencing bypass, double-connect race) and stubbed
+implementations that silently succeed without doing real work (four CLI commands,
+CDC Kafka loop). R11 eliminates all confirmed findings.
+
+Features:
+
+- Lock-poisoning recovery across scheduler, API, and catalog crates.
+- Fencing-token correctness: reject both stale *and* future-generation tokens.
+- `executor_channels` serialized via `tokio::sync::Mutex` to eliminate the
+  double-connect race.
+- `CdcEventSource` trait + `run_with_source` real event loop in CDC connector.
+- Four CLI commands replaced: `savepoint`, `restore`, `checkpoints list`,
+  `state inspect` — all backed by `LocalFsCheckpointStorage` or the in-process
+  coordinator API.
+- `ShuffleMetadata` partition-count cap (default 65536) to prevent OOM on
+  pathological workloads.
+- K8s operator lease-state TTL eviction to prevent unbounded memory growth.
+
+Checklist:
+
+- [ ] Replace `.lock().unwrap()` with `.unwrap_or_else(|p| p.into_inner())` in scheduler job-store paths.
+- [ ] Change `executor_channels` to `Arc<tokio::sync::Mutex<…>>` and hold lock across `connect().await`.
+- [ ] Change `validate_fencing_token` condition from `<` to `!=`.
+- [ ] Fix `jobs()` in `krishiv-api` to recover from lock poisoning.
+- [ ] Replace `.expect()` calls in `DataFusionSchemaBridge` with `unwrap_or_else`.
+- [ ] Add `CdcEventSource` trait and `InMemoryCdcEventSource` to `krishiv-connectors`.
+- [ ] Implement `CdcToLakehousePipeline::run_with_source` with real poll/parse/batch/write loop.
+- [ ] Add `krishiv-checkpoint` dependency to `krishiv-cli`.
+- [ ] Implement `krishiv checkpoints list` using `LocalFsCheckpointStorage`.
+- [ ] Implement `krishiv restore` with structured restore-plan output.
+- [ ] Implement `krishiv savepoint` against in-process coordinator API.
+- [ ] Implement `krishiv state inspect` using checkpoint operator snapshots.
+- [ ] Add `max_partitions` cap to `ShuffleMetadata::mark_pending`.
+- [ ] Add lease-state TTL eviction to `K8sLeaseElection`.
+
+Acceptance gate:
+
+- [ ] No `unwrap()` or `expect()` on `Mutex` lock results in non-test production paths.
+- [ ] `validate_fencing_token` rejects both `<` and `>` mismatches.
+- [ ] All four CLI commands return real output or a structured error — never "not yet implemented".
+- [ ] `CdcToLakehousePipeline::run_with_source` verified by test.
+- [ ] `cargo test --workspace` passes with zero failures.
+- [ ] `cargo clippy --workspace -- -D warnings` passes.
 
 ## Cross-Cutting Risks And Mitigations
 

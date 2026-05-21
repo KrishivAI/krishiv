@@ -864,7 +864,7 @@ pub struct Coordinator {
     streaming_task_index: HashMap<TaskId, (JobId, StageId)>,
     /// P1.2: Cached gRPC channels keyed by executor endpoint string.
     /// Avoids a full TCP+TLS handshake per task assignment push.
-    executor_channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
+    executor_channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -1406,7 +1406,7 @@ impl Coordinator {
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
             streaming_task_index: HashMap::new(),
-            executor_channels: Arc::new(Mutex::new(HashMap::new())),
+            executor_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1808,7 +1808,7 @@ impl Coordinator {
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
         if let Some(store) = &self.store {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             if let Err(e) = s.save_job(&record) {
                 tracing::warn!(
                     error = %e,
@@ -2197,7 +2197,7 @@ impl Coordinator {
         if let Some(record) = self.jobs.get(&job_id)
             && let Some(store) = &self.store
         {
-            let mut s = store.lock().unwrap();
+            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
             if let Err(e) = s.save_job(record) {
                 tracing::warn!(
                     error = %e,
@@ -2281,11 +2281,9 @@ impl Coordinator {
         &self,
         endpoint: &str,
     ) -> SchedulerResult<tonic::transport::Channel> {
-        {
-            let map = self.executor_channels.lock().unwrap();
-            if let Some(ch) = map.get(endpoint) {
-                return Ok(ch.clone());
-            }
+        let mut map = self.executor_channels.lock().await;
+        if let Some(ch) = map.get(endpoint) {
+            return Ok(ch.clone());
         }
         let ch = tonic::transport::Endpoint::from_shared(endpoint.to_string())
             .map_err(|e| SchedulerError::InvalidJob {
@@ -2297,10 +2295,7 @@ impl Coordinator {
                 endpoint: endpoint.to_string(),
                 reason: e.to_string(),
             })?;
-        self.executor_channels
-            .lock()
-            .unwrap()
-            .insert(endpoint.to_owned(), ch.clone());
+        map.insert(endpoint.to_owned(), ch.clone());
         Ok(ch)
     }
 
@@ -4583,11 +4578,10 @@ mod tests {
         AdaptiveDecisionKind, AdaptiveOverrideConfig, CheckpointCoordinator,
         CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator, CoordinatorConfig,
         CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryMetadataStore,
-        InMemoryQueueManager, JobSnapshot, JsonFileMetadataStore, LeaderElection, MetadataStore,
-        NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, QuotaQueueManager, ResourceUsage,
-        SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
-        TaskUpdateOutcome, job_spec_from_logical_plan,
-        serve_coordinator_executor_grpc_with_listener,
+        InMemoryQueueManager, JsonFileMetadataStore, LeaderElection, MetadataStore,
+        NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, QuotaQueueManager, SchedulerError,
+        SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
+        job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
 
     #[derive(Debug, Clone, Default)]
@@ -7748,7 +7742,7 @@ mod tests {
         let stage_id = StageId::try_new("stage-1").unwrap();
         let task_id = TaskId::try_new("task-1").unwrap();
 
-        use krishiv_proto::{AttemptId, LeaseGeneration, TaskRuntimeStats, TaskStatusUpdate};
+        use krishiv_proto::{TaskRuntimeStats, TaskStatusUpdate};
 
         let spec = JobSpec::new(job_id.clone(), "ru", JobKind::Batch).with_stage(
             StageSpec::new(stage_id.clone(), "s").with_task(TaskSpec::new(task_id.clone(), "t")),

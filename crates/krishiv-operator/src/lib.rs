@@ -1286,6 +1286,10 @@ impl fmt::Debug for K8sLeaseElection {
 struct K8sLeaseState {
     is_leader: bool,
     fencing_token: u64,
+    /// Wall-clock time of the last successful acquire or renew.
+    /// Used to auto-evict stale `is_leader = true` state when the renewal loop
+    /// dies without calling `release()`.
+    last_renewed_at: Option<std::time::Instant>,
 }
 
 impl K8sLeaseElection {
@@ -1308,6 +1312,7 @@ impl K8sLeaseElection {
             state: std::sync::Mutex::new(K8sLeaseState {
                 is_leader: false,
                 fencing_token: 0,
+                last_renewed_at: None,
             }),
         }
     }
@@ -1397,9 +1402,10 @@ impl K8sLeaseElection {
                 };
                 match api.create(&PostParams::default(), &lease).await {
                     Ok(_) => {
-                        let mut s = self.state.lock().unwrap();
+                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
                         s.fencing_token += 1;
                         s.is_leader = true;
+                        s.last_renewed_at = Some(std::time::Instant::now());
                         true
                     }
                     Err(e) => {
@@ -1464,9 +1470,10 @@ impl K8sLeaseElection {
                     .await
                 {
                     Ok(_) => {
-                        let mut s = self.state.lock().unwrap();
+                        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
                         s.fencing_token += 1;
                         s.is_leader = true;
+                        s.last_renewed_at = Some(std::time::Instant::now());
                         true
                     }
                     Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
@@ -1500,12 +1507,12 @@ impl K8sLeaseElection {
             Ok(Some(l)) => l,
             Ok(None) => {
                 tracing::warn!(lease = %self.lease_name, "k8s_lease: lease not found during renew");
-                self.state.lock().unwrap().is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 return false;
             }
             Err(e) => {
                 tracing::warn!(lease = %self.lease_name, error = %e, "k8s_lease: GET failed during renew");
-                self.state.lock().unwrap().is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 return false;
             }
         };
@@ -1522,7 +1529,7 @@ impl K8sLeaseElection {
                 our_identity = %self.holder_identity,
                 "k8s_lease: holderIdentity mismatch during renew — lost leadership"
             );
-            self.state.lock().unwrap().is_leader = false;
+            self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
             return false;
         }
 
@@ -1549,13 +1556,17 @@ impl K8sLeaseElection {
             .patch(&self.lease_name, &PatchParams::default(), &patch)
             .await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).last_renewed_at =
+                    Some(std::time::Instant::now());
+                true
+            }
             Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
                 tracing::warn!(
                     lease = %self.lease_name,
                     "k8s_lease: PATCH conflict (409) during renew — lost leadership"
                 );
-                self.state.lock().unwrap().is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 false
             }
             Err(e) => {
@@ -1564,7 +1575,7 @@ impl K8sLeaseElection {
                     error = %e,
                     "k8s_lease: PATCH failed during renew"
                 );
-                self.state.lock().unwrap().is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 false
             }
         }
@@ -1595,13 +1606,22 @@ impl K8sLeaseElection {
                 "k8s_lease: PATCH failed during release (ignoring)"
             );
         }
-        self.state.lock().unwrap().is_leader = false;
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
     }
 }
 
 impl LeaderElection for K8sLeaseElection {
     fn is_leader(&self) -> bool {
-        self.state.lock().unwrap().is_leader
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.is_leader {
+            let expired = s
+                .last_renewed_at
+                .is_none_or(|t| t.elapsed().as_secs() > self.lease_duration_s);
+            if expired {
+                s.is_leader = false;
+            }
+        }
+        s.is_leader
     }
 
     fn try_acquire(&self) -> bool {
@@ -1612,9 +1632,10 @@ impl LeaderElection for K8sLeaseElection {
             tokio::runtime::Handle::current().block_on(self.k8s_try_acquire(client))
         } else {
             // Simulation mode: increment fencing token and mark as leader.
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             s.fencing_token += 1;
             s.is_leader = true;
+            s.last_renewed_at = Some(std::time::Instant::now());
             true
         }
     }
@@ -1624,7 +1645,12 @@ impl LeaderElection for K8sLeaseElection {
             tokio::runtime::Handle::current().block_on(self.k8s_renew(client))
         } else {
             // Simulation: renewal succeeds as long as we are still marked leader.
-            self.state.lock().unwrap().is_leader
+            let is_leader = self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader;
+            if is_leader {
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).last_renewed_at =
+                    Some(std::time::Instant::now());
+            }
+            is_leader
         }
     }
 
@@ -1632,12 +1658,12 @@ impl LeaderElection for K8sLeaseElection {
         if let Some(ref client) = self.client {
             tokio::runtime::Handle::current().block_on(self.k8s_release(client));
         } else {
-            self.state.lock().unwrap().is_leader = false;
+            self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
         }
     }
 
     fn fencing_token(&self) -> u64 {
-        self.state.lock().unwrap().fencing_token
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).fencing_token
     }
 }
 

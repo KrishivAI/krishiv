@@ -73,9 +73,19 @@ pub enum PartitionState {
 // ── ShuffleMetadata ───────────────────────────────────────────────────────────
 
 /// In-memory registry tracking the state of shuffle partitions.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShuffleMetadata {
     states: HashMap<ShufflePath, PartitionState>,
+    max_partitions: usize,
+}
+
+impl Default for ShuffleMetadata {
+    fn default() -> Self {
+        Self {
+            states: HashMap::new(),
+            max_partitions: 65_536,
+        }
+    }
 }
 
 impl ShuffleMetadata {
@@ -84,9 +94,22 @@ impl ShuffleMetadata {
         Self::default()
     }
 
+    /// Set the maximum number of tracked partitions (default 65536).
+    #[must_use]
+    pub fn with_max_partitions(mut self, n: usize) -> Self {
+        self.max_partitions = n;
+        self
+    }
+
     /// Record that a partition write has been started.
-    pub fn mark_pending(&mut self, path: &ShufflePath) {
+    ///
+    /// Returns `TooManyPartitions` when the cap is already reached.
+    pub fn mark_pending(&mut self, path: &ShufflePath) -> ShuffleResult<()> {
+        if self.states.len() >= self.max_partitions && !self.states.contains_key(path) {
+            return Err(ShuffleError::TooManyPartitions { limit: self.max_partitions });
+        }
         self.states.insert(path.clone(), PartitionState::Pending);
+        Ok(())
     }
 
     /// Record that a partition is fully written and available.
@@ -158,6 +181,11 @@ pub enum ShuffleError {
         /// String representation of the missing path.
         path: String,
     },
+    /// The shuffle partition cap was exceeded; no new partitions may be registered.
+    TooManyPartitions {
+        /// The configured partition limit.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for ShuffleError {
@@ -175,6 +203,9 @@ impl std::fmt::Display for ShuffleError {
                 "stale shuffle lease token: expected {expected}, actual {actual}"
             ),
             Self::NotFound { path } => write!(f, "shuffle path not found: {path}"),
+            Self::TooManyPartitions { limit } => {
+                write!(f, "shuffle partition limit exceeded: max {limit} partitions")
+            }
         }
     }
 }
@@ -1020,7 +1051,7 @@ mod tests {
     fn metadata_pending_to_available() {
         let mut meta = ShuffleMetadata::new();
         let p = make_path(0);
-        meta.mark_pending(&p);
+        meta.mark_pending(&p).unwrap();
         assert_eq!(meta.state(&p), Some(&PartitionState::Pending));
         meta.mark_available(&p);
         assert_eq!(meta.state(&p), Some(&PartitionState::Available));
@@ -1030,7 +1061,7 @@ mod tests {
     fn metadata_pending_to_failed() {
         let mut meta = ShuffleMetadata::new();
         let p = make_path(1);
-        meta.mark_pending(&p);
+        meta.mark_pending(&p).unwrap();
         meta.mark_failed(&p, "disk full".into());
         assert_eq!(
             meta.state(&p),
@@ -1046,7 +1077,7 @@ mod tests {
         let p0 = make_path(0);
         let p1 = make_path(1);
         meta.mark_available(&p0);
-        meta.mark_pending(&p1);
+        meta.mark_pending(&p1).unwrap();
 
         assert!(!meta.all_available(&[p0.clone(), p1.clone()]));
 
@@ -1058,6 +1089,27 @@ mod tests {
     fn metadata_all_available_empty_slice() {
         let meta = ShuffleMetadata::new();
         assert!(meta.all_available(&[]));
+    }
+
+    #[test]
+    fn metadata_partition_cap_enforced() {
+        let mut meta = ShuffleMetadata::new().with_max_partitions(2);
+        meta.mark_pending(&make_path(0)).unwrap();
+        meta.mark_pending(&make_path(1)).unwrap();
+        let err = meta.mark_pending(&make_path(2)).unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::TooManyPartitions { limit: 2 }),
+            "expected TooManyPartitions(2), got: {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_cap_allows_update_of_existing_partition() {
+        let mut meta = ShuffleMetadata::new().with_max_partitions(1);
+        let p = make_path(0);
+        meta.mark_pending(&p).unwrap();
+        // Re-marking an existing key must succeed even at cap.
+        meta.mark_pending(&p).unwrap();
     }
 
     // ── LocalShuffleStore ─────────────────────────────────────────────────

@@ -26,6 +26,7 @@ Each tracker is intentionally checklist-oriented. R1-R3 are more concrete becaus
 | R8 Lakehouse And Python Beta | [r8-lakehouse-and-python-beta.md](r8-lakehouse-and-python-beta.md) |
 | R9 Governance And Operations | [r9-governance-and-operations.md](r9-governance-and-operations.md) |
 | R10 GA Platform Release | [r10-ga-platform-release.md](r10-ga-platform-release.md) |
+| R11 Stability, Correctness, and CLI Completeness | [r11-stability-correctness-cli.md](r11-stability-correctness-cli.md) |
 
 ## Tracker Template
 

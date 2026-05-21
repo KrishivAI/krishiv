@@ -142,15 +142,21 @@ fn format_key_value(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecResu
     let col = batch.column(col_idx);
     match col.data_type() {
         DataType::Int32 => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Int32 key failed downcast".into())
+            })?;
             Ok(arr.value(row).to_string())
         }
         DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Int64 key failed downcast".into())
+            })?;
             Ok(arr.value(row).to_string())
         }
         DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Utf8 key failed downcast".into())
+            })?;
             Ok(arr.value(row).to_string())
         }
         other => Err(ExecError::UnsupportedType(format!(
@@ -440,11 +446,21 @@ impl AggState {
                     let col = batch.column(col_idx);
                     let v = match col.data_type() {
                         DataType::Int32 => {
-                            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                            let arr =
+                                col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                                    ExecError::UnsupportedType(
+                                        "declared Int32 aggregate input failed downcast".into(),
+                                    )
+                                })?;
                             arr.value(row) as i64
                         }
                         DataType::Int64 => {
-                            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                            let arr =
+                                col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                                    ExecError::UnsupportedType(
+                                        "declared Int64 aggregate input failed downcast".into(),
+                                    )
+                                })?;
                             arr.value(row)
                         }
                         other => {
@@ -582,17 +598,33 @@ impl LocalAggregator {
             let dtype = batch.schema().field(col_idx).data_type().clone();
             match dtype {
                 DataType::Int32 => {
-                    let arr: Int32Array = sorted_entries
+                    let values: Vec<i32> = sorted_entries
                         .iter()
-                        .map(|(key, _)| key[gb_pos].parse::<i32>().unwrap())
-                        .collect();
+                        .map(|(key, _)| {
+                            key[gb_pos].parse::<i32>().map_err(|e| {
+                                ExecError::UnsupportedType(format!(
+                                    "failed to rebuild Int32 group key '{}': {e}",
+                                    key[gb_pos]
+                                ))
+                            })
+                        })
+                        .collect::<ExecResult<_>>()?;
+                    let arr = Int32Array::from(values);
                     columns.push(Arc::new(arr) as ArrayRef);
                 }
                 DataType::Int64 => {
-                    let arr: Int64Array = sorted_entries
+                    let values: Vec<i64> = sorted_entries
                         .iter()
-                        .map(|(key, _)| key[gb_pos].parse::<i64>().unwrap())
-                        .collect();
+                        .map(|(key, _)| {
+                            key[gb_pos].parse::<i64>().map_err(|e| {
+                                ExecError::UnsupportedType(format!(
+                                    "failed to rebuild Int64 group key '{}': {e}",
+                                    key[gb_pos]
+                                ))
+                            })
+                        })
+                        .collect::<ExecResult<_>>()?;
+                    let arr = Int64Array::from(values);
                     columns.push(Arc::new(arr) as ArrayRef);
                 }
                 DataType::Utf8 => {

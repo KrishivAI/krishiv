@@ -436,7 +436,7 @@ pub fn validate_fencing_token(
     metadata: &CheckpointMetadata,
     current_token: u64,
 ) -> CheckpointResult<()> {
-    if metadata.fencing_token < current_token {
+    if metadata.fencing_token != current_token {
         return Err(CheckpointError::StaleFencingToken {
             stored: metadata.fencing_token,
             current: current_token,
@@ -982,13 +982,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_fencing_token_future_token_accepted() {
+    fn validate_fencing_token_future_token_rejected() {
+        // Only an exact token match is valid; a future-generation token indicates
+        // split-brain and must be rejected.
         let meta = sample_metadata(1); // fencing_token = 1
-        // If the coordinator's current token is 1, a meta with token=1 is fine
-        // A meta with token=2 is also fine (coordinator upgraded its token)
         let mut meta2 = meta.clone();
         meta2.fencing_token = 2;
-        assert!(validate_fencing_token(&meta2, 1).is_ok());
+        let result = validate_fencing_token(&meta2, 1);
+        assert!(
+            matches!(result, Err(CheckpointError::StaleFencingToken { stored: 2, current: 1 })),
+            "expected StaleFencingToken(stored=2, current=1), got: {result:?}"
+        );
     }
 
     #[test]
@@ -1011,6 +1015,34 @@ mod tests {
         let err = validate_fencing_token(&meta, 5).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("stale"), "expected 'stale' in: {msg}");
+    }
+
+    #[test]
+    fn validate_fencing_token_future_generation_rejected() {
+        let mut meta = sample_metadata(1);
+        meta.fencing_token = 5; // future-generation token
+        // Current coordinator is at token=2; metadata has token=5 → invalid
+        let result = validate_fencing_token(&meta, 2);
+        assert!(
+            matches!(
+                result,
+                Err(CheckpointError::StaleFencingToken {
+                    stored: 5,
+                    current: 2
+                })
+            ),
+            "future-generation fencing token must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_fencing_token_exact_match_accepted() {
+        let mut meta = sample_metadata(1);
+        meta.fencing_token = 3;
+        assert!(
+            validate_fencing_token(&meta, 3).is_ok(),
+            "exact fencing token match must be accepted"
+        );
     }
 
     // ── Path traversal protection (P3.21) ────────────────────────────────

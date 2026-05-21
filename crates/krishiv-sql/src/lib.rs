@@ -5,15 +5,17 @@
 //! This crate owns the DataFusion integration for R1 while keeping DataFusion
 //! out of the long-term public API exposed by `krishiv-api`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
 
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
@@ -390,6 +392,29 @@ pub fn explain_sql_with_cost(
     Ok(output)
 }
 
+/// Return all base table/relation names referenced by `query`.
+///
+/// This uses the same SQL parser family as DataFusion, so policy checks cover
+/// joins, subqueries, CTE bodies, and other nested relation references instead
+/// of relying on a single best-effort `FROM` token.
+pub fn referenced_table_names(query: impl AsRef<str>) -> SqlResult<Vec<String>> {
+    let query = query.as_ref();
+    if query.trim().is_empty() {
+        return Err(SqlError::EmptyQuery);
+    }
+
+    let statements =
+        Parser::parse_sql(&GenericDialect {}, query).map_err(|e| SqlError::DataFusion {
+            message: format!("SQL parse error: {e}"),
+        })?;
+    let mut names = BTreeSet::new();
+    let _ = visit_relations(&statements, |relation| {
+        names.insert(relation.to_string());
+        ControlFlow::<()>::Continue(())
+    });
+    Ok(names.into_iter().collect())
+}
+
 /// Format Arrow batches for CLI and tests.
 pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
     Ok(pretty_format_batches(batches)
@@ -442,24 +467,22 @@ impl PolicyEnforcingSqlEngine {
             })
     }
 
-    /// Execute a query as `principal`, applying table-access check and column masking.
-    ///
-    /// `table_name` is the logical table being queried — used for the access check and
-    /// as the table context for the column-masking hook.
+    /// Execute a query as `principal`, applying table-access checks and column masking.
     pub async fn execute_as(
         &self,
         principal: &Principal,
         query: &str,
-        table_name: &str,
     ) -> SqlResult<Vec<RecordBatch>> {
-        // Table access check
-        if !self.policy.check_table_access(principal, table_name) {
-            return Err(SqlError::AccessDenied {
-                reason: format!(
-                    "principal '{}' denied access to table '{}'",
-                    principal.subject, table_name
-                ),
-            });
+        let table_names = referenced_table_names(query)?;
+        for table_name in &table_names {
+            if !self.policy.check_table_access(principal, table_name) {
+                return Err(SqlError::AccessDenied {
+                    reason: format!(
+                        "principal '{}' denied access to table '{}'",
+                        principal.subject, table_name
+                    ),
+                });
+            }
         }
 
         // Execute query via inner engine
@@ -469,7 +492,7 @@ impl PolicyEnforcingSqlEngine {
         // Apply column masking
         let masked = batches
             .iter()
-            .map(|batch| apply_masking(batch, principal, table_name, self.policy.as_ref()))
+            .map(|batch| apply_masking(batch, principal, &table_names, self.policy.as_ref()))
             .collect::<SqlResult<Vec<_>>>()?;
 
         Ok(masked)
@@ -480,31 +503,46 @@ impl PolicyEnforcingSqlEngine {
 fn apply_masking(
     batch: &RecordBatch,
     principal: &Principal,
-    table_name: &str,
+    table_names: &[String],
     policy: &dyn PolicyHook,
 ) -> SqlResult<RecordBatch> {
     use arrow::array::Array;
     use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use sha2::{Digest, Sha256};
 
     let schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
 
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
-        match policy.column_masking_rule(principal, table_name, field.name()) {
-            None => columns.push(col.clone()),
+        match masking_rule_for_field(policy, principal, table_names, field.name()) {
+            None => {
+                fields.push(field.as_ref().clone());
+                columns.push(col.clone());
+            }
             Some(MaskingRule::Nullify) => {
                 // Rebuild the column as a null array cast to the same type.
                 // Using arrow's NullArray directly changes the data type, so we
                 // cast a NullArray back to the original type so the schema stays
                 // consistent.
                 use arrow::array::new_null_array;
+                fields.push(field.as_ref().clone());
                 columns.push(new_null_array(col.data_type(), batch.num_rows()));
             }
             Some(MaskingRule::Redact) => {
-                let redacted: StringArray =
-                    (0..batch.num_rows()).map(|_| Some("REDACTED")).collect();
+                let redacted: StringArray = (0..batch.num_rows())
+                    .map(|row| {
+                        if col.is_null(row) {
+                            None
+                        } else {
+                            Some("REDACTED")
+                        }
+                    })
+                    .collect();
+                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
                 columns.push(std::sync::Arc::new(redacted));
             }
             Some(MaskingRule::Hash) => {
@@ -516,21 +554,40 @@ fn apply_masking(
                 })?;
                 let hashed: StringArray = (0..batch.num_rows())
                     .map(|row| {
-                        use std::hash::{Hash, Hasher};
+                        if col.is_null(row) {
+                            return None;
+                        }
                         let val = formatter.value(row).to_string();
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        val.hash(&mut h);
-                        Some(format!("{:016x}", h.finish()))
+                        let digest = Sha256::digest(val.as_bytes());
+                        Some(format!("{digest:x}"))
                     })
                     .collect();
+                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
                 columns.push(std::sync::Arc::new(hashed));
             }
         }
     }
 
-    RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
+    let output_schema =
+        std::sync::Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(output_schema, columns).map_err(|e| SqlError::DataFusion {
         message: e.to_string(),
     })
+}
+
+fn masking_rule_for_field(
+    policy: &dyn PolicyHook,
+    principal: &Principal,
+    table_names: &[String],
+    column_name: &str,
+) -> Option<MaskingRule> {
+    if table_names.is_empty() {
+        return policy.column_masking_rule(principal, "", column_name);
+    }
+
+    table_names
+        .iter()
+        .find_map(|table| policy.column_masking_rule(principal, table, column_name))
 }
 
 // ─── Materialized Views Baseline ─────────────────────────────────────────────
@@ -840,7 +897,23 @@ mod policy_tests {
         }));
         let p = engine.authenticate("key1").unwrap();
         let err = engine
-            .execute_as(&p, "SELECT 1", "secret")
+            .execute_as(&p, "SELECT * FROM secret")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SqlError::AccessDenied { .. }));
+    }
+
+    #[tokio::test]
+    async fn denied_join_table_returns_access_denied() {
+        let engine = make_engine_with_policy(Arc::new(DenyTablePolicy {
+            denied_table: "secret".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        let err = engine
+            .execute_as(
+                &p,
+                "SELECT * FROM public JOIN secret ON public.id = secret.id",
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SqlError::AccessDenied { .. }));
@@ -852,10 +925,7 @@ mod policy_tests {
             denied_table: "secret".into(),
         }));
         let p = engine.authenticate("key1").unwrap();
-        let batches = engine
-            .execute_as(&p, "SELECT 42 AS val", "public")
-            .await
-            .unwrap();
+        let batches = engine.execute_as(&p, "SELECT 42 AS val").await.unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1);
     }
@@ -890,7 +960,7 @@ mod policy_tests {
             .unwrap();
 
         let batches = engine
-            .execute_as(&p, "SELECT id, name FROM people", "people")
+            .execute_as(&p, "SELECT id, name FROM people")
             .await
             .unwrap();
 
@@ -903,6 +973,42 @@ mod policy_tests {
             .unwrap();
         assert_eq!(name_col.value(0), "REDACTED");
     }
+
+    #[tokio::test]
+    async fn redact_policy_can_mask_non_string_columns() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let engine = make_engine_with_policy(Arc::new(RedactColumnPolicy {
+            column: "id".into(),
+        }));
+        let p = engine.authenticate("key1").unwrap();
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        use arrow::array::Int64Array;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        engine
+            .inner
+            .register_record_batches("people", vec![batch])
+            .await
+            .unwrap();
+
+        let batches = engine
+            .execute_as(&p, "SELECT id FROM people")
+            .await
+            .unwrap();
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Utf8);
+        let id_col = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "REDACTED");
+    }
 }
 
 #[cfg(test)]
@@ -912,6 +1018,7 @@ mod tests {
 
     use super::{
         SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
+        referenced_table_names,
     };
 
     #[test]
@@ -922,6 +1029,16 @@ mod tests {
         };
 
         assert_eq!(error, SqlError::EmptyQuery);
+    }
+
+    #[test]
+    fn referenced_table_names_covers_joins_and_subqueries() {
+        let tables = referenced_table_names(
+            "SELECT * FROM public JOIN secret ON public.id = secret.id \
+             WHERE public.id IN (SELECT id FROM audit)",
+        )
+        .unwrap();
+        assert_eq!(tables, vec!["audit", "public", "secret"]);
     }
 
     #[test]

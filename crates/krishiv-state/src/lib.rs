@@ -35,6 +35,7 @@ pub enum StateError {
     BackendUnavailable { message: String },
     SnapshotUnsupported { backend: &'static str },
     SnapshotCorrupt { message: String },
+    CorruptEntry { message: String },
 }
 
 impl std::fmt::Display for StateError {
@@ -48,6 +49,9 @@ impl std::fmt::Display for StateError {
             }
             Self::SnapshotCorrupt { message } => {
                 write!(f, "snapshot corrupt: {message}")
+            }
+            Self::CorruptEntry { message } => {
+                write!(f, "state entry corrupt: {message}")
             }
         }
     }
@@ -916,16 +920,24 @@ impl<B: StateBackend> TtlStateBackend<B> {
         encoded
     }
 
-    fn decode_if_live(encoded: Vec<u8>, now_ms: i64) -> Option<Vec<u8>> {
+    fn decode_if_live(encoded: Vec<u8>, now_ms: i64) -> StateResult<Option<Vec<u8>>> {
         if encoded.len() < 8 {
-            return None;
+            return Err(StateError::CorruptEntry {
+                message: format!("ttl value is too short: {} bytes", encoded.len()),
+            });
         }
         let expires_at_ms =
-            i64::from_le_bytes(encoded[..8].try_into().expect("slice is exactly 8 bytes"));
+            i64::from_le_bytes(
+                encoded[..8]
+                    .try_into()
+                    .map_err(|_| StateError::CorruptEntry {
+                        message: "ttl expiry prefix is not 8 bytes".into(),
+                    })?,
+            );
         if now_ms >= expires_at_ms {
-            None
+            Ok(None)
         } else {
-            Some(encoded[8..].to_vec())
+            Ok(Some(encoded[8..].to_vec()))
         }
     }
 }
@@ -934,7 +946,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     fn get(&self, namespace: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
         match self.inner.get(namespace, key)? {
             None => Ok(None),
-            Some(encoded) => Ok(Self::decode_if_live(encoded, unix_now_ms())),
+            Some(encoded) => Self::decode_if_live(encoded, unix_now_ms()),
         }
     }
 
@@ -1276,6 +1288,17 @@ mod tests {
         let ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
         // now_ms() >> 1, so this entry must be expired.
         assert!(ttl.get(&n, b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn ttl_backend_corrupt_value_returns_error() {
+        let mut inner = InMemoryStateBackend::new();
+        let n = ns("op1", "session");
+        inner.put(&n, b"k".to_vec(), b"short".to_vec()).unwrap();
+
+        let ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+        let err = ttl.get(&n, b"k").unwrap_err();
+        assert!(matches!(err, StateError::CorruptEntry { .. }));
     }
 
     #[test]

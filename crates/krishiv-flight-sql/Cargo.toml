@@ -12,6 +12,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 krishiv-api = { path = "../krishiv-api" }
 krishiv-governance = { path = "../krishiv-governance" }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
