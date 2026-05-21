@@ -7,7 +7,10 @@ GA platform release on branch `claude/plan-r10-architecture-GnRvo`.
 
 ## Active Task
 
-None — all P0/P1/P2 gaps resolved. Ready for GA tag.
+**Cross-codebase correctness audit complete (2026-05-21). Working through fix plan.**  
+Full plan: `docs/implementation/audit-and-fix-plan.md`  
+Next task: **P0.1** — fix dual `SqlEngine` split in `SessionBuilder` (`krishiv-api/src/lib.rs:228–242`).  
+Validation: `cargo test -p krishiv-api --lib && cargo test -p krishiv-sql --lib`
 
 ## Post-R10 Gap Fixes (P0 → P2)
 
