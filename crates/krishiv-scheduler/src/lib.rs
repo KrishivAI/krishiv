@@ -4465,6 +4465,16 @@ fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 /// `SingleNodeElection` is the embedded/single-node implementation.
 /// `K8sLeaseElection` in `krishiv-operator` implements this for Kubernetes HA.
 /// Bare-metal HA backed by external etcd is deferred post-R9.
+///
+/// # ADR-R12-02 (Option B — AFIT)
+/// The three mutating methods use `async fn` (AFIT, stable since Rust 1.75).
+/// This eliminates the `block_on` anti-pattern in `K8sLeaseElection`, which
+/// panics when called from inside an async Tokio runtime context.
+///
+/// `dyn LeaderElection` is not used anywhere in this codebase, so auto-trait
+/// bounds on the returned futures (the lint `async_fn_in_trait` warns about)
+/// are not a concern.
+#[allow(async_fn_in_trait)]
 pub trait LeaderElection: Send + Sync {
     /// Whether this node currently holds the leader lease.
     fn is_leader(&self) -> bool;
@@ -4472,7 +4482,7 @@ pub trait LeaderElection: Send + Sync {
     /// Attempt to acquire the leader lease. Returns `true` if acquired.
     ///
     /// Default: always succeeds (single-node behaviour).
-    fn try_acquire(&self) -> bool {
+    async fn try_acquire(&self) -> bool {
         self.is_leader()
     }
 
@@ -4482,14 +4492,14 @@ pub trait LeaderElection: Send + Sync {
     /// stop acting as leader immediately and reject any pending checkpoint writes.
     ///
     /// Default: returns `is_leader()` (single-node behaviour).
-    fn renew(&self) -> bool {
+    async fn renew(&self) -> bool {
         self.is_leader()
     }
 
     /// Release the leader lease voluntarily (graceful shutdown).
     ///
     /// Default: no-op.
-    fn release(&self) {}
+    async fn release(&self) {}
 
     /// Monotonically increasing fencing token for this lease holder.
     ///
