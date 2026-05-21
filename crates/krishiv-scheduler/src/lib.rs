@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_checkpoint::{
-    CheckpointMetadata, CheckpointResult, IntegrityManifest, LocalFsCheckpointStorage,
-    OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
-    read_epoch_metadata, read_operator_snapshot, validate_epoch, write_epoch_metadata,
-    write_manifest,
+    CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
+    LocalFsCheckpointStorage, OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch,
+    list_valid_epochs, read_epoch_metadata, read_operator_snapshot, validate_epoch,
+    write_epoch_metadata, write_manifest,
 };
 use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 use krishiv_proto::{
@@ -534,7 +534,7 @@ pub enum CheckpointCoordinatorState {
 #[derive(Clone)]
 pub struct CheckpointCoordinator {
     job_id: JobId,
-    storage: Arc<LocalFsCheckpointStorage>,
+    storage: Arc<dyn CheckpointStorage>,
     interval_ms: u64,
     current_epoch: u64,
     fencing_token: FencingToken,
@@ -567,7 +567,7 @@ impl CheckpointCoordinator {
     /// Create a new checkpoint coordinator for `job_id`.
     pub fn new(
         job_id: JobId,
-        storage: Arc<LocalFsCheckpointStorage>,
+        storage: Arc<dyn CheckpointStorage>,
         interval_ms: u64,
         expected_task_count: usize,
     ) -> Self {
@@ -4566,8 +4566,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use krishiv_checkpoint::{
-        CheckpointMetadata, IntegrityManifest, LocalFsCheckpointStorage, list_valid_epochs,
-        write_epoch_metadata, write_manifest,
+        CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
+        list_valid_epochs, write_epoch_metadata, write_manifest,
     };
     use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
     use krishiv_proto::{
@@ -6705,7 +6705,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_initiates_and_collects_acks() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-1").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 5000, 2);
 
@@ -6777,7 +6778,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_rejects_stale_epoch_ack() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-stale").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 1);
         let _ = coord.initiate().unwrap(); // epoch = 1
@@ -6790,7 +6792,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_abort_resets_state() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-abort").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 2);
         let _ = coord.initiate().unwrap();
@@ -6810,7 +6813,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_recover_finds_latest_epoch() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-recover").unwrap();
 
         // Write two complete epochs manually.
@@ -6841,7 +6845,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_savepoint_sets_flag() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-ck-sp").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 5000, 1);
 
@@ -7071,7 +7076,8 @@ mod tests {
 
     #[test]
     fn chaos_1a_coordinator_restart_recovers_from_durable_metadata() {
-        let storage = std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: std::sync::Arc<dyn CheckpointStorage> =
+            std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-chaos1a").unwrap();
 
         // Coordinator A: commit epoch 1.
@@ -7097,7 +7103,8 @@ mod tests {
 
     #[test]
     fn chaos_2_executor_kill_mid_checkpoint_abort_is_clean() {
-        let storage = std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: std::sync::Arc<dyn CheckpointStorage> =
+            std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-chaos2").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id.clone(), storage, 5000, 2);
 
@@ -7227,7 +7234,8 @@ mod tests {
     fn chaos_e6_rolling_upgrade_savepoint_restore_preserves_epoch_sequence() {
         use krishiv_checkpoint::read_epoch_metadata;
 
-        let storage = std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: std::sync::Arc<dyn CheckpointStorage> =
+            std::sync::Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-chaos-e6").unwrap();
 
         // Coordinator A: normal epoch 1, then savepoint epoch 2.
@@ -7290,7 +7298,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_try_tick_fires_after_interval() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-tick").unwrap();
         let mut coord = CheckpointCoordinator::new(job_id, storage, 5_000, 0);
 
@@ -7306,7 +7315,8 @@ mod tests {
 
     #[test]
     fn checkpoint_coordinator_try_tick_skips_while_awaiting_acks() {
-        let storage = Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-tick-busy").unwrap();
         // expected_task_count = 1 so the coordinator will wait for an ack.
         let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 1);

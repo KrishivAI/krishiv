@@ -75,6 +75,8 @@ pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Op
         .to_string();
 
     // Build one column per key in the JSON object for before/after payloads.
+    // Keys are sorted alphabetically to guarantee a deterministic schema across
+    // events from the same table (P1.19).
     let make_payload_batch = |payload: &serde_json::Value| -> Option<RecordBatch> {
         if payload.is_null() || !payload.is_object() {
             return None;
@@ -83,16 +85,21 @@ pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Op
         if obj.is_empty() {
             return None;
         }
+        // Sort keys for deterministic column ordering.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
         let mut fields: Vec<Field> = Vec::new();
         let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
-        for (key, val) in obj {
-            fields.push(Field::new(key.as_str(), DataType::Utf8, true));
+        for key in &keys {
+            let val = &obj[*key];
+            fields.push(Field::new(*key, DataType::Utf8, true));
             let str_val: Option<String> = match val {
                 serde_json::Value::Null => None,
                 serde_json::Value::String(s) => Some(s.clone()),
                 other => Some(other.to_string()),
             };
-            let arr: arrow::array::StringArray = std::iter::once(str_val.as_deref()).collect();
+            let arr: StringArray = std::iter::once(str_val.as_deref()).collect();
             columns.push(Arc::new(arr));
         }
         let schema = Arc::new(Schema::new(fields));
@@ -129,6 +136,11 @@ pub struct CdcToLakehousePipeline {
     pub primary_key_columns: Vec<String>,
     /// Optional Confluent Schema Registry URL.
     pub schema_registry_url: Option<String>,
+    /// Number of CDC events to accumulate before writing a single Arrow batch.
+    ///
+    /// Defaults to 1000. Higher values reduce write amplification; lower values
+    /// reduce end-to-end latency.
+    pub batch_size: usize,
 }
 
 impl CdcToLakehousePipeline {
@@ -147,12 +159,20 @@ impl CdcToLakehousePipeline {
             iceberg_table: iceberg_table.into(),
             primary_key_columns,
             schema_registry_url: None,
+            batch_size: 1000,
         }
     }
 
     /// Attach a schema registry URL.
     pub fn with_schema_registry(mut self, url: impl Into<String>) -> Self {
         self.schema_registry_url = Some(url.into());
+        self
+    }
+
+    /// Set the number of CDC events to accumulate before writing a single Arrow batch.
+    #[must_use]
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
         self
     }
 
@@ -172,6 +192,129 @@ impl CdcToLakehousePipeline {
         }
         Ok(())
     }
+
+    /// Run the pipeline.
+    ///
+    /// 1. Validates the configuration.
+    /// 2. Sets up the event processing loop structure.
+    /// 3. TODO: wire Kafka consumer here — currently returns `Ok(())` after setup.
+    pub async fn run(&self) -> Result<(), String> {
+        self.validate()?;
+        // TODO: wire Kafka consumer here.
+        // When a live Kafka client is available:
+        //   - Create a consumer subscribed to `self.source_topic`.
+        //   - Loop: poll for up to `self.batch_size` messages, parse each with
+        //     `parse_debezium_envelope`, call `build_batch_from_events`, and write
+        //     to the target table sink.
+        //   - On shutdown signal, flush and commit the sink.
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Columnar batch builder for multiple CDC events  (P1.18 / P1.19)
+// ---------------------------------------------------------------------------
+
+/// An error type for CDC batch building.
+#[derive(Debug)]
+pub struct CdcBatchError(pub String);
+
+impl std::fmt::Display for CdcBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CDC batch error: {}", self.0)
+    }
+}
+
+impl std::error::Error for CdcBatchError {}
+
+/// Build a single columnar Arrow `RecordBatch` from a slice of `CdcEvent`s.
+///
+/// All events must share the same column names in their `after` payload (or
+/// `before` payload for deletes). Column names are derived from the union of
+/// keys across all events, sorted alphabetically (P1.19), with missing values
+/// represented as `null`.
+///
+/// Returns an error if `events` is empty or if batch construction fails.
+pub fn build_batch_from_events(events: &[CdcEvent]) -> Result<RecordBatch, CdcBatchError> {
+    if events.is_empty() {
+        return Err(CdcBatchError("events slice is empty".into()));
+    }
+
+    // Collect the union of all column names from after/before payloads, sorted.
+    let mut col_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for event in events {
+        let payload = event.after.as_ref().or(event.before.as_ref());
+        if let Some(batch) = payload {
+            for field in batch.schema().fields() {
+                col_names.insert(field.name().clone());
+            }
+        }
+    }
+
+    // Add metadata columns present on every row.
+    let meta_cols = ["_op", "_table", "_lsn", "_ts_ms", "_partition", "_offset"];
+    for mc in &meta_cols {
+        col_names.insert(mc.to_string());
+    }
+
+    let col_names: Vec<String> = col_names.into_iter().collect(); // already sorted via BTreeSet
+
+    // Build one string column per name.
+    let mut column_data: Vec<Vec<Option<String>>> = vec![Vec::new(); col_names.len()];
+
+    for event in events {
+        let payload = event.after.as_ref().or(event.before.as_ref());
+
+        for (col_idx, col_name) in col_names.iter().enumerate() {
+            let value: Option<String> = match col_name.as_str() {
+                "_op" => Some(format!("{:?}", event.op)),
+                "_table" => Some(event.table.clone()),
+                "_lsn" => event.source_lsn.map(|v| v.to_string()),
+                "_ts_ms" => event.source_ts_ms.map(|v| v.to_string()),
+                "_partition" => Some(event.partition_id.to_string()),
+                "_offset" => Some(event.offset.to_string()),
+                user_col => {
+                    // Look up the column in the payload batch.
+                    payload.and_then(|batch| {
+                        let schema = batch.schema();
+                        schema.index_of(user_col).ok().and_then(|idx| {
+                            use arrow::array::{Array, StringArray};
+                            let col = batch.column(idx);
+                            if col.is_null(0) {
+                                None
+                            } else {
+                                col.as_any().downcast_ref::<StringArray>().and_then(|s| {
+                                    if s.is_null(0) {
+                                        None
+                                    } else {
+                                        Some(s.value(0).to_string())
+                                    }
+                                })
+                            }
+                        })
+                    })
+                }
+            };
+            column_data[col_idx].push(value);
+        }
+    }
+
+    // Build Arrow arrays and schema.
+    let fields: Vec<Field> = col_names
+        .iter()
+        .map(|name| Field::new(name.as_str(), DataType::Utf8, true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+
+    let columns: Vec<Arc<dyn arrow::array::Array>> = column_data
+        .into_iter()
+        .map(|vals| {
+            let arr: StringArray = vals.iter().map(|v| v.as_deref()).collect();
+            Arc::new(arr) as Arc<dyn arrow::array::Array>
+        })
+        .collect();
+
+    RecordBatch::try_new(schema, columns).map_err(|e| CdcBatchError(e.to_string()))
 }
 
 /// Metadata column names injected by `build_batch_from_events`.

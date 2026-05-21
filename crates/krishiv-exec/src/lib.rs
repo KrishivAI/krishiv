@@ -110,12 +110,7 @@ pub type ExecResult<T> = Result<T, ExecError>;
 
 // ── JoinType ──────────────────────────────────────────────────────────────────
 
-/// Join algorithm variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JoinType {
-    /// Inner equi-join: only rows with matching keys on both sides.
-    Inner,
-}
+pub use krishiv_plan::JoinType;
 
 // ── Shared helper ─────────────────────────────────────────────────────────────
 
@@ -202,10 +197,14 @@ impl HashJoin {
             .map_err(|_| ExecError::ColumnNotFound(self.right_key.clone()))?;
 
         // Build phase: hash map from serialized key → list of right row indices.
-        let mut build_map: HashMap<String, Vec<u32>> = HashMap::new();
+        // Using Arc<str> avoids per-row String allocation for probe lookups.
+        let mut build_map: HashMap<Arc<str>, Vec<u32>> = HashMap::with_capacity(right.num_rows());
         for row in 0..right.num_rows() {
             let key = format_key_value(right, right_key_idx, row)?;
-            build_map.entry(key).or_default().push(row as u32);
+            build_map
+                .entry(Arc::<str>::from(key.as_str()))
+                .or_default()
+                .push(row as u32);
         }
 
         // Probe phase: collect (left_row, right_row) pairs.
@@ -214,7 +213,8 @@ impl HashJoin {
 
         for row in 0..left.num_rows() {
             let key = format_key_value(left, left_key_idx, row)?;
-            if let Some(right_rows) = build_map.get(&key) {
+            let probe_key: Arc<str> = Arc::<str>::from(key.as_str());
+            if let Some(right_rows) = build_map.get(&probe_key) {
                 for &r in right_rows {
                     left_indices.push(row as u32);
                     right_indices.push(r);
@@ -373,6 +373,27 @@ fn build_join_batch(
     Ok(RecordBatch::try_new(out_schema, columns)?)
 }
 
+// ── Group-key sort helper ──────────────────────────────────────────────────────
+
+/// Compare two serialized group keys part-by-part.
+///
+/// Each part is compared numerically (as `i64`) when both sides parse as an
+/// integer, and falls back to lexicographic comparison when they do not.
+/// This prevents `["1", "10", "2"]` from being sorted lexicographically
+/// (which would be wrong) rather than numerically (`[1, 2, 10]`).
+fn compare_key_parts(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    for (ai, bi) in a.iter().zip(b.iter()) {
+        let ord = match (ai.parse::<i64>(), bi.parse::<i64>()) {
+            (Ok(an), Ok(bn)) => an.cmp(&bn),
+            _ => ai.cmp(bi),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 // ── LocalAggregator ───────────────────────────────────────────────────────────
 
 /// Supported aggregate functions.
@@ -404,6 +425,8 @@ pub struct AggExpr {
 struct AggState {
     /// One running value per `AggExpr`: count, sum, min, or max.
     values: Vec<i64>,
+    /// Tracks whether Min/Max has received at least one value.
+    has_value: Vec<bool>,
 }
 
 impl AggState {
@@ -417,7 +440,8 @@ impl AggState {
                 AggFunction::Max => i64::MIN,
             })
             .collect();
-        Self { values }
+        let has_value = agg_exprs.iter().map(|_| false).collect();
+        Self { values, has_value }
     }
 
     fn update(&mut self, agg_exprs: &[AggExpr], batch: &RecordBatch, row: usize) -> ExecResult<()> {
@@ -425,6 +449,7 @@ impl AggState {
             match expr.function {
                 AggFunction::Count => {
                     self.values[i] += 1;
+                    self.has_value[i] = true;
                 }
                 AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
                     let col_idx = batch
@@ -448,16 +473,21 @@ impl AggState {
                         }
                     };
                     match expr.function {
-                        AggFunction::Sum => self.values[i] += v,
+                        AggFunction::Sum => {
+                            self.values[i] += v;
+                            self.has_value[i] = true;
+                        }
                         AggFunction::Min => {
-                            if v < self.values[i] {
+                            if !self.has_value[i] || v < self.values[i] {
                                 self.values[i] = v;
                             }
+                            self.has_value[i] = true;
                         }
                         AggFunction::Max => {
-                            if v > self.values[i] {
+                            if !self.has_value[i] || v > self.values[i] {
                                 self.values[i] = v;
                             }
+                            self.has_value[i] = true;
                         }
                         AggFunction::Count => unreachable!(),
                     }
@@ -465,6 +495,21 @@ impl AggState {
             }
         }
         Ok(())
+    }
+
+    /// Return the finalized value for position `i`. For Min/Max with no data,
+    /// returns 0 rather than the sentinel.
+    fn finalized_value(&self, i: usize, expr: &AggExpr) -> i64 {
+        match expr.function {
+            AggFunction::Min | AggFunction::Max => {
+                if self.has_value[i] {
+                    self.values[i]
+                } else {
+                    0
+                }
+            }
+            _ => self.values[i],
+        }
     }
 }
 
@@ -586,10 +631,10 @@ impl LocalAggregator {
         }
 
         // Aggregate output columns.
-        for (agg_pos, _agg) in self.agg_exprs.iter().enumerate() {
+        for (agg_pos, agg) in self.agg_exprs.iter().enumerate() {
             let arr: Int64Array = sorted_entries
                 .iter()
-                .map(|(_, state)| state.values[agg_pos])
+                .map(|(_, state)| state.finalized_value(agg_pos, agg))
                 .collect();
             columns.push(Arc::new(arr) as ArrayRef);
         }
@@ -841,8 +886,10 @@ fn build_window_record_batch(
         Arc::new(Int64Array::from(vec![window_start_ms])),
         Arc::new(Int64Array::from(vec![window_end_ms])),
     ];
-    for (i, _) in agg_exprs.iter().enumerate() {
-        columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
+    for (i, agg) in agg_exprs.iter().enumerate() {
+        columns.push(Arc::new(Int64Array::from(vec![
+            state.finalized_value(i, agg),
+        ])));
     }
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -1189,8 +1236,10 @@ impl SessionWindowOperator {
             Arc::new(Int64Array::from(vec![session_start_ms])),
             Arc::new(Int64Array::from(vec![session_end_ms])),
         ];
-        for (i, _) in self.spec.agg_exprs.iter().enumerate() {
-            columns.push(Arc::new(Int64Array::from(vec![state.values[i]])));
+        for (i, agg) in self.spec.agg_exprs.iter().enumerate() {
+            columns.push(Arc::new(Int64Array::from(vec![
+                state.finalized_value(i, agg),
+            ])));
         }
         Ok(RecordBatch::try_new(schema, columns)?)
     }
@@ -1235,43 +1284,20 @@ impl StreamTableJoin {
             .index_of(&self.join_key_column)
             .map_err(|_| ExecError::ColumnNotFound(self.join_key_column.clone()))?;
 
-        // Build key → row-index map for the table side.
-        let table_key_arr = self
-            .table
-            .column(table_key_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                ExecError::UnsupportedType(format!(
-                    "join key column '{}' must be Utf8",
-                    self.join_key_column
-                ))
-            })?;
+        // Build key → row-index map for the table side using format_key_value
+        // so that Int32, Int64, and Utf8 key columns are all supported.
         let mut table_index: HashMap<String, Vec<u32>> = HashMap::new();
         for row in 0..self.table.num_rows() {
-            table_index
-                .entry(table_key_arr.value(row).to_owned())
-                .or_default()
-                .push(row as u32);
+            let key = format_key_value(&self.table, table_key_idx, row)?;
+            table_index.entry(key).or_default().push(row as u32);
         }
-
-        let stream_key_arr = stream_batch
-            .column(stream_key_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                ExecError::UnsupportedType(format!(
-                    "join key column '{}' must be Utf8 in stream",
-                    self.join_key_column
-                ))
-            })?;
 
         // Collect matching (stream_row, table_row) index pairs.
         let mut stream_rows: Vec<u32> = Vec::new();
         let mut table_rows: Vec<u32> = Vec::new();
         for s_row in 0..stream_batch.num_rows() {
-            let key = stream_key_arr.value(s_row);
-            if let Some(t_rows) = table_index.get(key) {
+            let key = format_key_value(stream_batch, stream_key_idx, s_row)?;
+            if let Some(t_rows) = table_index.get(&key) {
                 for &t_row in t_rows {
                     stream_rows.push(s_row as u32);
                     table_rows.push(t_row);
@@ -1280,7 +1306,7 @@ impl StreamTableJoin {
         }
 
         if stream_rows.is_empty() {
-            return self.empty_output(stream_batch);
+            return self.empty_output(stream_batch, table_key_idx);
         }
 
         let stream_indices: ArrayRef = Arc::new(UInt32Array::from(stream_rows));
@@ -1313,18 +1339,17 @@ impl StreamTableJoin {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    fn empty_output(&self, stream_batch: &RecordBatch) -> ExecResult<RecordBatch> {
+    fn empty_output(
+        &self,
+        stream_batch: &RecordBatch,
+        table_key_idx: usize,
+    ) -> ExecResult<RecordBatch> {
         let mut fields: Vec<Field> = stream_batch
             .schema()
             .fields()
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        let table_key_idx = self
-            .table
-            .schema()
-            .index_of(&self.join_key_column)
-            .unwrap_or(usize::MAX);
         for (i, f) in self.table.schema().fields().iter().enumerate() {
             if i != table_key_idx {
                 fields.push(f.as_ref().clone());
@@ -1523,6 +1548,8 @@ pub struct HeavyHittersTracker {
     capacity: usize,
     /// (key, estimated_count, max_error).
     counters: Vec<(String, u64, u64)>,
+    /// O(1) index: key → position in `counters`.
+    index: HashMap<String, usize>,
     /// Total items processed.
     total: u64,
 }
@@ -1533,6 +1560,7 @@ impl HeavyHittersTracker {
         Self {
             capacity: capacity.max(1),
             counters: Vec::with_capacity(capacity),
+            index: HashMap::new(),
             total: 0,
         }
     }
@@ -1542,13 +1570,16 @@ impl HeavyHittersTracker {
         let key = key.into();
         self.total += 1;
 
-        if let Some(pos) = self.counters.iter().position(|(k, _, _)| k == &key) {
+        // O(1) lookup via index map.
+        if let Some(&pos) = self.index.get(&key) {
             self.counters[pos].1 += 1;
             return;
         }
 
         if self.counters.len() < self.capacity {
-            self.counters.push((key, 1, 0));
+            let pos = self.counters.len();
+            self.counters.push((key.clone(), 1, 0));
+            self.index.insert(key, pos);
             return;
         }
 
@@ -1562,7 +1593,11 @@ impl HeavyHittersTracker {
             .unwrap_or(0);
 
         let min_count = self.counters[min_pos].1;
-        self.counters[min_pos] = (key, min_count + 1, min_count);
+        // Remove old key from index before overwriting.
+        let old_key = self.counters[min_pos].0.clone();
+        self.index.remove(&old_key);
+        self.counters[min_pos] = (key.clone(), min_count + 1, min_count);
+        self.index.insert(key, min_pos);
     }
 
     /// Return the top-K entries by estimated count, highest first.
@@ -1605,6 +1640,7 @@ impl HeavyHittersTracker {
     /// Reset all counters (e.g., at checkpoint epoch boundary).
     pub fn reset(&mut self) {
         self.counters.clear();
+        self.index.clear();
         self.total = 0;
     }
 }
@@ -1628,7 +1664,7 @@ pub struct ThrottleCommand {
 pub struct RateLimiter {
     rows_per_second: u64,
     tokens: f64,
-    last_refill_ms: u64,
+    last_refill_ms: Option<u64>,
 }
 
 impl RateLimiter {
@@ -1637,7 +1673,7 @@ impl RateLimiter {
         Self {
             rows_per_second,
             tokens: rows_per_second as f64,
-            last_refill_ms: 0,
+            last_refill_ms: None,
         }
     }
 
@@ -1647,11 +1683,14 @@ impl RateLimiter {
     /// retrying if the bucket doesn't have enough tokens, or `None` if the
     /// consumption was satisfied immediately.
     pub fn try_consume(&mut self, n: u64, now_ms: u64) -> Option<u64> {
-        // Refill based on elapsed time.
-        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
-        let new_tokens = (elapsed_ms as f64 / 1000.0) * self.rows_per_second as f64;
-        self.tokens = (self.tokens + new_tokens).min(self.rows_per_second as f64);
-        self.last_refill_ms = now_ms;
+        // On the first call, set the refill timestamp without adding tokens.
+        // This prevents the huge epoch-ms elapsed time from over-filling the bucket.
+        if let Some(last) = self.last_refill_ms {
+            let elapsed_ms = now_ms.saturating_sub(last);
+            let new_tokens = (elapsed_ms as f64 / 1000.0) * self.rows_per_second as f64;
+            self.tokens = (self.tokens + new_tokens).min(self.rows_per_second as f64);
+        }
+        self.last_refill_ms = Some(now_ms);
 
         if self.tokens >= n as f64 {
             self.tokens -= n as f64;

@@ -21,6 +21,7 @@ use arrow::array::{
 use arrow::compute::take;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use futures::StreamExt as _;
 
 // ── ShufflePath ───────────────────────────────────────────────────────────────
 
@@ -142,6 +143,21 @@ pub enum ShuffleError {
         /// String representation of the path.
         path: String,
     },
+    /// A stale lease token was used; the write was rejected.
+    StaleLeaseToken {
+        /// The expected (current) lease token.
+        expected: u64,
+        /// The token actually presented by the caller.
+        actual: u64,
+    },
+    /// An object-store or generic path was not found.
+    ///
+    /// Used as the `StoreError::PartitionNotFound` alias when the partition key
+    /// has already been formatted into a path string.
+    NotFound {
+        /// String representation of the missing path.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for ShuffleError {
@@ -154,6 +170,11 @@ impl std::fmt::Display for ShuffleError {
             Self::PartitionNotAvailable { path } => {
                 write!(f, "shuffle partition not available: {path}")
             }
+            Self::StaleLeaseToken { expected, actual } => write!(
+                f,
+                "stale shuffle lease token: expected {expected}, actual {actual}"
+            ),
+            Self::NotFound { path } => write!(f, "shuffle path not found: {path}"),
         }
     }
 }
@@ -282,10 +303,11 @@ pub fn scan_orphans(
 
     for entry in std::fs::read_dir(base_dir)? {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
+        // P2.16: use DirEntry::file_type() to avoid an extra stat syscall per entry.
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
             continue;
         }
+        let path = entry.path();
         let job_id = match path.file_name().and_then(|n| n.to_str()) {
             Some(name) => name.to_string(),
             None => continue,
@@ -307,8 +329,10 @@ fn collect_ipc_files(
 ) -> ShuffleResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        // P2.16: use DirEntry::file_type() to avoid an extra stat syscall per entry.
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         let path = entry.path();
-        if path.is_dir() {
+        if is_dir {
             collect_ipc_files(&path, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("ipc") {
             out.push(path);
@@ -368,6 +392,7 @@ impl HashPartitioner {
         let num_rows = batch.num_rows();
 
         // Collect row indices per bucket.
+        // P3.8: use a generic helper closure to avoid five near-identical loop bodies.
         let mut bucket_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
 
         match key_col.data_type() {
@@ -376,50 +401,45 @@ impl HashPartitioner {
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .expect("data type is Int32");
-                for row in 0..num_rows {
-                    let bucket = hash_i64(arr.value(row) as i64, self.buckets);
-                    bucket_indices[bucket as usize].push(row as u32);
-                }
+                fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
+                    hash_i64(arr.value(row) as i64, self.buckets)
+                });
             }
             DataType::Int64 => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .expect("data type is Int64");
-                for row in 0..num_rows {
-                    let bucket = hash_i64(arr.value(row), self.buckets);
-                    bucket_indices[bucket as usize].push(row as u32);
-                }
+                fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
+                    hash_i64(arr.value(row), self.buckets)
+                });
             }
             DataType::Utf8 => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .expect("data type is Utf8");
-                for row in 0..num_rows {
-                    let bucket = hash_str(arr.value(row), self.buckets);
-                    bucket_indices[bucket as usize].push(row as u32);
-                }
+                fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
+                    hash_str(arr.value(row), self.buckets)
+                });
             }
             DataType::Utf8View => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<StringViewArray>()
                     .expect("data type is Utf8View");
-                for row in 0..num_rows {
-                    let bucket = hash_str(arr.value(row), self.buckets);
-                    bucket_indices[bucket as usize].push(row as u32);
-                }
+                fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
+                    hash_str(arr.value(row), self.buckets)
+                });
             }
             DataType::LargeUtf8 => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
                     .expect("data type is LargeUtf8");
-                for row in 0..num_rows {
-                    let bucket = hash_str(arr.value(row), self.buckets);
-                    bucket_indices[bucket as usize].push(row as u32);
-                }
+                fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
+                    hash_str(arr.value(row), self.buckets)
+                });
             }
             other => {
                 return Err(ShuffleError::Io(format!("unsupported key type: {other}")));
@@ -432,7 +452,7 @@ impl HashPartitioner {
             if indices.is_empty() {
                 result.push(RecordBatch::new_empty(schema.clone()));
             } else {
-                let index_arr = UInt32Array::from(indices.clone());
+                let index_arr = UInt32Array::from_iter_values(indices.iter().copied());
                 let columns: Vec<Arc<dyn arrow::array::Array>> = batch
                     .columns()
                     .iter()
@@ -465,6 +485,25 @@ fn hash_str(value: &str, buckets: u32) -> u32 {
     (hasher.finish() % buckets as u64) as u32
 }
 
+/// P3.8: Generic bucket-fill helper shared by all `HashPartitioner::partition` arms.
+///
+/// Iterates `num_rows` rows, calls `bucket_fn(row_index)` to determine the
+/// target bucket, and appends the row index to the corresponding bucket vec.
+/// Avoids code duplication across the five supported Arrow column types.
+fn fill_buckets<F>(
+    num_rows: usize,
+    _num_partitions: u32,
+    bucket_indices: &mut [Vec<u32>],
+    bucket_fn: F,
+) where
+    F: Fn(usize) -> u32,
+{
+    for row in 0..num_rows {
+        let bucket = bucket_fn(row) as usize;
+        bucket_indices[bucket].push(row as u32);
+    }
+}
+
 // ── ShuffleStore trait + implementations ──────────────────────────────────────
 
 /// Identifies a shuffle partition uniquely within a job.
@@ -483,48 +522,17 @@ pub struct ShufflePartition {
     pub batches: Vec<RecordBatch>,
 }
 
-/// Errors produced by shuffle store operations.
+/// Unified error type for [`ShuffleStore`] operations.
 ///
-/// Note: The existing [`ShuffleError`] type is retained for the local-disk
-/// byte-level store.  This error type is used by the [`ShuffleStore`] trait.
-#[derive(Debug)]
-pub enum StoreError {
-    /// Partition data not found (may have been GC'd or not yet written).
-    PartitionNotFound {
-        job_id: String,
-        stage_id: String,
-        partition: u32,
-    },
-    /// I/O error reading or writing partition data.
-    Io { message: String },
-    /// A stale lease token was used; the write was rejected.
-    StaleLeaseToken { expected: u64, actual: u64 },
-}
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PartitionNotFound {
-                job_id,
-                stage_id,
-                partition,
-            } => write!(
-                f,
-                "shuffle partition not found: {job_id}/{stage_id}/{partition}"
-            ),
-            Self::Io { message } => write!(f, "shuffle store I/O error: {message}"),
-            Self::StaleLeaseToken { expected, actual } => write!(
-                f,
-                "stale shuffle lease token: expected {expected}, actual {actual}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StoreError {}
+/// Previously a separate `StoreError` enum; now a type alias for [`ShuffleError`]
+/// so callers only need to handle one error type across all shuffle APIs.
+/// External code that imports `StoreError` continues to compile unchanged.
+pub type StoreError = ShuffleError;
 
 /// Convenience result alias for [`ShuffleStore`] operations.
-pub type StoreResult<T> = Result<T, StoreError>;
+///
+/// Equivalent to [`ShuffleResult`]; kept for backward compatibility.
+pub type StoreResult<T> = ShuffleResult<T>;
 
 /// An async shuffle store that persists inter-stage partition data.
 ///
@@ -597,7 +605,7 @@ impl ShuffleStore for InMemoryShuffleStore {
         if let Some(&expected) = leases.get(&key)
             && lease_token != expected
         {
-            return Err(StoreError::StaleLeaseToken {
+            return Err(ShuffleError::StaleLeaseToken {
                 expected,
                 actual: lease_token,
             });
@@ -619,8 +627,10 @@ impl ShuffleStore for InMemoryShuffleStore {
         {
             let mut leases = self.lease_tokens.write().unwrap();
             if let Some(&expected) = leases.get(&key) {
-                if lease_token != expected {
-                    return Err(StoreError::StaleLeaseToken {
+                // P1.25: use `<` (monotonic-token semantics) — reject stale writes,
+                // accept equal or newer tokens.
+                if lease_token < expected {
+                    return Err(ShuffleError::StaleLeaseToken {
                         expected,
                         actual: lease_token,
                     });
@@ -670,11 +680,11 @@ impl LocalDiskShuffleStore {
     /// Create a new store rooted at `base_dir`, creating the directory if needed.
     pub fn new(base_dir: impl AsRef<Path>) -> StoreResult<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&base_dir).map_err(|e| StoreError::Io {
-            message: format!(
+        std::fs::create_dir_all(&base_dir).map_err(|e| {
+            ShuffleError::Io(format!(
                 "failed to create shuffle base dir '{}': {e}",
                 base_dir.display()
-            ),
+            ))
         })?;
         Ok(Self {
             base_dir,
@@ -697,7 +707,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         if let Some(&expected) = leases.get(&key)
             && lease_token != expected
         {
-            return Err(StoreError::StaleLeaseToken {
+            return Err(ShuffleError::StaleLeaseToken {
                 expected,
                 actual: lease_token,
             });
@@ -723,8 +733,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
         {
             let mut tokens = self.lease_tokens.write().unwrap();
             if let Some(&expected) = tokens.get(&key) {
-                if lease_token != expected {
-                    return Err(StoreError::StaleLeaseToken {
+                // P1.25: use `<` (monotonic-token semantics) — reject stale writes,
+                // accept equal or newer tokens.
+                if lease_token < expected {
+                    return Err(ShuffleError::StaleLeaseToken {
                         expected,
                         actual: lease_token,
                     });
@@ -738,28 +750,29 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
         let path = self.partition_path(&partition.id);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| StoreError::Io {
-                message: format!("failed to create partition dir: {e}"),
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ShuffleError::Io(format!("failed to create partition dir: {e}")))?;
         }
 
-        let file = std::fs::File::create(&path).map_err(|e| StoreError::Io {
-            message: format!("failed to create partition file '{}': {e}", path.display()),
+        let file = std::fs::File::create(&path).map_err(|e| {
+            ShuffleError::Io(format!(
+                "failed to create partition file '{}': {e}",
+                path.display()
+            ))
         })?;
 
         let schema = partition.schema.clone();
-        let mut writer = ArrowWriter::try_new(file, schema, None).map_err(|e| StoreError::Io {
-            message: format!("failed to create Parquet writer: {e}"),
-        })?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
 
         for batch in &partition.batches {
-            writer.write(batch).map_err(|e| StoreError::Io {
-                message: format!("failed to write Parquet batch: {e}"),
-            })?;
+            writer
+                .write(batch)
+                .map_err(|e| ShuffleError::Io(format!("failed to write Parquet batch: {e}")))?;
         }
-        writer.close().map_err(|e| StoreError::Io {
-            message: format!("failed to close Parquet writer: {e}"),
-        })?;
+        writer
+            .close()
+            .map_err(|e| ShuffleError::Io(format!("failed to close Parquet writer: {e}")))?;
         Ok(())
     }
 
@@ -771,22 +784,22 @@ impl ShuffleStore for LocalDiskShuffleStore {
         if !path.exists() {
             return Ok(None);
         }
-        let file = File::open(&path).map_err(|e| StoreError::Io {
-            message: format!("failed to open partition file '{}': {e}", path.display()),
+        let file = File::open(&path).map_err(|e| {
+            ShuffleError::Io(format!(
+                "failed to open partition file '{}': {e}",
+                path.display()
+            ))
         })?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| StoreError::Io {
-                message: format!("failed to build Parquet reader: {e}"),
-            })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| ShuffleError::Io(format!("failed to build Parquet reader: {e}")))?;
         let schema = builder.schema().clone();
-        let reader = builder.build().map_err(|e| StoreError::Io {
-            message: format!("failed to build Parquet batch reader: {e}"),
-        })?;
+        let reader = builder
+            .build()
+            .map_err(|e| ShuffleError::Io(format!("failed to build Parquet batch reader: {e}")))?;
         let mut batches = Vec::new();
         for result in reader {
-            let batch = result.map_err(|e| StoreError::Io {
-                message: format!("error reading Parquet batch: {e}"),
-            })?;
+            let batch = result
+                .map_err(|e| ShuffleError::Io(format!("error reading Parquet batch: {e}")))?;
             batches.push(batch);
         }
         Ok(Some(ShufflePartition {
@@ -802,9 +815,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
             Ok(()) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(StoreError::Io {
-                    message: format!("failed to delete job partitions: {e}"),
-                });
+                return Err(ShuffleError::Io(format!(
+                    "failed to delete job partitions: {e}"
+                )));
             }
         }
         // Clean up in-memory lease tokens for this job.
@@ -875,18 +888,16 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         use arrow::ipc::writer::StreamWriter;
 
         let mut buf = Vec::new();
-        let mut writer =
-            StreamWriter::try_new(&mut buf, &partition.schema).map_err(|e| StoreError::Io {
-                message: e.to_string(),
-            })?;
+        let mut writer = StreamWriter::try_new(&mut buf, &partition.schema)
+            .map_err(|e| ShuffleError::Io(e.to_string()))?;
         for batch in &partition.batches {
-            writer.write(batch).map_err(|e| StoreError::Io {
-                message: e.to_string(),
-            })?;
+            writer
+                .write(batch)
+                .map_err(|e| ShuffleError::Io(e.to_string()))?;
         }
-        writer.finish().map_err(|e| StoreError::Io {
-            message: e.to_string(),
-        })?;
+        writer
+            .finish()
+            .map_err(|e| ShuffleError::Io(e.to_string()))?;
 
         self.store
             .put(
@@ -894,9 +905,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
                 bytes::Bytes::from(buf).into(),
             )
             .await
-            .map_err(|e| StoreError::Io {
-                message: e.to_string(),
-            })?;
+            .map_err(|e| ShuffleError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -907,24 +916,19 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         let result = self.store.get(&path).await;
         match result {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(StoreError::Io {
-                message: e.to_string(),
-            }),
+            Err(e) => Err(ShuffleError::Io(e.to_string())),
             Ok(obj) => {
-                let data = obj.bytes().await.map_err(|e| StoreError::Io {
-                    message: e.to_string(),
-                })?;
+                let data = obj
+                    .bytes()
+                    .await
+                    .map_err(|e| ShuffleError::Io(e.to_string()))?;
                 let cursor = std::io::Cursor::new(data.as_ref());
-                let mut reader =
-                    StreamReader::try_new(cursor, None).map_err(|e| StoreError::Io {
-                        message: e.to_string(),
-                    })?;
+                let mut reader = StreamReader::try_new(cursor, None)
+                    .map_err(|e| ShuffleError::Io(e.to_string()))?;
                 let schema = reader.schema();
                 let mut batches = Vec::new();
                 for batch_result in &mut reader {
-                    let batch = batch_result.map_err(|e| StoreError::Io {
-                        message: e.to_string(),
-                    })?;
+                    let batch = batch_result.map_err(|e| ShuffleError::Io(e.to_string()))?;
                     batches.push(batch);
                 }
                 Ok(Some(ShufflePartition {
@@ -939,19 +943,25 @@ impl ShuffleStore for ObjectStoreShuffleStore {
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
         use futures::TryStreamExt;
 
+        // P2.9: collect all object paths, then issue a single batch-delete stream
+        // rather than O(N) serial round-trips.
         let prefix = self.job_prefix(job_id);
-        let mut stream = self.store.list(Some(&prefix));
-        let mut keys = Vec::new();
-        while let Some(meta) = stream.try_next().await.map_err(|e| StoreError::Io {
-            message: e.to_string(),
-        })? {
-            keys.push(meta.location);
-        }
-        for key in keys {
-            self.store.delete(&key).await.map_err(|e| StoreError::Io {
-                message: e.to_string(),
-            })?;
-        }
+        let paths: Vec<object_store::path::Path> = self
+            .store
+            .list(Some(&prefix))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+
+        self.store
+            .delete_stream(
+                futures::stream::iter(paths.into_iter().map(Ok::<_, object_store::Error>)).boxed(),
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+
         Ok(())
     }
 }

@@ -291,105 +291,146 @@ impl PlanNode {
     }
 }
 
+/// Shared core fields for logical and physical plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanCore {
+    pub(crate) name: String,
+    pub(crate) kind: ExecutionKind,
+    pub(crate) nodes: Vec<PlanNode>,
+}
+
+impl PlanCore {
+    fn new(name: impl Into<String>, kind: ExecutionKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            nodes: Vec::new(),
+        }
+    }
+
+    fn add_node(&mut self, node: PlanNode) {
+        self.nodes.push(node);
+    }
+
+    fn with_node(mut self, node: PlanNode) -> Self {
+        self.add_node(node);
+        self
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> ExecutionKind {
+        self.kind
+    }
+
+    fn nodes(&self) -> &[PlanNode] {
+        &self.nodes
+    }
+}
+
 /// Krishiv logical plan wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalPlan {
-    name: String,
-    kind: ExecutionKind,
-    nodes: Vec<PlanNode>,
+    pub(crate) core: PlanCore,
 }
 
 impl LogicalPlan {
     /// Create an empty logical plan.
     pub fn new(name: impl Into<String>, kind: ExecutionKind) -> Self {
         Self {
-            name: name.into(),
-            kind,
-            nodes: Vec::new(),
+            core: PlanCore::new(name, kind),
         }
     }
 
     /// Add a node to the plan.
     pub fn add_node(&mut self, node: PlanNode) {
-        self.nodes.push(node);
+        self.core.add_node(node);
     }
 
     /// Add a node and return the updated plan.
     #[must_use]
     pub fn with_node(mut self, node: PlanNode) -> Self {
-        self.add_node(node);
+        self.core = self.core.with_node(node);
         self
     }
 
     /// Plan name.
     pub fn name(&self) -> &str {
-        &self.name
+        self.core.name()
     }
 
     /// Plan execution kind.
     pub fn kind(&self) -> ExecutionKind {
-        self.kind
+        self.core.kind()
     }
 
     /// Plan nodes.
     pub fn nodes(&self) -> &[PlanNode] {
-        &self.nodes
+        self.core.nodes()
     }
 
     /// Compact textual description for early `EXPLAIN` output.
     pub fn describe(&self) -> String {
-        describe_plan("logical", &self.name, self.kind, &self.nodes)
+        describe_plan(
+            "logical",
+            self.core.name(),
+            self.core.kind(),
+            self.core.nodes(),
+        )
     }
 }
 
 /// Krishiv physical plan wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalPlan {
-    name: String,
-    kind: ExecutionKind,
-    nodes: Vec<PlanNode>,
+    pub(crate) core: PlanCore,
 }
 
 impl PhysicalPlan {
     /// Create an empty physical plan.
     pub fn new(name: impl Into<String>, kind: ExecutionKind) -> Self {
         Self {
-            name: name.into(),
-            kind,
-            nodes: Vec::new(),
+            core: PlanCore::new(name, kind),
         }
     }
 
     /// Add a node to the plan.
     pub fn add_node(&mut self, node: PlanNode) {
-        self.nodes.push(node);
+        self.core.add_node(node);
     }
 
     /// Add a node and return the updated plan.
     #[must_use]
     pub fn with_node(mut self, node: PlanNode) -> Self {
-        self.add_node(node);
+        self.core = self.core.with_node(node);
         self
     }
 
     /// Plan name.
     pub fn name(&self) -> &str {
-        &self.name
+        self.core.name()
     }
 
     /// Plan execution kind.
     pub fn kind(&self) -> ExecutionKind {
-        self.kind
+        self.core.kind()
     }
 
     /// Plan nodes.
     pub fn nodes(&self) -> &[PlanNode] {
-        &self.nodes
+        self.core.nodes()
     }
 
     /// Compact textual description for early `EXPLAIN` output.
     pub fn describe(&self) -> String {
-        describe_plan("physical", &self.name, self.kind, &self.nodes)
+        describe_plan(
+            "physical",
+            self.core.name(),
+            self.core.kind(),
+            self.core.nodes(),
+        )
     }
 }
 

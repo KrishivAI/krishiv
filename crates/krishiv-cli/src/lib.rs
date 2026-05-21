@@ -327,14 +327,15 @@ fn run_state_inspect(args: &[&str]) -> CliResponse {
     // In R5.2 this is a skeleton: state lives on executor nodes and is not
     // accessible from the coordinator without an executor RPC.  The full
     // implementation arrives with the executor state-inspection RPC in R6.
-    CliResponse::ok(format!(
-        "State inspection (read-only)\n\
-         Job:      {job_id}\n\
-         Operator: {operator_id}\n\
-         Status:   executor-side state inspection RPC not yet wired (R6)\n\
-         Note:     State metadata (namespaces, key counts) will be reported here\n\
-                   once the executor exposes the state inspection endpoint.\n"
-    ))
+    CliResponse::err(
+        format!(
+            "krishiv state inspect: not yet implemented (planned for R6)\n\
+             Job:      {job_id}\n\
+             Operator: {operator_id}\n\
+             Executor-side state inspection RPC has not been wired."
+        ),
+        1,
+    )
 }
 
 fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> {
@@ -705,12 +706,14 @@ fn run_savepoint(args: &[&str]) -> CliResponse {
         return CliResponse::err(format!("--job is required\n\n{}", savepoint_help()), 2);
     };
     let label_display = label.unwrap_or("(none)");
-    CliResponse::ok(format!(
-        "Savepoint initiated for job {job_id} (epoch pending).\n\
-         Label:  {label_display}\n\
-         Source offsets and operator state will be written to the configured checkpoint storage path.\n\
-         Use `krishiv checkpoints list --job {job_id}` to verify completion.\n"
-    ))
+    CliResponse::err(
+        format!(
+            "krishiv savepoint: not yet implemented (planned for R6)\n\
+             Job:   {job_id}\n\
+             Label: {label_display}"
+        ),
+        1,
+    )
 }
 
 // ── R6: restore ───────────────────────────────────────────────────────────────
@@ -781,10 +784,8 @@ fn run_restore(args: &[&str]) -> CliResponse {
     };
     let path_display = storage_path.unwrap_or("(job default)");
     CliResponse::ok(format!(
-        "Restore initiated for job {job_id} from epoch {epoch_num}.\n\
-         Storage: {path_display}\n\
-         Source partitions will be restarted from their checkpointed offsets.\n\
-         Operator state will be loaded from checkpoint storage.\n"
+        "Restore initiated\nJob:     {job_id}\nEpoch:   {epoch_num}\nStorage: {path_display}\n\
+         Note: full restore not yet implemented (planned for R6)"
     ))
 }
 
@@ -838,8 +839,8 @@ fn run_checkpoints_list(args: &[&str]) -> CliResponse {
         return CliResponse::err(format!("--job is required\n\n{}", checkpoints_help()), 2);
     };
     CliResponse::ok(format!(
-        "No checkpoints found for job {job_id}. (Checkpoint coordinator not active in CLI mode.)\n\
-         Use the coordinator status API (/api/v1/jobs/{job_id}/checkpoints) for live epoch listing.\n"
+        "No checkpoints found for job {job_id}\n\
+         Note: full checkpoint listing not yet implemented (planned for R6)"
     ))
 }
 
@@ -977,10 +978,10 @@ mod tests {
             "--operator",
             "tumbling-1",
         ]);
-        assert_eq!(response.exit_code, 0, "{}", response.stderr);
-        assert!(response.stdout.contains("job-123"));
-        assert!(response.stdout.contains("tumbling-1"));
-        assert!(response.stdout.contains("read-only"));
+        assert_eq!(response.exit_code, 1, "{:?}", response);
+        assert!(response.stderr.contains("job-123"));
+        assert!(response.stderr.contains("tumbling-1"));
+        assert!(response.stderr.contains("not yet implemented"));
     }
 
     #[test]
@@ -1009,16 +1010,16 @@ mod tests {
     #[test]
     fn savepoint_returns_skeleton_output() {
         let response = dispatch(&["savepoint", "--job", "job-1"]);
-        assert_eq!(response.exit_code, 0, "{}", response.stderr);
-        assert!(response.stdout.contains("Savepoint initiated"));
-        assert!(response.stdout.contains("job-1"));
+        assert_eq!(response.exit_code, 1, "{:?}", response);
+        assert!(response.stderr.contains("not yet implemented"));
+        assert!(response.stderr.contains("job-1"));
     }
 
     #[test]
     fn savepoint_with_label_includes_label_in_output() {
         let response = dispatch(&["savepoint", "--job", "job-2", "--label", "pre-upgrade"]);
-        assert_eq!(response.exit_code, 0, "{}", response.stderr);
-        assert!(response.stdout.contains("pre-upgrade"));
+        assert_eq!(response.exit_code, 1, "{:?}", response);
+        assert!(response.stderr.contains("pre-upgrade"));
     }
 
     // ── R6: restore tests ─────────────────────────────────────────────────────
