@@ -18,8 +18,8 @@ fn local_parquet_sink_declares_capabilities() {
 }
 
 /// Dead-letter sink correctly splits a batch with null violations.
-#[test]
-fn dead_letter_sink_certification_notnull() {
+#[tokio::test]
+async fn dead_letter_sink_certification_notnull() {
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -31,13 +31,11 @@ fn dead_letter_sink_certification_notnull() {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
     let config = DataQualityConfig::new().with_rule(
-        DataQualityRule::NotNull {
-            column: "v".into(),
-        },
+        DataQualityRule::NotNull { column: "v".into() },
         QualityAction::Reject,
     );
-    let sink = DeadLetterSink::new("cert_test", config);
-    let (accepted, rejected) = sink.process_batch(&batch).unwrap();
+    let mut sink = DeadLetterSink::new("cert_test", config);
+    let (accepted, rejected) = sink.process_batch(&batch).await.unwrap();
     assert_eq!(accepted.num_rows(), 2);
     assert_eq!(rejected.len(), 1);
     assert_eq!(rejected[0].batch_row_index, 1);

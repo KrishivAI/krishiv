@@ -45,6 +45,8 @@ pub enum CheckpointError {
     ///
     /// A stale coordinator must not commit checkpoint epochs — reject the write.
     StaleFencingToken { stored: u64, current: u64 },
+    /// The resolved path escapes the storage base directory (path-traversal attempt).
+    InvalidPath { path: String },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -62,6 +64,9 @@ impl std::fmt::Display for CheckpointError {
                 f,
                 "stale fencing token: metadata token {stored} < current coordinator token {current}"
             ),
+            Self::InvalidPath { path } => {
+                write!(f, "path escapes storage base directory: {path}")
+            }
         }
     }
 }
@@ -392,10 +397,10 @@ pub fn list_valid_epochs(
     let epoch_dirs = storage.list_dir(&checkpoint_prefix)?;
     let mut valid = Vec::new();
     for name in epoch_dirs {
-        if let Ok(epoch) = name.parse::<u64>() {
-            if validate_epoch(storage, job_id, epoch).unwrap_or(false) {
-                valid.push(epoch);
-            }
+        if let Ok(epoch) = name.parse::<u64>()
+            && validate_epoch(storage, job_id, epoch).unwrap_or(false)
+        {
+            valid.push(epoch);
         }
     }
     valid.sort_unstable();
@@ -515,8 +520,11 @@ impl LocalFsCheckpointStorage {
         &self.base_dir
     }
 
-    /// Create storage in a uniquely-named temporary subdirectory under `std::env::temp_dir()`.
-    pub fn ephemeral() -> CheckpointResult<Self> {
+    /// Create storage in a uniquely-named temporary directory.
+    ///
+    /// Returns an [`EphemeralCheckpointStorage`] wrapper whose `Drop` impl
+    /// automatically removes the directory, preventing temp-dir leaks.
+    pub fn ephemeral() -> CheckpointResult<EphemeralCheckpointStorage> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(1);
         let name = format!(
@@ -524,22 +532,62 @@ impl LocalFsCheckpointStorage {
             std::process::id(),
             CTR.fetch_add(1, Ordering::Relaxed)
         );
-        Self::new(std::env::temp_dir().join(name))
+        let path = std::env::temp_dir().join(name);
+        let inner = Self::new(path.clone())?;
+        Ok(EphemeralCheckpointStorage { inner, path })
     }
 
-    fn full_path(&self, path: &str) -> PathBuf {
-        // Prevent path traversal: strip any leading '/' or '..' components.
+    fn full_path(&self, path: &str) -> CheckpointResult<PathBuf> {
+        // Prevent path traversal: strip any leading '/' or '..' components,
+        // then verify the resolved path stays within `self.base_dir`.
         let clean: PathBuf = path
             .split('/')
             .filter(|c| !c.is_empty() && *c != "..")
             .collect();
-        self.base_dir.join(clean)
+        let result = self.base_dir.join(clean);
+        if !result.starts_with(&self.base_dir) {
+            return Err(CheckpointError::InvalidPath {
+                path: result.display().to_string(),
+            });
+        }
+        Ok(result)
+    }
+}
+
+/// RAII wrapper returned by [`LocalFsCheckpointStorage::ephemeral`].
+///
+/// Holds the `LocalFsCheckpointStorage` and the directory path; removes the
+/// directory on drop to prevent temp-dir leaks.  Implements `Deref` so all
+/// [`CheckpointStorage`] methods are available transparently.
+pub struct EphemeralCheckpointStorage {
+    inner: LocalFsCheckpointStorage,
+    path: PathBuf,
+}
+
+impl std::ops::Deref for EphemeralCheckpointStorage {
+    type Target = LocalFsCheckpointStorage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for EphemeralCheckpointStorage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for EphemeralCheckpointStorage {
+    fn drop(&mut self) {
+        // Best-effort cleanup; ignore errors (e.g. already removed).
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
 impl CheckpointStorage for LocalFsCheckpointStorage {
     fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
-        let full = self.full_path(path);
+        let full = self.full_path(path)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CheckpointError::Storage {
                 message: format!("mkdir {}: {e}", parent.display()),
@@ -556,7 +604,7 @@ impl CheckpointStorage for LocalFsCheckpointStorage {
     }
 
     fn read_bytes(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>> {
-        let full = self.full_path(path);
+        let full = self.full_path(path)?;
         match std::fs::read(&full) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -567,7 +615,7 @@ impl CheckpointStorage for LocalFsCheckpointStorage {
     }
 
     fn list_dir(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
-        let full = self.full_path(prefix);
+        let full = self.full_path(prefix)?;
         match std::fs::read_dir(&full) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(e) => Err(CheckpointError::Storage {
@@ -587,7 +635,7 @@ impl CheckpointStorage for LocalFsCheckpointStorage {
     }
 
     fn delete_prefix(&self, prefix: &str) -> CheckpointResult<()> {
-        let full = self.full_path(prefix);
+        let full = self.full_path(prefix)?;
         match std::fs::remove_dir_all(&full) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -598,13 +646,31 @@ impl CheckpointStorage for LocalFsCheckpointStorage {
     }
 }
 
+impl CheckpointStorage for EphemeralCheckpointStorage {
+    fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
+        self.inner.write_bytes(path, data)
+    }
+
+    fn read_bytes(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        self.inner.read_bytes(path)
+    }
+
+    fn list_dir(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
+        self.inner.list_dir(prefix)
+    }
+
+    fn delete_prefix(&self, prefix: &str) -> CheckpointResult<()> {
+        self.inner.delete_prefix(prefix)
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_storage() -> LocalFsCheckpointStorage {
+    fn make_storage() -> EphemeralCheckpointStorage {
         LocalFsCheckpointStorage::ephemeral().unwrap()
     }
 
@@ -945,6 +1011,59 @@ mod tests {
         let err = validate_fencing_token(&meta, 5).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("stale"), "expected 'stale' in: {msg}");
+    }
+
+    // ── Path traversal protection (P3.21) ────────────────────────────────
+
+    #[test]
+    fn full_path_blocks_dot_dot_traversal() {
+        let s = make_storage();
+        // A path with '..' components must be rejected.
+        let result = s.read_bytes("../../etc/passwd");
+        // The cleaned path collapses to within base_dir (empty relative path),
+        // so the result should be Ok(None) rather than escaping the base.
+        // Either Ok or InvalidPath is acceptable; what is NOT acceptable is
+        // silently resolving to a path outside base_dir.
+        match result {
+            Ok(_) => {
+                // The '..' components were stripped; confirm result path is
+                // within the storage base.
+                // (No assertion needed — the file simply doesn't exist.)
+            }
+            Err(CheckpointError::InvalidPath { .. }) => {
+                // Expected if canonicalization detects escape.
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn full_path_allows_normal_paths() {
+        let s = make_storage();
+        // Normal nested paths should work without error.
+        s.write_bytes("job1/checkpoints/00000000000000000001/metadata.json", b"ok")
+            .unwrap();
+        let data = s
+            .read_bytes("job1/checkpoints/00000000000000000001/metadata.json")
+            .unwrap();
+        assert_eq!(data, Some(b"ok".to_vec()));
+    }
+
+    // ── Ephemeral cleanup (P3.20) ─────────────────────────────────────────
+
+    #[test]
+    fn ephemeral_storage_cleans_up_on_drop() {
+        let base_path;
+        {
+            let s = make_storage();
+            base_path = s.inner.base_dir().to_path_buf();
+            s.write_bytes("test/data.bin", b"hello").unwrap();
+            assert!(base_path.exists(), "dir must exist while storage is live");
+        } // s dropped here — directory should be removed
+        assert!(
+            !base_path.exists(),
+            "ephemeral dir must be removed after drop"
+        );
     }
 
     // ── Replay bundle ─────────────────────────────────────────────────────

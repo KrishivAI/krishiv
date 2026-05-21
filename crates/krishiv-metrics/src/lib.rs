@@ -4,7 +4,7 @@
 //! OpenTelemetry metrics, traces, and structured log initialization for all Krishiv processes.
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -111,7 +111,7 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, String> {
             .map_err(|e| format!("OTLP exporter build failed: {e}"))?;
 
         SdkTracerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_batch_exporter(exporter)
             .build()
     } else {
         match config.exporter {

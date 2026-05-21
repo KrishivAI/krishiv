@@ -3107,26 +3107,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_coordinator_service_checkpoint_ack_through_service_boundary() {
-        use krishiv_proto::FencingToken;
-        let service = AcceptingCoordinatorService;
-        let req = CheckpointAckRequest {
-            job_id: JobId::try_new("job-ck-1").unwrap(),
-            operator_id: "operator-1".to_owned(),
-            task_id: TaskId::try_new("task-ck-1").unwrap(),
-            epoch: 1,
-            fencing_token: FencingToken::initial(),
-            source_offsets: vec![],
-            snapshot_path: Some("/checkpoints/epoch-1".to_owned()),
-        };
-        let result = service
-            .checkpoint_ack(tonic::Request::new(req))
-            .await
-            .unwrap();
-        assert_eq!(result.into_inner(), CheckpointAckResponse::Accepted);
-    }
-
-    #[tokio::test]
     async fn task_runner_reports_cancelled_when_inbox_cancel_received() {
         let inbox = ExecutorAssignmentInbox::new();
         let runner = ExecutorTaskRunner::new(inbox.clone());

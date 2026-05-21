@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use object_store::{ObjectStore, PutPayload, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, path::Path};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -106,6 +106,11 @@ impl Source for S3Source {
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         Some(Box::new(self.cursor))
     }
+
+    /// Reset the cursor to the beginning so the source can be read again.
+    fn reset(&mut self) {
+        self.cursor = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,10 +167,9 @@ impl Sink for S3Sink {
             return Ok(());
         }
 
-        let schema = self
-            .schema
-            .clone()
-            .expect("schema is set when pending is non-empty");
+        let schema = self.schema.clone().ok_or_else(|| ConnectorError::Io {
+            message: "S3Sink::flush: schema not set (no batches written)".into(),
+        })?;
 
         // Serialise all pending batches to a Parquet byte buffer.
         let mut buf: Vec<u8> = Vec::new();

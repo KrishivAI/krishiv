@@ -8,7 +8,10 @@ fn connector_offset_v0_round_trip() {
     // The current reader should accept blobs with missing schema_version as v0.
     let v0_json = r#"{"partition": 0, "offset": 42}"#;
     let parsed: serde_json::Value = serde_json::from_str(v0_json).unwrap();
-    let schema_version = parsed.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0);
+    let schema_version = parsed
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     assert_eq!(schema_version, 0, "missing schema_version treated as v0");
     assert_eq!(parsed["partition"].as_u64().unwrap(), 0);
     assert_eq!(parsed["offset"].as_i64().unwrap(), 42);
@@ -22,7 +25,10 @@ fn job_metadata_schema_v1_round_trip() {
     assert_eq!(parsed["schema_version"].as_u64().unwrap(), 1);
     assert_eq!(parsed["job_id"].as_str().unwrap(), "job-abc");
     // New optional fields introduced in future versions default to null/missing
-    assert!(parsed.get("new_field_v2").is_none(), "new fields absent in v1 blob");
+    assert!(
+        parsed.get("new_field_v2").is_none(),
+        "new fields absent in v1 blob"
+    );
 }
 
 /// Savepoint: verify that a missing schema_version field is treated as v0.
@@ -30,7 +36,10 @@ fn job_metadata_schema_v1_round_trip() {
 fn savepoint_missing_schema_version_treated_as_v0() {
     let legacy_json = r#"{"checkpoint_epoch": 7, "operator_state": {}}"#;
     let parsed: serde_json::Value = serde_json::from_str(legacy_json).unwrap();
-    let schema_version = parsed.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(0);
+    let schema_version = parsed
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     assert_eq!(schema_version, 0);
 }
 

@@ -27,8 +27,8 @@ fn checkpoint_prepare_failure_leaves_no_committed_state() {
 }
 
 /// A Fail-action data quality violation returns an error with no partial write.
-#[test]
-fn dead_letter_sink_fail_action_returns_error() {
+#[tokio::test]
+async fn dead_letter_sink_fail_action_returns_error() {
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -39,10 +39,15 @@ fn dead_letter_sink_fail_action_returns_error() {
     let col = Float64Array::from(vec![None::<f64>]);
     let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
 
-    let config = DataQualityConfig::new()
-        .with_rule(DataQualityRule::NotNull { column: "v".into() }, QualityAction::Fail);
-    let sink = DeadLetterSink::new("chaos_test", config);
-    assert!(sink.process_batch(&batch).is_err(), "Fail action must return Err");
+    let config = DataQualityConfig::new().with_rule(
+        DataQualityRule::NotNull { column: "v".into() },
+        QualityAction::Fail,
+    );
+    let mut sink = DeadLetterSink::new("chaos_test", config);
+    assert!(
+        sink.process_batch(&batch).await.is_err(),
+        "Fail action must return Err"
+    );
 }
 
 /// Policy hook denies table access for a principal without permission.
@@ -66,7 +71,10 @@ fn policy_hook_denies_table_access() {
     }
 
     let policy = DenyAllPolicy;
-    let principal = Principal { subject: "attacker".into(), role: Role::Reader };
+    let principal = Principal {
+        subject: "attacker".into(),
+        role: Role::Reader,
+    };
     assert!(!policy.check_table_access(&principal, "secret_table"));
 }
 
@@ -75,13 +83,17 @@ fn policy_hook_denies_table_access() {
 fn fault_injector_rotates_through_faults() {
     let injector = FaultInjector::new(vec![
         FaultMode::None,
-        FaultMode::Error { message: "network timeout".into() },
+        FaultMode::Error {
+            message: "network timeout".into(),
+        },
         FaultMode::Drop,
     ]);
     assert_eq!(injector.next_fault(), &FaultMode::None);
     assert_eq!(
         injector.next_fault(),
-        &FaultMode::Error { message: "network timeout".into() }
+        &FaultMode::Error {
+            message: "network timeout".into()
+        }
     );
     assert_eq!(injector.next_fault(), &FaultMode::Drop);
     // Wraps around

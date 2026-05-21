@@ -188,11 +188,38 @@ impl AuditSink for TracingAuditSink {
     }
 }
 
+// P1.15 — Global pluggable AuditSink so callers don't need to pass a sink reference.
+//
+// Defaults to `TracingAuditSink` when no custom sink has been installed.
+// Call `set_audit_sink` once at process startup (e.g. in `krishiv-metrics::init`)
+// to route audit events to a production SIEM or log aggregator.
+static GLOBAL_AUDIT_SINK: std::sync::OnceLock<Box<dyn AuditSink + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Install a custom [`AuditSink`] for the lifetime of the process.
+///
+/// Must be called before the first `audit_log` invocation.  Subsequent calls are
+/// silently ignored (the first installation wins).
+pub fn set_audit_sink(sink: Box<dyn AuditSink + Send + Sync>) {
+    GLOBAL_AUDIT_SINK.set(sink).ok();
+}
+
+fn get_audit_sink() -> &'static dyn AuditSink {
+    GLOBAL_AUDIT_SINK
+        .get_or_init(|| Box::new(TracingAuditSink))
+        .as_ref()
+}
+
 /// **Beta API**: Emit a structured audit log event via `tracing` (target `"krishiv::audit"`).
 ///
 /// In production, the `tracing` subscriber routes these to the audit log
 /// destination configured by `krishiv-metrics::init()`.
-pub fn audit_log(principal: &str, action: &AuditAction<'_>) {
+///
+/// # Parameters
+/// - `principal`: identity of the actor performing the action.
+/// - `action`: the audited action.
+/// - `outcome`: whether the action was permitted or denied.
+pub fn audit_log(principal: &str, action: &AuditAction<'_>, outcome: AuditOutcome) {
     let (action_name, detail): (&str, String) = match action {
         AuditAction::QueryExecuted { query_hash } => {
             ("query_executed", format!("hash={query_hash}"))
@@ -216,9 +243,9 @@ pub fn audit_log(principal: &str, action: &AuditAction<'_>) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64,
-        outcome: AuditOutcome::Allowed,
+        outcome,
     };
-    TracingAuditSink.record(&event);
+    get_audit_sink().record(&event);
     tracing::info!(
         target: "krishiv::audit",
         principal = principal,
@@ -357,16 +384,43 @@ impl OpenLineageEmitter for HttpEmitter {
     }
 }
 
-/// Return the current time as a Unix epoch seconds string.
+/// Return the current UTC time as an RFC 3339 / ISO 8601 string.
 ///
-/// Full ISO 8601 formatting is deferred to R10; this is sufficient for the R9 beta.
+/// Example output: `"2024-05-21T12:34:56.789000000Z"`
 fn event_time_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{secs}")
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let nanos = dur.subsec_nanos();
+    // Manual RFC 3339 formatting without external deps.
+    // secs since epoch → broken-down UTC date/time.
+    let (year, month, day, hour, min, sec) = epoch_secs_to_datetime(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{nanos:09}Z")
+}
+
+/// Decompose Unix epoch seconds into (year, month, day, hour, min, sec) in UTC.
+fn epoch_secs_to_datetime(secs: u64) -> (u64, u8, u8, u8, u8, u8) {
+    let time_of_day = secs % 86_400;
+    let days_since_epoch = secs / 86_400;
+    let hour = (time_of_day / 3_600) as u8;
+    let min = ((time_of_day % 3_600) / 60) as u8;
+    let sec = (time_of_day % 60) as u8;
+
+    // Gregorian calendar computation from days since 1970-01-01.
+    // Algorithm: http://howardhinnant.github.io/date_algorithms.html#civil_from_days
+    let z = days_since_epoch as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let year = if month <= 2 { y + 1 } else { y } as u64;
+    (year, month, day, hour, min, sec)
 }
 
 /// **Beta API**: Build a new [`RunEvent`] with the current UTC timestamp and a fresh UUID run_id.
@@ -469,7 +523,31 @@ mod tests {
 
     #[test]
     fn audit_log_does_not_panic() {
-        audit_log("alice", &AuditAction::JobSubmitted { job_id: "j1" });
+        audit_log(
+            "alice",
+            &AuditAction::JobSubmitted { job_id: "j1" },
+            AuditOutcome::Allowed,
+        );
+    }
+
+    #[test]
+    fn audit_log_denied_does_not_panic() {
+        audit_log(
+            "eve",
+            &AuditAction::AdminAction {
+                description: "unauthorized escalation",
+            },
+            AuditOutcome::Denied,
+        );
+    }
+
+    #[test]
+    fn event_time_now_is_iso8601() {
+        let ts = super::event_time_now();
+        // Must match YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ
+        assert!(ts.ends_with('Z'), "timestamp must end with Z: {ts}");
+        assert!(ts.contains('T'), "timestamp must contain T separator: {ts}");
+        assert_eq!(ts.len(), 30, "ISO 8601 with 9 nanos: {ts}");
     }
 
     #[test]
