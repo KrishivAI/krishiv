@@ -375,25 +375,6 @@ fn build_join_batch(
 
 // ── Group-key sort helper ──────────────────────────────────────────────────────
 
-/// Compare two serialized group keys part-by-part.
-///
-/// Each part is compared numerically (as `i64`) when both sides parse as an
-/// integer, and falls back to lexicographic comparison when they do not.
-/// This prevents `["1", "10", "2"]` from being sorted lexicographically
-/// (which would be wrong) rather than numerically (`[1, 2, 10]`).
-fn compare_key_parts(a: &[String], b: &[String]) -> std::cmp::Ordering {
-    for (ai, bi) in a.iter().zip(b.iter()) {
-        let ord = match (ai.parse::<i64>(), bi.parse::<i64>()) {
-            (Ok(an), Ok(bn)) => an.cmp(&bn),
-            _ => ai.cmp(bi),
-        };
-        if ord != std::cmp::Ordering::Equal {
-            return ord;
-        }
-    }
-    a.len().cmp(&b.len())
-}
-
 // ── LocalAggregator ───────────────────────────────────────────────────────────
 
 /// Supported aggregate functions.
