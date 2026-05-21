@@ -752,8 +752,6 @@ impl ShuffleStore for LocalDiskShuffleStore {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> StoreResult<()> {
-        use parquet::arrow::ArrowWriter;
-
         let key = (
             partition.id.job_id.clone(),
             partition.id.stage_id.clone(),
@@ -780,80 +778,104 @@ impl ShuffleStore for LocalDiskShuffleStore {
         }
 
         let path = self.partition_path(&partition.id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ShuffleError::Io(format!("failed to create partition dir: {e}")))?;
-        }
 
-        let file = std::fs::File::create(&path).map_err(|e| {
-            ShuffleError::Io(format!(
-                "failed to create partition file '{}': {e}",
-                path.display()
-            ))
-        })?;
+        // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
+        // async executor thread is never stalled by synchronous disk calls.
+        tokio::task::spawn_blocking(move || {
+            use parquet::arrow::ArrowWriter;
 
-        let schema = partition.schema.clone();
-        let mut writer = ArrowWriter::try_new(file, schema, None)
-            .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ShuffleError::Io(format!("failed to create partition dir: {e}"))
+                })?;
+            }
 
-        for batch in &partition.batches {
+            let file = std::fs::File::create(&path).map_err(|e| {
+                ShuffleError::Io(format!(
+                    "failed to create partition file '{}': {e}",
+                    path.display()
+                ))
+            })?;
+
+            let schema = partition.schema.clone();
+            let mut writer = ArrowWriter::try_new(file, schema, None)
+                .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
+
+            for batch in &partition.batches {
+                writer.write(batch).map_err(|e| {
+                    ShuffleError::Io(format!("failed to write Parquet batch: {e}"))
+                })?;
+            }
             writer
-                .write(batch)
-                .map_err(|e| ShuffleError::Io(format!("failed to write Parquet batch: {e}")))?;
-        }
-        writer
-            .close()
-            .map_err(|e| ShuffleError::Io(format!("failed to close Parquet writer: {e}")))?;
-        Ok(())
+                .close()
+                .map_err(|e| ShuffleError::Io(format!("failed to close Parquet writer: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use std::fs::File;
-
         let path = self.partition_path(id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = File::open(&path).map_err(|e| {
-            ShuffleError::Io(format!(
-                "failed to open partition file '{}': {e}",
-                path.display()
-            ))
-        })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| ShuffleError::Io(format!("failed to build Parquet reader: {e}")))?;
-        let schema = builder.schema().clone();
-        let reader = builder
-            .build()
-            .map_err(|e| ShuffleError::Io(format!("failed to build Parquet batch reader: {e}")))?;
-        let mut batches = Vec::new();
-        for result in reader {
-            let batch = result
-                .map_err(|e| ShuffleError::Io(format!("error reading Parquet batch: {e}")))?;
-            batches.push(batch);
-        }
-        Ok(Some(ShufflePartition {
-            id: id.clone(),
-            schema,
-            batches,
-        }))
+        let id = id.clone();
+
+        // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
+        // async executor thread is never stalled by synchronous disk calls.
+        tokio::task::spawn_blocking(move || {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            use std::fs::File;
+
+            if !path.exists() {
+                return Ok(None);
+            }
+            let file = File::open(&path).map_err(|e| {
+                ShuffleError::Io(format!(
+                    "failed to open partition file '{}': {e}",
+                    path.display()
+                ))
+            })?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| ShuffleError::Io(format!("failed to build Parquet reader: {e}")))?;
+            let schema = builder.schema().clone();
+            let reader = builder.build().map_err(|e| {
+                ShuffleError::Io(format!("failed to build Parquet batch reader: {e}"))
+            })?;
+            let mut batches = Vec::new();
+            for result in reader {
+                let batch = result.map_err(|e| {
+                    ShuffleError::Io(format!("error reading Parquet batch: {e}"))
+                })?;
+                batches.push(batch);
+            }
+            Ok(Some(ShufflePartition { id, schema, batches }))
+        })
+        .await
+        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
         let dir = self.base_dir.join(job_id);
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(ShuffleError::Io(format!(
-                    "failed to delete job partitions: {e}"
-                )));
+        let job_id_owned = job_id.to_owned();
+
+        // P0.4: Wrap blocking filesystem removal in spawn_blocking.
+        tokio::task::spawn_blocking(move || {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(ShuffleError::Io(format!(
+                        "failed to delete job partitions: {e}"
+                    )));
+                }
             }
-        }
-        // Clean up in-memory lease tokens for this job.
+            Ok(())
+        })
+        .await
+        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))??;
+
+        // Clean up in-memory lease tokens for this job (in-memory, safe outside spawn_blocking).
         let mut tokens = self.lease_tokens.write().unwrap();
-        tokens.retain(|(jid, _, _), _| jid != job_id);
+        tokens.retain(|(jid, _, _), _| jid != &job_id_owned);
         Ok(())
     }
 }

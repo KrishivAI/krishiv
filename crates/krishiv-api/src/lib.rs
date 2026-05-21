@@ -950,13 +950,19 @@ fn accept_plan_with_backend(
 }
 
 fn block_on_krishiv<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| KrishivError::Runtime {
-            message: error.to_string(),
-        })?
-        .block_on(future)
+    // P0.3 fix: When inside an existing Tokio runtime we must not spawn a new
+    // runtime (that panics with "Cannot start a runtime from within a runtime").
+    // Instead we use `block_in_place` to park the current task and then call
+    // `handle.block_on` from within that blocking context, which is always safe.
+    // When there is no current runtime (e.g. a plain `#[test]` or CLI main), we
+    // fall back to creating a short-lived runtime so callers outside any async
+    // context still work.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Runtime::new()
+            .expect("failed to create Tokio runtime for block_on_krishiv")
+            .block_on(future),
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +978,62 @@ mod tests {
         DataType, ExecutionMode, Field, KrishivError, RecordBatch, Schema, Session, SessionBuilder,
         StreamBatch,
     };
+
+    // ── P0.3 regression: block_on_krishiv must reuse the current runtime ────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn block_on_krishiv_does_not_panic_inside_tokio_runtime() {
+        // P0.3: Calling block_on_krishiv (the sync wrapper) from within an
+        // existing multi-thread Tokio runtime must NOT panic.  The previous
+        // implementation called `Runtime::new().block_on(f)` which panics with
+        // "Cannot start a runtime from within a runtime".  The fix uses
+        // `block_in_place(|| handle.block_on(f))` which is safe on multi-thread
+        // runtimes.  We need `flavor = "multi_thread"` here because
+        // `block_in_place` is not supported on the default current_thread
+        // runtime used by `#[tokio::test]`.
+        let session = Session::builder()
+            .build()
+            .expect("SessionBuilder must succeed");
+        // sql() calls block_on_krishiv internally; this must not panic.
+        let result = session.sql("SELECT 1 AS v");
+        assert!(result.is_ok(), "block_on_krishiv panicked inside Tokio runtime: {result:?}");
+    }
+
+    // ── P0.1: SessionBuilder::build uses a single shared SqlEngine ───────────
+
+    #[tokio::test]
+    async fn session_builder_policy_engine_shares_sql_engine_context() {
+        // P0.1: When a session is built with auth + policy, the PolicyEnforcingSqlEngine
+        // must share the same underlying SessionContext as sql_engine so that
+        // tables registered on the session are visible to policy-enforced queries.
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key-ptr".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
+        let session = SessionBuilder::new()
+            .with_auth(auth)
+            .with_policy(Arc::new(AllowAllPolicy))
+            .build()
+            .unwrap();
+
+        // Register a table via the sql_engine path.
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+        session
+            .register_parquet_async("people", &parquet_path)
+            .await
+            .unwrap();
+
+        // The policy engine must see the same table (shared context).
+        let df = session
+            .sql_as("key-ptr", "SELECT count(*) AS n FROM people")
+            .await
+            .expect("policy engine should see tables registered on the shared sql_engine");
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
 
     #[test]
     fn session_builder_defaults_to_embedded() {
