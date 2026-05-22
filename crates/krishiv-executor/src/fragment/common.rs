@@ -10,7 +10,7 @@ use krishiv_proto::{
 use crate::{ExecutorError, ExecutorResult};
 use crate::runner::{
     LocalParquetPartition, CONNECTOR_PARQUET_PARTITION_PREFIX, OBJECT_PARQUET_PARTITION_PREFIX,
-    OBJECT_PARQUET_SINK_PREFIX, PARQUET_SINK_PREFIX,
+    OBJECT_PARQUET_SINK_PREFIX,
 };
 
 pub(crate) fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
@@ -61,28 +61,6 @@ pub(crate) fn parse_object_parquet_descriptor(
         PathBuf::from(base_dir),
         object_path.to_owned(),
     ))
-}
-
-pub(crate) fn parse_parquet_sink_path(contract: &OutputContract) -> ExecutorResult<PathBuf> {
-    let path = match contract.descriptor() {
-        Some(OutputContractDescriptor::ParquetSink { path }) => path.as_str(),
-        _ => contract
-            .description()
-            .trim()
-            .strip_prefix(PARQUET_SINK_PREFIX)
-            .ok_or_else(|| ExecutorError::InvalidAssignment {
-                message: format!(
-                    "Kafka-to-Parquet output contract must use {PARQUET_SINK_PREFIX}<path>"
-                ),
-            })?,
-    }
-    .trim();
-    if path.is_empty() {
-        return Err(ExecutorError::InvalidAssignment {
-            message: String::from("Kafka-to-Parquet output path cannot be empty"),
-        });
-    }
-    Ok(PathBuf::from(path))
 }
 
 /// Read all batches from `connector-parquet:<path>` input partitions via `ParquetSource`.

@@ -9,11 +9,9 @@ use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapsh
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointSourceOffset, CoordinatorExecutorService,
     ExecutorTaskAssignment, InitiateCheckpointRequest, InputPartitionDescriptor,
-    OutputContractDescriptor, OutputContractKind, ShufflePartitionOutput, TaskAttemptRef,
-    TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState, TaskStatusRequest,
-    TaskStatusResponse, TransportDisposition,
+    TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
-use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
 
 use crate::{
@@ -647,7 +645,7 @@ impl ExecutorTaskRunner {
     ///
     /// All R1–R4 fragment kinds route through here.  The function collects
     /// output and returns it so the caller can report `TaskState::Succeeded`.
-    /// This is always called with `ExecutionModel::Batch`.
+    #[allow(dead_code)]
     pub(crate) async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
@@ -656,6 +654,7 @@ impl ExecutorTaskRunner {
     }
 
     /// Execute a streaming (continuous) stage fragment.
+    #[allow(dead_code)]
     pub(crate) async fn execute_streaming_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
