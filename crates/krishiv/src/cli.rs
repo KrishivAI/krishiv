@@ -53,12 +53,8 @@ impl CoordinatorMode {
             }
         }
         // Explicit flag beats env var.
-        if url.is_none() {
-            if let Some(env_url) = env_value {
-                if !env_url.is_empty() {
-                    url = Some(env_url.to_owned());
-                }
-            }
+        if url.is_none() && let Some(env_url) = env_value.filter(|u| !u.is_empty()) {
+            url = Some(env_url.to_owned());
         }
         let mode = match url {
             Some(u) => CoordinatorMode::Remote(u),

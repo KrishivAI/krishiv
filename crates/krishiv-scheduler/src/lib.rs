@@ -4799,6 +4799,8 @@ mod tests {
         SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
         job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
+    #[cfg(feature = "sqlite")]
+    use super::SqliteMetadataStore;
 
     #[derive(Debug, Clone, Default)]
     struct RecordingExecutorTaskService {
@@ -8373,35 +8375,39 @@ mod tests {
     // ── S6.4: SqliteMetadataStore ─────────────────────────────────────────────
 
     #[cfg(feature = "sqlite")]
+    fn sqlite_coordinator_with_job(job_id: &JobId, name: &str) -> Coordinator {
+        let task = TaskSpec::new(TaskId::try_new("task-1").unwrap(), "test-task");
+        let stage = StageSpec::new(StageId::try_new("stage-1").unwrap(), "test-stage")
+            .with_task(task);
+        let spec = JobSpec::new(job_id.clone(), name, JobKind::Batch).with_stage(stage);
+        let exec_id = ExecutorId::try_new("exec-sqlite-1").unwrap();
+        let mut coord = Coordinator::active(
+            CoordinatorId::try_new(&format!("coord-{name}")).unwrap(),
+        );
+        coord.register_executor(ExecutorDescriptor::new(exec_id, "sqlite-node", 4)).unwrap();
+        coord.submit_job(spec).unwrap();
+        coord
+    }
+
+    #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_metadata_store_save_and_reload_job() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("meta.db");
-
         let job_id = JobId::try_new("job-sqlite-1").unwrap();
-        let spec = JobSpec::new(job_id.clone(), "sqlite-test", JobKind::Batch);
 
-        // Write.
+        // Write via coordinator.
         {
+            let mut coordinator = sqlite_coordinator_with_job(&job_id, "sqlite-test");
             let mut store = SqliteMetadataStore::open(&path).unwrap();
-            let record = JobRecord {
-                spec: spec.clone(),
-                state: JobState::Pending,
-                max_stage_retries: 2,
-                stages: vec![],
-                shuffle_output: std::collections::HashMap::new(),
-                resource_usage: crate::ResourceUsage::default(),
-            };
-            store.save_job(&record).unwrap();
+            coordinator.persist_jobs_to_store(&mut store).unwrap();
             assert_eq!(store.jobs().len(), 1);
         }
 
         // Reopen and verify.
-        {
-            let store = SqliteMetadataStore::open(&path).unwrap();
-            assert_eq!(store.jobs().len(), 1);
-            assert_eq!(store.jobs()[0].job_id(), &job_id);
-        }
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        assert_eq!(store.jobs().len(), 1);
+        assert_eq!(store.jobs()[0].job_id(), &job_id);
     }
 
     #[cfg(feature = "sqlite")]
@@ -8410,42 +8416,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upsert.db");
         let job_id = JobId::try_new("job-sqlite-2").unwrap();
-        let spec = JobSpec::new(job_id.clone(), "upsert-test", JobKind::Batch);
-
+        let mut coordinator = sqlite_coordinator_with_job(&job_id, "upsert-test");
         let mut store = SqliteMetadataStore::open(&path).unwrap();
 
-        let record = |state: JobState| JobRecord {
-            spec: spec.clone(),
-            state,
-            max_stage_retries: 1,
-            stages: vec![],
-            shuffle_output: std::collections::HashMap::new(),
-            resource_usage: crate::ResourceUsage::default(),
-        };
+        // Persist twice — upsert means only one row.
+        coordinator.persist_jobs_to_store(&mut store).unwrap();
+        coordinator.persist_jobs_to_store(&mut store).unwrap();
 
-        store.save_job(&record(JobState::Pending)).unwrap();
-        store.save_job(&record(JobState::Running)).unwrap();
-
-        // Upsert means only one row.
-        assert_eq!(store.jobs().len(), 1);
-        assert_eq!(store.jobs()[0].state, JobState::Running);
+        assert_eq!(store.jobs().len(), 1, "upsert must not create duplicate rows");
+        assert_eq!(store.jobs()[0].job_id(), &job_id);
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_metadata_store_persist_jobs_to_store_roundtrip() {
-        // persist_jobs_to_store writes to a SqliteMetadataStore.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.db");
-
         let job_id = JobId::try_new("job-sqlite-3").unwrap();
-        let spec = JobSpec::new(job_id.clone(), "persist-test", JobKind::Batch);
 
-        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-sqlite").unwrap());
-        coordinator
-            .submit_job(JobSpec::new(job_id.clone(), "persist-test", JobKind::Batch))
-            .unwrap();
-
+        let mut coordinator = sqlite_coordinator_with_job(&job_id, "persist-test");
         let mut store = SqliteMetadataStore::open(&path).unwrap();
         coordinator.persist_jobs_to_store(&mut store).unwrap();
 

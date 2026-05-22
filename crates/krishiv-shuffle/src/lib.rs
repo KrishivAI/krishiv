@@ -1083,9 +1083,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{
-        CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState, ShuffleCompression,
-        ShuffleError, ShuffleMetadata, ShufflePath, cleanup_orphans, compress_block,
-        decompress_block, scan_orphans,
+        CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState,
+        ShuffleError, ShuffleMetadata, ShufflePath, cleanup_orphans, scan_orphans,
     };
 
     // ── ShufflePath ───────────────────────────────────────────────────────
