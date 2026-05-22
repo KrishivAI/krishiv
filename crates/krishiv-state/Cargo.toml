@@ -9,6 +9,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+krishiv-async-util = { path = "../krishiv-async-util" }
 redb.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
