@@ -51,7 +51,12 @@ grep -r "simulation_mode\|with_simulation" deploy/   # should return nothing
 ### Fencing Tokens
 
 - `validate_fencing_token()` must be called at every checkpoint write site.
-- Audit the codebase before GA: a missing call allows stale coordinators to corrupt state.
+- **Post-R12 review (GAP-CP-03):** `commit_epoch` in `krishiv-scheduler` currently writes
+  metadata without calling `validate_fencing_token`. Treat checkpoint exactly-once as
+  **not production-certified** until GAP-CP-03 and GAP-CK-01 are closed. See
+  [`r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md).
+- Audit the codebase before GA: `rg validate_fencing_token` must show call sites on
+  every write and restore path.
 - Alert on `fencing_token_rejection_total` > 0 (see Section 3).
 
 ### Replicas
@@ -408,7 +413,9 @@ Set per-tenant, not globally, to prevent one tenant from starving others.
 
 ---
 
-## 7. Known Limitations (R10)
+## 7. Known Limitations
+
+### R10 GA scope boundaries
 
 | Area | Limitation |
 |---|---|
@@ -419,5 +426,24 @@ Set per-tenant, not globally, to prevent one tenant from starving others.
 | Multi-region | No global multi-region active-active. One active coordinator per job, one region. |
 | Spark/Flink API compatibility | Not in scope for v1.0. |
 
-These are not bugs — they are documented scope boundaries for R10 GA. Workloads that
-require unsupported features must wait for a future release or use a workaround.
+### Post-R12 maturity gaps (do not deploy as production-ready)
+
+Full register: [`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md).
+
+| Area | Limitation | Gap ID | Target fix |
+|---|---|---|---|
+| Remote coordinator CLI | `RemoteCoordinatorClient` may return success without RPC | GAP-RT-04 | R12 carryover |
+| Distributed `Session` | `DistributedBackend` logs URL only; local DataFusion still runs | GAP-RT-01 | R13 (Flight SQL) |
+| Runtime backends | Embedded/SingleNode accept plans without coordinator loop | GAP-RT-01 | R13 S6.2–S6.3 |
+| Policy | `Session::sql()` bypasses policy when hooks configured | GAP-RT-05 | R12 carryover |
+| Checkpoint fencing | Write path may skip `validate_fencing_token` | GAP-CP-03 | R12 carryover |
+| Coordinator restart | Binary may not recover jobs from metadata store | GAP-CP-04 | R12 carryover / R13 |
+| Streaming HA | Window state in memory, not `StateBackend`; barriers deferred | GAP-ST-01, GAP-ST-03 | R16 |
+| Shuffle | Compression codecs not on executor hot path; unstable partition hash | GAP-SH-01, GAP-SH-03 | R12 carryover |
+| Kafka / CDC | Default stubs; duplicate rdkafka CDC type risks build failure | GAP-CN-01, GAP-CN-02 | R12 carryover / R13 |
+| Connector matrix | LocalParquet “certified” ahead of CI suite | GAP-CN-03 | R14 |
+| Executor process | Binary register/heartbeat only | GAP-CP-09 | R13 |
+| HA leadership | No wired `LeaderElection` in coordinator process | GAP-CP-01 | R16 |
+
+Workloads requiring rows in the right-hand column must wait for the target release or
+use embedded/local batch SQL only.

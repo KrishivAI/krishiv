@@ -162,6 +162,35 @@ on skewed joins.
   live cluster.
 - `cargo test --workspace` passes; `cargo clippy --workspace -- -D warnings` clean.
 
+### Maturity gaps, risks, and resolutions (post-R12 review)
+
+R12 closed the original P0/P1 audit inventory and several structural slices (Kafka
+feature gate, `CoalesceRule`, compression codecs, federation skeleton). A separate
+**subsystem maturity review** (2026-05-22) identified additional gaps where library
+code exists but **binaries, enforcement, or end-to-end paths** remain incomplete.
+
+**Canonical register:** [`r12-maturity-gap-register.md`](r12-maturity-gap-register.md)
+
+| Theme | Example gap IDs | Target resolution |
+|-------|-----------------|-------------------|
+| Checkpoint fencing not enforced at write | GAP-CP-03, GAP-CK-01, GAP-CK-04 | **R12 carryover** — wire `validate_fencing_token` in `commit_epoch` / restore |
+| Remote CLI / distributed session stubs | GAP-RT-01, GAP-RT-04 | **R12 carryover** (RPCs) + **R13** (Flight SQL `DistributedBackend`) |
+| Runtime backends accept-only | GAP-RT-01, GAP-RT-03 | **R13** — ADR-12.3/12.4/12.5; `WindowedStream` → executor fragments |
+| Streaming state not durable | GAP-ST-01, GAP-ST-03, GAP-ST-05 | **R16** — `StateBackend` + barrier transport (ADR-16.3) |
+| Shuffle compression off hot path | GAP-SH-01, GAP-SH-03 | **R12 carryover** — executor path + stable hash |
+| Connector / matrix honesty | GAP-CN-01, GAP-CN-03 | **R12 carryover** (kafka compile) + **R14** (full certification) |
+| HA coordinator | GAP-CP-01, GAP-CP-02 | **R16** / R9 lease model |
+| Policy bypass on default `sql()` | GAP-RT-05 | **R12 carryover** / R13 fail-closed when policy configured |
+| Doc vs code drift | GAP-DOC-01 | **R12 carryover** — trackers require L4 validation per gap ID |
+
+**R12 carryover sprint (before R13):** GAP-CP-03, GAP-CK-01, GAP-CN-01, GAP-RT-04,
+GAP-CP-04–06, GAP-SH-01/03, GAP-RT-05, GAP-DOC-01. See the register for full
+acceptance tests per gap.
+
+**Deferred to R13+ (unchanged intent):** S6.2 SingleNode mpsc, S6.3 embedded
+streaming redirect, full Flight transport, watermark-aware Kafka — now tracked with
+gap IDs in the register.
+
 ---
 
 ## R13: Python-First Streaming API

@@ -54,20 +54,21 @@ Out of scope:
 
 ## Dependencies
 
-- R12 acceptance gate is complete: all P0 and selected P1 bugs closed, Kafka
-  connector live, remote CLI mode working.
-- **R12 Sprint 6 (deployment layer) is complete** — specifically:
-  - `DistributedBackend` is implemented and `ExecutionMode::Distributed` no
-    longer returns `Err(unsupported)`. `ks.Session.connect("http://coord:7070")`
-    depends on this directly; without it, connecting to a remote cluster from
-    Python is impossible.
-  - `SingleNodeBackend` has a real in-process coordinator + executor. The asyncio
-    streaming loop (`async for batch in stream.window()`) in Sprint 5 requires
-    the streaming execution loop to work in embedded/single-node mode.
-  - `krishiv-federation` crate exists (skeleton). `ks.Session` will expose a
-    `federation_client()` accessor in R13 Sprint 1 as a type-checked reference.
-- `cargo test --workspace` passes clean on the R12 baseline before any R13
-  edits.
+- R12 **audit scope** (P0/P1 bugs) is closed on the R12 branch; **R12 carryover**
+  maturity gaps must be closed or explicitly deferred before R13 Sprint 1.
+  See [`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md).
+- **R12 carryover prerequisites for R13** (minimum):
+  - **GAP-RT-04**: real remote coordinator gRPC (CLI and Python `connect()` depend on this).
+  - **GAP-RT-01 / ADR-12.3**: `DistributedBackend` Flight SQL transport — not log-only stub.
+  - **GAP-RT-03**: `WindowedStream` → executor / plan lowering for asyncio window loops.
+  - **GAP-CP-09**: executor binary task loop (or R13 documents library-only executor for dev).
+  - **GAP-CN-01**: `kafka` feature compiles (`cargo build -p krishiv-connectors --features kafka`).
+- **R13 Sprint 6 / deployment layer** (partially landed; gap-tracked):
+  - `DistributedBackend` struct exists; full Flight client — **GAP-RT-01** (R13).
+  - `SingleNodeBackend` in-process coordinator — **GAP-RT-01**, S6.2 (R13).
+  - `EmbeddedBackend` streaming redirect — **GAP-RT-03**, S6.3 (R13).
+  - `krishiv-federation` skeleton exists (**GAP-FD-01** remote client is R19).
+- `cargo test --workspace` passes clean on the baseline before any R13 edits.
 - Python ≥ 3.10 in CI (for `match` statement in bridge code and PEP 604 union
   types in stubs).
 - `maturin ≥ 1.4` installed in CI (`pip install maturin`).

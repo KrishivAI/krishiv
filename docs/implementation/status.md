@@ -2,8 +2,12 @@
 
 ## Current Phase
 
-**R12 IN PROGRESS — Foundation Completeness & Real Connectivity (2026-05-22).**
-Release tracker: `docs/implementation/r12-foundation-completeness.md`
+**R12 CARRYOVER — Foundation Completeness & Maturity Gaps (2026-05-22).**
+Release tracker: `docs/implementation/r12-foundation-completeness.md`  
+Gap register: [`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md)
+
+Original R12 audit slices (S1–S6) landed on branch `claude/r12-slices-planning-BcFL5`; **main** may differ.
+Subsystem maturity review identified **open integration gaps** — see register for GAP-* IDs.
 
 ## R12 Sprint Completion Summary (2026-05-22)
 
@@ -43,19 +47,41 @@ cargo check --workspace                   → 0 errors
 cargo clippy (modified crates) -D warnings → 0 errors
 ```
 
-### Deferred to R13
-- S6.2: `SingleNodeBackend` in-process coordinator (mpsc channels)
-- S6.3: `EmbeddedBackend` streaming redirect
-- S3.3: `KafkaSource` watermark-aware streaming
-- `--metadata-backend sqlite` CLI flag wiring in coordinator binary
-- Full Flight SQL transport in `DistributedBackend`
+### Deferred to R13 (gap-tracked)
+- S6.2: `SingleNodeBackend` in-process coordinator — **GAP-RT-01**, GAP-ST-06
+- S6.3: `EmbeddedBackend` streaming redirect — **GAP-RT-01**, GAP-RT-03
+- S3.3: `KafkaSource` watermark-aware streaming — **GAP-CN-02**
+- `--metadata-backend sqlite` CLI flag — **GAP-CP-04**
+- Full Flight SQL transport in `DistributedBackend` — **GAP-RT-01** (ADR-12.3)
+- `WindowedStream` → executor fragments — **GAP-RT-03**
+- Executor binary task gRPC loop — **GAP-CP-09**
+- Python API `todo!()` removal — **GAP-PY-01**
+
+### R12 carryover (close before R13 Sprint 1)
+
+| Priority | Gap ID | Summary |
+|----------|--------|---------|
+| P0 | GAP-CP-03 | Wire `validate_fencing_token` in `commit_epoch` / writes |
+| P0 | GAP-CK-01 | Restore validates fencing token |
+| P0 | GAP-CN-01 | Fix duplicate `RdkafkaCdcEventSource` (`kafka` feature compile) |
+| P0 | GAP-RT-04 | Real `RemoteCoordinatorClient` gRPC (not stub `Ok`) |
+| P1 | GAP-CP-04–06 | Coordinator startup metadata recovery |
+| P1 | GAP-SH-01, GAP-SH-03 | Shuffle compression on executor path; stable partition hash |
+| P1 | GAP-RT-05 | Policy fail-closed when `Session::sql()` used with policy configured |
+| P1 | GAP-DOC-01 | Align “complete” claims with L4 acceptance per gap register |
+
+Full list: [`r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md).
 
 ### Blockers
-None. All R12 deliverables shipped and pushed to `claude/r12-slices-planning-BcFL5`.
+
+None for local batch SQL / in-process scheduler tests. **Distributed and streaming product claims**
+remain blocked on carryover gaps above (especially GAP-CP-03, GAP-RT-01, GAP-RT-04, GAP-ST-01).
 
 ### Next Task
-Update `docs/implementation/r13-python-streaming-api.md` and begin R13 planning.
-Validation command: `cargo check --workspace`
+
+1. Close P0 R12 carryover gaps (fencing, remote CLI RPCs, kafka compile).
+2. Update R13 tracker prerequisites to reference gap IDs.
+3. Validation: `cargo test --workspace` and carryover-specific tests in gap register.
 
 ## R11 Completion Summary
 

@@ -707,10 +707,14 @@ rebalance testing in Sprint 3.
 R12 is complete when:
 
 - [ ] All 21 P0 bugs and 6 selected P1 bugs have closed test coverage.
+- [ ] R12 **carryover** maturity gaps in
+      [`r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md)
+      (GAP-CP-03, GAP-CK-01, GAP-CN-01, GAP-RT-04, GAP-RT-05, GAP-SH-01, GAP-SH-03)
+      are closed **or** explicitly deferred to R13 with tracker + `status.md` updated.
 - [ ] `cargo test --workspace` passes with zero failures and zero ignored P0-related tests.
 - [ ] `cargo clippy --workspace -- -D warnings` passes.
 - [ ] `krishiv --coordinator http://localhost:7070 savepoint <job-id>` calls the
-      remote gRPC endpoint and returns a structured result.
+      remote gRPC endpoint and returns a structured result (GAP-RT-04 — not stub `Ok`).
 - [ ] A Kafka-backed streaming job ingests 1 000 messages end-to-end in the
       integration test suite without data loss.
 - [ ] `CoalesceRule::apply` reduces a 200-partition plan to ≤ 10 partitions in
@@ -728,6 +732,71 @@ R12 is complete when:
 - [ ] `cargo test -p krishiv-federation` passes (crate exists, trait compiles,
       `SingleRegionFederationClient` routes correctly).
 
+## Maturity Gap and Risk Register
+
+Post-R12 **subsystem maturity code review** (2026-05-22) identified gaps beyond the
+original P0/P1 audit list: traits and unit tests exist, but several **L4/L5**
+integration and enforcement paths remain open.
+
+**Full register (gap IDs, severity, resolutions, validation):**
+[`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md)
+
+### R12 carryover (close before R13 Sprint 1)
+
+| Gap ID | Summary | Resolution |
+|--------|---------|------------|
+| GAP-CP-03 | `validate_fencing_token` not called in `commit_epoch` | Call before every `write_epoch_metadata`; add scheduler test |
+| GAP-CK-01 | Restore ignores fencing token vs live coordinator | Validate on restore in CLI + checkpoint crate |
+| GAP-CN-01 | Duplicate `RdkafkaCdcEventSource` — `kafka` feature build risk | Merge to single implementation in `cdc.rs` |
+| GAP-RT-04 | `RemoteCoordinatorClient` RPCs return `Ok` without gRPC | Wire savepoint / checkpoints / state / restore proto RPCs |
+| GAP-CP-04 | Coordinator binary no metadata recovery on startup | `--metadata-backend` + `recover_from_store` in `krishiv_coordinator` |
+| GAP-CP-05 | Metadata persist failures warn-only | Fail-closed on submit/task-update persist (production mode) |
+| GAP-CP-06 | `checkpoint_coordinators` empty after `recover_from_store` | Rebuild coordinators from recovered jobs |
+| GAP-SH-01 | Shuffle compression not on executor `ShuffleStore` path | Plumb `ShuffleCompression` into disk/IPC writes |
+| GAP-SH-03 | `DefaultHasher` partition routing unstable cross-node | Replace with stable hash on key bytes |
+| GAP-RT-05 | `Session::sql()` bypasses policy when policy configured | Fail-closed or force `sql_as` |
+| GAP-DOC-01 | Trackers claim “complete” while stubs remain | Acceptance gate requires L4 evidence per gap ID |
+
+### Deferred to R13 (unchanged sprints, now gap-tracked)
+
+| Sprint / item | Gap IDs |
+|---------------|---------|
+| S6.2 SingleNodeBackend mpsc | GAP-RT-01, GAP-ST-06 |
+| S6.3 Embedded streaming redirect | GAP-RT-01, GAP-RT-03 |
+| S3.3 Kafka watermark streaming | GAP-CN-02 |
+| `--metadata-backend sqlite` CLI | GAP-CP-04 |
+| Full Flight SQL in `DistributedBackend` | GAP-RT-01, ADR-12.3 |
+| `WindowedStream` → executor | GAP-RT-03 |
+| Executor binary task loop | GAP-CP-09 |
+| Python `todo!()` | GAP-PY-01 |
+
+### Deferred to R14–R20
+
+| Release | Gap IDs (examples) |
+|---------|-------------------|
+| R14 | GAP-CN-03, GAP-CN-04, GAP-GV-02 |
+| R16 | GAP-CP-01, GAP-CP-02, GAP-ST-01–05, GAP-CK-02, GAP-ST-03 |
+| R18 | GAP-CN-06, GAP-CN-07 |
+| R19 | GAP-FD-01, GAP-CP-12 |
+| R20 | GAP-GV-01, GAP-GV-04, GAP-GV-05 |
+
+### Updated acceptance gate (maturity-aware)
+
+R12 is **code-complete for the original audit scope** when P0/P1 tests pass. R12 is
+**product-complete for distributed/streaming claims** only when carryover gaps
+above are closed or explicitly deferred with tracker updates.
+
+Additional gate items (see register for tests):
+
+- [ ] GAP-CP-03 / GAP-CK-01: fencing enforced on write and restore.
+- [ ] GAP-RT-04: remote CLI issues real gRPC (not stub `Ok`).
+- [ ] GAP-CN-01: `cargo build -p krishiv-connectors --features kafka` succeeds.
+- [ ] GAP-SH-01: executor shuffle path uses negotiated compression.
+- [ ] GAP-RT-05: policy-configured session rejects or routes `sql()` safely.
+- [ ] GAP-DOC-01: `status.md` and this tracker reference open gap IDs.
+
+---
+
 ## Risks and Mitigations
 
 | Risk | Mitigation |
@@ -736,3 +805,5 @@ R12 is complete when:
 | LeaderElection async conversion breaks K8s operator reconciliation loop | S2.1 is implemented and tested independently with `MockLeaderElection` before touching `K8sLeaseElection` |
 | AQE coalescing changes query results if partition boundaries shift aggregation semantics | `CoalesceRule` only fires post-shuffle, after all aggregation keys are fixed; validated by comparing row counts before and after coalescing in tests |
 | Zstd compression license (BSL/dual) | `zstd` crate uses the Zstandard library under BSD-3; acceptable for Krishiv's license; confirm in legal review |
+| Library-complete but integration-incomplete surfaces (remote CLI, backends, fencing) | Track in [`r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md); R12 carryover sprint before R13 |
+| Connector matrix overstates certification | GAP-CN-03: expand `certification.rs` in R14; until then matrix marks LocalParquet as **beta** in [`compatibility-matrices.md`](../architecture/compatibility-matrices.md) |
