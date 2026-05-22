@@ -30,12 +30,12 @@ impl ParquetSource {
     /// Open a Parquet file and eagerly load all record batches.
     pub fn open(path: impl AsRef<Path>) -> ConnectorResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path).map_err(|e| ConnectorError::Io {
+        let file = File::open(&path).map_err(|e| ConnectorError::IoStr {
             message: format!("failed to open '{}': {e}", path.display()),
         })?;
 
         let builder =
-            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| ConnectorError::Io {
+            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| ConnectorError::IoStr {
                 message: format!(
                     "failed to build Parquet reader for '{}': {e}",
                     path.display()
@@ -43,13 +43,13 @@ impl ParquetSource {
             })?;
 
         let schema = builder.schema().clone();
-        let reader = builder.build().map_err(|e| ConnectorError::Io {
+        let reader = builder.build().map_err(|e| ConnectorError::IoStr {
             message: format!("failed to create Parquet batch reader: {e}"),
         })?;
 
         let mut batches = Vec::new();
         for result in reader {
-            let batch = result.map_err(|e| ConnectorError::Io {
+            let batch = result.map_err(|e| ConnectorError::IoStr {
                 message: format!("error reading Parquet batch: {e}"),
             })?;
             batches.push(batch);
@@ -135,11 +135,11 @@ impl Sink for ParquetSink {
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
         if self.writer.is_none() {
             let schema = batch.schema();
-            let file = File::create(&self.path).map_err(|e| ConnectorError::Io {
+            let file = File::create(&self.path).map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to create '{}': {e}", self.path.display()),
             })?;
             let writer = ArrowWriter::try_new(file, schema.clone(), None).map_err(|e| {
-                ConnectorError::Io {
+                ConnectorError::IoStr {
                     message: format!("failed to create Parquet writer: {e}"),
                 }
             })?;
@@ -151,7 +151,7 @@ impl Sink for ParquetSink {
             .as_mut()
             .expect("writer is set above")
             .write(&batch)
-            .map_err(|e| ConnectorError::Io {
+            .map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to write Parquet batch: {e}"),
             })?;
         Ok(())
@@ -159,7 +159,7 @@ impl Sink for ParquetSink {
 
     async fn flush(&mut self) -> ConnectorResult<()> {
         if let Some(writer) = self.writer.take() {
-            writer.close().map_err(|e| ConnectorError::Io {
+            writer.close().map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to close Parquet writer: {e}"),
             })?;
         }

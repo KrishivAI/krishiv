@@ -27,21 +27,42 @@ pub mod s3;
 pub enum ConnectorError {
     /// Configuration problem (missing required property, bad value, etc.).
     Config { message: String },
-    /// I/O error reading from or writing to a source/sink.
-    Io { message: String },
+    /// Kafka-specific error (connection, produce, consume).
+    Kafka { message: String, retriable: bool },
+    /// Parquet read/write error.
+    Parquet(String),
+    /// Object-store (S3/GCS/Azure) error with optional HTTP status code.
+    ObjectStore { message: String, status: Option<u16> },
+    /// CDC (change-data-capture) pipeline error.
+    Cdc(String),
+    /// Typed I/O error from the operating system.
+    Io(std::io::Error),
     /// Schema mismatch or incompatible field types.
     Schema { message: String },
     /// Operation is not supported by this connector.
     Unsupported { message: String },
     /// A certification test assertion failed.
     CertificationFailed { reason: String },
+    /// Migration alias: callers that previously used `Io { message }` form.
+    #[allow(non_camel_case_types)]
+    IoStr { message: String },
 }
 
 impl fmt::Display for ConnectorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConnectorError::Config { message } => write!(f, "connector config error: {message}"),
-            ConnectorError::Io { message } => write!(f, "connector I/O error: {message}"),
+            ConnectorError::Kafka { message, retriable } => write!(
+                f,
+                "connector Kafka error (retriable={retriable}): {message}"
+            ),
+            ConnectorError::Parquet(message) => write!(f, "connector Parquet error: {message}"),
+            ConnectorError::ObjectStore { message, status } => match status {
+                Some(code) => write!(f, "connector object-store error (HTTP {code}): {message}"),
+                None => write!(f, "connector object-store error: {message}"),
+            },
+            ConnectorError::Cdc(message) => write!(f, "connector CDC error: {message}"),
+            ConnectorError::Io(e) => write!(f, "connector I/O error: {e}"),
             ConnectorError::Schema { message } => write!(f, "connector schema error: {message}"),
             ConnectorError::Unsupported { message } => {
                 write!(f, "connector unsupported: {message}")
@@ -49,6 +70,7 @@ impl fmt::Display for ConnectorError {
             ConnectorError::CertificationFailed { reason } => {
                 write!(f, "connector certification failed: {reason}")
             }
+            ConnectorError::IoStr { message } => write!(f, "connector I/O error: {message}"),
         }
     }
 }
@@ -397,7 +419,7 @@ impl Offset for ParquetOffset {
 
     fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
         if bytes.len() < 8 {
-            return Err(ConnectorError::Io {
+            return Err(ConnectorError::IoStr {
                 message: "ParquetOffset decode: expected 8 bytes".into(),
             });
         }
@@ -747,7 +769,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             use arrow::array::BooleanArray;
             let result = check_batch(batch, qc)?;
             if result.failed {
-                return Err(ConnectorError::Io {
+                return Err(ConnectorError::IoStr {
                     message: format!("data quality Fail action triggered at epoch {}", epoch),
                 });
             }
@@ -758,7 +780,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                     .map(|i| Some(result.accepted_indices.contains(&i)))
                     .collect();
                 filtered = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
-                    ConnectorError::Io {
+                    ConnectorError::IoStr {
                         message: e.to_string(),
                     }
                 })?;
@@ -786,7 +808,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
                 Ok(file) => break (staging_path, final_path, file),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
-                    return Err(ConnectorError::Io {
+                    return Err(ConnectorError::IoStr {
                         message: format!("parquet 2pc prepare: cannot create {staging_name}: {e}"),
                     });
                 }
@@ -794,13 +816,13 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         };
 
         let mut writer = ::parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
-            .map_err(|e| ConnectorError::Io {
+            .map_err(|e| ConnectorError::IoStr {
                 message: format!("parquet 2pc prepare: cannot create writer: {e}"),
             })?;
-        writer.write(batch).map_err(|e| ConnectorError::Io {
+        writer.write(batch).map_err(|e| ConnectorError::IoStr {
             message: format!("parquet 2pc prepare: write error: {e}"),
         })?;
-        writer.close().map_err(|e| ConnectorError::Io {
+        writer.close().map_err(|e| ConnectorError::IoStr {
             message: format!("parquet 2pc prepare: close error: {e}"),
         })?;
 
@@ -813,7 +835,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
         match std::fs::hard_link(&handle.staging_path, &handle.final_path) {
-            Ok(()) => std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::Io {
+            Ok(()) => std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::IoStr {
                 message: format!(
                     "parquet 2pc commit: remove staging {:?}: {e}",
                     handle.staging_path
@@ -826,7 +848,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && handle.final_path.exists() => {
                 Ok(())
             }
-            Err(e) => Err(ConnectorError::Io {
+            Err(e) => Err(ConnectorError::IoStr {
                 message: format!(
                     "parquet 2pc commit: link {:?} to {:?}: {e}",
                     handle.staging_path, handle.final_path
@@ -840,7 +862,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         match std::fs::remove_file(&handle.staging_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ConnectorError::Io {
+            Err(e) => Err(ConnectorError::IoStr {
                 message: format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
             }),
         }
@@ -1309,7 +1331,7 @@ impl DeadLetterSink {
         let result = check_batch(batch, &self.quality_config)?;
 
         if result.failed {
-            return Err(ConnectorError::Io {
+            return Err(ConnectorError::IoStr {
                 message: format!("sink '{}': data quality Fail action triggered", self.name),
             });
         }
@@ -1319,7 +1341,7 @@ impl DeadLetterSink {
             .map(|i| Some(result.accepted_indices.contains(&i)))
             .collect();
         let accepted = arrow::compute::filter_record_batch(batch, &keep_mask).map_err(|e| {
-            ConnectorError::Io {
+            ConnectorError::IoStr {
                 message: e.to_string(),
             }
         })?;
@@ -1333,7 +1355,7 @@ impl DeadLetterSink {
                 .collect();
             let rejected_batch =
                 arrow::compute::filter_record_batch(batch, &reject_mask).map_err(|e| {
-                    ConnectorError::Io {
+                    ConnectorError::IoStr {
                         message: e.to_string(),
                     }
                 })?;
@@ -1372,7 +1394,7 @@ impl DeadLetterSink {
                 rejected_batch.columns().to_vec();
             new_cols.push(std::sync::Arc::new(error_col));
             let dlq_batch = arrow::record_batch::RecordBatch::try_new(new_schema, new_cols)
-                .map_err(|e| ConnectorError::Io {
+                .map_err(|e| ConnectorError::IoStr {
                     message: format!("failed to build dead-letter batch: {e}"),
                 })?;
 
@@ -1638,7 +1660,7 @@ mod tests {
         ) -> ConnectorResult<()> {
             self.events.push("write");
             if self.fail_write {
-                return Err(ConnectorError::Io {
+                return Err(ConnectorError::IoStr {
                     message: "injected write failure".into(),
                 });
             }
@@ -1648,7 +1670,7 @@ mod tests {
         async fn flush(&mut self) -> ConnectorResult<()> {
             self.events.push("flush");
             if self.fail_flush {
-                return Err(ConnectorError::Io {
+                return Err(ConnectorError::IoStr {
                     message: "injected flush failure".into(),
                 });
             }
@@ -1697,7 +1719,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, ConnectorError::Io { .. }));
+        assert!(matches!(err, ConnectorError::IoStr { .. }));
         assert_eq!(sink.events, vec!["write"]);
         assert!(committer.committed.is_empty());
     }
@@ -1719,7 +1741,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, ConnectorError::Io { .. }));
+        assert!(matches!(err, ConnectorError::IoStr { .. }));
         assert_eq!(sink.events, vec!["write", "flush"]);
         assert!(committer.committed.is_empty());
     }

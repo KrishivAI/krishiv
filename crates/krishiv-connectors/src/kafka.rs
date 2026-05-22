@@ -44,20 +44,20 @@ impl crate::Offset for KafkaOffset {
 
     fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
         if bytes.len() < 4 {
-            return Err(ConnectorError::Io {
+            return Err(ConnectorError::IoStr {
                 message: "KafkaOffset decode: buffer too short for topic_len".into(),
             });
         }
         let topic_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let topic_end = 4 + topic_len;
         if bytes.len() < topic_end + 4 + 8 {
-            return Err(ConnectorError::Io {
+            return Err(ConnectorError::IoStr {
                 message: "KafkaOffset decode: buffer too short for topic + partition + offset"
                     .into(),
             });
         }
         let topic = std::str::from_utf8(&bytes[4..topic_end])
-            .map_err(|e| ConnectorError::Io {
+            .map_err(|e| ConnectorError::IoStr {
                 message: format!("KafkaOffset decode: invalid UTF-8 in topic: {e}"),
             })?
             .to_string();
@@ -480,7 +480,7 @@ impl Source for RdkafkaKafkaSource {
             Err(_timeout) => Ok(Some(arrow::record_batch::RecordBatch::new_empty(
                 std::sync::Arc::new(arrow::datatypes::Schema::empty()),
             ))),
-            Ok(Err(e)) => Err(crate::ConnectorError::Io {
+            Ok(Err(e)) => Err(crate::ConnectorError::IoStr {
                 message: format!("rdkafka receive error: {e}"),
             }),
             Ok(Ok(msg)) => {
