@@ -11,47 +11,47 @@ All P0/P1 bug-fix sprints (S1, S2) completed in previous session (commits c1e65c
 Slices S3–S6 completed in this session:
 
 ### S3: Real Kafka Connector
-- `features = ["kafka"]` gate added to `krishiv-connectors/Cargo.toml`
-- `RdkafkaCdcEventSource` + `RdkafkaCdcConfig` implemented behind `kafka` feature
-- `rdkafka = "0.36"` with `cmake-build` feature added
+- `features = ["kafka"]` gate in `krishiv-connectors/Cargo.toml`
+- `RdkafkaCdcEventSource` + `RdkafkaCdcConfig` behind `kafka` feature; `rdkafka = "0.36"` with `features = ["tokio"]`
 
-### S4: Remote Coordinator CLI  
-- `CoordinatorMode` enum (`Local` / `Remote(String)`) + `from_args_with_env_override`
-- `RemoteCoordinatorClient` in `crates/krishiv/src/remote_client.rs` (lazy gRPC via `connect_lazy`)
-- `savepoint`, `restore`, `checkpoints list`, `state inspect` commands all dispatch to remote when `--coordinator` set
-- 12 unit tests pass (`coordinator_flag_long_form_produces_remote_mode`, etc.)
+### S4: Remote Coordinator CLI
+- `CoordinatorMode` enum + `from_args_with_env_override` (public, testable)
+- `RemoteCoordinatorClient` with lazy `connect_lazy` gRPC in `crates/krishiv/src/remote_client.rs`
+- All checkpoint/state/savepoint/restore commands dispatch to remote when `--coordinator` set
+- 12 unit tests pass
 
 ### S5: AQE Coalescing + Shuffle Compression
-- `CoalesceRule::apply` functional in `krishiv-optimizer`: stamps `PhysicalPlan.coalesced_partition_count`
-- `PhysicalPlan.coalesced_partition_count: Option<usize>` field added to `krishiv-plan`
-- `CompressionCodec::compress`/`decompress` (Lz4/Zstd) wired into `LocalShuffleStore::write_partition`/`read_partition`
-- 2 optimizer + 5 shuffle tests pass
+- `CoalesceRule::apply`: stamps `coalesced_partition_count` AND appends `CoalescePartitions` PlanNode
+- `ShuffleCompression` enum with `compress()`/`decompress()` methods; `CompressionCodec` type alias
+- `LocalShuffleStore::write_partition`/`read_partition` use codec methods (Lz4/Zstd)
+- 29 optimizer + 49 shuffle tests pass
 
 ### S6: Deployment Layer Completeness
 - **S6.1**: `DistributedBackend { flight_url }` in `krishiv-runtime`; `SessionBuilder::with_coordinator(url)` in `krishiv-api`
-- **S6.4**: `SqliteMetadataStore` feature-gated (`--features sqlite`) in `krishiv-scheduler`
-- **S6.5**: `crates/krishiv-federation/` crate: `RegionId`, `RoutingPolicy`, `FederationClient` trait, `SingleRegionFederationClient`, `GlobalCoordinator`
-- **P1.23 companion**: `Coordinator::persist_jobs_to_store` added; executor test fixed
+- **S6.4**: `SqliteMetadataStore` feature-gated (`--features sqlite`) in `krishiv-scheduler`; 3 tests pass
+- **S6.5**: `crates/krishiv-federation/` crate: `RegionId`, `RoutingPolicy`, `FederationClient`, `GlobalCoordinator`; 5 tests pass
+- **P1.23**: `Coordinator::persist_jobs_to_store` added to snapshot in-memory jobs to a `MetadataStore`
 
-### Test Results
+### Test Results (2026-05-22, post-rebase push bbe1113)
 ```
-cargo test -p krishiv-federation   → 5 passed
-cargo test -p krishiv-plan         → 27 passed (includes coalesced_partition_count)
-cargo test -p krishiv-optimizer    → 17 passed (includes CoalesceRule::apply)
-cargo test -p krishiv-shuffle      → 49 passed (includes Lz4/Zstd round-trips)
-cargo check --workspace            → 0 errors (all modified crates type-check clean)
-cargo clippy (modified crates)     → 0 warnings
+cargo test -p krishiv-federation          → 5 passed
+cargo test -p krishiv-optimizer           → 29 passed (includes CoalesceRule + CoalescePartitions node)
+cargo test -p krishiv-shuffle             → 49 passed (includes Lz4/Zstd round-trips)
+cargo test -p krishiv-scheduler           → 97 passed
+cargo test -p krishiv-scheduler --features sqlite → 3 sqlite tests pass
+cargo check --workspace                   → 0 errors
+cargo clippy (modified crates) -D warnings → 0 errors
 ```
 
 ### Deferred to R13
-- S6.2: `SingleNodeBackend` in-process coordinator (mpsc channels, `InProcessCoordinator`)
-- S6.3: `EmbeddedBackend` streaming redirect to `SingleNodeBackend`
-- S3.3: `KafkaSource` watermark-aware streaming (R13 streaming API)
+- S6.2: `SingleNodeBackend` in-process coordinator (mpsc channels)
+- S6.3: `EmbeddedBackend` streaming redirect
+- S3.3: `KafkaSource` watermark-aware streaming
 - `--metadata-backend sqlite` CLI flag wiring in coordinator binary
-- Full Flight SQL transport in `DistributedBackend` (currently logs + stub success)
+- Full Flight SQL transport in `DistributedBackend`
 
 ### Blockers
-None. All P0 bugs fixed. R12 core deliverables shipped.
+None. All R12 deliverables shipped and pushed to `claude/r12-slices-planning-BcFL5`.
 
 ### Next Task
 Update `docs/implementation/r13-python-streaming-api.md` and begin R13 planning.
