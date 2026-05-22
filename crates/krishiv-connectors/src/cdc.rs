@@ -422,6 +422,249 @@ fn safe_payload_column(name: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RdkafkaCdcEventSource  (behind `kafka` feature)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the rdkafka-backed CDC event source.
+///
+/// Construct via the builder pattern and pass to [`RdkafkaCdcEventSource::new`].
+#[cfg(feature = "kafka")]
+#[derive(Debug, Clone)]
+pub struct KafkaCdcConfig {
+    /// Comma-separated list of `host:port` bootstrap broker addresses.
+    pub bootstrap_servers: String,
+    /// Consumer group id used for offset management.
+    pub group_id: String,
+    /// Topic that carries Debezium CDC envelopes.
+    pub topic: String,
+    /// Security protocol (e.g. `"PLAINTEXT"`, `"SASL_SSL"`).
+    pub security_protocol: String,
+    /// SASL mechanism (e.g. `"PLAIN"`, `"SCRAM-SHA-256"`).  `None` for
+    /// unauthenticated connections.
+    pub sasl_mechanism: Option<String>,
+    /// SASL username.  `None` for unauthenticated connections.
+    pub sasl_username: Option<String>,
+    /// SASL password.  `None` for unauthenticated connections.
+    pub sasl_password: Option<String>,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaCdcConfig {
+    /// Create a minimal unauthenticated config for local/test brokers.
+    pub fn new(
+        bootstrap_servers: impl Into<String>,
+        group_id: impl Into<String>,
+        topic: impl Into<String>,
+    ) -> Self {
+        Self {
+            bootstrap_servers: bootstrap_servers.into(),
+            group_id: group_id.into(),
+            topic: topic.into(),
+            security_protocol: "PLAINTEXT".to_string(),
+            sasl_mechanism: None,
+            sasl_username: None,
+            sasl_password: None,
+        }
+    }
+
+    /// Set the security protocol.
+    #[must_use]
+    pub fn with_security_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.security_protocol = protocol.into();
+        self
+    }
+
+    /// Configure SASL authentication.
+    #[must_use]
+    pub fn with_sasl(
+        mut self,
+        mechanism: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.sasl_mechanism = Some(mechanism.into());
+        self.sasl_username = Some(username.into());
+        self.sasl_password = Some(password.into());
+        self
+    }
+
+    /// Validate the configuration.  Returns an error message if required
+    /// fields are missing or inconsistent.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.bootstrap_servers.is_empty() {
+            return Err("bootstrap_servers must not be empty".into());
+        }
+        if self.group_id.is_empty() {
+            return Err("group_id must not be empty".into());
+        }
+        if self.topic.is_empty() {
+            return Err("topic must not be empty".into());
+        }
+        // If any SASL field is set, all three must be set.
+        let sasl_fields = [
+            self.sasl_mechanism.is_some(),
+            self.sasl_username.is_some(),
+            self.sasl_password.is_some(),
+        ];
+        let sasl_count = sasl_fields.iter().filter(|&&v| v).count();
+        if sasl_count != 0 && sasl_count != 3 {
+            return Err(
+                "sasl_mechanism, sasl_username, and sasl_password must all be set together".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A [`CdcEventSource`] backed by a real Kafka broker via `rdkafka`.
+///
+/// Uses a `StreamConsumer` with group-level offset management.  After each
+/// successful `poll_events` batch the consumer commits offsets synchronously
+/// (at-least-once delivery; duplicates are possible on restart).
+///
+/// Construct with [`RdkafkaCdcEventSource::new`] and pass to
+/// [`CdcToLakehousePipeline::run_with_source`].
+#[cfg(feature = "kafka")]
+pub struct RdkafkaCdcEventSource {
+    consumer: std::sync::Arc<rdkafka::consumer::StreamConsumer>,
+    /// Maximum number of milliseconds to wait for a single message poll.
+    poll_timeout_ms: u64,
+}
+
+#[cfg(feature = "kafka")]
+impl RdkafkaCdcEventSource {
+    /// Create a new source from a [`KafkaCdcConfig`].
+    ///
+    /// Validates the config, builds a `StreamConsumer`, and subscribes to the
+    /// configured topic.  Returns an error string if configuration or consumer
+    /// creation fails.
+    pub fn new(config: &KafkaCdcConfig) -> Result<Self, String> {
+        use rdkafka::ClientConfig;
+        use rdkafka::consumer::Consumer;
+
+        config.validate()?;
+
+        let mut client_config = ClientConfig::new();
+        client_config
+            .set("bootstrap.servers", &config.bootstrap_servers)
+            .set("group.id", &config.group_id)
+            .set("security.protocol", &config.security_protocol)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest");
+
+        if let (Some(mechanism), Some(username), Some(password)) = (
+            &config.sasl_mechanism,
+            &config.sasl_username,
+            &config.sasl_password,
+        ) {
+            client_config
+                .set("sasl.mechanisms", mechanism)
+                .set("sasl.username", username)
+                .set("sasl.password", password);
+        }
+
+        let consumer: rdkafka::consumer::StreamConsumer = client_config
+            .create()
+            .map_err(|e| format!("rdkafka consumer creation failed: {e}"))?;
+
+        consumer
+            .subscribe(&[config.topic.as_str()])
+            .map_err(|e| format!("rdkafka subscribe failed: {e}"))?;
+
+        Ok(Self {
+            consumer: std::sync::Arc::new(consumer),
+            poll_timeout_ms: 100,
+        })
+    }
+
+    /// Override the per-message poll timeout (default: 100 ms).
+    #[must_use]
+    pub fn with_poll_timeout_ms(mut self, ms: u64) -> Self {
+        self.poll_timeout_ms = ms;
+        self
+    }
+
+    /// Commit consumer group offsets for the currently assigned partitions.
+    ///
+    /// Called internally after a successful batch is handed to the pipeline.
+    /// On failure the error is logged but does not abort the pipeline (the
+    /// consumer will reprocess from the last committed offset on restart,
+    /// providing at-least-once semantics).
+    fn commit_offsets(&self) {
+        use rdkafka::consumer::Consumer;
+        if let Err(e) = self.consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
+            tracing::warn!(error = %e, "rdkafka offset commit failed (at-least-once: will reprocess on restart)");
+        }
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl CdcEventSource for RdkafkaCdcEventSource {
+    /// Poll up to `max` Debezium JSON strings from Kafka.
+    ///
+    /// Each call blocks for at most `poll_timeout_ms` per message.  Returns an
+    /// empty `Vec` when no messages are available within the timeout window
+    /// (the pipeline interprets this as a momentary idle, not shutdown).
+    /// Commits consumer offsets after assembling the batch.
+    fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+        use rdkafka::Message;
+
+        let rt = tokio::runtime::Handle::current();
+        let mut events = Vec::with_capacity(max.min(64));
+
+        for _ in 0..max {
+            // poll() is sync in the rdkafka non-async path but StreamConsumer
+            // also provides it; we use recv() with a timeout via the blocking
+            // adapter so we stay on the tokio runtime.
+            let msg = rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(self.poll_timeout_ms),
+                    self.consumer.recv(),
+                )
+                .await
+            });
+
+            match msg {
+                // Timed out – no more messages available right now.
+                Err(_timeout) => break,
+                Ok(Err(e)) => {
+                    return Err(format!("rdkafka receive error: {e}"));
+                }
+                Ok(Ok(msg)) => {
+                    let payload = match msg.payload_view::<str>() {
+                        Some(Ok(s)) => s.to_string(),
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                error = ?e,
+                                partition = msg.partition(),
+                                offset = msg.offset(),
+                                "skipping message with invalid UTF-8 payload"
+                            );
+                            continue;
+                        }
+                        None => {
+                            tracing::warn!(
+                                partition = msg.partition(),
+                                offset = msg.offset(),
+                                "skipping tombstone message (null payload)"
+                            );
+                            continue;
+                        }
+                    };
+                    events.push(payload);
+                }
+            }
+        }
+
+        if !events.is_empty() {
+            self.commit_offsets();
+        }
+
+        Ok(events)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,7 @@ bytes = { workspace = true }
 krishiv-proto = { path = "../krishiv-proto" }
 object_store = { workspace = true }
 parquet = { workspace = true }
+rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
 regex = "1"
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -22,6 +23,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+kafka = ["dep:rdkafka"]
 
 [lints]
 workspace = true
