@@ -17,6 +17,8 @@ parquet = { workspace = true }
 tokio = { workspace = true, features = ["fs", "net"] }
 futures = { workspace = true }
 tonic = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

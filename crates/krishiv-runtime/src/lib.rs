@@ -320,6 +320,51 @@ impl ExecutionBackend for SingleNodeBackend {
     }
 }
 
+/// Distributed backend that routes plan execution to a remote coordinator.
+///
+/// The `flight_url` is the Arrow Flight endpoint of the remote coordinator
+/// (e.g. `http://coordinator:50051`).  In the current release slice the
+/// transport is a stub that logs the submission and returns success; full
+/// gRPC dispatch lands in R13.
+#[derive(Debug, Clone)]
+pub struct DistributedBackend {
+    flight_url: String,
+}
+
+impl DistributedBackend {
+    pub fn new(flight_url: impl Into<String>) -> Self {
+        Self {
+            flight_url: flight_url.into(),
+        }
+    }
+
+    pub fn flight_url(&self) -> &str {
+        &self.flight_url
+    }
+}
+
+impl ExecutionBackend for DistributedBackend {
+    fn backend_name(&self) -> &str {
+        "distributed"
+    }
+
+    fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        debug!(
+            backend = "distributed",
+            coordinator = %self.flight_url,
+            plan = %plan.name(),
+            kind = %plan.kind(),
+            "DistributedBackend: forwarding plan to remote coordinator"
+        );
+        Ok(ExecutionReport::new(
+            self.backend_name(),
+            plan.name(),
+            plan.kind(),
+            true,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use krishiv_plan::{ExecutionKind, PhysicalPlan};

@@ -68,6 +68,14 @@ message ExecutorHeartbeatRequest {
   uint64 lease_generation = 3;
   ExecutorState state = 4;
   repeated TaskAttemptRef running_attempts = 5;
+  // Per-executor resource telemetry (P0.17).
+  uint64 memory_used_bytes = 6;
+  uint64 memory_limit_bytes = 7;
+  uint32 active_task_count = 8;
+  // Per-executor network and CPU resource usage (P0.17).
+  double cpu_cores_used = 9;
+  uint64 network_bytes_sent = 10;
+  uint64 network_bytes_recv = 11;
 }
 
 message ExecutorHeartbeatResponse {

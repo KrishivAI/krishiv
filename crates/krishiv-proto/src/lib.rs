@@ -1669,6 +1669,12 @@ pub struct ExecutorHeartbeatRequest {
     memory_used_bytes: Option<u64>,
     memory_limit_bytes: Option<u64>,
     active_task_count: Option<u32>,
+    /// CPU cores currently in use by this executor (P0.17).
+    cpu_cores_used: Option<f64>,
+    /// Network bytes sent by this executor since the last heartbeat (P0.17).
+    network_bytes_sent: Option<u64>,
+    /// Network bytes received by this executor since the last heartbeat (P0.17).
+    network_bytes_recv: Option<u64>,
     /// Per-task streaming state for the re-attach protocol.
     /// Populated on the first heartbeat after a coordinator restart by executors
     /// that have running streaming tasks, so the coordinator can resume tracking
@@ -1698,6 +1704,9 @@ impl ExecutorHeartbeatRequest {
             memory_used_bytes: None,
             memory_limit_bytes: None,
             active_task_count: None,
+            cpu_cores_used: None,
+            network_bytes_sent: None,
+            network_bytes_recv: None,
             streaming_task_states: Vec::new(),
             hot_key_reports: Vec::new(),
             trace_context: None,
@@ -1751,6 +1760,27 @@ impl ExecutorHeartbeatRequest {
         self
     }
 
+    /// Attach CPU cores in use (P0.17).
+    #[must_use]
+    pub fn with_cpu_cores_used(mut self, cores: f64) -> Self {
+        self.cpu_cores_used = Some(cores);
+        self
+    }
+
+    /// Attach network bytes sent since the last heartbeat (P0.17).
+    #[must_use]
+    pub fn with_network_bytes_sent(mut self, bytes: u64) -> Self {
+        self.network_bytes_sent = Some(bytes);
+        self
+    }
+
+    /// Attach network bytes received since the last heartbeat (P0.17).
+    #[must_use]
+    pub fn with_network_bytes_recv(mut self, bytes: u64) -> Self {
+        self.network_bytes_recv = Some(bytes);
+        self
+    }
+
     /// Attach streaming task states for the re-attach protocol.
     #[must_use]
     pub fn with_streaming_task_states(mut self, states: Vec<StreamingTaskState>) -> Self {
@@ -1796,6 +1826,21 @@ impl ExecutorHeartbeatRequest {
     /// Active task count.
     pub fn active_task_count(&self) -> Option<u32> {
         self.active_task_count
+    }
+
+    /// CPU cores in use on this executor (P0.17).
+    pub fn cpu_cores_used(&self) -> Option<f64> {
+        self.cpu_cores_used
+    }
+
+    /// Network bytes sent by this executor since the last heartbeat (P0.17).
+    pub fn network_bytes_sent(&self) -> Option<u64> {
+        self.network_bytes_sent
+    }
+
+    /// Network bytes received by this executor since the last heartbeat (P0.17).
+    pub fn network_bytes_recv(&self) -> Option<u64> {
+        self.network_bytes_recv
     }
 
     /// Per-task streaming state for the re-attach protocol.
@@ -2814,6 +2859,8 @@ pub mod wire {
     }
 
     /// Convert a domain heartbeat request to protobuf.
+    ///
+    /// P0.17: Maps ALL task-resource fields so none are silently dropped.
     pub fn executor_heartbeat_request_to_wire(
         value: ExecutorHeartbeatRequest,
     ) -> v1::ExecutorHeartbeatRequest {
@@ -2827,10 +2874,18 @@ pub mod wire {
                 .iter()
                 .map(task_attempt_ref_to_wire)
                 .collect(),
+            memory_used_bytes: value.memory_used_bytes().unwrap_or(0),
+            memory_limit_bytes: value.memory_limit_bytes().unwrap_or(0),
+            active_task_count: value.active_task_count().unwrap_or(0),
+            cpu_cores_used: value.cpu_cores_used().unwrap_or(0.0),
+            network_bytes_sent: value.network_bytes_sent().unwrap_or(0),
+            network_bytes_recv: value.network_bytes_recv().unwrap_or(0),
         }
     }
 
     /// Convert a protobuf heartbeat request to the domain contract.
+    ///
+    /// P0.17: Restores ALL task-resource fields from the wire message.
     pub fn executor_heartbeat_request_from_wire(
         value: v1::ExecutorHeartbeatRequest,
     ) -> WireResult<ExecutorHeartbeatRequest> {
@@ -2845,11 +2900,30 @@ pub mod wire {
             .map(task_attempt_ref_from_wire)
             .collect::<WireResult<Vec<_>>>()?;
 
-        Ok(
-            ExecutorHeartbeatRequest::new(executor_id, lease_generation, state)
-                .with_version(version)
-                .with_running_attempts(running_attempts),
-        )
+        let mut req = ExecutorHeartbeatRequest::new(executor_id, lease_generation, state)
+            .with_version(version)
+            .with_running_attempts(running_attempts);
+
+        if value.memory_used_bytes > 0 {
+            req = req.with_memory_used_bytes(value.memory_used_bytes);
+        }
+        if value.memory_limit_bytes > 0 {
+            req = req.with_memory_limit_bytes(value.memory_limit_bytes);
+        }
+        if value.active_task_count > 0 {
+            req = req.with_active_task_count(value.active_task_count);
+        }
+        if value.cpu_cores_used > 0.0 {
+            req = req.with_cpu_cores_used(value.cpu_cores_used);
+        }
+        if value.network_bytes_sent > 0 {
+            req = req.with_network_bytes_sent(value.network_bytes_sent);
+        }
+        if value.network_bytes_recv > 0 {
+            req = req.with_network_bytes_recv(value.network_bytes_recv);
+        }
+
+        Ok(req)
     }
 
     /// Convert a domain heartbeat response to protobuf.
@@ -4058,6 +4132,34 @@ mod tests {
         let task = TaskSpec::new(TaskId::try_new("task-plain").unwrap(), "sql: select 1");
         assert!(task.shuffle_write().is_none());
         assert!(task.shuffle_read().is_none());
+    }
+
+    // ── P0.17: heartbeat request resource fields round-trip ───────────────────
+
+    #[test]
+    fn heartbeat_request_all_resource_fields_round_trip() {
+        let request = ExecutorHeartbeatRequest::new(
+            ExecutorId::try_new("exec-rt").unwrap(),
+            LeaseGeneration::initial(),
+            ExecutorState::Healthy,
+        )
+        .with_memory_used_bytes(512 * 1024 * 1024)
+        .with_memory_limit_bytes(2 * 1024 * 1024 * 1024)
+        .with_active_task_count(4)
+        .with_cpu_cores_used(3.5)
+        .with_network_bytes_sent(1_000_000)
+        .with_network_bytes_recv(2_000_000);
+
+        let wire = super::wire::executor_heartbeat_request_to_wire(request.clone());
+        let round_trip = super::wire::executor_heartbeat_request_from_wire(wire).unwrap();
+
+        assert_eq!(round_trip.memory_used_bytes(), request.memory_used_bytes());
+        assert_eq!(round_trip.memory_limit_bytes(), request.memory_limit_bytes());
+        assert_eq!(round_trip.active_task_count(), request.active_task_count());
+        assert_eq!(round_trip.cpu_cores_used(), request.cpu_cores_used());
+        assert_eq!(round_trip.network_bytes_sent(), request.network_bytes_sent());
+        assert_eq!(round_trip.network_bytes_recv(), request.network_bytes_recv());
+        assert_eq!(round_trip, request);
     }
 
     #[test]

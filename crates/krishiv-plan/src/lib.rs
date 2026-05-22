@@ -112,6 +112,14 @@ pub enum NodeOp {
     Exchange { partitioning: Partitioning },
     /// Output sink.
     Sink { format: String },
+    /// AQE coalesce: merge many small partitions into fewer larger ones.
+    ///
+    /// Inserted by the AQE `CoalesceRule` when runtime statistics show that
+    /// partition count can be reduced to improve downstream task efficiency.
+    CoalescePartitions {
+        /// Number of output partitions after coalescing.
+        target_partitions: usize,
+    },
     /// Operator not covered by the above variants.
     Other { description: String },
 }
@@ -386,6 +394,9 @@ impl LogicalPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalPlan {
     pub(crate) core: PlanCore,
+    /// Post-AQE coalesced partition count set by `CoalesceRule::apply`.
+    /// `None` means coalescing has not been applied.
+    coalesced_partition_count: Option<usize>,
 }
 
 impl PhysicalPlan {
@@ -393,7 +404,19 @@ impl PhysicalPlan {
     pub fn new(name: impl Into<String>, kind: ExecutionKind) -> Self {
         Self {
             core: PlanCore::new(name, kind),
+            coalesced_partition_count: None,
         }
+    }
+
+    /// Return the post-AQE coalesced partition count, if set by `CoalesceRule`.
+    pub fn coalesced_partition_count(&self) -> Option<usize> {
+        self.coalesced_partition_count
+    }
+
+    /// Set the coalesced partition count (called by `CoalesceRule::apply`).
+    pub fn with_coalesced_partition_count(mut self, count: usize) -> Self {
+        self.coalesced_partition_count = Some(count);
+        self
     }
 
     /// Add a node to the plan.
@@ -696,6 +719,9 @@ mod tests {
             },
             NodeOp::Sink {
                 format: String::from("parquet"),
+            },
+            NodeOp::CoalescePartitions {
+                target_partitions: 4,
             },
             NodeOp::Other {
                 description: String::from("custom"),

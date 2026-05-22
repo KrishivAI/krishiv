@@ -109,16 +109,16 @@ fn fault_injector_empty_returns_none() {
 }
 
 /// Leader election simulation: acquire sets is_leader, release clears it.
-#[test]
-fn leader_election_simulation_acquire_release() {
+#[tokio::test]
+async fn leader_election_simulation_acquire_release() {
     use krishiv_operator::K8sLeaseElection;
     use krishiv_scheduler::LeaderElection;
 
     let election = K8sLeaseElection::new("chaos-job", "default", "pod-a");
     assert!(!election.is_leader());
-    assert!(election.try_acquire());
+    assert!(election.try_acquire().await);
     assert!(election.is_leader());
-    assert!(election.renew(), "renewal must succeed while leader");
-    election.release();
+    assert!(election.renew().await, "renewal must succeed while leader");
+    election.release().await;
     assert!(!election.is_leader());
 }

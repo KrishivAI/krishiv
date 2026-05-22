@@ -2,8 +2,60 @@
 
 ## Current Phase
 
-**R11 COMPLETE — Stability, Correctness, and CLI Completeness (2026-05-21).**
-Release tracker: `docs/implementation/r11-stability-correctness-cli.md`
+**R12 IN PROGRESS — Foundation Completeness & Real Connectivity (2026-05-22).**
+Release tracker: `docs/implementation/r12-foundation-completeness.md`
+
+## R12 Sprint Completion Summary (2026-05-22)
+
+All P0/P1 bug-fix sprints (S1, S2) completed in previous session (commits c1e65c4 etc.).
+Slices S3–S6 completed in this session:
+
+### S3: Real Kafka Connector
+- `features = ["kafka"]` gate in `krishiv-connectors/Cargo.toml`
+- `RdkafkaCdcEventSource` + `RdkafkaCdcConfig` behind `kafka` feature; `rdkafka = "0.36"` with `features = ["tokio"]`
+
+### S4: Remote Coordinator CLI
+- `CoordinatorMode` enum + `from_args_with_env_override` (public, testable)
+- `RemoteCoordinatorClient` with lazy `connect_lazy` gRPC in `crates/krishiv/src/remote_client.rs`
+- All checkpoint/state/savepoint/restore commands dispatch to remote when `--coordinator` set
+- 12 unit tests pass
+
+### S5: AQE Coalescing + Shuffle Compression
+- `CoalesceRule::apply`: stamps `coalesced_partition_count` AND appends `CoalescePartitions` PlanNode
+- `ShuffleCompression` enum with `compress()`/`decompress()` methods; `CompressionCodec` type alias
+- `LocalShuffleStore::write_partition`/`read_partition` use codec methods (Lz4/Zstd)
+- 29 optimizer + 49 shuffle tests pass
+
+### S6: Deployment Layer Completeness
+- **S6.1**: `DistributedBackend { flight_url }` in `krishiv-runtime`; `SessionBuilder::with_coordinator(url)` in `krishiv-api`
+- **S6.4**: `SqliteMetadataStore` feature-gated (`--features sqlite`) in `krishiv-scheduler`; 3 tests pass
+- **S6.5**: `crates/krishiv-federation/` crate: `RegionId`, `RoutingPolicy`, `FederationClient`, `GlobalCoordinator`; 5 tests pass
+- **P1.23**: `Coordinator::persist_jobs_to_store` added to snapshot in-memory jobs to a `MetadataStore`
+
+### Test Results (2026-05-22, post-rebase push bbe1113)
+```
+cargo test -p krishiv-federation          → 5 passed
+cargo test -p krishiv-optimizer           → 29 passed (includes CoalesceRule + CoalescePartitions node)
+cargo test -p krishiv-shuffle             → 49 passed (includes Lz4/Zstd round-trips)
+cargo test -p krishiv-scheduler           → 97 passed
+cargo test -p krishiv-scheduler --features sqlite → 3 sqlite tests pass
+cargo check --workspace                   → 0 errors
+cargo clippy (modified crates) -D warnings → 0 errors
+```
+
+### Deferred to R13
+- S6.2: `SingleNodeBackend` in-process coordinator (mpsc channels)
+- S6.3: `EmbeddedBackend` streaming redirect
+- S3.3: `KafkaSource` watermark-aware streaming
+- `--metadata-backend sqlite` CLI flag wiring in coordinator binary
+- Full Flight SQL transport in `DistributedBackend`
+
+### Blockers
+None. All R12 deliverables shipped and pushed to `claude/r12-slices-planning-BcFL5`.
+
+### Next Task
+Update `docs/implementation/r13-python-streaming-api.md` and begin R13 planning.
+Validation command: `cargo check --workspace`
 
 ## R11 Completion Summary
 

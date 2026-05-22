@@ -196,6 +196,28 @@ impl AuditSink for TracingAuditSink {
 static GLOBAL_AUDIT_SINK: std::sync::OnceLock<Box<dyn AuditSink + Send + Sync>> =
     std::sync::OnceLock::new();
 
+// P0.21 — Dedup key for the last-emitted audit event.
+//
+// Stores a hash of `(principal, action_name, detail)` for the most recently
+// emitted event.  If two consecutive calls produce the same key the second
+// emission is suppressed and a warning is logged instead.
+static LAST_AUDIT_KEY: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Compute a stable 64-bit dedup key for an audit event.
+fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(principal.as_bytes());
+    h.update(b"\x00");
+    h.update(action_name.as_bytes());
+    h.update(b"\x00");
+    h.update(detail.as_bytes());
+    let digest = h.finalize();
+    // Use the first 8 bytes as a u64 key – collisions are astronomically rare
+    // for the sequential-emission dedup use case.
+    u64::from_le_bytes(digest[..8].try_into().expect("sha256 is at least 8 bytes"))
+}
+
 /// Install a custom [`AuditSink`] for the lifetime of the process.
 ///
 /// Must be called before the first `audit_log` invocation.  Subsequent calls are
@@ -214,6 +236,10 @@ fn get_audit_sink() -> &'static dyn AuditSink {
 ///
 /// In production, the `tracing` subscriber routes these to the audit log
 /// destination configured by `krishiv-metrics::init()`.
+///
+/// Duplicate events are suppressed: if two consecutive calls produce the same
+/// `(principal, action, detail)` triple the second emission is skipped and a
+/// warning is logged instead (P0.21 deduplication).
 ///
 /// # Parameters
 /// - `principal`: identity of the actor performing the action.
@@ -235,6 +261,23 @@ pub fn audit_log(principal: &str, action: &AuditAction<'_>, outcome: AuditOutcom
         ),
         AuditAction::AdminAction { description } => ("admin_action", (*description).to_owned()),
     };
+
+    // P0.21 — Deduplication: skip if this event is identical to the last one.
+    let key = audit_dedup_key(principal, action_name, &detail);
+    {
+        let mut last = LAST_AUDIT_KEY.lock().unwrap_or_else(|p| p.into_inner());
+        if *last == Some(key) {
+            tracing::warn!(
+                target: "krishiv::audit",
+                principal = principal,
+                action = action_name,
+                "duplicate audit event suppressed",
+            );
+            return;
+        }
+        *last = Some(key);
+    }
+
     let event = AuditEvent {
         principal: principal.to_string(),
         action: action_name.to_string(),
@@ -316,11 +359,21 @@ pub struct LineageDataset {
 
 /// **Beta API**: Error emitting an OpenLineage event.
 #[derive(Debug)]
-pub struct EmitError(pub String);
+pub enum EmitError {
+    /// The HTTP transport failed (connection error, timeout, etc.).
+    Transport(String),
+    /// The server rejected the event with a 4xx or 5xx status.
+    SinkRejected { status: u16, message: String },
+}
 
 impl std::fmt::Display for EmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "emit error: {}", self.0)
+        match self {
+            EmitError::Transport(msg) => write!(f, "emit transport error: {msg}"),
+            EmitError::SinkRejected { status, message } => {
+                write!(f, "emit rejected by sink: HTTP {status} — {message}")
+            }
+        }
     }
 }
 
@@ -349,7 +402,8 @@ pub struct LoggingEmitter;
 #[async_trait::async_trait]
 impl OpenLineageEmitter for LoggingEmitter {
     async fn emit(&self, event: RunEvent) -> Result<(), EmitError> {
-        let json = serde_json::to_string(&event).map_err(|e| EmitError(e.to_string()))?;
+        let json =
+            serde_json::to_string(&event).map_err(|e| EmitError::Transport(e.to_string()))?;
         tracing::info!(target: "krishiv::lineage", event = json.as_str(), "openlineage event");
         Ok(())
     }
@@ -374,12 +428,21 @@ impl HttpEmitter {
 #[async_trait::async_trait]
 impl OpenLineageEmitter for HttpEmitter {
     async fn emit(&self, event: RunEvent) -> Result<(), EmitError> {
-        self.client
+        let response = self
+            .client
             .post(&self.endpoint)
             .json(&event)
             .send()
             .await
-            .map_err(|e| EmitError(e.to_string()))?;
+            .map_err(|e| EmitError::Transport(e.to_string()))?;
+
+        // P0.20: propagate 4xx/5xx instead of silently ignoring them.
+        if let Err(e) = response.error_for_status_ref() {
+            let status = e.status().map_or(0, |s| s.as_u16());
+            let message = e.to_string();
+            return Err(EmitError::SinkRejected { status, message });
+        }
+
         Ok(())
     }
 }
@@ -595,5 +658,149 @@ mod tests {
         let emitter = NoOpEmitter;
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok());
+    }
+
+    // ── P0.15 — Deterministic hash masking ───────────────────────────────────
+
+    #[test]
+    fn audit_dedup_key_is_deterministic() {
+        // P0.15: the same input must always produce the same hash.
+        let key1 = super::audit_dedup_key("alice", "job_submitted", "job_id=j1");
+        let key2 = super::audit_dedup_key("alice", "job_submitted", "job_id=j1");
+        assert_eq!(key1, key2, "audit_dedup_key must be deterministic");
+    }
+
+    #[test]
+    fn audit_dedup_key_differs_for_different_inputs() {
+        let key1 = super::audit_dedup_key("alice", "job_submitted", "job_id=j1");
+        let key2 = super::audit_dedup_key("bob", "job_submitted", "job_id=j1");
+        assert_ne!(key1, key2);
+    }
+
+    // ── P0.21 — Audit deduplication ──────────────────────────────────────────
+
+    #[test]
+    fn audit_log_dedup_suppresses_consecutive_identical_events() {
+        // Reset the global dedup state so this test is not affected by other tests.
+        {
+            let mut last = LAST_AUDIT_KEY.lock().unwrap();
+            *last = None;
+        }
+
+        // Use a thread-local collector; we can't replace the global sink mid-test
+        // because it is a OnceLock and may already be initialised.  Instead we
+        // verify dedup by inspecting LAST_AUDIT_KEY directly.
+
+        // First call – should be emitted (key updated).
+        audit_log(
+            "dedup_user",
+            &AuditAction::JobSubmitted { job_id: "dup-job" },
+            AuditOutcome::Allowed,
+        );
+        let key_after_first = *LAST_AUDIT_KEY.lock().unwrap();
+        assert!(key_after_first.is_some(), "key must be set after first emission");
+
+        // Second identical call – should be suppressed (key unchanged).
+        audit_log(
+            "dedup_user",
+            &AuditAction::JobSubmitted { job_id: "dup-job" },
+            AuditOutcome::Allowed,
+        );
+        let key_after_second = *LAST_AUDIT_KEY.lock().unwrap();
+        assert_eq!(
+            key_after_first, key_after_second,
+            "duplicate event must not change the stored key"
+        );
+
+        // A different event should be emitted and update the key.
+        audit_log(
+            "dedup_user",
+            &AuditAction::JobSubmitted { job_id: "different-job" },
+            AuditOutcome::Allowed,
+        );
+        let key_after_different = *LAST_AUDIT_KEY.lock().unwrap();
+        assert_ne!(
+            key_after_first, key_after_different,
+            "a different event must update the stored key"
+        );
+    }
+
+    // ── P0.20: HttpEmitter error-for-status tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn http_emitter_400_returns_sink_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(400)
+            .with_body("bad request")
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        let result = emitter.emit(event).await;
+        assert!(result.is_err(), "400 must be an error");
+        if let Err(EmitError::SinkRejected { status, .. }) = result {
+            assert_eq!(status, 400);
+        } else {
+            panic!("expected SinkRejected, got: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_emitter_429_returns_sink_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(429)
+            .with_body("rate limited")
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        let result = emitter.emit(event).await;
+        assert!(result.is_err(), "429 must be an error");
+        if let Err(EmitError::SinkRejected { status, .. }) = result {
+            assert_eq!(status, 429);
+        } else {
+            panic!("expected SinkRejected, got: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_emitter_500_returns_sink_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(500)
+            .with_body("internal server error")
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        let result = emitter.emit(event).await;
+        assert!(result.is_err(), "500 must be an error");
+        if let Err(EmitError::SinkRejected { status, .. }) = result {
+            assert_eq!(status, 500);
+        } else {
+            panic!("expected SinkRejected, got: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_emitter_200_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/lineage")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
+        let event = sample_run_event();
+        assert!(emitter.emit(event).await.is_ok(), "200 must succeed");
     }
 }

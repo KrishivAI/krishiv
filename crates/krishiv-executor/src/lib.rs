@@ -4852,10 +4852,11 @@ mod tests {
             (task_id, lease)
         };
 
-        // Simulate coordinator restart: load job records from store and start grace period.
+        // Simulate coordinator restart: persist live jobs, then reload from store.
         {
             let mut coordinator = shared.write().unwrap();
-            let store = InMemoryMetadataStore::default();
+            let mut store = InMemoryMetadataStore::default();
+            coordinator.persist_jobs_to_store(&mut store).unwrap();
             coordinator.recover_from_store(&store).unwrap();
         }
 

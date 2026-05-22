@@ -37,6 +37,14 @@ pub struct ShufflePath {
 }
 
 impl ShufflePath {
+    pub fn new(job_id: impl Into<String>, stage_id: impl Into<String>, partition_id: u32) -> Self {
+        Self {
+            job_id: job_id.into(),
+            stage_id: stage_id.into(),
+            partition_id,
+        }
+    }
+
     /// Returns the staging path: `{job_id}/{stage_id}/{partition_id}.tmp`
     pub fn staging_name(&self) -> String {
         format!(
@@ -106,7 +114,9 @@ impl ShuffleMetadata {
     /// Returns `TooManyPartitions` when the cap is already reached.
     pub fn mark_pending(&mut self, path: &ShufflePath) -> ShuffleResult<()> {
         if self.states.len() >= self.max_partitions && !self.states.contains_key(path) {
-            return Err(ShuffleError::TooManyPartitions { limit: self.max_partitions });
+            return Err(ShuffleError::TooManyPartitions {
+                limit: self.max_partitions,
+            });
         }
         self.states.insert(path.clone(), PartitionState::Pending);
         Ok(())
@@ -204,7 +214,10 @@ impl std::fmt::Display for ShuffleError {
             ),
             Self::NotFound { path } => write!(f, "shuffle path not found: {path}"),
             Self::TooManyPartitions { limit } => {
-                write!(f, "shuffle partition limit exceeded: max {limit} partitions")
+                write!(
+                    f,
+                    "shuffle partition limit exceeded: max {limit} partitions"
+                )
             }
         }
     }
@@ -221,18 +234,49 @@ impl From<std::io::Error> for ShuffleError {
 /// Convenience alias for `Result<T, ShuffleError>`.
 pub type ShuffleResult<T> = Result<T, ShuffleError>;
 
-// ── CompressionCodec ──────────────────────────────────────────────────────────
+// ── ShuffleCompression / CompressionCodec ────────────────────────────────────
 
-/// Compression codec for shuffle partition data.
+/// Compression algorithm for shuffle block data.
+///
+/// Used in [`ShuffleWriteConfig`] and [`ShuffleReadConfig`] to specify
+/// how shuffle blocks are compressed on write and decompressed on read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CompressionCodec {
+pub enum ShuffleCompression {
     /// No compression (default).
     #[default]
     None,
-    /// LZ4 frame compression (reserved for future implementation).
+    /// LZ4 frame compression via `lz4_flex`.
     Lz4,
-    /// Zstandard compression (reserved for future implementation).
+    /// Zstandard compression via `zstd`.
     Zstd,
+}
+
+/// Compression codec — type alias for [`ShuffleCompression`].
+pub type CompressionCodec = ShuffleCompression;
+
+impl ShuffleCompression {
+    /// Compress `data` using this codec. Returns the compressed bytes.
+    pub fn compress(self, data: &[u8]) -> ShuffleResult<Vec<u8>> {
+        match self {
+            ShuffleCompression::None => Ok(data.to_vec()),
+            ShuffleCompression::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
+            ShuffleCompression::Zstd => {
+                zstd::encode_all(data, 0).map_err(|e| ShuffleError::Io(e.to_string()))
+            }
+        }
+    }
+
+    /// Decompress `data` using this codec. Returns the original bytes.
+    pub fn decompress(self, data: &[u8]) -> ShuffleResult<Vec<u8>> {
+        match self {
+            ShuffleCompression::None => Ok(data.to_vec()),
+            ShuffleCompression::Lz4 => lz4_flex::decompress_size_prepended(data)
+                .map_err(|e| ShuffleError::Io(e.to_string())),
+            ShuffleCompression::Zstd => {
+                zstd::decode_all(data).map_err(|e| ShuffleError::Io(e.to_string()))
+            }
+        }
+    }
 }
 
 // ── LocalShuffleStore ─────────────────────────────────────────────────────────
@@ -269,12 +313,15 @@ impl LocalShuffleStore {
         self.compression
     }
 
-    /// Write `data` to disk for the given partition.
+    /// Write `data` to disk for the given partition, applying the configured
+    /// compression codec before writing.
     ///
-    /// 1. Creates `{base_dir}/{staging_name}` (including parent dirs).
-    /// 2. Writes `data`.
-    /// 3. Atomically renames staging path → final path.
+    /// 1. Compresses `data` with the configured codec.
+    /// 2. Creates `{base_dir}/{staging_name}` (including parent dirs).
+    /// 3. Writes the compressed bytes.
+    /// 4. Atomically renames staging path → final path.
     pub async fn write_partition(&self, path: &ShufflePath, data: &[u8]) -> ShuffleResult<()> {
+        let compressed = self.compression.compress(data)?;
         let staging = self.base_dir.join(path.staging_name());
         let final_path = self.base_dir.join(path.final_name());
 
@@ -283,18 +330,18 @@ impl LocalShuffleStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(&staging, data).await?;
+        tokio::fs::write(&staging, &compressed).await?;
         tokio::fs::rename(&staging, &final_path).await?;
         Ok(())
     }
 
-    /// Read the bytes for a partition.
+    /// Read the bytes for a partition, decompressing with the configured codec.
     ///
     /// Returns `PartitionNotFound` if the final path does not exist.
     pub async fn read_partition(&self, path: &ShufflePath) -> ShuffleResult<Vec<u8>> {
         let final_path = self.base_dir.join(path.final_name());
         match tokio::fs::read(&final_path).await {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => self.compression.decompress(&bytes),
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(ShuffleError::PartitionNotFound {
                     path: final_path.display().to_string(),
@@ -752,8 +799,6 @@ impl ShuffleStore for LocalDiskShuffleStore {
         partition: ShufflePartition,
         lease_token: u64,
     ) -> StoreResult<()> {
-        use parquet::arrow::ArrowWriter;
-
         let key = (
             partition.id.job_id.clone(),
             partition.id.stage_id.clone(),
@@ -780,80 +825,107 @@ impl ShuffleStore for LocalDiskShuffleStore {
         }
 
         let path = self.partition_path(&partition.id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ShuffleError::Io(format!("failed to create partition dir: {e}")))?;
-        }
 
-        let file = std::fs::File::create(&path).map_err(|e| {
-            ShuffleError::Io(format!(
-                "failed to create partition file '{}': {e}",
-                path.display()
-            ))
-        })?;
+        // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
+        // async executor thread is never stalled by synchronous disk calls.
+        tokio::task::spawn_blocking(move || {
+            use parquet::arrow::ArrowWriter;
 
-        let schema = partition.schema.clone();
-        let mut writer = ArrowWriter::try_new(file, schema, None)
-            .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ShuffleError::Io(format!("failed to create partition dir: {e}"))
+                })?;
+            }
 
-        for batch in &partition.batches {
+            let file = std::fs::File::create(&path).map_err(|e| {
+                ShuffleError::Io(format!(
+                    "failed to create partition file '{}': {e}",
+                    path.display()
+                ))
+            })?;
+
+            let schema = partition.schema.clone();
+            let mut writer = ArrowWriter::try_new(file, schema, None)
+                .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
+
+            for batch in &partition.batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| ShuffleError::Io(format!("failed to write Parquet batch: {e}")))?;
+            }
             writer
-                .write(batch)
-                .map_err(|e| ShuffleError::Io(format!("failed to write Parquet batch: {e}")))?;
-        }
-        writer
-            .close()
-            .map_err(|e| ShuffleError::Io(format!("failed to close Parquet writer: {e}")))?;
-        Ok(())
+                .close()
+                .map_err(|e| ShuffleError::Io(format!("failed to close Parquet writer: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-        use std::fs::File;
-
         let path = self.partition_path(id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = File::open(&path).map_err(|e| {
-            ShuffleError::Io(format!(
-                "failed to open partition file '{}': {e}",
-                path.display()
-            ))
-        })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| ShuffleError::Io(format!("failed to build Parquet reader: {e}")))?;
-        let schema = builder.schema().clone();
-        let reader = builder
-            .build()
-            .map_err(|e| ShuffleError::Io(format!("failed to build Parquet batch reader: {e}")))?;
-        let mut batches = Vec::new();
-        for result in reader {
-            let batch = result
-                .map_err(|e| ShuffleError::Io(format!("error reading Parquet batch: {e}")))?;
-            batches.push(batch);
-        }
-        Ok(Some(ShufflePartition {
-            id: id.clone(),
-            schema,
-            batches,
-        }))
+        let id = id.clone();
+
+        // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
+        // async executor thread is never stalled by synchronous disk calls.
+        tokio::task::spawn_blocking(move || {
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            use std::fs::File;
+
+            if !path.exists() {
+                return Ok(None);
+            }
+            let file = File::open(&path).map_err(|e| {
+                ShuffleError::Io(format!(
+                    "failed to open partition file '{}': {e}",
+                    path.display()
+                ))
+            })?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| ShuffleError::Io(format!("failed to build Parquet reader: {e}")))?;
+            let schema = builder.schema().clone();
+            let reader = builder.build().map_err(|e| {
+                ShuffleError::Io(format!("failed to build Parquet batch reader: {e}"))
+            })?;
+            let mut batches = Vec::new();
+            for result in reader {
+                let batch = result
+                    .map_err(|e| ShuffleError::Io(format!("error reading Parquet batch: {e}")))?;
+                batches.push(batch);
+            }
+            Ok(Some(ShufflePartition {
+                id,
+                schema,
+                batches,
+            }))
+        })
+        .await
+        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
         let dir = self.base_dir.join(job_id);
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(ShuffleError::Io(format!(
-                    "failed to delete job partitions: {e}"
-                )));
+        let job_id_owned = job_id.to_owned();
+
+        // P0.4: Wrap blocking filesystem removal in spawn_blocking.
+        tokio::task::spawn_blocking(move || {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(ShuffleError::Io(format!(
+                        "failed to delete job partitions: {e}"
+                    )));
+                }
             }
-        }
-        // Clean up in-memory lease tokens for this job.
+            Ok(())
+        })
+        .await
+        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))??;
+
+        // Clean up in-memory lease tokens for this job (in-memory, safe outside spawn_blocking).
         let mut tokens = self.lease_tokens.write().unwrap();
-        tokens.retain(|(jid, _, _), _| jid != job_id);
+        tokens.retain(|(jid, _, _), _| jid != &job_id_owned);
         Ok(())
     }
 }
@@ -1011,8 +1083,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{
-        CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState, ShuffleError,
-        ShuffleMetadata, ShufflePath, cleanup_orphans, scan_orphans,
+        CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState,
+        ShuffleError, ShuffleMetadata, ShufflePath, cleanup_orphans, scan_orphans,
     };
 
     // ── ShufflePath ───────────────────────────────────────────────────────
@@ -1189,6 +1261,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
         assert_eq!(store.compression(), CompressionCodec::Lz4);
+    }
+
+    // ── Compression round-trip tests ──────────────────────────────────────
+
+    #[test]
+    fn compression_codec_none_round_trip() {
+        let data = b"hello shuffle world";
+        let compressed = CompressionCodec::None.compress(data).unwrap();
+        let decompressed = CompressionCodec::None.decompress(&compressed).unwrap();
+        assert_eq!(&decompressed, data);
+    }
+
+    #[test]
+    fn compression_codec_lz4_round_trip() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let compressed = CompressionCodec::Lz4.compress(&data).unwrap();
+        let decompressed = CompressionCodec::Lz4.decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data, "LZ4 round-trip must be byte-exact");
+    }
+
+    #[test]
+    fn compression_codec_zstd_round_trip() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let compressed = CompressionCodec::Zstd.compress(&data).unwrap();
+        let decompressed = CompressionCodec::Zstd.decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data, "Zstd round-trip must be byte-exact");
+    }
+
+    #[tokio::test]
+    async fn local_store_lz4_write_read_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
+        let path = ShufflePath::new("job-1", "stage-1", 0);
+        let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+        store.write_partition(&path, &data).await.unwrap();
+        let read_back = store.read_partition(&path).await.unwrap();
+        assert_eq!(read_back, data, "LZ4 write/read round-trip must be byte-exact");
+    }
+
+    #[tokio::test]
+    async fn local_store_zstd_write_read_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Zstd);
+        let path = ShufflePath::new("job-1", "stage-1", 0);
+        let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+        store.write_partition(&path, &data).await.unwrap();
+        let read_back = store.read_partition(&path).await.unwrap();
+        assert_eq!(read_back, data, "Zstd write/read round-trip must be byte-exact");
     }
 
     // ── Orphan detection ──────────────────────────────────────────────────

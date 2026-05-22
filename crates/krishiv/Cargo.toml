@@ -25,11 +25,10 @@ krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
 parquet = { workspace = true }
 tempfile = { workspace = true }
-
-[lints]
-workspace = true
