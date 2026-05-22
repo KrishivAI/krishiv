@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use krishiv_api::{ExecutionMode, Session};
+use krishiv_async_util::block_on;
 use krishiv_checkpoint::{LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata};
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
@@ -674,11 +675,7 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
 }
 
 fn block_on_remote<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(fut)
+    block_on(fut)
 }
 
 // ── R6: restore ───────────────────────────────────────────────────────────────
@@ -710,7 +707,6 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
             "--storage-path" if i + 1 < args.len() => { storage_path = Some(args[i + 1]); i += 2; }
             other => return CliResponse::err(format!("unexpected argument '{other}'\n\n{}", restore_help()), 2),
         }
-        i += 1;
     }
     let Some(job_id) = job_id else {
         return CliResponse::err(format!("--job is required\n\n{}", restore_help()), 2);

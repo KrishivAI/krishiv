@@ -42,26 +42,26 @@ impl S3Source {
         let path = path.into();
 
         // Download the full object.
-        let get_result = store.get(&path).await.map_err(|e| ConnectorError::Io {
+        let get_result = store.get(&path).await.map_err(|e| ConnectorError::IoStr {
             message: format!("failed to get object '{}': {e}", path),
         })?;
-        let raw: Bytes = get_result.bytes().await.map_err(|e| ConnectorError::Io {
+        let raw: Bytes = get_result.bytes().await.map_err(|e| ConnectorError::IoStr {
             message: format!("failed to read bytes from '{}': {e}", path),
         })?;
 
         // Parse as Parquet.
         let builder =
-            ParquetRecordBatchReaderBuilder::try_new(raw).map_err(|e| ConnectorError::Io {
+            ParquetRecordBatchReaderBuilder::try_new(raw).map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to build Parquet reader for '{}': {e}", path),
             })?;
         let schema = builder.schema().clone();
-        let reader = builder.build().map_err(|e| ConnectorError::Io {
+        let reader = builder.build().map_err(|e| ConnectorError::IoStr {
             message: format!("failed to build Parquet batch reader for '{}': {e}", path),
         })?;
 
         let mut batches = Vec::new();
         for result in reader {
-            let batch = result.map_err(|e| ConnectorError::Io {
+            let batch = result.map_err(|e| ConnectorError::IoStr {
                 message: format!("error reading Parquet batch from '{}': {e}", path),
             })?;
             batches.push(batch);
@@ -167,7 +167,7 @@ impl Sink for S3Sink {
             return Ok(());
         }
 
-        let schema = self.schema.clone().ok_or_else(|| ConnectorError::Io {
+        let schema = self.schema.clone().ok_or_else(|| ConnectorError::IoStr {
             message: "S3Sink::flush: schema not set (no batches written)".into(),
         })?;
 
@@ -175,15 +175,15 @@ impl Sink for S3Sink {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut writer =
-                ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| ConnectorError::Io {
+                ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| ConnectorError::IoStr {
                     message: format!("failed to create Parquet writer: {e}"),
                 })?;
             for batch in &self.pending {
-                writer.write(batch).map_err(|e| ConnectorError::Io {
+                writer.write(batch).map_err(|e| ConnectorError::IoStr {
                     message: format!("failed to write Parquet batch: {e}"),
                 })?;
             }
-            writer.close().map_err(|e| ConnectorError::Io {
+            writer.close().map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to close Parquet writer: {e}"),
             })?;
         }
@@ -193,7 +193,7 @@ impl Sink for S3Sink {
         self.store
             .put(&self.path, payload)
             .await
-            .map_err(|e| ConnectorError::Io {
+            .map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to put object '{}': {e}", self.path),
             })?;
 
