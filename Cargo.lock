@@ -3109,6 +3109,8 @@ dependencies = [
  "krishiv-udf",
  "parquet 58.3.0",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
