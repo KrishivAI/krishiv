@@ -112,6 +112,14 @@ pub enum NodeOp {
     Exchange { partitioning: Partitioning },
     /// Output sink.
     Sink { format: String },
+    /// AQE coalesce: merge many small partitions into fewer larger ones.
+    ///
+    /// Inserted by the AQE `CoalesceRule` when runtime statistics show that
+    /// partition count can be reduced to improve downstream task efficiency.
+    CoalescePartitions {
+        /// Number of output partitions after coalescing.
+        target_partitions: usize,
+    },
     /// Operator not covered by the above variants.
     Other { description: String },
 }
@@ -696,6 +704,9 @@ mod tests {
             },
             NodeOp::Sink {
                 format: String::from("parquet"),
+            },
+            NodeOp::CoalescePartitions {
+                target_partitions: 4,
             },
             NodeOp::Other {
                 description: String::from("custom"),

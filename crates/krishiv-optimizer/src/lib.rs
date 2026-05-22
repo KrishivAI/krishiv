@@ -7,7 +7,7 @@
 //! Query Execution) extension traits that operate on runtime statistics
 //! collected during stage execution.
 
-use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
+use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
 
 // ── Cost model ────────────────────────────────────────────────────────────────
 
@@ -238,16 +238,45 @@ pub struct CoalesceAdvice {
 }
 
 /// Merges partitions whose `memory_bytes` falls below `min_partition_bytes`.
+///
+/// When coalescing is beneficial (i.e. the advised group count is smaller than
+/// the current partition count), `apply` rewrites the physical plan by appending
+/// a [`NodeOp::CoalescePartitions`] node that signals downstream operators to
+/// merge the output into `target_partitions` partitions.
 pub struct CoalesceRule {
+    /// Partitions smaller than this threshold (bytes) are candidates for merging.
     min_partition_bytes: u64,
+    /// Target size for each merged partition (bytes).
+    ///
+    /// Used to determine `target_partitions = ceil(total_bytes / target_partition_bytes)`
+    /// when inserting a `CoalescePartitions` node.  Default: 128 MiB.
+    target_partition_bytes: u64,
 }
+
+/// Default target partition size: 128 MiB.
+const DEFAULT_TARGET_PARTITION_BYTES: u64 = 134_217_728;
 
 impl CoalesceRule {
     /// Create a new `CoalesceRule` with the given minimum partition byte threshold.
+    ///
+    /// Uses the default `target_partition_bytes` of 128 MiB.
     pub fn new(min_partition_bytes: u64) -> Self {
         Self {
             min_partition_bytes,
+            target_partition_bytes: DEFAULT_TARGET_PARTITION_BYTES,
         }
+    }
+
+    /// Set a custom `target_partition_bytes` (bytes per merged output partition).
+    #[must_use]
+    pub fn with_target_partition_bytes(mut self, target_partition_bytes: u64) -> Self {
+        self.target_partition_bytes = target_partition_bytes;
+        self
+    }
+
+    /// Return the configured `target_partition_bytes`.
+    pub fn target_partition_bytes(&self) -> u64 {
+        self.target_partition_bytes
     }
 
     /// Compute coalesce advice from per-partition stats, without modifying the plan.
@@ -281,6 +310,19 @@ impl CoalesceRule {
 
         CoalesceAdvice { groups }
     }
+
+    /// Compute the target partition count based on total bytes and `target_partition_bytes`.
+    ///
+    /// Returns `ceil(total_bytes / target_partition_bytes)`, with a minimum of 1.
+    fn target_partitions_from_stats(&self, stats: &[RuntimeStats]) -> usize {
+        let total_bytes: u64 = stats.iter().map(|s| s.memory_bytes).sum();
+        if total_bytes == 0 || self.target_partition_bytes == 0 {
+            return 1;
+        }
+        // ceiling division
+        ((total_bytes + self.target_partition_bytes - 1) / self.target_partition_bytes)
+            .max(1) as usize
+    }
 }
 
 impl AqeRule for CoalesceRule {
@@ -288,26 +330,45 @@ impl AqeRule for CoalesceRule {
         "coalesce-small-partitions"
     }
 
-    /// P1.17: Compute coalesce advice and log it, then return the plan.
+    /// Compute coalesce advice and, when beneficial, rewrite the plan.
     ///
-    /// Full plan-node rewriting requires scheduler-side support (adding
-    /// `CoalescePartitions` nodes) which is implemented in `krishiv-scheduler`.
-    /// Here we compute the advice, emit a `tracing::debug!` event so the
-    /// coordinator can observe it, and return the plan unchanged.  The scheduler
-    /// is expected to act on the logged advice in a subsequent planning round.
+    /// When `advise()` produces fewer groups than the current partition count,
+    /// this method appends a [`NodeOp::CoalescePartitions`] node to the plan
+    /// that carries the computed `target_partitions` count.  The node label
+    /// includes both the original partition count and the target for
+    /// observability in EXPLAIN output.
+    ///
+    /// When no coalescing is needed the plan is returned unchanged so the
+    /// [`AqeOptimizer`] does not record this rule as having fired.
     fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> PhysicalPlan {
         let advice = self.advise(stats);
-        if advice.groups.len() < stats.len() {
-            // At least one coalescing group was produced — log the advice.
-            tracing::debug!(
-                rule = self.name(),
-                coalesce_groups = ?advice.groups,
-                "coalesce advice: {} partition(s) → {} group(s)",
-                stats.len(),
-                advice.groups.len(),
-            );
+        let original_count = stats.len();
+
+        if advice.groups.len() >= original_count || original_count == 0 {
+            // No coalescing benefit — return unchanged.
+            return plan;
         }
-        plan
+
+        let target_partitions = self.target_partitions_from_stats(stats);
+
+        tracing::debug!(
+            rule = self.name(),
+            coalesce_groups = ?advice.groups,
+            target_partitions,
+            "coalesce: {} partition(s) → {} group(s) (target_partitions={})",
+            original_count,
+            advice.groups.len(),
+            target_partitions,
+        );
+
+        let coalesce_node = PlanNode::new(
+            "coalesce",
+            format!("CoalescePartitions({original_count} → {target_partitions})"),
+            ExecutionKind::Batch,
+        )
+        .with_op(NodeOp::CoalescePartitions { target_partitions });
+
+        plan.with_node(coalesce_node)
     }
 }
 
@@ -882,5 +943,93 @@ mod tests {
         let stats = stats_small(3);
         let (returned_plan, _) = aqe.apply(plan.clone(), &stats);
         assert_eq!(returned_plan, plan);
+    }
+
+    // ── S5.1: CoalesceRule reduces 200 small partitions to ≤ 10 ──────────
+
+    /// S5.1 test: 200 partitions × 1 MiB each → total 200 MiB.
+    ///
+    /// With `target_partition_bytes = 128 MiB`:
+    ///   target_partitions = ceil(200 MiB / 128 MiB) = 2
+    ///
+    /// All 200 partitions are "small" (1 MiB < min_partition_bytes = 128 MiB),
+    /// so `advise()` returns a single group of all 200 indices, giving
+    /// `groups.len() = 1 < original_count = 200`.
+    ///
+    /// `CoalesceRule::apply` must insert a `CoalescePartitions` node and the
+    /// resulting plan must have `target_partitions ≤ 10`.
+    #[test]
+    fn coalesce_rule_reduces_200_small_partitions() {
+        use krishiv_plan::NodeOp;
+
+        use crate::AqeRule;
+
+        const PARTITIONS: usize = 200;
+        const ONE_MIB: u64 = 1_048_576; // 1 MiB per partition
+
+        // Build stats: 200 partitions, each 1 MiB — all below the 128 MiB threshold.
+        let stats: Vec<RuntimeStats> = (0..PARTITIONS)
+            .map(|_| RuntimeStats {
+                memory_bytes: ONE_MIB,
+                ..Default::default()
+            })
+            .collect();
+
+        let rule = CoalesceRule::new(ONE_MIB * 2) // min = 2 MiB → all 200 are small
+            .with_target_partition_bytes(134_217_728); // target = 128 MiB
+
+        let plan = PhysicalPlan::new("big-job", ExecutionKind::Batch);
+        let rewritten = AqeRule::apply(&rule, plan, &stats);
+
+        // The plan must have had a CoalescePartitions node appended.
+        let coalesce_node = rewritten
+            .nodes()
+            .iter()
+            .find(|n: &&krishiv_plan::PlanNode| {
+                matches!(n.op(), Some(NodeOp::CoalescePartitions { .. }))
+            });
+
+        assert!(
+            coalesce_node.is_some(),
+            "expected a CoalescePartitions node to be inserted"
+        );
+
+        // Extract target_partitions from the node and verify it is ≤ 10.
+        if let Some(NodeOp::CoalescePartitions { target_partitions }) =
+            coalesce_node.and_then(|n: &krishiv_plan::PlanNode| n.op())
+        {
+            assert!(
+                *target_partitions <= 10,
+                "expected target_partitions ≤ 10, got {target_partitions}"
+            );
+        }
+    }
+
+    /// Verify that `CoalesceRule::apply` is a no-op when all partitions are
+    /// already large enough (no coalescing benefit).
+    #[test]
+    fn coalesce_rule_noop_when_partitions_are_large() {
+        use crate::AqeRule;
+
+        const ONE_GIB: u64 = 1_073_741_824;
+
+        // Each partition is 1 GiB — well above any threshold.
+        let stats: Vec<RuntimeStats> = (0..4)
+            .map(|_| RuntimeStats {
+                memory_bytes: ONE_GIB,
+                ..Default::default()
+            })
+            .collect();
+
+        let rule = CoalesceRule::new(1_048_576); // min = 1 MiB
+        let plan = PhysicalPlan::new("large-job", ExecutionKind::Batch);
+        let plan_clone = plan.clone();
+        let rewritten = AqeRule::apply(&rule, plan, &stats);
+
+        // No coalescing: plan must be returned unchanged.
+        assert_eq!(
+            rewritten, plan_clone,
+            "plan must be unchanged when no partitions are small"
+        );
     }
 }
