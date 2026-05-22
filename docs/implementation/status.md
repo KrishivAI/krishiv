@@ -2,8 +2,31 @@
 
 ## Current Phase
 
-**R12 IN PROGRESS — Foundation Completeness & Real Connectivity (2026-05-22).**
+**Code-Review Refactor IN PROGRESS (2026-05-22) — branch `claude/code-review-refactor-SfIid`.**
 Release tracker: `docs/implementation/r12-foundation-completeness.md`
+
+## Code-Review Refactor Session (2026-05-22)
+
+### Completed (commit 47c9a1f)
+- Extracted `krishiv-async-util` crate: panic-safe `block_on`, `unix_now_ms` helpers
+- Extracted `krishiv-sql-policy` crate: re-exports `PolicyEnforcingSqlEngine` from `krishiv-sql`
+- Added `krishiv-testkit` stub crate for future shared test utilities
+- Wired `block_on` from `krishiv-async-util` into `krishiv-api` and `krishiv/src/cli.rs`
+- Created scheduler module files: admission, checkpoint, heartbeat, job, store
+- Created exec module files: adaptive (SpaceSaving), aggregate, join, queue, window
+- Created executor module files: barrier, fragment, grpc, runner, transport
+- Fixed pre-existing double-increment bug in `run_restore` arg parser (2 tests now pass)
+- Fixed `block_on_works_inside_tokio_runtime` test to use multi-thread flavor
+
+### In Progress / Next Task
+Wire the new module files into their parent `lib.rs` with `mod` declarations and remove
+the corresponding duplicated code from lib.rs. Start with `krishiv-scheduler/src/lib.rs`
+(8449 lines → target ~4000 lines after extracting admission, checkpoint, heartbeat, job, store).
+
+Validation command: `cargo test --workspace --lib && cargo clippy --workspace -- -D warnings`
+
+### Blockers
+None. Workspace compiles clean; all lib tests pass.
 
 ## R12 Sprint Completion Summary (2026-05-22)
 
