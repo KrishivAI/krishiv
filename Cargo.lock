@@ -3422,10 +3422,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "datafusion",
- "krishiv-governance",
  "krishiv-optimizer",
  "krishiv-plan",
- "sha2",
  "tokio",
 ]
 
@@ -3433,13 +3431,18 @@ dependencies = [
 name = "krishiv-sql-policy"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "krishiv-governance",
  "krishiv-sql",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]
 name = "krishiv-state"
 version = "0.1.0"
 dependencies = [
+ "krishiv-async-util",
  "redb",
  "tempfile",
  "tokio",
