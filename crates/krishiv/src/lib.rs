@@ -121,6 +121,7 @@ pub type Result<T> = std::result::Result<T, KrishivError>;
 
 #[doc(hidden)]
 pub mod cli;
+pub mod remote_client;
 
 /// Convenient glob import for the most common Krishiv types.
 ///
