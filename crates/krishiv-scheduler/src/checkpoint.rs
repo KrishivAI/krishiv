@@ -5,8 +5,7 @@ use std::sync::Arc;
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
     OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
-    read_epoch_metadata, read_operator_snapshot, validate_epoch, write_epoch_metadata,
-    write_manifest,
+    read_operator_snapshot, write_epoch_metadata, write_manifest,
 };
 use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 
