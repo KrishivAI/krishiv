@@ -11,5 +11,8 @@ krishiv-governance = { path = "../krishiv-governance" }
 krishiv-sql = { path = "../krishiv-sql" }
 sha2 = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
 [lints]
 workspace = true
