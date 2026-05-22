@@ -16,6 +16,7 @@ name = "krishiv"
 path = "src/main.rs"
 
 [dependencies]
+krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-api = { path = "../krishiv-api" }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }

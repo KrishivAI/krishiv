@@ -7,10 +7,12 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-sql = { path = "../krishiv-sql" }
+krishiv-sql-policy = { path = "../krishiv-sql-policy" }
 tokio = { workspace = true }
 
 [dev-dependencies]

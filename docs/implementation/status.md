@@ -2,8 +2,61 @@
 
 ## Current Phase
 
-**R12 IN PROGRESS — Foundation Completeness & Real Connectivity (2026-05-22).**
+**Code-Review Refactor PHASES 4–7 COMPLETE (2026-05-22) — branch `claude/code-review-refactor-SfIid`.**
 Release tracker: `docs/implementation/r12-foundation-completeness.md`
+
+## Code-Review Refactor Session (2026-05-22) — Phases 4–7
+
+### Completed
+
+**Phase 4 — Move PolicyEnforcingSqlEngine out of krishiv-sql** (commit 858e37b)
+- Full `PolicyEnforcingSqlEngine` implementation was already in `krishiv-sql-policy`; this phase removed the leftover `policy_tests` module from `krishiv-sql` and moved it to `krishiv-sql-policy`.
+- Added `inner()` accessor to `PolicyEnforcingSqlEngine`; added tokio dev-dep to `krishiv-sql-policy`.
+- `krishiv-sql/Cargo.toml` no longer depends on `krishiv-governance`.
+
+**Phase 5 — Consolidate unix_now_ms into krishiv-async-util** (commit 7337583)
+- Removed local `unix_now_ms()` and `unix_now_ms_checked()` from `krishiv-state`.
+- Added `krishiv-async-util` dependency; updated test to call `krishiv_async_util::unix_now_ms_checked()`.
+
+**Phase 6 — Improve ConnectorError variants** (commit 7afa21a)
+- Added typed variants: `Kafka { message, retriable }`, `Parquet(String)`, `ObjectStore { message, status }`, `Cdc(String)`, `Io(io::Error)`.
+- Added `IoStr { message }` migration alias so all existing call-sites rename safely (`Io { message }` → `IoStr { message }`).
+- Updated `Display` impl; all 57 connector tests pass.
+
+**Phase 7 — Small cleanups** (commit 59abfee)
+- 7a: `#[deprecated]` on `StoreError` alias in `krishiv-shuffle` (kept for `krishiv-executor` source compat).
+- 7b: Renamed `execute_kafka_to_parquet_pipeline` → `execute_source_to_sink_pipeline`.
+- 7c: Added `Transport`, `PlanRejected`, `PartialResult` variants + constructor helpers to `RuntimeError`; added `#[non_exhaustive]`.
+- 7d: Added `Arc<SqlEngine>` field + `with_sql_engine()` builder to `ExecutorTaskRunner`.
+
+### Validation
+```
+cargo test --workspace --lib    → 29 suites, 0 failures (audit_log_dedup flaky test is pre-existing, passes in isolation)
+cargo clippy --workspace -- -D warnings → 0 errors
+```
+
+### Blockers
+None. Workspace compiles clean; all lib tests pass.
+
+### Next Task
+Wire the new module files into their parent `lib.rs` with `mod` declarations and remove
+the corresponding duplicated code from lib.rs. Start with `krishiv-scheduler/src/lib.rs`
+(8449 lines → target ~4000 lines after extracting admission, checkpoint, heartbeat, job, store).
+
+Validation command: `cargo test --workspace --lib && cargo clippy --workspace -- -D warnings`
+
+## Code-Review Refactor Session (2026-05-22) — Phases 1–3
+
+### Completed (commit 47c9a1f)
+- Extracted `krishiv-async-util` crate: panic-safe `block_on`, `unix_now_ms` helpers
+- Extracted `krishiv-sql-policy` crate: re-exports `PolicyEnforcingSqlEngine` from `krishiv-sql`
+- Added `krishiv-testkit` stub crate for future shared test utilities
+- Wired `block_on` from `krishiv-async-util` into `krishiv-api` and `krishiv/src/cli.rs`
+- Created scheduler module files: admission, checkpoint, heartbeat, job, store
+- Created exec module files: adaptive (SpaceSaving), aggregate, join, queue, window
+- Created executor module files: barrier, fragment, grpc, runner, transport
+- Fixed pre-existing double-increment bug in `run_restore` arg parser (2 tests now pass)
+- Fixed `block_on_works_inside_tokio_runtime` test to use multi-thread flavor
 
 ## R12 Sprint Completion Summary (2026-05-22)
 

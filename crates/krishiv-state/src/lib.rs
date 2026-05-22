@@ -15,6 +15,7 @@
 //! - `RocksDbStateBackend` — type alias for `RedbStateBackend` (kept for
 //!   source compatibility; the old filesystem-based placeholder is removed).
 
+use krishiv_async_util::unix_now_ms;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::{BTreeMap, HashMap};
 
@@ -958,26 +959,6 @@ impl TtlConfig {
 }
 
 // ── TtlStateBackend ───────────────────────────────────────────────────────────
-
-/// Return the current wall-clock time as milliseconds since the UNIX epoch.
-///
-/// Returns `Err(StateError::ClockError)` if the system clock is set to a time
-/// before the UNIX epoch (clock underflow), rather than silently returning 0.
-fn unix_now_ms_checked() -> StateResult<i64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .map_err(|e| StateError::ClockError {
-            message: format!("system clock is before UNIX epoch: {e}"),
-        })
-}
-
-/// Return current wall-clock time as milliseconds since UNIX epoch.
-/// Returns 0 on underflow (kept for internal non-critical callers that
-/// tolerate a worst-case expiry rather than propagating an error).
-fn unix_now_ms() -> i64 {
-    unix_now_ms_checked().unwrap_or(0)
-}
 
 /// A [`StateBackend`] wrapper that enforces TTL expiry on all stored values.
 ///
@@ -1985,7 +1966,7 @@ mod tests {
     /// Verify `unix_now_ms_checked()` returns a positive value under normal conditions.
     #[test]
     fn p0_8_unix_now_ms_checked_returns_positive() {
-        let now = unix_now_ms_checked();
+        let now = krishiv_async_util::unix_now_ms_checked();
         assert!(
             now.is_ok(),
             "unix_now_ms_checked must succeed on a normal clock"

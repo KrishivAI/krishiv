@@ -1,0 +1,178 @@
+use std::collections::HashMap;
+use std::fmt;
+use std::fs;
+use std::path::Path;
+
+use krishiv_proto::JobSpec;
+use serde::{Deserialize, Serialize};
+
+use crate::{NamespaceQuotaSnapshot, SubmitOutcome};
+
+/// Admission decision returned by a `QueueManager`.
+///
+/// Receives the static `JobSpec` and a live `NamespaceQuotaSnapshot` from the
+/// coordinator. Implementations compare the spec's resource requests against
+/// the snapshot's current reservations and their own configured limits.
+pub trait QueueManager: Send + Sync + fmt::Debug {
+    /// Return whether `spec` may enter the scheduler immediately.
+    ///
+    /// `quota` contains the live reservation totals for the job's namespace.
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome;
+
+    /// Notify the queue manager when a job reaches a terminal state.
+    ///
+    /// `usage` carries the accumulated cost from `TaskRuntimeStats`. The
+    /// default is a no-op; stateful implementations may use this for
+    /// accounting or logging.
+    fn on_job_complete(&self, _job_id: &krishiv_proto::JobId, _usage: &crate::ResourceUsage) {}
+}
+
+/// Always-admit queue manager for embedded and test contexts.
+///
+/// Every job is immediately accepted regardless of quota snapshot values. This
+/// is the default; R7.1 `QuotaQueueManager` and `CrdQueueManager` replace it
+/// for production deployments.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryQueueManager;
+
+impl QueueManager for InMemoryQueueManager {
+    fn admit(&self, _spec: &JobSpec, _quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        SubmitOutcome::Accepted
+    }
+}
+
+// ── QuotaQueueManager (process-mode quota enforcement) ───────────────────────
+
+/// Static resource limits for one namespace (or the default namespace).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaPolicy {
+    /// Maximum total CPU nanoseconds reserved simultaneously (`None` = unlimited).
+    pub cpu_nanos_limit: Option<u64>,
+    /// Maximum total memory bytes reserved simultaneously (`None` = unlimited).
+    pub memory_bytes_limit: Option<u64>,
+    /// Maximum number of concurrently active jobs (`None` = unlimited).
+    pub max_concurrent_jobs: Option<usize>,
+}
+
+/// Quota-aware queue manager for process (non-Kubernetes) deployments.
+///
+/// Checks `cpu_limit_nanos`, `memory_limit_bytes`, and concurrent-job count
+/// against per-namespace or default policies. A job that would exceed any
+/// limit is returned as `Queued { position: 0 }` rather than rejected, so the
+/// caller may retry admission after earlier jobs complete.
+#[derive(Debug)]
+pub struct QuotaQueueManager {
+    default_policy: QuotaPolicy,
+    namespace_policies: HashMap<String, QuotaPolicy>,
+}
+
+impl QuotaQueueManager {
+    /// Create a quota manager with a default policy and optional per-namespace overrides.
+    pub fn new(
+        default_policy: QuotaPolicy,
+        namespace_policies: HashMap<String, QuotaPolicy>,
+    ) -> Self {
+        Self {
+            default_policy,
+            namespace_policies,
+        }
+    }
+
+    /// Create a quota manager with a single default policy applied to all namespaces.
+    pub fn with_default(default_policy: QuotaPolicy) -> Self {
+        Self::new(default_policy, HashMap::new())
+    }
+
+    fn policy_for(&self, namespace_id: Option<&str>) -> &QuotaPolicy {
+        match namespace_id {
+            Some(ns) => self
+                .namespace_policies
+                .get(ns)
+                .unwrap_or(&self.default_policy),
+            None => &self.default_policy,
+        }
+    }
+}
+
+impl QueueManager for QuotaQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        let policy = self.policy_for(spec.namespace_id());
+
+        if let Some(limit) = policy.max_concurrent_jobs
+            && quota.active_job_count >= limit
+        {
+            return SubmitOutcome::Queued {
+                position: quota.active_job_count - limit,
+            };
+        }
+        if let Some(limit) = policy.cpu_nanos_limit {
+            let requested = spec.cpu_limit_nanos().unwrap_or(0);
+            if quota.cpu_nanos_reserved.saturating_add(requested) > limit {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        if let Some(limit) = policy.memory_bytes_limit {
+            let requested = spec.memory_limit_bytes().unwrap_or(0);
+            if quota.memory_bytes_reserved.saturating_add(requested) > limit {
+                return SubmitOutcome::Queued { position: 0 };
+            }
+        }
+        SubmitOutcome::Accepted
+    }
+}
+
+// ── ConfigFileQueueManager ────────────────────────────────────────────────────
+
+/// On-disk config format for `ConfigFileQueueManager`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct QueueConfig {
+    #[serde(default)]
+    default: QuotaPolicy,
+    #[serde(default)]
+    namespaces: HashMap<String, QuotaPolicy>,
+}
+
+/// File-backed queue manager that reads quota policies from a JSON config file.
+///
+/// Policies are loaded once at construction time. Re-load by creating a new
+/// instance from the updated file. This keeps the implementation free of async
+/// runtimes and background threads.
+///
+/// Config file format (JSON):
+/// ```json
+/// {
+///   "default": { "max_concurrent_jobs": 10 },
+///   "namespaces": {
+///     "analytics": { "cpu_nanos_limit": 1000000000000, "memory_bytes_limit": 8589934592 }
+///   }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ConfigFileQueueManager {
+    inner: QuotaQueueManager,
+}
+
+impl ConfigFileQueueManager {
+    /// Load queue policies from the JSON file at `path`.
+    pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let config: QueueConfig = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Self {
+            inner: QuotaQueueManager::new(config.default, config.namespaces),
+        })
+    }
+
+    /// Construct directly from a `QueueConfig` (useful in tests).
+    pub fn from_config(default: QuotaPolicy, namespaces: HashMap<String, QuotaPolicy>) -> Self {
+        Self {
+            inner: QuotaQueueManager::new(default, namespaces),
+        }
+    }
+}
+
+impl QueueManager for ConfigFileQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        self.inner.admit(spec, quota)
+    }
+}

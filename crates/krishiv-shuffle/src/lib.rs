@@ -605,6 +605,7 @@ pub struct ShufflePartition {
 /// Previously a separate `StoreError` enum; now a type alias for [`ShuffleError`]
 /// so callers only need to handle one error type across all shuffle APIs.
 /// External code that imports `StoreError` continues to compile unchanged.
+#[deprecated(since = "0.2.0", note = "Use `ShuffleError` directly")]
 pub type StoreError = ShuffleError;
 
 /// Convenience result alias for [`ShuffleStore`] operations.

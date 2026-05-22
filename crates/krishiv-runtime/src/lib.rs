@@ -18,12 +18,19 @@ use tracing::debug;
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 /// Runtime errors shared by bootstrap backends and traits.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     /// A requested capability is not available in the current release slice.
     Unsupported { feature: String },
     /// Runtime state was invalid for the requested operation.
     InvalidState { message: String },
+    /// A transport-level failure (connection refused, timeout, etc.).
+    Transport { message: String },
+    /// The submitted plan was rejected by the coordinator.
+    PlanRejected { reason: String },
+    /// The operation succeeded for some partitions but not all.
+    PartialResult { succeeded: usize, failed: usize },
 }
 
 impl RuntimeError {
@@ -32,6 +39,25 @@ impl RuntimeError {
         Self::Unsupported {
             feature: feature.into(),
         }
+    }
+
+    /// Create a transport-level error.
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::Transport {
+            message: message.into(),
+        }
+    }
+
+    /// Create a plan-rejected error.
+    pub fn plan_rejected(reason: impl Into<String>) -> Self {
+        Self::PlanRejected {
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a partial-result error.
+    pub fn partial_result(succeeded: usize, failed: usize) -> Self {
+        Self::PartialResult { succeeded, failed }
     }
 }
 
@@ -42,6 +68,12 @@ impl fmt::Display for RuntimeError {
                 write!(f, "unsupported runtime feature: {feature}")
             }
             Self::InvalidState { message } => write!(f, "invalid runtime state: {message}"),
+            Self::Transport { message } => write!(f, "transport error: {message}"),
+            Self::PlanRejected { reason } => write!(f, "plan rejected: {reason}"),
+            Self::PartialResult { succeeded, failed } => write!(
+                f,
+                "partial result: {succeeded} partitions succeeded, {failed} failed"
+            ),
         }
     }
 }
