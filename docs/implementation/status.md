@@ -2,8 +2,18 @@
 
 ## Current Phase
 
-**Code-Review Refactor PHASES 4–7 COMPLETE (2026-05-22) — branch `claude/code-review-refactor-SfIid`.**
-Release tracker: `docs/implementation/r12-foundation-completeness.md`
+**R12 CARRYOVER + Code-Review Refactor (2026-05-22).**
+
+Release tracker: [`r12-foundation-completeness.md`](r12-foundation-completeness.md)  
+Gap register: [`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md)
+
+**Merged from `main`:** Code-review refactor Phases 1–7 (`krishiv-async-util`,
+`krishiv-sql-policy`, scheduler/exec/executor module extractions). Workspace lib tests
+and clippy clean per refactor session below.
+
+**R12 maturity:** Audit slices S1–S6 are documented on branch `claude/r12-slices-planning-BcFL5`;
+integration gaps for distributed/streaming/remote paths remain open — see **GAP-*** IDs in the
+gap register and **R12 carryover** section below.
 
 ## Code-Review Refactor Session (2026-05-22) — Phases 4–7
 
@@ -38,12 +48,13 @@ cargo clippy --workspace -- -D warnings → 0 errors
 ### Blockers
 None. Workspace compiles clean; all lib tests pass.
 
-### Next Task
+### Next Task (refactor track)
+
 Wire the new module files into their parent `lib.rs` with `mod` declarations and remove
 the corresponding duplicated code from lib.rs. Start with `krishiv-scheduler/src/lib.rs`
 (8449 lines → target ~4000 lines after extracting admission, checkpoint, heartbeat, job, store).
 
-Validation command: `cargo test --workspace --lib && cargo clippy --workspace -- -D warnings`
+Validation: `cargo test --workspace --lib && cargo clippy --workspace -- -D warnings`
 
 ## Code-Review Refactor Session (2026-05-22) — Phases 1–3
 
@@ -96,19 +107,41 @@ cargo check --workspace                   → 0 errors
 cargo clippy (modified crates) -D warnings → 0 errors
 ```
 
-### Deferred to R13
-- S6.2: `SingleNodeBackend` in-process coordinator (mpsc channels)
-- S6.3: `EmbeddedBackend` streaming redirect
-- S3.3: `KafkaSource` watermark-aware streaming
-- `--metadata-backend sqlite` CLI flag wiring in coordinator binary
-- Full Flight SQL transport in `DistributedBackend`
+### Deferred to R13 (gap-tracked)
+- S6.2: `SingleNodeBackend` in-process coordinator — **GAP-RT-01**, GAP-ST-06
+- S6.3: `EmbeddedBackend` streaming redirect — **GAP-RT-01**, GAP-RT-03
+- S3.3: `KafkaSource` watermark-aware streaming — **GAP-CN-02**
+- `--metadata-backend sqlite` CLI flag — **GAP-CP-04**
+- Full Flight SQL transport in `DistributedBackend` — **GAP-RT-01** (ADR-12.3)
+- `WindowedStream` → executor fragments — **GAP-RT-03**
+- Executor binary task gRPC loop — **GAP-CP-09**
+- Python API `todo!()` removal — **GAP-PY-01**
+
+### R12 carryover (close before R13 Sprint 1)
+
+| Priority | Gap ID | Summary |
+|----------|--------|---------|
+| P0 | GAP-CP-03 | Wire `validate_fencing_token` in `commit_epoch` / writes |
+| P0 | GAP-CK-01 | Restore validates fencing token |
+| P0 | GAP-CN-01 | Fix duplicate `RdkafkaCdcEventSource` (`kafka` feature compile) |
+| P0 | GAP-RT-04 | Real `RemoteCoordinatorClient` gRPC (not stub `Ok`) |
+| P1 | GAP-CP-04–06 | Coordinator startup metadata recovery |
+| P1 | GAP-SH-01, GAP-SH-03 | Shuffle compression on executor path; stable partition hash |
+| P1 | GAP-RT-05 | Policy fail-closed when `Session::sql()` used with policy configured |
+| P1 | GAP-DOC-01 | Align “complete” claims with L4 acceptance per gap register |
+
+Full list: [`r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md).
 
 ### Blockers
-None. All R12 deliverables shipped and pushed to `claude/r12-slices-planning-BcFL5`.
+
+None for local batch SQL / in-process scheduler tests. **Distributed and streaming product claims**
+remain blocked on carryover gaps above (especially GAP-CP-03, GAP-RT-01, GAP-RT-04, GAP-ST-01).
 
 ### Next Task
-Update `docs/implementation/r13-python-streaming-api.md` and begin R13 planning.
-Validation command: `cargo check --workspace`
+
+1. Close P0 R12 carryover gaps (fencing, remote CLI RPCs, kafka compile).
+2. Update R13 tracker prerequisites to reference gap IDs.
+3. Validation: `cargo test --workspace` and carryover-specific tests in gap register.
 
 ## R11 Completion Summary
 

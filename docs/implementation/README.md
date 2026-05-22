@@ -5,10 +5,12 @@ This directory contains release-by-release implementation trackers for Krishiv. 
 ## How To Use These Trackers
 
 1. Read `docs/implementation/status.md`.
-2. Open the tracker for the current release phase.
-3. Pick one small unchecked task.
-4. Implement the task with tests.
-5. Update the tracker and `status.md` before stopping.
+2. If working on R12 carryover or pre-R13 integration, read
+   `docs/architecture/r12-maturity-gap-register.md`.
+3. Open the tracker for the current release phase.
+4. Pick one small unchecked task.
+5. Implement the task with tests.
+6. Update the tracker and `status.md` before stopping.
 
 Each tracker is intentionally checklist-oriented. R1-R3 are more concrete because they are near-term. R4-R10 stay decision-guiding where implementation details depend on earlier releases.
 
@@ -37,6 +39,7 @@ Each tracker is intentionally checklist-oriented. R1-R3 are more concrete becaus
 | R19 Multi-Region, Autoscaling & Cloud-Native | [r19-multi-region-cloud-native.md](r19-multi-region-cloud-native.md) |
 | R20 Enterprise Platform & Ecosystem | [r20-enterprise-platform.md](r20-enterprise-platform.md) |
 | R12–R20 Strategic Roadmap (planning doc) | [../architecture/r12-r20-roadmap.md](../architecture/r12-r20-roadmap.md) |
+| R12 Maturity Gap & Risk Register | [../architecture/r12-maturity-gap-register.md](../architecture/r12-maturity-gap-register.md) |
 | Architectural Decisions R12–R20 (ADR master) | [../architecture/architectural-decisions-r12-r20.md](../architecture/architectural-decisions-r12-r20.md) |
 
 ## Tracker Template

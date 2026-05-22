@@ -35,6 +35,7 @@ as explicit work items rather than discovering blockers mid-sprint.
 | ADR-12.6 | Scheduler God-File Decomposition | R12 | DECIDED | HIGH — `krishiv-scheduler/src/lib.rs` at 7 971 lines blocks any structural work |
 | ADR-12.7 | ExecutionBackend Async Migration | R12 | DECIDED | HIGH — sync trait forces `block_on` inside Tokio; causes nested-runtime panics |
 | ADR-12.8 | PhysicalPlan → Real Operator Wiring | R12 | DECIDED | HIGH — plan is name-only; `execute()` never runs actual operators |
+| ADR-12.9 | Maturity Gap Enforcement & L4 Acceptance | R12 | DECIDED | HIGH — doc/code drift; stubs marked complete while integration open |
 | ADR-13.1 | Python/Tokio Async Bridge | R13 | DECIDED | HIGH — blocks asyncio-native streaming API |
 | ADR-13.2 | Python Schema Metaclass | R13 | DECIDED | MEDIUM — blocks schema-declared sources |
 | ADR-14.1 | Incremental View Delta Storage | R14 | DECIDED | HIGH — blocks live table refresh correctness |
@@ -522,6 +523,49 @@ Every R13 Python integration test that calls `session.sql("SELECT ...")` and
 checks the result will fail because the result is always `ExecutionReport::accepted()`
 regardless of the query. The Python API becomes untestable end-to-end. This bottleneck
 is the single most critical gap between the current codebase and a working engine.
+
+---
+
+### ADR-12.9: Maturity Gap Enforcement & L4 Acceptance
+
+**Status**: DECIDED
+
+**Problem statement**
+
+R12 closed the original P0/P1 audit inventory and added library-level features
+(Kafka feature gate, `CoalesceRule`, compression codecs, federation skeleton).
+A post-R12 subsystem maturity review found **documentation and tracker drift**:
+items marked complete while integration paths remain stubbed (remote CLI RPCs,
+`DistributedBackend` log-only accept, fencing helper unused at write sites,
+connector matrix “certified” ahead of CI).
+
+**Options**
+
+- A. **Single gap register** — maintain
+  [`r12-maturity-gap-register.md`](r12-maturity-gap-register.md) with GAP-* IDs;
+  release trackers and `status.md` reference gap IDs; acceptance gates require
+  L4 (binary/CLI) evidence before marking `[x]`.
+- B. Re-open R12 as a new release (R12.1) without a register — duplicate tracker
+  noise; easy to lose cross-subsystem mapping.
+- C. Ignore gaps until R13 — risks Python API built on stub backends.
+
+**Recommendation**: Option A.
+
+**Decision**: Option A — gap register + R12 carryover sprint (P0 gaps) before R13
+Sprint 1. Decided 2026-05-22. All gaps map to a target release and proposed
+resolution in the register. `compatibility-matrices.md` downgrades LocalParquet to
+**beta** until GAP-CN-03 closes in R14.
+
+**Consequences**
+
+- R12 “complete” means **audit-complete**, not **distributed/streaming product-complete**.
+- R13 dependencies cite GAP-* IDs (see `r13-python-streaming-api.md`).
+- Production hardening guide Section 7 lists post-R12 limitations by gap ID.
+
+**Risk if deferred**
+
+R13 ships `ks.Session.connect()` against stub Flight/remote paths; operators assume
+HA checkpoints that fencing does not enforce; certification matrix misleads adopters.
 
 ---
 

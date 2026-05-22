@@ -106,9 +106,14 @@ UDFs are registered at session creation time via `UdfRegistry::register()` and a
 - **beta**: connector exists and is functionally tested but does not yet pass the full certification suite.
 - **experimental**: connector is present in the codebase but not yet recommended for production use.
 
+> **Post-R12 maturity review (2026-05-22):** LocalParquet was previously marked
+> **certified** while `tests/certification.rs` only runs capability-invariant checks
+> (see **GAP-CN-03** in [`r12-maturity-gap-register.md`](r12-maturity-gap-register.md)).
+> Status below reflects **honest CI coverage** until R14 expands the suite.
+
 | Connector | Mode | Guarantee | Status | Notes |
 |---|---|---|---|---|
-| LocalParquet | sink | exactly-once | certified | Atomic rename 2PC in `LocalParquetTwoPhaseCommitSink`; `.tmp` on prepare, rename on commit |
+| LocalParquet | sink | exactly-once | beta | 2PC implementation is strong; full certification lifecycle tests land in R14 (GAP-CN-03) |
 | Kafka | source | at-least-once | beta | Offset committed after batch ack; no dedup on recovery |
 | Iceberg | source | at-least-once | beta | Snapshot-based reads; no row-level dedup |
 | Iceberg | sink | at-least-once | beta | Optimistic concurrency; 2PC promotion planned for R11 |
@@ -116,4 +121,4 @@ UDFs are registered at session creation time via `UdfRegistry::register()` and a
 | FlightSQL gateway | query gateway | at-least-once | beta | Auth + policy wired; read-path only for R10 |
 | DebeziumKafka | source (CDC) | at-least-once + idempotent | beta | Combined with Iceberg merge-on-read for idempotent-exactly-once CDC-to-lakehouse |
 
-Connectors must pass the certification suite before status can be upgraded from beta to certified. The certification suite is defined in `crates/krishiv-connectors/tests/certification/`.
+Connectors must pass the certification suite before status can be upgraded from beta to certified. The certification suite is defined in `crates/krishiv-connectors/tests/certification.rs` (expand in R14 per GAP-CN-03). Until then, do not mark connectors **certified** in this matrix without matching CI jobs.
