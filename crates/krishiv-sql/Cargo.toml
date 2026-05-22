@@ -8,10 +8,8 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 datafusion = { workspace = true }
-krishiv-governance = { path = "../krishiv-governance" }
 krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }
-sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
