@@ -394,6 +394,9 @@ impl LogicalPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalPlan {
     pub(crate) core: PlanCore,
+    /// Post-AQE coalesced partition count set by `CoalesceRule::apply`.
+    /// `None` means coalescing has not been applied.
+    coalesced_partition_count: Option<usize>,
 }
 
 impl PhysicalPlan {
@@ -401,7 +404,19 @@ impl PhysicalPlan {
     pub fn new(name: impl Into<String>, kind: ExecutionKind) -> Self {
         Self {
             core: PlanCore::new(name, kind),
+            coalesced_partition_count: None,
         }
+    }
+
+    /// Return the post-AQE coalesced partition count, if set by `CoalesceRule`.
+    pub fn coalesced_partition_count(&self) -> Option<usize> {
+        self.coalesced_partition_count
+    }
+
+    /// Set the coalesced partition count (called by `CoalesceRule::apply`).
+    pub fn with_coalesced_partition_count(mut self, count: usize) -> Self {
+        self.coalesced_partition_count = Some(count);
+        self
     }
 
     /// Add a node to the plan.

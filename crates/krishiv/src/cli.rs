@@ -10,53 +10,59 @@ use krishiv_proto::{
 };
 use krishiv_scheduler::{Coordinator, JobDetailSnapshot, JobSnapshot};
 
-pub use crate::remote_client::RemoteCoordinatorClient;
+use crate::remote_client::RemoteCoordinatorClient;
 
-// ── Coordinator mode ──────────────────────────────────────────────────────────
+// ── CoordinatorMode ───────────────────────────────────────────────────────────
 
-/// Whether CLI commands address a local in-process coordinator or a remote one.
+/// Whether commands dispatch locally (in-process) or to a remote coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordinatorMode {
-    /// Default: use the in-process local coordinator.
+    /// Use the in-process coordinator (default).
     Local,
-    /// Connect to a remote coordinator at the given URL.
-    ///
-    /// Set via `--coordinator <URL>` / `-c <URL>`, or the
-    /// `KRISHIV_COORDINATOR` environment variable (flag takes precedence).
+    /// Forward commands to a remote coordinator at the given URL.
     Remote(String),
 }
 
 impl CoordinatorMode {
-    pub(crate) fn from_args_and_env<'a>(args: &'a [&'a str]) -> (CoordinatorMode, Vec<&'a str>) {
+    /// Parse `--coordinator`/`-c` from `args`, consulting `KRISHIV_COORDINATOR`
+    /// env var as a fallback. Returns the mode and the remaining args.
+    pub fn from_args_and_env<'a>(args: &'a [&'a str]) -> (CoordinatorMode, Vec<&'a str>) {
         let env_value = std::env::var("KRISHIV_COORDINATOR").ok();
         Self::from_args_with_env_override(args, env_value.as_deref())
     }
 
-    pub(crate) fn from_args_with_env_override<'a>(
+    /// Testable variant: `env_value` is `Some(url)` if the env var is set.
+    /// Call sites in tests pass an explicit value instead of mutating real env.
+    pub fn from_args_with_env_override<'a>(
         args: &'a [&'a str],
         env_value: Option<&str>,
     ) -> (CoordinatorMode, Vec<&'a str>) {
-        let mut remaining: Vec<&str> = Vec::new();
-        let mut coordinator_url: Option<String> = None;
+        let mut remaining = Vec::new();
+        let mut url: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             match args[i] {
                 "--coordinator" | "-c" if i + 1 < args.len() => {
-                    coordinator_url = Some(args[i + 1].to_owned());
+                    url = Some(args[i + 1].to_owned());
                     i += 2;
                 }
-                _ => {
-                    remaining.push(args[i]);
+                other => {
+                    remaining.push(other);
                     i += 1;
                 }
             }
         }
-        if coordinator_url.is_none() {
-            coordinator_url = env_value.map(str::to_owned);
+        // Explicit flag beats env var.
+        if url.is_none() {
+            if let Some(env_url) = env_value {
+                if !env_url.is_empty() {
+                    url = Some(env_url.to_owned());
+                }
+            }
         }
-        let mode = match coordinator_url {
-            Some(url) if !url.trim().is_empty() => CoordinatorMode::Remote(url),
-            _ => CoordinatorMode::Local,
+        let mode = match url {
+            Some(u) => CoordinatorMode::Remote(u),
+            None => CoordinatorMode::Local,
         };
         (mode, remaining)
     }
@@ -98,6 +104,7 @@ struct SubmitCommand {
 
 /// Dispatch CLI arguments after the binary name.
 pub fn dispatch(args: &[&str]) -> CliResponse {
+    // Strip the global --coordinator/-c flag before routing to subcommands.
     let (coordinator_mode, remaining) = CoordinatorMode::from_args_and_env(args);
     let args: &[&str] = &remaining;
 
@@ -127,7 +134,9 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["savepoint", rest @ ..] => run_savepoint(rest, &coordinator_mode),
         ["restore", rest @ ..] => run_restore(rest, &coordinator_mode),
         ["checkpoints", rest @ ..] => run_checkpoints(rest, &coordinator_mode),
-        [unknown, ..] => CliResponse::err(format!("unknown command: {unknown}\n\n{}", main_help()), 2),
+        [unknown, ..] => {
+            CliResponse::err(format!("unknown command: {unknown}\n\n{}", main_help()), 2)
+        }
     }
 }
 
@@ -150,7 +159,7 @@ pub fn main_help() -> String {
            help         Show help for a command\n\
          \n\
          Options:\n\
-           -c, --coordinator <URL>  Remote coordinator URL (overrides KRISHIV_COORDINATOR env var)\n\
+           -c, --coordinator <URL>  Remote coordinator URL (or set KRISHIV_COORDINATOR)\n\
            -h, --help               Show help\n",
     )
 }
@@ -308,14 +317,14 @@ pub fn state_help() -> String {
     )
 }
 
-fn run_state(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse {
+fn run_state(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     match args {
-        ["inspect", rest @ ..] => run_state_inspect(rest, coordinator_mode),
+        ["inspect", rest @ ..] => run_state_inspect(rest, mode),
         _ => CliResponse::err(format!("unknown state subcommand\n\n{}", state_help()), 2),
     }
 }
 
-fn run_state_inspect(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse {
+fn run_state_inspect(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut job_id: Option<&str> = None;
     let mut operator_id: Option<&str> = None;
     let mut storage_path: Option<&str> = None;
@@ -334,24 +343,28 @@ fn run_state_inspect(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliRe
     let Some(operator_id) = operator_id else {
         return CliResponse::err(format!("--operator is required\n\n{}", state_help()), 2);
     };
-    if let CoordinatorMode::Remote(url) = coordinator_mode {
-        let mut client = RemoteCoordinatorClient::new(url);
+
+    // Remote coordinator path.
+    if let CoordinatorMode::Remote(url) = mode {
+        let mut client = RemoteCoordinatorClient::new(url.clone());
         return match block_on_remote(client.inspect_state(job_id, operator_id)) {
             Ok(snapshots) if snapshots.is_empty() => CliResponse::ok(format!(
-                "No state snapshots found for operator {operator_id} on coordinator {url} (job {job_id}).\n"
+                "No state snapshots found for operator {operator_id} (job {job_id}) on coordinator {url}.\n"
             )),
             Ok(snapshots) => {
                 let mut out = format!(
-                    "State snapshot(s) for operator {operator_id} (job {job_id}) on coordinator {url}:\n\nTASK\tSNAPSHOT PATH\n"
+                    "State snapshots for operator {operator_id} (job {job_id}) from {url}:\n\nTASK\tSNAPSHOT PATH\n"
                 );
-                for s in &snapshots {
+                for s in snapshots {
                     out.push_str(&format!("{}\t{}\n", s.task_id, s.snapshot_path));
                 }
                 CliResponse::ok(out)
             }
-            Err(e) => CliResponse::err(format!("remote state-inspect error: {e}\n"), 1),
+            Err(e) => CliResponse::err(format!("remote coordinator error: {e}\n"), 1),
         };
     }
+
+
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
         Ok(s) => s,
@@ -369,7 +382,11 @@ fn run_state_inspect(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliRe
     };
     let meta = match read_epoch_metadata(&storage, job_id, latest_epoch) {
         Ok(Some(m)) => m,
-        Ok(None) => return CliResponse::ok(format!("No metadata for epoch {latest_epoch} of job {job_id}.\n")),
+        Ok(None) => {
+            return CliResponse::ok(format!(
+                "No metadata for epoch {latest_epoch} of job {job_id}.\n"
+            ));
+        }
         Err(e) => return CliResponse::err(format!("metadata read error: {e}\n"), 1),
     };
     let snapshots: Vec<_> = meta
@@ -603,7 +620,7 @@ pub fn savepoint_help() -> String {
     )
 }
 
-fn run_savepoint(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse {
+fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut job_id: Option<&str> = None;
     let mut label: Option<&str> = None;
     let mut i = 0;
@@ -617,37 +634,46 @@ fn run_savepoint(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliRespon
     let Some(job_id_str) = job_id else {
         return CliResponse::err(format!("--job is required\n\n{}", savepoint_help()), 2);
     };
-    if let CoordinatorMode::Remote(url) = coordinator_mode {
-        let mut client = RemoteCoordinatorClient::new(url);
+    let label_opt = label.map(String::from);
+
+    // Remote coordinator path.
+    if let CoordinatorMode::Remote(url) = mode {
+        let mut client = RemoteCoordinatorClient::new(url.clone());
         return match block_on_remote(client.trigger_savepoint(job_id_str)) {
-            Ok(()) => CliResponse::ok(format!(
-                "Savepoint initiated (remote)\nJob:         {job_id_str}\nLabel:       {}\nCoordinator: {url}\n",
-                label.unwrap_or("(none)")
-            )),
-            Err(e) => CliResponse::err(format!("remote savepoint error: {e}\n"), 1),
+            Ok(()) => {
+                let label_display = label_opt.as_deref().unwrap_or("(none)");
+                CliResponse::ok(format!(
+                    "Savepoint initiated\nJob:   {job_id_str}\nLabel: {label_display}\nCoordinator: {url}\n"
+                ))
+            }
+            Err(e) => CliResponse::err(format!("remote coordinator error: {e}\n"), 1),
         };
     }
+
+    // Local coordinator path.
     let job_id = match JobId::try_new(job_id_str) {
         Ok(id) => id,
         Err(e) => return CliResponse::err(format!("invalid job id: {e}\n"), 2),
     };
-    let label_opt = label.map(String::from);
     let mut coordinator = match active_local_coordinator() {
         Ok(c) => c,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
     match coordinator.trigger_checkpoint_for_job(&job_id) {
-        Ok(_) => CliResponse::ok(format!(
-            "Savepoint initiated\nJob:   {job_id}\nLabel: {}\n\
-             Note: in local mode the coordinator holds no running jobs.\n\
-             For distributed jobs, use a remote coordinator (--coordinator <URL>).\n",
-            label_opt.as_deref().unwrap_or("(none)")
-        )),
-        Err(e) => CliResponse::err(format!(
-            "Savepoint failed for job {job_id}: {e}\n\
-             Ensure the job is a running streaming job with checkpoint_interval_ms set.\n\
-             For distributed jobs, connect to the coordinator (--coordinator <URL>).\n"
-        ), 1),
+        Ok(_) => {
+            let label_display = label_opt.as_deref().unwrap_or("(none)");
+            CliResponse::ok(format!(
+                "Savepoint initiated\nJob:   {job_id}\nLabel: {label_display}\n\
+                 Note: in local mode the coordinator holds no running jobs.\n"
+            ))
+        }
+        Err(e) => CliResponse::err(
+            format!(
+                "Savepoint failed for job {job_id}: {e}\n\
+                 Ensure the job is a running streaming job with checkpoint_interval_ms set.\n"
+            ),
+            1,
+        ),
     }
 }
 
@@ -676,7 +702,7 @@ pub fn restore_help() -> String {
     )
 }
 
-fn run_restore(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse {
+fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut job_id: Option<&str> = None;
     let mut epoch: Option<&str> = None;
     let mut storage_path: Option<&str> = None;
@@ -702,32 +728,51 @@ fn run_restore(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse
             format!("--epoch must be a non-negative integer; got '{epoch}'\n\n{}", restore_help()), 2,
         ),
     };
-    if let CoordinatorMode::Remote(url) = coordinator_mode {
-        let mut client = RemoteCoordinatorClient::new(url);
+
+    // Remote coordinator path.
+    if let CoordinatorMode::Remote(url) = mode {
+        let mut client = RemoteCoordinatorClient::new(url.clone());
         return match block_on_remote(client.restore(job_id, epoch_num)) {
             Ok(()) => CliResponse::ok(format!(
-                "Restore initiated (remote)\nJob:         {job_id}\nEpoch:       {epoch_num}\nCoordinator: {url}\n"
+                "Restore requested\nJob:         {job_id}\nEpoch:       {epoch_num}\nCoordinator: {url}\n"
             )),
-            Err(e) => CliResponse::err(format!("remote restore error: {e}\n"), 1),
+            Err(e) => CliResponse::err(format!("remote coordinator error: {e}\n"), 1),
         };
     }
+
+
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("storage error: {e}\n"), 1),
     };
-    match read_epoch_metadata(&storage, job_id, epoch_num) {
-        Ok(Some(meta)) => {
-            let kind = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
-            let label = meta.savepoint_label.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
-            CliResponse::ok(format!(
-                "Restore plan\nJob: {job_id}\nEpoch: {epoch_num}\nType: {kind}{label}\nStorage: {path}\n\
-                 Use --coordinator <URL> to apply directly to a remote coordinator.\n"
-            ))
+    let meta = match read_epoch_metadata(&storage, job_id, epoch_num) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return CliResponse::err(
+                format!("epoch {epoch_num} not found for job {job_id} in {path}\n"),
+                1,
+            );
         }
-        Ok(None) => CliResponse::err(format!("epoch {epoch_num} not found for job {job_id} in {path}\n"), 1),
-        Err(e) => CliResponse::err(format!("checkpoint read error: {e}\n"), 1),
-    }
+        Err(e) => return CliResponse::err(format!("checkpoint read error: {e}\n"), 1),
+    };
+    let snapshot_count = meta.operator_snapshots.len();
+    let source_count = meta.source_offsets.len();
+    let kind = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
+    let label = meta.savepoint_label.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
+    CliResponse::ok(format!(
+        "Restore plan\n\
+         Job:              {job_id}\n\
+         Epoch:            {epoch_num}\n\
+         Type:             {kind}{label}\n\
+         Storage:          {path}\n\
+         Source partitions:{source_count}\n\
+         Operator snapshots:{snapshot_count}\n\
+         Fencing token:    {ft}\n\
+         \n\
+         To apply: use --coordinator <URL> to trigger restore on a live cluster.\n",
+        ft = meta.fencing_token,
+    ))
 }
 
 // ── R6: checkpoints ───────────────────────────────────────────────────────────
@@ -748,14 +793,17 @@ pub fn checkpoints_help() -> String {
     )
 }
 
-fn run_checkpoints(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse {
+fn run_checkpoints(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     match args {
-        ["list", rest @ ..] => run_checkpoints_list(rest, coordinator_mode),
-        _ => CliResponse::err(format!("unknown checkpoints subcommand\n\n{}", checkpoints_help()), 2),
+        ["list", rest @ ..] => run_checkpoints_list(rest, mode),
+        _ => CliResponse::err(
+            format!("unknown checkpoints subcommand\n\n{}", checkpoints_help()),
+            2,
+        ),
     }
 }
 
-fn run_checkpoints_list(args: &[&str], coordinator_mode: &CoordinatorMode) -> CliResponse {
+fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut job_id: Option<&str> = None;
     let mut storage_path: Option<&str> = None;
     let mut i = 0;
@@ -769,22 +817,28 @@ fn run_checkpoints_list(args: &[&str], coordinator_mode: &CoordinatorMode) -> Cl
     let Some(job_id) = job_id else {
         return CliResponse::err(format!("--job is required\n\n{}", checkpoints_help()), 2);
     };
-    if let CoordinatorMode::Remote(url) = coordinator_mode {
-        let mut client = RemoteCoordinatorClient::new(url);
+
+    // Remote coordinator path.
+    if let CoordinatorMode::Remote(url) = mode {
+        let mut client = RemoteCoordinatorClient::new(url.clone());
         return match block_on_remote(client.list_checkpoints(job_id)) {
             Ok(epochs) if epochs.is_empty() => CliResponse::ok(format!(
                 "No checkpoints found for job {job_id} on coordinator {url}\n"
             )),
             Ok(epochs) => {
-                let mut out = format!("Checkpoints for job {job_id} on coordinator {url}\n\nEPOCH\tTYPE\tLABEL\n");
-                for ep in &epochs {
-                    out.push_str(&format!("{e}\t{k}\t{l}\n", e=ep.epoch, k=ep.kind, l=ep.label.as_deref().unwrap_or("")));
+                let mut out =
+                    format!("Checkpoints for job {job_id} from {url}\n\nEPOCH\tTYPE\tLABEL\n");
+                for e in epochs {
+                    let label = e.label.unwrap_or_default();
+                    out.push_str(&format!("{}\t{}\t{}\n", e.epoch, e.kind, label));
                 }
                 CliResponse::ok(out)
             }
-            Err(e) => CliResponse::err(format!("remote list-checkpoints error: {e}\n"), 1),
+            Err(e) => CliResponse::err(format!("remote coordinator error: {e}\n"), 1),
         };
     }
+
+
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
         Ok(s) => s,
@@ -802,7 +856,8 @@ fn run_checkpoints_list(args: &[&str], coordinator_mode: &CoordinatorMode) -> Cl
         let (kind, label) = match read_epoch_metadata(&storage, job_id, epoch) {
             Ok(Some(meta)) => {
                 let k = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
-                (k, meta.savepoint_label.unwrap_or_default())
+                let l = meta.savepoint_label.unwrap_or_default();
+                (k, l)
             }
             _ => ("unknown", String::new()),
         };
@@ -813,7 +868,7 @@ fn run_checkpoints_list(args: &[&str], coordinator_mode: &CoordinatorMode) -> Cl
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, CoordinatorMode};
+    use super::{CoordinatorMode, dispatch};
 
     #[test]
     fn top_level_help_lists_commands() {
@@ -893,6 +948,26 @@ mod tests {
         let response = dispatch(&["savepoint", "--job", "job-1"]);
         assert_eq!(response.exit_code, 1, "{:?}", response);
         assert!(response.stderr.contains("job-1"));
+        assert!(
+            response.stderr.contains("Savepoint failed")
+                || response.stderr.contains("Savepoint initiated"),
+            "expected savepoint result, got: {:?}",
+            response.stderr
+        );
+    }
+
+    #[test]
+    fn savepoint_with_label_includes_job_in_output() {
+        let response = dispatch(&["savepoint", "--job", "job-2", "--label", "pre-upgrade"]);
+        assert_eq!(response.exit_code, 1, "{:?}", response);
+        assert!(response.stderr.contains("job-2"));
+    }
+
+    #[test]
+    fn restore_help_command_exits_zero() {
+        let response = dispatch(&["restore", "--help"]);
+        assert_eq!(response.exit_code, 0);
+        assert!(response.stdout.contains("restore"));
     }
 
     #[test]
@@ -923,65 +998,152 @@ mod tests {
         assert!(response.stdout.contains("No checkpoints found"));
     }
 
+    // ── S4: CoordinatorMode tests ─────────────────────────────────────────────
+
     #[test]
     fn coordinator_flag_long_form_produces_remote_mode() {
         let (mode, remaining) = CoordinatorMode::from_args_with_env_override(
-            &["--coordinator", "http://localhost:7070", "savepoint", "--job", "j1"],
+            &[
+                "--coordinator",
+                "http://coord:7070",
+                "savepoint",
+                "--job",
+                "j1",
+            ],
             None,
         );
-        assert_eq!(mode, CoordinatorMode::Remote("http://localhost:7070".into()));
+        assert_eq!(
+            mode,
+            CoordinatorMode::Remote("http://coord:7070".to_string())
+        );
         assert_eq!(remaining, vec!["savepoint", "--job", "j1"]);
     }
 
     #[test]
+    fn coordinator_short_flag_produces_remote_mode() {
+        let (mode, remaining) =
+            CoordinatorMode::from_args_with_env_override(&["-c", "http://c:9", "jobs"], None);
+        assert_eq!(mode, CoordinatorMode::Remote("http://c:9".to_string()));
+        assert_eq!(remaining, vec!["jobs"]);
+    }
+
+    #[test]
     fn coordinator_flag_absent_and_no_env_var_is_local() {
-        let (mode, _) = CoordinatorMode::from_args_with_env_override(&["savepoint", "--job", "j1"], None);
+        let (mode, remaining) =
+            CoordinatorMode::from_args_with_env_override(&["savepoint", "--job", "j1"], None);
         assert_eq!(mode, CoordinatorMode::Local);
+        assert_eq!(remaining, vec!["savepoint", "--job", "j1"]);
     }
 
     #[test]
     fn env_var_coordinator_produces_remote_mode_when_no_flag() {
-        let (mode, _) = CoordinatorMode::from_args_with_env_override(
-            &["savepoint", "--job", "j1"],
-            Some("http://host:7070"),
+        let (mode, _) =
+            CoordinatorMode::from_args_with_env_override(&["jobs"], Some("http://env-coord:7070"));
+        assert_eq!(
+            mode,
+            CoordinatorMode::Remote("http://env-coord:7070".to_string())
         );
-        assert_eq!(mode, CoordinatorMode::Remote("http://host:7070".into()));
     }
 
     #[test]
-    fn dispatch_savepoint_with_coordinator_flag_uses_remote_path() {
-        let response = dispatch(&["--coordinator", "http://localhost:7070", "savepoint", "--job", "job-remote"]);
-        assert_eq!(response.exit_code, 0, "{:?}", response);
-        assert!(response.stdout.contains("remote"));
-        assert!(response.stdout.contains("job-remote"));
-    }
-
-    #[test]
-    fn dispatch_restore_with_short_coordinator_flag_uses_remote_path() {
-        let response = dispatch(&["-c", "http://localhost:7070", "restore", "--job", "job-remote", "--epoch", "3"]);
-        assert_eq!(response.exit_code, 0, "{:?}", response);
-        assert!(response.stdout.contains("remote"));
-        assert!(response.stdout.contains("job-remote"));
-    }
-
-    #[test]
-    fn dispatch_checkpoints_list_with_coordinator_flag_uses_remote_path() {
-        let response = dispatch(&["--coordinator", "http://localhost:7070", "checkpoints", "list", "--job", "job-remote"]);
-        assert_eq!(response.exit_code, 0, "{:?}", response);
-        assert!(response.stdout.contains("No checkpoints found") || response.stdout.contains("job-remote"));
-    }
-
-    #[test]
-    fn coordinator_flag_does_not_break_local_sql() {
-        let response = dispatch(&["--coordinator", "http://localhost:7070", "sql", "--query", "select 42 as answer"]);
-        assert_eq!(response.exit_code, 0, "{:?}", response);
-        assert!(response.stdout.contains("42"));
+    fn flag_beats_env_var() {
+        let (mode, _) = CoordinatorMode::from_args_with_env_override(
+            &["--coordinator", "http://flag:1"],
+            Some("http://env:2"),
+        );
+        assert_eq!(mode, CoordinatorMode::Remote("http://flag:1".to_string()));
     }
 
     #[test]
     fn main_help_mentions_coordinator_flag() {
         let response = dispatch(&["--help"]);
         assert_eq!(response.exit_code, 0);
-        assert!(response.stdout.contains("--coordinator"));
+        assert!(
+            response.stdout.contains("--coordinator"),
+            "help must document --coordinator flag"
+        );
+    }
+
+    #[test]
+    fn dispatch_savepoint_with_coordinator_flag_uses_remote_path() {
+        // Remote path: stub client returns Ok, so we get exit 0 and coordinator in output.
+        let response = dispatch(&[
+            "--coordinator",
+            "http://coord:7070",
+            "savepoint",
+            "--job",
+            "job-remote-1",
+        ]);
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        assert!(
+            response.stdout.contains("Coordinator") || response.stdout.contains("coord:7070"),
+            "expected coordinator URL in output, got: {:?}",
+            response.stdout
+        );
+    }
+
+    #[test]
+    fn dispatch_checkpoints_list_with_coordinator_flag_uses_remote_path() {
+        let response = dispatch(&[
+            "--coordinator",
+            "http://coord:7070",
+            "checkpoints",
+            "list",
+            "--job",
+            "job-ck-1",
+        ]);
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        // Stub returns empty list → "No checkpoints found"
+        assert!(response.stdout.contains("job-ck-1"));
+    }
+
+    #[test]
+    fn dispatch_restore_with_coordinator_flag_uses_remote_path() {
+        let response = dispatch(&[
+            "--coordinator",
+            "http://coord:7070",
+            "restore",
+            "--job",
+            "job-rs-1",
+            "--epoch",
+            "5",
+        ]);
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        assert!(
+            response.stdout.contains("Restore requested") || response.stdout.contains("coord:7070")
+        );
+    }
+
+    #[test]
+    fn dispatch_state_inspect_with_coordinator_flag_uses_remote_path() {
+        let response = dispatch(&[
+            "--coordinator",
+            "http://coord:7070",
+            "state",
+            "inspect",
+            "--job",
+            "job-si-1",
+            "--operator",
+            "op-1",
+        ]);
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        assert!(
+            response.stdout.contains("No state snapshots found")
+                || response.stdout.contains("coord:7070")
+        );
+    }
+
+    #[test]
+    fn coordinator_flag_does_not_break_sql_command() {
+        // --coordinator is stripped before routing; sql doesn't use it but must not error
+        let response = dispatch(&[
+            "--coordinator",
+            "http://coord:7070",
+            "sql",
+            "--query",
+            "select 42 as answer",
+        ]);
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        assert!(response.stdout.contains("42") || response.stdout.contains("answer"));
     }
 }

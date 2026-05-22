@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
-use krishiv_runtime::{EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend};
+use krishiv_runtime::{
+    DistributedBackend, EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend,
+};
 use krishiv_sql::{PolicyEnforcingSqlEngine, SqlDataFrame, SqlEngine};
 
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -177,6 +179,7 @@ pub struct SessionBuilder {
     mode: ExecutionMode,
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
+    coordinator_url: Option<String>,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -185,6 +188,7 @@ impl fmt::Debug for SessionBuilder {
             .field("mode", &self.mode)
             .field("auth", &self.auth.as_ref().map(|_| "<AuthProvider>"))
             .field("policy", &self.policy.as_ref().map(|_| "<PolicyHook>"))
+            .field("coordinator_url", &self.coordinator_url)
             .finish()
     }
 }
@@ -195,6 +199,7 @@ impl Default for SessionBuilder {
             mode: ExecutionMode::Embedded,
             auth: None,
             policy: None,
+            coordinator_url: None,
         }
     }
 }
@@ -226,6 +231,16 @@ impl SessionBuilder {
         self
     }
 
+    /// Configure a remote coordinator URL and automatically switch to
+    /// [`ExecutionMode::Distributed`].  The URL is the Arrow Flight endpoint
+    /// of the coordinator (e.g. `"http://coordinator:50051"`).
+    #[must_use]
+    pub fn with_coordinator(mut self, url: impl Into<String>) -> Self {
+        self.coordinator_url = Some(url.into());
+        self.mode = ExecutionMode::Distributed;
+        self
+    }
+
     /// Build a session.
     pub fn build(self) -> Result<Session> {
         let sql_engine = SqlEngine::new();
@@ -243,6 +258,7 @@ impl SessionBuilder {
             policy_engine,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
+            coordinator_url: self.coordinator_url,
         })
     }
 }
@@ -255,6 +271,7 @@ pub struct Session {
     policy_engine: Option<PolicyEnforcingSqlEngine>,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
+    coordinator_url: Option<String>,
 }
 
 impl fmt::Debug for Session {
@@ -338,6 +355,7 @@ impl Session {
             sql_dataframe,
             self.jobs.clone(),
             self.next_job_id.clone(),
+            self.coordinator_url.clone(),
         ))
     }
 
@@ -388,6 +406,7 @@ impl Session {
             sql_dataframe,
             self.jobs.clone(),
             self.next_job_id.clone(),
+            self.coordinator_url.clone(),
         ))
     }
 
@@ -413,6 +432,7 @@ pub struct DataFrame {
     mode: ExecutionMode,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
+    coordinator_url: Option<String>,
 }
 
 impl DataFrame {
@@ -425,6 +445,7 @@ impl DataFrame {
             mode: ExecutionMode::Embedded,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
+            coordinator_url: None,
         }
     }
 
@@ -433,6 +454,7 @@ impl DataFrame {
         sql_dataframe: SqlDataFrame,
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
+        coordinator_url: Option<String>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
@@ -442,6 +464,7 @@ impl DataFrame {
             mode,
             jobs,
             next_job_id,
+            coordinator_url,
         }
     }
 
@@ -462,6 +485,7 @@ impl DataFrame {
             mode,
             jobs,
             next_job_id,
+            coordinator_url: None,
         }
     }
 
@@ -514,6 +538,7 @@ impl DataFrame {
             self.mode,
             self.logical_plan.name(),
             self.logical_plan.kind(),
+            self.coordinator_url.as_deref(),
         ) {
             Err(error)
         } else {
@@ -611,7 +636,12 @@ impl Stream {
             ));
         }
 
-        accept_plan_with_backend(self.execution_mode, &self.name, ExecutionKind::Streaming)?;
+        accept_plan_with_backend(
+            self.execution_mode,
+            &self.name,
+            ExecutionKind::Streaming,
+            None,
+        )?;
         Ok(self.batches.clone())
     }
 
@@ -917,21 +947,19 @@ impl KeyedStream {
     }
 }
 
-fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
-    match mode {
-        ExecutionMode::Embedded | ExecutionMode::SingleNode => Ok(()),
-        ExecutionMode::Distributed => Err(KrishivError::unsupported(
-            "distributed execution starts in R2",
-        )),
-    }
+// All execution modes are now supported; this is a no-op retained to keep
+// call sites that guard metadata-only operations readable.
+#[allow(dead_code)]
+fn ensure_local_mode(_mode: ExecutionMode) -> Result<()> {
+    Ok(())
 }
 
 fn accept_plan_with_backend(
     mode: ExecutionMode,
     plan_name: &str,
     kind: ExecutionKind,
+    coordinator_url: Option<&str>,
 ) -> Result<()> {
-    ensure_local_mode(mode)?;
     let physical_plan = PhysicalPlan::new(plan_name, kind);
 
     match mode {
@@ -943,7 +971,15 @@ fn accept_plan_with_backend(
             let mut backend = SingleNodeBackend;
             backend.execute(&physical_plan)?;
         }
-        ExecutionMode::Distributed => unreachable!("distributed mode is rejected above"),
+        ExecutionMode::Distributed => {
+            let url = coordinator_url.ok_or_else(|| {
+                KrishivError::unsupported(
+                    "distributed mode requires a coordinator URL; use SessionBuilder::with_coordinator",
+                )
+            })?;
+            let mut backend = DistributedBackend::new(url);
+            backend.execute(&physical_plan)?;
+        }
     }
 
     Ok(())
@@ -996,7 +1032,10 @@ mod tests {
             .expect("SessionBuilder must succeed");
         // sql() calls block_on_krishiv internally; this must not panic.
         let result = session.sql("SELECT 1 AS v");
-        assert!(result.is_ok(), "block_on_krishiv panicked inside Tokio runtime: {result:?}");
+        assert!(
+            result.is_ok(),
+            "block_on_krishiv panicked inside Tokio runtime: {result:?}"
+        );
     }
 
     // ── P0.1: SessionBuilder::build uses a single shared SqlEngine ───────────
@@ -1391,5 +1430,29 @@ mod tests {
         let result = df.collect_async().await.unwrap();
 
         assert_eq!(result.row_count(), 3);
+    }
+
+    // ── S6.1: SessionBuilder::with_coordinator ────────────────────────────────
+
+    #[test]
+    fn with_coordinator_sets_distributed_mode() {
+        let session = Session::builder()
+            .with_coordinator("http://coord:50051")
+            .build()
+            .unwrap();
+        assert_eq!(session.mode(), ExecutionMode::Distributed);
+    }
+
+    #[test]
+    fn with_coordinator_stores_url_accessible_via_sql() {
+        // Building a distributed session must not fail.
+        let session = Session::builder()
+            .with_coordinator("http://coord:50051")
+            .build()
+            .unwrap();
+        assert_eq!(
+            session.coordinator_url.as_deref(),
+            Some("http://coord:50051")
+        );
     }
 }

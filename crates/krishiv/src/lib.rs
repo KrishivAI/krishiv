@@ -63,23 +63,9 @@
 // ── Session API ───────────────────────────────────────────────────────────────
 
 pub use krishiv_api::{
-    DataFrame,
-    ExecutionMode,
-    KeyedStream,
-    KrishivError,
-    MultiSourceWatermarkSpec,
-    QueryResult,
-    RecordBatch,
-    Session,
-    SessionBuilder,
-    SessionWindowedStream,
-    SlidingWindowedStream,
-    StateTtlConfig,
-    Stream,
-    StreamBatch,
-    StreamMode,
-    WatermarkSpec,
-    WindowedStream,
+    DataFrame, ExecutionMode, KeyedStream, KrishivError, MultiSourceWatermarkSpec, QueryResult,
+    RecordBatch, Session, SessionBuilder, SessionWindowedStream, SlidingWindowedStream,
+    StateTtlConfig, Stream, StreamBatch, StreamMode, WatermarkSpec, WindowedStream,
 };
 
 // Arrow schema/type primitives re-exported so users never import `arrow` directly.
@@ -92,24 +78,13 @@ pub use krishiv_udf::{AggregateUdf, ScalarUdf, TableUdf, UdfError, UdfRegistry};
 // ── Connector API ─────────────────────────────────────────────────────────────
 
 pub use krishiv_connectors::{
-    CommitHandle,
-    ConnectorCapabilities,
-    ConnectorConfig,
-    ConnectorError,
-    Offset,
-    Sink,
-    Source,
+    CommitHandle, ConnectorCapabilities, ConnectorConfig, ConnectorError, Offset, Sink, Source,
 };
 
 // ── Lakehouse API ─────────────────────────────────────────────────────────────
 
 pub use krishiv_lakehouse::{
-    IcebergScanOptions,
-    IcebergTableRef,
-    LakehouseError,
-    LakehouseTable,
-    SchemaField,
-    SchemaVersion,
+    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaField, SchemaVersion,
 };
 
 // ── Top-level aliases ─────────────────────────────────────────────────────────
@@ -121,6 +96,7 @@ pub type Result<T> = std::result::Result<T, KrishivError>;
 
 #[doc(hidden)]
 pub mod cli;
+#[doc(hidden)]
 pub mod remote_client;
 
 /// Convenient glob import for the most common Krishiv types.
@@ -133,8 +109,8 @@ pub mod prelude {
         AggregateUdf, CommitHandle, ConnectorCapabilities, ConnectorConfig, ConnectorError,
         DataFrame, DataType, ExecutionMode, Field, IcebergScanOptions, IcebergTableRef,
         KeyedStream, KrishivError, LakehouseTable, Offset, QueryResult, RecordBatch, Result,
-        ScalarUdf, Schema, SchemaRef, Session, SessionBuilder, SessionWindowedStream,
-        SlidingWindowedStream, Sink, Source, StateTtlConfig, Stream, StreamBatch, StreamMode,
-        TableUdf, UdfError, UdfRegistry, WatermarkSpec, WindowedStream,
+        ScalarUdf, Schema, SchemaRef, Session, SessionBuilder, SessionWindowedStream, Sink,
+        SlidingWindowedStream, Source, StateTtlConfig, Stream, StreamBatch, StreamMode, TableUdf,
+        UdfError, UdfRegistry, WatermarkSpec, WindowedStream,
     };
 }

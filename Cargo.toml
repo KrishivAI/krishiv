@@ -26,6 +26,7 @@ members = [
     "crates/krishiv-upgrade-tests",
     "crates/krishiv-bench",
     "crates/krishiv-chaos",
+    "crates/krishiv-federation",
 ]
 resolver = "3"
 

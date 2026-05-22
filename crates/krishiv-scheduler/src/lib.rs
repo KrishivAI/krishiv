@@ -1695,6 +1695,16 @@ impl Coordinator {
         })
     }
 
+    /// Snapshot all in-memory jobs to a `MetadataStore` so that a subsequent
+    /// `recover_from_store` call sees the current state.  Primarily useful in
+    /// tests that simulate a coordinator restart without a real persistent store.
+    pub fn persist_jobs_to_store(&self, store: &mut dyn MetadataStore) -> SchedulerResult<()> {
+        for record in self.jobs.values() {
+            store.save_job(record)?;
+        }
+        Ok(())
+    }
+
     /// Restore job state from a `MetadataStore` after coordinator restart.
     ///
     /// For streaming jobs with Running tasks, the `streaming_reattach_grace_ticks`
@@ -3901,6 +3911,151 @@ impl MetadataStore for JsonFileMetadataStore {
     }
 }
 
+// ── SqliteMetadataStore ───────────────────────────────────────────────────────
+
+/// SQLite-backed metadata store for durable coordinator recovery.
+///
+/// Feature-gated behind `--features sqlite`.  Uses a bundled SQLite binary so
+/// no system library is required.  Records are serialized as JSON blobs in the
+/// `events` and `jobs` tables and loaded into memory on `open`; subsequent
+/// `save_job`/`append_event` calls update both the in-memory cache and the
+/// on-disk database atomically via transactions.
+#[cfg(feature = "sqlite")]
+pub struct SqliteMetadataStore {
+    conn: std::sync::Mutex<rusqlite::Connection>,
+    events: Vec<EventLogEvent>,
+    jobs: Vec<JobRecord>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteMetadataStore {
+    /// Open (or create) a SQLite metadata store at `path`.
+    pub fn open(path: impl AsRef<std::path::Path>) -> SchedulerResult<Self> {
+        let conn = rusqlite::Connection::open(path).map_err(|e| SchedulerError::Transport {
+            message: format!("sqlite open error: {e}"),
+        })?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS jobs   (job_id TEXT PRIMARY KEY, payload TEXT NOT NULL);",
+        )
+        .map_err(|e| SchedulerError::Transport {
+            message: format!("sqlite schema init error: {e}"),
+        })?;
+
+        // Load existing events.
+        let events = {
+            let mut stmt = conn
+                .prepare("SELECT payload FROM events ORDER BY id")
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite events query error: {e}"),
+                })?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite events iter error: {e}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite events row error: {e}"),
+                })?
+                .into_iter()
+                .map(|json| {
+                    let pe: PersistedEvent =
+                        serde_json::from_str(&json).map_err(|e| SchedulerError::InvalidJob {
+                            message: format!("sqlite event decode error: {e}"),
+                        })?;
+                    EventLogEvent::try_from(pe)
+                })
+                .collect::<SchedulerResult<Vec<_>>>()?
+        };
+
+        // Load existing jobs.
+        let jobs = {
+            let mut stmt = conn.prepare("SELECT payload FROM jobs").map_err(|e| {
+                SchedulerError::Transport {
+                    message: format!("sqlite jobs query error: {e}"),
+                }
+            })?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite jobs iter error: {e}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite jobs row error: {e}"),
+                })?
+                .into_iter()
+                .map(|json| {
+                    let pj: PersistedJobRecord =
+                        serde_json::from_str(&json).map_err(|e| SchedulerError::InvalidJob {
+                            message: format!("sqlite job decode error: {e}"),
+                        })?;
+                    JobRecord::try_from(pj)
+                })
+                .collect::<SchedulerResult<Vec<_>>>()?
+        };
+
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            events,
+            jobs,
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl MetadataStore for SqliteMetadataStore {
+    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        let json = serde_json::to_string(&PersistedEvent::from(&event)).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("sqlite event encode error: {e}"),
+            }
+        })?;
+        self.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute("INSERT INTO events (payload) VALUES (?1)", [&json])
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("sqlite event insert error: {e}"),
+            })?;
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
+
+    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
+        let job_id = record.job_id().to_string();
+        let json = serde_json::to_string(&PersistedJobRecord::from(record)).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("sqlite job encode error: {e}"),
+            }
+        })?;
+        self.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute(
+                "INSERT INTO jobs (job_id, payload) VALUES (?1, ?2)
+                 ON CONFLICT(job_id) DO UPDATE SET payload = excluded.payload",
+                rusqlite::params![job_id, json],
+            )
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("sqlite job upsert error: {e}"),
+            })?;
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
+            *existing = record.clone();
+        } else {
+            self.jobs.push(record.clone());
+        }
+        Ok(())
+    }
+
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedMetadata {
     #[serde(default = "default_json_metadata_schema_version")]
@@ -5859,7 +6014,10 @@ mod tests {
         let assigned = coordinator.assign_pending_tasks(&job_id).unwrap();
         assert_eq!(assigned, 2, "both tasks must be re-assigned after retry");
         let launched = coordinator.launch_assigned_tasks(&job_id).unwrap();
-        assert_eq!(launched, 2, "both tasks must be launchable after re-assignment");
+        assert_eq!(
+            launched, 2,
+            "both tasks must be launchable after re-assignment"
+        );
     }
 
     #[test]
@@ -6345,8 +6503,7 @@ mod tests {
         // P0.19: Verify correct behaviour with 1000+ tasks using the HashSet path.
         let job_id = JobId::try_new("job-large").unwrap();
         const TASK_COUNT: usize = 1024;
-        let mut stage =
-            StageSpec::new(StageId::try_new("stage-big").unwrap(), "big stage");
+        let mut stage = StageSpec::new(StageId::try_new("stage-big").unwrap(), "big stage");
         for i in 0..TASK_COUNT {
             stage = stage.with_task(TaskSpec::new(
                 TaskId::try_new(format!("task-{i}")).unwrap(),
@@ -6455,7 +6612,10 @@ mod tests {
                 .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
         );
         coordinator.submit_job(stale_spec).unwrap();
-        assert!(coordinator.job_snapshot(&stale_job_id).is_ok(), "stale job must be in-memory");
+        assert!(
+            coordinator.job_snapshot(&stale_job_id).is_ok(),
+            "stale job must be in-memory"
+        );
 
         // Build a store that only has a different job.
         let mut store = InMemoryMetadataStore::default();
@@ -6466,11 +6626,10 @@ mod tests {
             2,
         ))
         .unwrap();
-        let stored_spec =
-            JobSpec::new(store_job_id.clone(), "stored", JobKind::Batch).with_stage(
-                StageSpec::new(StageId::try_new("stage-s").unwrap(), "ss")
-                    .with_task(TaskSpec::new(TaskId::try_new("task-s1").unwrap(), "ts1")),
-            );
+        let stored_spec = JobSpec::new(store_job_id.clone(), "stored", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-s").unwrap(), "ss")
+                .with_task(TaskSpec::new(TaskId::try_new("task-s1").unwrap(), "ts1")),
+        );
         prev.submit_job(stored_spec).unwrap();
         store.save_job(prev.jobs.values().next().unwrap()).unwrap();
 
@@ -8209,5 +8368,93 @@ mod tests {
         assert!(!cfg.disable_hot_key_splitting);
         assert!(!cfg.disable_adaptive_repartition);
         assert!(!cfg.disable_source_throttling);
+    }
+
+    // ── S6.4: SqliteMetadataStore ─────────────────────────────────────────────
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_metadata_store_save_and_reload_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+
+        let job_id = JobId::try_new("job-sqlite-1").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "sqlite-test", JobKind::Batch);
+
+        // Write.
+        {
+            let mut store = SqliteMetadataStore::open(&path).unwrap();
+            let record = JobRecord {
+                spec: spec.clone(),
+                state: JobState::Pending,
+                max_stage_retries: 2,
+                stages: vec![],
+                shuffle_output: std::collections::HashMap::new(),
+                resource_usage: crate::ResourceUsage::default(),
+            };
+            store.save_job(&record).unwrap();
+            assert_eq!(store.jobs().len(), 1);
+        }
+
+        // Reopen and verify.
+        {
+            let store = SqliteMetadataStore::open(&path).unwrap();
+            assert_eq!(store.jobs().len(), 1);
+            assert_eq!(store.jobs()[0].job_id(), &job_id);
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_metadata_store_upserts_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upsert.db");
+        let job_id = JobId::try_new("job-sqlite-2").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "upsert-test", JobKind::Batch);
+
+        let mut store = SqliteMetadataStore::open(&path).unwrap();
+
+        let record = |state: JobState| JobRecord {
+            spec: spec.clone(),
+            state,
+            max_stage_retries: 1,
+            stages: vec![],
+            shuffle_output: std::collections::HashMap::new(),
+            resource_usage: crate::ResourceUsage::default(),
+        };
+
+        store.save_job(&record(JobState::Pending)).unwrap();
+        store.save_job(&record(JobState::Running)).unwrap();
+
+        // Upsert means only one row.
+        assert_eq!(store.jobs().len(), 1);
+        assert_eq!(store.jobs()[0].state, JobState::Running);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_metadata_store_persist_jobs_to_store_roundtrip() {
+        // persist_jobs_to_store writes to a SqliteMetadataStore.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist.db");
+
+        let job_id = JobId::try_new("job-sqlite-3").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "persist-test", JobKind::Batch);
+
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-sqlite").unwrap());
+        coordinator
+            .submit_job(JobSpec::new(job_id.clone(), "persist-test", JobKind::Batch))
+            .unwrap();
+
+        let mut store = SqliteMetadataStore::open(&path).unwrap();
+        coordinator.persist_jobs_to_store(&mut store).unwrap();
+
+        // Reopen and recover.
+        let store2 = SqliteMetadataStore::open(&path).unwrap();
+        let mut coordinator2 =
+            Coordinator::active(CoordinatorId::try_new("coord-sqlite-2").unwrap());
+        coordinator2.recover_from_store(&store2).unwrap();
+
+        assert!(coordinator2.job_detail_snapshot(&job_id).is_ok());
     }
 }

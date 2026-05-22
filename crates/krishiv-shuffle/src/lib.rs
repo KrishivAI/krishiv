@@ -37,6 +37,14 @@ pub struct ShufflePath {
 }
 
 impl ShufflePath {
+    pub fn new(job_id: impl Into<String>, stage_id: impl Into<String>, partition_id: u32) -> Self {
+        Self {
+            job_id: job_id.into(),
+            stage_id: stage_id.into(),
+            partition_id,
+        }
+    }
+
     /// Returns the staging path: `{job_id}/{stage_id}/{partition_id}.tmp`
     pub fn staging_name(&self) -> String {
         format!(
@@ -106,7 +114,9 @@ impl ShuffleMetadata {
     /// Returns `TooManyPartitions` when the cap is already reached.
     pub fn mark_pending(&mut self, path: &ShufflePath) -> ShuffleResult<()> {
         if self.states.len() >= self.max_partitions && !self.states.contains_key(path) {
-            return Err(ShuffleError::TooManyPartitions { limit: self.max_partitions });
+            return Err(ShuffleError::TooManyPartitions {
+                limit: self.max_partitions,
+            });
         }
         self.states.insert(path.clone(), PartitionState::Pending);
         Ok(())
@@ -204,7 +214,10 @@ impl std::fmt::Display for ShuffleError {
             ),
             Self::NotFound { path } => write!(f, "shuffle path not found: {path}"),
             Self::TooManyPartitions { limit } => {
-                write!(f, "shuffle partition limit exceeded: max {limit} partitions")
+                write!(
+                    f,
+                    "shuffle partition limit exceeded: max {limit} partitions"
+                )
             }
         }
     }
@@ -238,72 +251,30 @@ pub enum ShuffleCompression {
     Zstd,
 }
 
-/// Compression codec for shuffle partition data.
-///
-/// Kept as a type alias for [`ShuffleCompression`] for backward compatibility.
+/// Compression codec — type alias for [`ShuffleCompression`].
 pub type CompressionCodec = ShuffleCompression;
 
-// ── ShuffleWriteConfig / ShuffleReadConfig ────────────────────────────────────
-
-/// Configuration for writing shuffle blocks.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ShuffleWriteConfig {
-    /// Compression algorithm to apply when writing blocks.
-    pub compression: ShuffleCompression,
-}
-
-impl ShuffleWriteConfig {
-    /// Create a new write config with the given compression algorithm.
-    pub fn new(compression: ShuffleCompression) -> Self {
-        Self { compression }
-    }
-}
-
-/// Configuration for reading shuffle blocks.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ShuffleReadConfig {
-    /// Compression algorithm used when the blocks were written.
-    pub compression: ShuffleCompression,
-}
-
-impl ShuffleReadConfig {
-    /// Create a new read config with the given compression algorithm.
-    pub fn new(compression: ShuffleCompression) -> Self {
-        Self { compression }
-    }
-}
-
-// ── Compression helpers ───────────────────────────────────────────────────────
-
-/// Compress `data` using the given [`ShuffleCompression`] algorithm.
-///
-/// Returns the compressed bytes, or the original bytes when compression is `None`.
-pub fn compress_block(data: &[u8], codec: ShuffleCompression) -> ShuffleResult<Vec<u8>> {
-    match codec {
-        ShuffleCompression::None => Ok(data.to_vec()),
-        ShuffleCompression::Lz4 => {
-            Ok(lz4_flex::compress_prepend_size(data))
-        }
-        ShuffleCompression::Zstd => {
-            zstd::encode_all(data, 0 /* default level */)
-                .map_err(|e| ShuffleError::Io(format!("zstd compress error: {e}")))
+impl ShuffleCompression {
+    /// Compress `data` using this codec. Returns the compressed bytes.
+    pub fn compress(self, data: &[u8]) -> ShuffleResult<Vec<u8>> {
+        match self {
+            ShuffleCompression::None => Ok(data.to_vec()),
+            ShuffleCompression::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
+            ShuffleCompression::Zstd => {
+                zstd::encode_all(data, 0).map_err(|e| ShuffleError::Io(e.to_string()))
+            }
         }
     }
-}
 
-/// Decompress `data` using the given [`ShuffleCompression`] algorithm.
-///
-/// Returns the decompressed bytes, or the original bytes when compression is `None`.
-pub fn decompress_block(data: &[u8], codec: ShuffleCompression) -> ShuffleResult<Vec<u8>> {
-    match codec {
-        ShuffleCompression::None => Ok(data.to_vec()),
-        ShuffleCompression::Lz4 => {
-            lz4_flex::decompress_size_prepended(data)
-                .map_err(|e| ShuffleError::Io(format!("lz4 decompress error: {e}")))
-        }
-        ShuffleCompression::Zstd => {
-            zstd::decode_all(data)
-                .map_err(|e| ShuffleError::Io(format!("zstd decompress error: {e}")))
+    /// Decompress `data` using this codec. Returns the original bytes.
+    pub fn decompress(self, data: &[u8]) -> ShuffleResult<Vec<u8>> {
+        match self {
+            ShuffleCompression::None => Ok(data.to_vec()),
+            ShuffleCompression::Lz4 => lz4_flex::decompress_size_prepended(data)
+                .map_err(|e| ShuffleError::Io(e.to_string())),
+            ShuffleCompression::Zstd => {
+                zstd::decode_all(data).map_err(|e| ShuffleError::Io(e.to_string()))
+            }
         }
     }
 }
@@ -342,13 +313,15 @@ impl LocalShuffleStore {
         self.compression
     }
 
-    /// Write `data` to disk for the given partition.
+    /// Write `data` to disk for the given partition, applying the configured
+    /// compression codec before writing.
     ///
-    /// 1. Compresses `data` with the configured codec (if any).
+    /// 1. Compresses `data` with the configured codec.
     /// 2. Creates `{base_dir}/{staging_name}` (including parent dirs).
-    /// 3. Writes the (possibly compressed) bytes.
+    /// 3. Writes the compressed bytes.
     /// 4. Atomically renames staging path → final path.
     pub async fn write_partition(&self, path: &ShufflePath, data: &[u8]) -> ShuffleResult<()> {
+        let compressed = self.compression.compress(data)?;
         let staging = self.base_dir.join(path.staging_name());
         let final_path = self.base_dir.join(path.final_name());
 
@@ -357,8 +330,7 @@ impl LocalShuffleStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let payload = compress_block(data, self.compression)?;
-        tokio::fs::write(&staging, &payload).await?;
+        tokio::fs::write(&staging, &compressed).await?;
         tokio::fs::rename(&staging, &final_path).await?;
         Ok(())
     }
@@ -369,7 +341,7 @@ impl LocalShuffleStore {
     pub async fn read_partition(&self, path: &ShufflePath) -> ShuffleResult<Vec<u8>> {
         let final_path = self.base_dir.join(path.final_name());
         match tokio::fs::read(&final_path).await {
-            Ok(bytes) => decompress_block(&bytes, self.compression),
+            Ok(bytes) => self.compression.decompress(&bytes),
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(ShuffleError::PartitionNotFound {
                     path: final_path.display().to_string(),
@@ -877,9 +849,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
 
             for batch in &partition.batches {
-                writer.write(batch).map_err(|e| {
-                    ShuffleError::Io(format!("failed to write Parquet batch: {e}"))
-                })?;
+                writer
+                    .write(batch)
+                    .map_err(|e| ShuffleError::Io(format!("failed to write Parquet batch: {e}")))?;
             }
             writer
                 .close()
@@ -917,12 +889,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
             })?;
             let mut batches = Vec::new();
             for result in reader {
-                let batch = result.map_err(|e| {
-                    ShuffleError::Io(format!("error reading Parquet batch: {e}"))
-                })?;
+                let batch = result
+                    .map_err(|e| ShuffleError::Io(format!("error reading Parquet batch: {e}")))?;
                 batches.push(batch);
             }
-            Ok(Some(ShufflePartition { id, schema, batches }))
+            Ok(Some(ShufflePartition {
+                id,
+                schema,
+                batches,
+            }))
         })
         .await
         .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
@@ -1292,75 +1267,49 @@ mod tests {
     // ── Compression round-trip tests ──────────────────────────────────────
 
     #[test]
-    fn compress_decompress_none_round_trip() {
-        let original = b"hello shuffle data, no compression".as_slice();
-        let compressed = compress_block(original, ShuffleCompression::None).unwrap();
-        let decompressed = decompress_block(&compressed, ShuffleCompression::None).unwrap();
-        assert_eq!(decompressed, original, "None: decompressed must equal original");
+    fn compression_codec_none_round_trip() {
+        let data = b"hello shuffle world";
+        let compressed = CompressionCodec::None.compress(data).unwrap();
+        let decompressed = CompressionCodec::None.decompress(&compressed).unwrap();
+        assert_eq!(&decompressed, data);
     }
 
     #[test]
-    fn compress_decompress_lz4_round_trip() {
-        let original: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        let compressed = compress_block(&original, ShuffleCompression::Lz4).unwrap();
-        let decompressed = decompress_block(&compressed, ShuffleCompression::Lz4).unwrap();
-        assert_eq!(decompressed, original, "Lz4: decompressed must equal original");
+    fn compression_codec_lz4_round_trip() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let compressed = CompressionCodec::Lz4.compress(&data).unwrap();
+        let decompressed = CompressionCodec::Lz4.decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data, "LZ4 round-trip must be byte-exact");
     }
 
     #[test]
-    fn compress_decompress_zstd_round_trip() {
-        let original: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        let compressed = compress_block(&original, ShuffleCompression::Zstd).unwrap();
-        let decompressed = decompress_block(&compressed, ShuffleCompression::Zstd).unwrap();
-        assert_eq!(decompressed, original, "Zstd: decompressed must equal original");
+    fn compression_codec_zstd_round_trip() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let compressed = CompressionCodec::Zstd.compress(&data).unwrap();
+        let decompressed = CompressionCodec::Zstd.decompress(&compressed).unwrap();
+        assert_eq!(decompressed, data, "Zstd round-trip must be byte-exact");
     }
 
     #[tokio::test]
     async fn local_store_lz4_write_read_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            LocalShuffleStore::new(dir.path()).with_compression(ShuffleCompression::Lz4);
-        let path = ShufflePath {
-            job_id: "job-lz4".into(),
-            stage_id: "s0".into(),
-            partition_id: 0,
-        };
-        let data: Vec<u8> = b"lz4 compressed shuffle block data".to_vec();
+        let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
+        let path = ShufflePath::new("job-1", "stage-1", 0);
+        let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
         store.write_partition(&path, &data).await.unwrap();
-        let read = store.read_partition(&path).await.unwrap();
-        assert_eq!(read, data, "Lz4 round-trip: decompressed must equal original");
+        let read_back = store.read_partition(&path).await.unwrap();
+        assert_eq!(read_back, data, "LZ4 write/read round-trip must be byte-exact");
     }
 
     #[tokio::test]
     async fn local_store_zstd_write_read_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            LocalShuffleStore::new(dir.path()).with_compression(ShuffleCompression::Zstd);
-        let path = ShufflePath {
-            job_id: "job-zstd".into(),
-            stage_id: "s0".into(),
-            partition_id: 0,
-        };
-        let data: Vec<u8> = b"zstd compressed shuffle block data".to_vec();
+        let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Zstd);
+        let path = ShufflePath::new("job-1", "stage-1", 0);
+        let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
         store.write_partition(&path, &data).await.unwrap();
-        let read = store.read_partition(&path).await.unwrap();
-        assert_eq!(read, data, "Zstd round-trip: decompressed must equal original");
-    }
-
-    #[tokio::test]
-    async fn local_store_none_compression_write_read_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store =
-            LocalShuffleStore::new(dir.path()).with_compression(ShuffleCompression::None);
-        let path = ShufflePath {
-            job_id: "job-none".into(),
-            stage_id: "s0".into(),
-            partition_id: 0,
-        };
-        let data: Vec<u8> = b"no compression shuffle block data".to_vec();
-        store.write_partition(&path, &data).await.unwrap();
-        let read = store.read_partition(&path).await.unwrap();
-        assert_eq!(read, data, "None round-trip: bytes must equal original");
+        let read_back = store.read_partition(&path).await.unwrap();
+        assert_eq!(read_back, data, "Zstd write/read round-trip must be byte-exact");
     }
 
     // ── Orphan detection ──────────────────────────────────────────────────

@@ -333,19 +333,16 @@ impl AqeRule for CoalesceRule {
     /// Compute coalesce advice and, when beneficial, rewrite the plan.
     ///
     /// When `advise()` produces fewer groups than the current partition count,
-    /// this method appends a [`NodeOp::CoalescePartitions`] node to the plan
-    /// that carries the computed `target_partitions` count.  The node label
-    /// includes both the original partition count and the target for
-    /// observability in EXPLAIN output.
-    ///
-    /// When no coalescing is needed the plan is returned unchanged so the
-    /// [`AqeOptimizer`] does not record this rule as having fired.
+    /// stamps `coalesced_partition_count` on the plan and appends a
+    /// [`NodeOp::CoalescePartitions`] node carrying the computed target count.
     fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> PhysicalPlan {
+        if stats.is_empty() {
+            return plan;
+        }
         let advice = self.advise(stats);
         let original_count = stats.len();
 
         if advice.groups.len() >= original_count || original_count == 0 {
-            // No coalescing benefit — return unchanged.
             return plan;
         }
 
@@ -353,12 +350,13 @@ impl AqeRule for CoalesceRule {
 
         tracing::debug!(
             rule = self.name(),
+            original_partitions = original_count,
+            coalesced_partitions = advice.groups.len(),
             coalesce_groups = ?advice.groups,
             target_partitions,
-            "coalesce: {} partition(s) → {} group(s) (target_partitions={})",
+            "CoalesceRule: {} partition(s) → {} group(s)",
             original_count,
             advice.groups.len(),
-            target_partitions,
         );
 
         let coalesce_node = PlanNode::new(
@@ -369,6 +367,7 @@ impl AqeRule for CoalesceRule {
         .with_op(NodeOp::CoalescePartitions { target_partitions });
 
         plan.with_node(coalesce_node)
+            .with_coalesced_partition_count(advice.groups.len())
     }
 }
 
@@ -557,7 +556,8 @@ mod tests {
     use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
 
     use super::{
-        AqeOptimizer, CoalesceRule, Optimizer, OptimizerRule, RuntimeStats, StreamingAqeGuard,
+        AqeOptimizer, AqeRule, CoalesceRule, Optimizer, OptimizerRule, RuntimeStats,
+        StreamingAqeGuard,
     };
 
     fn empty_plan() -> LogicalPlan {
@@ -817,6 +817,47 @@ mod tests {
         let rule = CoalesceRule::new(1000);
         let advice = rule.advise(&[]);
         assert_eq!(advice.groups, Vec::<Vec<usize>>::new());
+    }
+
+    #[test]
+    fn coalesce_rule_apply_reduces_200_small_partitions_to_le_10() {
+        // 200 partitions each with 1 byte — all below the 128 MiB threshold.
+        let stats: Vec<RuntimeStats> = (0..200)
+            .map(|_| RuntimeStats {
+                memory_bytes: 1,
+                ..RuntimeStats::default()
+            })
+            .collect();
+        let plan = PhysicalPlan::new("test-plan", ExecutionKind::Batch);
+        let rule = CoalesceRule::new(128 * 1024 * 1024); // 128 MiB
+        let result = rule.apply(plan, &stats);
+        let coalesced = result
+            .coalesced_partition_count()
+            .expect("CoalesceRule must set coalesced_partition_count");
+        // All 200 partitions are small so they collapse into one group.
+        assert!(
+            coalesced <= 10,
+            "expected ≤ 10 partitions after coalescing, got {coalesced}"
+        );
+    }
+
+    #[test]
+    fn coalesce_rule_apply_does_not_stamp_when_no_coalescing_needed() {
+        // All partitions are large — no coalescing.
+        let stats: Vec<RuntimeStats> = (0..5)
+            .map(|_| RuntimeStats {
+                memory_bytes: 256 * 1024 * 1024, // 256 MiB each
+                ..RuntimeStats::default()
+            })
+            .collect();
+        let plan = PhysicalPlan::new("big-plan", ExecutionKind::Batch);
+        let rule = CoalesceRule::new(128 * 1024 * 1024);
+        let result = rule.apply(plan, &stats);
+        assert_eq!(
+            result.coalesced_partition_count(),
+            None,
+            "no coalescing should leave count unset"
+        );
     }
 
     // ── SmallFilePlanner ──────────────────────────────────────────────────
