@@ -8,17 +8,18 @@
 
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
     DistributedBackend, EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend,
 };
-use krishiv_sql::{PolicyEnforcingSqlEngine, SqlDataFrame, SqlEngine};
+use krishiv_sql::{SqlDataFrame, SqlEngine};
+use krishiv_sql_policy::PolicyEnforcingSqlEngine;
 
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
@@ -318,7 +319,7 @@ impl Session {
         ensure_local_mode(self.mode)?;
         let table_name = table_name.as_ref().to_owned();
         let path = path.as_ref().to_path_buf();
-        block_on_krishiv(async {
+        block_on(async {
             self.sql_engine
                 .register_parquet(table_name, path)
                 .await
@@ -342,7 +343,7 @@ impl Session {
     /// Create a DataFrame from a SQL query.
     pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;
-        block_on_krishiv(self.sql_async(query))
+        block_on(self.sql_async(query))
     }
 
     /// Asynchronously create a DataFrame from a SQL query.
@@ -394,7 +395,7 @@ impl Session {
     pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;
         let path = path.as_ref().to_path_buf();
-        block_on_krishiv(self.read_parquet_async(path))
+        block_on(self.read_parquet_async(path))
     }
 
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.
@@ -496,7 +497,7 @@ impl DataFrame {
 
     /// Explain the current plan.
     pub fn explain(&self) -> Result<String> {
-        block_on_krishiv(self.explain_async())
+        block_on(self.explain_async())
     }
 
     /// Asynchronously explain the current plan.
@@ -518,7 +519,7 @@ impl DataFrame {
 
     /// Collect results.
     pub fn collect(&self) -> Result<QueryResult> {
-        block_on_krishiv(self.collect_async())
+        block_on(self.collect_async())
     }
 
     /// Asynchronously collect results.
@@ -985,21 +986,6 @@ fn accept_plan_with_backend(
     Ok(())
 }
 
-fn block_on_krishiv<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
-    // P0.3 fix: When inside an existing Tokio runtime we must not spawn a new
-    // runtime (that panics with "Cannot start a runtime from within a runtime").
-    // Instead we use `block_in_place` to park the current task and then call
-    // `handle.block_on` from within that blocking context, which is always safe.
-    // When there is no current runtime (e.g. a plain `#[test]` or CLI main), we
-    // fall back to creating a short-lived runtime so callers outside any async
-    // context still work.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => tokio::runtime::Runtime::new()
-            .expect("failed to create Tokio runtime for block_on_krishiv")
-            .block_on(future),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1015,26 +1001,25 @@ mod tests {
         StreamBatch,
     };
 
-    // ── P0.3 regression: block_on_krishiv must reuse the current runtime ────────
+    // ── P0.3 regression: block_on must reuse the current runtime ────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn block_on_krishiv_does_not_panic_inside_tokio_runtime() {
-        // P0.3: Calling block_on_krishiv (the sync wrapper) from within an
-        // existing multi-thread Tokio runtime must NOT panic.  The previous
-        // implementation called `Runtime::new().block_on(f)` which panics with
-        // "Cannot start a runtime from within a runtime".  The fix uses
-        // `block_in_place(|| handle.block_on(f))` which is safe on multi-thread
-        // runtimes.  We need `flavor = "multi_thread"` here because
-        // `block_in_place` is not supported on the default current_thread
-        // runtime used by `#[tokio::test]`.
+    async fn block_on_does_not_panic_inside_tokio_runtime() {
+        // P0.3: Calling block_on (the sync wrapper) from within an existing
+        // multi-thread Tokio runtime must NOT panic.  The previous implementation
+        // called `Runtime::new().block_on(f)` which panics with "Cannot start a
+        // runtime from within a runtime".  The fix uses `block_in_place(||
+        // handle.block_on(f))` which is safe on multi-thread runtimes.  We need
+        // `flavor = "multi_thread"` here because `block_in_place` is not
+        // supported on the default current_thread runtime used by `#[tokio::test]`.
         let session = Session::builder()
             .build()
             .expect("SessionBuilder must succeed");
-        // sql() calls block_on_krishiv internally; this must not panic.
+        // sql() calls block_on internally; this must not panic.
         let result = session.sql("SELECT 1 AS v");
         assert!(
             result.is_ok(),
-            "block_on_krishiv panicked inside Tokio runtime: {result:?}"
+            "block_on panicked inside Tokio runtime: {result:?}"
         );
     }
 
@@ -1395,11 +1380,10 @@ mod tests {
         assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
     }
 
-    #[test]
-    fn session_without_policy_sql_as_returns_access_denied() {
+    #[tokio::test]
+    async fn session_without_policy_sql_as_returns_access_denied() {
         let session = SessionBuilder::new().build().unwrap();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(session.sql_as("any_key", "SELECT 1"));
+        let result = session.sql_as("any_key", "SELECT 1").await;
         assert!(matches!(result, Err(KrishivError::AccessDenied { .. })));
     }
 

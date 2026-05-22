@@ -1,0 +1,12 @@
+[package]
+name = "krishiv-sql-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+krishiv-sql = { path = "../krishiv-sql" }
+
+[lints]
+workspace = true

@@ -27,6 +27,9 @@ members = [
     "crates/krishiv-bench",
     "crates/krishiv-chaos",
     "crates/krishiv-federation",
+    "crates/krishiv-async-util",
+    "crates/krishiv-testkit",
+    "crates/krishiv-sql-policy",
 ]
 resolver = "3"
 

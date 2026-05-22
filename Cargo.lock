@@ -3124,6 +3124,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-api",
+ "krishiv-async-util",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-lakehouse",
@@ -3142,12 +3143,21 @@ name = "krishiv-api"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "krishiv-async-util",
  "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
+ "krishiv-sql-policy",
  "parquet 58.3.0",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "krishiv-async-util"
+version = "0.1.0"
+dependencies = [
  "tokio",
 ]
 
@@ -3420,6 +3430,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-sql-policy"
+version = "0.1.0"
+dependencies = [
+ "krishiv-sql",
+]
+
+[[package]]
 name = "krishiv-state"
 version = "0.1.0"
 dependencies = [
@@ -3427,6 +3444,10 @@ dependencies = [
  "tempfile",
  "tokio",
 ]
+
+[[package]]
+name = "krishiv-testkit"
+version = "0.1.0"
 
 [[package]]
 name = "krishiv-udf"
