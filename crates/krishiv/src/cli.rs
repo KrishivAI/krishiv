@@ -10,6 +10,59 @@ use krishiv_proto::{
 };
 use krishiv_scheduler::{Coordinator, JobDetailSnapshot, JobSnapshot};
 
+pub use crate::remote_client::RemoteCoordinatorClient;
+
+// ── Coordinator mode ──────────────────────────────────────────────────────────
+
+/// Whether CLI commands address a local in-process coordinator or a remote one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorMode {
+    /// Default: use the in-process local coordinator.
+    Local,
+    /// Connect to a remote coordinator at the given URL.
+    ///
+    /// Set via `--coordinator <URL>` / `-c <URL>`, or the
+    /// `KRISHIV_COORDINATOR` environment variable (flag takes precedence).
+    Remote(String),
+}
+
+impl CoordinatorMode {
+    /// Resolve the coordinator mode from CLI args and/or environment.
+    ///
+    /// Strips `--coordinator <URL>` / `-c <URL>` from `args` (returning the
+    /// remaining tokens) and returns the resolved `CoordinatorMode`.
+    /// The environment variable `KRISHIV_COORDINATOR` is used as a fallback
+    /// when no flag is present.
+    pub(crate) fn from_args_and_env<'a>(args: &'a [&'a str]) -> (CoordinatorMode, Vec<&'a str>) {
+        let mut remaining: Vec<&str> = Vec::new();
+        let mut coordinator_url: Option<String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i] {
+                "--coordinator" | "-c" if i + 1 < args.len() => {
+                    coordinator_url = Some(args[i + 1].to_owned());
+                    i += 2;
+                }
+                _ => {
+                    remaining.push(args[i]);
+                    i += 1;
+                }
+            }
+        }
+
+        // Env var fallback when the flag was not provided.
+        if coordinator_url.is_none() {
+            coordinator_url = std::env::var("KRISHIV_COORDINATOR").ok();
+        }
+
+        let mode = match coordinator_url {
+            Some(url) if !url.trim().is_empty() => CoordinatorMode::Remote(url),
+            _ => CoordinatorMode::Local,
+        };
+        (mode, remaining)
+    }
+}
+
 /// CLI response used by `main` and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliResponse {
