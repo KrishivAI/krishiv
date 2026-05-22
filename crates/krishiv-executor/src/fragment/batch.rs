@@ -51,7 +51,7 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if fragment == KAFKA_TO_PARQUET_FRAGMENT {
-        return execute_kafka_to_parquet_pipeline(assignment).await;
+        return execute_source_to_sink_pipeline(assignment).await;
     }
 
     if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
@@ -514,7 +514,7 @@ async fn execute_inmem_shuffle_read(
     ))
 }
 
-async fn execute_kafka_to_parquet_pipeline(
+async fn execute_source_to_sink_pipeline(
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_connectors::kafka::{

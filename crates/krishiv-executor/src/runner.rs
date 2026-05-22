@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
@@ -12,6 +13,7 @@ use krishiv_proto::{
     TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
     TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
+use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
 
 use crate::{
@@ -449,6 +451,8 @@ pub struct ExecutorTaskRunner {
     pub(crate) inbox: ExecutorAssignmentInbox,
     pub(crate) shuffle: Option<ShuffleContext>,
     pub(crate) inmem_shuffle: Option<std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>>,
+    /// Shared SQL engine — one instance per runner rather than per-fragment.
+    pub(crate) sql_engine: Arc<SqlEngine>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -463,6 +467,7 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .as_ref()
                     .map(|_| "<InMemoryShuffleStore>"),
             )
+            .field("sql_engine", &self.sql_engine)
             .finish()
     }
 }
@@ -474,7 +479,14 @@ impl ExecutorTaskRunner {
             inbox,
             shuffle: None,
             inmem_shuffle: None,
+            sql_engine: Arc::new(SqlEngine::new()),
         }
+    }
+
+    /// Attach a custom SQL engine. Useful for tests or policy-wrapped engines.
+    pub fn with_sql_engine(mut self, engine: Arc<SqlEngine>) -> Self {
+        self.sql_engine = engine;
+        self
     }
 
     /// Attach a shuffle context so this runner can handle `shuffle-write:` fragments.
