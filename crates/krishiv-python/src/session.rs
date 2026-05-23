@@ -279,6 +279,7 @@ impl PySession {
         self.inner.scalar_udf_names()
     }
 
+
     pub fn memory_stream_collect(
         &self,
         py: Python<'_>,
