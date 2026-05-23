@@ -96,6 +96,7 @@ pub type Result<T> = std::result::Result<T, KrishivError>;
 
 #[doc(hidden)]
 pub mod cli;
+pub mod compat;
 #[doc(hidden)]
 pub mod remote_client;
 

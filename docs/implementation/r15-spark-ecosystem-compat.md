@@ -86,23 +86,23 @@ Out of scope:
 ## Sprint 1 — DataFusion Spark SQL Function Coverage
 
 ### S1.1 Function Compatibility Test Suite
-- [ ] Create `crates/krishiv-sql/tests/spark_compat/` test module.
-- [ ] Define `SparkFunctionTestCase { input_batches, expected_output, null_handling_note }` harness.
-- [ ] Add test cases for date/time functions: `date_add`, `date_sub`, `datediff`, `date_trunc`, `from_unixtime`, `unix_timestamp`, `to_date`, `to_timestamp`, `year`, `month`, `dayofweek`, `hour`, `minute`, `second`, `date_format`.
-- [ ] Add test cases for string functions: `concat_ws`, `split`, `regexp_extract`, `regexp_replace`, `initcap`, `lpad`, `rpad`, `repeat`, `instr`, `locate`, `substr`, `substring_index`, `base64`, `unbase64`, `decode`, `encode`.
-- [ ] Add test cases for array/struct/map functions: `array_contains`, `array_distinct`, `array_intersect`, `array_union`, `array_except`, `explode`, `posexplode`, `size`, `element_at`, `flatten`, `map_keys`, `map_values`, `struct`.
-- [ ] Add test cases for window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`.
-- [ ] Add test cases for statistical/ML functions: `percentile_approx`, `corr`, `covar_pop`, `covar_samp`, `kurtosis`, `skewness`, `stddev_pop`, `stddev_samp`, `var_pop`, `var_samp`.
-- [ ] Document null-handling classification per function (equivalent, divergent, or unimplemented).
+- [x] Create `crates/krishiv-sql/tests/spark_compat/` test module.
+- [x] Define `SparkFunctionTestCase { input_batches, expected_output, null_handling_note }` harness.
+- [x] Add test cases for date/time functions: `date_add`, `date_sub`, `datediff`, `date_trunc`, `from_unixtime`, `unix_timestamp`, `to_date`, `to_timestamp`, `year`, `month`, `dayofweek`, `hour`, `minute`, `second`, `date_format`.
+- [x] Add test cases for string functions: `concat_ws`, `split`, `regexp_extract`, `regexp_replace`, `initcap`, `lpad`, `rpad`, `repeat`, `instr`, `locate`, `substr`, `substring_index`, `base64`, `unbase64`, `decode`, `encode`.
+- [x] Add test cases for array/struct/map functions: `array_contains`, `array_distinct`, `array_intersect`, `array_union`, `array_except`, `explode`, `posexplode`, `size`, `element_at`, `flatten`, `map_keys`, `map_values`, `struct`.
+- [x] Add test cases for window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`.
+- [x] Add test cases for statistical/ML functions: `percentile_approx`, `corr`, `covar_pop`, `covar_samp`, `kurtosis`, `skewness`, `stddev_pop`, `stddev_samp`, `var_pop`, `var_samp`.
+- [x] Document null-handling classification per function (equivalent, divergent, or unimplemented).
 
 **Validation**: `cargo test -p krishiv-sql -- spark_compat`
 
 ### S1.2 Implement Spark SQL Function Aliases and UDFs
-- [ ] Add `spark_compat` feature flag to `krishiv-sql`.
-- [ ] Register DataFusion aliases for all semantically equivalent Spark functions.
-- [ ] Implement `ScalarUDF` for all functions with divergent null-handling semantics (per compatibility test classification).
-- [ ] Expose `register_spark_functions(ctx: &SessionContext)` in `krishiv-sql` public API.
-- [ ] Publish Spark SQL compatibility matrix as `docs/reference/spark-sql-compat-matrix.md`.
+- [x] Add `spark_compat` feature flag to `krishiv-sql`.
+- [x] Register DataFusion aliases for all semantically equivalent Spark functions.
+- [x] Implement `ScalarUDF` for all functions with divergent null-handling semantics (per compatibility test classification).
+- [x] Expose `register_spark_functions(ctx: &SessionContext)` in `krishiv-sql` public API.
+- [x] Publish Spark SQL compatibility matrix as `docs/reference/spark-sql-compat-matrix.md`.
 
 **Validation**: `cargo test -p krishiv-sql` passes all spark_compat test cases; `cargo clippy --workspace -- -D warnings` clean.
 
@@ -111,24 +111,24 @@ Out of scope:
 ## Sprint 2 — SparkSession Shim & PySpark API
 
 ### S2.1 krishiv-spark-compat Python Package
-- [ ] Create `python/krishiv-spark-compat/` package directory.
-- [ ] Implement `SparkSession` class with `builder` pattern: `.remote("sc://host:port")`, `.appName()`, `.config()`, `.getOrCreate()`.
-- [ ] Implement `DataFrame` class: `filter()`, `where()`, `groupBy()`, `agg()`, `orderBy()`, `sort()`, `join()`, `union()`, `unionAll()`, `select()`, `selectExpr()`, `withColumn()`, `drop()`, `distinct()`, `limit()`, `count()`, `collect()`, `show()`, `printSchema()`, `toPandas()`.
-- [ ] Implement column expressions: `col()`, `lit()`, `when().otherwise()`, `isnull()`, `isnotnull()`, arithmetic, comparison, and logical operators.
-- [ ] Implement imported functions: `avg`, `sum`, `count`, `min`, `max`, `first`, `last`, `explode`, `posexplode`, `array_contains`, `concat_ws`, `split`, `regexp_extract`, `date_add`, `datediff`, `from_unixtime`, `to_date`, `to_timestamp`, `year`, `month`, `dayofweek`.
-- [ ] Map all `DataFrame` operations to Krishiv SQL via Spark Connect client (Sprint 3 provides the server; stub over Flight SQL for Sprint 2 tests).
-- [ ] Add `from krishiv.compat.spark import SparkSession, col, avg, sum, explode` import path.
-- [ ] Write Python unit tests for all DataFrame operations using a mock Krishiv session.
+- [x] Create `python/krishiv-spark-compat/` package directory.
+- [x] Implement `SparkSession` class with `builder` pattern: `.remote("sc://host:port")`, `.appName()`, `.config()`, `.getOrCreate()`.
+- [x] Implement `DataFrame` class: `filter()`, `where()`, `groupBy()`, `agg()`, `orderBy()`, `sort()`, `join()`, `union()`, `unionAll()`, `select()`, `selectExpr()`, `withColumn()`, `drop()`, `distinct()`, `limit()`, `count()`, `collect()`, `show()`, `printSchema()`, `toPandas()`.
+- [x] Implement column expressions: `col()`, `lit()`, `when().otherwise()`, `isnull()`, `isnotnull()`, arithmetic, comparison, and logical operators.
+- [x] Implement imported functions: `avg`, `sum`, `count`, `min`, `max`, `first`, `last`, `explode`, `posexplode`, `array_contains`, `concat_ws`, `split`, `regexp_extract`, `date_add`, `datediff`, `from_unixtime`, `to_date`, `to_timestamp`, `year`, `month`, `dayofweek`.
+- [x] Map all `DataFrame` operations to Krishiv SQL via Spark Connect client (Sprint 3 provides the server; stub over Flight SQL for Sprint 2 tests).
+- [x] Add `from krishiv.compat.spark import SparkSession, col, avg, sum, explode` import path.
+- [x] Write Python unit tests for all DataFrame operations using a mock Krishiv session.
 
 **Validation**: `pytest python/krishiv-spark-compat/tests/` passes.
 
 ### S2.2 SparkSession Remote Connection
-- [ ] Implement Spark Connect gRPC client stub in `krishiv-spark-compat` (connects to Sprint 3 server).
-- [ ] Implement plan serialization: DataFrame operations → Spark Connect `Relation` proto messages.
-- [ ] Implement `ExecutePlan` RPC call with streaming result collection.
-- [ ] Implement Arrow IPC result deserialization from `ExecutePlanResponse` batches.
-- [ ] Add connection retry and timeout configuration.
-- [ ] Write integration test: `SparkSession.builder.remote("sc://localhost:7070").getOrCreate()` connects to a local coordinator stub.
+- [x] Implement Spark Connect gRPC client stub in `krishiv-spark-compat` (connects to Sprint 3 server).
+- [x] Implement plan serialization: DataFrame operations → Spark Connect `Relation` proto messages.
+- [x] Implement `ExecutePlan` RPC call with streaming result collection.
+- [x] Implement Arrow IPC result deserialization from `ExecutePlanResponse` batches.
+- [x] Add connection retry and timeout configuration.
+- [x] Write integration test: `SparkSession.builder.remote("sc://localhost:7070").getOrCreate()` connects to a local coordinator stub.
 
 **Validation**: `pytest python/krishiv-spark-compat/tests/test_remote.py` passes against stub server.
 
@@ -137,31 +137,31 @@ Out of scope:
 ## Sprint 3 — Spark Connect gRPC Server
 
 ### S3.1 Spark Connect Proto Integration
-- [ ] Add `spark-connect` proto files (`spark/connect/relations.proto`, `spark/connect/expressions.proto`, `spark/connect/commands.proto`, `spark/connect/base.proto`) to `crates/krishiv-proto/`.
-- [ ] Generate Rust types via `tonic-build` in `krishiv-proto/build.rs`.
-- [ ] Define `SparkConnectCompatMatrix`: enumerated set of supported `Relation` and `Expression` variant names.
-- [ ] Implement version negotiation: `AnalyzePlan` RPC returns server-supported Spark Connect version.
+- [x] Add `spark-connect` proto files (`spark/connect/relations.proto`, `spark/connect/expressions.proto`, `spark/connect/commands.proto`, `spark/connect/base.proto`) to `crates/krishiv-proto/`.
+- [x] Generate Rust types via `tonic-build` in `krishiv-proto/build.rs`.
+- [x] Define `SparkConnectCompatMatrix`: enumerated set of supported `Relation` and `Expression` variant names.
+- [x] Implement version negotiation: `AnalyzePlan` RPC returns server-supported Spark Connect version.
 
 **Validation**: `cargo check -p krishiv-proto` clean.
 
 ### S3.2 Spark Connect Plan Translation
-- [ ] Add `krishiv-spark-connect` crate (thin adapter, depends on `krishiv-sql` and `krishiv-scheduler`).
-- [ ] Implement `SparkRelationTranslator`: translates Spark Connect `Relation` proto → DataFusion `LogicalPlan`.
-- [ ] Support relation types: `Read` (named table, parquet, CSV), `Filter`, `Project`, `Aggregate`, `Sort`, `Limit`, `Join` (inner, left, right, outer), `SetOperation` (union, intersect, except), `WithColumns`, `Deduplicate`, `LocalRelation`.
-- [ ] Support expression types: `Literal`, `Attribute` (column reference), `Alias`, `Cast`, `UnresolvedFunction`, `Unresolved­Attribute`, arithmetic, comparison, logical, and window expressions.
-- [ ] Return `UNIMPLEMENTED` gRPC status for unsupported relation/expression types with a descriptive message referencing the compatibility matrix.
-- [ ] Write unit tests for each supported relation translator.
+- [x] Add `krishiv-spark-connect` crate (thin adapter, depends on `krishiv-sql` and `krishiv-scheduler`).
+- [x] Implement `SparkRelationTranslator`: translates Spark Connect `Relation` proto → DataFusion `LogicalPlan`.
+- [x] Support relation types: `Read` (named table, parquet, CSV), `Filter`, `Project`, `Aggregate`, `Sort`, `Limit`, `Join` (inner, left, right, outer), `SetOperation` (union, intersect, except), `WithColumns`, `Deduplicate`, `LocalRelation`.
+- [x] Support expression types: `Literal`, `Attribute` (column reference), `Alias`, `Cast`, `UnresolvedFunction`, `Unresolved­Attribute`, arithmetic, comparison, logical, and window expressions.
+- [x] Return `UNIMPLEMENTED` gRPC status for unsupported relation/expression types with a descriptive message referencing the compatibility matrix.
+- [x] Write unit tests for each supported relation translator.
 
 **Validation**: `cargo test -p krishiv-spark-connect`
 
 ### S3.3 Spark Connect gRPC Server on Coordinator
-- [ ] Add `SparkConnectService` tonic server implementing `spark.connect.SparkConnectService`.
-- [ ] Implement `ExecutePlan` RPC: translate relation → DataFusion plan → execute → stream Arrow IPC batches in `ExecutePlanResponse`.
-- [ ] Implement `AnalyzePlan` RPC: return schema and explain plan.
-- [ ] Implement `Config` RPC: accept and store session config (no-op for unsupported keys, warn for unknown keys).
-- [ ] Integrate `SparkConnectService` into `krishiv-scheduler` coordinator startup on configurable port (default 7070).
-- [ ] Add `spark_connect_port` field to coordinator configuration.
-- [ ] Write integration test: PySpark 3.5 client connects, runs TPC-H Q1, result matches expected.
+- [x] Add `SparkConnectService` tonic server implementing `spark.connect.SparkConnectService`.
+- [x] Implement `ExecutePlan` RPC: translate relation → DataFusion plan → execute → stream Arrow IPC batches in `ExecutePlanResponse`.
+- [x] Implement `AnalyzePlan` RPC: return schema and explain plan.
+- [x] Implement `Config` RPC: accept and store session config (no-op for unsupported keys, warn for unknown keys).
+- [x] Integrate `SparkConnectService` into `krishiv-scheduler` coordinator startup on configurable port (default 7070).
+- [x] Add `spark_connect_port` field to coordinator configuration.
+- [x] Write integration test: PySpark 3.5 client connects, runs TPC-H Q1, result matches expected.
 
 **Validation**: `cargo test -p krishiv-spark-connect -- integration`; `cargo check --workspace` clean.
 
@@ -170,37 +170,37 @@ Out of scope:
 ## Sprint 4 — dbt Adapter & Airflow Operator
 
 ### S4.1 krishiv-dbt-adapter Python Package
-- [ ] Create `python/krishiv-dbt-adapter/` package directory.
-- [ ] Implement dbt adapter class inheriting from `dbt.adapters.base.Adapter`.
-- [ ] Implement `profiles.yml` connection type: `type: krishiv`, `flight_sql_host`, `flight_sql_port`, `database`, `schema`.
-- [ ] Implement connection using Flight SQL Python client (`flightsql-dbapi`).
-- [ ] Implement `execute()` and `get_result_from_cursor()` using Flight SQL `do_get`.
-- [ ] Support dbt model types: `table` (CREATE TABLE AS SELECT), `view` (CREATE VIEW AS SELECT), `incremental` (INSERT INTO ... SELECT with predicate merge).
-- [ ] Implement `list_relations_without_caching()`, `get_relation()`, `create_schema()`, `drop_relation()`, `truncate_relation()`, `rename_relation()`.
-- [ ] Implement dbt `seed` support (upload CSV via Flight SQL `do_put`).
-- [ ] Write dbt adapter tests: model compilation, execute, list_relations, incremental merge.
-- [ ] Package as `krishiv-dbt-adapter` on PyPI (maturin-independent, pure Python).
+- [x] Create `python/krishiv-dbt-adapter/` package directory.
+- [x] Implement dbt adapter class inheriting from `dbt.adapters.base.Adapter`.
+- [x] Implement `profiles.yml` connection type: `type: krishiv`, `flight_sql_host`, `flight_sql_port`, `database`, `schema`.
+- [x] Implement connection using Flight SQL Python client (`flightsql-dbapi`).
+- [x] Implement `execute()` and `get_result_from_cursor()` using Flight SQL `do_get`.
+- [x] Support dbt model types: `table` (CREATE TABLE AS SELECT), `view` (CREATE VIEW AS SELECT), `incremental` (INSERT INTO ... SELECT with predicate merge).
+- [x] Implement `list_relations_without_caching()`, `get_relation()`, `create_schema()`, `drop_relation()`, `truncate_relation()`, `rename_relation()`.
+- [x] Implement dbt `seed` support (upload CSV via Flight SQL `do_put`).
+- [x] Write dbt adapter tests: model compilation, execute, list_relations, incremental merge.
+- [x] Package as `krishiv-dbt-adapter` on PyPI (maturin-independent, pure Python).
 
 **Validation**: `pytest python/krishiv-dbt-adapter/tests/` passes.
 
 ### S4.2 krishiv-airflow Python Package
-- [ ] Create `python/krishiv-airflow/` package directory.
-- [ ] Implement `KrishivSubmitJobOperator(BaseOperator)`: submits a Krishiv job via the coordinator gRPC `SubmitJob` RPC.
-- [ ] Implement operator parameters: `coordinator_url`, `job_spec`, `namespace`, `priority`, `cpu_limit`, `memory_limit`, `conn_id`.
-- [ ] Implement XCom push of `job_id` on submission.
-- [ ] Implement `KrishivJobSensor(BaseSensorOperator)`: polls `GetJobStatus` until terminal state.
-- [ ] Implement sensor parameters: `job_id` (from XCom or literal), `coordinator_url`, `success_states`, `failure_states`, `poke_interval`.
-- [ ] Add Airflow connection type `krishiv` to connection UI schema.
-- [ ] Write unit tests for operator and sensor using mock gRPC stubs.
+- [x] Create `python/krishiv-airflow/` package directory.
+- [x] Implement `KrishivSubmitJobOperator(BaseOperator)`: submits a Krishiv job via the coordinator gRPC `SubmitJob` RPC.
+- [x] Implement operator parameters: `coordinator_url`, `job_spec`, `namespace`, `priority`, `cpu_limit`, `memory_limit`, `conn_id`.
+- [x] Implement XCom push of `job_id` on submission.
+- [x] Implement `KrishivJobSensor(BaseSensorOperator)`: polls `GetJobStatus` until terminal state.
+- [x] Implement sensor parameters: `job_id` (from XCom or literal), `coordinator_url`, `success_states`, `failure_states`, `poke_interval`.
+- [x] Add Airflow connection type `krishiv` to connection UI schema.
+- [x] Write unit tests for operator and sensor using mock gRPC stubs.
 
 **Validation**: `pytest python/krishiv-airflow/tests/` passes.
 
 ### S4.3 Great Expectations KrishivDatasource
-- [ ] Create `python/krishiv-ge/` package directory.
-- [ ] Implement `KrishivDatasource` extending GE `Datasource`.
-- [ ] Implement `KrishivSQLAlchemyDataConnector` using the SQLAlchemy/Flight SQL dialect from ADR-R15.3.
-- [ ] Support `BatchRequest` with `table_name` and `query` batch specs.
-- [ ] Write smoke test: connect, get batch, run `expect_column_values_to_not_be_null`.
+- [x] Create `python/krishiv-ge/` package directory.
+- [x] Implement `KrishivDatasource` extending GE `Datasource`.
+- [x] Implement `KrishivSQLAlchemyDataConnector` using the SQLAlchemy/Flight SQL dialect from ADR-R15.3.
+- [x] Support `BatchRequest` with `table_name` and `query` batch specs.
+- [x] Write smoke test: connect, get batch, run `expect_column_values_to_not_be_null`.
 
 **Validation**: `pytest python/krishiv-ge/tests/` passes.
 
@@ -209,23 +209,23 @@ Out of scope:
 ## Sprint 5 — Migration Tooling & Great Expectations
 
 ### S5.1 Migration Analyzer CLI
-- [ ] Add `krishiv compat analyze <file.py>` subcommand to `krishiv-cli`.
-- [ ] Implement Python AST parser (via `rustpython-parser` or subprocess `ast.dump`) to identify PySpark API call sites.
-- [ ] Implement compatibility classifier: map each identified API call to `Supported`, `PartiallySupported { caveats }`, or `Unsupported { reason }` using the compatibility matrix.
-- [ ] Implement report generator: output per-API-call compatibility status, total supported/unsupported counts, migration confidence score.
-- [ ] Support `--format json` and `--format text` output.
-- [ ] Support `--output <file>` for report persistence.
-- [ ] Write CLI tests: analyze a sample PySpark script, verify JSON report structure and accuracy.
+- [x] Add `krishiv compat analyze <file.py>` subcommand to `krishiv-cli`.
+- [x] Implement Python AST parser (via `rustpython-parser` or subprocess `ast.dump`) to identify PySpark API call sites.
+- [x] Implement compatibility classifier: map each identified API call to `Supported`, `PartiallySupported { caveats }`, or `Unsupported { reason }` using the compatibility matrix.
+- [x] Implement report generator: output per-API-call compatibility status, total supported/unsupported counts, migration confidence score.
+- [x] Support `--format json` and `--format text` output.
+- [x] Support `--output <file>` for report persistence.
+- [x] Write CLI tests: analyze a sample PySpark script, verify JSON report structure and accuracy.
 
 **Validation**: `cargo test -p krishiv-cli -- compat_analyze`
 
 ### S5.2 Compatibility Matrix Publication and E2E Validation
-- [ ] Finalize `docs/reference/spark-sql-compat-matrix.md` with all function and operation statuses.
-- [ ] Add TPC-H end-to-end test: run all 22 TPC-H queries via PySpark `SparkSession.builder.remote()` against Krishiv coordinator; verify result correctness.
-- [ ] Add migration analyzer test: analyze `tpch_pyspark.py` reference script, verify 100% Supported classification for all TPC-H operations.
-- [ ] Add dbt adapter end-to-end test: `dbt run` with Krishiv profile, all models build successfully.
-- [ ] Add Airflow operator integration test: submit job, sensor detects completion.
-- [ ] Publish Python packages to internal registry: `krishiv-spark-compat`, `krishiv-dbt-adapter`, `krishiv-airflow`, `krishiv-ge`.
+- [x] Finalize `docs/reference/spark-sql-compat-matrix.md` with all function and operation statuses.
+- [x] Add TPC-H end-to-end test: run all 22 TPC-H queries via PySpark `SparkSession.builder.remote()` against Krishiv coordinator; verify result correctness.
+- [x] Add migration analyzer test: analyze `tpch_pyspark.py` reference script, verify 100% Supported classification for all TPC-H operations.
+- [x] Add dbt adapter end-to-end test: `dbt run` with Krishiv profile, all models build successfully.
+- [x] Add Airflow operator integration test: submit job, sensor detects completion.
+- [x] Publish Python packages to internal registry: `krishiv-spark-compat`, `krishiv-dbt-adapter`, `krishiv-airflow`, `krishiv-ge`.
 
 **Validation**: `cargo test --workspace`; TPC-H E2E test suite passes; `pytest python/` passes.
 
@@ -233,13 +233,13 @@ Out of scope:
 
 ## Acceptance Gate
 
-- [ ] `SparkSession.builder.remote("sc://coordinator:7070").getOrCreate()` connects and executes all 22 TPC-H queries with correct results.
-- [ ] `from krishiv.compat.spark import SparkSession, col, avg, sum, explode` import path works.
-- [ ] Spark SQL compatibility matrix covers 100+ Spark 3.5 functions with documented null-handling status.
-- [ ] All functions in the "Supported" column of the compatibility matrix pass the function compatibility test suite.
-- [ ] `dbt run` with `type: krishiv` profile executes table, view, and incremental models successfully.
-- [ ] `KrishivSubmitJobOperator` submits a job and `KrishivJobSensor` detects terminal state.
-- [ ] `KrishivDatasource` runs a GE expectation suite against a Krishiv table.
-- [ ] `krishiv compat analyze` produces a structured report for a PySpark script.
-- [ ] Spark Connect server returns `UNIMPLEMENTED` (not a crash) for unsupported plan node types.
-- [ ] `cargo test --workspace` passes; `cargo clippy --workspace -- -D warnings` clean.
+- [x] `SparkSession.builder.remote("sc://coordinator:7070").getOrCreate()` connects and executes all 22 TPC-H queries with correct results.
+- [x] `from krishiv.compat.spark import SparkSession, col, avg, sum, explode` import path works.
+- [x] Spark SQL compatibility matrix covers 100+ Spark 3.5 functions with documented null-handling status.
+- [x] All functions in the "Supported" column of the compatibility matrix pass the function compatibility test suite.
+- [x] `dbt run` with `type: krishiv` profile executes table, view, and incremental models successfully.
+- [x] `KrishivSubmitJobOperator` submits a job and `KrishivJobSensor` detects terminal state.
+- [x] `KrishivDatasource` runs a GE expectation suite against a Krishiv table.
+- [x] `krishiv compat analyze` produces a structured report for a PySpark script.
+- [x] Spark Connect server returns `UNIMPLEMENTED` (not a crash) for unsupported plan node types.
+- [x] `cargo test --workspace` passes; `cargo clippy --workspace -- -D warnings` clean.

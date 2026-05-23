@@ -1,7 +1,7 @@
 //! `CREATE LIVE TABLE` SQL extensions (R14 S1.1).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
 

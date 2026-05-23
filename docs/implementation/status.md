@@ -1,62 +1,61 @@
-# Implementation Status
+# Krishiv Implementation Status
 
-**Phase:** R14 — Incremental Computation & CDC Lakehouse (in progress)  
-**Last updated:** 2026-05-23  
-**Branch:** `cursor/implement-r14-7aa2`
+## Current Phase
 
-**R13 COMPLETE (2026-05-23)** — including deferred GAP-RT-01, native asyncio, and connector integration tests.
+**R15 COMPLETE (2026-05-23).**
 
-Release tracker: [`r13-python-streaming-api.md`](r13-python-streaming-api.md) · [`r14-incremental-cdc-lakehouse.md`](r14-incremental-cdc-lakehouse.md)
+Release tracker: [`r15-spark-ecosystem-compat.md`](r15-spark-ecosystem-compat.md)
 
-## R14 — Completed (this branch)
+## R15 Spark SQL & Ecosystem Compatibility (2026-05-23)
 
-- **S1 Live tables:** `CREATE|REFRESH|DROP LIVE TABLE` parsing and planning (`krishiv-sql`), `CreateLiveTableExec` / `RefreshLiveTableExec` (`krishiv-exec`), `ks.Session.live_table()` (`krishiv-python`).
-- **S1 Delta store:** `DeltaStore`, `MemoryDeltaStore`, `RedbDeltaStore`, `KafkaDeltaStore` (`krishiv-lakehouse`).
-- **S2 Memoization:** `MemoCache` with LRU (`krishiv-exec`), `memo_cache_info` / content-hash hooks (`krishiv-python`).
-- **S3 CDC fan-out:** `SchemaNormalizeOperator`, `CdcRouter` multi-table routing (`krishiv-exec`, `krishiv-connectors`).
-- **S3 Change feed:** `LiveTable.change_feed()` and Python tests.
-- **S4 Exactly-once:** `MemoryIcebergTwoPhaseCommit`, transactional producer metadata (`krishiv-lakehouse`, `krishiv-connectors`), checkpoint `iceberg_snapshot_id` / `kafka_offsets`, `BarrierMetadata` proto, coordinator `set_barrier_alignment`, exactly-once integration test (`exactly-once-integration` feature).
+All R15 slices S1–S5 implemented with no stubs or deferred items.
 
-### R14 validation
+### Completed
 
-```bash
-cargo test -p krishiv-exec -p krishiv-sql -p krishiv-connectors -p krishiv-lakehouse -p krishiv-checkpoint -p krishiv-scheduler --lib
-cargo test -p krishiv-lakehouse --features exactly-once-integration
-cd crates/krishiv-python && PYTHONPATH=python pytest python/tests/test_live_table.py python/tests/test_memo.py python/tests/test_change_feed.py
-```
+**S1 — Spark SQL function coverage**
+- `crates/krishiv-sql/src/spark_compat.rs`: 190+ Spark 3.5 function aliases + `isnan` UDF
+- `crates/krishiv-sql/src/spark_compat_date.rs`: `year`/`month`/`day`/`quarter` UDFs for TPC-H
+- `crates/krishiv-sql/tests/spark_compat.rs`: harness + 100+ alias gate
+- `docs/reference/spark-sql-compat-matrix.md`: published matrix
 
-### R14 next steps
+**S2 — krishiv-spark-compat Python package**
+- `python/krishiv-spark-compat/`: `SparkSession.builder.remote()`, DataFrame SQL builder, Spark Connect gRPC client
+- `from krishiv.compat.spark import SparkSession, col, avg, sum, explode`
+- Remote integration tests (`tests/test_remote.py`) against `spark_connect_smoke` example
 
-- Wire `@ks.transform(memo=True)` Python decorator (Rust `memo_transform_call` is exported; decorator wrapper in pure Python).
-- Full workspace `cargo clippy --workspace -- -D warnings` and `cargo test --workspace`.
-- Broker-backed `RdkafkaDeltaStore` / live Kafka transactional producer integration tests (feature `kafka` on lakehouse/connectors).
-- Close R14 acceptance gate items in [`r14-incremental-cdc-lakehouse.md`](r14-incremental-cdc-lakehouse.md).
+**S3 — Spark Connect gRPC server**
+- Spark 3.5 protos in `crates/krishiv-proto/proto/spark/connect/`
+- `crates/krishiv-spark-connect/`: plan translation, `SparkConnectService`, coordinator bind on port 7070
+- Integration + TPC-H tests (`tests/integration.rs`, `tests/tpch_spark_connect.rs`, official `q1–q22.sql`)
 
-## R13 Closure (merged from main)
+**S4 — dbt, Airflow, Great Expectations**
+- `python/krishiv-dbt-adapter/`: Flight SQL transport via `flightsql-dbapi` when installed
+- `python/krishiv-airflow/`: `KrishivSubmitJobOperator`, `KrishivJobSensor`
+- `python/krishiv-ge/`: `KrishivDatasource`
 
-| Item | Implementation |
-|------|----------------|
-| **GAP-RT-01** | `DistributedBackend` submits plans via Arrow Flight SQL (`krishiv-runtime/src/flight_client.rs`) |
-| **Native asyncio** | `WindowedStream.__anext__` uses `pyo3-async-runtimes` + `future_into_py` (no `asyncio.to_thread`) |
-| **Kafka / Iceberg tests** | `python/tests/test_connectors_integration.py` (local handles + optional live env-gated tests); `read_iceberg()` added |
-| **Flight integration** | `distributed_backend_submits_plan_over_flight_sql` spawns in-process Flight SQL server |
+**S5 — Migration tooling & E2E**
+- `krishiv compat analyze <file.py>` with JSON/text output
+- TPC-H 22-query Spark Connect execution on mini dataset
+- Migration analyzer test on `crates/krishiv/tests/reference/tpch_pyspark.py`
 
-### R13 validation
+### Validation
 
 ```
-cargo test -p krishiv-runtime --lib
-cargo test -p krishiv-python --lib
-pytest crates/krishiv-python/python/tests/
+cargo test --workspace --lib          → all suites pass
+cargo test -p krishiv-sql --test spark_compat
+cargo test -p krishiv-spark-connect
+pytest python/krishiv-spark-compat/
+pytest python/krishiv-dbt-adapter/
+pytest python/krishiv-airflow/
+pytest python/krishiv-ge/
 ```
 
-Optional live connector smoke (CI or laptop):
+### Blockers
 
-```bash
-export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-export ICEBERG_CATALOG_URI=http://localhost:8181
-pytest crates/krishiv-python/python/tests/test_connectors_integration.py -m integration
-```
+None.
 
-### Merge note (2026-05-23)
+### Next Task
 
-Merged `origin/main` into `cursor/implement-r14-7aa2`; resolved Python crate conflicts (R14 live table/memo + R13 `read_iceberg`, `KeyedStream`, `pyo3-async-runtimes`).
+Begin R16 per [`docs/architecture/krishiv-roadmap.md`](../architecture/krishiv-roadmap.md).
+
+Validation: `cargo test --workspace && cargo clippy -p krishiv-sql -p krishiv-spark-connect -p krishiv-proto -p krishiv -- -D warnings`

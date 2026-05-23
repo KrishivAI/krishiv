@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "krishiv-dbt-adapter"
+version = "0.1.0"
+description = "dbt adapter for Krishiv via Flight SQL"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dbt = ["dbt-core>=1.7", "dbt-adapters>=1.7"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["krishiv_dbt_adapter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

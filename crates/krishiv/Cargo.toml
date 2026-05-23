@@ -28,6 +28,8 @@ krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
