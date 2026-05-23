@@ -22,6 +22,8 @@
 //! every file it lists passes SHA-256 validation.  Epochs missing the manifest
 //! (partial writes) are treated as corrupt during restore.
 
+pub mod rescaling;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -105,10 +107,8 @@ pub struct CheckpointMetadata {
     pub is_savepoint: bool,
     /// Optional human-readable label for savepoints.
     pub savepoint_label: Option<String>,
-    /// Latest committed Iceberg snapshot id at the barrier (R14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iceberg_snapshot_id: Option<u64>,
-    /// Kafka offsets keyed by topic-partition at barrier alignment (R14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kafka_offsets: Option<std::collections::BTreeMap<String, i64>>,
 }

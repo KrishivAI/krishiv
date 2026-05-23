@@ -7,7 +7,6 @@
 //! maps coordinator/executor gRPC messages into these domain contracts without
 //! making scheduler code depend on Kubernetes details.
 
-pub mod spark_connect;
 
 use std::error::Error;
 use std::fmt;

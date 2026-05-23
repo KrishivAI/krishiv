@@ -13,7 +13,6 @@ axum = { workspace = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
-krishiv-spark-connect = { path = "../krishiv-spark-connect" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
 rusqlite = { version = "0.31", optional = true, features = ["bundled"] }

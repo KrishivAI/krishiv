@@ -2,60 +2,46 @@
 
 ## Current Phase
 
-**R15 COMPLETE (2026-05-23).**
+**R16 IN PROGRESS (2026-05-23).**
 
-Release tracker: [`r15-spark-ecosystem-compat.md`](r15-spark-ecosystem-compat.md)
+Release tracker: [`r16-advanced-streaming-exactly-once.md`](r16-advanced-streaming-exactly-once.md)
 
-## R15 Spark SQL & Ecosystem Compatibility (2026-05-23)
+## R16 — Advanced Stateful Streaming & Exactly-Once
 
-All R15 slices S1–S5 implemented with no stubs or deferred items.
+### Completed (this session)
 
-### Completed
+- **S1** — `barrier.proto`, `BarrierInjector` / `SharedBarrierInjector`, `BarrierAligner`, `CheckpointBarrierTracker`, executor `BarrierService` gRPC server + `checkpoint_barrier_integration` test.
+- **S2** — `krishiv-cep` crate (`Pattern`, `SequentialPatternMatcher`), `CepOperator` in `krishiv-exec`.
+- **S3** — `TemporalJoinSpec` / `IntervalJoinSpec` / `SideOutput` in `krishiv-plan`; temporal join, interval join, side output routing, watermark E2E helper in `krishiv-exec`.
+- **S4** — Key groups (`NUM_KEY_GROUPS=32768`), `StateMigrationRegistry`, `IncrementalCheckpointWriter`, `KeyGroupRescaler` in `krishiv-checkpoint`; `StateBackend::key_group_range` / `schema_version`.
+- **S5** — `TransactionalKafkaSink`, `TwoPhaseParquetSink`, `exactly_once_certification` integration tests; `docs/reference/exactly-once-matrix.md`.
+- **S6** — Incremental checkpoint manifest diffing; watermark E2E test; streaming fragment barrier flush on `OperatorMessage::Barrier`.
 
-**S1 — Spark SQL function coverage**
-- `crates/krishiv-sql/src/spark_compat.rs`: 190+ Spark 3.5 function aliases + `isnan` UDF
-- `crates/krishiv-sql/src/spark_compat_date.rs`: `year`/`month`/`day`/`quarter` UDFs for TPC-H
-- `crates/krishiv-sql/tests/spark_compat.rs`: harness + 100+ alias gate
-- `docs/reference/spark-sql-compat-matrix.md`: published matrix
+### API
 
-**S2 — krishiv-spark-compat Python package**
-- `python/krishiv-spark-compat/`: `SparkSession.builder.remote()`, DataFrame SQL builder, Spark Connect gRPC client
-- `from krishiv.compat.spark import SparkSession, col, avg, sum, explode`
-- Remote integration tests (`tests/test_remote.py`) against `spark_connect_smoke` example
+- `KeyedStream::join_temporal`, `join_interval`, `cep_pattern`; `WindowedStream::with_side_output`.
 
-**S3 — Spark Connect gRPC server**
-- Spark 3.5 protos in `crates/krishiv-proto/proto/spark/connect/`
-- `crates/krishiv-spark-connect/`: plan translation, `SparkConnectService`, coordinator bind on port 7070
-- Integration + TPC-H tests (`tests/integration.rs`, `tests/tpch_spark_connect.rs`, official `q1–q22.sql`)
-
-**S4 — dbt, Airflow, Great Expectations**
-- `python/krishiv-dbt-adapter/`: Flight SQL transport via `flightsql-dbapi` when installed
-- `python/krishiv-airflow/`: `KrishivSubmitJobOperator`, `KrishivJobSensor`
-- `python/krishiv-ge/`: `KrishivDatasource`
-
-**S5 — Migration tooling & E2E**
-- `krishiv compat analyze <file.py>` with JSON/text output
-- TPC-H 22-query Spark Connect execution on mini dataset
-- Migration analyzer test on `crates/krishiv/tests/reference/tpch_pyspark.py`
-
-### Validation
+### Validation (2026-05-23)
 
 ```
-cargo test --workspace --lib          → all suites pass
-cargo test -p krishiv-sql --test spark_compat
-cargo test -p krishiv-spark-connect
-pytest python/krishiv-spark-compat/
-pytest python/krishiv-dbt-adapter/
-pytest python/krishiv-airflow/
-pytest python/krishiv-ge/
+cargo test -p krishiv-cep -p krishiv-exec -p krishiv-state -p krishiv-checkpoint \
+  -p krishiv-connectors -p krishiv-executor -p krishiv-scheduler  → pass
+cargo test --workspace --lib → pass
+cargo clippy -p krishiv-cep -p krishiv-exec -p krishiv-state -p krishiv-checkpoint \
+  -p krishiv-connectors -p krishiv-executor -p krishiv-scheduler -p krishiv-api -p krishiv-plan -- -D warnings → pass
 ```
 
-### Blockers
+### Remaining / follow-up
 
-None.
+- Python `@ks.state_migration` decorator (`krishiv-python`).
+- CLI `krishiv stream jobs --show-watermarks` (coordinator task watermark report).
+- Wire `BarrierService` on coordinator serve path alongside executor registration (client in `barrier_client.rs`).
+- RocksDB SST incremental upload (current incremental writer diffs snapshot SHA-256 blobs for `RedbStateBackend`).
+- Full workspace `cargo clippy -- -D warnings` blocked by pre-existing `krishiv-lakehouse` lints.
 
-### Next Task
+### Next command
 
-Begin R16 per [`docs/architecture/krishiv-roadmap.md`](../architecture/krishiv-roadmap.md).
-
-Validation: `cargo test --workspace && cargo clippy -p krishiv-sql -p krishiv-spark-connect -p krishiv-proto -p krishiv -- -D warnings`
+```bash
+cargo test -p krishiv-executor --test checkpoint_barrier_integration
+cargo test -p krishiv-connectors --test exactly_once_certification
+```
