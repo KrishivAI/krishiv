@@ -19,6 +19,7 @@ kafka = []
 krishiv-api = { path = "../krishiv-api" }
 krishiv-udf = { path = "../krishiv-udf" }
 krishiv-state = { path = "../krishiv-state" }
+krishiv-governance = { path = "../krishiv-governance" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse", optional = true }
 arrow = { workspace = true }
 pyo3 = { workspace = true }

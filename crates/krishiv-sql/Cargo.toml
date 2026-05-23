@@ -10,16 +10,13 @@ arrow = { workspace = true }
 datafusion = { workspace = true }
 krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }
+krishiv-udf = { path = "../krishiv-udf" }
 
 [dev-dependencies]
 tokio = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
-
-[features]
-default = ["spark_compat"]
-spark_compat = []
 
 [lints]
 workspace = true

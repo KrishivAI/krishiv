@@ -1,4 +1,4 @@
-//! Sink configuration types.
+//! Sink configuration types and `krishiv.sinks` submodule.
 
 use pyo3::prelude::*;
 
@@ -87,4 +87,34 @@ impl PyIcebergSink {
             self.catalog, self.table
         )
     }
+}
+
+#[pyfunction]
+#[pyo3(name = "parquet")]
+fn sinks_parquet(path: String) -> PyParquetSink {
+    PyParquetSink::new(path)
+}
+
+#[pyfunction]
+#[pyo3(name = "kafka")]
+fn sinks_kafka(topic: String, bootstrap_servers: String) -> PyKafkaSink {
+    PyKafkaSink::new(topic, bootstrap_servers)
+}
+
+#[pyfunction]
+#[pyo3(name = "iceberg")]
+fn sinks_iceberg(catalog: String, table: String) -> PyIcebergSink {
+    PyIcebergSink::new(catalog, table)
+}
+
+pub fn register_sinks_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    let sinks = PyModule::new(py, "sinks")?;
+    sinks.add_class::<PyParquetSink>()?;
+    sinks.add_class::<PyKafkaSink>()?;
+    sinks.add_class::<PyIcebergSink>()?;
+    sinks.add_function(wrap_pyfunction!(sinks_parquet, &sinks)?)?;
+    sinks.add_function(wrap_pyfunction!(sinks_kafka, &sinks)?)?;
+    sinks.add_function(wrap_pyfunction!(sinks_iceberg, &sinks)?)?;
+    parent.add_submodule(&sinks)?;
+    Ok(())
 }

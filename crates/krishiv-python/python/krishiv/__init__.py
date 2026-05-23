@@ -3,6 +3,8 @@
 from .krishiv import (  # noqa: F401
     AuthorizationError,
     Batch,
+    QueryResult,
+    JobStatus,
     CheckpointError,
     ConnectorError,
     DataFrame,
@@ -28,6 +30,8 @@ from .krishiv import (  # noqa: F401
     state_migration,
     udf,
 )
+
+from .krishiv import sinks
 
 from .krishiv import agg
 from .krishiv import windows
@@ -71,4 +75,7 @@ __all__ = [
     "agg",
     "windows",
     "udf",
+    "QueryResult",
+    "JobStatus",
+    "sinks",
 ]
