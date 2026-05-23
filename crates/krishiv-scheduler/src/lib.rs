@@ -27,6 +27,7 @@ use krishiv_proto::{
     DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, HeartbeatThrottleCommand, InitiateCheckpointRequest,
+    LlmThrottleCommand,
     InspectStateRequest, InspectStateResponse, ListCheckpointsRequest, ListCheckpointsResponse,
     JobId, JobKind, JobSpec, LeaseGeneration,
     RegisterExecutorRequest, RegisterExecutorResponse,
@@ -141,6 +142,10 @@ pub struct CoordinatorConfig {
     /// Used to convert tick counts into elapsed-time estimates for the
     /// per-job checkpoint interval timer.  Defaults to 1 000 ms (1 second).
     tick_period_ms: u64,
+    /// Job-level LLM request quota per minute (R17).
+    llm_quota_requests_per_minute: u32,
+    /// Job-level LLM token quota per minute (R17).
+    llm_quota_tokens_per_minute: u64,
 }
 
 impl CoordinatorConfig {
@@ -152,7 +157,17 @@ impl CoordinatorConfig {
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
             tick_period_ms: 1_000,
+            llm_quota_requests_per_minute: 100,
+            llm_quota_tokens_per_minute: 10_000,
         }
+    }
+
+    /// Override job-level LLM request quota (R17).
+    #[must_use]
+    pub fn with_llm_quota(mut self, requests_per_minute: u32, tokens_per_minute: u64) -> Self {
+        self.llm_quota_requests_per_minute = requests_per_minute;
+        self.llm_quota_tokens_per_minute = tokens_per_minute;
+        self
     }
 
     /// Set the memory threshold above which executors are skipped for placement.
@@ -259,6 +274,15 @@ pub struct ThrottleDecision {
     pub source_id: String,
     /// Maximum rows per second (`None` clears the throttle).
     pub rows_per_second: Option<u64>,
+}
+
+/// Side effects returned from a successful executor heartbeat.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExecutorHeartbeatEffects {
+    /// Source-operator throttle directives (R7.2).
+    pub source_throttles: Vec<ThrottleDecision>,
+    /// LLM UDF throttle directives (R17).
+    pub llm_throttles: Vec<LlmThrottleCommand>,
 }
 
 /// Scheduler and coordinator errors.
@@ -389,6 +413,8 @@ pub struct Coordinator {
     /// P1.2: Cached gRPC channels keyed by executor endpoint string.
     /// Avoids a full TCP+TLS handshake per task assignment push.
     executor_channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+    /// Aggregates LLM quota reports across executors (R17).
+    llm_quota_aggregator: llm_quota::LlmQuotaAggregator,
 }
 
 impl fmt::Debug for Coordinator {
@@ -563,19 +589,23 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         if !request.hot_key_reports().is_empty() {
             heartbeat = heartbeat.with_hot_key_reports(request.hot_key_reports().to_vec());
         }
+        if !request.llm_quota_reports().is_empty() {
+            heartbeat = heartbeat.with_llm_quota_reports(request.llm_quota_reports().to_vec());
+        }
         let mut coordinator = self
             .coordinator
             .write()
             .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {
-            Ok(throttle_cmds) => {
+            Ok(effects) => {
                 let mut resp = ExecutorHeartbeatResponse::new(
                     request.lease_generation(),
                     TransportDisposition::Accepted,
                 );
-                if !throttle_cmds.is_empty() {
-                    let wire_cmds: Vec<HeartbeatThrottleCommand> = throttle_cmds
+                if !effects.source_throttles.is_empty() {
+                    let wire_cmds: Vec<HeartbeatThrottleCommand> = effects
+                        .source_throttles
                         .into_iter()
                         .map(|c| HeartbeatThrottleCommand {
                             source_id: c.source_id,
@@ -583,6 +613,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                         })
                         .collect();
                     resp = resp.with_throttle_commands(wire_cmds);
+                }
+                if !effects.llm_throttles.is_empty() {
+                    resp = resp.with_llm_throttles(effects.llm_throttles);
                 }
                 resp
             }
@@ -1181,6 +1214,10 @@ impl Coordinator {
             adaptive_override: AdaptiveOverrideConfig::default(),
             streaming_task_index: HashMap::new(),
             executor_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            llm_quota_aggregator: llm_quota::LlmQuotaAggregator::new(
+                config.llm_quota_requests_per_minute,
+                config.llm_quota_tokens_per_minute,
+            ),
         }
     }
 
@@ -1306,17 +1343,25 @@ impl Coordinator {
     pub fn executor_heartbeat(
         &mut self,
         heartbeat: ExecutorHeartbeat,
-    ) -> SchedulerResult<Vec<ThrottleDecision>> {
+    ) -> SchedulerResult<ExecutorHeartbeatEffects> {
         self.ensure_active()?;
         let streaming_states: Vec<StreamingTaskState> = heartbeat.streaming_task_states().to_vec();
         let hot_key_reports = heartbeat.hot_key_reports().to_vec();
+        let llm_reports = heartbeat.llm_quota_reports().to_vec();
         self.executors.heartbeat(heartbeat)?;
         for state in &streaming_states {
             self.apply_streaming_task_state(state);
         }
         // R7.2 Group D: process hot-key reports and record adaptive decisions.
         self.process_hot_key_reports(&hot_key_reports);
-        Ok(Vec::new())
+        if !llm_reports.is_empty() {
+            self.llm_quota_aggregator.ingest(&llm_reports);
+        }
+        let llm_throttles = self.llm_quota_aggregator.evaluate_and_reset();
+        Ok(ExecutorHeartbeatEffects {
+            source_throttles: Vec::new(),
+            llm_throttles,
+        })
     }
 
     /// Record adaptive decisions for incoming hot-key reports.
@@ -4761,6 +4806,8 @@ mod tests {
                 operator_snapshots: vec![],
                 is_savepoint: false,
                 savepoint_label: None,
+                iceberg_snapshot_id: None,
+                kafka_offsets: None,
             };
             write_epoch_metadata(storage.as_ref(), "job-ck-recover", epoch, &meta).unwrap();
             let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
@@ -5120,6 +5167,8 @@ mod tests {
                 operator_snapshots: vec![],
                 is_savepoint: false,
                 savepoint_label: None,
+                iceberg_snapshot_id: None,
+                kafka_offsets: None,
             };
             let storage_dyn: &dyn CheckpointStorage = storage;
             write_epoch_metadata(storage_dyn, job_id, epoch, &meta).unwrap();
@@ -5810,9 +5859,10 @@ mod tests {
                 source_id: "src-0".into(),
             }]);
 
-        let throttle_cmds = coordinator.executor_heartbeat(heartbeat).unwrap();
+        let effects = coordinator.executor_heartbeat(heartbeat).unwrap();
         // Default config: no throttle commands issued.
-        assert!(throttle_cmds.is_empty());
+        assert!(effects.source_throttles.is_empty());
+        assert!(effects.llm_throttles.is_empty());
 
         let log = coordinator.adaptive_decision_log(&job_id);
         assert_eq!(log.len(), 1);

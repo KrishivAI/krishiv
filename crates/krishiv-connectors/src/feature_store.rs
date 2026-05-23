@@ -128,10 +128,10 @@ impl FeatureStoreSink {
             if row_id != entity_id || row.created_at_ms > timestamp_ms {
                 continue;
             }
-            if let Some(ttl) = row.ttl_ms {
-                if now.saturating_sub(row.created_at_ms) > ttl {
-                    continue;
-                }
+            if let Some(ttl) = row.ttl_ms
+                && now.saturating_sub(row.created_at_ms) > ttl
+            {
+                continue;
             }
             for (k, v) in &row.feature_values {
                 best.entry(k.clone())

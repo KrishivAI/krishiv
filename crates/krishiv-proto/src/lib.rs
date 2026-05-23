@@ -1139,6 +1139,23 @@ pub struct HeartbeatHotKeyReport {
     pub source_id: String,
 }
 
+/// Per-model LLM API usage reported by an executor (R17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmQuotaReport {
+    pub model: String,
+    pub requests_used: u64,
+    pub tokens_used: u64,
+    pub period_ms: u64,
+}
+
+/// Coordinator throttle directive for executor LLM rate limiters (R17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmThrottleCommand {
+    pub model: String,
+    pub max_requests_per_minute: u32,
+    pub max_tokens_per_minute: u64,
+}
+
 /// A throttle command sent from the coordinator to an executor in the
 /// heartbeat response.  The executor forwards this to the matching source.
 #[derive(Debug, Clone, PartialEq)]
@@ -1224,6 +1241,8 @@ pub struct ExecutorHeartbeat {
     streaming_task_states: Vec<StreamingTaskState>,
     /// Hot-key reports from the executor's SpaceSaving tracker (R7.2).
     hot_key_reports: Vec<HeartbeatHotKeyReport>,
+    /// LLM quota usage reports (R17).
+    llm_quota_reports: Vec<LlmQuotaReport>,
 }
 
 impl ExecutorHeartbeat {
@@ -1239,6 +1258,7 @@ impl ExecutorHeartbeat {
             active_task_count: None,
             streaming_task_states: Vec::new(),
             hot_key_reports: Vec::new(),
+            llm_quota_reports: Vec::new(),
         }
     }
 
@@ -1334,6 +1354,18 @@ impl ExecutorHeartbeat {
     /// Hot-key reports in this heartbeat.
     pub fn hot_key_reports(&self) -> &[HeartbeatHotKeyReport] {
         &self.hot_key_reports
+    }
+
+    /// Attach LLM quota reports (R17).
+    #[must_use]
+    pub fn with_llm_quota_reports(mut self, reports: Vec<LlmQuotaReport>) -> Self {
+        self.llm_quota_reports = reports;
+        self
+    }
+
+    /// LLM quota reports in this heartbeat.
+    pub fn llm_quota_reports(&self) -> &[LlmQuotaReport] {
+        &self.llm_quota_reports
     }
 }
 
@@ -1685,6 +1717,8 @@ pub struct ExecutorHeartbeatRequest {
     /// Populated by streaming executors whenever the tracker has entries whose
     /// heat score exceeds the reporting threshold (default 5%).
     hot_key_reports: Vec<HeartbeatHotKeyReport>,
+    /// LLM quota reports (R17).
+    llm_quota_reports: Vec<LlmQuotaReport>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
 }
@@ -1710,6 +1744,7 @@ impl ExecutorHeartbeatRequest {
             network_bytes_recv: None,
             streaming_task_states: Vec::new(),
             hot_key_reports: Vec::new(),
+            llm_quota_reports: Vec::new(),
             trace_context: None,
         }
     }
@@ -1731,6 +1766,18 @@ impl ExecutorHeartbeatRequest {
     /// W3C trace context, if provided by the caller.
     pub fn trace_context(&self) -> Option<&TraceContext> {
         self.trace_context.as_ref()
+    }
+
+    /// Attach LLM quota reports (R17).
+    #[must_use]
+    pub fn with_llm_quota_reports(mut self, reports: Vec<LlmQuotaReport>) -> Self {
+        self.llm_quota_reports = reports;
+        self
+    }
+
+    /// LLM quota reports in this request.
+    pub fn llm_quota_reports(&self) -> &[LlmQuotaReport] {
+        &self.llm_quota_reports
     }
 
     /// Attach running attempts.
@@ -1871,6 +1918,8 @@ pub struct ExecutorHeartbeatResponse {
     message: Option<String>,
     /// Throttle commands the executor must forward to its source operators.
     throttle_commands: Vec<HeartbeatThrottleCommand>,
+    /// LLM throttle commands for executor-wide rate limiters (R17).
+    llm_throttles: Vec<LlmThrottleCommand>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
 }
@@ -1884,6 +1933,7 @@ impl ExecutorHeartbeatResponse {
             disposition,
             message: None,
             throttle_commands: Vec::new(),
+            llm_throttles: Vec::new(),
             trace_context: None,
         }
     }
@@ -1912,6 +1962,18 @@ impl ExecutorHeartbeatResponse {
     /// Throttle commands in this heartbeat response.
     pub fn throttle_commands(&self) -> &[HeartbeatThrottleCommand] {
         &self.throttle_commands
+    }
+
+    /// Attach LLM throttle commands (R17).
+    #[must_use]
+    pub fn with_llm_throttles(mut self, cmds: Vec<LlmThrottleCommand>) -> Self {
+        self.llm_throttles = cmds;
+        self
+    }
+
+    /// LLM throttle commands in this response.
+    pub fn llm_throttles(&self) -> &[LlmThrottleCommand] {
+        &self.llm_throttles
     }
 
     /// Transport version.
@@ -2965,6 +3027,11 @@ pub mod wire {
             cpu_cores_used: value.cpu_cores_used().unwrap_or(0.0),
             network_bytes_sent: value.network_bytes_sent().unwrap_or(0),
             network_bytes_recv: value.network_bytes_recv().unwrap_or(0),
+            llm_quota_reports: value
+                .llm_quota_reports()
+                .iter()
+                .map(llm_quota_report_to_wire)
+                .collect(),
         }
     }
 
@@ -3007,6 +3074,15 @@ pub mod wire {
         if value.network_bytes_recv > 0 {
             req = req.with_network_bytes_recv(value.network_bytes_recv);
         }
+        if !value.llm_quota_reports.is_empty() {
+            req = req.with_llm_quota_reports(
+                value
+                    .llm_quota_reports
+                    .into_iter()
+                    .map(llm_quota_report_from_wire)
+                    .collect(),
+            );
+        }
 
         Ok(req)
     }
@@ -3020,6 +3096,11 @@ pub mod wire {
             lease_generation: value.lease_generation().as_u64(),
             disposition: transport_disposition_to_wire(value.disposition()) as i32,
             message: value.message().unwrap_or_default().to_owned(),
+            llm_throttles: value
+                .llm_throttles()
+                .iter()
+                .map(llm_throttle_command_to_wire)
+                .collect(),
         }
     }
 
@@ -3036,7 +3117,50 @@ pub mod wire {
         if !value.message.is_empty() {
             response = response.with_message(value.message);
         }
+        if !value.llm_throttles.is_empty() {
+            response = response.with_llm_throttles(
+                value
+                    .llm_throttles
+                    .into_iter()
+                    .map(llm_throttle_command_from_wire)
+                    .collect(),
+            );
+        }
         Ok(response)
+    }
+
+    fn llm_quota_report_to_wire(value: &super::LlmQuotaReport) -> v1::LlmQuotaReport {
+        v1::LlmQuotaReport {
+            model: value.model.clone(),
+            requests_used: value.requests_used,
+            tokens_used: value.tokens_used,
+            period_ms: value.period_ms,
+        }
+    }
+
+    fn llm_quota_report_from_wire(value: v1::LlmQuotaReport) -> super::LlmQuotaReport {
+        super::LlmQuotaReport {
+            model: value.model,
+            requests_used: value.requests_used,
+            tokens_used: value.tokens_used,
+            period_ms: value.period_ms,
+        }
+    }
+
+    fn llm_throttle_command_to_wire(value: &super::LlmThrottleCommand) -> v1::LlmThrottleCommand {
+        v1::LlmThrottleCommand {
+            model: value.model.clone(),
+            max_requests_per_minute: value.max_requests_per_minute,
+            max_tokens_per_minute: value.max_tokens_per_minute,
+        }
+    }
+
+    fn llm_throttle_command_from_wire(value: v1::LlmThrottleCommand) -> super::LlmThrottleCommand {
+        super::LlmThrottleCommand {
+            model: value.model,
+            max_requests_per_minute: value.max_requests_per_minute,
+            max_tokens_per_minute: value.max_tokens_per_minute,
+        }
     }
 
     /// Convert a domain executor task assignment to protobuf.
@@ -3824,7 +3948,8 @@ pub mod wire {
 mod tests {
     use super::{
         AttemptId, ConnectorCapabilityFlags, DeregisterExecutorRequest, ExecutorDescriptor,
-        ExecutorHeartbeatRequest, ExecutorId, ExecutorState, ExecutorTaskAssignment, FencingToken,
+        ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
+        ExecutorTaskAssignment, FencingToken, LlmQuotaReport, LlmThrottleCommand,
         InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState,
         LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
         OutputContractKind, PlanFragment, RegisterExecutorRequest, StageId, StageSpec,
@@ -4133,6 +4258,42 @@ mod tests {
             response.message(),
             Some("newer attempt already owns this task")
         );
+    }
+
+    #[test]
+    fn executor_heartbeat_llm_quota_round_trips_on_wire() {
+        use super::wire::{
+            executor_heartbeat_request_from_wire, executor_heartbeat_request_to_wire,
+            executor_heartbeat_response_from_wire, executor_heartbeat_response_to_wire,
+        };
+
+        let request = ExecutorHeartbeatRequest::new(
+            ExecutorId::try_new("exec-llm").unwrap(),
+            LeaseGeneration::initial(),
+            ExecutorState::Healthy,
+        )
+        .with_llm_quota_reports(vec![LlmQuotaReport {
+            model: "gpt-4o".into(),
+            requests_used: 42,
+            tokens_used: 1000,
+            period_ms: 60_000,
+        }]);
+        let wire_req = executor_heartbeat_request_to_wire(request.clone());
+        let round_trip_req = executor_heartbeat_request_from_wire(wire_req).unwrap();
+        assert_eq!(round_trip_req.llm_quota_reports(), request.llm_quota_reports());
+
+        let response = ExecutorHeartbeatResponse::new(
+            LeaseGeneration::initial(),
+            TransportDisposition::Accepted,
+        )
+        .with_llm_throttles(vec![LlmThrottleCommand {
+            model: "gpt-4o".into(),
+            max_requests_per_minute: 100,
+            max_tokens_per_minute: 10_000,
+        }]);
+        let wire_resp = executor_heartbeat_response_to_wire(response.clone());
+        let round_trip_resp = executor_heartbeat_response_from_wire(wire_resp).unwrap();
+        assert_eq!(round_trip_resp.llm_throttles(), response.llm_throttles());
     }
 
     #[test]

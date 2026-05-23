@@ -84,6 +84,8 @@ message ExecutorHeartbeatRequest {
   double cpu_cores_used = 9;
   uint64 network_bytes_sent = 10;
   uint64 network_bytes_recv = 11;
+  // R17: per-model LLM API usage since last heartbeat.
+  repeated LlmQuotaReport llm_quota_reports = 12;
 }
 
 message ExecutorHeartbeatResponse {
@@ -91,6 +93,8 @@ message ExecutorHeartbeatResponse {
   uint64 lease_generation = 2;
   TransportDisposition disposition = 3;
   string message = 4;
+  // R17: coordinator throttle directives for LLM UDF rate limiters.
+  repeated LlmThrottleCommand llm_throttles = 5;
 }
 
 message ExecutorTaskAssignment {

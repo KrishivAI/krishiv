@@ -41,10 +41,10 @@ impl OpenAiLlmUdf {
 
     async fn call_one(&self, prompt: String) -> Result<LlmResponse, LlmError> {
         let cache_key = Self::cache_key(&prompt);
-        if self.config.cache {
-            if let Some(hit) = self.cache.get(&cache_key) {
-                return Ok(hit.clone());
-            }
+        if self.config.cache
+            && let Some(hit) = self.cache.get(&cache_key)
+        {
+            return Ok(hit.clone());
         }
         let api_key = self.api_key.clone();
         let model = self.config.model.clone();
@@ -119,10 +119,8 @@ impl OpenAiLlmUdf {
         })
         .await
         .map_err(|e| LlmError::Http(e.to_string()))??;
-        if self.config.cache {
-            if self.cache.len() < 10_000 {
-                self.cache.insert(cache_key, response.clone());
-            }
+        if self.config.cache && self.cache.len() < 10_000 {
+            self.cache.insert(cache_key, response.clone());
         }
         Ok(response)
     }

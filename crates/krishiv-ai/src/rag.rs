@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use krishiv_vector_sinks::{
-    EmbeddingBatch, InMemoryVectorSink, PayloadValue, VectorSink, VectorSinkConfig,
+    EmbeddingBatch, PayloadValue, VectorSink,
 };
 use sha2::{Digest, Sha256};
 
@@ -52,11 +52,11 @@ where
 
         for (doc_id, text) in documents {
             let hash = content_hash(text);
-            if let Some(entry) = self.memo.get(&hash)? {
-                if entry.embedding.len() == self.embedder.embedding_dim() {
-                    skipped += 1;
-                    continue;
-                }
+            if let Some(entry) = self.memo.get(&hash)?
+                && entry.embedding.len() == self.embedder.embedding_dim()
+            {
+                skipped += 1;
+                continue;
             }
             let chunks: Vec<Chunk> = self.chunker.chunk(text);
             if chunks.is_empty() {
@@ -149,8 +149,9 @@ fn content_hash(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::chunk::RecursiveTextChunker;
-    use crate::{EmbeddingDevice, EmbeddingModelRegistry, ModelKey};
     use crate::embed::HuggingFaceEmbeddingModel;
+    use crate::{EmbeddingDevice, EmbeddingModelRegistry, ModelKey};
+    use krishiv_vector_sinks::InMemoryVectorSink;
 
     struct CountingEmbedder {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,

@@ -1,4 +1,9 @@
-//! Lance-compatible local sink: Parquet fragments + merge_insert on `id` (no lancedb crate dep).
+//! LanceDB-compatible local sink (R17 S1.4).
+//!
+//! Uses Parquet fragments under `{uri}/{table}/` with per-point `merge_insert` on `id`
+//! (`hash(doc_id || epoch)`). The upstream `lancedb` Rust crate is not linked here because
+//! its `chrono` dependency conflicts with DataFusion 53 in this workspace; the idempotent
+//! upsert contract from ADR-R17.3 is preserved via the same point-id scheme as other sinks.
 
 use std::collections::HashMap;
 use std::sync::Arc;

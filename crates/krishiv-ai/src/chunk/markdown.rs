@@ -27,7 +27,7 @@ impl MarkdownSectionChunker {
             return None;
         }
         let rest = trimmed[hashes..].trim_start();
-        if rest.is_empty() || !trimmed.as_bytes().get(hashes).is_some_and(|b| *b == b' ') {
+        if rest.is_empty() || trimmed.as_bytes().get(hashes).is_none_or(|b| *b != b' ') {
             return None;
         }
         Some(hashes as u8)
@@ -45,11 +45,12 @@ impl TextChunker for MarkdownSectionChunker {
                 .take(line_start)
                 .map(|l| l.len() + 1)
                 .sum::<usize>();
-            if let Some(level) = Self::heading_level(line) {
-                if level >= self.min_heading_level && !current.is_empty() {
-                    sections.push((current_start, byte_offset, std::mem::take(&mut current)));
-                    current_start = byte_offset;
-                }
+            if let Some(level) = Self::heading_level(line)
+                && level >= self.min_heading_level
+                && !current.is_empty()
+            {
+                sections.push((current_start, byte_offset, std::mem::take(&mut current)));
+                current_start = byte_offset;
             }
             if !current.is_empty() {
                 current.push('\n');

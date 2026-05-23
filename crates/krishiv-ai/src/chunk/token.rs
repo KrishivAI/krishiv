@@ -20,7 +20,7 @@ impl TokenAwareChunker {
 
     fn approx_tokens(s: &str) -> usize {
         // Rough cl100k_base proxy: ~4 chars per token for ASCII text.
-        (s.len() + 3) / 4
+        s.len().div_ceil(4)
     }
 }
 

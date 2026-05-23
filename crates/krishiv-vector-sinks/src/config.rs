@@ -16,6 +16,7 @@ pub enum VectorSinkConfig {
         table: String,
         vector_dim: usize,
     },
+    /// LanceDB-compatible Parquet layout (see `lancedb_sink` module docs).
     LanceDb {
         uri: String,
         table: String,

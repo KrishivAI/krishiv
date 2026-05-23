@@ -2,25 +2,10 @@
 
 use std::collections::HashMap;
 
-/// Per-executor LLM usage report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LlmQuotaReport {
-    pub model: String,
-    pub requests_used: u64,
-    pub tokens_used: u64,
-    pub period_ms: u64,
-}
-
-/// Coordinator throttle directive for executors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LlmThrottleCommand {
-    pub model: String,
-    pub max_requests_per_minute: u32,
-    pub max_tokens_per_minute: u64,
-}
+pub use krishiv_proto::{LlmQuotaReport, LlmThrottleCommand};
 
 /// Aggregates quota reports and issues throttle when job quota exceeded.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LlmQuotaAggregator {
     job_quota_requests_per_minute: u32,
     job_quota_tokens_per_minute: u64,
@@ -68,6 +53,34 @@ impl LlmQuotaAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_heartbeat_returns_llm_throttle_when_quota_exceeded() {
+        use krishiv_proto::{ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration};
+
+        let mut coordinator = crate::Coordinator::new_active(Some(
+            crate::CoordinatorConfig::new(3, 10).with_llm_quota(100, 10_000),
+        ));
+        let executor_id = ExecutorId::try_new("exec-llm").unwrap();
+        coordinator
+            .register_executor(
+                krishiv_proto::ExecutorDescriptor::new(executor_id.clone(), "host", 4)
+                    .with_task_endpoint("grpc://127.0.0.1:1"),
+            )
+            .unwrap();
+
+        let heartbeat = ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy)
+            .with_lease_generation(LeaseGeneration::initial())
+            .with_llm_quota_reports(vec![LlmQuotaReport {
+                model: "gpt-4o".into(),
+                requests_used: 150,
+                tokens_used: 0,
+                period_ms: 60_000,
+            }]);
+        let effects = coordinator.executor_heartbeat(heartbeat).unwrap();
+        assert_eq!(effects.llm_throttles.len(), 1);
+        assert_eq!(effects.llm_throttles[0].model, "gpt-4o");
+    }
 
     #[test]
     fn llm_quota_aggregator_issues_throttle_when_exceeded() {

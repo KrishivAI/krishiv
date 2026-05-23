@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const MEMO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("memo");
@@ -36,9 +36,9 @@ impl MemoStore {
         let read = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = read.open_table(MEMO_TABLE).map_err(|e| e.to_string())?;
         let value = table.get(key).map_err(|e| e.to_string())?;
-        Ok(value
+        value
             .map(|v| serde_json::from_slice(v.value()).map_err(|e| e.to_string()))
-            .transpose()?)
+            .transpose()
     }
 
     /// Insert or update memo entry.

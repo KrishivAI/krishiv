@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+# CI uses `--no-default-features`; enable `fastembed-local` for HuggingFace + rag_index tests (needs C++ / libstdc++ for ONNX).
 default = []
 fastembed-local = ["dep:fastembed"]
 
