@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+dashmap = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 bytes = { workspace = true }

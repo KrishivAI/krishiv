@@ -5,13 +5,13 @@
 //! Provides local-disk shuffle write/read paths, an Arrow-based hash
 //! partitioner, compression codec metadata, and orphan artifact detection.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use dashmap::DashMap;
 use object_store::ObjectStoreExt as _;
 
 use arrow::array::{
@@ -276,6 +276,30 @@ impl ShuffleCompression {
             }
         }
     }
+}
+
+fn partition_memory_bytes(partition: &ShufflePartition) -> usize {
+    partition
+        .batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum()
+}
+
+fn parquet_writer_properties(
+    compression: ShuffleCompression,
+) -> parquet::file::properties::WriterProperties {
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+
+    let codec = match compression {
+        ShuffleCompression::None => Compression::UNCOMPRESSED,
+        ShuffleCompression::Lz4 => Compression::LZ4,
+        ShuffleCompression::Zstd => {
+            Compression::ZSTD(ZstdLevel::try_new(3).unwrap_or_default())
+        }
+    };
+    WriterProperties::builder().set_compression(codec).build()
 }
 
 // ── LocalShuffleStore ─────────────────────────────────────────────────────────
@@ -705,18 +729,113 @@ type LeaseMap = Arc<RwLock<BTreeMap<PartitionKey, u64>>>;
 /// An in-memory shuffle store backed by a `BTreeMap` under an `RwLock`.
 ///
 /// Used for testing and single-node deployments where shuffle data does
-/// not need to survive process restarts.
-#[derive(Default)]
+/// not need to survive process restarts. When configured with
+/// [`Self::with_max_bytes`] and [`Self::with_spill_store`], partitions are
+/// spilled to a [`LocalDiskShuffleStore`] once the in-memory byte cap is exceeded.
 pub struct InMemoryShuffleStore {
     // key: (job_id, stage_id, partition) → latest accepted partition
     partitions: Arc<RwLock<BTreeMap<PartitionKey, ShufflePartition>>>,
     // key: (job_id, stage_id, partition) → current assignment lease token
     lease_tokens: LeaseMap,
+    max_bytes: Option<usize>,
+    bytes_used: Arc<RwLock<usize>>,
+    spill_store: Option<Arc<LocalDiskShuffleStore>>,
+    spill_order: Arc<RwLock<VecDeque<PartitionKey>>>,
+    spilled: Arc<RwLock<BTreeSet<PartitionKey>>>,
+}
+
+impl Default for InMemoryShuffleStore {
+    fn default() -> Self {
+        Self {
+            partitions: Arc::new(RwLock::new(BTreeMap::new())),
+            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            max_bytes: None,
+            bytes_used: Arc::new(RwLock::new(0)),
+            spill_store: None,
+            spill_order: Arc::new(RwLock::new(VecDeque::new())),
+            spilled: Arc::new(RwLock::new(BTreeSet::new())),
+        }
+    }
 }
 
 impl InMemoryShuffleStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the in-memory byte cap. When exceeded, oldest partitions spill to disk.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    /// Attach a disk store used to spill partitions evicted from memory.
+    #[must_use]
+    pub fn with_spill_store(mut self, spill_store: Arc<LocalDiskShuffleStore>) -> Self {
+        self.spill_store = Some(spill_store);
+        self
+    }
+
+    async fn ensure_memory_capacity(
+        &self,
+        incoming_key: &PartitionKey,
+        incoming_size: usize,
+    ) -> StoreResult<()> {
+        let Some(max_bytes) = self.max_bytes else {
+            return Ok(());
+        };
+        let Some(spill) = self.spill_store.as_ref() else {
+            return Ok(());
+        };
+
+        loop {
+            let projected = {
+                let used = self.bytes_used.read().unwrap();
+                used.saturating_add(incoming_size)
+            };
+            if projected <= max_bytes {
+                return Ok(());
+            }
+
+            let key_to_spill = {
+                let order = self.spill_order.read().unwrap();
+                let parts = self.partitions.read().unwrap();
+                order
+                    .iter()
+                    .find(|k| **k != *incoming_key && parts.contains_key(*k))
+                    .cloned()
+            };
+            let Some(key_to_spill) = key_to_spill else {
+                return Ok(());
+            };
+
+            let (spill_partition, spill_size, spill_token) = {
+                let mut parts = self.partitions.write().unwrap();
+                let Some(partition) = parts.remove(&key_to_spill) else {
+                    continue;
+                };
+                let spill_size = partition_memory_bytes(&partition);
+                let spill_token = self
+                    .lease_tokens
+                    .read()
+                    .unwrap()
+                    .get(&key_to_spill)
+                    .copied()
+                    .unwrap_or(0);
+                (partition, spill_size, spill_token)
+            };
+
+            {
+                let mut used = self.bytes_used.write().unwrap();
+                *used = used.saturating_sub(spill_size);
+            }
+
+            spill
+                .write_partition(spill_partition, spill_token)
+                .await?;
+            self.spilled.write().unwrap().insert(key_to_spill);
+        }
     }
 }
 
@@ -763,12 +882,35 @@ impl ShuffleStore for InMemoryShuffleStore {
                 leases.insert(key.clone(), lease_token);
             }
         }
-        self.partitions.write().unwrap().insert(key, partition);
+
+        let new_size = partition_memory_bytes(&partition);
+        {
+            let mut used = self.bytes_used.write().unwrap();
+            if let Some(old) = self.partitions.read().unwrap().get(&key) {
+                *used = used.saturating_sub(partition_memory_bytes(old));
+            }
+        }
+        self.spilled.write().unwrap().remove(&key);
+        self.ensure_memory_capacity(&key, new_size).await?;
+
+        {
+            let mut parts = self.partitions.write().unwrap();
+            parts.insert(key.clone(), partition);
+            let mut order = self.spill_order.write().unwrap();
+            order.retain(|existing| existing != &key);
+            order.push_back(key);
+            *self.bytes_used.write().unwrap() += new_size;
+        }
         Ok(())
     }
 
     async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        if self.spilled.read().unwrap().contains(&key) {
+            if let Some(spill) = &self.spill_store {
+                return spill.read_partition(id).await;
+            }
+        }
         let guard = self.partitions.read().unwrap();
         Ok(guard.get(&key).cloned())
     }
@@ -782,6 +924,22 @@ impl ShuffleStore for InMemoryShuffleStore {
             .write()
             .unwrap()
             .retain(|(jid, _, _), _| jid != job_id);
+        self.spilled
+            .write()
+            .unwrap()
+            .retain(|(jid, _, _)| jid != job_id);
+        self.spill_order
+            .write()
+            .unwrap()
+            .retain(|(jid, _, _)| jid != job_id);
+        if let Some(spill) = &self.spill_store {
+            spill.delete_job_partitions(job_id).await?;
+        }
+        let mut total = 0usize;
+        for partition in self.partitions.read().unwrap().values() {
+            total += partition_memory_bytes(partition);
+        }
+        *self.bytes_used.write().unwrap() = total;
         Ok(())
     }
 }
@@ -796,6 +954,7 @@ impl ShuffleStore for InMemoryShuffleStore {
 pub struct LocalDiskShuffleStore {
     base_dir: PathBuf,
     lease_tokens: LeaseMap,
+    compression: ShuffleCompression,
 }
 
 impl LocalDiskShuffleStore {
@@ -811,7 +970,20 @@ impl LocalDiskShuffleStore {
         Ok(Self {
             base_dir,
             lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            compression: ShuffleCompression::None,
         })
+    }
+
+    /// Set the Parquet compression codec for partition writes.
+    #[must_use]
+    pub fn with_compression(mut self, compression: ShuffleCompression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Return the configured Parquet compression codec.
+    pub fn compression(&self) -> ShuffleCompression {
+        self.compression
     }
 
     fn partition_path(&self, id: &PartitionId) -> PathBuf {
@@ -869,6 +1041,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         }
 
         let path = self.partition_path(&partition.id);
+        let writer_props = parquet_writer_properties(self.compression);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -889,7 +1062,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             })?;
 
             let schema = partition.schema.clone();
-            let mut writer = ArrowWriter::try_new(file, schema, None)
+            let mut writer = ArrowWriter::try_new(file, schema, Some(writer_props))
                 .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
 
             for batch in &partition.batches {
@@ -981,11 +1154,12 @@ impl ShuffleStore for LocalDiskShuffleStore {
 /// Partitions are stored as Arrow IPC stream files at paths:
 ///   `<prefix>/<job_id>/<stage_id>/<partition>.ipc`
 ///
-/// This store has no lease mechanism — it is intended for batch jobs where
-/// task retries use overwrite semantics on the same object key.
+/// Assignment lease tokens are tracked in memory so zombie writers cannot
+/// overwrite committed partitions after a task retry.
 pub struct ObjectStoreShuffleStore {
     store: Arc<dyn object_store::ObjectStore>,
     prefix: object_store::path::Path,
+    lease_tokens: Arc<DashMap<PartitionKey, u64>>,
 }
 
 impl ObjectStoreShuffleStore {
@@ -997,7 +1171,11 @@ impl ObjectStoreShuffleStore {
         } else {
             object_store::path::Path::from(prefix_str.as_str())
         };
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            lease_tokens: Arc::new(DashMap::new()),
+        }
     }
 
     fn object_path(&self, id: &PartitionId) -> object_store::path::Path {
@@ -1021,17 +1199,43 @@ impl ObjectStoreShuffleStore {
 impl ShuffleStore for ObjectStoreShuffleStore {
     async fn register_partition_lease(
         &self,
-        _id: PartitionId,
-        _lease_token: u64,
+        id: PartitionId,
+        lease_token: u64,
     ) -> StoreResult<()> {
+        let key = (id.job_id, id.stage_id, id.partition);
+        if let Some(expected) = self.lease_tokens.get(&key).map(|entry| *entry)
+            && lease_token != expected
+        {
+            return Err(ShuffleError::StaleLeaseToken {
+                expected,
+                actual: lease_token,
+            });
+        }
+        self.lease_tokens.insert(key, lease_token);
         Ok(())
     }
 
     async fn write_partition(
         &self,
         partition: ShufflePartition,
-        _lease_token: u64,
+        lease_token: u64,
     ) -> StoreResult<()> {
+        let key = (
+            partition.id.job_id.clone(),
+            partition.id.stage_id.clone(),
+            partition.id.partition,
+        );
+        if let Some(expected) = self.lease_tokens.get(&key).map(|entry| *entry) {
+            if lease_token < expected {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
+            }
+        } else {
+            self.lease_tokens.insert(key, lease_token);
+        }
+
         use arrow::ipc::writer::StreamWriter;
 
         let mut buf = Vec::new();
@@ -1090,6 +1294,9 @@ impl ShuffleStore for ObjectStoreShuffleStore {
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
         use futures::TryStreamExt;
 
+        self.lease_tokens
+            .retain(|(jid, _, _), _| jid != job_id);
+
         // P2.9: collect all object paths, then issue a single batch-delete stream
         // rather than O(N) serial round-trips.
         let prefix = self.job_prefix(job_id);
@@ -1126,8 +1333,9 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{
-        CompressionCodec, HashPartitioner, LocalShuffleStore, PartitionState,
-        ShuffleError, ShuffleMetadata, ShufflePath, cleanup_orphans, scan_orphans,
+        CompressionCodec, HashPartitioner, InMemoryShuffleStore, LocalDiskShuffleStore,
+        LocalShuffleStore, PartitionState, ShuffleCompression, ShuffleError, ShuffleMetadata,
+        ShufflePath, cleanup_orphans, scan_orphans,
     };
 
     // ── ShufflePath ───────────────────────────────────────────────────────
@@ -1592,8 +1800,7 @@ mod tests {
     // ── ShuffleStore tests ────────────────────────────────────────────────
 
     use super::{
-        InMemoryShuffleStore, LocalDiskShuffleStore, PartitionId, ShufflePartition, ShuffleStore,
-        StoreError,
+        PartitionId, ShufflePartition, ShuffleStore, StoreError,
     };
 
     fn make_store_partition(job_id: &str, stage_id: &str, partition: u32) -> ShufflePartition {
@@ -1919,6 +2126,102 @@ mod tests {
         };
         assert!(store.read_partition(&id0).await.unwrap().is_none());
         assert!(store.read_partition(&id1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn spills_to_disk_at_memory_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let store = InMemoryShuffleStore::new()
+            .with_max_bytes(64)
+            .with_spill_store(Arc::clone(&spill));
+
+        let p0 = make_store_partition("job-spill", "s0", 0);
+        let p1 = make_store_partition("job-spill", "s0", 1);
+        let id0 = p0.id.clone();
+        let id1 = p1.id.clone();
+
+        store.write_partition(p0, 1).await.unwrap();
+        store.write_partition(p1, 1).await.unwrap();
+
+        assert!(store.read_partition(&id0).await.unwrap().is_some());
+        assert!(store.read_partition(&id1).await.unwrap().is_some());
+
+        let spilled_path = dir
+            .path()
+            .join("job-spill")
+            .join("s0")
+            .join("0.parquet");
+        assert!(
+            spilled_path.exists(),
+            "oldest partition should spill to LocalDiskShuffleStore"
+        );
+        assert!(
+            store.read_partition(&id0).await.unwrap().is_some(),
+            "spilled partition must remain readable through the in-memory store"
+        );
+        assert!(
+            store.read_partition(&id1).await.unwrap().is_some(),
+            "newest partition should remain readable in memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_store_writes_compressed() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path())
+            .unwrap()
+            .with_compression(ShuffleCompression::Zstd);
+        let partition = make_store_partition("job-parquet-zstd", "s0", 0);
+        let path = dir
+            .path()
+            .join("job-parquet-zstd")
+            .join("s0")
+            .join("0.parquet");
+
+        store.write_partition(partition, 1).await.unwrap();
+
+        let file = File::open(&path).unwrap();
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .metadata()
+            .clone();
+        assert!(
+            metadata.row_groups().iter().any(|rg| {
+                rg.columns()
+                    .iter()
+                    .any(|col| col.compression() != parquet::basic::Compression::UNCOMPRESSED)
+            }),
+            "Parquet row groups should be written with compression enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn zombie_write_rejected_by_lease() {
+        let inner = Arc::new(InMemory::new());
+        let store = ObjectStoreShuffleStore::new(inner, "shuffle-lease-test");
+        let partition = make_object_store_partition("job-zombie-os", "s0", 0);
+        let id = partition.id.clone();
+
+        store.register_partition_lease(id.clone(), 9).await.unwrap();
+        let err = store.write_partition(partition.clone(), 8).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StaleLeaseToken {
+                    expected: 9,
+                    actual: 8
+                }
+            ),
+            "expected stale lease rejection, got {err}"
+        );
+        assert!(store.read_partition(&id).await.unwrap().is_none());
+
+        store.write_partition(partition, 9).await.unwrap();
+        assert!(store.read_partition(&id).await.unwrap().is_some());
     }
 }
 
