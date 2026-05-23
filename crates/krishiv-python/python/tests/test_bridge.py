@@ -1,24 +1,26 @@
-"""PyArrow and Pandas bridges."""
+"""Pandas / PyArrow batch bridges."""
 
 import pytest
-
-pyarrow = pytest.importorskip("pyarrow")
-pandas = pytest.importorskip("pandas")
 
 import krishiv as ks
 
 
 def test_batch_to_arrow_and_pandas():
-    session = ks.Session.embedded()
-    df = session.sql("SELECT 42 AS value, 'x' AS label")
-    # Materialize via windowed collect on a synthetic stream path
-    local = ks.Session.local()
-    stream = local.stream("SELECT 42 AS value", "ts", 0)
-    batches = stream.tumbling_window(1).collect()
-    if not batches:
-        pytest.skip("no batches materialized")
-    batch = batches[0]
-    rb = batch.to_arrow()
-    assert rb.num_rows >= 1
-    pdf = batch.to_pandas()
-    assert len(pdf) >= 1
+    pa = pytest.importorskip("pyarrow")
+    pd = pytest.importorskip("pandas")
+
+    batch = ks.make_example_batch()
+    assert batch.num_rows == 3
+    arrow_batch = batch.to_arrow()
+    assert arrow_batch.num_rows == 3
+    assert arrow_batch.schema.field("n").type == pa.int64()
+    df = batch.to_pandas()
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == 3
+
+
+def test_batch_repr_html():
+    batch = ks.make_example_batch()
+    html = batch._repr_html_()
+    assert "<table>" in html
+    assert "n" in html
