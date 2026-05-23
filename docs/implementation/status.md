@@ -18,10 +18,10 @@ Branch: `cursor/gap-mitigation-7aa2`
 | P0-7/8 | `GrpcCoordinatorService` gRPC client pooling; executor lease generation updated after register/heartbeat |
 | P0-9/10 | Catalog `MemTable` scans via `register_table_with_batches`; `SqlEngine::with_in_memory_catalog` |
 | P0-13 | Shared `RAG_VECTOR_SINKS` registry between `rag_index` / `rag_query` |
+| P0-12 | Wired Python split modules into `lib.rs`: mod declarations, `pub use`, submodule registration via `#[pymodule]`, removed duplicate inline pyclasses; `session.rs` uses `crate::RUNTIME`; added deps (`pyo3-arrow`, `krishiv-exec`, `krishiv-governance`, `krishiv-state`, `sha2`) |
 
 ## Not done (Sprint 1 remainder)
 
-- **P0-12**: Python split modules (`session.rs`, `dataframe.rs`, …) still conflict with inline types in `lib.rs` — needs dedicated refactor.
 - **P0-5/6, P0-11, P0-14–16**: K8s leader election, finalizer, Weaviate query, Spark CAST, audit call sites, OTel metrics.
 
 ## Validation (this session)
