@@ -5,7 +5,7 @@ use std::sync::Arc;
 use krishiv_state::SharedStateMigrationRegistry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyType};
 
 use crate::dataframe::PyDataFrame;
 use crate::errors::ModeError;
@@ -158,5 +158,42 @@ impl PySession {
             watermark_column,
             max_lateness_ms,
         ))
+    }
+
+    #[pyo3(signature = (name_or_callable, callable=None, *, input_types=None, output_type=None, output_name=None))]
+    pub fn register_udf(
+        &self,
+        py: Python<'_>,
+        name_or_callable: Bound<'_, PyAny>,
+        callable: Option<Bound<'_, PyAny>>,
+        input_types: Option<Bound<'_, PyDict>>,
+        output_type: Option<String>,
+        output_name: Option<String>,
+    ) -> PyResult<()> {
+        use pyo3::types::PyDict;
+
+        let (name, callable, input_types, output_type, output_name) =
+            crate::udf::resolve_register_udf_args(
+                name_or_callable,
+                callable,
+                input_types,
+                output_type,
+                output_name,
+            )?;
+        let input_types_bound = input_types.bind(py);
+        let registered = crate::udf::build_python_scalar_udf(
+            py,
+            name,
+            callable,
+            &input_types_bound,
+            &output_type,
+            output_name,
+        )?;
+        self.inner.register_scalar_udf(registered);
+        Ok(())
+    }
+
+    pub fn list_udfs(&self) -> Vec<String> {
+        self.inner.scalar_udf_names()
     }
 }

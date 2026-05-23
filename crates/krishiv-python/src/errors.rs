@@ -9,6 +9,7 @@ pyo3::create_exception!(krishiv, ConnectorError, KrishivError);
 pyo3::create_exception!(krishiv, CheckpointError, KrishivError);
 pyo3::create_exception!(krishiv, AuthorizationError, KrishivError);
 pyo3::create_exception!(krishiv, ModeError, KrishivError);
+pyo3::create_exception!(krishiv, UdfError, KrishivError);
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -19,5 +20,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CheckpointError", py.get_type::<CheckpointError>())?;
     m.add("AuthorizationError", py.get_type::<AuthorizationError>())?;
     m.add("ModeError", py.get_type::<ModeError>())?;
+    m.add("UdfError", py.get_type::<UdfError>())?;
     Ok(())
 }

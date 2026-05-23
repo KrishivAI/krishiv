@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
@@ -25,6 +25,7 @@ pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
+pub use krishiv_udf::{ScalarUdf, UdfError, UdfRegistry};
 
 /// API result alias.
 pub type Result<T> = std::result::Result<T, KrishivError>;
@@ -260,6 +261,7 @@ impl SessionBuilder {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
+            udf_registry: Arc::new(RwLock::new(UdfRegistry::new())),
         })
     }
 }
@@ -273,6 +275,7 @@ pub struct Session {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     coordinator_url: Option<String>,
+    udf_registry: Arc<RwLock<UdfRegistry>>,
 }
 
 impl fmt::Debug for Session {
@@ -308,6 +311,30 @@ impl Session {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .snapshot()
+    }
+
+    /// Shared UDF registry for this session.
+    pub fn udf_registry(&self) -> Arc<RwLock<UdfRegistry>> {
+        Arc::clone(&self.udf_registry)
+    }
+
+    /// Register a vectorized scalar UDF for this session.
+    pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) {
+        self.udf_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_scalar(udf);
+    }
+
+    /// Names of scalar UDFs registered on this session.
+    pub fn scalar_udf_names(&self) -> Vec<String> {
+        self.udf_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .scalar_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Register a local Parquet path as a SQL table.
@@ -1451,6 +1478,26 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(session.mode(), ExecutionMode::Distributed);
+    }
+
+    #[test]
+    fn session_register_scalar_udf() {
+        use std::sync::Arc;
+
+        use krishiv_udf::MultiplyScalarUdf;
+
+        let session = SessionBuilder::new().build().unwrap();
+        assert!(session.scalar_udf_names().is_empty());
+
+        let udf = Arc::new(MultiplyScalarUdf::new("double", "x", 2));
+        session.register_scalar_udf(udf);
+        let names = session.scalar_udf_names();
+        assert_eq!(names, vec!["double".to_string()]);
+
+        let registry = session.udf_registry();
+        let guard = registry.read().unwrap();
+        let loaded = guard.get_scalar("double").expect("udf should be registered");
+        assert_eq!(loaded.name(), "double");
     }
 
     #[test]

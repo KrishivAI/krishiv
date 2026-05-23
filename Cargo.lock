@@ -3156,12 +3156,12 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-async-util",
- "krishiv-cep",
  "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
  "krishiv-sql-policy",
+ "krishiv-udf",
  "parquet 58.3.0",
  "tempfile",
  "tokio",

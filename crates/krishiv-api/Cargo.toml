@@ -9,14 +9,15 @@ license.workspace = true
 arrow = { workspace = true }
 krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-governance = { path = "../krishiv-governance" }
-krishiv-cep = { path = "../krishiv-cep" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-sql-policy = { path = "../krishiv-sql-policy" }
+krishiv-udf = { path = "../krishiv-udf" }
 tokio = { workspace = true }
 
 [dev-dependencies]
+krishiv-udf = { path = "../krishiv-udf" }
 parquet = { workspace = true }
 tempfile = { workspace = true }
 
