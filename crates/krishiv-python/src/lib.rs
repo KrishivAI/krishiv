@@ -7,6 +7,8 @@ mod batch;
 mod dataframe;
 mod errors;
 mod migration;
+mod job_status;
+mod query_result;
 mod pipeline;
 mod schema;
 mod session;
@@ -30,6 +32,7 @@ use batch::PyBatch as Batch;
 use dataframe::PyDataFrame;
 use migration::{apply_state_migration, register_state_migration, state_migration};
 use schema::PySchema;
+use query_result::PyQueryResult;
 use session::PySession;
 use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
 use sources::{read_iceberg, read_kafka, read_parquet};
@@ -44,6 +47,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PySession>()?;
     m.add_class::<PyDataFrame>()?;
+    m.add_class::<PyQueryResult>()?;
+    m.add_class::<job_status::PyJobStatus>()?;
     m.add_class::<PySchema>()?;
     m.add_class::<PyStream>()?;
     m.add_class::<PyKeyedStream>()?;
@@ -66,6 +71,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     agg::register_agg_module(py, m)?;
     windows::register_windows_module(py, m)?;
+    sinks::register_sinks_module(py, m)?;
 
     Ok(())
 }

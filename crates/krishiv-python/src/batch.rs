@@ -8,7 +8,8 @@ use pyo3::prelude::*;
 use pyo3_arrow::PyRecordBatch;
 
 /// One record batch from a query or stream window.
-#[pyclass(name = "Batch")]
+#[pyclass(name = "Batch", from_py_object)]
+#[derive(Clone)]
 pub struct PyBatch {
     batch: Arc<RecordBatch>,
 }

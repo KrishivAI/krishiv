@@ -3398,6 +3398,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-api",
+ "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-state",
  "krishiv-udf",
@@ -3468,6 +3469,7 @@ dependencies = [
  "datafusion",
  "krishiv-optimizer",
  "krishiv-plan",
+ "krishiv-udf",
  "tokio",
 ]
 

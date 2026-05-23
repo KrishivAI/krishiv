@@ -20,15 +20,7 @@ use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, 
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
-#[cfg(feature = "spark_compat")]
-pub mod spark_compat;
-pub mod spark_compat_date;
-
-mod live_table;
-pub use live_table::{
-    execute_live_table_ddl, parse_live_table_statement, plan_live_table, LiveTableRegistry,
-    LiveTableStatement,
-};
+mod udf;
 
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
@@ -95,6 +87,7 @@ impl SqlPlan {
 pub struct SqlEngine {
     context: SessionContext,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
+    udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -114,13 +107,38 @@ impl Default for SqlEngine {
 impl SqlEngine {
     /// Create a local SQL engine.
     pub fn new() -> Self {
-        let context = SessionContext::new();
-        #[cfg(feature = "spark_compat")]
-        let _ = spark_compat::register_spark_functions(&context);
         Self {
-            context,
+            context: SessionContext::new(),
             view_registry: None,
+            udf_registry: None,
         }
+    }
+
+    /// Share a session UDF registry so scalar UDFs are visible in SQL.
+    #[must_use]
+    pub fn with_udf_registry(
+        mut self,
+        registry: std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>,
+    ) -> Self {
+        self.udf_registry = Some(registry);
+        self
+    }
+
+    /// Register all scalar UDFs from the attached registry with DataFusion.
+    pub async fn sync_scalar_udfs(&self) -> SqlResult<()> {
+        let Some(registry) = &self.udf_registry else {
+            return Ok(());
+        };
+        let guard = registry
+            .read()
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        udf::sync_scalar_udfs(&self.context, &guard)
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })
     }
 
     /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
@@ -211,6 +229,7 @@ impl SqlEngine {
             return Err(SqlError::EmptyQuery);
         }
 
+        self.sync_scalar_udfs().await?;
         let dataframe = self.context.sql(query).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe))
     }
@@ -790,5 +809,53 @@ mod tests {
             total_rows, 3,
             "expected 3 rows from registered table, got {total_rows} (stats: {stats:?})"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod udf_sql_tests {
+    use std::sync::Arc;
+
+    use krishiv_udf::MultiplyScalarUdf;
+
+    use super::SqlEngine;
+
+    #[tokio::test]
+    async fn registered_scalar_udf_visible_in_sql() {
+        let registry = Arc::new(std::sync::RwLock::new(krishiv_udf::UdfRegistry::new()));
+        registry
+            .write()
+            .unwrap()
+            .register_scalar(Arc::new(MultiplyScalarUdf::new("triple", "x", 3)));
+        let engine = SqlEngine::new().with_udf_registry(registry);
+        engine
+            .register_record_batches(
+                "t",
+                vec![{
+                    use std::sync::Arc;
+                    use arrow::array::Int64Array;
+                    use arrow::datatypes::{DataType, Field, Schema};
+                    use arrow::record_batch::RecordBatch;
+                    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+                    RecordBatch::try_new(
+                        schema,
+                        vec![Arc::new(Int64Array::from(vec![Some(2), Some(4)]))],
+                    )
+                    .unwrap()
+                }],
+            )
+            .await
+            .unwrap();
+        let df = engine.sql("SELECT triple(x) AS y FROM t").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 6);
+        assert_eq!(col.value(1), 12);
     }
 }

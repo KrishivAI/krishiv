@@ -2,13 +2,17 @@
 
 use std::sync::Arc;
 
+use krishiv_api::StreamBatch;
+use krishiv_governance::{Role, RoleBasedPolicyHook, StaticApiKeyAuthProvider};
 use krishiv_state::SharedStateMigrationRegistry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 
+use crate::batch::PyBatch;
 use crate::dataframe::PyDataFrame;
-use crate::errors::ModeError;
+use crate::errors::{map_krishiv_error, ModeError};
+use crate::job_status::PyJobStatus;
 use crate::stream::PyStream;
 
 fn build_embedded_session() -> PyResult<PySession> {
@@ -27,6 +31,13 @@ static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLo
         .build()
         .expect("failed to build embedded Krishiv Tokio runtime")
 });
+
+pub(crate) fn block_on_async<F, T>(future: F) -> Result<T, krishiv_api::KrishivError>
+where
+    F: std::future::Future<Output = Result<T, krishiv_api::KrishivError>>,
+{
+    RUNTIME.block_on(future)
+}
 
 /// A Krishiv query session.
 #[pyclass(name = "Session")]
@@ -101,6 +112,48 @@ impl PySession {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Session with API-key auth and policy for [`Self::sql_as`].
+    #[classmethod]
+    #[pyo3(signature = (api_keys, *, policy = "role_based", mode = "embedded"))]
+    pub fn with_policy(
+        _cls: &Bound<'_, PyType>,
+        api_keys: Vec<(String, String, String)>,
+        policy: &str,
+        mode: &str,
+    ) -> PyResult<Self> {
+        let auth_entries = api_keys
+            .into_iter()
+            .map(|(key, subject, role)| Ok((key, subject, parse_role(&role)?)))
+            .collect::<PyResult<Vec<_>>>()?;
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(auth_entries));
+        let policy_hook: Arc<dyn krishiv_governance::PolicyHook> = match policy {
+            "allow_all" | "noop" => Arc::new(krishiv_governance::NoOpPolicyHook),
+            "role_based" => Arc::new(RoleBasedPolicyHook),
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unknown policy '{other}'; use allow_all or role_based"
+                )));
+            }
+        };
+        let mut builder = krishiv_api::SessionBuilder::new()
+            .with_auth(auth)
+            .with_policy(policy_hook);
+        builder = match mode {
+            "local" | "single-node" => {
+                builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
+            }
+            "distributed" => builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed),
+            _ => builder,
+        };
+        builder
+            .build()
+            .map(|s| Self {
+                inner: Arc::new(s),
+                state_migrations: SharedStateMigrationRegistry::new(),
+            })
+            .map_err(map_krishiv_error)
+    }
+
     #[getter]
     pub fn mode(&self) -> &'static str {
         match self.inner.mode() {
@@ -116,27 +169,58 @@ impl PySession {
             inner
                 .sql(&query)
                 .map(|df| PyDataFrame { inner: df })
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                .map_err(map_krishiv_error)
         })
     }
 
     pub fn sql_async(&self, py: Python<'_>, query: String) -> PyResult<PyDataFrame> {
         let inner = self.inner.clone();
         py.detach(move || {
-            RUNTIME.block_on(async move {
+            block_on_async(async move {
                 inner
                     .sql_async(&query)
                     .await
                     .map(|df| PyDataFrame { inner: df })
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })
+            .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn sql_as(&self, py: Python<'_>, api_key: String, query: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            block_on_async(async move {
+                inner
+                    .sql_as(&api_key, &query)
+                    .await
+                    .map(|df| PyDataFrame { inner: df })
+            })
+            .map_err(map_krishiv_error)
+        })
+    }
+
+    pub fn read_parquet(&self, py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .read_parquet(&path)
+                .map(|df| PyDataFrame { inner: df })
+                .map_err(map_krishiv_error)
         })
     }
 
     pub fn register_parquet(&self, name: String, path: String) -> PyResult<()> {
         self.inner
             .register_parquet(&name, &path)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(map_krishiv_error)
+    }
+
+    pub fn jobs(&self) -> Vec<PyJobStatus> {
+        self.inner
+            .jobs()
+            .into_iter()
+            .map(PyJobStatus::from_status)
+            .collect()
     }
 
     #[pyo3(signature = (query, watermark_column, max_lateness_ms))]
@@ -170,8 +254,6 @@ impl PySession {
         output_type: Option<String>,
         output_name: Option<String>,
     ) -> PyResult<()> {
-        use pyo3::types::PyDict;
-
         let (name, callable, input_types, output_type, output_name) =
             crate::udf::resolve_register_udf_args(
                 name_or_callable,
@@ -195,5 +277,42 @@ impl PySession {
 
     pub fn list_udfs(&self) -> Vec<String> {
         self.inner.scalar_udf_names()
+    }
+
+    pub fn memory_stream_collect(
+        &self,
+        py: Python<'_>,
+        name: String,
+        batches: Vec<PyBatch>,
+    ) -> PyResult<Vec<PyBatch>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            let stream_batches: Vec<StreamBatch> = batches
+                .into_iter()
+                .enumerate()
+                .map(|(seq, b)| StreamBatch::new(seq as u64, b.record_batch().clone()))
+                .collect();
+            inner
+                .memory_stream(name, stream_batches)
+                .collect_bounded()
+                .map(|collected| {
+                    collected
+                        .into_iter()
+                        .map(|sb| PyBatch::from_record_batch(sb.batch().clone()))
+                        .collect()
+                })
+                .map_err(map_krishiv_error)
+        })
+    }
+}
+
+fn parse_role(role: &str) -> PyResult<Role> {
+    match role.to_lowercase().as_str() {
+        "admin" => Ok(Role::Admin),
+        "writer" => Ok(Role::Writer),
+        "reader" => Ok(Role::Reader),
+        other => Err(PyRuntimeError::new_err(format!(
+            "unknown role '{other}'; use admin, writer, or reader"
+        ))),
     }
 }

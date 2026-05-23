@@ -245,7 +245,8 @@ impl SessionBuilder {
 
     /// Build a session.
     pub fn build(self) -> Result<Session> {
-        let sql_engine = SqlEngine::new();
+        let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
+        let sql_engine = SqlEngine::new().with_udf_registry(Arc::clone(&udf_registry));
         let policy_engine = match (self.auth, self.policy) {
             (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
                 sql_engine.clone(),
@@ -261,7 +262,7 @@ impl SessionBuilder {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
-            udf_registry: Arc::new(RwLock::new(UdfRegistry::new())),
+            udf_registry,
         })
     }
 }
@@ -324,6 +325,7 @@ impl Session {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .register_scalar(udf);
+        let _ = block_on(self.sql_engine.sync_scalar_udfs());
     }
 
     /// Names of scalar UDFs registered on this session.
