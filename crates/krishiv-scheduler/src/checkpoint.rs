@@ -376,7 +376,6 @@ mod tests {
 
         // Simulate a coordinator failover: bump fencing token.
         coord.fencing_token = FencingToken::try_new(2).unwrap();
-
         let epoch = coord.initiate().unwrap();
         assert_eq!(epoch, 1);
 
@@ -406,7 +405,6 @@ mod tests {
 
         // Set a token of 3 on the coordinator.
         coord.fencing_token = FencingToken::try_new(3).unwrap();
-
         let _epoch = coord.initiate().unwrap();
 
         // Directly corrupt the coordinator's in-flight token to mismatch.
@@ -416,7 +414,6 @@ mod tests {
         let ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
         // Mutate token after building ack — simulate a race that changes coordinator token.
         coord.fencing_token = FencingToken::try_new(4).unwrap();
-
         // The ack carries token=3, but the coordinator is now at 4.
         // receive_ack checks ack.fencing_token >= self.fencing_token, so this would fail
         // the ack-level check. The validate_fencing_token guard in commit_epoch provides

@@ -990,12 +990,22 @@ impl StabilityMetrics {
 
 /// Convert a Krishiv logical plan into an R2 distributed job spec.
 pub fn job_spec_from_logical_plan(job_id: JobId, plan: &LogicalPlan) -> SchedulerResult<JobSpec> {
-    job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes())
+    job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes(), None)
 }
 
 /// Convert a Krishiv physical plan into an R2 distributed job spec.
+///
+/// GAP-SH-04: If the plan carries a `coalesced_partition_count` (set by the
+/// AQE `CoalesceRule`), that count overrides the default one-task-per-node
+/// layout so the scheduler generates the correct number of downstream tasks.
 pub fn job_spec_from_physical_plan(job_id: JobId, plan: &PhysicalPlan) -> SchedulerResult<JobSpec> {
-    job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes())
+    job_spec_from_plan_parts(
+        job_id,
+        plan.name(),
+        plan.kind(),
+        plan.nodes(),
+        plan.coalesced_partition_count(),
+    )
 }
 
 pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
@@ -1048,6 +1058,7 @@ fn job_spec_from_plan_parts(
     plan_name: &str,
     kind: PlanExecutionKind,
     nodes: &[PlanNode],
+    coalesced_partition_count: Option<usize>,
 ) -> SchedulerResult<JobSpec> {
     let job_kind = match kind {
         PlanExecutionKind::Batch => JobKind::Batch,
@@ -1063,7 +1074,23 @@ fn job_spec_from_plan_parts(
     })?;
 
     let mut stage = StageSpec::new(stage_id, format!("{job_name}-stage"));
-    if nodes.is_empty() {
+
+    // GAP-SH-04: If AQE CoalesceRule set a target partition count, generate
+    // exactly that many tasks instead of one-per-plan-node.
+    if let Some(count) = coalesced_partition_count {
+        let task_count = count.max(1);
+        for i in 0..task_count {
+            let task_id = TaskId::try_new(format!("task-{}", i + 1)).map_err(|error| {
+                SchedulerError::InvalidPlan {
+                    message: error.to_string(),
+                }
+            })?;
+            stage = stage.with_task(TaskSpec::new(
+                task_id,
+                format!("coalesced-partition-{i}: {job_name}"),
+            ));
+        }
+    } else if nodes.is_empty() {
         let task_id = TaskId::try_new("task-1").map_err(|error| SchedulerError::InvalidPlan {
             message: error.to_string(),
         })?;

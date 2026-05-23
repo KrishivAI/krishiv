@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LazyLock, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_checkpoint::{
     CheckpointMetadata, LocalFsCheckpointStorage, read_epoch_metadata, validate_epoch,
@@ -36,6 +36,40 @@ use krishiv_proto::{
     TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion,
     TriggerSavepointRequest, TriggerSavepointResponse, wire,
 };
+
+// ── GAP-OB-01: Scheduler hot-path metrics counters ──────────────────────────
+//
+// Simple process-local atomic counters exposed via `scheduler_metrics()`.
+// Prometheus / OTLP export can scrape these via the metrics HTTP endpoint.
+
+/// Total number of jobs accepted by `submit_job` since process start.
+pub static JOBS_SUBMITTED_TOTAL: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+/// Total number of checkpoint epochs initiated since process start.
+pub static CHECKPOINT_EPOCHS_TOTAL: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+/// Total number of task assignments launched since process start.
+pub static TASKS_ASSIGNED_TOTAL: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+/// Snapshot of scheduler-level metrics counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerMetrics {
+    pub jobs_submitted_total: u64,
+    pub checkpoint_epochs_total: u64,
+    pub tasks_assigned_total: u64,
+}
+
+/// Read the current scheduler metrics snapshot.
+pub fn scheduler_metrics() -> SchedulerMetrics {
+    SchedulerMetrics {
+        jobs_submitted_total: JOBS_SUBMITTED_TOTAL.load(AtomicOrdering::Relaxed),
+        checkpoint_epochs_total: CHECKPOINT_EPOCHS_TOTAL.load(AtomicOrdering::Relaxed),
+        tasks_assigned_total: TASKS_ASSIGNED_TOTAL.load(AtomicOrdering::Relaxed),
+    }
+}
 
 /// Scheduler result alias.
 pub type SchedulerResult<T> = Result<T, SchedulerError>;
@@ -419,6 +453,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+        // GAP-CP-08: Extract auth context for every handler.
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -453,6 +490,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "deregister_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -493,6 +532,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -563,6 +604,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "task_status");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -625,12 +668,22 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
-        let response = coordinator.handle_checkpoint_ack(ack);
+        // GAP-CK-03: commit_epoch() calls sync disk I/O via LocalFsCheckpointStorage.
+        // Move the lock-acquire + storage write onto a blocking thread so the
+        // Tokio worker pool is not stalled.
+        let coordinator = self.coordinator.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            coordinator
+                .write()
+                .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))
+                .map(|mut c| c.handle_checkpoint_ack(ack))
+        })
+        .await
+        .map_err(|e| tonic::Status::internal(format!("checkpoint_ack task panicked: {e}")))?
+        ?;
         Ok(tonic::Response::new(response))
     }
 }
@@ -1602,6 +1655,8 @@ impl Coordinator {
         self.jobs.insert(inserted_job_id.clone(), record);
         // P1.1: Index streaming tasks for O(1) heartbeat lookup.
         self.index_streaming_tasks(&inserted_job_id);
+        // GAP-OB-01: Increment jobs_submitted counter.
+        JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1626,7 +1681,11 @@ impl Coordinator {
             Some(coord) => {
                 let current_epoch = coord.current_epoch();
                 match coord.receive_ack(ack) {
-                    Ok(_) => CheckpointAckResponse::Accepted,
+                    Ok(_) => {
+                        // GAP-OB-01: Count completed checkpoint epochs.
+                        CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        CheckpointAckResponse::Accepted
+                    }
                     Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
                 }
             }
@@ -1825,8 +1884,11 @@ impl Coordinator {
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         self.ensure_active()?;
         let executor_leases = self.executors.assignment_leases();
-        self.find_job_mut(job_id)?
-            .launch_assigned_task_assignments(&executor_leases)
+        let assignments = self.find_job_mut(job_id)?
+            .launch_assigned_task_assignments(&executor_leases)?;
+        // GAP-OB-01: Increment tasks_assigned counter.
+        TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
+        Ok(assignments)
     }
 
     /// Cancel a job and mark non-terminal stages/tasks cancelled.

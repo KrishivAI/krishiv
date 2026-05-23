@@ -213,7 +213,7 @@ pub use runner::{
 pub use barrier::{BarrierSimulator, BarrierSnapshot};
 pub use grpc::{ExecutorTaskInboxService, ExecutorTaskGrpcService, executor_task_grpc_server};
 pub use transport::{
-    ExecutorTransportError, ExecutorConfig, ExecutorRuntime,
+    ExecutorTransportError, ExecutorConfig, ExecutorRuntime, GrpcCoordinatorService,
     serve_executor_task_grpc, serve_executor_task_grpc_with_listener,
 };
 

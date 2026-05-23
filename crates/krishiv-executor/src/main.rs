@@ -9,7 +9,10 @@ use axum::Router;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use krishiv_executor::{ExecutorConfig, ExecutorRuntime};
+use krishiv_executor::{
+    ExecutorAssignmentInbox, ExecutorConfig, ExecutorRuntime, ExecutorTaskRunner,
+    GrpcCoordinatorService, serve_executor_task_grpc_with_listener,
+};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -34,6 +37,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let mode = config.mode;
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
     let http_addr = config.http_addr;
+    let task_grpc_addr = config.task_grpc_addr;
     let runtime = ExecutorRuntime::new(config.into_executor_config()?);
 
     // Start optional HTTP health server (/healthz, /readyz, /metrics).
@@ -54,7 +58,9 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     match mode {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
         ExecutorMode::RegisterOnce => register_once(&runtime).await,
-        ExecutorMode::Connect => heartbeat_loop(&runtime, heartbeat_interval_secs).await,
+        ExecutorMode::Connect => {
+            heartbeat_loop(&runtime, heartbeat_interval_secs, task_grpc_addr).await
+        }
     }
 }
 
@@ -129,8 +135,46 @@ async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
 async fn heartbeat_loop(
     runtime: &ExecutorRuntime,
     heartbeat_interval_secs: u64,
+    task_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
     register_once(runtime).await?;
+
+    // GAP-CP-09: Start the executor task gRPC server so the coordinator can push
+    // task assignments without polling.  The inbox is shared between the gRPC
+    // service and the task runner loop below.
+    let inbox = ExecutorAssignmentInbox::new();
+    if let Some(addr) = task_grpc_addr {
+        let task_listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind task gRPC addr {addr}: {e}"))?;
+        let bound_addr = task_listener.local_addr().unwrap();
+        println!("Krishiv executor task gRPC listening on {bound_addr}");
+        let server_inbox = inbox.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor_task_grpc_with_listener(task_listener, server_inbox).await;
+        });
+    }
+
+    // Spawn the task runner loop: pop assignments from the inbox and run them,
+    // reporting status to the coordinator endpoint.
+    let runner_inbox = inbox.clone();
+    let runner_endpoint = runtime.config().coordinator_endpoint().to_owned();
+    tokio::spawn(async move {
+        let runner = ExecutorTaskRunner::new(runner_inbox);
+        loop {
+            let coord = GrpcCoordinatorService::new(runner_endpoint.clone());
+            match runner.run_next_with(&coord).await {
+                Ok(Some(_report)) => {}
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    eprintln!("task runner error: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+    });
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
 
@@ -167,6 +211,8 @@ struct ExecutorCliConfig {
     mode: ExecutorMode,
     heartbeat_interval_secs: u64,
     http_addr: Option<SocketAddr>,
+    /// GAP-CP-09: Address for the executor task gRPC server.
+    task_grpc_addr: Option<SocketAddr>,
     help: bool,
 }
 
@@ -197,6 +243,10 @@ impl ExecutorCliConfig {
             http_addr: env::var("KRISHIV_HTTP_ADDR")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            task_grpc_addr: env::var("KRISHIV_TASK_GRPC_ADDR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| "0.0.0.0:50055".parse().ok()),
             help: false,
         };
         let mut args = args.into_iter();
@@ -226,6 +276,16 @@ impl ExecutorCliConfig {
                         Some(value.parse().map_err(|_| {
                             format!("invalid socket address for --http-addr: {value}")
                         })?);
+                }
+                "--task-grpc-addr" => {
+                    let value = next_arg(&mut args, "--task-grpc-addr")?;
+                    if value == "off" {
+                        config.task_grpc_addr = None;
+                    } else {
+                        config.task_grpc_addr = Some(value.parse().map_err(|_| {
+                            format!("invalid socket address for --task-grpc-addr: {value}")
+                        })?);
+                    }
                 }
                 "--heartbeat-interval-secs" => {
                     let value = next_arg(&mut args, "--heartbeat-interval-secs")?;
@@ -267,20 +327,21 @@ impl ExecutorCliConfig {
     }
 
     fn help() -> &'static str {
-        "Run the Krishiv R3.1 executor skeleton.\n\
+        "Run the Krishiv executor.\n\
          \n\
          Usage:\n\
            krishiv-executor [OPTIONS]\n\
          \n\
          Options:\n\
-           --executor-id <ID>       Executor id, defaults to KRISHIV_EXECUTOR_ID or exec-local\n\
-           --host <HOST>            Host or pod name, defaults to HOSTNAME or localhost\n\
-           --slots <N>              Task slots, defaults to KRISHIV_TASK_SLOTS or 1\n\
-           --coordinator <URL>      Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:8080\n\
-           --register-once          Register with the coordinator, send one heartbeat, then exit\n\
-           --connect                Register with the coordinator and continue heartbeating\n\
+           --executor-id <ID>           Executor id, defaults to KRISHIV_EXECUTOR_ID or exec-local\n\
+           --host <HOST>                Host or pod name, defaults to HOSTNAME or localhost\n\
+           --slots <N>                  Task slots, defaults to KRISHIV_TASK_SLOTS or 1\n\
+           --coordinator <URL>          Coordinator endpoint, defaults to KRISHIV_COORDINATOR_ENDPOINT or http://127.0.0.1:8080\n\
+           --register-once              Register with the coordinator, send one heartbeat, then exit\n\
+           --connect                    Register with the coordinator and continue heartbeating\n\
            --heartbeat-interval-secs <N> Heartbeat interval for --connect, defaults to KRISHIV_HEARTBEAT_INTERVAL_SECS or 10\n\
-           -h, --help               Show help\n"
+           --task-grpc-addr <ADDR>      Task gRPC server address (default: KRISHIV_TASK_GRPC_ADDR or 0.0.0.0:50055; use 'off' to disable)\n\
+           -h, --help                   Show help\n"
     }
 }
 

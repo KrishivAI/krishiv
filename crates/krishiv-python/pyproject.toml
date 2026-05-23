@@ -40,3 +40,5 @@ features = ["pyo3/extension-module"]
 strip = true
 # Target the Cargo.toml in this directory
 manifest-path = "Cargo.toml"
+# Include the pure-Python package facade alongside the native extension
+python-source = "python"
