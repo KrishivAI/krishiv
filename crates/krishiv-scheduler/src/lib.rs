@@ -86,10 +86,9 @@ pub enum TaskUpdateOutcome {
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod admission;
 pub mod checkpoint;
-pub mod barrier_tracker;
-pub mod barrier_client;
 pub mod heartbeat;
 pub mod job;
+pub mod llm_quota;
 pub(crate) mod store;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
@@ -4762,8 +4761,6 @@ mod tests {
                 operator_snapshots: vec![],
                 is_savepoint: false,
                 savepoint_label: None,
-                iceberg_snapshot_id: None,
-                kafka_offsets: None,
             };
             write_epoch_metadata(storage.as_ref(), "job-ck-recover", epoch, &meta).unwrap();
             let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
@@ -5123,8 +5120,6 @@ mod tests {
                 operator_snapshots: vec![],
                 is_savepoint: false,
                 savepoint_label: None,
-                iceberg_snapshot_id: None,
-                kafka_offsets: None,
             };
             let storage_dyn: &dyn CheckpointStorage = storage;
             write_epoch_metadata(storage_dyn, job_id, epoch, &meta).unwrap();

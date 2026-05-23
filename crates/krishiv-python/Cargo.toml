@@ -10,20 +10,13 @@ name = "krishiv_python"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
-[features]
-default = []
-iceberg = ["dep:krishiv-lakehouse"]
-kafka = []
-
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
+krishiv-ai = { path = "../krishiv-ai", features = ["fastembed-local"] }
 krishiv-udf = { path = "../krishiv-udf" }
-krishiv-state = { path = "../krishiv-state" }
-krishiv-governance = { path = "../krishiv-governance" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse", optional = true }
+krishiv-vector-sinks = { path = "../krishiv-vector-sinks" }
 arrow = { workspace = true }
 pyo3 = { workspace = true }
-pyo3-arrow = "0.17"
 tokio = { workspace = true }
 
 [lints]

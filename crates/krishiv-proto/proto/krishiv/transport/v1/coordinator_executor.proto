@@ -337,3 +337,17 @@ enum TransportDisposition {
   TRANSPORT_DISPOSITION_UNKNOWN_TASK = 7;
   TRANSPORT_DISPOSITION_UNKNOWN_EXECUTOR = 8;
 }
+
+// R17: LLM UDF quota reporting and coordinator throttling.
+message LlmQuotaReport {
+  string model = 1;
+  uint64 requests_used = 2;
+  uint64 tokens_used = 3;
+  uint64 period_ms = 4;
+}
+
+message LlmThrottleCommand {
+  string model = 1;
+  uint32 max_requests_per_minute = 2;
+  uint64 max_tokens_per_minute = 3;
+}

@@ -30,6 +30,8 @@ members = [
     "crates/krishiv-async-util",
     "crates/krishiv-testkit",
     "crates/krishiv-sql-policy",
+    "crates/krishiv-vector-sinks",
+    "crates/krishiv-ai",
 ]
 resolver = "3"
 
@@ -43,7 +45,6 @@ license = "Apache-2.0"
 arrow = { version = "58.3.0", features = ["prettyprint"] }
 arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
-pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 iceberg = "0.9.1"
 async-trait = "0.1"
 bytes = "1"
@@ -82,6 +83,12 @@ uuid = { version = "1", features = ["v4"] }
 lz4_flex = "0.11"
 twox-hash = "2.1"
 zstd = "0.13"
+dashmap = "6.1"
+fastembed = "4.9"
+qdrant-client = "1.16"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+hex = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

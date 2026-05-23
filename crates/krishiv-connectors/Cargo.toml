@@ -13,12 +13,10 @@ kafka = ["dep:rdkafka"]
 
 [dependencies]
 arrow = { workspace = true }
+parquet = { workspace = true }
 bytes = { workspace = true }
-krishiv-exec = { path = "../krishiv-exec" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-proto = { path = "../krishiv-proto" }
 object_store = { workspace = true }
-parquet = { workspace = true }
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
 regex = "1"
 serde_json = { workspace = true }
