@@ -12,24 +12,64 @@ use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LazyLock, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_checkpoint::{
     CheckpointMetadata, LocalFsCheckpointStorage, read_epoch_metadata, validate_epoch,
+    validate_fencing_token,
 };
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse,
-    CoordinatorExecutorService, CoordinatorId, CoordinatorState, DeregisterExecutorRequest,
+    CheckpointEpochInfo, CoordinatorExecutorService, CoordinatorId, CoordinatorState,
+    CoordinatorManagementService,
+    DeregisterExecutorRequest,
     DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, HeartbeatThrottleCommand, InitiateCheckpointRequest,
+    InspectStateRequest, InspectStateResponse, ListCheckpointsRequest, ListCheckpointsResponse,
     JobId, JobKind, JobSpec, LeaseGeneration,
     RegisterExecutorRequest, RegisterExecutorResponse,
-    StageId, StreamingTaskState, TaskAssignment, TaskAttemptRef,
+    RestoreJobRequest, RestoreJobResponse,
+    StageId, StateSnapshotInfo, StreamingTaskState, TaskAssignment, TaskAttemptRef,
     TaskCancellationRequest, TaskId, TaskState, TaskStatusRequest,
-    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion, wire,
+    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion,
+    TriggerSavepointRequest, TriggerSavepointResponse, wire,
 };
+
+// ── GAP-OB-01: Scheduler hot-path metrics counters ──────────────────────────
+//
+// Simple process-local atomic counters exposed via `scheduler_metrics()`.
+// Prometheus / OTLP export can scrape these via the metrics HTTP endpoint.
+
+/// Total number of jobs accepted by `submit_job` since process start.
+pub static JOBS_SUBMITTED_TOTAL: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+/// Total number of checkpoint epochs initiated since process start.
+pub static CHECKPOINT_EPOCHS_TOTAL: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+/// Total number of task assignments launched since process start.
+pub static TASKS_ASSIGNED_TOTAL: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+/// Snapshot of scheduler-level metrics counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerMetrics {
+    pub jobs_submitted_total: u64,
+    pub checkpoint_epochs_total: u64,
+    pub tasks_assigned_total: u64,
+}
+
+/// Read the current scheduler metrics snapshot.
+pub fn scheduler_metrics() -> SchedulerMetrics {
+    SchedulerMetrics {
+        jobs_submitted_total: JOBS_SUBMITTED_TOTAL.load(AtomicOrdering::Relaxed),
+        checkpoint_epochs_total: CHECKPOINT_EPOCHS_TOTAL.load(AtomicOrdering::Relaxed),
+        tasks_assigned_total: TASKS_ASSIGNED_TOTAL.load(AtomicOrdering::Relaxed),
+    }
+}
 
 /// Scheduler result alias.
 pub type SchedulerResult<T> = Result<T, SchedulerError>;
@@ -413,6 +453,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+        // GAP-CP-08: Extract auth context for every handler.
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -447,6 +490,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "deregister_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -487,6 +532,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -557,6 +604,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "task_status");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
@@ -619,13 +668,138 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
-        let response = coordinator.handle_checkpoint_ack(ack);
+        // GAP-CK-03: commit_epoch() calls sync disk I/O via LocalFsCheckpointStorage.
+        // Move the lock-acquire + storage write onto a blocking thread so the
+        // Tokio worker pool is not stalled.
+        let coordinator = self.coordinator.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            coordinator
+                .write()
+                .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))
+                .map(|mut c| c.handle_checkpoint_ack(ack))
+        })
+        .await
+        .map_err(|e| tonic::Status::internal(format!("checkpoint_ack task panicked: {e}")))?
+        ?;
         Ok(tonic::Response::new(response))
+    }
+}
+
+/// Management service implementation: routes CLI→coordinator RPCs (GAP-RT-04).
+#[tonic::async_trait]
+impl CoordinatorManagementService for CoordinatorExecutorTonicService {
+    async fn trigger_savepoint(
+        &self,
+        request: tonic::Request<TriggerSavepointRequest>,
+    ) -> Result<tonic::Response<TriggerSavepointResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
+        })?;
+        let label = if req.label.is_empty() { None } else { Some(req.label) };
+        let mut coordinator = self.coordinator.write().map_err(|_| {
+            tonic::Status::internal("coordinator lock poisoned")
+        })?;
+        let epoch = coordinator.savepoint_job(&job_id, label).map_err(|e| {
+            tonic::Status::internal(e.to_string())
+        })?;
+        Ok(tonic::Response::new(TriggerSavepointResponse { epoch }))
+    }
+
+    async fn restore_job(
+        &self,
+        request: tonic::Request<RestoreJobRequest>,
+    ) -> Result<tonic::Response<RestoreJobResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
+        })?;
+        let coordinator = self.coordinator.read().map_err(|_| {
+            tonic::Status::internal("coordinator lock poisoned")
+        })?;
+        match coordinator.restore_job_from_checkpoint(&job_id, req.epoch, &req.storage_path) {
+            Ok(_meta) => Ok(tonic::Response::new(RestoreJobResponse {
+                accepted: true,
+                message: format!("restore plan loaded for job {} epoch {}", req.job_id, req.epoch),
+            })),
+            Err(e) => Ok(tonic::Response::new(RestoreJobResponse {
+                accepted: false,
+                message: e.to_string(),
+            })),
+        }
+    }
+
+    async fn list_checkpoints(
+        &self,
+        request: tonic::Request<ListCheckpointsRequest>,
+    ) -> Result<tonic::Response<ListCheckpointsResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
+        })?;
+        let coordinator = self.coordinator.read().map_err(|_| {
+            tonic::Status::internal("coordinator lock poisoned")
+        })?;
+        let epoch_nums = coordinator.list_job_checkpoints(&job_id).map_err(|e| {
+            tonic::Status::internal(e.to_string())
+        })?;
+        // Enrich each epoch with savepoint metadata if available.
+        let epochs = epoch_nums
+            .into_iter()
+            .map(|epoch| {
+                // Try to read metadata for savepoint labeling; skip on error.
+                let (is_savepoint, savepoint_label) = coordinator
+                    .checkpoint_coordinator(&job_id)
+                    .and_then(|coord| {
+                        let storage = coord.storage.as_ref();
+                        krishiv_checkpoint::read_epoch_metadata(storage, req.job_id.as_str(), epoch)
+                            .ok()
+                            .flatten()
+                            .map(|m| (m.is_savepoint, m.savepoint_label.unwrap_or_default()))
+                    })
+                    .unwrap_or((false, String::new()));
+                CheckpointEpochInfo {
+                    epoch,
+                    is_savepoint,
+                    savepoint_label: if savepoint_label.is_empty() { None } else { Some(savepoint_label) },
+                }
+            })
+            .collect();
+        Ok(tonic::Response::new(ListCheckpointsResponse { epochs }))
+    }
+
+    async fn inspect_state(
+        &self,
+        request: tonic::Request<InspectStateRequest>,
+    ) -> Result<tonic::Response<InspectStateResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
+            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
+        })?;
+        let coordinator = self.coordinator.read().map_err(|_| {
+            tonic::Status::internal("coordinator lock poisoned")
+        })?;
+        // Collect snapshot paths for the requested operator from the checkpoint coordinator.
+        let snapshots = coordinator
+            .checkpoint_coordinator(&job_id)
+            .map(|coord| {
+                coord
+                    .pending_acks
+                    .values()
+                    .filter(|ack| req.operator_id.is_empty() || ack.operator_id == req.operator_id)
+                    .filter_map(|ack| {
+                        ack.snapshot_path.as_ref().map(|path| StateSnapshotInfo {
+                            task_id: ack.task_id.as_str().to_owned(),
+                            snapshot_path: path.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(tonic::Response::new(InspectStateResponse { snapshots }))
     }
 }
 
@@ -729,6 +903,122 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         Ok(tonic::Response::new(wire::checkpoint_ack_response_to_wire(
             response,
         )))
+    }
+}
+
+/// gRPC adapter exposing the coordinator management service (GAP-RT-04).
+///
+/// Converts wire proto types to domain types, then delegates to
+/// `CoordinatorExecutorTonicService::CoordinatorManagementService`.
+#[derive(Debug, Clone)]
+pub struct CoordinatorManagementGrpcService {
+    inner: CoordinatorExecutorTonicService,
+}
+
+impl CoordinatorManagementGrpcService {
+    pub fn new(coordinator: SharedCoordinator) -> Self {
+        Self {
+            inner: CoordinatorExecutorTonicService::new(coordinator),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl wire::v1::coordinator_management_server::CoordinatorManagement
+    for CoordinatorManagementGrpcService
+{
+    async fn trigger_savepoint(
+        &self,
+        request: tonic::Request<wire::v1::TriggerSavepointRequest>,
+    ) -> Result<tonic::Response<wire::v1::TriggerSavepointResponse>, tonic::Status> {
+        let w = request.into_inner();
+        let domain = TriggerSavepointRequest { job_id: w.job_id, label: w.label };
+        let resp = CoordinatorManagementService::trigger_savepoint(
+            &self.inner,
+            tonic::Request::new(domain),
+        )
+        .await?
+        .into_inner();
+        Ok(tonic::Response::new(wire::v1::TriggerSavepointResponse {
+            epoch: resp.epoch,
+            message: String::new(),
+        }))
+    }
+
+    async fn restore_job(
+        &self,
+        request: tonic::Request<wire::v1::RestoreJobRequest>,
+    ) -> Result<tonic::Response<wire::v1::RestoreJobResponse>, tonic::Status> {
+        let w = request.into_inner();
+        let domain = RestoreJobRequest {
+            job_id: w.job_id,
+            epoch: w.epoch,
+            storage_path: w.storage_path,
+        };
+        let resp = CoordinatorManagementService::restore_job(
+            &self.inner,
+            tonic::Request::new(domain),
+        )
+        .await?
+        .into_inner();
+        Ok(tonic::Response::new(wire::v1::RestoreJobResponse {
+            accepted: resp.accepted,
+            message: resp.message,
+        }))
+    }
+
+    async fn list_checkpoints(
+        &self,
+        request: tonic::Request<wire::v1::ListCheckpointsRequest>,
+    ) -> Result<tonic::Response<wire::v1::ListCheckpointsResponse>, tonic::Status> {
+        let w = request.into_inner();
+        let domain = ListCheckpointsRequest { job_id: w.job_id };
+        let resp = CoordinatorManagementService::list_checkpoints(
+            &self.inner,
+            tonic::Request::new(domain),
+        )
+        .await?
+        .into_inner();
+        let epochs = resp
+            .epochs
+            .into_iter()
+            .map(|e| wire::v1::CheckpointEpochInfo {
+                epoch: e.epoch,
+                is_savepoint: e.is_savepoint,
+                savepoint_label: e.savepoint_label.unwrap_or_default(),
+            })
+            .collect();
+        Ok(tonic::Response::new(wire::v1::ListCheckpointsResponse {
+            epochs,
+        }))
+    }
+
+    async fn inspect_state(
+        &self,
+        request: tonic::Request<wire::v1::InspectStateRequest>,
+    ) -> Result<tonic::Response<wire::v1::InspectStateResponse>, tonic::Status> {
+        let w = request.into_inner();
+        let domain = InspectStateRequest {
+            job_id: w.job_id,
+            operator_id: w.operator_id,
+        };
+        let resp = CoordinatorManagementService::inspect_state(
+            &self.inner,
+            tonic::Request::new(domain),
+        )
+        .await?
+        .into_inner();
+        let snapshots = resp
+            .snapshots
+            .into_iter()
+            .map(|s| wire::v1::StateSnapshotInfo {
+                task_id: s.task_id,
+                snapshot_path: s.snapshot_path,
+            })
+            .collect();
+        Ok(tonic::Response::new(wire::v1::InspectStateResponse {
+            snapshots,
+        }))
     }
 }
 
@@ -1217,9 +1507,49 @@ impl Coordinator {
         for job_id in streaming_job_ids {
             self.index_streaming_tasks(&job_id);
         }
-        // Recover checkpoint coordinators from storage.
-        for coord in self.checkpoint_coordinators.values_mut() {
-            let _ = coord.recover_from_storage();
+        // GAP-CP-06: Rebuild checkpoint coordinators from the recovered job specs.
+        // Before this fix, recover_from_store iterated an empty in-memory map
+        // because checkpoint coordinators are only inserted in submit_job.  After
+        // a coordinator restart the map is empty so no checkpointing resumes.
+        self.checkpoint_coordinators.clear();
+        let streaming_checkpoint_jobs: Vec<(JobId, u64, String, usize)> = self
+            .jobs
+            .values()
+            .filter(|j| {
+                j.spec.kind() == JobKind::Streaming
+                    && j.spec.checkpoint_interval_ms().is_some()
+                    && j.spec.checkpoint_storage_path().is_some()
+            })
+            .map(|j| {
+                let task_count: usize = j.spec.stages().iter().map(|s| s.tasks().len()).sum();
+                (
+                    j.job_id().clone(),
+                    j.spec.checkpoint_interval_ms().unwrap(),
+                    j.spec.checkpoint_storage_path().unwrap().to_owned(),
+                    task_count,
+                )
+            })
+            .collect();
+        for (job_id, interval_ms, storage_path, task_count) in streaming_checkpoint_jobs {
+            match Self::open_checkpoint_storage(&storage_path) {
+                Ok(storage) => {
+                    let mut coord = CheckpointCoordinator::new(
+                        job_id.clone(),
+                        Arc::new(storage),
+                        interval_ms,
+                        task_count,
+                    );
+                    let _ = coord.recover_from_storage();
+                    self.checkpoint_coordinators.insert(job_id, coord);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %e,
+                        "cannot restore checkpoint coordinator (storage unavailable); job will checkpoint from scratch"
+                    );
+                }
+            }
         }
         // Start the re-attach grace period.
         self.ticks_since_restart = 0;
@@ -1305,20 +1635,19 @@ impl Coordinator {
         record.apply_assignments(assignments);
         if let Some(store) = &self.store {
             let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = s.save_job(&record) {
-                tracing::warn!(
-                    error = %e,
-                    job_id = %record.job_id(),
-                    "failed to persist job to store"
-                );
-            }
+            // GAP-CP-05: Fail-closed on persist errors — a submission that cannot
+            // be durably recorded must not be accepted, to prevent phantom jobs
+            // surviving coordinator restart.
+            s.save_job(&record).map_err(|e| SchedulerError::Transport {
+                message: format!("failed to persist job {} to metadata store: {e}", record.job_id()),
+            })?;
             if let Err(e) = s.append_event(EventLogEvent::JobSubmitted {
                 job_id: job_id.clone(),
             }) {
                 tracing::warn!(
                     error = %e,
                     job_id = %job_id,
-                    "failed to append JobSubmitted event to store"
+                    "failed to append JobSubmitted event to store (non-fatal)"
                 );
             }
         }
@@ -1326,6 +1655,8 @@ impl Coordinator {
         self.jobs.insert(inserted_job_id.clone(), record);
         // P1.1: Index streaming tasks for O(1) heartbeat lookup.
         self.index_streaming_tasks(&inserted_job_id);
+        // GAP-OB-01: Increment jobs_submitted counter.
+        JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1350,7 +1681,11 @@ impl Coordinator {
             Some(coord) => {
                 let current_epoch = coord.current_epoch();
                 match coord.receive_ack(ack) {
-                    Ok(_) => CheckpointAckResponse::Accepted,
+                    Ok(_) => {
+                        // GAP-OB-01: Count completed checkpoint epochs.
+                        CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        CheckpointAckResponse::Accepted
+                    }
                     Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
                 }
             }
@@ -1412,6 +1747,18 @@ impl Coordinator {
                 message: format!("checkpoint epoch {epoch} failed integrity check: {e}"),
             }
         })?;
+
+        // GAP-CK-01: Validate fencing token against the live coordinator.
+        // Rejects restores from checkpoints that predate the current coordinator
+        // generation, preventing stale-epoch restores after a failover.
+        if let Some(coord) = self.checkpoint_coordinators.get(job_id) {
+            let current_token = coord.fencing_token().as_u64();
+            validate_fencing_token(&meta, current_token).map_err(|e| {
+                SchedulerError::InvalidJob {
+                    message: format!("restore rejected for job {job_id}: {e}"),
+                }
+            })?;
+        }
 
         // Parallelism check: if the job is already tracked, reject mismatched task count.
         if let Ok(detail) = self.job_detail_snapshot(job_id) {
@@ -1537,8 +1884,11 @@ impl Coordinator {
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         self.ensure_active()?;
         let executor_leases = self.executors.assignment_leases();
-        self.find_job_mut(job_id)?
-            .launch_assigned_task_assignments(&executor_leases)
+        let assignments = self.find_job_mut(job_id)?
+            .launch_assigned_task_assignments(&executor_leases)?;
+        // GAP-OB-01: Increment tasks_assigned counter.
+        TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
+        Ok(assignments)
     }
 
     /// Cancel a job and mark non-terminal stages/tasks cancelled.

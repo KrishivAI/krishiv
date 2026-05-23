@@ -40,29 +40,36 @@ impl ExecutorRegistry {
     }
 
     /// Register an executor.
+    ///
+    /// GAP-CP-07: Idempotent re-registration with lease bump.  When an executor
+    /// re-registers (e.g. after a coordinator restart where state is in memory,
+    /// or after a network partition), the lease generation is bumped so all
+    /// in-flight heartbeats with the old generation are rejected.  This prevents
+    /// zombie executors from submitting stale task updates.
     pub fn register(&mut self, descriptor: ExecutorDescriptor) -> SchedulerResult<LeaseGeneration> {
         if let Some(executor) = self
             .executors
-            .iter()
-            .find(|executor| executor.executor_id() == descriptor.executor_id())
-            && (executor.state().can_accept_work() || executor.state() == ExecutorState::Draining)
-        {
-            return Err(SchedulerError::DuplicateExecutor {
-                executor_id: descriptor.executor_id().clone(),
-            });
-        }
-
-        if let Some(executor) = self
-            .executors
             .iter_mut()
-            .find(|executor| executor.executor_id() == descriptor.executor_id())
+            .find(|e| e.executor_id() == descriptor.executor_id())
         {
+            // Idempotent re-registration: bump lease only when the executor was
+            // still in a healthy state.  mark_lost / deregister already bump the
+            // lease, so re-registering from Lost/Removed keeps the current
+            // generation rather than incrementing it a second time.
+            let was_alive = executor.state.can_accept_work()
+                || matches!(executor.state, ExecutorState::Draining);
+            let new_lease = if was_alive {
+                executor.lease_generation.next()
+            } else {
+                executor.lease_generation
+            };
             executor.descriptor = descriptor;
             executor.state = ExecutorState::Registered;
             executor.running_tasks.clear();
             executor.last_heartbeat_tick = self.current_tick;
             executor.health_snapshot = None;
-            return Ok(executor.lease_generation);
+            executor.lease_generation = new_lease;
+            return Ok(new_lease);
         }
 
         let lease_generation = LeaseGeneration::initial();

@@ -1,8 +1,9 @@
-//! Stub gRPC client for remote coordinator dispatch.
+//! gRPC client for remote coordinator management RPCs (GAP-RT-04).
 //!
-//! All async methods use `connect_lazy` so no TCP handshake happens during
-//! tests or CLI startup — the connection is deferred to the first actual RPC.
+//! Uses `connect_lazy` so no TCP handshake happens during tests or CLI startup.
+//! All methods proxy to the generated `CoordinatorManagementClient`.
 
+use krishiv_proto::wire::v1::coordinator_management_client::CoordinatorManagementClient;
 use tonic::transport::Channel;
 
 /// Error type for remote coordinator calls.
@@ -44,12 +45,12 @@ pub struct RemoteStateSnapshot {
     pub snapshot_path: String,
 }
 
-/// gRPC client for a remote coordinator.
+/// gRPC client for a remote coordinator management service.
 ///
 /// Connection is lazy — no TCP is opened until the first RPC is sent.
 pub struct RemoteCoordinatorClient {
     url: String,
-    channel: Option<Channel>,
+    client: Option<CoordinatorManagementClient<Channel>>,
 }
 
 impl RemoteCoordinatorClient {
@@ -57,50 +58,136 @@ impl RemoteCoordinatorClient {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            channel: None,
+            client: None,
         }
     }
 
-    fn channel(&mut self) -> Result<&Channel, RemoteClientError> {
-        if self.channel.is_none() {
+    fn client(&mut self) -> Result<&mut CoordinatorManagementClient<Channel>, RemoteClientError> {
+        if self.client.is_none() {
             let endpoint = self
                 .url
                 .parse::<tonic::transport::Endpoint>()
                 .map_err(|e| RemoteClientError(e.to_string()))?;
-            self.channel = Some(endpoint.connect_lazy());
+            let channel = endpoint.connect_lazy();
+            self.client = Some(CoordinatorManagementClient::new(channel));
         }
-        Ok(self.channel.as_ref().unwrap())
+        Ok(self.client.as_mut().unwrap())
     }
 
     /// Trigger a savepoint for the given job on the remote coordinator.
-    pub async fn trigger_savepoint(&mut self, _job_id: &str) -> Result<(), RemoteClientError> {
-        let _ch = self.channel()?;
+    pub async fn trigger_savepoint(&mut self, job_id: &str) -> Result<(), RemoteClientError> {
+        let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
+            job_id: job_id.to_owned(),
+            label: String::new(),
+        };
+        self.client()?
+            .trigger_savepoint(tonic::Request::new(req))
+            .await
+            .map_err(RemoteClientError::from)?;
         Ok(())
     }
 
+    /// Trigger a named savepoint for the given job on the remote coordinator.
+    pub async fn trigger_savepoint_with_label(
+        &mut self,
+        job_id: &str,
+        label: &str,
+    ) -> Result<u64, RemoteClientError> {
+        let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
+            job_id: job_id.to_owned(),
+            label: label.to_owned(),
+        };
+        let resp = self
+            .client()?
+            .trigger_savepoint(tonic::Request::new(req))
+            .await
+            .map_err(RemoteClientError::from)?;
+        Ok(resp.into_inner().epoch)
+    }
+
     /// Request a restore from a specific checkpoint epoch on the remote coordinator.
-    pub async fn restore(&mut self, _job_id: &str, _epoch: u64) -> Result<(), RemoteClientError> {
-        let _ch = self.channel()?;
+    pub async fn restore(
+        &mut self,
+        job_id: &str,
+        epoch: u64,
+        storage_path: &str,
+    ) -> Result<(), RemoteClientError> {
+        let req = krishiv_proto::wire::v1::RestoreJobRequest {
+            job_id: job_id.to_owned(),
+            epoch,
+            storage_path: storage_path.to_owned(),
+        };
+        let resp = self
+            .client()?
+            .restore_job(tonic::Request::new(req))
+            .await
+            .map_err(RemoteClientError::from)?;
+        let inner = resp.into_inner();
+        if !inner.accepted {
+            return Err(RemoteClientError(inner.message));
+        }
         Ok(())
     }
 
     /// List checkpoint epochs for a job on the remote coordinator.
     pub async fn list_checkpoints(
         &mut self,
-        _job_id: &str,
+        job_id: &str,
     ) -> Result<Vec<RemoteCheckpointEpoch>, RemoteClientError> {
-        let _ch = self.channel()?;
-        Ok(Vec::new())
+        let req = krishiv_proto::wire::v1::ListCheckpointsRequest {
+            job_id: job_id.to_owned(),
+        };
+        let resp = self
+            .client()?
+            .list_checkpoints(tonic::Request::new(req))
+            .await
+            .map_err(RemoteClientError::from)?;
+        let epochs = resp
+            .into_inner()
+            .epochs
+            .into_iter()
+            .map(|e| RemoteCheckpointEpoch {
+                epoch: e.epoch,
+                kind: if e.is_savepoint {
+                    "savepoint".to_owned()
+                } else {
+                    "checkpoint".to_owned()
+                },
+                label: if e.savepoint_label.is_empty() {
+                    None
+                } else {
+                    Some(e.savepoint_label)
+                },
+            })
+            .collect();
+        Ok(epochs)
     }
 
     /// Inspect operator state snapshots for a job on the remote coordinator.
     pub async fn inspect_state(
         &mut self,
-        _job_id: &str,
-        _operator_id: &str,
+        job_id: &str,
+        operator_id: &str,
     ) -> Result<Vec<RemoteStateSnapshot>, RemoteClientError> {
-        let _ch = self.channel()?;
-        Ok(Vec::new())
+        let req = krishiv_proto::wire::v1::InspectStateRequest {
+            job_id: job_id.to_owned(),
+            operator_id: operator_id.to_owned(),
+        };
+        let resp = self
+            .client()?
+            .inspect_state(tonic::Request::new(req))
+            .await
+            .map_err(RemoteClientError::from)?;
+        let snapshots = resp
+            .into_inner()
+            .snapshots
+            .into_iter()
+            .map(|s| RemoteStateSnapshot {
+                task_id: s.task_id,
+                snapshot_path: s.snapshot_path,
+            })
+            .collect();
+        Ok(snapshots)
     }
 }
 
@@ -112,7 +199,7 @@ mod tests {
     fn remote_client_new_stores_url() {
         let client = RemoteCoordinatorClient::new("http://coord:7070");
         assert_eq!(client.url, "http://coord:7070");
-        assert!(client.channel.is_none(), "channel must be lazy");
+        assert!(client.client.is_none(), "channel must be lazy");
     }
 
     #[test]
@@ -121,31 +208,10 @@ mod tests {
         assert!(e.to_string().contains("connection refused"));
     }
 
-    #[tokio::test]
-    async fn trigger_savepoint_stub_returns_ok() {
-        let mut client = RemoteCoordinatorClient::new("http://localhost:9999");
-        let result = client.trigger_savepoint("job-1").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn list_checkpoints_stub_returns_empty() {
-        let mut client = RemoteCoordinatorClient::new("http://localhost:9999");
-        let result = client.list_checkpoints("job-1").await;
-        assert_eq!(result.unwrap(), Vec::new());
-    }
-
-    #[tokio::test]
-    async fn inspect_state_stub_returns_empty() {
-        let mut client = RemoteCoordinatorClient::new("http://localhost:9999");
-        let result = client.inspect_state("job-1", "op-1").await;
-        assert_eq!(result.unwrap(), Vec::new());
-    }
-
-    #[tokio::test]
-    async fn restore_stub_returns_ok() {
-        let mut client = RemoteCoordinatorClient::new("http://localhost:9999");
-        let result = client.restore("job-1", 42).await;
-        assert!(result.is_ok());
+    #[test]
+    fn remote_client_error_from_status() {
+        let status = tonic::Status::not_found("job not found");
+        let e = RemoteClientError::from(status);
+        assert!(e.to_string().contains("not_found") || e.to_string().contains("job not found"));
     }
 }
