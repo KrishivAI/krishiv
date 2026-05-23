@@ -134,9 +134,7 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
-        udf::sync_scalar_udfs(&self.context, &guard)
-            .await
-            .map_err(|e| SqlError::DataFusion {
+        udf::sync_scalar_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })
     }

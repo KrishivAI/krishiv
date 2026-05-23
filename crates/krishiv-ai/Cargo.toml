@@ -1,0 +1,35 @@
+[package]
+name = "krishiv-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# CI uses `--no-default-features`; enable `fastembed-local` for HuggingFace + rag_index tests (needs C++ / libstdc++ for ONNX).
+default = []
+fastembed-local = ["dep:fastembed"]
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+fastembed = { workspace = true, optional = true }
+hex = { workspace = true }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-vector-sinks = { path = "../krishiv-vector-sinks" }
+redb = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+mockito = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

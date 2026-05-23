@@ -89,8 +89,6 @@ pub enum ExecError {
     UnexpectedBatchSchema,
     /// A window operator was constructed with an invalid configuration.
     InvalidWindowConfig(String),
-    IncompatibleSchemaEvolution(String),
-    SchemaEvolutionTimeout,
 }
 
 impl fmt::Display for ExecError {
@@ -101,10 +99,6 @@ impl fmt::Display for ExecError {
             Self::UnsupportedType(msg) => write!(f, "unsupported type: {msg}"),
             Self::UnexpectedBatchSchema => write!(f, "unexpected record batch schema"),
             Self::InvalidWindowConfig(msg) => write!(f, "invalid window config: {msg}"),
-            Self::IncompatibleSchemaEvolution(msg) => {
-                write!(f, "incompatible schema evolution: {msg}")
-            }
-            Self::SchemaEvolutionTimeout => write!(f, "schema evolution timeout"),
         }
     }
 }
@@ -131,15 +125,9 @@ pub mod aggregate;
 pub mod window;
 pub mod queue;
 pub mod adaptive;
-pub mod barrier_align;
-pub mod side_output;
-pub mod temporal_join;
-pub mod interval_join;
-pub mod cep;
-pub mod watermark_e2e;
-pub mod schema_normalize;
-pub mod memo;
-pub mod live_table;
+pub mod chunk;
+
+pub use chunk::ChunkOperator;
 
 // ── Re-exports for backwards-compatible crate-level API ───────────────────────
 
@@ -151,9 +139,6 @@ pub use window::{WatermarkState, MultiSourceWatermarkState,
     SessionWindowSpec, SessionWindowOperator};
 pub use queue::{OperatorMessage, OperatorQueueMetrics, OperatorQueueSender,
     OperatorQueueReceiver, OperatorQueueError, operator_queue};
-pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
-pub use memo::MemoCache;
-pub use live_table::{ChangeFeed, CreateLiveTableExec, RefreshLiveTableExec};
 pub use adaptive::{HotKeyReport, HeavyHittersTracker, ThrottleCommand, RateLimiter,
     SinkLatencyTracker, AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig};
 // ── Tests ─────────────────────────────────────────────────────────────────────

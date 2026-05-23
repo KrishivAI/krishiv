@@ -9,10 +9,8 @@ use datafusion::logical_expr::ColumnarValue;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{create_udf, Volatility};
 
-use krishiv_udf::ScalarUdf;
-
 /// Register every scalar UDF in `registry` with the DataFusion session context.
-pub async fn sync_scalar_udfs(
+pub fn sync_scalar_udfs(
     ctx: &datafusion::prelude::SessionContext,
     registry: &krishiv_udf::UdfRegistry,
 ) -> Result<(), DataFusionError> {

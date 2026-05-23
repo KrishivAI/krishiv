@@ -1,4 +1,5 @@
 /target/
+**/.fastembed_cache/
 /.DS_Store
 /.claude/worktrees/
 **/krishiv*.so

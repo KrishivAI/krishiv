@@ -8,9 +8,9 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 axum = { workspace = true }
-krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-ai = { path = "../krishiv-ai" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
@@ -20,7 +20,6 @@ object_store = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "signal"] }
 tokio-stream.workspace = true
-futures = { workspace = true }
 tonic.workspace = true
 
 [dev-dependencies]

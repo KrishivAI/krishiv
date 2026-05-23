@@ -8,6 +8,12 @@
 
 use std::fmt;
 
+pub mod r17;
+pub use r17::{
+    ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
+    RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
+};
+
 /// Data type for a plan schema field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldType {
@@ -120,12 +126,6 @@ pub enum NodeOp {
         /// Number of output partitions after coalescing.
         target_partitions: usize,
     },
-    /// CREATE LIVE TABLE (R14).
-    CreateLiveTable { name: String, query: String },
-    /// REFRESH LIVE TABLE (R14).
-    RefreshLiveTable { name: String },
-    /// DROP LIVE TABLE (R14).
-    DropLiveTable { name: String },
     /// Operator not covered by the above variants.
     Other { description: String },
 }

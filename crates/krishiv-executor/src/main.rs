@@ -185,6 +185,9 @@ async fn heartbeat_loop(
                     .heartbeat_with_grpc_endpoint()
                     .await
                     .map_err(|error| error.to_string())?;
+                krishiv_executor::transport::ExecutorRuntime::apply_llm_throttles_from_response(
+                    &heartbeat,
+                );
                 println!(
                     "heartbeat response version={} lease_generation={} disposition={} message={}",
                     heartbeat.version(),

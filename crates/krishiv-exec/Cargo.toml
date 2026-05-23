@@ -7,8 +7,7 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-krishiv-cep = { path = "../krishiv-cep" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
+krishiv-ai = { path = "../krishiv-ai" }
 krishiv-plan = { path = "../krishiv-plan" }
 tokio = { workspace = true, features = ["sync", "time"] }
 

@@ -202,6 +202,25 @@ impl ExecutorRuntime {
         )
     }
 
+    /// Build a heartbeat including LLM quota reports (R17).
+    pub fn heartbeat_request_with_llm_quota(
+        &self,
+        reports: Vec<krishiv_proto::LlmQuotaReport>,
+    ) -> ExecutorHeartbeatRequest {
+        self.heartbeat_request().with_llm_quota_reports(reports)
+    }
+
+    /// Apply LLM throttle commands from a heartbeat response (R17).
+    pub fn apply_llm_throttles_from_response(response: &ExecutorHeartbeatResponse) {
+        for cmd in response.llm_throttles() {
+            crate::llm_throttle::apply_llm_throttle(
+                &cmd.model,
+                cmd.max_requests_per_minute,
+                cmd.max_tokens_per_minute,
+            );
+        }
+    }
+
     /// Send a heartbeat through a tonic-shaped coordinator service.
     pub async fn heartbeat_with<S>(
         &self,
