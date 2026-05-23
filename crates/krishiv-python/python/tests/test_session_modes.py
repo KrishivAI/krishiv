@@ -1,40 +1,42 @@
-"""R13 deployment-mode factory smoke tests (no maturin required for import check)."""
+"""R13 deployment-mode factory smoke tests."""
 
 import os
 
+import pytest
+
+import krishiv as ks
+
 
 def test_embedded_mode():
-    import krishiv as ks
-
     session = ks.Session.embedded()
     assert session.mode == "embedded"
 
 
 def test_local_mode():
-    import krishiv as ks
-
     session = ks.Session.local()
     assert session.mode == "local"
 
 
 def test_connect_mode():
-    import krishiv as ks
-
     session = ks.Session.connect("http://localhost:50051")
     assert session.mode == "distributed"
 
 
-def test_from_env_without_coordinator():
-    import krishiv as ks
-
-    os.environ.pop("KRISHIV_COORDINATOR", None)
+def test_from_env_without_coordinator(monkeypatch):
+    monkeypatch.delenv("KRISHIV_COORDINATOR", raising=False)
+    monkeypatch.delenv("KRISHIV_COORDINATOR_URL", raising=False)
+    monkeypatch.delenv("KRISHIV_MODE", raising=False)
     session = ks.Session.from_env()
-    assert session.mode in ("embedded", "local")
+    assert session.mode == "local"
 
 
 def test_from_env_with_coordinator(monkeypatch):
-    import krishiv as ks
-
     monkeypatch.setenv("KRISHIV_COORDINATOR", "http://coordinator:50051")
     session = ks.Session.from_env()
     assert session.mode == "distributed"
+
+
+def test_embedded_stream_raises_mode_error():
+    session = ks.Session.embedded()
+    with pytest.raises(ks.ModeError):
+        session.stream("events", "ts", 1000)

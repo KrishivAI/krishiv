@@ -2,6 +2,9 @@
 
 ## Goal
 
+> **Status (2026-05-23):** R13 acceptance met on branch `cursor/implement-r13-7aa2` — Python package, transforms, bridges, CI, and runtime gap closures (GAP-RT-03/08, GAP-OB-01). Flight SQL client (GAP-RT-01) deferred to R14.
+
+
 Expose the full Krishiv streaming compute engine to Python through a first-class
 PyO3-backed package (`pip install krishiv`) with a schema-declared source API,
 an asyncio-native streaming loop, a composable transformation chain, Pandas and

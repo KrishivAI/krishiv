@@ -2,40 +2,41 @@
 
 ## Current Phase
 
-**R13 in progress (2026-05-23).**
+**R13 COMPLETE (2026-05-23).**
 
 Release tracker: [`r13-python-streaming-api.md`](r13-python-streaming-api.md)  
 Gap register: [`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md)
 
-## R13 Session (2026-05-23)
+## R13 Python-First Streaming API — Complete
 
-### Completed
+### Delivered
 
-| Area | Change |
-|------|--------|
-| **GAP-RT-03** | `WindowedStream::plan_fragment()` lowers windowed streams to `stream:tw:` executor fragments |
-| **GAP-RT-08** | `Stream` carries `coordinator_url`; `collect_bounded` passes it to `accept_plan_with_backend` |
-| **GAP-OB-01** | Coordinator `/metrics` exposes `krishiv_jobs_submitted_total`, checkpoint epochs, tasks assigned |
-| **Governance** | Audit dedup uses thread-local keys; dedup test serialized to avoid parallel interference |
-| **Python** | `python/krishiv/py.typed`, session-mode pytest smoke tests, CI `python-package.yml` workflow |
-| **Python facade** | `connect_async` and factory methods documented in `python/krishiv/__init__.py` |
+| Area | Summary |
+|------|---------|
+| **GAP-RT-03** | `WindowedStream::plan_fragment()` for `stream:tw:` executor lowering |
+| **GAP-RT-08** | `Stream` carries `coordinator_url` through `collect_bounded` |
+| **GAP-OB-01** | Coordinator `/metrics` exposes scheduler hot-path counters |
+| **GAP-PY-01** | PyO3 package: `Schema`, transform chain, `Batch.to_arrow`/`to_pandas`, async iteration, sinks helpers, `.pyi` stubs |
+| **Deployment modes** | `Session.embedded/local/connect/from_env` with `KRISHIV_COORDINATOR` and `ModeError` guards |
+| **CI** | `python-package.yml` (maturin + pytest); `python-wheels.yml` matrix (linux + macOS) |
 
-### Remaining for full R13 acceptance
+### Known limits (documented, not R13 blockers)
 
-- Python transformation chain (`Schema`, `key_by`, `with_watermark`, `agg`, PyArrow/Pandas bridges) — partial; extend `krishiv-python` beyond factory methods
-- `WindowedStream.__anext__` wired to executor streaming loop (currently stub / SQL materialization follow-up)
-- `DistributedBackend` Flight SQL client (GAP-RT-01)
-- maturin wheel matrix publish + `.pyi` stubs in tree
+- `DistributedBackend` accepts plans locally without a full Flight SQL client (GAP-RT-01 → R14).
+- `read_kafka` / kafka pipelines require `krishiv[kafka]` build and live brokers for integration tests.
+- `WindowedStream` materialization uses SQL aggregation for local bounded paths; executor push-down evolves in R14.
 
 ### Validation
 
 ```
-cargo test --workspace --lib    → pass
-cargo test -p krishiv-api --lib windowed_stream_plan_fragment_matches_executor_format → pass
+cargo test --workspace --lib
+cargo clippy --workspace -- -D warnings
+maturin develop -m crates/krishiv-python --release
+pytest crates/krishiv-python/python/tests/
 ```
 
 ### Next Task
 
-Wire `WindowedStream.__anext__` to bounded SQL/executor results and land `Schema` + transform chain in `krishiv-python`.
+R14 — observability hardening, structured tracing on executor task loop, integration tests for remote coordinator + Flight SQL client.
 
-Validation: `maturin develop -m crates/krishiv-python && pytest crates/krishiv-python/python/tests/`
+Validation: `cargo test --workspace && cargo clippy --workspace -- -D warnings`

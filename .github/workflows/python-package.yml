@@ -2,7 +2,7 @@ name: Python package
 
 on:
   push:
-    branches: [main]
+    branches: [main, "cursor/**"]
     paths:
       - "crates/krishiv-python/**"
       - ".github/workflows/python-package.yml"
@@ -20,8 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install maturin
-        run: pip install "maturin>=1.7,<2.0" pytest
+      - name: Install Python deps
+        run: pip install "maturin>=1.7,<2.0" pytest pytest-asyncio pyarrow pandas
       - name: Build and install krishiv-python
         working-directory: crates/krishiv-python
         run: maturin develop --release
