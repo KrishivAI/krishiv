@@ -1,11 +1,9 @@
 //! `@ks.transform(memo=True)` support (R14 S2).
 
-use std::sync::{Arc, Mutex};
-
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::MemoCache;
+use krishiv_exec::memo::MemoCache;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;

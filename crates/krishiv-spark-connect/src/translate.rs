@@ -176,6 +176,48 @@ fn sort_order_to_sql(so: &expression::SortOrder) -> Result<String, SparkTranslat
     Ok(format!("{child} {dir}"))
 }
 
+fn cast_target_to_sql(cast: &expression::Cast) -> &'static str {
+    use krishiv_proto::spark_connect::connect::types::data_type::Kind;
+    if let Some(expression::cast::CastToType::Type(dt)) = &cast.cast_to_type {
+        if let Some(kind) = &dt.kind {
+            return match kind {
+                Kind::Integer(_) => "INT",
+                Kind::Long(_) => "BIGINT",
+                Kind::Float(_) | Kind::Double(_) => "DOUBLE",
+                Kind::Short(_) => "SMALLINT",
+                Kind::Byte(_) => "TINYINT",
+                Kind::Boolean(_) => "BOOLEAN",
+                Kind::String(_) | Kind::Char(_) | Kind::VarChar(_) => "VARCHAR",
+                Kind::Date(_) => "DATE",
+                Kind::Timestamp(_) | Kind::TimestampNtz(_) => "TIMESTAMP",
+                Kind::Decimal(_) => "DECIMAL",
+                Kind::Binary(_) => "VARBINARY",
+                _ => "VARCHAR",
+            };
+        }
+    }
+    if let Some(expression::cast::CastToType::TypeStr(s)) = &cast.cast_to_type {
+        let upper = s.to_uppercase();
+        if !upper.is_empty() {
+            return match upper.as_str() {
+                "INT" | "INTEGER" => "INT",
+                "BIGINT" | "LONG" => "BIGINT",
+                "DOUBLE" | "FLOAT" => "DOUBLE",
+                "TIMESTAMP" => "TIMESTAMP",
+                "DATE" => "DATE",
+                "BOOLEAN" => "BOOLEAN",
+                other => {
+                    if other.starts_with("DECIMAL") {
+                        return "DECIMAL";
+                    }
+                    "VARCHAR"
+                }
+            };
+        }
+    }
+    "VARCHAR"
+}
+
 fn expr_to_sql(expr: &Expression) -> Result<String, SparkTranslateError> {
     use krishiv_proto::spark_connect::connect::expression;
     match expr.expr_type.as_ref() {
@@ -189,7 +231,8 @@ fn expr_to_sql(expr: &Expression) -> Result<String, SparkTranslateError> {
         }
         Some(expression::ExprType::Cast(c)) => {
             let inner = expr_to_sql(c.expr.as_ref().ok_or(missing("cast.expr"))?)?;
-            Ok(format!("CAST({inner} AS STRING)"))
+            let sql_type = cast_target_to_sql(c);
+            Ok(format!("CAST({inner} AS {sql_type})"))
         }
         Some(expression::ExprType::UnresolvedFunction(f)) => {
             let args: Vec<_> = f

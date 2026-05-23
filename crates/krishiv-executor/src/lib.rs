@@ -201,6 +201,7 @@ impl ExecutorAssignmentInbox {
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod runner;
 pub mod barrier;
+pub mod barrier_transport;
 pub mod grpc;
 pub mod transport;
 pub mod llm_throttle;
@@ -460,6 +461,16 @@ mod tests {
         assert_eq!(heartbeat.state(), ExecutorState::Healthy);
         assert_eq!(heartbeat.lease_generation(), LeaseGeneration::initial());
         assert!(heartbeat.running_attempts().is_empty());
+    }
+
+    #[test]
+    fn lease_generation_updated_after_reregister() {
+        let mut runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-1", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let next = LeaseGeneration::initial().next();
+        runtime.apply_lease_generation(next);
+        assert_eq!(runtime.config().lease_generation(), next);
     }
 
     #[tokio::test]
@@ -2489,6 +2500,125 @@ mod tests {
             runner.last_acked_epoch, 5,
             "last_acked_epoch must not change on stale rejection"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_delivered() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingCoordinator {
+            acks: Arc<Mutex<Vec<CheckpointAckRequest>>>,
+        }
+
+        #[tonic::async_trait]
+        impl CoordinatorExecutorService for RecordingCoordinator {
+            async fn register_executor(
+                &self,
+                request: tonic::Request<RegisterExecutorRequest>,
+            ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+                let request = request.into_inner();
+                Ok(tonic::Response::new(RegisterExecutorResponse::new(
+                    request.descriptor().executor_id().clone(),
+                    LeaseGeneration::initial(),
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn deregister_executor(
+                &self,
+                _request: tonic::Request<DeregisterExecutorRequest>,
+            ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not needed"))
+            }
+
+            async fn executor_heartbeat(
+                &self,
+                request: tonic::Request<ExecutorHeartbeatRequest>,
+            ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+                Ok(tonic::Response::new(ExecutorHeartbeatResponse::new(
+                    request.into_inner().lease_generation(),
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn task_status(
+                &self,
+                _request: tonic::Request<TaskStatusRequest>,
+            ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+                Ok(tonic::Response::new(TaskStatusResponse::new(
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn checkpoint_ack(
+                &self,
+                request: tonic::Request<CheckpointAckRequest>,
+            ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+                self.acks.lock().unwrap().push(request.into_inner());
+                Ok(tonic::Response::new(CheckpointAckResponse::Accepted))
+            }
+        }
+
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let backend = InMemoryStateBackend::new();
+        let coordinator = RecordingCoordinator::default();
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-ack").unwrap(),
+                StageId::try_new("stage-ack").unwrap(),
+                TaskId::try_new("task-ack").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-ack").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        );
+        let req = InitiateCheckpointRequest {
+            job_id: JobId::try_new("job-ack").unwrap(),
+            epoch: 3,
+            fencing_token: FencingToken::initial(),
+        };
+
+        let response = runner
+            .initiate_checkpoint_and_deliver_ack(
+                &assignment,
+                req,
+                &backend,
+                &storage,
+                &coordinator,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, CheckpointAckResponse::Accepted);
+        let acks = coordinator.acks.lock().unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].epoch, 3);
+        assert_eq!(acks[0].task_id.as_str(), "task-ack");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_includes_running_attempts() {
+        use krishiv_proto::StageId;
+
+        let runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-hb", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let attempt = TaskAttemptRef::new(
+            JobId::try_new("job-hb").unwrap(),
+            StageId::try_new("stage-hb").unwrap(),
+            TaskId::try_new("task-hb").unwrap(),
+            AttemptId::initial(),
+        );
+        runtime
+            .running_attempts()
+            .insert(attempt.task_id().as_str().to_string(), attempt.clone());
+
+        let heartbeat = runtime.heartbeat_request();
+        assert_eq!(heartbeat.running_attempts().len(), 1);
+        assert_eq!(heartbeat.running_attempts()[0].task_id().as_str(), "task-hb");
     }
 
     // ── R4a typed shuffle write / read ────────────────────────────────────────

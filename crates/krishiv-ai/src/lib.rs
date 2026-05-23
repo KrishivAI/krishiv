@@ -21,7 +21,7 @@ pub use embed::{
 pub use llm::{
     LlmError, LlmRateLimiter, LlmResponse, LlmUdf, LlmUdfConfig, OpenAiLlmUdf, RateLimitConfig,
 };
-pub use memo::{MemoEntry, MemoStore};
+pub use memo::{memo_key, MemoEntry, MemoStore};
 pub use rag::{RagIndexPipeline, RagIndexResult, RagQuery, RefreshPolicy};
 
 #[cfg(feature = "fastembed-local")]

@@ -8,6 +8,9 @@ license.workspace = true
 name = "krishiv_chaos"
 path = "src/lib.rs"
 
+[dependencies]
+tokio = { workspace = true, features = ["time"] }
+
 [dev-dependencies]
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }

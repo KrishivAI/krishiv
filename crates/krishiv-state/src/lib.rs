@@ -60,6 +60,10 @@ pub enum StateError {
     ClockError {
         message: String,
     },
+    /// An internal lock was poisoned after a panicking thread.
+    LockPoisoned {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for StateError {
@@ -82,6 +86,9 @@ impl std::fmt::Display for StateError {
             }
             Self::ClockError { message } => {
                 write!(f, "clock error: {message}")
+            }
+            Self::LockPoisoned { message } => {
+                write!(f, "state lock poisoned: {message}")
             }
         }
     }
@@ -194,6 +201,14 @@ pub trait StateBackend: Send + Sync {
     /// Schema version stored in this backend (R16 S4.3).
     fn schema_version(&self) -> u32 {
         1
+    }
+
+    /// Physically delete obsolete keys in `namespace`.
+    ///
+    /// TTL-aware backends override this to purge expired entries.
+    fn compact(&mut self, namespace: &Namespace) -> StateResult<usize> {
+        let _ = namespace;
+        Ok(0)
     }
 }
 
@@ -452,7 +467,54 @@ impl RedbStateBackend {
     ///
     /// The database is created if it does not yet exist.  Suitable for
     /// production use; state persists across executor restarts.
+    ///
+    /// If the on-disk file is corrupt, redb auto-repair is attempted first.
+    /// When repair fails the corrupt file is renamed to
+    /// `{path}.corrupt.{timestamp}` and a fresh database is created.
     pub fn open(path: impl AsRef<std::path::Path>) -> StateResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        match Database::create(&path) {
+            Ok(db) => {
+                let this = Self { db };
+                this.ensure_table()?;
+                Ok(this)
+            }
+            Err(open_err) => {
+                if !path.exists() {
+                    return Err(db_err(open_err));
+                }
+                if let Ok(db) = Database::builder().open(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "opened redb database after create failure (auto-repair)"
+                    );
+                    let this = Self { db };
+                    this.ensure_table()?;
+                    return Ok(this);
+                }
+                Self::rename_corrupt_and_recreate(&path, &open_err)
+            }
+        }
+    }
+
+    fn rename_corrupt_and_recreate(
+        path: &std::path::Path,
+        open_err: &impl std::fmt::Display,
+    ) -> StateResult<Self> {
+        let ts = unix_now_ms() as u64;
+        let corrupt_path = std::path::PathBuf::from(format!("{}.corrupt.{ts}", path.display()));
+        std::fs::rename(path, &corrupt_path).map_err(|e| StateError::BackendUnavailable {
+            message: format!(
+                "failed to rename corrupt redb database '{}': {e}",
+                path.display()
+            ),
+        })?;
+        tracing::error!(
+            path = %path.display(),
+            corrupt_path = %corrupt_path.display(),
+            error = %open_err,
+            "redb database corrupt; renamed and creating fresh store"
+        );
         let db = Database::create(path).map_err(db_err)?;
         let this = Self { db };
         this.ensure_table()?;
@@ -913,9 +975,12 @@ pub trait ProcessingTimeTimerService: Send + Sync {
 // ── InMemoryProcessingTimeTimerService ────────────────────────────────────────
 
 /// In-memory processing-time timer service for R5.2.
+///
+/// Uses a secondary identity index for O(1) cancel by `(namespace, key)` (P3-7).
 #[derive(Debug, Default)]
 pub struct InMemoryProcessingTimeTimerService {
     timers: BTreeMap<ProcessingTimeTimerKey, ()>,
+    identity_index: HashMap<(Namespace, Vec<u8>), i64>,
 }
 
 impl InMemoryProcessingTimeTimerService {
@@ -927,6 +992,16 @@ impl InMemoryProcessingTimeTimerService {
 
 impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
     fn register_processing_time_timer(&mut self, timer: ProcessingTimeTimerKey) -> StateResult<()> {
+        let identity = (timer.namespace.clone(), timer.key.clone());
+        if let Some(old_fire_at) = self.identity_index.get(&identity).copied() {
+            let old_key = ProcessingTimeTimerKey {
+                fire_at_ms: old_fire_at,
+                namespace: timer.namespace.clone(),
+                key: timer.key.clone(),
+            };
+            self.timers.remove(&old_key);
+        }
+        self.identity_index.insert(identity, timer.fire_at_ms);
         self.timers.insert(timer, ());
         Ok(())
     }
@@ -936,8 +1011,15 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
         namespace: &Namespace,
         key: &[u8],
     ) -> StateResult<()> {
-        self.timers
-            .retain(|t, _| !(t.namespace == *namespace && t.key == key));
+        let identity = (namespace.clone(), key.to_vec());
+        if let Some(fire_at_ms) = self.identity_index.remove(&identity) {
+            let timer_key = ProcessingTimeTimerKey {
+                fire_at_ms,
+                namespace: namespace.clone(),
+                key: key.to_vec(),
+            };
+            self.timers.remove(&timer_key);
+        }
         Ok(())
     }
 
@@ -948,9 +1030,12 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
             key: vec![],
         };
         let pending = self.timers.split_off(&sentinel);
-        std::mem::replace(&mut self.timers, pending)
-            .into_keys()
-            .collect()
+        let fired = std::mem::replace(&mut self.timers, pending).into_keys().collect::<Vec<_>>();
+        for timer in &fired {
+            self.identity_index
+                .remove(&(timer.namespace.clone(), timer.key.clone()));
+        }
+        fired
     }
 
     fn pending_count(&self) -> usize {
@@ -995,6 +1080,47 @@ impl<B: StateBackend> TtlStateBackend<B> {
     /// Access the underlying backend.
     pub fn inner(&self) -> &B {
         &self.inner
+    }
+
+    /// Access the underlying backend mutably.
+    pub fn inner_mut(&mut self) -> &mut B {
+        &mut self.inner
+    }
+
+    /// Compact all namespaces, deleting every expired entry.
+    pub fn compact_all(&mut self) -> StateResult<usize> {
+        let namespaces = self.inner.list_namespaces()?;
+        let mut removed = 0usize;
+        for namespace in namespaces {
+            removed += self.compact(&namespace)?;
+        }
+        Ok(removed)
+    }
+
+    fn is_entry_expired(encoded: &[u8], now_ms: i64) -> bool {
+        if encoded.len() < 8 {
+            return false;
+        }
+        let Ok(prefix): Result<[u8; 8], _> = encoded[..8].try_into() else {
+            return false;
+        };
+        now_ms >= i64::from_le_bytes(prefix)
+    }
+
+    fn is_expired(&self, namespace: &Namespace, key: &[u8], now_ms: i64) -> StateResult<bool> {
+        match self.inner.get(namespace, key)? {
+            None => Ok(true),
+            Some(encoded) => Ok(Self::is_entry_expired(&encoded, now_ms)),
+        }
+    }
+
+    fn namespace_has_live_keys(&self, namespace: &Namespace, now_ms: i64) -> StateResult<bool> {
+        for key in self.inner.list_keys(namespace)? {
+            if !self.is_expired(namespace, &key, now_ms)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn encode(value: Vec<u8>, expires_at_ms: i64) -> Vec<u8> {
@@ -1049,11 +1175,40 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     }
 
     fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
-        self.inner.list_namespaces()
+        let now = unix_now_ms();
+        let mut namespaces = Vec::new();
+        for namespace in self.inner.list_namespaces()? {
+            if self.namespace_has_live_keys(&namespace, now)? {
+                namespaces.push(namespace);
+            }
+        }
+        Ok(namespaces)
     }
 
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
-        self.inner.list_keys(namespace)
+        let now = unix_now_ms();
+        let mut keys = Vec::new();
+        for key in self.inner.list_keys(namespace)? {
+            if !self.is_expired(namespace, &key, now)? {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
+    fn compact(&mut self, namespace: &Namespace) -> StateResult<usize> {
+        let now = unix_now_ms();
+        let keys = self.inner.list_keys(namespace)?;
+        let mut removed = 0usize;
+        for key in keys {
+            if let Some(encoded) = self.inner.get(namespace, &key)? {
+                if Self::is_entry_expired(&encoded, now) {
+                    self.inner.delete(namespace, &key)?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Snapshot state with TTL prefix stripped from values.
@@ -1453,6 +1608,98 @@ mod tests {
         ttl.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
         ttl.delete(&n, b"k").unwrap();
         assert!(ttl.get(&n, b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_keys_excludes_expired() {
+        let mut inner = InMemoryStateBackend::new();
+        let n = ns("op1", "session");
+        let mut expired = 1i64.to_le_bytes().to_vec();
+        expired.extend_from_slice(b"stale");
+        inner.put(&n, b"expired".to_vec(), expired).unwrap();
+
+        let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+        ttl.put(&n, b"live".to_vec(), b"fresh".to_vec()).unwrap();
+
+        let mut keys = ttl.list_keys(&n).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec![b"live".to_vec()]);
+        assert_eq!(ttl.list_namespaces().unwrap(), vec![n]);
+    }
+
+    #[test]
+    fn ttl_compact_removes_expired_keys_and_shrinks_redb_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ttl-state.redb");
+        let mut inner = RedbStateBackend::open(&path).expect("open redb");
+        let n = ns("op1", "session");
+
+        for i in 0..1000u32 {
+            let mut encoded = 1i64.to_le_bytes().to_vec();
+            encoded.extend_from_slice(format!("expired-{i}").as_bytes());
+            inner
+                .put(&n, format!("expired-{i}").into_bytes(), encoded)
+                .unwrap();
+        }
+        let size_before = std::fs::metadata(&path).expect("metadata").len();
+        drop(inner);
+
+        let mut ttl = TtlStateBackend::new(
+            RedbStateBackend::open(&path).expect("reopen redb"),
+            TtlConfig::new(60_000),
+        );
+        assert_eq!(ttl.list_keys(&n).unwrap().len(), 0);
+        let removed = ttl.compact(&n).expect("compact");
+        assert_eq!(removed, 1000);
+        assert!(ttl.list_keys(&n).unwrap().is_empty());
+        drop(ttl);
+
+        let size_after = std::fs::metadata(&path).expect("metadata").len();
+        assert!(
+            size_after < size_before,
+            "compact should physically delete expired keys (before={size_before}, after={size_after})"
+        );
+    }
+
+    #[test]
+    fn redb_open_recovers_from_truncated_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.redb");
+        {
+            let mut backend = RedbStateBackend::open(&path).expect("initial open");
+            let n = ns("op1", "window");
+            backend.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for truncate");
+        file.set_len(64).expect("truncate");
+        drop(file);
+
+        let backend = RedbStateBackend::open(&path).expect("open after corruption");
+        let n = ns("op1", "window");
+        assert!(backend.get(&n, b"k").unwrap().is_none());
+
+        let corrupt_files: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("state.redb.corrupt."))
+            })
+            .collect();
+        assert_eq!(corrupt_files.len(), 1, "corrupt file should be renamed");
+        assert!(
+            corrupt_files[0]
+                .file_name()
+                .to_string_lossy()
+                .starts_with("state.redb.corrupt."),
+            "unexpected corrupt backup name"
+        );
     }
 
     // ── StateInspector ────────────────────────────────────────────────────────

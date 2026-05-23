@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
 // ── RegionId ──────────────────────────────────────────────────────────────────
 
 /// Opaque identifier for a deployment region (e.g. `"us-east-1"`).
@@ -42,16 +44,17 @@ pub enum RoutingPolicy {
 // ── FederationClient ──────────────────────────────────────────────────────────
 
 /// Trait implemented by both the local short-circuit and the remote gRPC
-/// federation client.
+/// federation client (P3-26: async methods for non-blocking I/O).
+#[async_trait]
 pub trait FederationClient: Send + Sync {
     /// Submit a job to this region.  Returns an opaque remote job-id string.
-    fn submit_job(&self, job_id: &str, spec_json: &str) -> FederationResult<String>;
+    async fn submit_job(&self, job_id: &str, spec_json: &str) -> FederationResult<String>;
 
     /// Query job status from this region.
-    fn job_status(&self, remote_job_id: &str) -> FederationResult<JobStatusResponse>;
+    async fn job_status(&self, remote_job_id: &str) -> FederationResult<JobStatusResponse>;
 
     /// Cancel a job in this region.
-    fn cancel_job(&self, remote_job_id: &str) -> FederationResult<()>;
+    async fn cancel_job(&self, remote_job_id: &str) -> FederationResult<()>;
 }
 
 // ── FederationResult / FederationError ────────────────────────────────────────
@@ -97,13 +100,14 @@ impl SingleRegionFederationClient {
     }
 }
 
+#[async_trait]
 impl FederationClient for SingleRegionFederationClient {
-    fn submit_job(&self, job_id: &str, _spec_json: &str) -> FederationResult<String> {
+    async fn submit_job(&self, job_id: &str, _spec_json: &str) -> FederationResult<String> {
         tracing::debug!(region = %self.region, job_id, "SingleRegionFederationClient: submit_job (no-op)");
         Ok(job_id.to_owned())
     }
 
-    fn job_status(&self, remote_job_id: &str) -> FederationResult<JobStatusResponse> {
+    async fn job_status(&self, remote_job_id: &str) -> FederationResult<JobStatusResponse> {
         tracing::debug!(region = %self.region, remote_job_id, "SingleRegionFederationClient: job_status (no-op)");
         Ok(JobStatusResponse {
             remote_job_id: remote_job_id.to_owned(),
@@ -111,7 +115,7 @@ impl FederationClient for SingleRegionFederationClient {
         })
     }
 
-    fn cancel_job(&self, remote_job_id: &str) -> FederationResult<()> {
+    async fn cancel_job(&self, remote_job_id: &str) -> FederationResult<()> {
         tracing::debug!(region = %self.region, remote_job_id, "SingleRegionFederationClient: cancel_job (no-op)");
         Ok(())
     }
@@ -242,10 +246,8 @@ mod tests {
             ],
             RoutingPolicy::Primary,
         );
-        // Sorted: eu-west-1 < us-east-1, so Primary picks eu-west-1.
         let url = gc.route_task("job-x").unwrap();
         assert_eq!(url, "http://coord-eu:7070");
-        // Second call still returns same region.
         let url2 = gc.route_task("job-y").unwrap();
         assert_eq!(url2, "http://coord-eu:7070");
     }
@@ -256,19 +258,19 @@ mod tests {
         assert!(gc.route_task("job-z").is_err());
     }
 
-    #[test]
-    fn single_region_client_submit_returns_job_id() {
+    #[tokio::test]
+    async fn single_region_client_submit_returns_job_id() {
         let client =
             SingleRegionFederationClient::new(RegionId::new("us-east-1"), "http://localhost:7070");
-        let result = client.submit_job("job-123", "{}").unwrap();
+        let result = client.submit_job("job-123", "{}").await.unwrap();
         assert_eq!(result, "job-123");
     }
 
-    #[test]
-    fn single_region_client_status_returns_running() {
+    #[tokio::test]
+    async fn single_region_client_status_returns_running() {
         let client =
             SingleRegionFederationClient::new(RegionId::new("us-east-1"), "http://localhost:7070");
-        let status = client.job_status("job-123").unwrap();
+        let status = client.job_status("job-123").await.unwrap();
         assert_eq!(status.state, "Running");
     }
 }

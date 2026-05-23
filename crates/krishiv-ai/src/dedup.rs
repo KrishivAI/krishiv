@@ -38,24 +38,36 @@ impl SemanticDedup {
         }
     }
 
+    fn band_hash(slice: &[f32]) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = twox_hash::XxHash64::with_seed(0);
+        for v in slice {
+            hasher.write(&v.to_le_bytes());
+        }
+        hasher.finish()
+    }
+
     fn lsh_candidates(embeddings: &[Vec<f32>]) -> Vec<(usize, usize)> {
-        let mut pairs = Vec::new();
         let bands = 10usize;
-        let functions = 5usize;
-        for i in 0..embeddings.len() {
-            for j in (i + 1)..embeddings.len() {
-                let mut same = 0usize;
-                for b in 0..bands {
-                    let hi = (b * functions).min(embeddings[i].len());
-                    let lo = hi.saturating_sub(functions);
-                    let sig_i: f32 = embeddings[i][lo..hi].iter().sum();
-                    let sig_j: f32 = embeddings[j][lo..hi].iter().sum();
-                    if (sig_i - sig_j).abs() < 0.01 {
-                        same += 1;
-                    }
+        let width = 8usize.max(1);
+        let mut buckets: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, emb) in embeddings.iter().enumerate() {
+            for band in 0..bands {
+                let start = (band * width).min(emb.len());
+                let end = (start + width).min(emb.len());
+                if start >= end {
+                    continue;
                 }
-                if same >= bands / 2 {
-                    pairs.push((i, j));
+                let key = Self::band_hash(&emb[start..end]);
+                buckets.entry(key).or_default().push(idx);
+            }
+        }
+        let mut pairs = Vec::new();
+        for members in buckets.values() {
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    pairs.push((members[i], members[j]));
                 }
             }
         }
@@ -63,7 +75,7 @@ impl SemanticDedup {
     }
 
     /// Return indices to keep after deduplication.
-    pub fn dedup_indices(&self, embeddings: &[Vec<f32>]) -> Vec<usize> {
+    pub fn dedup_indices(&self, embeddings: &[Vec<f32>], scores: &[f32]) -> Vec<usize> {
         if embeddings.is_empty() {
             return Vec::new();
         }
@@ -93,13 +105,25 @@ impl SemanticDedup {
                     drop.insert(i);
                 }
                 DedupStrategy::KeepHighestScore => {
-                    drop.insert(j);
+                    let si = scores.get(i).copied().unwrap_or(0.0);
+                    let sj = scores.get(j).copied().unwrap_or(0.0);
+                    if si >= sj {
+                        drop.insert(j);
+                    } else {
+                        drop.insert(i);
+                    }
                 }
             }
         }
         (0..embeddings.len())
             .filter(|idx| !drop.contains(idx))
             .collect()
+    }
+
+    /// Backward-compatible wrapper when scores are unavailable.
+    pub fn dedup_indices_unscored(&self, embeddings: &[Vec<f32>]) -> Vec<usize> {
+        let scores = vec![0.0f32; embeddings.len()];
+        self.dedup_indices(embeddings, &scores)
     }
 }
 
@@ -114,7 +138,7 @@ mod tests {
             strategy: DedupStrategy::KeepFirst,
         });
         let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
-        let kept = dedup.dedup_indices(&embeddings);
+        let kept = dedup.dedup_indices_unscored(&embeddings);
         assert_eq!(kept.len(), 1);
     }
 
@@ -125,7 +149,7 @@ mod tests {
             strategy: DedupStrategy::KeepFirst,
         });
         let embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let kept = dedup.dedup_indices(&embeddings);
+        let kept = dedup.dedup_indices_unscored(&embeddings);
         assert_eq!(kept.len(), 2);
     }
 }

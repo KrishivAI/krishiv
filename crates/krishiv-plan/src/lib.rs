@@ -9,13 +9,14 @@
 use std::fmt;
 
 pub mod r17;
+pub mod streaming;
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
     RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
 };
 
 /// Data type for a plan schema field.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldType {
     Boolean,
     Int32,
@@ -27,7 +28,7 @@ pub enum FieldType {
 }
 
 /// One field in a plan schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaField {
     name: String,
     field_type: FieldType,
@@ -68,7 +69,7 @@ impl SchemaField {
 }
 
 /// Output schema for a plan node.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PlanSchema {
     fields: Vec<SchemaField>,
 }
@@ -91,7 +92,7 @@ impl PlanSchema {
 }
 
 /// Join variant used in `NodeOp::Join`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JoinType {
     Inner,
     Left,
@@ -102,7 +103,7 @@ pub enum JoinType {
 }
 
 /// Typed operator classification for a plan node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NodeOp {
     /// Table or file scan.
     Scan { table: String },
@@ -126,12 +127,18 @@ pub enum NodeOp {
         /// Number of output partitions after coalescing.
         target_partitions: usize,
     },
+    /// Create a live table backed by a streaming query.
+    CreateLiveTable { name: String, query: String },
+    /// Refresh materialized state for a live table.
+    RefreshLiveTable { name: String },
+    /// Drop a live table.
+    DropLiveTable { name: String },
     /// Operator not covered by the above variants.
     Other { description: String },
 }
 
 /// Whether a plan represents bounded batch work or unbounded streaming work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecutionKind {
     /// Bounded work that eventually completes.
     Batch,
@@ -149,7 +156,7 @@ impl fmt::Display for ExecutionKind {
 }
 
 /// Partitioning strategy for a plan node's output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Partitioning {
     /// No partitioning — data is not distributed across partitions.
     Unpartitioned,
@@ -183,7 +190,7 @@ impl fmt::Display for Partitioning {
 }
 
 /// A small bootstrap plan node used by both logical and physical plans.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanNode {
     id: String,
     label: String,
@@ -307,6 +314,7 @@ impl PlanNode {
 
 /// Shared core fields for logical and physical plans.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlanCore {
     pub(crate) name: String,
     pub(crate) kind: ExecutionKind,
@@ -345,7 +353,7 @@ impl PlanCore {
 }
 
 /// Krishiv logical plan wrapper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogicalPlan {
     pub(crate) core: PlanCore,
 }
@@ -397,7 +405,7 @@ impl LogicalPlan {
 }
 
 /// Krishiv physical plan wrapper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PhysicalPlan {
     pub(crate) core: PlanCore,
     /// Post-AQE coalesced partition count set by `CoalesceRule::apply`.

@@ -92,6 +92,44 @@ impl SequentialPatternMatcher {
     }
 }
 
+/// Partitioned wrapper routing events to per-key [`SequentialPatternMatcher`] instances (P3-27).
+#[derive(Debug, Clone)]
+pub struct PartitionedCepMatcher<K>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    pattern: CompiledPattern,
+    states: std::collections::HashMap<K, (SequentialPatternMatcher, CepKeyState)>,
+}
+
+impl<K> PartitionedCepMatcher<K>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    pub fn new(pattern: CompiledPattern) -> Self {
+        Self {
+            pattern: pattern.clone(),
+            states: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn process_event(
+        &mut self,
+        key: K,
+        stage_name: &str,
+        batch: RecordBatch,
+        event_time_ms: i64,
+    ) -> Vec<Vec<RecordBatch>> {
+        let entry = self.states.entry(key).or_insert_with(|| {
+            (
+                SequentialPatternMatcher::new(self.pattern.clone()),
+                CepKeyState::default(),
+            )
+        });
+        entry.0.process_event(&mut entry.1, stage_name, batch, event_time_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

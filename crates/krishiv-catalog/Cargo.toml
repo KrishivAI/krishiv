@@ -20,6 +20,7 @@ url = "2"
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+datafusion = { workspace = true }
 
 [lints]
 workspace = true

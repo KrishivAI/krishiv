@@ -381,8 +381,18 @@ async fn healthz() -> &'static str {
 /// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
 async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
     let body = match state.coordinator.read() {
-        Ok(coordinator) => format_stability_metrics(&coordinator.stability_metrics()),
-        Err(_) => format_stability_metrics(&StabilityMetrics::empty()),
+        Ok(coordinator) => {
+            let mut body = format_stability_metrics(&coordinator.stability_metrics());
+            body.push('\n');
+            body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
+            body
+        }
+        Err(_) => {
+            let mut body = format_stability_metrics(&StabilityMetrics::empty());
+            body.push('\n');
+            body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
+            body
+        }
     };
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -413,18 +423,30 @@ krishiv_failed_assignments_total {failed}
 krishiv_max_executor_heartbeat_age_ticks {hb_age}
 # HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
 # TYPE krishiv_shuffle_bytes_written_total counter
-krishiv_shuffle_bytes_written_total 0
+krishiv_shuffle_bytes_written_total {shuffle_bytes}
 ",
         running = m.running_task_count(),
         retries = m.retry_count(),
         failed = m.failed_assignments(),
         hb_age = max_heartbeat_age,
+        shuffle_bytes = m.shuffle_bytes_written,
     )
 }
 
-async fn readyz(State(state): State<UiState>) -> Result<&'static str, UiError> {
+async fn readyz(State(state): State<UiState>) -> Result<impl IntoResponse, UiError> {
+    use krishiv_proto::CoordinatorState;
+    let coordinator = state
+        .coordinator
+        .read()
+        .map_err(|_| UiError::LockPoisoned)?;
+    if coordinator.state() != CoordinatorState::Active {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coordinator is not active\n",
+        ));
+    }
     let _snapshot = status_snapshot(&state)?;
-    Ok("ready\n")
+    Ok((StatusCode::OK, "ready\n"))
 }
 
 async fn api_jobs(State(state): State<UiState>) -> Result<Json<JobsResponse>, UiError> {

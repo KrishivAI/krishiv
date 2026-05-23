@@ -20,6 +20,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use krishiv_api::SessionBuilder;
 use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
+use krishiv_sql::SqlEngine;
+use krishiv_sql_policy::PolicyEnforcingSqlEngine;
 
 /// **Beta API**: may change between minor releases.
 #[derive(Clone, Default)]
@@ -274,41 +276,35 @@ impl FlightSqlService for KrishivFlightSqlService {
         let query = std::str::from_utf8(&ticket.statement_handle)
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
 
-        let session = self.make_session()?;
-        let result = if self.auth.is_some() && self.policy.is_some() {
+        let batches = if let (Some(auth), Some(policy)) = (&self.auth, &self.policy) {
             let token = token
                 .as_deref()
                 .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
-            session
-                .sql_as(token, query)
+            let engine =
+                PolicyEnforcingSqlEngine::new(SqlEngine::new(), auth.clone(), policy.clone());
+            let principal = engine
+                .authenticate(token)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
+            engine
+                .execute_as(&principal, query)
                 .await
                 .map_err(|e| match e {
-                    krishiv_api::KrishivError::AccessDenied { reason } => {
+                    krishiv_sql::SqlError::AccessDenied { reason } => {
                         Status::permission_denied(reason)
                     }
                     other => Status::internal(other.to_string()),
                 })?
-                .collect_async()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
         } else {
-            // Use async — do_get_statement is async, sync Session::sql() would panic inside a runtime.
+            let session = self.make_session()?;
             let df = session
                 .sql_async(query)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            df.collect_async()
+            let result = df
+                .collect_async()
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        };
-
-        // `sql_as` already applies policy checks and masking. The local helper is
-        // retained for auth-only/no-auth beta flows.
-        let raw_batches = result.batches().to_vec();
-        let batches = if self.auth.is_some() && self.policy.is_some() {
-            raw_batches
-        } else {
-            self.apply_policy_masking(&principal, "", raw_batches)?
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.apply_policy_masking(&principal, "", result.batches().to_vec())?
         };
 
         let schema: Arc<Schema> = if batches.is_empty() {

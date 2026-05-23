@@ -9,6 +9,7 @@ license.workspace = true
 askama.workspace = true
 axum.workspace = true
 krishiv-proto = { path = "../krishiv-proto" }
+krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 serde.workspace = true
 tokio = { workspace = true, features = ["net"] }

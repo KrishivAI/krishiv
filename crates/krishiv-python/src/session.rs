@@ -13,6 +13,7 @@ use crate::batch::PyBatch;
 use crate::dataframe::PyDataFrame;
 use crate::errors::{map_krishiv_error, ModeError};
 use crate::job_status::PyJobStatus;
+use crate::live_table::PyLiveTable;
 use crate::stream::PyStream;
 
 fn build_embedded_session() -> PyResult<PySession> {
@@ -25,18 +26,11 @@ fn build_embedded_session() -> PyResult<PySession> {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build embedded Krishiv Tokio runtime")
-});
-
 pub(crate) fn block_on_async<F, T>(future: F) -> Result<T, krishiv_api::KrishivError>
 where
     F: std::future::Future<Output = Result<T, krishiv_api::KrishivError>>,
 {
-    RUNTIME.block_on(future)
+    crate::RUNTIME.block_on(future)
 }
 
 /// A Krishiv query session.
@@ -279,6 +273,10 @@ impl PySession {
         self.inner.scalar_udf_names()
     }
 
+
+    pub fn live_table(&self, name: String, query: String) -> PyResult<PyLiveTable> {
+        crate::live_table::create_live_table(name, query)
+    }
 
     pub fn memory_stream_collect(
         &self,

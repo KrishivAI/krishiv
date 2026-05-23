@@ -13,15 +13,25 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
 krishiv-catalog = { path = "../krishiv-catalog" }
+krishiv-exec = { path = "../krishiv-exec" }
+krishiv-governance = { path = "../krishiv-governance" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-schema-registry = { path = "../krishiv-schema-registry" }
 krishiv-sql = { path = "../krishiv-sql" }
+krishiv-state = { path = "../krishiv-state" }
 krishiv-ai = { path = "../krishiv-ai", features = ["fastembed-local"] }
 krishiv-udf = { path = "../krishiv-udf" }
 krishiv-vector-sinks = { path = "../krishiv-vector-sinks" }
 arrow = { workspace = true }
 pyo3 = { workspace = true }
+pyo3-arrow = "0.17"
+sha2 = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+default = []
+kafka = []
+iceberg = []
 
 [lints]
 workspace = true

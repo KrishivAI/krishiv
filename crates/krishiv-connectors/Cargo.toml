@@ -10,12 +10,16 @@ path = "src/lib.rs"
 
 [features]
 kafka = ["dep:rdkafka"]
+state = ["dep:krishiv-state"]
 
 [dependencies]
 arrow = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
+krishiv-exec = { path = "../krishiv-exec" }
+krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-proto = { path = "../krishiv-proto" }
+krishiv-state = { path = "../krishiv-state", optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
 regex = "1"

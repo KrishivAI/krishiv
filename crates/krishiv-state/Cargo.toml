@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-async-util = { path = "../krishiv-async-util" }
 redb.workspace = true
+tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

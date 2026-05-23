@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use arrow::array::Array;
 use arrow::datatypes::{Field, Schema};
@@ -16,6 +15,7 @@ mod as_of;
 mod delta;
 mod delta_lake;
 mod hudi;
+mod iceberg_fs;
 mod local_delta;
 mod partition_spec;
 mod two_phase;
@@ -23,6 +23,7 @@ mod two_phase;
 pub use as_of::{AsOfSpec};
 pub use delta::{DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore};
 pub use hudi::{write_hudi_cow_fixture, HudiQueryType, HudiSnapshotReader};
+pub use iceberg_fs::IcebergFsTable;
 pub use partition_spec::{PartitionSpecResolver, PartitionSpecVersion};
 pub use delta_lake::{
     merge_delta, write_delta, DeltaTableHandle, DeltaWriteMode, MergeDeltaResult,
@@ -208,12 +209,60 @@ pub trait LakehouseTable: Send + Sync {
 // MemoryLakehouseTable
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+struct SnapshotLayer {
+    snapshot_id: i64,
+    batches: Vec<RecordBatch>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryLakehouseTableState {
+    /// Batches committed per snapshot, in commit order.
+    layers: Vec<SnapshotLayer>,
+    /// Last assigned snapshot id; `0` means no snapshots yet.
+    last_snapshot_id: i64,
+}
+
+impl MemoryLakehouseTableState {
+    fn current_snapshot_id(&self) -> Option<i64> {
+        if self.last_snapshot_id == 0 {
+            None
+        } else {
+            Some(self.last_snapshot_id)
+        }
+    }
+
+    fn batches_up_to_snapshot(&self, snapshot_id: i64) -> Vec<RecordBatch> {
+        self.layers
+            .iter()
+            .filter(|layer| layer.snapshot_id <= snapshot_id)
+            .flat_map(|layer| layer.batches.iter().cloned())
+            .collect()
+    }
+
+    fn all_batches(&self) -> Vec<RecordBatch> {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.batches.iter().cloned())
+            .collect()
+    }
+
+    fn append_layer(&mut self, batches: Vec<RecordBatch>) -> i64 {
+        self.last_snapshot_id += 1;
+        let snapshot_id = self.last_snapshot_id;
+        self.layers.push(SnapshotLayer {
+            snapshot_id,
+            batches,
+        });
+        snapshot_id
+    }
+}
+
 #[doc = "**Beta API**: may change between minor releases."]
 pub struct MemoryLakehouseTable {
     table_ref: IcebergTableRef,
     schema_version: SchemaVersion,
-    batches: tokio::sync::Mutex<Vec<RecordBatch>>,
-    next_snapshot: AtomicI64,
+    state: tokio::sync::Mutex<MemoryLakehouseTableState>,
 }
 
 impl MemoryLakehouseTable {
@@ -222,9 +271,32 @@ impl MemoryLakehouseTable {
         Self {
             table_ref,
             schema_version,
-            batches: tokio::sync::Mutex::new(Vec::new()),
-            next_snapshot: AtomicI64::new(0),
+            state: tokio::sync::Mutex::new(MemoryLakehouseTableState::default()),
         }
+    }
+
+    /// Atomically verify the guard's expected snapshot and append batches.
+    ///
+    /// Holds the table mutex across the precondition check and snapshot commit so
+    /// concurrent writers cannot both pass the check (P1-11).
+    #[doc = "**Beta API**: may change between minor releases."]
+    pub async fn check_and_append(
+        &self,
+        guard: &MultiWriterGuard,
+        batches: Vec<RecordBatch>,
+    ) -> Result<i64, LakehouseError> {
+        let mut state = self.state.lock().await;
+        if state.current_snapshot_id() != guard.expected_snapshot() {
+            return Err(LakehouseError::Concurrency {
+                message: format!(
+                    "writer '{}' expected snapshot {:?} but found {:?}",
+                    guard.writer_id(),
+                    guard.expected_snapshot(),
+                    state.current_snapshot_id(),
+                ),
+            });
+        }
+        Ok(state.append_layer(batches))
     }
 }
 
@@ -239,13 +311,12 @@ impl LakehouseTable for MemoryLakehouseTable {
     }
 
     async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError> {
-        let batches = self.batches.lock().await;
-        if let Some(target) = opts.snapshot_id {
-            let snap = self.next_snapshot.load(Ordering::SeqCst);
-            if target != snap {
-                return Ok(Vec::new());
-            }
-        }
+        let state = self.state.lock().await;
+        let batches = if let Some(target) = opts.snapshot_id {
+            state.batches_up_to_snapshot(target)
+        } else {
+            state.all_batches()
+        };
 
         // Filter columns if requested
         let filtered: Vec<RecordBatch> = if let Some(cols) = &opts.columns {
@@ -296,15 +367,13 @@ impl LakehouseTable for MemoryLakehouseTable {
     }
 
     async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
-        let mut stored = self.batches.lock().await;
-        stored.extend(batches);
-        self.next_snapshot.fetch_add(1, Ordering::SeqCst);
+        let mut state = self.state.lock().await;
+        state.append_layer(batches);
         Ok(())
     }
 
     async fn current_snapshot_id(&self) -> Result<Option<i64>, LakehouseError> {
-        let snap = self.next_snapshot.load(Ordering::SeqCst);
-        if snap == 0 { Ok(None) } else { Ok(Some(snap)) }
+        Ok(self.state.lock().await.current_snapshot_id())
     }
 }
 
@@ -483,20 +552,90 @@ mod tests {
             let guard_a = MultiWriterGuard::new(None, "writer-a");
             let guard_b = MultiWriterGuard::new(None, "writer-b");
 
-            // First writer checks precondition and commits
-            check_write_precondition(table.as_ref(), &guard_a)
+            // First writer commits atomically
+            table
+                .check_and_append(&guard_a, vec![make_batch(vec![1, 2])])
                 .await
                 .expect("writer-a precondition should pass");
-            table.append(vec![make_batch(vec![1, 2])]).await.unwrap();
 
             // Second writer now sees a stale snapshot expectation
-            let err = check_write_precondition(table.as_ref(), &guard_b)
+            let err = table
+                .check_and_append(&guard_b, vec![make_batch(vec![3])])
                 .await
                 .expect_err("writer-b should detect conflict");
             assert!(
                 matches!(err, LakehouseError::Concurrency { .. }),
                 "expected Concurrency error, got: {err}"
             );
+        });
+    }
+
+    #[test]
+    fn concurrent_append_no_data_duplication() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let table = Arc::new(MemoryLakehouseTable::new(
+                make_table_ref(),
+                make_schema_version(),
+            ));
+            let guard_a = MultiWriterGuard::new(None, "writer-a");
+            let guard_b = MultiWriterGuard::new(None, "writer-b");
+
+            let table_a = Arc::clone(&table);
+            let table_b = Arc::clone(&table);
+
+            let handle_a = tokio::spawn(async move {
+                table_a
+                    .check_and_append(&guard_a, vec![make_batch(vec![1])])
+                    .await
+            });
+            let handle_b = tokio::spawn(async move {
+                // Yield so writer-a can acquire the mutex first.
+                tokio::task::yield_now().await;
+                table_b
+                    .check_and_append(&guard_b, vec![make_batch(vec![2])])
+                    .await
+            });
+
+            let result_a = handle_a.await.unwrap();
+            let result_b = handle_b.await.unwrap();
+            let successes = [result_a.is_ok(), result_b.is_ok()]
+                .into_iter()
+                .filter(|ok| *ok)
+                .count();
+            assert_eq!(successes, 1, "exactly one concurrent writer may commit");
+
+            let opts = IcebergScanOptions::new();
+            let scanned = table.scan(&opts).await.unwrap();
+            let total_rows: usize = scanned.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 1, "only one writer's batch must be visible");
+        });
+    }
+
+    #[test]
+    fn time_travel_returns_historical_snapshot() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let table = MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
+
+            table.append(vec![make_batch(vec![1, 2])]).await.unwrap();
+            let snap1 = table.current_snapshot_id().await.unwrap().unwrap();
+            table.append(vec![make_batch(vec![3, 4, 5])]).await.unwrap();
+            let snap2 = table.current_snapshot_id().await.unwrap().unwrap();
+
+            let at_snap1 = table
+                .scan(&IcebergScanOptions::new().with_snapshot(snap1))
+                .await
+                .unwrap();
+            let rows_snap1: usize = at_snap1.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows_snap1, 2);
+
+            let at_snap2 = table
+                .scan(&IcebergScanOptions::new().with_snapshot(snap2))
+                .await
+                .unwrap();
+            let rows_snap2: usize = at_snap2.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows_snap2, 5);
         });
     }
 

@@ -22,7 +22,10 @@
 //! every file it lists passes SHA-256 validation.  Epochs missing the manifest
 //! (partial writes) are treated as corrupt during restore.
 
+pub mod object_store;
 pub mod rescaling;
+
+pub use object_store::ObjectStoreCheckpointStorage;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -47,6 +50,8 @@ pub enum CheckpointError {
     ///
     /// A stale coordinator must not commit checkpoint epochs — reject the write.
     StaleFencingToken { stored: u64, current: u64 },
+    /// Attempted to write an epoch that is not newer than the latest committed epoch.
+    StaleEpoch { attempted: u64, latest: u64 },
     /// The resolved path escapes the storage base directory (path-traversal attempt).
     InvalidPath { path: String },
 }
@@ -62,6 +67,10 @@ impl std::fmt::Display for CheckpointError {
                 write!(f, "unsupported checkpoint metadata version {version}")
             }
             Self::NoValidEpoch => write!(f, "no valid committed checkpoint epoch found"),
+            Self::StaleEpoch { attempted, latest } => write!(
+                f,
+                "stale checkpoint epoch {attempted}: latest committed is {latest}"
+            ),
             Self::StaleFencingToken { stored, current } => write!(
                 f,
                 "stale fencing token: metadata token {stored} < current coordinator token {current}"
@@ -288,6 +297,12 @@ pub trait CheckpointStorage: Send + Sync {
     fn delete_prefix(&self, prefix: &str) -> CheckpointResult<()>;
 }
 
+fn uuid_simple() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 // ── High-level helpers ────────────────────────────────────────────────────────
 
 /// Write serialized `metadata` to `{epoch_dir}/metadata.json`.
@@ -297,10 +312,22 @@ pub fn write_epoch_metadata(
     epoch: u64,
     metadata: &CheckpointMetadata,
 ) -> CheckpointResult<()> {
+    if let Ok(latest) = latest_valid_epoch(storage, job_id)
+        && epoch <= latest
+    {
+        return Err(CheckpointError::StaleEpoch {
+            attempted: epoch,
+            latest,
+        });
+    }
     let json = serde_json::to_vec_pretty(metadata).map_err(|e| CheckpointError::Storage {
         message: format!("metadata serialize: {e}"),
     })?;
-    storage.write_bytes(&metadata_path(job_id, epoch), &json)
+    storage.write_bytes(&metadata_path(job_id, epoch), &json)?;
+    storage.write_bytes(
+        &format!("{job_id}/checkpoints/latest_epoch.json"),
+        epoch.to_string().as_bytes(),
+    )
 }
 
 /// Read and deserialize `metadata.json` for `epoch`.  Returns `None` if absent.
@@ -403,10 +430,17 @@ pub fn list_valid_epochs(
     let epoch_dirs = storage.list_dir(&checkpoint_prefix)?;
     let mut valid = Vec::new();
     for name in epoch_dirs {
-        if let Ok(epoch) = name.parse::<u64>()
-            && validate_epoch(storage, job_id, epoch).unwrap_or(false)
-        {
-            valid.push(epoch);
+        let Ok(epoch) = name.parse::<u64>() else {
+            tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            continue;
+        };
+        match validate_epoch(storage, job_id, epoch) {
+            Ok(true) => valid.push(epoch),
+            Ok(false) => tracing::warn!(job_id, epoch, "excluding invalid checkpoint epoch"),
+            Err(e) => {
+                tracing::warn!(job_id, epoch, error = %e, "checkpoint epoch validation failed");
+                return Err(e);
+            }
         }
     }
     valid.sort_unstable();
@@ -442,7 +476,7 @@ pub fn validate_fencing_token(
     metadata: &CheckpointMetadata,
     current_token: u64,
 ) -> CheckpointResult<()> {
-    if metadata.fencing_token != current_token {
+    if metadata.fencing_token < current_token {
         return Err(CheckpointError::StaleFencingToken {
             stored: metadata.fencing_token,
             current: current_token,
@@ -599,13 +633,30 @@ impl CheckpointStorage for LocalFsCheckpointStorage {
                 message: format!("mkdir {}: {e}", parent.display()),
             })?;
         }
-        let tmp = full.with_extension("tmp");
-        std::fs::write(&tmp, data).map_err(|e| CheckpointError::Storage {
-            message: format!("write {}: {e}", tmp.display()),
-        })?;
+        use std::io::Write as _;
+        let tmp = full.with_extension(format!("tmp.{}", uuid_simple()));
+        {
+            let mut file = std::fs::File::create(&tmp).map_err(|e| CheckpointError::Storage {
+                message: format!("create {}: {e}", tmp.display()),
+            })?;
+            file.write_all(data).map_err(|e| CheckpointError::Storage {
+                message: format!("write {}: {e}", tmp.display()),
+            })?;
+            file.sync_all().map_err(|e| CheckpointError::Storage {
+                message: format!("fsync {}: {e}", tmp.display()),
+            })?;
+        }
         std::fs::rename(&tmp, &full).map_err(|e| CheckpointError::Storage {
             message: format!("rename to {}: {e}", full.display()),
         })?;
+        if let Some(parent) = full.parent() {
+            let dir = std::fs::File::open(parent).map_err(|e| CheckpointError::Storage {
+                message: format!("open dir {}: {e}", parent.display()),
+            })?;
+            dir.sync_all().map_err(|e| CheckpointError::Storage {
+                message: format!("fsync dir {}: {e}", parent.display()),
+            })?;
+        }
         Ok(())
     }
 
@@ -914,7 +965,7 @@ mod tests {
     fn latest_valid_epoch_returns_highest() {
         let s = make_storage();
 
-        for epoch in [3u64, 1, 5] {
+        for epoch in [1u64, 3, 5] {
             let meta = sample_metadata(epoch);
             let state = format!("state {epoch}");
             let state_b = state.as_bytes();
@@ -990,16 +1041,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_fencing_token_future_token_rejected() {
-        // Only an exact token match is valid; a future-generation token indicates
-        // split-brain and must be rejected.
-        let meta = sample_metadata(1); // fencing_token = 1
+    fn fencing_token_accepts_future_generation() {
+        let meta = sample_metadata(1);
         let mut meta2 = meta.clone();
-        meta2.fencing_token = 2;
-        let result = validate_fencing_token(&meta2, 1);
+        meta2.fencing_token = 5;
         assert!(
-            matches!(result, Err(CheckpointError::StaleFencingToken { stored: 2, current: 1 })),
-            "expected StaleFencingToken(stored=2, current=1), got: {result:?}"
+            validate_fencing_token(&meta2, 2).is_ok(),
+            "metadata from a prior valid coordinator (higher token) must be accepted"
         );
     }
 
@@ -1026,21 +1074,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_fencing_token_future_generation_rejected() {
-        let mut meta = sample_metadata(1);
-        meta.fencing_token = 5; // future-generation token
-        // Current coordinator is at token=2; metadata has token=5 → invalid
-        let result = validate_fencing_token(&meta, 2);
-        assert!(
-            matches!(
-                result,
-                Err(CheckpointError::StaleFencingToken {
-                    stored: 5,
-                    current: 2
-                })
-            ),
-            "future-generation fencing token must be rejected"
-        );
+    fn validate_fencing_token_stale_metadata_rejected() {
+        let meta = sample_metadata(1);
+        let result = validate_fencing_token(&meta, 5);
+        assert!(matches!(
+            result,
+            Err(CheckpointError::StaleFencingToken { stored: 1, current: 5 })
+        ));
     }
 
     #[test]

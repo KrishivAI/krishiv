@@ -89,6 +89,8 @@ pub enum ExecError {
     UnexpectedBatchSchema,
     /// A window operator was constructed with an invalid configuration.
     InvalidWindowConfig(String),
+    /// Incoming batch schema cannot be evolved to the target schema.
+    IncompatibleSchemaEvolution(String),
 }
 
 impl fmt::Display for ExecError {
@@ -99,6 +101,9 @@ impl fmt::Display for ExecError {
             Self::UnsupportedType(msg) => write!(f, "unsupported type: {msg}"),
             Self::UnexpectedBatchSchema => write!(f, "unexpected record batch schema"),
             Self::InvalidWindowConfig(msg) => write!(f, "invalid window config: {msg}"),
+            Self::IncompatibleSchemaEvolution(msg) => {
+                write!(f, "incompatible schema evolution: {msg}")
+            }
         }
     }
 }
@@ -122,10 +127,21 @@ pub use krishiv_plan::JoinType;
 
 pub mod join;
 pub mod aggregate;
+pub mod coalesce_partitions;
 pub mod window;
 pub mod queue;
 pub mod adaptive;
 pub mod chunk;
+pub mod schema_normalize;
+pub mod live_table;
+pub mod temporal_join;
+pub mod interval_join;
+pub mod cep;
+pub mod barrier_align;
+pub mod side_output;
+pub mod memo;
+#[cfg(test)]
+pub mod watermark_e2e;
 
 pub use chunk::ChunkOperator;
 
@@ -141,6 +157,7 @@ pub use queue::{OperatorMessage, OperatorQueueMetrics, OperatorQueueSender,
     OperatorQueueReceiver, OperatorQueueError, operator_queue};
 pub use adaptive::{HotKeyReport, HeavyHittersTracker, ThrottleCommand, RateLimiter,
     SinkLatencyTracker, AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig};
+pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

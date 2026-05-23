@@ -66,13 +66,8 @@ impl MetricsHandle {
     }
 
     /// Explicitly shut down the tracer provider and flush any pending spans.
-    ///
-    /// This is equivalent to dropping the handle.  Calling it more than once is
-    /// safe — the second call is a no-op because the provider has already been
-    /// shut down.
     pub fn shutdown(self) {
-        // Explicit drop triggers the Drop impl which calls provider.shutdown().
-        drop(self);
+        // Drop runs `Drop::drop` which calls `tracer_provider.shutdown()`.
     }
 }
 
@@ -171,6 +166,94 @@ pub fn current_traceparent() -> Option<String> {
     }
 }
 
+// ── Process metrics (Prometheus text) ─────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// OpenTelemetry-aligned counters/histograms for Krishiv runtime observability.
+#[derive(Debug, Default)]
+pub struct KrishivMetrics {
+    tasks_submitted: AtomicU64,
+    tasks_running: AtomicU64,
+    tasks_succeeded: AtomicU64,
+    tasks_failed: AtomicU64,
+    shuffle_bytes_written: AtomicU64,
+    job_queue_depth: AtomicU64,
+}
+
+static GLOBAL_METRICS: OnceLock<KrishivMetrics> = OnceLock::new();
+
+/// Process-wide metrics registry (lazy-initialized).
+pub fn global_metrics() -> &'static KrishivMetrics {
+    GLOBAL_METRICS.get_or_init(KrishivMetrics::default)
+}
+
+impl KrishivMetrics {
+    /// Record a submitted task.
+    pub fn inc_tasks_submitted(&self) {
+        self.tasks_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the current running task gauge.
+    pub fn set_tasks_running(&self, count: u64) {
+        self.tasks_running.store(count, Ordering::Relaxed);
+    }
+
+    /// Record a succeeded task.
+    pub fn inc_tasks_succeeded(&self) {
+        self.tasks_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a failed task.
+    pub fn inc_tasks_failed(&self) {
+        self.tasks_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add shuffle bytes written.
+    pub fn add_shuffle_bytes_written(&self, bytes: u64) {
+        self.shuffle_bytes_written
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Set job queue depth gauge.
+    pub fn set_job_queue_depth(&self, depth: u64) {
+        self.job_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Render Prometheus exposition format for Krishiv counters/gauges.
+    pub fn render_prometheus(&self) -> String {
+        format!(
+            "\
+# HELP krishiv_tasks_total Tasks submitted to the coordinator
+# TYPE krishiv_tasks_total counter
+krishiv_tasks_total{{status=\"submitted\"}} {submitted}
+# HELP krishiv_tasks_running Currently running tasks
+# TYPE krishiv_tasks_running gauge
+krishiv_tasks_running {running}
+# HELP krishiv_tasks_total Tasks that completed successfully
+# TYPE krishiv_tasks_total counter
+krishiv_tasks_total{{status=\"succeeded\"}} {succeeded}
+# HELP krishiv_tasks_total Tasks that failed
+# TYPE krishiv_tasks_total counter
+krishiv_tasks_total{{status=\"failed\"}} {failed}
+# HELP krishiv_shuffle_bytes_written_total Shuffle bytes written
+# TYPE krishiv_shuffle_bytes_written_total counter
+krishiv_shuffle_bytes_written_total {shuffle_bytes}
+# HELP krishiv_job_queue_depth Pending jobs in admission queue
+# TYPE krishiv_job_queue_depth gauge
+krishiv_job_queue_depth {queue_depth}
+",
+            submitted = self.tasks_submitted.load(Ordering::Relaxed),
+            running = self.tasks_running.load(Ordering::Relaxed),
+            succeeded = self.tasks_succeeded.load(Ordering::Relaxed),
+            failed = self.tasks_failed.load(Ordering::Relaxed),
+            shuffle_bytes = self.shuffle_bytes_written.load(Ordering::Relaxed),
+            queue_depth = self.job_queue_depth.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +289,15 @@ mod tests {
     fn current_traceparent_no_span_returns_none() {
         // Outside any active span, current_traceparent must return None.
         assert_eq!(current_traceparent(), None);
+    }
+
+    #[test]
+    fn krishiv_metrics_prometheus_contains_tasks_total() {
+        let m = KrishivMetrics::default();
+        m.inc_tasks_submitted();
+        let body = m.render_prometheus();
+        assert!(body.contains("krishiv_tasks_total"));
+        assert!(body.contains("krishiv_job_queue_depth"));
     }
 
     /// OTLP integration test — only runs when OTEL_EXPORTER_OTLP_ENDPOINT is set.

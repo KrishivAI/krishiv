@@ -53,12 +53,23 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                                 ),
                             }
                         })?;
-                        let list = PyList::new(
-                            py,
-                            arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())),
-                        )
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
-                            message: e.to_string(),
+                        let mut cells = Vec::with_capacity(arr.len());
+                        for v in arr.iter() {
+                            cells.push(match v {
+                                Some(x) => Some(
+                                    x.into_pyobject(py).map_err(|e| {
+                                        krishiv_udf::UdfError::Execution {
+                                            message: e.to_string(),
+                                        }
+                                    })?,
+                                ),
+                                None => None,
+                            });
+                        }
+                        let list = PyList::new(py, cells).map_err(|e| {
+                            krishiv_udf::UdfError::Execution {
+                                message: e.to_string(),
+                            }
                         })?;
                         list.into_any()
                     }
@@ -71,16 +82,28 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                                 ),
                             }
                         })?;
-                        let list = PyList::new(
-                            py,
-                            arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())),
-                        )
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
-                            message: e.to_string(),
+                        let mut cells = Vec::with_capacity(arr.len());
+                        for v in arr.iter() {
+                            cells.push(match v {
+                                Some(x) => Some(
+                                    x.into_pyobject(py).map_err(|e| {
+                                        krishiv_udf::UdfError::Execution {
+                                            message: e.to_string(),
+                                        }
+                                    })?,
+                                ),
+                                None => None,
+                            });
+                        }
+                        let list = PyList::new(py, cells).map_err(|e| {
+                            krishiv_udf::UdfError::Execution {
+                                message: e.to_string(),
+                            }
                         })?;
                         list.into_any()
                     }
                     DataType::Utf8 => {
+                        use arrow::array::Array;
                         let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
                             krishiv_udf::UdfError::InvalidArgument {
                                 message: format!(
@@ -89,12 +112,23 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                                 ),
                             }
                         })?;
-                        let list = PyList::new(
-                            py,
-                            arr.iter().map(|v| v.map(|x| x.into_pyobject(py).unwrap())),
-                        )
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
-                            message: e.to_string(),
+                        let mut cells = Vec::with_capacity(arr.len());
+                        for v in arr.iter() {
+                            cells.push(match v {
+                                Some(x) => Some(
+                                    x.into_pyobject(py).map_err(|e| {
+                                        krishiv_udf::UdfError::Execution {
+                                            message: e.to_string(),
+                                        }
+                                    })?,
+                                ),
+                                None => None,
+                            });
+                        }
+                        let list = PyList::new(py, cells).map_err(|e| {
+                            krishiv_udf::UdfError::Execution {
+                                message: e.to_string(),
+                            }
                         })?;
                         list.into_any()
                     }

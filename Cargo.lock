@@ -534,6 +534,7 @@ version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
+ "bitflags",
  "serde_core",
  "serde_json",
 ]
@@ -640,7 +641,7 @@ dependencies = [
  "memchr",
  "proc-macro2",
  "quote",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_derive",
  "syn",
@@ -661,7 +662,7 @@ version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7db09fde9143e7ac4513358fb32ee32847125b63b18ea715afd487956da715da"
 dependencies = [
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_derive",
  "unicode-ident",
@@ -950,6 +951,12 @@ checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
+
+[[package]]
+name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -982,6 +989,21 @@ name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
+
+[[package]]
+name = "bit-set"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0700ddab506f33b20a03b13996eccd309a48e5ff77d0d95926aa0210fb4e95f1"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
 
 [[package]]
 name = "bit_field"
@@ -1099,6 +1121,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
 dependencies = [
  "tinyvec",
+]
+
+[[package]]
+name = "bstr"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
+dependencies = [
+ "memchr",
+ "regex-automata",
+ "serde",
 ]
 
 [[package]]
@@ -2654,6 +2687,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fancy-regex"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "531e46835a22af56d1e3b66f04844bed63158bc094a628bec1d321d9b4c44bf2"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastembed"
 version = "4.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3792,8 +3836,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tiktoken-rs",
  "tokio",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -3848,6 +3894,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-cep"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "serde",
+]
+
+[[package]]
 name = "krishiv-chaos"
 version = "0.1.0"
 dependencies = [
@@ -3864,11 +3918,15 @@ dependencies = [
 name = "krishiv-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "krishiv-state",
+ "object_store",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3877,7 +3935,10 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "krishiv-exec",
+ "krishiv-lakehouse",
  "krishiv-proto",
+ "krishiv-state",
  "object_store",
  "parquet 58.3.0",
  "rdkafka",
@@ -3894,6 +3955,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-ai",
+ "krishiv-cep",
+ "krishiv-lakehouse",
  "krishiv-plan",
  "tokio",
 ]
@@ -3904,7 +3967,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum 0.8.9",
+ "dashmap",
  "krishiv-ai",
+ "krishiv-async-util",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-exec",
@@ -3926,6 +3991,7 @@ dependencies = [
 name = "krishiv-federation"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "tokio",
  "tracing",
 ]
@@ -3940,6 +4006,8 @@ dependencies = [
  "futures",
  "krishiv-api",
  "krishiv-governance",
+ "krishiv-sql",
+ "krishiv-sql-policy",
  "prost 0.14.3",
  "sha2",
  "tokio",
@@ -3951,6 +4019,7 @@ name = "krishiv-governance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dashmap",
  "mockito",
  "reqwest 0.13.3",
  "serde",
@@ -4048,12 +4117,17 @@ dependencies = [
  "krishiv-ai",
  "krishiv-api",
  "krishiv-catalog",
+ "krishiv-exec",
+ "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-schema-registry",
  "krishiv-sql",
+ "krishiv-state",
  "krishiv-udf",
  "krishiv-vector-sinks",
  "pyo3",
+ "pyo3-arrow",
+ "sha2",
  "tokio",
 ]
 
@@ -4079,6 +4153,8 @@ dependencies = [
  "axum 0.8.9",
  "krishiv-checkpoint",
  "krishiv-connectors",
+ "krishiv-governance",
+ "krishiv-metrics",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
@@ -4115,6 +4191,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "bytes",
+ "dashmap",
  "futures",
  "lz4_flex 0.11.6",
  "object_store",
@@ -4165,12 +4242,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tracing",
  "twox-hash",
 ]
 
 [[package]]
 name = "krishiv-testkit"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+]
 
 [[package]]
 name = "krishiv-udf"
@@ -4186,6 +4267,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "axum 0.8.9",
+ "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
  "serde",
@@ -4210,6 +4292,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "futures",
  "hex",
  "mockito",
  "parquet 58.3.0",
@@ -4934,6 +5017,23 @@ name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
+
+[[package]]
+name = "numpy"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "778da78c64ddc928ebf5ad9df5edf0789410ff3bdbf3619aed51cd789a6af1e2"
+dependencies = [
+ "half",
+ "libc",
+ "ndarray",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "pyo3",
+ "pyo3-build-config",
+ "rustc-hash 2.1.2",
+]
 
 [[package]]
 name = "object"
@@ -5749,12 +5849,36 @@ version = "0.28.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91fd8e38a3b50ed1167fb981cd6fd60147e091784c427b8f7183a7ee32c31c12"
 dependencies = [
+ "chrono",
+ "chrono-tz",
+ "indexmap 2.14.0",
  "libc",
  "once_cell",
  "portable-atomic",
  "pyo3-build-config",
  "pyo3-ffi",
  "pyo3-macros",
+]
+
+[[package]]
+name = "pyo3-arrow"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0360400036dda3db3d69102ef7e9646e4cd946c75a2d1d41fb8fd39879312636"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-cast 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
+ "arrow-select 58.3.0",
+ "chrono",
+ "chrono-tz",
+ "half",
+ "indexmap 2.14.0",
+ "numpy",
+ "pyo3",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5855,7 +5979,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls",
  "socket2 0.6.3",
  "thiserror 2.0.18",
@@ -5876,7 +6000,7 @@ dependencies = [
  "lru-slab",
  "rand 0.9.4",
  "ring",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls",
  "rustls-pki-types",
  "slab",
@@ -6344,6 +6468,12 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -7247,6 +7377,22 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44075987ee2486402f0808505dd65692163d243a337fc54363d49afac41087f6"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "bstr",
+ "fancy-regex",
+ "lazy_static",
+ "parking_lot",
+ "regex",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]

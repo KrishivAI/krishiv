@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
@@ -17,11 +18,15 @@ use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
 
+use krishiv_catalog::{datafusion_bridge::DataFusionCatalogBridge, InMemoryCatalog};
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
 mod lakehouse;
 mod udf;
+pub mod live_table;
+pub mod spark_compat;
+pub mod spark_compat_date;
 
 pub use lakehouse::{preprocess_as_of_sql, AsOfTableRef, MergeResult, MergeTargetUnsupportedError};
 
@@ -89,6 +94,7 @@ impl SqlPlan {
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
+    krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
     udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>>,
 }
@@ -112,9 +118,30 @@ impl SqlEngine {
     pub fn new() -> Self {
         Self {
             context: SessionContext::new(),
+            krishiv_catalog: None,
             view_registry: None,
             udf_registry: None,
         }
+    }
+
+    /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
+    pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self> {
+        let context = SessionContext::new();
+        context.register_catalog(
+            "krishiv",
+            Arc::new(DataFusionCatalogBridge::new(catalog.clone())),
+        );
+        Ok(Self {
+            context,
+            krishiv_catalog: Some(catalog),
+            view_registry: None,
+            udf_registry: None,
+        })
+    }
+
+    /// Shared Krishiv catalog backing this engine, if configured.
+    pub fn krishiv_catalog(&self) -> Option<&Arc<RwLock<InMemoryCatalog>>> {
+        self.krishiv_catalog.as_ref()
     }
 
     /// Share a session UDF registry so scalar UDFs are visible in SQL.
@@ -140,6 +167,32 @@ impl SqlEngine {
         udf::sync_scalar_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })
+    }
+
+    /// Register aggregate UDFs from the attached registry (P1-21).
+    pub async fn sync_aggregate_udfs(&self) -> SqlResult<()> {
+        let Some(registry) = &self.udf_registry else {
+            return Ok(());
+        };
+        let guard = registry.read().map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        udf::sync_aggregate_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })
+    }
+
+    /// Register table UDFs from the attached registry (P1-21).
+    pub async fn sync_table_udfs(&self) -> SqlResult<()> {
+        let Some(registry) = &self.udf_registry else {
+            return Ok(());
+        };
+        let guard = registry.read().map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        udf::sync_table_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })
     }
 
     /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
@@ -738,6 +791,37 @@ mod tests {
         SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
         referenced_table_names,
     };
+
+    #[tokio::test]
+    async fn catalog_table_resolved_in_sql() {
+        use std::sync::{Arc, RwLock};
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use krishiv_catalog::{CatalogField, FieldType, InMemoryCatalog, TableMetadata, TableSchema};
+
+        let catalog = Arc::new(RwLock::new(InMemoryCatalog::new()));
+        let schema = TableSchema::new(vec![CatalogField::new("id", FieldType::Int64, false)]);
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let values: Vec<Option<i64>> = (0..10).map(Some).collect();
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
+        catalog
+            .write()
+            .unwrap()
+            .register_table_with_batches(TableMetadata::new("t", schema), vec![batch])
+            .unwrap();
+
+        let engine = SqlEngine::with_in_memory_catalog(catalog).unwrap();
+        let df = engine
+            .sql("SELECT * FROM krishiv.public.t")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 10);
+    }
 
     #[test]
     fn rejects_empty_sql() {

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::chunk::{Chunk, TextChunker};
 use crate::embed::EmbeddingModel;
-use crate::memo::{MemoEntry, MemoStore};
+use crate::memo::{memo_key, MemoEntry, MemoStore};
 
 /// RAG refresh policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,43 +52,57 @@ where
 
         for (doc_id, text) in documents {
             let hash = content_hash(text);
-            if let Some(entry) = self.memo.get(&hash)?
-                && entry.embedding.len() == self.embedder.embedding_dim()
-            {
-                skipped += 1;
-                continue;
-            }
             let chunks: Vec<Chunk> = self.chunker.chunk(text);
             if chunks.is_empty() {
                 continue;
             }
-            let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+            let mut texts_to_embed = Vec::new();
+            let mut chunk_indices = Vec::new();
+            for chunk in &chunks {
+                let key = memo_key(&hash, chunk.chunk_index);
+                if let Some(entry) = self.memo.get(&key)?
+                    && entry.embedding.len() == self.embedder.embedding_dim()
+                {
+                    skipped += 1;
+                    continue;
+                }
+                texts_to_embed.push(chunk.text.clone());
+                chunk_indices.push(chunk.chunk_index);
+            }
+            if texts_to_embed.is_empty() {
+                continue;
+            }
             let embs = self
                 .embedder
-                .embed_batch(&texts)
+                .embed_batch(&texts_to_embed)
                 .await
                 .map_err(|e| e.to_string())?;
-            for (chunk, vector) in chunks.iter().zip(embs.iter()) {
+            for ((chunk_index, vector), text) in chunk_indices
+                .iter()
+                .zip(embs.iter())
+                .zip(texts_to_embed.iter())
+            {
                 let point_id = krishiv_vector_sinks::point_id_from_doc_epoch(
-                    &format!("{doc_id}:{}", chunk.chunk_index),
+                    &format!("{doc_id}:{chunk_index}"),
                     self.epoch,
                 );
                 let mut payload = HashMap::new();
-                payload.insert("text".into(), PayloadValue::String(chunk.text.clone()));
+                payload.insert("text".into(), PayloadValue::String(text.clone()));
                 payload.insert(
                     "chunk_index".into(),
-                    PayloadValue::Int(chunk.chunk_index as i64),
+                    PayloadValue::Int(*chunk_index as i64),
                 );
                 payload.insert("doc_id".into(), PayloadValue::String(doc_id.clone()));
-                doc_ids.push(format!("{doc_id}:{}", chunk.chunk_index));
+                doc_ids.push(format!("{doc_id}:{chunk_index}"));
                 vectors.push(vector.clone());
                 payloads.push(payload);
                 self.memo.put(
-                    &hash,
+                    &memo_key(&hash, *chunk_index),
                     &MemoEntry {
                         content_hash: hash.clone(),
                         embedding: vector.clone(),
                         point_id,
+                        created_at_ms: 0,
                     },
                 )?;
             }

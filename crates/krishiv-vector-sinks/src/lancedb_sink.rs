@@ -39,13 +39,48 @@ impl LanceDbSink {
     pub async fn open(uri: impl AsRef<Path>, table_name: &str, vector_dim: usize) -> VectorSinkResult<Self> {
         let uri = uri.as_ref().to_path_buf();
         std::fs::create_dir_all(&uri).map_err(|e| VectorSinkError::Connection(e.to_string()))?;
-        Ok(Self {
-            uri,
+        let mut sink = Self {
+            uri: uri.clone(),
             table_name: table_name.to_string(),
             vector_dim,
             index: InMemoryVectorSink::new(),
             manifest: RwLock::new(HashMap::new()),
-        })
+        };
+        sink.load_existing_fragments()?;
+        Ok(sink)
+    }
+
+    /// Reload Parquet fragments written in prior runs (P2-9).
+    fn load_existing_fragments(&mut self) -> VectorSinkResult<()> {
+        let table_dir = self.uri.join(&self.table_name);
+        if !table_dir.is_dir() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&table_dir).map_err(|e| VectorSinkError::Connection(e.to_string()))? {
+            let entry = entry.map_err(|e| VectorSinkError::Connection(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
+                continue;
+            }
+            let file = std::fs::File::open(&path).map_err(|e| VectorSinkError::Query(e.to_string()))?;
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .map_err(|e| VectorSinkError::Query(e.to_string()))?
+                .build()
+                .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+            for batch in reader {
+                let batch = batch.map_err(|e| VectorSinkError::Query(e.to_string()))?;
+                let restored = Self::arrow_batch_to_embedding(&batch, self.vector_dim)?;
+                // P2-9: reload is sync; block on in-memory index upsert.
+                futures::executor::block_on(self.index.upsert_batch(&restored))?;
+                if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                    self.manifest
+                        .write()
+                        .map_err(|e| VectorSinkError::Upsert(e.to_string()))?
+                        .insert(id.to_string(), path.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn fragment_path(&self, id: &str) -> PathBuf {
@@ -134,6 +169,41 @@ impl LanceDbSink {
             ],
         )
         .map_err(|e| VectorSinkError::Upsert(e.to_string()))
+    }
+
+    fn arrow_batch_to_embedding(batch: &RecordBatch, vector_dim: usize) -> VectorSinkResult<EmbeddingBatch> {
+        use arrow::array::Array;
+        let doc_ids = batch
+            .column_by_name("doc_id")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| VectorSinkError::SchemaConflict("missing doc_id".into()))?;
+        let epochs = batch
+            .column_by_name("epoch")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| VectorSinkError::SchemaConflict("missing epoch".into()))?;
+        let vectors = batch
+            .column_by_name("vector")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+            .ok_or_else(|| VectorSinkError::SchemaConflict("missing vector".into()))?;
+        let mut out = EmbeddingBatch {
+            doc_ids: Vec::new(),
+            vectors: Vec::new(),
+            payloads: vec![HashMap::new(); batch.num_rows()],
+            epoch: epochs.value(0) as u64,
+        };
+        for row in 0..batch.num_rows() {
+            out.doc_ids.push(doc_ids.value(row).to_string());
+            let list = vectors.value(row);
+            let floats = list
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| VectorSinkError::SchemaConflict("vector not float32".into()))?;
+            if floats.len() != vector_dim {
+                return Err(VectorSinkError::SchemaConflict("vector dim mismatch".into()));
+            }
+            out.vectors.push(floats.values().to_vec());
+        }
+        Ok(out)
     }
 }
 

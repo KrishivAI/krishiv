@@ -1,0 +1,261 @@
+//! Filesystem-backed Iceberg-style table with Parquet data files (P1-10).
+//!
+//! Persists snapshot layers as Parquet under `{root}/data/` and metadata in
+//! `{root}/metadata.json`. Supports restart durability: reopen the same path
+//! and scan committed rows.
+
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion,
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FsLayerMeta {
+    snapshot_id: i64,
+    file: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct FsTableMetadata {
+    last_snapshot_id: i64,
+    layers: Vec<FsLayerMeta>,
+}
+
+#[derive(Debug)]
+struct FsLayer {
+    snapshot_id: i64,
+    path: PathBuf,
+}
+
+/// Parquet-on-disk lakehouse table with snapshot layering (read + append).
+#[doc = "**Beta API**: may change between minor releases."]
+pub struct IcebergFsTable {
+    table_ref: IcebergTableRef,
+    schema_version: SchemaVersion,
+    root: PathBuf,
+    state: tokio::sync::Mutex<Vec<FsLayer>>,
+}
+
+impl IcebergFsTable {
+    #[doc = "**Beta API**: may change between minor releases."]
+    pub fn new(
+        root: impl AsRef<Path>,
+        table_ref: IcebergTableRef,
+        schema_version: SchemaVersion,
+    ) -> Result<Self, LakehouseError> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(root.join("data"))
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let layers = Self::load_layers(&root)?;
+        Ok(Self {
+            table_ref,
+            schema_version,
+            root,
+            state: tokio::sync::Mutex::new(layers),
+        })
+    }
+
+    fn metadata_path(root: &Path) -> PathBuf {
+        root.join("metadata.json")
+    }
+
+    fn load_layers(root: &Path) -> Result<Vec<FsLayer>, LakehouseError> {
+        let meta_path = Self::metadata_path(root);
+        if !meta_path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&meta_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let meta: FsTableMetadata =
+            serde_json::from_str(&text).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        Ok(meta
+            .layers
+            .into_iter()
+            .map(|l| FsLayer {
+                snapshot_id: l.snapshot_id,
+                path: root.join("data").join(l.file),
+            })
+            .collect())
+    }
+
+    fn persist_metadata(layers: &[FsLayer], root: &Path) -> Result<(), LakehouseError> {
+        let last_snapshot_id = layers.last().map(|l| l.snapshot_id).unwrap_or(0);
+        let meta = FsTableMetadata {
+            last_snapshot_id,
+            layers: layers
+                .iter()
+                .map(|l| FsLayerMeta {
+                    snapshot_id: l.snapshot_id,
+                    file: l.path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("part.parquet")
+                        .to_string(),
+                })
+                .collect(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&meta).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let tmp = root.join("metadata.json.tmp");
+        let final_path = Self::metadata_path(root);
+        fs::write(&tmp, &bytes).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        fs::rename(&tmp, &final_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>, LakehouseError> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?
+            .build()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        reader
+            .map(|b| b.map_err(|e| LakehouseError::Io(e.to_string())))
+            .collect()
+    }
+
+    fn write_parquet_file(path: &Path, batches: &[RecordBatch]) -> Result<(), LakehouseError> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        }
+        let schema = batches[0].schema();
+        let file = File::create(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut writer =
+            ArrowWriter::try_new(file, schema, None).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        }
+        writer
+            .close()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl LakehouseTable for IcebergFsTable {
+    fn table_ref(&self) -> &IcebergTableRef {
+        &self.table_ref
+    }
+
+    async fn schema(&self) -> Result<SchemaVersion, LakehouseError> {
+        Ok(self.schema_version.clone())
+    }
+
+    async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError> {
+        let layers = self.state.lock().await;
+        let selected: Vec<&FsLayer> = if let Some(target) = opts.snapshot_id {
+            layers.iter().filter(|l| l.snapshot_id <= target).collect()
+        } else {
+            layers.iter().collect()
+        };
+        let mut out = Vec::new();
+        for layer in selected {
+            out.extend(Self::read_parquet_file(&layer.path)?);
+        }
+        if let Some(limit) = opts.row_limit {
+            let mut trimmed = Vec::new();
+            let mut rows = 0u64;
+            for batch in out {
+                if rows >= limit {
+                    break;
+                }
+                let take = (limit - rows).min(batch.num_rows() as u64) as usize;
+                if take < batch.num_rows() {
+                    trimmed.push(batch.slice(0, take));
+                } else {
+                    trimmed.push(batch);
+                }
+                rows += take as u64;
+            }
+            return Ok(trimmed);
+        }
+        Ok(out)
+    }
+
+    async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let mut layers = self.state.lock().await;
+        let next_id = layers.last().map(|l| l.snapshot_id + 1).unwrap_or(1);
+        let file_name = format!("snap-{next_id:05}.parquet");
+        let path = self.root.join("data").join(&file_name);
+        Self::write_parquet_file(&path, &batches)?;
+        layers.push(FsLayer {
+            snapshot_id: next_id,
+            path,
+        });
+        Self::persist_metadata(&layers, &self.root)?;
+        Ok(())
+    }
+
+    async fn current_snapshot_id(&self) -> Result<Option<i64>, LakehouseError> {
+        let layers = self.state.lock().await;
+        Ok(layers.last().map(|l| l.snapshot_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn schema_version() -> SchemaVersion {
+        SchemaVersion {
+            schema_id: 1,
+            fields: vec![crate::SchemaField {
+                id: 1,
+                name: "x".to_string(),
+                required: true,
+                data_type: "int64".to_string(),
+            }],
+        }
+    }
+
+    fn batch(values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_append_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let root = dir.path().to_path_buf();
+
+        {
+            let table =
+                IcebergFsTable::new(&root, table_ref.clone(), schema_version()).unwrap();
+            table.append(vec![batch(vec![1, 2, 3])]).await.unwrap();
+            table.append(vec![batch(vec![4, 5])]).await.unwrap();
+        }
+
+        let reopened = IcebergFsTable::new(&root, table_ref, schema_version()).unwrap();
+        let rows: usize = reopened
+            .scan(&IcebergScanOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 5);
+        assert_eq!(reopened.current_snapshot_id().await.unwrap(), Some(2));
+    }
+}
