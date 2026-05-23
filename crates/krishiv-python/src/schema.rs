@@ -1,181 +1,218 @@
-//! Python `Schema` base class — annotation → Arrow type mapping (ADR-R13-02).
+//! `ks.Schema` — Python type annotations → Arrow types (ADR-R13-02).
 
-use arrow::datatypes::{DataType, Field, Schema};
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3_arrow::PySchema as ArrowPySchema;
 
-use crate::SchemaError;
+use crate::errors::SchemaError;
 
-const ARROW_FIELDS_KEY: &str = "_krishiv_arrow_fields";
+const FIELDS_ATTR: &str = "_krishiv_fields";
 
-/// Base class for declarative Krishiv schemas (`class MySchema(ks.Schema): ...`).
+/// Declarative schema base class. Subclasses declare columns via PEP 484 annotations.
 #[pyclass(name = "Schema", subclass)]
-pub struct PySchema;
+#[derive(Clone)]
+pub struct PySchema {
+    fields: Vec<(String, DataType)>,
+}
+
+impl PySchema {
+    fn fields_from_class<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<(String, DataType)>> {
+        if let Ok(attr) = cls.getattr(FIELDS_ATTR) {
+            if let Ok(dict) = attr.cast::<PyDict>() {
+                let mut fields = Vec::new();
+                for (name, dt_obj) in dict.iter() {
+                    let name: String = name.extract()?;
+                    let dt_str: String = dt_obj.extract()?;
+                    let dt: DataType = dt_str.parse().map_err(
+                        |_| {
+                            PyRuntimeError::new_err("invalid Arrow type in schema".to_string())
+                        },
+                    )?;
+                    fields.push((name, dt));
+                }
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                return Ok(fields);
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn store_fields_on_class<'py>(
+        cls: &Bound<'py, PyType>,
+        fields: &[(String, DataType)],
+    ) -> PyResult<()> {
+        let dict = PyDict::new(cls.py());
+        for (name, dt) in fields {
+            dict.set_item(name, dt.to_string())?;
+        }
+        cls.setattr(FIELDS_ATTR, dict)?;
+        Ok(())
+    }
+
+    pub fn arrow_schema_from_class<'py>(cls: &Bound<'py, PyType>) -> PyResult<Arc<Schema>> {
+        let fields = Self::fields_from_class(cls)?;
+        if fields.is_empty() {
+            return Err(SchemaError::new_err(
+                "Schema subclass has no column annotations; declare fields like `name: str`",
+            ));
+        }
+        let arrow_fields: Vec<Field> = fields
+            .iter()
+            .map(|(n, dt)| Field::new(n, dt.clone(), true))
+            .collect();
+        Ok(Arc::new(Schema::new(arrow_fields)))
+    }
+}
 
 #[pymethods]
 impl PySchema {
+    #[new]
+    fn new() -> Self {
+        Self { fields: vec![] }
+    }
+
     #[classmethod]
-    #[pyo3(signature = (**_kwargs))]
     fn __init_subclass__(
         cls: &Bound<'_, PyType>,
+        _args: &Bound<'_, PyTuple>,
         _kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let annotations = cls.getattr("__annotations__")?;
+        let py = cls.py();
+        let annotations = match cls.getattr("__annotations__") {
+            Ok(a) => a,
+            Err(_) => return Ok(()),
+        };
         let ann_dict = annotations.cast::<PyDict>()?;
         let mut fields = Vec::new();
-
-        for (name_any, type_hint) in ann_dict.iter() {
-            let name: String = name_any.extract()?;
+        for (name, ann) in ann_dict.iter() {
+            let name: String = name.extract()?;
             if name.starts_with('_') {
                 continue;
             }
-            let data_type = python_type_to_arrow(&type_hint)?;
-            fields.push(Field::new(name, data_type, true));
+            let dt = python_annotation_to_arrow(py, ann)?;
+            fields.push((name, dt));
         }
-
-        let py = cls.py();
-        let field_list = PyList::empty(py);
-        for field in &fields {
-            let item = PyTuple::new(
-                py,
-                [
-                    PyString::new(py, field.name()).into_any(),
-                    PyString::new(py, &format!("{:?}", field.data_type())).into_any(),
-                ],
-            )?;
-            field_list.append(item)?;
-        }
-        cls.setattr(ARROW_FIELDS_KEY, field_list)?;
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        Self::store_fields_on_class(cls, &fields)?;
         Ok(())
     }
 
     #[classmethod]
-    fn arrow_schema(cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
-        let fields = load_arrow_fields(cls)?;
-        let schema = Schema::new(fields);
-        schema_to_pyarrow(cls.py(), &schema)
+    fn arrow_schema(cls: &Bound<'_, PyType>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let schema = Self::arrow_schema_from_class(cls)?;
+        let py_schema = ArrowPySchema::new(schema);
+        Ok(py_schema.into_pyobject(py)?.into_any().unbind())
+    }
+
+    #[classmethod]
+    fn column_names(cls: &Bound<'_, PyType>) -> PyResult<Vec<String>> {
+        Ok(Self::fields_from_class(cls)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
     }
 
     #[classmethod]
     fn _repr_html_(cls: &Bound<'_, PyType>) -> PyResult<String> {
-        let fields = load_arrow_fields(cls)?;
-        let mut rows = String::from("<table><tr><th>column</th><th>type</th></tr>");
-        for field in fields {
-            rows.push_str(&format!(
-                "<tr><td>{}</td><td>{:?}</td></tr>",
-                field.name(),
-                field.data_type()
+        let fields = PySchema::fields_from_class(&cls)?;
+        let mut html = String::from(
+            "<table><thead><tr><th>Column</th><th>Arrow type</th></tr></thead><tbody>",
+        );
+        for (name, dt) in fields {
+            html.push_str(&format!(
+                "<tr><td>{name}</td><td><code>{dt}</code></td></tr>"
             ));
         }
-        rows.push_str("</table>");
-        Ok(rows)
+        html.push_str("</tbody></table>");
+        Ok(html)
     }
 
     #[classmethod]
     fn __repr__(cls: &Bound<'_, PyType>) -> PyResult<String> {
-        let fields = load_arrow_fields(cls)?;
-        let names: Vec<_> = fields.iter().map(|f| f.name().as_str()).collect();
-        Ok(format!("Schema({names:?})"))
+        let names: Vec<String> = PySchema::fields_from_class(&cls)?
+            .into_iter()
+            .map(|(n, dt)| format!("{n}: {dt}"))
+            .collect();
+        Ok(format!("Schema({})", names.join(", ")))
     }
 }
 
-pub(crate) fn load_arrow_fields(cls: &Bound<'_, PyType>) -> PyResult<Vec<Field>> {
-    let stored = if cls.hasattr(ARROW_FIELDS_KEY)? {
-        cls.getattr(ARROW_FIELDS_KEY)?
-    } else {
-        return Err(SchemaError::new_err(
-            "Schema subclass has no resolved fields; inherit from Schema",
-        ));
-    };
-    let list = stored.cast::<PyList>()?;
-    let mut fields = Vec::with_capacity(list.len());
-    for item in list.iter() {
-        let tuple = item.cast::<PyTuple>()?;
-        let name: String = tuple.get_item(0)?.extract()?;
-        let type_str: String = tuple.get_item(1)?.extract()?;
-        let data_type = arrow_type_from_debug_str(&type_str)?;
-        fields.push(Field::new(name, data_type, true));
-    }
-    Ok(fields)
-}
-
-fn python_type_to_arrow(py_type: &Bound<'_, PyAny>) -> PyResult<DataType> {
-    if py_type.is_none() {
-        return Err(SchemaError::new_err("column type annotation cannot be None"));
+fn python_annotation_to_arrow(py: Python<'_>, ann: Bound<'_, PyAny>) -> PyResult<DataType> {
+    let builtins = py.import("builtins")?;
+    let typing = py.import("typing")?;
+    if let Ok(origin) = ann.getattr("__origin__") {
+        let union_type = typing.getattr("Union")?;
+        if origin.is(&union_type) {
+            let args_obj = ann.getattr("__args__")?;
+            let args = args_obj.cast::<PyTuple>()?;
+            let non_none: Vec<Bound<'_, PyAny>> = args
+                .iter()
+                .filter(|a| !a.is_none())
+                .map(|a| a.clone())
+                .collect();
+            if non_none.len() == 1 {
+                return python_annotation_to_arrow(py, non_none[0].clone());
+            }
+        }
     }
 
-    if let Ok(py_type_obj) = py_type.cast::<PyType>() {
-        let name = py_type_obj.name()?.to_string();
-        return match name.as_str() {
-            "str" => Ok(DataType::Utf8),
-            "int" => Ok(DataType::Int64),
-            "float" => Ok(DataType::Float64),
-            "bool" => Ok(DataType::Boolean),
-            "bytes" => Ok(DataType::LargeBinary),
-            "datetime" => Ok(DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                None,
-            )),
-            other => Err(SchemaError::new_err(format!(
-                "unsupported schema column type: {other}"
-            ))),
-        };
+    let str_ty = builtins.getattr("str")?;
+    let int_ty = builtins.getattr("int")?;
+    let float_ty = builtins.getattr("float")?;
+    let bool_ty = builtins.getattr("bool")?;
+    let bytes_ty = builtins.getattr("bytes")?;
+
+    if ann.is(&str_ty) {
+        return Ok(DataType::Utf8);
+    }
+    if ann.is(&int_ty) {
+        return Ok(DataType::Int64);
+    }
+    if ann.is(&float_ty) {
+        return Ok(DataType::Float64);
+    }
+    if ann.is(&bool_ty) {
+        return Ok(DataType::Boolean);
+    }
+    if ann.is(&bytes_ty) {
+        return Ok(DataType::LargeBinary);
     }
 
+    let datetime_mod = py.import("datetime")?;
+    let datetime_ty = datetime_mod.getattr("datetime")?;
+    if ann.is(&datetime_ty) {
+        return Ok(DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+
+    let name = ann.str()?.to_string();
     Err(SchemaError::new_err(format!(
-        "unsupported type annotation: {py_type}"
+        "unsupported schema annotation: {name}"
     )))
 }
 
-fn arrow_type_from_debug_str(s: &str) -> PyResult<DataType> {
-    match s {
-        "Utf8" => Ok(DataType::Utf8),
-        "Int64" => Ok(DataType::Int64),
-        "Float64" => Ok(DataType::Float64),
-        "Boolean" => Ok(DataType::Boolean),
-        "LargeBinary" => Ok(DataType::LargeBinary),
-        s if s.starts_with("Timestamp") => Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        )),
-        other => Err(SchemaError::new_err(format!("unknown Arrow type: {other}"))),
+pub fn validate_batch_against_schema_class<'py>(
+    cls: &Bound<'py, PyType>,
+    batch: &arrow::record_batch::RecordBatch,
+) -> PyResult<()> {
+    let expected = PySchema::fields_from_class(cls)?;
+    if expected.is_empty() {
+        return Ok(());
     }
-}
-
-pub(crate) fn schema_to_pyarrow(py: Python<'_>, schema: &Schema) -> PyResult<Py<PyAny>> {
-    let pa = py.import("pyarrow")?;
-    let field_type = pa.getattr("field")?;
-    let mut py_fields = Vec::new();
-    for field in schema.fields() {
-        let pa_type = data_type_to_pyarrow(py, field.data_type())?;
-        let py_field = field_type.call1((field.name(), pa_type, field.is_nullable()))?;
-        py_fields.push(py_field);
-    }
-    let fields_tuple = PyTuple::new(py, py_fields)?;
-    Ok(pa.getattr("schema")?.call1((fields_tuple,))?.unbind())
-}
-
-fn data_type_to_pyarrow(py: Python<'_>, data_type: &DataType) -> PyResult<Py<PyAny>> {
-    let pa = py.import("pyarrow")?;
-    let value = match data_type {
-        DataType::Utf8 => pa.getattr("string")?.call0()?,
-        DataType::Int64 => pa.getattr("int64")?.call0()?,
-        DataType::Float64 => pa.getattr("float64")?.call0()?,
-        DataType::Boolean => pa.getattr("bool_")?.call0()?,
-        DataType::LargeBinary => pa.getattr("large_binary")?.call0()?,
-        DataType::Timestamp(unit, _) => match unit {
-            arrow::datatypes::TimeUnit::Microsecond => pa.getattr("timestamp")?.call1(("us",))?,
-            other => {
-                return Err(SchemaError::new_err(format!(
-                    "unsupported timestamp unit for pyarrow export: {other:?}"
-                )));
-            }
-        },
-        other => {
+    let batch_schema = batch.schema();
+    for (name, expected_dt) in expected {
+        let idx = batch_schema.index_of(&name).map_err(|_| {
+            SchemaError::new_err(format!("schema column '{name}' not found in batch"))
+        })?;
+        let actual = batch_schema.field(idx).data_type();
+        if actual != &expected_dt {
             return Err(SchemaError::new_err(format!(
-                "unsupported Arrow type for pyarrow export: {other:?}"
+                "column '{name}': expected {expected_dt}, got {actual}"
             )));
         }
-    };
-    Ok(value.unbind())
+    }
+    Ok(())
 }

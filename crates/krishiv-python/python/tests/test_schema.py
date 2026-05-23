@@ -1,19 +1,35 @@
 """Schema annotation → Arrow type mapping."""
 
-import pytest
+from datetime import datetime
 
-pyarrow = pytest.importorskip("pyarrow")
+import krishiv as ks
 
 
-def test_schema_annotations_resolve():
-    import krishiv as ks
+class EventSchema(ks.Schema):
+    name: str
+    value: float
+    active: bool
+    ts: datetime
+    payload: bytes
 
-    class EventSchema(ks.Schema):
-        user_id: str
-        value: float
-        active: bool
 
-    fields = {f.name: str(f.type) for f in EventSchema.arrow_schema()}
-    assert "user_id" in fields
-    assert "value" in fields
-    assert "active" in fields
+def test_schema_column_names():
+    assert EventSchema.column_names() == ["active", "name", "payload", "ts", "value"]
+
+
+def test_schema_repr_html_contains_columns():
+    html = EventSchema._repr_html_()
+    assert "name" in html
+    assert "Float64" in html or "float" in html.lower()
+
+
+def test_arrow_schema_requires_pyarrow():
+    try:
+        import pyarrow  # noqa: F401
+
+        schema = EventSchema.arrow_schema()
+        assert schema.field("name").type == pyarrow.string()
+    except ImportError:
+        import pytest
+
+        pytest.skip("pyarrow not installed")

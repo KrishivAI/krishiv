@@ -25,20 +25,18 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# pip install krishiv[pandas]
 pandas = ["pandas>=1.5"]
-# pip install krishiv[pyarrow]
 pyarrow = ["pyarrow>=14.0"]
-# pip install krishiv[all]
-all = ["pandas>=1.5", "pyarrow>=14.0"]
+arrow = ["pyarrow>=14.0", "pandas>=1.5"]
+kafka = []
+iceberg = []
+all = ["pandas>=1.5", "pyarrow>=14.0", "kafka", "iceberg"]
 
 [tool.maturin]
-# Makes the extension importable as `import krishiv` (not `import krishiv_python`)
 module-name = "krishiv"
 features = ["pyo3/extension-module"]
-# Strip debug symbols in release builds to reduce wheel size
 strip = true
-# Target the Cargo.toml in this directory
 manifest-path = "Cargo.toml"
-# Include the pure-Python package facade alongside the native extension
 python-source = "python"
+
+# Map pip extras → Cargo features (maturin 1.7+)
