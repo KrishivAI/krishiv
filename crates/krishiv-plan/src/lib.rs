@@ -9,6 +9,7 @@
 use std::fmt;
 
 pub mod r17;
+pub mod streaming;
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
     RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
@@ -126,6 +127,12 @@ pub enum NodeOp {
         /// Number of output partitions after coalescing.
         target_partitions: usize,
     },
+    /// Create a live table backed by a streaming query.
+    CreateLiveTable { name: String, query: String },
+    /// Refresh materialized state for a live table.
+    RefreshLiveTable { name: String },
+    /// Drop a live table.
+    DropLiveTable { name: String },
     /// Operator not covered by the above variants.
     Other { description: String },
 }

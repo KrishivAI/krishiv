@@ -29,6 +29,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let client = Client::try_default().await?;
+    // P0-4: embedded coordinator must tick heartbeats and launch assigned tasks.
+    runtime.coordinator().spawn_orchestration_loops();
     if config.status_addr.is_some() || config.executor_grpc_addr.is_some() {
         run_controller_with_servers(
             client,

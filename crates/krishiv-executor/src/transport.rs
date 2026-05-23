@@ -128,6 +128,11 @@ impl ExecutorConfig {
         self.lease_generation
     }
 
+    /// Update lease generation after coordinator registration or heartbeat (P0-8).
+    pub fn set_lease_generation(&mut self, lease_generation: LeaseGeneration) {
+        self.lease_generation = lease_generation;
+    }
+
     /// Build an executor descriptor for registration.
     pub fn descriptor(&self) -> ExecutorDescriptor {
         ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots)
@@ -149,6 +154,16 @@ impl ExecutorRuntime {
     /// Runtime configuration.
     pub fn config(&self) -> &ExecutorConfig {
         &self.config
+    }
+
+    /// Mutable runtime configuration (lease generation updates).
+    pub fn config_mut(&mut self) -> &mut ExecutorConfig {
+        &mut self.config
+    }
+
+    /// Apply lease generation from a coordinator transport response (P0-8).
+    pub fn apply_lease_generation(&mut self, lease_generation: LeaseGeneration) {
+        self.config.set_lease_generation(lease_generation);
     }
 
     /// Build the versioned registration request this executor will send.
@@ -290,7 +305,7 @@ impl ExecutorRuntime {
 
     /// Register once and immediately send one heartbeat over gRPC.
     pub async fn register_and_heartbeat_once(
-        &self,
+        &mut self,
     ) -> ExecutorTransportResult<(RegisterExecutorResponse, ExecutorHeartbeatResponse)> {
         let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
             self.config.coordinator_endpoint.clone(),
@@ -304,6 +319,7 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let registration = wire::register_executor_response_from_wire(registration)?;
+        self.apply_lease_generation(registration.lease_generation());
 
         let heartbeat = client
             .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
@@ -312,6 +328,7 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat)?;
+        self.apply_lease_generation(heartbeat.lease_generation());
 
         Ok((registration, heartbeat))
     }
@@ -332,17 +349,45 @@ impl ExecutorRuntime {
 ///
 /// GAP-CP-09: The task runner in `--connect` mode needs a `CoordinatorExecutorService`
 /// to report task status (Running / Succeeded / Failed) after each assignment is
-/// executed.  Each RPC reconnects to the coordinator endpoint; channel pooling
-/// is deferred to R14.
+/// executed.
 #[derive(Debug, Clone)]
 pub struct GrpcCoordinatorService {
     endpoint: String,
+    client: std::sync::Arc<
+        tokio::sync::Mutex<
+            Option<wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
+                tonic::transport::Channel,
+            >>,
+        >,
+    >,
 }
 
 impl GrpcCoordinatorService {
     /// Create a gRPC coordinator service backed by `endpoint`.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Self { endpoint: endpoint.into() }
+        Self {
+            endpoint: endpoint.into(),
+            client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    async fn client(
+        &self,
+    ) -> Result<
+        wire::v1::coordinator_executor_client::CoordinatorExecutorClient<tonic::transport::Channel>,
+        tonic::Status,
+    > {
+        let mut guard = self.client.lock().await;
+        if guard.is_none() {
+            *guard = Some(
+                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
+                    self.endpoint.clone(),
+                )
+                .await
+                .map_err(|e| tonic::Status::unavailable(e.to_string()))?,
+            );
+        }
+        Ok(guard.as_ref().expect("client initialized").clone())
     }
 }
 
@@ -352,12 +397,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         &self,
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
-        let mut client =
-            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-                self.endpoint.clone(),
-            )
-            .await
-            .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+        let mut client = self.client().await?;
         let response = client
             .register_executor(wire::register_executor_request_to_wire(request.into_inner()))
             .await?
@@ -372,12 +412,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         &self,
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
-        let mut client =
-            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-                self.endpoint.clone(),
-            )
-            .await
-            .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+        let mut client = self.client().await?;
         let response = client
             .deregister_executor(wire::deregister_executor_request_to_wire(
                 request.into_inner(),
@@ -394,12 +429,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         &self,
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
-        let mut client =
-            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-                self.endpoint.clone(),
-            )
-            .await
-            .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+        let mut client = self.client().await?;
         let response = client
             .executor_heartbeat(wire::executor_heartbeat_request_to_wire(request.into_inner()))
             .await?
@@ -414,12 +444,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         &self,
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
-        let mut client =
-            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-                self.endpoint.clone(),
-            )
-            .await
-            .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+        let mut client = self.client().await?;
         let response = client
             .task_status(wire::task_status_request_to_wire(request.into_inner()))
             .await?
@@ -434,12 +459,7 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         &self,
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
-        let mut client =
-            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-                self.endpoint.clone(),
-            )
-            .await
-            .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+        let mut client = self.client().await?;
         let response = client
             .checkpoint_ack(wire::checkpoint_ack_request_to_wire(request.into_inner()))
             .await?

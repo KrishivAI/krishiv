@@ -1,6 +1,7 @@
 //! Python `krishiv.ai` submodule (R17).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use krishiv_ai::{
     EmbeddingDevice, EmbeddingModelRegistry, HuggingFaceEmbeddingModel, MarkdownSectionChunker,
@@ -10,6 +11,13 @@ use krishiv_vector_sinks::{InMemoryVectorSink, VectorSink};
 use pyo3::prelude::*;
 
 use crate::RUNTIME;
+
+static RAG_VECTOR_SINKS: std::sync::LazyLock<RwLock<HashMap<String, Arc<dyn VectorSink>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn rag_model_key(model: &str) -> String {
+    model.to_string()
+}
 
 #[pyclass(name = "RecursiveTextChunker")]
 pub struct PyRecursiveTextChunker {
@@ -129,6 +137,10 @@ fn rag_index(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let chunker = Arc::new(RecursiveTextChunker::new(512, 64));
     let sink: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
+    RAG_VECTOR_SINKS
+        .write()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        .insert(rag_model_key(model), sink.clone());
     let dir = std::env::temp_dir().join(format!("krishiv-rag-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let memo = krishiv_ai::MemoStore::open(dir.join("memo.redb"))
@@ -163,7 +175,16 @@ fn rag_query(query_text: &str, model: &str, top_k: usize) -> PyResult<Vec<(Strin
             .map_err(|e| krishiv_ai::EmbeddingError::Load(e.to_string()))
     })
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    let sink: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
+    let sink = RAG_VECTOR_SINKS
+        .read()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        .get(&rag_model_key(model))
+        .cloned()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "no RAG index for this model; call krishiv.ai.rag_index first",
+            )
+        })?;
     let query = krishiv_ai::RagQuery { embedder, sink };
     let chunks = RUNTIME
         .block_on(query.query(query_text, top_k))
@@ -172,6 +193,27 @@ fn rag_query(query_text: &str, model: &str, top_k: usize) -> PyResult<Vec<(Strin
         .into_iter()
         .map(|c| (c.text, c.score))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rag_index_then_query_returns_results() {
+        let sink: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
+        RAG_VECTOR_SINKS
+            .write()
+            .unwrap()
+            .insert(rag_model_key("test-model"), sink);
+        assert!(
+            RAG_VECTOR_SINKS
+                .read()
+                .unwrap()
+                .contains_key("test-model"),
+            "rag_index must register the shared sink for rag_query"
+        );
+    }
 }
 
 /// Register the `krishiv.ai` submodule.

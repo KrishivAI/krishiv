@@ -3848,6 +3848,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-cep"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "serde",
+]
+
+[[package]]
 name = "krishiv-chaos"
 version = "0.1.0"
 dependencies = [
@@ -3877,6 +3885,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "krishiv-exec",
+ "krishiv-lakehouse",
  "krishiv-proto",
  "object_store",
  "parquet 58.3.0",
@@ -3894,6 +3904,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-ai",
+ "krishiv-cep",
+ "krishiv-lakehouse",
  "krishiv-plan",
  "tokio",
 ]

@@ -38,7 +38,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
     let http_addr = config.http_addr;
     let task_grpc_addr = config.task_grpc_addr;
-    let runtime = ExecutorRuntime::new(config.into_executor_config()?);
+    let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
 
     // Start optional HTTP health server (/healthz, /readyz, /metrics).
     if let Some(addr) = http_addr {
@@ -57,9 +57,9 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
     match mode {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
-        ExecutorMode::RegisterOnce => register_once(&runtime).await,
+        ExecutorMode::RegisterOnce => register_once(&mut runtime).await,
         ExecutorMode::Connect => {
-            heartbeat_loop(&runtime, heartbeat_interval_secs, task_grpc_addr).await
+            heartbeat_loop(runtime, heartbeat_interval_secs, task_grpc_addr).await
         }
     }
 }
@@ -107,7 +107,7 @@ fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
     Ok(())
 }
 
-async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
+async fn register_once(runtime: &mut ExecutorRuntime) -> Result<(), String> {
     println!("{}", runtime.startup_summary());
     let (registration, heartbeat) = runtime
         .register_and_heartbeat_once()
@@ -133,11 +133,11 @@ async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
 }
 
 async fn heartbeat_loop(
-    runtime: &ExecutorRuntime,
+    mut runtime: ExecutorRuntime,
     heartbeat_interval_secs: u64,
     task_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
-    register_once(runtime).await?;
+    register_once(&mut runtime).await?;
 
     // GAP-CP-09: Start the executor task gRPC server so the coordinator can push
     // task assignments without polling.  The inbox is shared between the gRPC
@@ -185,6 +185,7 @@ async fn heartbeat_loop(
                     .heartbeat_with_grpc_endpoint()
                     .await
                     .map_err(|error| error.to_string())?;
+                runtime.apply_lease_generation(heartbeat.lease_generation());
                 krishiv_executor::transport::ExecutorRuntime::apply_llm_throttles_from_response(
                     &heartbeat,
                 );

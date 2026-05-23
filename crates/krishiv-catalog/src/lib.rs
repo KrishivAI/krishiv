@@ -392,6 +392,8 @@ impl TableProvider for TableMetadataProvider {
 /// An in-memory catalog backed by a sorted map.
 pub struct InMemoryCatalog {
     tables: BTreeMap<String, TableMetadataProvider>,
+    /// Optional in-memory row data keyed by table name.
+    table_data: BTreeMap<String, std::sync::Arc<Vec<arrow::record_batch::RecordBatch>>>,
 }
 
 impl InMemoryCatalog {
@@ -399,7 +401,27 @@ impl InMemoryCatalog {
     pub fn new() -> Self {
         Self {
             tables: BTreeMap::new(),
+            table_data: BTreeMap::new(),
         }
+    }
+
+    /// Register a table and attach in-memory Arrow batches for SQL scans (P0-9).
+    pub fn register_table_with_batches(
+        &mut self,
+        metadata: TableMetadata,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> CatalogResult<()> {
+        let name = metadata.name().to_owned();
+        self.register_table(metadata)?;
+        if !batches.is_empty() {
+            self.table_data.insert(name, std::sync::Arc::new(batches));
+        }
+        Ok(())
+    }
+
+    /// Return stored batches for a registered table, if any.
+    pub fn table_batches(&self, name: &str) -> Option<std::sync::Arc<Vec<arrow::record_batch::RecordBatch>>> {
+        self.table_data.get(name).cloned()
     }
 }
 
@@ -489,20 +511,12 @@ impl SchemaRegistry for InMemorySchemaRegistry {
 /// [`SessionContext`]: datafusion::prelude::SessionContext
 pub mod datafusion_bridge {
     use std::any::Any;
-    use std::borrow::Cow;
     use std::fmt;
     use std::sync::{Arc, RwLock};
 
-    use arrow::datatypes::SchemaRef;
     use datafusion::catalog::{CatalogProvider, SchemaProvider};
-    use datafusion::datasource::TableType;
+    use datafusion::datasource::MemTable;
     use datafusion::error::Result as DfResult;
-    use datafusion::logical_expr::Expr;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::physical_plan::empty::EmptyExec;
-
-    // Bring in the Session trait used by TableProvider::scan in DataFusion 48.
-    use datafusion::catalog::Session;
 
     /// Bridges a Krishiv [`InMemoryCatalog`] into a DataFusion
     /// [`CatalogProvider`].
@@ -589,11 +603,12 @@ pub mod datafusion_bridge {
             match catalog.get_table(name) {
                 Ok(table_provider) => {
                     let arrow_schema = Arc::new(table_provider.schema().to_arrow_schema());
-                    let bridge = DataFusionTableBridge {
-                        name: name.to_string(),
-                        arrow_schema,
-                    };
-                    Ok(Some(Arc::new(bridge)))
+                    let batches = catalog.table_batches(name);
+                    let partitions = batches
+                        .map(|b| (*b).clone())
+                        .unwrap_or_default();
+                    let mem = MemTable::try_new(arrow_schema, vec![partitions])?;
+                    Ok(Some(Arc::new(mem) as Arc<dyn datafusion::datasource::TableProvider>))
                 }
                 Err(_) => Ok(None),
             }
@@ -606,52 +621,6 @@ pub mod datafusion_bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
-
-    #[derive(Debug)]
-    struct DataFusionTableBridge {
-        name: String,
-        arrow_schema: SchemaRef,
-    }
-
-    #[async_trait::async_trait]
-    impl datafusion::datasource::TableProvider for DataFusionTableBridge {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn schema(&self) -> SchemaRef {
-            self.arrow_schema.clone()
-        }
-
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-
-        fn get_table_definition(&self) -> Option<&str> {
-            None
-        }
-
-        fn get_logical_plan(&self) -> Option<Cow<'_, datafusion::logical_expr::LogicalPlan>> {
-            None
-        }
-
-        async fn scan(
-            &self,
-            _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> DfResult<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(EmptyExec::new(self.arrow_schema.clone())))
-        }
-    }
-
-    impl fmt::Display for DataFusionTableBridge {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "DataFusionTableBridge({})", self.name)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +756,42 @@ mod tests {
         assert!(!schema_provider.table_exist("nonexistent"));
     }
 
-    #[test]
+    #[tokio::test]
+    async fn catalog_scan_returns_registered_row_count() {
+        use std::sync::Arc;
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::catalog::CatalogProvider as DfCatalogProvider;
+        use datafusion::prelude::SessionContext;
+
+        let catalog = Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
+        let schema = TableSchema::new(vec![CatalogField::new("id", FieldType::Int64, false)]);
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let values: Vec<Option<i64>> = (0..10).map(Some).collect();
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
+        catalog
+            .write()
+            .unwrap()
+            .register_table_with_batches(TableMetadata::new("t", schema), vec![batch])
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "krishiv",
+            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog)),
+        );
+        let df = ctx
+            .sql("SELECT * FROM krishiv.public.t")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 10);
+    }
+
     fn datafusion_bridge_unknown_schema_returns_none() {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 

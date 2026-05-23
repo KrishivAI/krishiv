@@ -13,10 +13,13 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub mod cdc;
+pub mod cdc_router;
 pub mod feature_store;
 pub mod kafka;
 pub mod parquet;
 pub mod s3;
+pub mod transactional_kafka;
+pub mod two_phase_parquet_s3;
 
 pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
 

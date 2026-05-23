@@ -462,6 +462,16 @@ mod tests {
         assert!(heartbeat.running_attempts().is_empty());
     }
 
+    #[test]
+    fn lease_generation_updated_after_reregister() {
+        let mut runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-1", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let next = LeaseGeneration::initial().next();
+        runtime.apply_lease_generation(next);
+        assert_eq!(runtime.config().lease_generation(), next);
+    }
+
     #[tokio::test]
     async fn runtime_registers_and_heartbeats_through_service_boundary() {
         let runtime = ExecutorRuntime::new(

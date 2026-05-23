@@ -454,6 +454,74 @@ impl SharedCoordinator {
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Coordinator>> {
         self.inner.write()
     }
+
+    /// Advance the heartbeat clock by one tick (P0-4).
+    pub fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
+        self.write()
+            .map_err(|_| SchedulerError::Transport {
+                message: "coordinator lock poisoned".to_string(),
+            })?
+            .advance_heartbeat_clock(1)
+    }
+
+    /// Launch and push all assigned tasks for non-terminal jobs (P0-4).
+    pub async fn drive_pending_task_launches(&self) -> SchedulerResult<usize> {
+        let job_ids = {
+            let coord = self.read().map_err(|_| SchedulerError::Transport {
+                message: "coordinator lock poisoned".to_string(),
+            })?;
+            coord
+                .jobs
+                .iter()
+                .filter(|(_, job)| !job.state().is_terminal())
+                .map(|(job_id, _)| job_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut launched = 0usize;
+        for job_id in job_ids {
+            let targets = {
+                let mut coord = self.write().map_err(|_| SchedulerError::Transport {
+                    message: "coordinator lock poisoned".to_string(),
+                })?;
+                let assignments = coord.launch_assigned_task_assignments(&job_id)?;
+                coord.resolve_assignment_targets(assignments)?
+            };
+            let channels = {
+                let coord = self.read().map_err(|_| SchedulerError::Transport {
+                    message: "coordinator lock poisoned".to_string(),
+                })?;
+                coord.executor_channels.clone()
+            };
+            let responses =
+                Coordinator::deliver_assignment_targets_with_channels(channels, targets).await?;
+            launched = launched.saturating_add(responses.len());
+        }
+        Ok(launched)
+    }
+
+    /// Spawn background heartbeat and task-launch loops for standalone deployments (P0-4).
+    pub fn spawn_orchestration_loops(&self) {
+        let heartbeat = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(error) = heartbeat.advance_heartbeat_tick() {
+                    eprintln!("coordinator heartbeat tick failed: {error}");
+                }
+            }
+        });
+        let launch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if let Err(error) = launch.drive_pending_task_launches().await {
+                    eprintln!("coordinator task launch tick failed: {error}");
+                }
+            }
+        });
+    }
 }
 
 /// Tonic-shaped adapter that exposes coordinator/executor RPCs over a shared coordinator.
@@ -1994,12 +2062,11 @@ impl Coordinator {
         }
     }
 
-    /// Launch assigned tasks and push them to executor-owned task endpoints.
-    pub async fn push_assigned_task_assignments(
-        &mut self,
-        job_id: &JobId,
-    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
-        let assignments = self.launch_assigned_task_assignments(job_id)?;
+    /// Resolve executor task endpoints for launched assignments.
+    pub fn resolve_assignment_targets(
+        &self,
+        assignments: Vec<ExecutorTaskAssignment>,
+    ) -> SchedulerResult<Vec<(String, ExecutorTaskAssignment)>> {
         let mut targets = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let endpoint = self
@@ -2016,11 +2083,25 @@ impl Coordinator {
                 .to_owned();
             targets.push((endpoint, assignment));
         }
+        Ok(targets)
+    }
 
+    /// Push pre-resolved assignments to executor task endpoints.
+    pub async fn deliver_assignment_targets(
+        &self,
+        targets: Vec<(String, ExecutorTaskAssignment)>,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+        let channels = self.executor_channels.clone();
+        Self::deliver_assignment_targets_with_channels(channels, targets).await
+    }
+
+    async fn deliver_assignment_targets_with_channels(
+        channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+        targets: Vec<(String, ExecutorTaskAssignment)>,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
         let mut responses = Vec::with_capacity(targets.len());
         for (endpoint, assignment) in targets {
-            // P1.2: Reuse cached gRPC channel; avoid TCP+TLS handshake per task.
-            let channel = self.get_or_connect_channel(&endpoint).await?;
+            let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
             let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
             let response = client
                 .assign_task(wire::executor_task_assignment_to_wire(assignment))
@@ -2038,6 +2119,16 @@ impl Coordinator {
             );
         }
         Ok(responses)
+    }
+
+    /// Launch assigned tasks and push them to executor-owned task endpoints.
+    pub async fn push_assigned_task_assignments(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+        let assignments = self.launch_assigned_task_assignments(job_id)?;
+        let targets = self.resolve_assignment_targets(assignments)?;
+        self.deliver_assignment_targets(targets).await
     }
 
     /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
@@ -2206,7 +2297,14 @@ impl Coordinator {
         &self,
         endpoint: &str,
     ) -> SchedulerResult<tonic::transport::Channel> {
-        let mut map = self.executor_channels.lock().await;
+        Self::get_or_connect_channel_on_map(&self.executor_channels, endpoint).await
+    }
+
+    async fn get_or_connect_channel_on_map(
+        channels: &Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+        endpoint: &str,
+    ) -> SchedulerResult<tonic::transport::Channel> {
+        let mut map = channels.lock().await;
         if let Some(ch) = map.get(endpoint) {
             return Ok(ch.clone());
         }
@@ -2831,6 +2929,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(responses[0].disposition(), TransportDisposition::Accepted);
+        assert_eq!(recorded.lock().unwrap().as_slice(), &["task-1".to_owned()]);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn task_launch_drives_to_running() {
+        let service = RecordingExecutorTaskService::default();
+        let recorded = service.task_ids.clone();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping task_launch_drives_to_running: loopback denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind executor task gRPC listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(wire::v1::executor_task_server::ExecutorTaskServer::new(
+                    service,
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let executor_id = ExecutorId::try_new("exec-launch").unwrap();
+        let job_id = JobId::try_new("job-launch").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-launch").unwrap());
+        coordinator
+            .register_executor(
+                ExecutorDescriptor::new(executor_id, "pod-launch", 1)
+                    .with_task_endpoint(format!("http://{addr}")),
+            )
+            .unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+
+        let shared = SharedCoordinator::new(coordinator);
+        let launched = shared.drive_pending_task_launches().await.unwrap();
+        assert_eq!(launched, 1);
         assert_eq!(recorded.lock().unwrap().as_slice(), &["task-1".to_owned()]);
 
         server.abort();

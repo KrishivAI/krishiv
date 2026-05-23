@@ -135,6 +135,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Spark Connect requires krishiv-spark-connect + proto (R15); disabled in R16 coordinator binary.
 
+    // P0-4: drive executor heartbeat timeouts and push assigned tasks to executors.
+    coordinator.spawn_orchestration_loops();
+
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
         "Krishiv coordinator {} gRPC listening on {}",
