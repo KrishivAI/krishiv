@@ -3142,6 +3142,8 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-udf",
  "parquet 58.3.0",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tonic",
@@ -3369,6 +3371,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "tonic",
  "tonic-prost",
@@ -3416,6 +3419,8 @@ dependencies = [
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
+ "krishiv-spark-connect",
+ "krishiv-sql",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3442,6 +3447,27 @@ dependencies = [
  "tonic",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "krishiv-spark-connect"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "krishiv-proto",
+ "krishiv-sql",
+ "parquet 58.3.0",
+ "prost",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

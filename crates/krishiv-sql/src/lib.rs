@@ -20,10 +20,14 @@ use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, 
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
-pub mod live_table;
+#[cfg(feature = "spark_compat")]
+pub mod spark_compat;
+pub mod spark_compat_date;
+
+mod live_table;
 pub use live_table::{
-    LiveTableRegistry, LiveTableStatement, execute_live_table_ddl,
-    parse_live_table_statement, plan_live_table,
+    execute_live_table_ddl, parse_live_table_statement, plan_live_table, LiveTableRegistry,
+    LiveTableStatement,
 };
 
 /// SQL result alias.
@@ -110,8 +114,11 @@ impl Default for SqlEngine {
 impl SqlEngine {
     /// Create a local SQL engine.
     pub fn new() -> Self {
+        let context = SessionContext::new();
+        #[cfg(feature = "spark_compat")]
+        let _ = spark_compat::register_spark_functions(&context);
         Self {
-            context: SessionContext::new(),
+            context,
             view_registry: None,
         }
     }
@@ -204,10 +211,6 @@ impl SqlEngine {
             return Err(SqlError::EmptyQuery);
         }
 
-        if let Some(stmt) = parse_live_table_statement(query)? {
-            return Ok(SqlDataFrame::from_live_table_plan(plan_live_table(stmt)));
-        }
-
         let dataframe = self.context.sql(query).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe))
     }
@@ -261,34 +264,20 @@ fn extract_simple_view_name(query: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct SqlDataFrame {
     name: String,
-    dataframe: Option<DataFusionDataFrame>,
-    live_table_plan: Option<LogicalPlan>,
+    dataframe: DataFusionDataFrame,
 }
 
 impl SqlDataFrame {
     fn new(name: impl Into<String>, dataframe: DataFusionDataFrame) -> Self {
         Self {
             name: name.into(),
-            dataframe: Some(dataframe),
-            live_table_plan: None,
-        }
-    }
-
-    fn from_live_table_plan(plan: LogicalPlan) -> Self {
-        Self {
-            name: plan.name().to_string(),
-            dataframe: None,
-            live_table_plan: Some(plan),
+            dataframe,
         }
     }
 
     /// Create a Krishiv logical plan wrapper for this DataFrame.
     pub fn krishiv_logical_plan(&self) -> LogicalPlan {
-        if let Some(plan) = &self.live_table_plan {
-            return plan.clone();
-        }
-        let df = self.dataframe.as_ref().expect("sql dataframe present");
-        let label = df.logical_plan().to_string();
+        let label = self.dataframe.logical_plan().to_string();
         LogicalPlan::new(self.name.clone(), ExecutionKind::Batch).with_node(PlanNode::new(
             "datafusion-logical",
             label,
@@ -298,18 +287,13 @@ impl SqlDataFrame {
 
     /// Explain the logical plan without executing it.
     pub fn explain_logical(&self) -> String {
-        self.krishiv_logical_plan().describe()
+        self.dataframe.logical_plan().to_string()
     }
 
     /// Explain logical and physical plan details through DataFusion.
     pub async fn explain(&self) -> SqlResult<String> {
-        if self.live_table_plan.is_some() {
-            return Ok(self.krishiv_logical_plan().describe());
-        }
         let batches = self
             .dataframe
-            .as_ref()
-            .expect("sql dataframe present")
             .clone()
             .explain(false, false)?
             .collect()
@@ -319,10 +303,7 @@ impl SqlDataFrame {
 
     /// Execute and collect this DataFrame.
     pub async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
-        if self.live_table_plan.is_some() {
-            return Ok(vec![]);
-        }
-        Ok(self.dataframe.as_ref().expect("sql dataframe present").clone().collect().await?)
+        Ok(self.dataframe.clone().collect().await?)
     }
 
     /// Execute and collect this DataFrame, also returning lightweight runtime statistics.
@@ -332,7 +313,7 @@ impl SqlDataFrame {
     pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
-        let df = self.dataframe.as_ref().expect("sql dataframe present").clone();
+        let df = self.dataframe.clone();
         let task_ctx = df.task_ctx();
         let physical_plan = df.create_physical_plan().await?;
 

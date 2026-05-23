@@ -7,6 +7,8 @@
 //! maps coordinator/executor gRPC messages into these domain contracts without
 //! making scheduler code depend on Kubernetes details.
 
+pub mod spark_connect;
+
 use std::error::Error;
 use std::fmt;
 
@@ -568,13 +570,6 @@ impl JobSpec {
 pub struct CheckpointSourceOffset {
     pub partition_id: String,
     pub offset: i64,
-}
-
-/// Barrier alignment metadata for exactly-once CDC → Iceberg (R14).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BarrierMetadata {
-    pub kafka_offsets: Vec<CheckpointSourceOffset>,
-    pub iceberg_snapshot_id: Option<u64>,
 }
 
 /// Coordinator → Executor: begin checkpoint epoch E.
