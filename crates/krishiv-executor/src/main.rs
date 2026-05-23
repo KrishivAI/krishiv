@@ -159,8 +159,10 @@ async fn heartbeat_loop(
     // reporting status to the coordinator endpoint.
     let runner_inbox = inbox.clone();
     let runner_endpoint = runtime.config().coordinator_endpoint().to_owned();
+    let running_attempts = runtime.running_attempts();
     tokio::spawn(async move {
-        let runner = ExecutorTaskRunner::new(runner_inbox);
+        let runner =
+            ExecutorTaskRunner::new(runner_inbox).with_running_attempts(running_attempts);
         loop {
             let coord = GrpcCoordinatorService::new(runner_endpoint.clone());
             match runner.run_next_with(&coord).await {

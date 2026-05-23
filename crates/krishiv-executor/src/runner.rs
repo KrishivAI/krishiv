@@ -6,11 +6,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointSourceOffset, CoordinatorExecutorService,
-    ExecutorTaskAssignment, InitiateCheckpointRequest, InputPartitionDescriptor,
-    TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset, CoordinatorExecutorService,
+    ExecutorTaskAssignment, InitiateCheckpointRequest, InputPartitionDescriptor, TaskAttemptRef,
+    TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
     TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
 use krishiv_sql::SqlEngine;
@@ -453,6 +454,10 @@ pub struct ExecutorTaskRunner {
     pub(crate) inmem_shuffle: Option<std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>>,
     /// Shared SQL engine — one instance per runner rather than per-fragment.
     pub(crate) sql_engine: Arc<SqlEngine>,
+    /// Per-task checkpoint state keyed by task id.
+    pub(crate) checkpoint_runners: Arc<DashMap<TaskId, TaskRunner>>,
+    /// Attempts currently executing on this executor (P1-19).
+    pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -468,6 +473,14 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .map(|_| "<InMemoryShuffleStore>"),
             )
             .field("sql_engine", &self.sql_engine)
+            .field(
+                "running_attempts",
+                &self
+                    .running_attempts
+                    .as_ref()
+                    .map(|map| map.len())
+                    .unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -480,7 +493,18 @@ impl ExecutorTaskRunner {
             shuffle: None,
             inmem_shuffle: None,
             sql_engine: Arc::new(SqlEngine::new()),
+            checkpoint_runners: Arc::new(DashMap::new()),
+            running_attempts: None,
         }
+    }
+
+    /// Track running attempts for coordinator heartbeats (P1-19).
+    pub fn with_running_attempts(
+        mut self,
+        running_attempts: Arc<DashMap<String, TaskAttemptRef>>,
+    ) -> Self {
+        self.running_attempts = Some(running_attempts);
+        self
     }
 
     /// Attach a custom SQL engine. Useful for tests or policy-wrapped engines.
@@ -553,6 +577,16 @@ impl ExecutorTaskRunner {
             TaskState::Running,
         )?;
 
+        if let Some(running_map) = &self.running_attempts {
+            let attempt = TaskAttemptRef::new(
+                assignment.job_id().clone(),
+                assignment.stage_id().clone(),
+                assignment.task_id().clone(),
+                assignment.attempt_id(),
+            );
+            running_map.insert(assignment.task_id().as_str().to_string(), attempt);
+        }
+
         // If a CancelTask RPC arrived while this task was queued, finish here
         // instead of starting execution.
         if self
@@ -560,6 +594,7 @@ impl ExecutorTaskRunner {
             .is_task_cancelled(assignment.task_id())
             .map_err(|error| tonic::Status::internal(error.to_string()))?
         {
+            self.clear_running_attempt(&assignment);
             let _ = self.inbox.clear_cancelled_task(assignment.task_id());
             let cancelled = self
                 .send_task_status(
@@ -614,6 +649,7 @@ impl ExecutorTaskRunner {
         let output = match execute_result {
             Ok(output) => output,
             Err(error) => {
+                self.clear_running_attempt(&assignment);
                 let failed = self
                     .send_task_status(
                         &assignment,
@@ -644,6 +680,8 @@ impl ExecutorTaskRunner {
             terminal.disposition(),
             TaskState::Succeeded,
         )?;
+
+        self.clear_running_attempt(&assignment);
 
         Ok(ExecutorTaskRunReport::new(
             assignment,
@@ -704,6 +742,39 @@ impl ExecutorTaskRunner {
 
         coordinator
             .task_status(tonic::Request::new(request))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    fn clear_running_attempt(&self, assignment: &ExecutorTaskAssignment) {
+        if let Some(running_map) = &self.running_attempts {
+            running_map.remove(assignment.task_id().as_str());
+        }
+    }
+
+    /// Handle a checkpoint initiation request and deliver the ack to the coordinator (P1-17).
+    pub async fn initiate_checkpoint_and_deliver_ack<S>(
+        &self,
+        assignment: &ExecutorTaskAssignment,
+        req: InitiateCheckpointRequest,
+        state_backend: &dyn StateBackend,
+        storage: &impl CheckpointStorage,
+        coordinator: &S,
+    ) -> Result<CheckpointAckResponse, tonic::Status>
+    where
+        S: CoordinatorExecutorService,
+    {
+        let mut checkpoint_runner = self
+            .checkpoint_runners
+            .entry(assignment.task_id().clone())
+            .or_insert_with(|| TaskRunner::new(assignment.task_id().clone()))
+            .clone();
+        let ack =
+            checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage);
+        self.checkpoint_runners
+            .insert(assignment.task_id().clone(), checkpoint_runner);
+        coordinator
+            .checkpoint_ack(tonic::Request::new(ack))
             .await
             .map(tonic::Response::into_inner)
     }

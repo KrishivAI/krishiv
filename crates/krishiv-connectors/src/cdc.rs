@@ -130,7 +130,16 @@ pub trait CdcEventSource: Send {
     ///
     /// Returns an empty `Vec` when the source is exhausted (signals pipeline
     /// shutdown). Returns `Err` on unrecoverable source failures.
+    ///
+    /// Implementations must **not** commit consumer offsets here; callers invoke
+    /// [`CdcEventSource::commit_polled_offsets`] only after downstream writes succeed.
     fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String>;
+
+    /// Commit offsets for the batch returned by the most recent successful
+    /// [`CdcEventSource::poll_events`] call.
+    fn commit_polled_offsets(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// In-memory [`CdcEventSource`] backed by a pre-loaded `Vec<String>`.
@@ -266,6 +275,7 @@ impl CdcToLakehousePipeline {
             let batch =
                 build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
             on_batch(batch)?;
+            source.commit_polled_offsets()?;
         }
         Ok(())
     }
@@ -283,6 +293,82 @@ impl CdcToLakehousePipeline {
                 .to_string(),
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// CdcOffsetTracker (P1-15)
+// ---------------------------------------------------------------------------
+
+/// Durable CDC offset cursor persisted in [`krishiv_state::RedbStateBackend`].
+#[cfg(feature = "state")]
+pub struct CdcOffsetTracker {
+    backend: krishiv_state::RedbStateBackend,
+}
+
+#[cfg(feature = "state")]
+impl CdcOffsetTracker {
+    const NAMESPACE: &'static str = "cdc_offsets";
+
+    fn namespace() -> krishiv_state::Namespace {
+        krishiv_state::Namespace::new(Self::NAMESPACE, "partitions")
+    }
+
+    /// Open or create a tracker backed by the redb file at `path`.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let backend = krishiv_state::RedbStateBackend::open(path)
+            .map_err(|e| format!("open cdc offset store: {e}"))?;
+        Ok(Self { backend })
+    }
+
+    /// In-memory tracker for unit tests.
+    pub fn in_memory() -> Result<Self, String> {
+        let backend = krishiv_state::RedbStateBackend::in_memory()
+            .map_err(|e| format!("in-memory cdc offset store: {e}"))?;
+        Ok(Self { backend })
+    }
+
+    /// Return the last committed offset for `partition_key`, if any.
+    pub fn committed_offset(&self, partition_key: &str) -> Result<Option<i64>, String> {
+        use krishiv_state::StateBackend;
+        let value = self
+            .backend
+            .get(&Self::namespace(), partition_key.as_bytes())
+            .map_err(|e| format!("read cdc offset: {e}"))?;
+        Ok(value.map(decode_i64))
+    }
+
+    /// Offset the source should resume from after restart (`committed + 1`).
+    pub fn resume_offset(&self, partition_key: &str) -> Result<i64, String> {
+        Ok(self
+            .committed_offset(partition_key)?
+            .map(|offset| offset + 1)
+            .unwrap_or(0))
+    }
+
+    /// Persist `offset` as the last successfully processed offset for `partition_key`.
+    pub fn commit_offset(&mut self, partition_key: &str, offset: i64) -> Result<(), String> {
+        use krishiv_state::StateBackend;
+        self.backend
+            .put(
+                &Self::namespace(),
+                partition_key.as_bytes().to_vec(),
+                encode_i64(offset),
+            )
+            .map_err(|e| format!("write cdc offset: {e}"))
+    }
+}
+
+#[cfg(feature = "state")]
+fn encode_i64(value: i64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+#[cfg(feature = "state")]
+fn decode_i64(bytes: Vec<u8>) -> i64 {
+    let mut buf = [0_u8; 8];
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    i64::from_le_bytes(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -519,9 +605,9 @@ impl KafkaCdcConfig {
 
 /// A [`CdcEventSource`] backed by a real Kafka broker via `rdkafka`.
 ///
-/// Uses a `StreamConsumer` with group-level offset management.  After each
-/// successful `poll_events` batch the consumer commits offsets synchronously
-/// (at-least-once delivery; duplicates are possible on restart).
+/// Uses a `StreamConsumer` with group-level offset management.  Offsets are
+/// committed only when [`RdkafkaCdcEventSource::commit_polled_offsets`] is called
+/// after the downstream sink acknowledges the batch (at-least-once delivery).
 ///
 /// Construct with [`RdkafkaCdcEventSource::new`] and pass to
 /// [`CdcToLakehousePipeline::run_with_source`].
@@ -587,15 +673,12 @@ impl RdkafkaCdcEventSource {
 
     /// Commit consumer group offsets for the currently assigned partitions.
     ///
-    /// Called internally after a successful batch is handed to the pipeline.
-    /// On failure the error is logged but does not abort the pipeline (the
-    /// consumer will reprocess from the last committed offset on restart,
-    /// providing at-least-once semantics).
-    fn commit_offsets(&self) {
+    /// Call only after the downstream sink has durably written the polled batch.
+    pub fn commit_polled_offsets(&self) -> Result<(), String> {
         use rdkafka::consumer::Consumer;
-        if let Err(e) = self.consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
-            tracing::warn!(error = %e, "rdkafka offset commit failed (at-least-once: will reprocess on restart)");
-        }
+        self.consumer
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+            .map_err(|e| format!("rdkafka offset commit failed: {e}"))
     }
 }
 
@@ -606,7 +689,8 @@ impl CdcEventSource for RdkafkaCdcEventSource {
     /// Each call blocks for at most `poll_timeout_ms` per message.  Returns an
     /// empty `Vec` when no messages are available within the timeout window
     /// (the pipeline interprets this as a momentary idle, not shutdown).
-    /// Commits consumer offsets after assembling the batch.
+    /// Does **not** commit consumer offsets; callers must invoke
+    /// [`CdcEventSource::commit_polled_offsets`] after successful sink writes.
     fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
         use rdkafka::Message;
 
@@ -657,11 +741,11 @@ impl CdcEventSource for RdkafkaCdcEventSource {
             }
         }
 
-        if !events.is_empty() {
-            self.commit_offsets();
-        }
-
         Ok(events)
+    }
+
+    fn commit_polled_offsets(&mut self) -> Result<(), String> {
+        RdkafkaCdcEventSource::commit_polled_offsets(self)
     }
 }
 
@@ -901,5 +985,79 @@ mod tests {
         );
         let result = pipeline.run().await;
         assert!(result.is_err(), "run() without source must return Err");
+    }
+
+    #[derive(Default)]
+    struct CommitTrackingSource {
+        events: std::collections::VecDeque<String>,
+        commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CdcEventSource for CommitTrackingSource {
+        fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+            let n = max.min(self.events.len());
+            Ok(self.events.drain(..n).collect())
+        }
+
+        fn commit_polled_offsets(&mut self) -> Result<(), String> {
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cdc_offset_not_committed_on_sink_failure() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        )
+        .with_batch_size(1);
+
+        let json = r#"{"op":"c","source":{"table":"orders"},"after":{"id":"1"}}"#;
+        let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = CommitTrackingSource {
+            events: std::collections::VecDeque::from([json.to_string()]),
+            commits: std::sync::Arc::clone(&commits),
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let result = pipeline
+            .run_with_source(
+                source,
+                |_batch| Err("sink write failed".to_string()),
+                shutdown_rx,
+            )
+            .await;
+
+        assert!(result.is_err(), "pipeline must propagate sink failure");
+        assert_eq!(
+            commits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "offsets must not be committed when sink write fails"
+        );
+    }
+
+    #[cfg(feature = "state")]
+    #[test]
+    fn cdc_offset_tracker_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cdc-offsets.redb");
+        let partition = "orders-0";
+
+        {
+            let mut tracker = super::CdcOffsetTracker::open(&path).unwrap();
+            for offset in 0..5 {
+                tracker.commit_offset(partition, offset).unwrap();
+            }
+            assert_eq!(tracker.committed_offset(partition).unwrap(), Some(4));
+        }
+
+        let reloaded = super::CdcOffsetTracker::open(&path).unwrap();
+        assert_eq!(reloaded.committed_offset(partition).unwrap(), Some(4));
+        assert_eq!(reloaded.resume_offset(partition).unwrap(), 5);
     }
 }

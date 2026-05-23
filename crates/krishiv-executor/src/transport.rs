@@ -3,12 +3,15 @@
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-    LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskStatusRequest,
+    LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef,
+    TaskStatusRequest,
     TaskStatusResponse, TransportVersion, wire,
 };
 
@@ -140,15 +143,24 @@ impl ExecutorConfig {
 }
 
 /// Minimal executor runtime facade for the R3.1 bootstrap slice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExecutorRuntime {
     config: ExecutorConfig,
+    running_attempts: Arc<DashMap<String, TaskAttemptRef>>,
 }
 
 impl ExecutorRuntime {
     /// Create an executor runtime.
     pub fn new(config: ExecutorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            running_attempts: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Shared map of attempts currently executing on this executor (P1-19).
+    pub fn running_attempts(&self) -> Arc<DashMap<String, TaskAttemptRef>> {
+        Arc::clone(&self.running_attempts)
     }
 
     /// Runtime configuration.
@@ -210,11 +222,17 @@ impl ExecutorRuntime {
 
     /// Build an empty healthy heartbeat request for this executor.
     pub fn heartbeat_request(&self) -> ExecutorHeartbeatRequest {
+        let running_attempts = self
+            .running_attempts
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
         ExecutorHeartbeatRequest::new(
             self.config.executor_id.clone(),
             self.config.lease_generation,
             ExecutorState::Healthy,
         )
+        .with_running_attempts(running_attempts)
     }
 
     /// Build a heartbeat including LLM quota reports (R17).

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 axum = { workspace = true }
+dashmap = { workspace = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-ai = { path = "../krishiv-ai" }

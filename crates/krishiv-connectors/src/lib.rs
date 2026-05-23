@@ -22,6 +22,8 @@ pub mod transactional_kafka;
 pub mod two_phase_parquet_s3;
 
 pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
+#[cfg(feature = "state")]
+pub use cdc::CdcOffsetTracker;
 
 // ---------------------------------------------------------------------------
 // Error and Result

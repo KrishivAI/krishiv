@@ -33,8 +33,9 @@ cargo test -p krishiv-executor --lib lease_generation_updated_after_reregister
 cargo test -p krishiv-sql --lib catalog_table_resolved_in_sql
 cargo test -p krishiv-catalog --lib catalog_scan_returns_registered_row_count
 cargo test -p krishiv-exec -p krishiv-plan -p krishiv-connectors --lib
+cargo check -p krishiv-python   # P0-12 module wiring (lib tests need libstdc++ for fastembed/ort)
 ```
 
 ## Next command
 
-Continue Sprint 1: P0-12 Python module wiring, then Sprint 2 items (P0-5/6, P1 checkpoint/shuffle/state).
+Continue Sprint 1: P0-5/6 K8s leader election + finalizer, then Sprint 2 items (P1 checkpoint/shuffle/state).

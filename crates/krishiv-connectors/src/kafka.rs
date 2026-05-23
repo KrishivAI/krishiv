@@ -108,17 +108,13 @@ impl KafkaConfig {
 // KafkaSource
 // ---------------------------------------------------------------------------
 
-/// A Kafka source stub.
-///
-/// Capabilities: unbounded + rewindable (consumer group offset allows seek to
-/// any committed offset).
-///
-/// All data methods return [`ConnectorError::Unsupported`] until the
-/// `kafka-runtime` feature is enabled and a real broker connection is wired.
+/// A Kafka source stub when the `kafka` feature is disabled.
+#[cfg(not(feature = "kafka"))]
 pub struct KafkaSource {
     config: KafkaConfig,
 }
 
+#[cfg(not(feature = "kafka"))]
 impl KafkaSource {
     /// Create a new `KafkaSource` from a validated config.
     pub fn new(config: KafkaConfig) -> Self {
@@ -131,6 +127,7 @@ impl KafkaSource {
     }
 }
 
+#[cfg(not(feature = "kafka"))]
 impl Source for KafkaSource {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities::new()
@@ -140,13 +137,56 @@ impl Source for KafkaSource {
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         Err(ConnectorError::Unsupported {
-            message: "Kafka broker connection not available in stub; enable kafka-runtime feature"
-                .into(),
+            message: "Kafka broker connection requires the `kafka` feature".into(),
         })
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         None
+    }
+}
+
+/// Kafka source backed by `rdkafka` when the `kafka` feature is enabled (P1-20).
+#[cfg(feature = "kafka")]
+pub struct KafkaSource {
+    inner: RdkafkaKafkaSource,
+    config: KafkaConfig,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaSource {
+    /// Create a new `KafkaSource` from a validated config.
+    pub fn new(config: KafkaConfig) -> ConnectorResult<Self> {
+        let inner = RdkafkaKafkaSource::new(
+            config.bootstrap_servers.clone(),
+            config.group_id.clone(),
+            config.topic.clone(),
+        )
+        .map_err(|message| ConnectorError::Kafka {
+            message,
+            retriable: false,
+        })?;
+        Ok(Self { inner, config })
+    }
+
+    /// Return the config this source was created with.
+    pub fn config(&self) -> &KafkaConfig {
+        &self.config
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl Source for KafkaSource {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        self.inner.read_batch().await
+    }
+
+    fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+        self.inner.current_offset()
     }
 }
 
@@ -583,9 +623,13 @@ mod tests {
             topic: "events".into(),
             group_id: "test-group".into(),
         };
+        #[cfg(not(feature = "kafka"))]
         let source = KafkaSource::new(config);
+        #[cfg(feature = "kafka")]
+        let source = KafkaSource::new(config).expect("kafka source");
         let caps = source.capabilities();
         assert!(caps.is_unbounded());
+        #[cfg(not(feature = "kafka"))]
         assert!(caps.is_rewindable());
         assert!(!caps.is_bounded());
         assert!(!caps.is_transactional());
@@ -617,6 +661,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    #[cfg(not(feature = "kafka"))]
     async fn kafka_source_read_batch_returns_unsupported() {
         let config = KafkaConfig {
             bootstrap_servers: "localhost:9092".into(),
@@ -632,6 +677,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kafka_source_reads_batches() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let mut source = InMemoryKafkaSource::new("events", 0, 0, vec![batch]);
+
+        let read = source.read_batch().await.unwrap().unwrap();
+        assert_eq!(read.num_rows(), 3);
+        assert!(source.read_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "kafka"))]
     async fn kafka_sink_write_batch_returns_unsupported() {
         use arrow::array::Int32Array;
         use arrow::datatypes::{DataType, Field, Schema};

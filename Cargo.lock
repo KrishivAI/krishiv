@@ -534,6 +534,7 @@ version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
+ "bitflags",
  "serde_core",
  "serde_json",
 ]
@@ -3888,6 +3889,7 @@ dependencies = [
  "krishiv-exec",
  "krishiv-lakehouse",
  "krishiv-proto",
+ "krishiv-state",
  "object_store",
  "parquet 58.3.0",
  "rdkafka",
@@ -3916,6 +3918,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum 0.8.9",
+ "dashmap",
  "krishiv-ai",
  "krishiv-checkpoint",
  "krishiv-connectors",
@@ -4060,12 +4063,17 @@ dependencies = [
  "krishiv-ai",
  "krishiv-api",
  "krishiv-catalog",
+ "krishiv-exec",
+ "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-schema-registry",
  "krishiv-sql",
+ "krishiv-state",
  "krishiv-udf",
  "krishiv-vector-sinks",
  "pyo3",
+ "pyo3-arrow",
+ "sha2",
  "tokio",
 ]
 
@@ -4948,6 +4956,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
+name = "numpy"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "778da78c64ddc928ebf5ad9df5edf0789410ff3bdbf3619aed51cd789a6af1e2"
+dependencies = [
+ "half",
+ "libc",
+ "ndarray",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "pyo3",
+ "pyo3-build-config",
+ "rustc-hash",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5761,12 +5786,36 @@ version = "0.28.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91fd8e38a3b50ed1167fb981cd6fd60147e091784c427b8f7183a7ee32c31c12"
 dependencies = [
+ "chrono",
+ "chrono-tz",
+ "indexmap 2.14.0",
  "libc",
  "once_cell",
  "portable-atomic",
  "pyo3-build-config",
  "pyo3-ffi",
  "pyo3-macros",
+]
+
+[[package]]
+name = "pyo3-arrow"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0360400036dda3db3d69102ef7e9646e4cd946c75a2d1d41fb8fd39879312636"
+dependencies = [
+ "arrow-array 58.3.0",
+ "arrow-buffer 58.3.0",
+ "arrow-cast 58.3.0",
+ "arrow-data 58.3.0",
+ "arrow-schema 58.3.0",
+ "arrow-select 58.3.0",
+ "chrono",
+ "chrono-tz",
+ "half",
+ "indexmap 2.14.0",
+ "numpy",
+ "pyo3",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
