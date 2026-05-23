@@ -201,6 +201,7 @@ impl ExecutorAssignmentInbox {
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod runner;
 pub mod barrier;
+pub mod barrier_transport;
 pub mod grpc;
 pub mod transport;
 pub mod llm_throttle;

@@ -207,10 +207,28 @@ mod imp {
                             _ => None,
                         })
                         .unwrap_or_default();
+                    let text = payload
+                        .get("text")
+                        .and_then(|v| match &v.kind {
+                            Some(qdrant_client::qdrant::value::Kind::StringValue(s)) => {
+                                Some(s.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let chunk_index = payload
+                        .get("chunk_index")
+                        .and_then(|v| match &v.kind {
+                            Some(qdrant_client::qdrant::value::Kind::IntegerValue(i)) => {
+                                Some(*i as usize)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0);
                     ScoredChunk {
                         doc_id,
-                        chunk_index: 0,
-                        text: String::new(),
+                        chunk_index,
+                        text,
                         score: p.score,
                         payload: HashMap::new(),
                     }

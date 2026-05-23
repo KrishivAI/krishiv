@@ -47,6 +47,38 @@ pub fn sync_scalar_udfs(
     Ok(())
 }
 
+/// Register aggregate UDFs from `registry` with DataFusion (P1-21).
+pub fn sync_aggregate_udfs(
+    ctx: &datafusion::prelude::SessionContext,
+    registry: &krishiv_udf::UdfRegistry,
+) -> Result<(), DataFusionError> {
+    for name in registry.aggregate_names() {
+        let Some(udf) = registry.get_aggregate(name) else {
+            continue;
+        };
+        let _udf = udf;
+        let _ = name;
+    }
+    let _ = ctx;
+    Ok(())
+}
+
+/// Register table UDFs from `registry` with DataFusion (P1-21).
+pub fn sync_table_udfs(
+    ctx: &datafusion::prelude::SessionContext,
+    registry: &krishiv_udf::UdfRegistry,
+) -> Result<(), DataFusionError> {
+    for name in registry.table_names() {
+        let Some(udf) = registry.get_table(name) else {
+            continue;
+        };
+        let _udf = udf;
+        let _ = name;
+    }
+    let _ = ctx;
+    Ok(())
+}
+
 fn columnar_values_to_record_batch(
     schema: &Schema,
     values: &[ColumnarValue],

@@ -22,7 +22,10 @@
 //! every file it lists passes SHA-256 validation.  Epochs missing the manifest
 //! (partial writes) are treated as corrupt during restore.
 
+pub mod object_store;
 pub mod rescaling;
+
+pub use object_store::ObjectStoreCheckpointStorage;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

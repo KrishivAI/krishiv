@@ -1,5 +1,7 @@
 //! Upgrade compatibility tests — schema_version forward-compat.
 
+use krishiv_checkpoint::CheckpointMetadata;
+
 /// Connector offset metadata: write a v0 (pre-versioned) byte blob and verify
 /// the current reader either accepts it with defaults or produces a clear error.
 #[test]
@@ -47,10 +49,10 @@ fn savepoint_missing_schema_version_treated_as_v0() {
 /// must be rejected with a clear error.
 #[test]
 fn schema_version_too_new_is_rejected() {
-    const CURRENT_VERSION: u64 = 1;
+    const CURRENT_VERSION: u32 = CheckpointMetadata::VERSION;
     let future_blob = r#"{"schema_version": 999, "data": "..."}"#;
     let parsed: serde_json::Value = serde_json::from_str(future_blob).unwrap();
-    let schema_version = parsed["schema_version"].as_u64().unwrap();
+    let schema_version = parsed["schema_version"].as_u64().unwrap() as u32;
     assert!(
         schema_version > CURRENT_VERSION,
         "test prereq: blob version is newer than current"

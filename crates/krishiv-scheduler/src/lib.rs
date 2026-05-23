@@ -550,6 +550,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         // GAP-CP-08: Extract auth context for every handler.
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -586,6 +587,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "deregister_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -628,6 +630,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -707,6 +710,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "task_status");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -771,6 +775,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
         // GAP-CK-03: commit_epoch() calls sync disk I/O via LocalFsCheckpointStorage.
@@ -1124,6 +1129,35 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
     }
 }
 
+// ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
+
+static GRPC_AUTH_PROVIDER: std::sync::OnceLock<Arc<dyn krishiv_governance::AuthProvider>> =
+    std::sync::OnceLock::new();
+
+/// Install a process-wide auth provider for coordinator gRPC (optional).
+pub fn set_grpc_auth_provider(provider: Arc<dyn krishiv_governance::AuthProvider>) {
+    let _ = GRPC_AUTH_PROVIDER.set(provider);
+}
+
+/// Validate `auth` when a provider is configured; otherwise allow anonymous access.
+pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
+    let Some(provider) = GRPC_AUTH_PROVIDER.get() else {
+        return Ok(());
+    };
+    match auth {
+        AuthContext::Bearer { subject } => {
+            if provider.authenticate(subject).is_some() {
+                Ok(())
+            } else {
+                Err(tonic::Status::unauthenticated("invalid API key"))
+            }
+        }
+        AuthContext::Anonymous => Err(tonic::Status::unauthenticated(
+            "missing Bearer token",
+        )),
+    }
+}
+
 // ── R8 auth interceptor skeleton ─────────────────────────────────────────────
 
 /// Authentication context extracted by the auth interceptor.
@@ -1291,20 +1325,12 @@ impl Coordinator {
 
     /// Create a new active coordinator with a process-unique identifier.
     pub fn new_active(config: Option<CoordinatorConfig>) -> Self {
-        Self::build(
-            Self::generate_id(),
-            config.unwrap_or_default(),
-            CoordinatorState::Active,
-        )
+        Self::try_new_active(config).expect("coordinator id generation")
     }
 
     /// Create a new standby coordinator with a process-unique identifier.
     pub fn new_standby(config: Option<CoordinatorConfig>) -> Self {
-        Self::build(
-            Self::generate_id(),
-            config.unwrap_or_default(),
-            CoordinatorState::Standby,
-        )
+        Self::try_new_standby(config).expect("coordinator id generation")
     }
 
     /// Generate a process-unique `CoordinatorId`.
@@ -1312,11 +1338,31 @@ impl Coordinator {
     /// Uses a process-local atomic counter so that multiple coordinator
     /// instances (e.g. during distributed tests or multi-API-server deployments)
     /// each receive a distinct identity without requiring an external ID service.
-    fn generate_id() -> CoordinatorId {
+    fn generate_id() -> SchedulerResult<CoordinatorId> {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         CoordinatorId::try_new(format!("coordinator-{n}"))
-            .expect("generated coordinator id is always valid")
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: format!("generated coordinator id invalid: {e}"),
+            })
+    }
+
+    /// Create a new active coordinator, returning an error if id generation fails.
+    pub fn try_new_active(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
+        Ok(Self::build(
+            Self::generate_id()?,
+            config.unwrap_or_default(),
+            CoordinatorState::Active,
+        ))
+    }
+
+    /// Create a new standby coordinator, returning an error if id generation fails.
+    pub fn try_new_standby(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
+        Ok(Self::build(
+            Self::generate_id()?,
+            config.unwrap_or_default(),
+            CoordinatorState::Standby,
+        ))
     }
 
     pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {

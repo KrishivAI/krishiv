@@ -41,4 +41,21 @@ impl FaultInjector {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         &self.faults[idx % self.faults.len()]
     }
+
+    /// Apply the next fault mode around an async call (P3-28).
+    pub async fn apply<F, Fut, T>(&self, operation: F) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        match self.next_fault() {
+            FaultMode::None => Ok(operation().await),
+            FaultMode::Delay { duration_ms } => {
+                tokio::time::sleep(std::time::Duration::from_millis(*duration_ms)).await;
+                Ok(operation().await)
+            }
+            FaultMode::Error { message } => Err(message.clone()),
+            FaultMode::Drop => Err(String::from("operation dropped by chaos injector")),
+        }
+    }
 }

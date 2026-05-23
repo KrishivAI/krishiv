@@ -3795,6 +3795,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -3873,11 +3874,14 @@ dependencies = [
 name = "krishiv-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "krishiv-state",
+ "object_store",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -3921,6 +3925,7 @@ dependencies = [
  "axum 0.8.9",
  "dashmap",
  "krishiv-ai",
+ "krishiv-async-util",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-exec",
@@ -3956,6 +3961,8 @@ dependencies = [
  "futures",
  "krishiv-api",
  "krishiv-governance",
+ "krishiv-sql",
+ "krishiv-sql-policy",
  "prost 0.14.3",
  "sha2",
  "tokio",
@@ -4240,6 +4247,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "futures",
  "hex",
  "mockito",
  "parquet 58.3.0",

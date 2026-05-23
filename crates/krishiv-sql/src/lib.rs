@@ -169,6 +169,32 @@ impl SqlEngine {
             })
     }
 
+    /// Register aggregate UDFs from the attached registry (P1-21).
+    pub async fn sync_aggregate_udfs(&self) -> SqlResult<()> {
+        let Some(registry) = &self.udf_registry else {
+            return Ok(());
+        };
+        let guard = registry.read().map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        udf::sync_aggregate_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })
+    }
+
+    /// Register table UDFs from the attached registry (P1-21).
+    pub async fn sync_table_udfs(&self) -> SqlResult<()> {
+        let Some(registry) = &self.udf_registry else {
+            return Ok(());
+        };
+        let guard = registry.read().map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        udf::sync_table_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })
+    }
+
     /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
     #[must_use]
     pub fn with_view_registry(

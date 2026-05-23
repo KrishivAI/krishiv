@@ -127,6 +127,7 @@ pub use krishiv_plan::JoinType;
 
 pub mod join;
 pub mod aggregate;
+pub mod coalesce_partitions;
 pub mod window;
 pub mod queue;
 pub mod adaptive;

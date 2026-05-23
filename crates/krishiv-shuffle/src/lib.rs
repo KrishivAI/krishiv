@@ -195,6 +195,10 @@ pub enum ShuffleError {
         /// The configured partition limit.
         limit: usize,
     },
+    /// An internal `RwLock` was poisoned.
+    LockPoisoned,
+    /// Arrow column type does not match the expected downcast target.
+    TypeMismatch { expected: String },
 }
 
 impl std::fmt::Display for ShuffleError {
@@ -218,9 +222,29 @@ impl std::fmt::Display for ShuffleError {
                     "shuffle partition limit exceeded: max {limit} partitions"
                 )
             }
+            Self::LockPoisoned => f.write_str("shuffle lock poisoned"),
+            Self::TypeMismatch { expected } => {
+                write!(f, "shuffle type mismatch: expected {expected}")
+            }
         }
     }
 }
+
+/// Acquire a write lock, mapping poison to [`ShuffleError::LockPoisoned`].
+fn shuffle_write_lock<T>(
+    lock: &std::sync::RwLock<T>,
+) -> ShuffleResult<std::sync::RwLockWriteGuard<'_, T>> {
+    lock.write().map_err(|_| ShuffleError::LockPoisoned)
+}
+
+fn shuffle_read_lock<T>(
+    lock: &std::sync::RwLock<T>,
+) -> ShuffleResult<std::sync::RwLockReadGuard<'_, T>> {
+    lock.read().map_err(|_| ShuffleError::LockPoisoned)
+}
+
+/// Maximum shuffle ticket line length (P3-3).
+const MAX_SHUFFLE_TICKET_LEN: usize = 65_536;
 
 impl std::error::Error for ShuffleError {}
 
@@ -527,6 +551,7 @@ impl HashPartitioner {
     /// buckets are represented as zero-row `RecordBatch` values with the same
     /// schema as the input.
     pub fn partition(&self, batch: &RecordBatch) -> ShuffleResult<Vec<RecordBatch>> {
+        use arrow::array::Array;
         let schema = batch.schema();
         let col_idx = schema
             .index_of(&self.key_column)
@@ -545,45 +570,75 @@ impl HashPartitioner {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<Int32Array>()
-                    .expect("data type is Int32");
+                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                        expected: "Int32".into(),
+                    })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
-                    hash_i64(arr.value(row) as i64, self.buckets)
+                    if arr.is_null(row) {
+                        0
+                    } else {
+                        hash_i64(arr.value(row) as i64, self.buckets)
+                    }
                 });
             }
             DataType::Int64 => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .expect("data type is Int64");
+                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                        expected: "Int64".into(),
+                    })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
-                    hash_i64(arr.value(row), self.buckets)
+                    if arr.is_null(row) {
+                        0
+                    } else {
+                        hash_i64(arr.value(row), self.buckets)
+                    }
                 });
             }
             DataType::Utf8 => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .expect("data type is Utf8");
+                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                        expected: "Utf8".into(),
+                    })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
-                    hash_str(arr.value(row), self.buckets)
+                    if arr.is_null(row) {
+                        0
+                    } else {
+                        hash_str(arr.value(row), self.buckets)
+                    }
                 });
             }
             DataType::Utf8View => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<StringViewArray>()
-                    .expect("data type is Utf8View");
+                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                        expected: "Utf8View".into(),
+                    })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
-                    hash_str(arr.value(row), self.buckets)
+                    if arr.is_null(row) {
+                        0
+                    } else {
+                        hash_str(arr.value(row), self.buckets)
+                    }
                 });
             }
             DataType::LargeUtf8 => {
                 let arr = key_col
                     .as_any()
                     .downcast_ref::<LargeStringArray>()
-                    .expect("data type is LargeUtf8");
+                    .ok_or_else(|| ShuffleError::TypeMismatch {
+                        expected: "LargeUtf8".into(),
+                    })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
-                    hash_str(arr.value(row), self.buckets)
+                    if arr.is_null(row) {
+                        0
+                    } else {
+                        hash_str(arr.value(row), self.buckets)
+                    }
                 });
             }
             other => {
@@ -791,7 +846,7 @@ impl InMemoryShuffleStore {
 
         loop {
             let projected = {
-                let used = self.bytes_used.read().unwrap();
+                let used = shuffle_read_lock(&self.bytes_used)?;
                 used.saturating_add(incoming_size)
             };
             if projected <= max_bytes {
@@ -799,8 +854,8 @@ impl InMemoryShuffleStore {
             }
 
             let key_to_spill = {
-                let order = self.spill_order.read().unwrap();
-                let parts = self.partitions.read().unwrap();
+                let order = shuffle_read_lock(&self.spill_order)?;
+                let parts = shuffle_read_lock(&self.partitions)?;
                 order
                     .iter()
                     .find(|k| **k != *incoming_key && parts.contains_key(*k))
@@ -811,15 +866,12 @@ impl InMemoryShuffleStore {
             };
 
             let (spill_partition, spill_size, spill_token) = {
-                let mut parts = self.partitions.write().unwrap();
+                let mut parts = shuffle_write_lock(&self.partitions)?;
                 let Some(partition) = parts.remove(&key_to_spill) else {
                     continue;
                 };
                 let spill_size = partition_memory_bytes(&partition);
-                let spill_token = self
-                    .lease_tokens
-                    .read()
-                    .unwrap()
+                let spill_token = shuffle_read_lock(&self.lease_tokens)?
                     .get(&key_to_spill)
                     .copied()
                     .unwrap_or(0);
@@ -827,14 +879,14 @@ impl InMemoryShuffleStore {
             };
 
             {
-                let mut used = self.bytes_used.write().unwrap();
+                let mut used = shuffle_write_lock(&self.bytes_used)?;
                 *used = used.saturating_sub(spill_size);
             }
 
             spill
                 .write_partition(spill_partition, spill_token)
                 .await?;
-            self.spilled.write().unwrap().insert(key_to_spill);
+            shuffle_write_lock(&self.spilled)?.insert(key_to_spill);
         }
     }
 }
@@ -842,7 +894,7 @@ impl InMemoryShuffleStore {
 impl ShuffleStore for InMemoryShuffleStore {
     async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
-        let mut leases = self.lease_tokens.write().unwrap();
+        let mut leases = shuffle_write_lock(&self.lease_tokens)?;
         if let Some(&expected) = leases.get(&key)
             && lease_token != expected
         {
@@ -866,7 +918,7 @@ impl ShuffleStore for InMemoryShuffleStore {
             partition.id.partition,
         );
         {
-            let mut leases = self.lease_tokens.write().unwrap();
+            let mut leases = shuffle_write_lock(&self.lease_tokens)?;
             if let Some(&expected) = leases.get(&key) {
                 // P1.25: use `<` (monotonic-token semantics) — reject stale writes,
                 // accept equal or newer tokens.
@@ -885,61 +937,50 @@ impl ShuffleStore for InMemoryShuffleStore {
 
         let new_size = partition_memory_bytes(&partition);
         {
-            let mut used = self.bytes_used.write().unwrap();
-            if let Some(old) = self.partitions.read().unwrap().get(&key) {
+            let mut used = shuffle_write_lock(&self.bytes_used)?;
+            if let Some(old) = shuffle_read_lock(&self.partitions)?.get(&key) {
                 *used = used.saturating_sub(partition_memory_bytes(old));
             }
         }
-        self.spilled.write().unwrap().remove(&key);
+        shuffle_write_lock(&self.spilled)?.remove(&key);
         self.ensure_memory_capacity(&key, new_size).await?;
 
         {
-            let mut parts = self.partitions.write().unwrap();
+            let mut parts = shuffle_write_lock(&self.partitions)?;
             parts.insert(key.clone(), partition);
-            let mut order = self.spill_order.write().unwrap();
+            let mut order = shuffle_write_lock(&self.spill_order)?;
             order.retain(|existing| existing != &key);
             order.push_back(key);
-            *self.bytes_used.write().unwrap() += new_size;
+            let mut used = shuffle_write_lock(&self.bytes_used)?;
+            *used += new_size;
         }
         Ok(())
     }
 
     async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-        if self.spilled.read().unwrap().contains(&key) {
+        if shuffle_read_lock(&self.spilled)?.contains(&key) {
             if let Some(spill) = &self.spill_store {
                 return spill.read_partition(id).await;
             }
         }
-        let guard = self.partitions.read().unwrap();
+        let guard = shuffle_read_lock(&self.partitions)?;
         Ok(guard.get(&key).cloned())
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
-        self.partitions
-            .write()
-            .unwrap()
-            .retain(|(jid, _, _), _| jid != job_id);
-        self.lease_tokens
-            .write()
-            .unwrap()
-            .retain(|(jid, _, _), _| jid != job_id);
-        self.spilled
-            .write()
-            .unwrap()
-            .retain(|(jid, _, _)| jid != job_id);
-        self.spill_order
-            .write()
-            .unwrap()
-            .retain(|(jid, _, _)| jid != job_id);
+        shuffle_write_lock(&self.partitions)?.retain(|(jid, _, _), _| jid != job_id);
+        shuffle_write_lock(&self.lease_tokens)?.retain(|(jid, _, _), _| jid != job_id);
+        shuffle_write_lock(&self.spilled)?.retain(|(jid, _, _)| jid != job_id);
+        shuffle_write_lock(&self.spill_order)?.retain(|(jid, _, _)| jid != job_id);
         if let Some(spill) = &self.spill_store {
             spill.delete_job_partitions(job_id).await?;
         }
         let mut total = 0usize;
-        for partition in self.partitions.read().unwrap().values() {
+        for partition in shuffle_read_lock(&self.partitions)?.values() {
             total += partition_memory_bytes(partition);
         }
-        *self.bytes_used.write().unwrap() = total;
+        *shuffle_write_lock(&self.bytes_used)? = total;
         Ok(())
     }
 }
@@ -997,7 +1038,7 @@ impl LocalDiskShuffleStore {
 impl ShuffleStore for LocalDiskShuffleStore {
     async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
-        let mut leases = self.lease_tokens.write().unwrap();
+        let mut leases = shuffle_write_lock(&self.lease_tokens)?;
         if let Some(&expected) = leases.get(&key)
             && lease_token != expected
         {
@@ -1023,7 +1064,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
         // Validate/update the lease token.
         {
-            let mut tokens = self.lease_tokens.write().unwrap();
+            let mut tokens = shuffle_write_lock(&self.lease_tokens)?;
             if let Some(&expected) = tokens.get(&key) {
                 // P1.25: use `<` (monotonic-token semantics) — reject stale writes,
                 // accept equal or newer tokens.
@@ -1141,7 +1182,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))??;
 
         // Clean up in-memory lease tokens for this job (in-memory, safe outside spawn_blocking).
-        let mut tokens = self.lease_tokens.write().unwrap();
+        let mut tokens = shuffle_write_lock(&self.lease_tokens)?;
         tokens.retain(|(jid, _, _), _| jid != &job_id_owned);
         Ok(())
     }
@@ -2286,6 +2327,9 @@ pub mod flight {
                         break;
                     }
                     buf.push(byte[0]);
+                    if buf.len() > super::MAX_SHUFFLE_TICKET_LEN {
+                        return;
+                    }
                 }
                 Err(_) => return,
             }

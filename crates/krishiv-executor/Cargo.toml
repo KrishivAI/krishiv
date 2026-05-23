@@ -12,6 +12,7 @@ dashmap = { workspace = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-ai = { path = "../krishiv-ai" }
+krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
