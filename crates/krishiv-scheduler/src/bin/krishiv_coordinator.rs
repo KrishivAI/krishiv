@@ -133,20 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    if let Some(spark_addr) = config.spark_connect_addr {
-        let spark_listener = TcpListener::bind(spark_addr).await?;
-        let spark_svc = SparkConnectServiceImpl::new(SqlEngine::new());
-        println!(
-            "Krishiv coordinator {} Spark Connect listening on {}",
-            config.coordinator_id,
-            spark_listener.local_addr()?
-        );
-        tokio::spawn(async move {
-            if let Err(e) = serve_spark_connect(spark_listener, spark_svc).await {
-                eprintln!("Spark Connect server error: {e}");
-            }
-        });
-    }
+    // Spark Connect requires krishiv-spark-connect + proto (R15); disabled in R16 coordinator binary.
 
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(

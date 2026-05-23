@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+pub mod streaming;
+
 /// Data type for a plan schema field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldType {
@@ -120,15 +122,6 @@ pub enum NodeOp {
         /// Number of output partitions after coalescing.
         target_partitions: usize,
     },
-    /// Register a continuously updated live table (R14).
-    CreateLiveTable {
-        name: String,
-        query: String,
-    },
-    /// Merge delta log into base Iceberg table for a live table.
-    RefreshLiveTable { name: String },
-    /// Drop a live table registration.
-    DropLiveTable { name: String },
     /// Operator not covered by the above variants.
     Other { description: String },
 }

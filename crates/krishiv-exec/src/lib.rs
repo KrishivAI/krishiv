@@ -131,6 +131,12 @@ pub mod aggregate;
 pub mod window;
 pub mod queue;
 pub mod adaptive;
+pub mod barrier_align;
+pub mod side_output;
+pub mod temporal_join;
+pub mod interval_join;
+pub mod cep;
+pub mod watermark_e2e;
 pub mod schema_normalize;
 pub mod memo;
 pub mod live_table;
@@ -145,11 +151,11 @@ pub use window::{WatermarkState, MultiSourceWatermarkState,
     SessionWindowSpec, SessionWindowOperator};
 pub use queue::{OperatorMessage, OperatorQueueMetrics, OperatorQueueSender,
     OperatorQueueReceiver, OperatorQueueError, operator_queue};
-pub use adaptive::{HotKeyReport, HeavyHittersTracker, ThrottleCommand, RateLimiter,
-    SinkLatencyTracker, AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig};
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
 pub use memo::MemoCache;
 pub use live_table::{ChangeFeed, CreateLiveTableExec, RefreshLiveTableExec};
+pub use adaptive::{HotKeyReport, HeavyHittersTracker, ThrottleCommand, RateLimiter,
+    SinkLatencyTracker, AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig};
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

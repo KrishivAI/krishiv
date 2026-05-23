@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package krishiv.transport.v1;
+
+// Dedicated control-plane barrier transport (ADR-R16.1).
+
+enum BarrierKind {
+  BARRIER_KIND_UNSPECIFIED = 0;
+  BARRIER_KIND_CHECKPOINT = 1;
+  BARRIER_KIND_SAVEPOINT = 2;
+}
+
+message CheckpointBarrier {
+  uint64 epoch = 1;
+  string job_id = 2;
+  string checkpoint_id = 3;
+  BarrierKind barrier_kind = 4;
+  int64 timestamp_ms = 5;
+}
+
+message StateHandle {
+  string backend_kind = 1;
+  string checkpoint_uri = 2;
+  uint32 key_group_range_start = 3;
+  uint32 key_group_range_end = 4;
+  uint32 schema_version = 5;
+}
+
+message BarrierAck {
+  uint64 epoch = 1;
+  string job_id = 2;
+  string task_id = 3;
+  StateHandle state_handle = 4;
+}
+
+service BarrierService {
+  // Bidirectional barrier stream: coordinator injects barriers; executors return acks.
+  rpc BarrierStream(stream CheckpointBarrier) returns (stream BarrierAck);
+}

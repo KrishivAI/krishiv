@@ -86,6 +86,8 @@ pub enum TaskUpdateOutcome {
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod admission;
 pub mod checkpoint;
+pub mod barrier_tracker;
+pub mod barrier_client;
 pub mod heartbeat;
 pub mod job;
 pub(crate) mod store;

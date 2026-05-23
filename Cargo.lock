@@ -3155,6 +3155,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-async-util",
+ "krishiv-cep",
  "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
@@ -3193,6 +3194,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-cep"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "serde",
+]
+
+[[package]]
 name = "krishiv-chaos"
 version = "0.1.0"
 dependencies = [
@@ -3209,6 +3218,7 @@ dependencies = [
 name = "krishiv-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "krishiv-state",
  "serde",
  "serde_json",
  "sha2",
@@ -3239,6 +3249,7 @@ name = "krishiv-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "krishiv-cep",
  "krishiv-lakehouse",
  "krishiv-plan",
  "tokio",
@@ -3250,6 +3261,8 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum",
+ "futures",
+ "krishiv-async-util",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-exec",
@@ -3419,7 +3432,6 @@ dependencies = [
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
- "krishiv-spark-connect",
  "krishiv-sql",
  "rusqlite",
  "serde",
@@ -3450,27 +3462,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-spark-connect"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "bytes",
- "futures",
- "krishiv-proto",
- "krishiv-sql",
- "parquet 58.3.0",
- "prost",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "krishiv-sql"
 version = "0.1.0"
 dependencies = [
@@ -3498,8 +3489,12 @@ version = "0.1.0"
 dependencies = [
  "krishiv-async-util",
  "redb",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "twox-hash",
 ]
 
 [[package]]

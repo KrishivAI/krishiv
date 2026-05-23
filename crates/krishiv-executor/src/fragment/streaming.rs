@@ -336,7 +336,20 @@ pub(crate) async fn execute_streaming_fragment(
                 }
             }
             OperatorMessage::Barrier { epoch } => {
-                // Barrier received: checkpoint handling is deferred to R8.
+                // R16: barrier aligned at source/window operator; flush open windows before ack.
+                let flush_wm = watermark
+                    .current_watermark_ms()
+                    .saturating_add(i64::MAX / 4);
+                let flushed = window_op.flush_closed_windows(flush_wm).map_err(|e| {
+                    ExecutorError::LocalExecution {
+                        message: format!("barrier flush failed at epoch {epoch}: {e}"),
+                    }
+                })?;
+                for ob in &flushed {
+                    total_rows += ob.num_rows();
+                    total_batches += 1;
+                    column_count = ob.num_columns();
+                }
                 let _ = epoch;
             }
         }

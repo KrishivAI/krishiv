@@ -15,6 +15,12 @@
 //! - `RocksDbStateBackend` — type alias for `RedbStateBackend` (kept for
 //!   source compatibility; the old filesystem-based placeholder is removed).
 
+pub mod incremental;
+pub mod key_group;
+pub mod migration;
+
+pub use migration::{SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry};
+
 use krishiv_async_util::unix_now_ms;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::{BTreeMap, HashMap};
@@ -178,6 +184,16 @@ pub trait StateBackend: Send + Sync {
                 self.get(&ns, key)
             })
             .collect()
+    }
+
+    /// Key groups owned by this backend instance (ADR-R16.3).
+    fn key_group_range(&self) -> std::ops::RangeInclusive<u16> {
+        0..=crate::key_group::NUM_KEY_GROUPS - 1
+    }
+
+    /// Schema version stored in this backend (R16 S4.3).
+    fn schema_version(&self) -> u32 {
+        1
     }
 }
 
