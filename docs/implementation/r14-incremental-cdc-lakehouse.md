@@ -179,7 +179,7 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S1.1: SQL parser extension — krishiv-sql
 
-- [ ] Extend the DataFusion SQL parser (or a pre-parse rewrite) to recognize
+- [x] Extend the DataFusion SQL parser (or a pre-parse rewrite) to recognize
       `CREATE LIVE TABLE <name> AS <query>` and `REFRESH LIVE TABLE <name>`.
 - [ ] Introduce `LogicalPlan::CreateLiveTable { name, query, delta_store }` and
       `LogicalPlan::RefreshLiveTable { name }` variants.
@@ -215,10 +215,10 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S1.4: Delta store — krishiv-lakehouse
 
-- [ ] Implement `DeltaStore` trait with `append(batch: RecordBatch, op:
+- [x] Implement `DeltaStore` trait with `append(batch: RecordBatch, op:
       DeltaOp)`, `scan() -> Vec<(DeltaOp, RecordBatch)>`, and `truncate()`.
-- [ ] Implement `RedbDeltaStore` for embedded mode.
-- [ ] Implement `KafkaDeltaStore` for distributed mode (gated on
+- [x] Implement `RedbDeltaStore` for embedded mode.
+- [x] Implement `KafkaDeltaStore` for distributed mode (gated on
       `features = ["kafka"]`).
 - [ ] Add unit tests for both implementations covering append, scan, and
       truncate.
@@ -265,7 +265,7 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S3.1: SchemaNormalizeOperator — krishiv-exec
 
-- [ ] Implement `SchemaNormalizeOperator` that accepts a target `Arc<Schema>`
+- [x] Implement `SchemaNormalizeOperator` that accepts a target `Arc<Schema>`
       and an incoming `RecordBatch` with a potentially different schema.
 - [ ] Handle: (a) add nullable column → fill with null array; (b) rename
       column → remap by position if metadata carries old/new name mapping; (c)
@@ -278,7 +278,7 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S3.2: Multi-table CDC routing — krishiv-connectors, krishiv-exec
 
-- [ ] Implement `CdcRouter` that reads from a single `CdcEventSource` and
+- [x] Implement `CdcRouter` that reads from a single `CdcEventSource` and
       routes events to per-table `DeltaStore` instances based on the event's
       `table_name` field.
 - [ ] Each routed channel has its own `SchemaNormalizeOperator` initialized from
@@ -314,7 +314,7 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S4.2: Iceberg two-phase commit — krishiv-lakehouse
 
-- [ ] Implement `IcebergTwoPhaseCommit`: `prepare(batch) -> StagedSnapshot` and
+- [x] Implement `IcebergTwoPhaseCommit`: `prepare(batch) -> StagedSnapshot` and
       `commit(staged, kafka_offsets: HashMap<TopicPartition, i64>)`.
 - [ ] Store `kafka_offsets` in the Iceberg snapshot summary under the key
       `krishiv.kafka.committed_offsets` as a JSON string.
@@ -325,7 +325,7 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S4.3: Coordinator barrier alignment — krishiv-scheduler, krishiv-proto
 
-- [ ] Extend the `BarrierMetadata` proto message with:
+- [x] Extend the `BarrierMetadata` proto message with:
       `kafka_offsets: map<string, int64>` and
       `iceberg_snapshot_id: optional uint64`.
 - [ ] In `CheckpointCoordinator::initiate_checkpoint`, populate both fields
@@ -341,7 +341,7 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 
 ### S4.4: Exactly-once end-to-end integration test
 
-- [ ] Write an integration test that:
+- [x] Write an integration test that:
       (1) Produces 10 000 Kafka messages via the transactional producer.
       (2) Runs a live table pipeline that consumes and writes to Iceberg.
       (3) Kills the coordinator mid-run (simulated panic).
@@ -361,9 +361,9 @@ crash-class risk for the CDC fan-out feature in Sprint 3.
 - [ ] `cargo test -p krishiv-connectors --features kafka` — transactional producer, CDC router tests.
 - [ ] `cargo test -p krishiv-scheduler` — barrier alignment and recovery tests.
 - [ ] `cargo test -p krishiv-proto` — barrier metadata round-trip tests.
-- [ ] `pytest python/tests/test_live_table.py` — Python live table API tests.
-- [ ] `pytest python/tests/test_memo.py` — memoization tests.
-- [ ] `pytest python/tests/test_change_feed.py` — ChangeFeed asyncio tests.
+- [x] `pytest python/tests/test_live_table.py` — Python live table API tests.
+- [x] `pytest python/tests/test_memo.py` — memoization tests.
+- [x] `pytest python/tests/test_change_feed.py` — ChangeFeed asyncio tests.
 - [ ] `cargo test --workspace` — full Rust suite passes.
 - [ ] `pytest python/tests/` — full Python suite passes.
 

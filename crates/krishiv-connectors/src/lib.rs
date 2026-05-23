@@ -13,7 +13,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub mod cdc;
+pub mod cdc_router;
 pub mod kafka;
+pub mod transactional;
 pub mod parquet;
 pub mod s3;
 

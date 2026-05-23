@@ -9,11 +9,25 @@ license.workspace = true
 arrow = { workspace = true }
 async-trait = { workspace = true }
 iceberg = { workspace = true }
+redb = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
+
+[features]
+default = []
+kafka = ["dep:rdkafka"]
+exactly-once-integration = []
 
 [dev-dependencies]
+krishiv-connectors = { path = "../krishiv-connectors" }
 tempfile = { workspace = true }
+
+[[test]]
+name = "exactly_once"
+path = "tests/exactly_once.rs"
+required-features = ["exactly-once-integration"]
 
 [lib]
 path = "src/lib.rs"

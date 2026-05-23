@@ -14,6 +14,8 @@ kafka = ["dep:rdkafka"]
 [dependencies]
 arrow = { workspace = true }
 bytes = { workspace = true }
+krishiv-exec = { path = "../krishiv-exec" }
+krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-proto = { path = "../krishiv-proto" }
 object_store = { workspace = true }
 parquet = { workspace = true }

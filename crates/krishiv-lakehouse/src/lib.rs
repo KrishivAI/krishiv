@@ -12,6 +12,17 @@ use arrow::array::Array;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+mod delta;
+mod two_phase;
+
+pub use delta::{DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore};
+pub use two_phase::{
+    IcebergTwoPhaseCommit, MemoryIcebergTwoPhaseCommit, StagedSnapshot, KAFKA_OFFSETS_SUMMARY_KEY,
+    kafka_offsets_json, parse_kafka_offsets_json,
+};
+#[cfg(feature = "kafka")]
+pub use delta::RdkafkaDeltaStore;
+
 // ---------------------------------------------------------------------------
 // LakehouseError
 // ---------------------------------------------------------------------------
