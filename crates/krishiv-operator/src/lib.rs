@@ -2393,6 +2393,8 @@ mod tests {
             operator_snapshots: vec![],
             is_savepoint: false,
             savepoint_label: None,
+            iceberg_snapshot_id: None,
+            kafka_offsets: None,
         };
         // Epoch 1 commit succeeds (current token = 1, meta token = 1).
         assert!(validate_fencing_token(&meta_epoch1, coord_a.fencing_token()).is_ok());

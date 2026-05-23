@@ -44,6 +44,8 @@ pub struct CheckpointCoordinator {
     /// Accumulated wall-clock ms since the last checkpoint was initiated.
     /// Driven by `try_tick`; resets on each successful `initiate()`.
     pub(crate) elapsed_ms: u64,
+    pub(crate) pending_iceberg_snapshot_id: Option<u64>,
+    pub(crate) pending_kafka_offsets: Option<std::collections::BTreeMap<String, i64>>,
 }
 
 impl fmt::Debug for CheckpointCoordinator {
@@ -79,7 +81,18 @@ impl CheckpointCoordinator {
             pending_savepoint_label: None,
             pending_is_savepoint: false,
             elapsed_ms: 0,
+            pending_iceberg_snapshot_id: None,
+            pending_kafka_offsets: None,
         }
+    }
+
+    pub fn set_barrier_alignment(
+        &mut self,
+        kafka_offsets: std::collections::BTreeMap<String, i64>,
+        iceberg_snapshot_id: Option<u64>,
+    ) {
+        self.pending_kafka_offsets = Some(kafka_offsets);
+        self.pending_iceberg_snapshot_id = iceberg_snapshot_id;
     }
 
     /// Begin a new checkpoint epoch.
@@ -228,6 +241,8 @@ impl CheckpointCoordinator {
             operator_snapshots,
             is_savepoint,
             savepoint_label,
+            iceberg_snapshot_id: self.pending_iceberg_snapshot_id,
+            kafka_offsets: self.pending_kafka_offsets.clone(),
         };
 
         // GAP-CP-03: Validate fencing token before committing to storage.
@@ -335,6 +350,8 @@ impl CheckpointCoordinator {
 
 #[cfg(test)]
 mod tests {
+
+
     use std::sync::Arc;
 
     use krishiv_checkpoint::{CheckpointError, LocalFsCheckpointStorage, write_operator_snapshot};

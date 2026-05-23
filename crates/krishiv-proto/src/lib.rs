@@ -570,6 +570,13 @@ pub struct CheckpointSourceOffset {
     pub offset: i64,
 }
 
+/// Barrier alignment metadata for exactly-once CDC → Iceberg (R14).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BarrierMetadata {
+    pub kafka_offsets: Vec<CheckpointSourceOffset>,
+    pub iceberg_snapshot_id: Option<u64>,
+}
+
 /// Coordinator → Executor: begin checkpoint epoch E.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitiateCheckpointRequest {

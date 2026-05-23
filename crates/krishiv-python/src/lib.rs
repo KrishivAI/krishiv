@@ -13,6 +13,8 @@ use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+mod live_table;
+mod memo;
 
 // ---------------------------------------------------------------------------
 // Exception hierarchy (GAP-PY-01)
@@ -209,6 +211,10 @@ impl PySession {
             max_lateness_ms,
             key_columns: Vec::new(),
         })
+    }
+
+    pub fn live_table(&self, name: String, query: String) -> PyResult<live_table::PyLiveTable> {
+        live_table::create_live_table(name, query)
     }
 }
 
@@ -640,6 +646,9 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKeyedStream>()?;
     m.add_class::<PyWindowedStream>()?;
     m.add_class::<PyBatch>()?;
+    m.add_class::<live_table::PyLiveTable>()?;
+    m.add_class::<live_table::PyChangeFeedIter>()?;
+    m.add_class::<memo::MemoCacheInfo>()?;
 
     // Sinks
     m.add_class::<PyParquetSink>()?;
@@ -650,6 +659,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(read_kafka, m)?)?;
     m.add_function(wrap_pyfunction!(read_iceberg, m)?)?;
+    m.add_function(wrap_pyfunction!(memo::memo_cache_info, m)?)?;
+    m.add_function(wrap_pyfunction!(memo::memo_transform_call, m)?)?;
 
     Ok(())
 }

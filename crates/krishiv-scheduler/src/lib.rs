@@ -4760,6 +4760,8 @@ mod tests {
                 operator_snapshots: vec![],
                 is_savepoint: false,
                 savepoint_label: None,
+                iceberg_snapshot_id: None,
+                kafka_offsets: None,
             };
             write_epoch_metadata(storage.as_ref(), "job-ck-recover", epoch, &meta).unwrap();
             let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
@@ -5119,6 +5121,8 @@ mod tests {
                 operator_snapshots: vec![],
                 is_savepoint: false,
                 savepoint_label: None,
+                iceberg_snapshot_id: None,
+                kafka_offsets: None,
             };
             let storage_dyn: &dyn CheckpointStorage = storage;
             write_epoch_metadata(storage_dyn, job_id, epoch, &meta).unwrap();
