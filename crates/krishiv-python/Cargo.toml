@@ -18,8 +18,14 @@ krishiv-sql = { path = "../krishiv-sql" }
 krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
 pyo3 = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+default = []
+kafka = []
+iceberg = []
 
 [lints]
 workspace = true
