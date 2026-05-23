@@ -1,12 +1,93 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::{ExecError, ExecResult};
+
+/// Typed group-by / aggregate key (P2-12).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum AggKey {
+    Int32(i32),
+    Int64(i64),
+    /// `f64` stored as IEEE-754 bits for total-order hashing.
+    Float64(u64),
+    Utf8(String),
+    Bool(bool),
+}
+
+impl AggKey {
+    pub(crate) fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Int32(a), Self::Int32(b)) => a.cmp(b),
+            (Self::Int64(a), Self::Int64(b)) => a.cmp(b),
+            (Self::Float64(a), Self::Float64(b)) => a.cmp(b),
+            (Self::Utf8(a), Self::Utf8(b)) => a.cmp(b),
+            (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            (a, b) => a.discriminant().cmp(&b.discriminant()),
+        }
+    }
+
+    fn discriminant(&self) -> u8 {
+        match self {
+            Self::Int32(_) => 0,
+            Self::Int64(_) => 1,
+            Self::Float64(_) => 2,
+            Self::Utf8(_) => 3,
+            Self::Bool(_) => 4,
+        }
+    }
+}
+
+/// Extract a typed key from one column at `row`.
+pub(crate) fn extract_agg_key(
+    batch: &RecordBatch,
+    col_idx: usize,
+    row: usize,
+) -> ExecResult<AggKey> {
+    let col = batch.column(col_idx);
+    match col.data_type() {
+        DataType::Int32 => {
+            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Int32 key failed downcast".into())
+            })?;
+            Ok(AggKey::Int32(arr.value(row)))
+        }
+        DataType::Int64 => {
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Int64 key failed downcast".into())
+            })?;
+            Ok(AggKey::Int64(arr.value(row)))
+        }
+        DataType::Float64 => {
+            let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Float64 key failed downcast".into())
+            })?;
+            Ok(AggKey::Float64(arr.value(row).to_bits()))
+        }
+        DataType::Utf8 => {
+            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Utf8 key failed downcast".into())
+            })?;
+            Ok(AggKey::Utf8(arr.value(row).to_string()))
+        }
+        DataType::Boolean => {
+            let arr = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                ExecError::UnsupportedType("declared Bool key failed downcast".into())
+            })?;
+            Ok(AggKey::Bool(arr.value(row)))
+        }
+        other => Err(ExecError::UnsupportedType(format!(
+            "unsupported group key type: {other}"
+        ))),
+    }
+}
 
 /// Compare two group-key string parts with numeric-first ordering.
 ///

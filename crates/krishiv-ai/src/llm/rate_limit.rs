@@ -28,7 +28,10 @@ impl LlmRateLimiter {
     /// Process-wide singleton per model name.
     pub fn for_model(model: &str, config: RateLimitConfig) -> Arc<tokio::sync::Mutex<Self>> {
         let map = GLOBAL_LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut guard = map.lock().expect("limiter map");
+        let mut guard = map.lock().unwrap_or_else(|e| {
+            tracing::error!("LLM rate limiter map lock poisoned: {e}");
+            e.into_inner()
+        });
         guard
             .entry(model.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(Self::new(config))))

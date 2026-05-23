@@ -73,12 +73,28 @@ impl SharedStateMigrationRegistry {
         Self::default()
     }
 
-    pub fn register(&self, from: u32, to: u32, f: StateMigrationFn) {
-        self.inner.write().unwrap().register(from, to, f);
+    pub fn register(&self, from: u32, to: u32, f: StateMigrationFn) -> Result<(), crate::StateError> {
+        self.inner
+            .write()
+            .map_err(|e| crate::StateError::LockPoisoned {
+                message: e.to_string(),
+            })?
+            .register(from, to, f);
+        Ok(())
     }
 
-    pub fn migrate(&self, from: u32, to: u32, bytes: &[u8]) -> Result<Vec<u8>, StateMigrationError> {
-        self.inner.read().unwrap().migrate(from, to, bytes)
+    pub fn migrate(
+        &self,
+        from: u32,
+        to: u32,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, StateMigrationError> {
+        self.inner
+            .read()
+            .map_err(|e| StateMigrationError {
+                message: format!("state migration registry lock poisoned: {e}"),
+            })?
+            .migrate(from, to, bytes)
     }
 }
 

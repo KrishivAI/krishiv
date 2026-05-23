@@ -2,34 +2,45 @@
 
 ## Current Phase
 
-**Gap mitigation (all sprints) — in progress on PR #36 (2026-05-23)**
+**Gap mitigation (all sprints) — PR #36 `cursor/gap-mitigation-7aa2` (2026-05-23)**
 
 Plan: [`docs/engineering/gap-mitigation-plan.md`](../engineering/gap-mitigation-plan.md)
 
-Branch: `cursor/gap-mitigation-7aa2`
+## Completed (optional follow-ups landed)
 
-## Completed this session (continued)
+| ID | Item |
+|----|------|
+| P2-7 | Nexmark Q1/Q2/Q5/Q8 benches via `SqlEngine` + in-memory Arrow tables |
+| P1-10 | `IcebergFsTable` — Parquet layers + `metadata.json`, restart durable |
+| P2-11 | `spark_compat` / `spark_compat_date` downcasts → `DataFusionError` |
+| P2-12 | Typed `AggKey` + `AggFunction::Avg` (Float64 output) |
+| P2-13 | `upgrade_compat` typed `CheckpointMetadata` deserialize + validate |
+| P3-7 | Processing-time timer O(1) cancel via identity index |
+| P3-8 | `SharedStateMigrationRegistry` poison → `StateError::LockPoisoned` |
+| P3-9 | OpenAI `call_one` native async (no `spawn_blocking`) |
+| P3-10 | LLM rate-limiter map poison recovery + error log |
+| P3-11 | `TokenAwareChunker` binary search; `tiktoken` feature for `tiktoken-rs` |
+| P3-12 | Memo keys `{content_hash}:{chunk_index}`; per-chunk RAG skip |
+| P3-13 | `MemoEntry.created_at_ms` + TTL eviction on `get` |
+| P3-26 | `FederationClient` `async_trait` methods |
 
-| Tier | Items |
-|------|--------|
-| P0 | P0-5/6 leader election + finalizer; P0-11 Weaviate query; P0-14 Spark CAST; P0-15 audit call sites; P0-16 KrishivMetrics + Prometheus text |
-| P1 | P1-1/2/3 checkpoint fencing, stale epoch, fsync; P3-6 list_valid_epochs warns/propagates |
-| P2 | P2-3 ProjectionPruning, PredicatePushdown, ConstantFolding rules; P2-6 krishiv-testkit helpers |
-| P3 | P3-14 DashMap audit dedup; P3-15 record_async; P3-16 owned AuditAction; P3-17 metrics shutdown; P3-21/22 UI shuffle bytes + active readyz; P3-23–25 catalog TableAlreadyExists + List/Struct types |
+## Still deferred (infra / large)
 
-## Prior commits on branch
-
-Sprint 1 P0 (modules, coordinator ticks, catalog SQL, Python wiring, RAG sink), P1 shuffle/state/lakehouse/connectors/executor, checkpoint ACK, etc.
+- Full Iceberg catalog + `object_store` remote backend (beyond FS Parquet table)
+- ONNX / `krishiv-ai` integration tests in CI without libstdc++
+- Full workspace `cargo test --workspace`
 
 ## Validation
 
 ```bash
 cargo check --workspace
-cargo test -p krishiv-checkpoint -p krishiv-governance -p krishiv-optimizer -p krishiv-catalog -p krishiv-metrics -p krishiv-ui -p krishiv-scheduler -p krishiv-sql-policy -p krishiv-vector-sinks --lib
+cargo test -p krishiv-exec -p krishiv-state -p krishiv-federation -p krishiv-lakehouse -p krishiv-upgrade-tests -p krishiv-ai --lib
+cargo test -p krishiv-upgrade-tests
+cargo test -p krishiv-sql spark_compat
 ```
 
-Note: `krishiv-python` / `krishiv-ai` lib tests need `libstdc++` (ONNX). `krishiv-executor` integration test `barrier_injection` needs `barrier_transport` module.
+Optional bench: `cargo bench -p krishiv-bench --bench nexmark`
 
 ## Next command
 
-Continue remaining P2/P3 items (shuffle lock poison, flight-sql PolicyEnforcingSqlEngine direct wire, coalesce exec, object-store checkpoint, nexmark benches, P3 AI/python items).
+Merge PR #36 after CI green.

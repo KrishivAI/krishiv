@@ -9,6 +9,7 @@ license.workspace = true
 # CI uses `--no-default-features`; enable `fastembed-local` for HuggingFace + rag_index tests (needs C++ / libstdc++ for ONNX).
 default = []
 fastembed-local = ["dep:fastembed"]
+tiktoken = ["dep:tiktoken-rs"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -26,6 +27,7 @@ sha2 = { workspace = true }
 twox-hash = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+tiktoken-rs = { version = "0.6", optional = true }
 
 [dev-dependencies]
 mockito = { workspace = true }

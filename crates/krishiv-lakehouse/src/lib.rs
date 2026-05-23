@@ -15,6 +15,7 @@ mod as_of;
 mod delta;
 mod delta_lake;
 mod hudi;
+mod iceberg_fs;
 mod local_delta;
 mod partition_spec;
 mod two_phase;
@@ -22,6 +23,7 @@ mod two_phase;
 pub use as_of::{AsOfSpec};
 pub use delta::{DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore};
 pub use hudi::{write_hudi_cow_fixture, HudiQueryType, HudiSnapshotReader};
+pub use iceberg_fs::IcebergFsTable;
 pub use partition_spec::{PartitionSpecResolver, PartitionSpecVersion};
 pub use delta_lake::{
     merge_delta, write_delta, DeltaTableHandle, DeltaWriteMode, MergeDeltaResult,

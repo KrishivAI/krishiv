@@ -46,79 +46,74 @@ impl OpenAiLlmUdf {
         {
             return Ok(hit.clone());
         }
-        let api_key = self.api_key.clone();
-        let model = self.config.model.clone();
+        let api_key = &self.api_key;
+        let model = &self.config.model;
         let max_tokens = self.config.max_tokens;
         let temperature = self.config.temperature;
         let limiter = Arc::clone(&self.rate_limiter);
-        let client = self.client.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                limiter.lock().await.acquire(max_tokens as u64).await;
-                let body = serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                });
-                let mut attempt = 0u32;
-                loop {
-                    let resp = client
-                        .post("https://api.openai.com/v1/chat/completions")
-                        .bearer_auth(&api_key)
-                        .json(&body)
-                        .send()
-                        .await
-                        .map_err(|e| LlmError::Http(e.to_string()))?;
-                    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        attempt += 1;
-                        if attempt > 4 {
-                            return Err(LlmError::RateLimit("429 retries exhausted".into()));
-                        }
-                        let jitter = 100 + (attempt * 37);
-                        tokio::time::sleep(std::time::Duration::from_millis(jitter as u64)).await;
-                        continue;
-                    }
-                    if !resp.status().is_success() {
-                        return Err(LlmError::Http(resp.text().await.unwrap_or_default()));
-                    }
-                    #[derive(Deserialize)]
-                    struct Choice {
-                        message: Message,
-                        finish_reason: Option<String>,
-                    }
-                    #[derive(Deserialize)]
-                    struct Message {
-                        content: String,
-                    }
-                    #[derive(Deserialize)]
-                    struct Usage {
-                        total_tokens: u32,
-                    }
-                    #[derive(Deserialize)]
-                    struct ChatResponse {
-                        choices: Vec<Choice>,
-                        usage: Option<Usage>,
-                    }
-                    let parsed: ChatResponse = resp
-                        .json()
-                        .await
-                        .map_err(|e| LlmError::Parse(e.to_string()))?;
-                    let choice = parsed
-                        .choices
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| LlmError::Parse("no choices".into()))?;
-                    return Ok(LlmResponse {
-                        text: choice.message.content,
-                        finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".into()),
-                        tokens_used: parsed.usage.map(|u| u.total_tokens).unwrap_or(0),
-                    });
+        let client = &self.client;
+
+        limiter.lock().await.acquire(max_tokens as u64).await;
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        });
+        let mut attempt = 0u32;
+        let response = loop {
+            let resp = client
+                .post("https://api.openai.com/v1/chat/completions")
+                .bearer_auth(api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| LlmError::Http(e.to_string()))?;
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                attempt += 1;
+                if attempt > 4 {
+                    return Err(LlmError::RateLimit("429 retries exhausted".into()));
                 }
-            })
-        })
-        .await
-        .map_err(|e| LlmError::Http(e.to_string()))??;
+                let jitter = 100 + (attempt * 37);
+                tokio::time::sleep(std::time::Duration::from_millis(jitter as u64)).await;
+                continue;
+            }
+            if !resp.status().is_success() {
+                return Err(LlmError::Http(resp.text().await.unwrap_or_default()));
+            }
+            #[derive(Deserialize)]
+            struct Choice {
+                message: Message,
+                finish_reason: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Message {
+                content: String,
+            }
+            #[derive(Deserialize)]
+            struct Usage {
+                total_tokens: u32,
+            }
+            #[derive(Deserialize)]
+            struct ChatResponse {
+                choices: Vec<Choice>,
+                usage: Option<Usage>,
+            }
+            let parsed: ChatResponse = resp
+                .json()
+                .await
+                .map_err(|e| LlmError::Parse(e.to_string()))?;
+            let choice = parsed
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| LlmError::Parse("no choices".into()))?;
+            break LlmResponse {
+                text: choice.message.content,
+                finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".into()),
+                tokens_used: parsed.usage.map(|u| u.total_tokens).unwrap_or(0),
+            };
+        };
         if self.config.cache && self.cache.len() < 10_000 {
             self.cache.insert(cache_key, response.clone());
         }

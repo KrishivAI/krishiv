@@ -172,7 +172,11 @@ pub fn register_spark_functions(
                 ColumnarValue::Array(a) => a.clone(),
                 ColumnarValue::Scalar(s) => s.to_array()?,
             };
-            let arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+            let arr = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(
+                    "isnan: expected Float64 array".into(),
+                )
+            })?;
             let out: BooleanArray = arr.iter().map(|v| v.map(|x| x.is_nan())).collect();
             Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
         }),

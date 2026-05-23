@@ -2,12 +2,14 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::{ExecError, ExecResult};
-use crate::join::{compare_key_parts, format_key_value};
+use crate::join::{extract_agg_key, AggKey};
 
 // ── LocalAggregator ───────────────────────────────────────────────────────────
 
@@ -22,6 +24,8 @@ pub enum AggFunction {
     Min,
     /// Maximum of an `Int32` or `Int64` column.
     Max,
+    /// Average of numeric columns (`Int32`, `Int64`, `Float64`).
+    Avg,
 }
 
 /// An aggregate expression: a function applied to an input column, producing an
@@ -39,10 +43,13 @@ pub struct AggExpr {
 /// Running aggregation state for one group.
 #[derive(Debug)]
 pub(crate) struct AggState {
-    /// One running value per `AggExpr`: count, sum, min, or max.
+    /// Integer aggregates: count, sum, min, max.
     pub(crate) values: Vec<i64>,
     /// Tracks whether Min/Max has received at least one value.
     pub(crate) has_value: Vec<bool>,
+    /// Sum for `Avg` (all numeric types promoted to f64).
+    pub(crate) avg_sums: Vec<f64>,
+    pub(crate) avg_counts: Vec<u64>,
 }
 
 impl AggState {
@@ -54,10 +61,60 @@ impl AggState {
                 AggFunction::Sum => 0i64,
                 AggFunction::Min => i64::MAX,
                 AggFunction::Max => i64::MIN,
+                AggFunction::Avg => 0i64,
             })
             .collect();
         let has_value = agg_exprs.iter().map(|_| false).collect();
-        Self { values, has_value }
+        let avg_sums = agg_exprs
+            .iter()
+            .map(|expr| if expr.function == AggFunction::Avg { 0.0 } else { 0.0 })
+            .collect();
+        let avg_counts = agg_exprs
+            .iter()
+            .map(|expr| if expr.function == AggFunction::Avg { 0 } else { 0 })
+            .collect();
+        Self {
+            values,
+            has_value,
+            avg_sums,
+            avg_counts,
+        }
+    }
+
+    fn numeric_value(
+        col: &ArrayRef,
+        row: usize,
+        input_column: &str,
+    ) -> ExecResult<f64> {
+        match col.data_type() {
+            DataType::Int32 => {
+                let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    ExecError::UnsupportedType(
+                        "declared Int32 aggregate input failed downcast".into(),
+                    )
+                })?;
+                Ok(arr.value(row) as f64)
+            }
+            DataType::Int64 => {
+                let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    ExecError::UnsupportedType(
+                        "declared Int64 aggregate input failed downcast".into(),
+                    )
+                })?;
+                Ok(arr.value(row) as f64)
+            }
+            DataType::Float64 => {
+                let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    ExecError::UnsupportedType(
+                        "declared Float64 aggregate input failed downcast".into(),
+                    )
+                })?;
+                Ok(arr.value(row))
+            }
+            other => Err(ExecError::UnsupportedType(format!(
+                "unsupported aggregate input type for {input_column}: {other}"
+            ))),
+        }
     }
 
     pub(crate) fn update(
@@ -120,16 +177,26 @@ impl AggState {
                             }
                             self.has_value[i] = true;
                         }
-                        AggFunction::Count => unreachable!(),
+                        AggFunction::Count | AggFunction::Avg => unreachable!(),
                     }
+                }
+                AggFunction::Avg => {
+                    let col_idx = batch
+                        .schema()
+                        .index_of(&expr.input_column)
+                        .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
+                    let col = batch.column(col_idx);
+                    let v = Self::numeric_value(col, row, &expr.input_column)?;
+                    self.avg_sums[i] += v;
+                    self.avg_counts[i] += 1;
+                    self.has_value[i] = true;
                 }
             }
         }
         Ok(())
     }
 
-    /// Return the finalized value for position `i`. For Min/Max with no data,
-    /// returns 0 rather than the sentinel.
+    /// Return the finalized integer value for position `i`.
     pub(crate) fn finalized_value(&self, i: usize, expr: &AggExpr) -> i64 {
         match expr.function {
             AggFunction::Min | AggFunction::Max => {
@@ -140,6 +207,14 @@ impl AggState {
                 }
             }
             _ => self.values[i],
+        }
+    }
+
+    pub(crate) fn finalized_avg(&self, i: usize) -> f64 {
+        if self.avg_counts[i] == 0 {
+            0.0
+        } else {
+            self.avg_sums[i] / self.avg_counts[i] as f64
         }
     }
 }
@@ -165,7 +240,6 @@ impl LocalAggregator {
     ///
     /// Returns one output row per unique group.
     pub fn aggregate(&self, batch: &RecordBatch) -> ExecResult<RecordBatch> {
-        // Resolve group-by column indices.
         let gb_indices: Vec<usize> = self
             .group_by
             .iter()
@@ -177,14 +251,12 @@ impl LocalAggregator {
             })
             .collect::<ExecResult<_>>()?;
 
-        // Group rows into a HashMap<Vec<String>, AggState>.
-        let mut groups: HashMap<Vec<String>, AggState> = HashMap::new();
+        let mut groups: HashMap<Vec<AggKey>, AggState> = HashMap::new();
 
         for row in 0..batch.num_rows() {
-            // Build key from group-by values.
-            let key: Vec<String> = gb_indices
+            let key: Vec<AggKey> = gb_indices
                 .iter()
-                .map(|&idx| format_key_value(batch, idx, row))
+                .map(|&idx| extract_agg_key(batch, idx, row))
                 .collect::<ExecResult<_>>()?;
 
             let state = groups
@@ -193,17 +265,15 @@ impl LocalAggregator {
             state.update(&self.agg_exprs, batch, row)?;
         }
 
-        // Sort entries for deterministic output using numeric-aware key comparison.
-        let mut sorted_entries: Vec<(Vec<String>, AggState)> = groups.into_iter().collect();
+        let mut sorted_entries: Vec<(Vec<AggKey>, AggState)> = groups.into_iter().collect();
         sorted_entries.sort_by(|(a, _), (b, _)| {
             a.iter()
                 .zip(b.iter())
-                .map(|(ai, bi)| compare_key_parts(ai, bi))
+                .map(|(ai, bi)| ai.cmp(bi))
                 .find(|&o| o != Ordering::Equal)
                 .unwrap_or_else(|| a.len().cmp(&b.len()))
         });
 
-        // Build output schema.
         let mut fields: Vec<Field> = Vec::new();
         for col_name in &self.group_by {
             let schema = batch.schema();
@@ -213,7 +283,11 @@ impl LocalAggregator {
             fields.push(f.clone());
         }
         for agg in &self.agg_exprs {
-            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
+            let dtype = match agg.function {
+                AggFunction::Avg => DataType::Float64,
+                _ => DataType::Int64,
+            };
+            fields.push(Field::new(&agg.output_column, dtype, false));
         }
         let out_schema = Arc::new(Schema::new(fields));
 
@@ -223,10 +297,8 @@ impl LocalAggregator {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        // Build output columns.
         let mut columns: Vec<ArrayRef> = Vec::new();
 
-        // Group-by columns.
         for (gb_pos, col_name) in self.group_by.iter().enumerate() {
             let col_idx = gb_indices[gb_pos];
             let dtype = batch.schema().field(col_idx).data_type().clone();
@@ -234,40 +306,62 @@ impl LocalAggregator {
                 DataType::Int32 => {
                     let values: Vec<i32> = sorted_entries
                         .iter()
-                        .map(|(key, _)| {
-                            key[gb_pos].parse::<i32>().map_err(|e| {
-                                ExecError::UnsupportedType(format!(
-                                    "failed to rebuild Int32 group key '{}': {e}",
-                                    key[gb_pos]
-                                ))
-                            })
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Int32(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Int32 group key mismatch for {col_name}"
+                            ))),
                         })
                         .collect::<ExecResult<_>>()?;
-                    let arr = Int32Array::from(values);
-                    columns.push(Arc::new(arr) as ArrayRef);
+                    columns.push(Arc::new(Int32Array::from(values)) as ArrayRef);
                 }
                 DataType::Int64 => {
                     let values: Vec<i64> = sorted_entries
                         .iter()
-                        .map(|(key, _)| {
-                            key[gb_pos].parse::<i64>().map_err(|e| {
-                                ExecError::UnsupportedType(format!(
-                                    "failed to rebuild Int64 group key '{}': {e}",
-                                    key[gb_pos]
-                                ))
-                            })
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Int64(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Int64 group key mismatch for {col_name}"
+                            ))),
                         })
                         .collect::<ExecResult<_>>()?;
-                    let arr = Int64Array::from(values);
-                    columns.push(Arc::new(arr) as ArrayRef);
+                    columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
+                }
+                DataType::Float64 => {
+                    let values: Vec<f64> = sorted_entries
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Float64(bits) => Ok(f64::from_bits(bits)),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Float64 group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<_>>()?;
+                    columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
                 }
                 DataType::Utf8 => {
                     let strs: Vec<&str> = sorted_entries
                         .iter()
-                        .map(|(key, _)| key[gb_pos].as_str())
-                        .collect();
-                    let arr = StringArray::from(strs);
-                    columns.push(Arc::new(arr) as ArrayRef);
+                        .map(|(key, _)| match &key[gb_pos] {
+                            AggKey::Utf8(s) => Ok(s.as_str()),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Utf8 group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<_>>()?;
+                    columns.push(Arc::new(StringArray::from(strs)) as ArrayRef);
+                }
+                DataType::Boolean => {
+                    let values: Vec<bool> = sorted_entries
+                        .iter()
+                        .map(|(key, _)| match key[gb_pos] {
+                            AggKey::Bool(v) => Ok(v),
+                            _ => Err(ExecError::UnsupportedType(format!(
+                                "Bool group key mismatch for {col_name}"
+                            ))),
+                        })
+                        .collect::<ExecResult<_>>()?;
+                    columns.push(Arc::new(BooleanArray::from(values)) as ArrayRef);
                 }
                 other => {
                     return Err(ExecError::UnsupportedType(format!(
@@ -277,13 +371,23 @@ impl LocalAggregator {
             }
         }
 
-        // Aggregate output columns.
         for (agg_pos, agg) in self.agg_exprs.iter().enumerate() {
-            let arr: Int64Array = sorted_entries
-                .iter()
-                .map(|(_, state)| state.finalized_value(agg_pos, agg))
-                .collect();
-            columns.push(Arc::new(arr) as ArrayRef);
+            match agg.function {
+                AggFunction::Avg => {
+                    let arr: Float64Array = sorted_entries
+                        .iter()
+                        .map(|(_, state)| state.finalized_avg(agg_pos))
+                        .collect();
+                    columns.push(Arc::new(arr) as ArrayRef);
+                }
+                _ => {
+                    let arr: Int64Array = sorted_entries
+                        .iter()
+                        .map(|(_, state)| state.finalized_value(agg_pos, agg))
+                        .collect();
+                    columns.push(Arc::new(arr) as ArrayRef);
+                }
+            }
         }
 
         Ok(RecordBatch::try_new(out_schema, columns)?)

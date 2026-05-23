@@ -40,7 +40,11 @@ pub fn register_spark_date_udfs(
                     ColumnarValue::Array(a) => a.clone(),
                     ColumnarValue::Scalar(s) => s.to_array()?,
                 };
-                let dates = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+                let dates = arr.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        format!("{name}: expected Date32 array"),
+                    )
+                })?;
                 let out: Int32Array = dates
                     .iter()
                     .map(|d| {
