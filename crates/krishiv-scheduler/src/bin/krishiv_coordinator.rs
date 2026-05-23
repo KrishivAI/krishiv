@@ -199,6 +199,15 @@ krishiv_shuffle_partitions_available {shuffle_partitions}
 # HELP krishiv_shuffle_bytes_written_total Total bytes written to shuffle store
 # TYPE krishiv_shuffle_bytes_written_total counter
 krishiv_shuffle_bytes_written_total {shuffle_bytes}
+# HELP krishiv_jobs_submitted_total Jobs accepted by submit_job since process start
+# TYPE krishiv_jobs_submitted_total counter
+krishiv_jobs_submitted_total {jobs_submitted}
+# HELP krishiv_checkpoint_epochs_total Checkpoint epochs initiated since process start
+# TYPE krishiv_checkpoint_epochs_total counter
+krishiv_checkpoint_epochs_total {checkpoint_epochs}
+# HELP krishiv_tasks_assigned_total Task assignments launched since process start
+# TYPE krishiv_tasks_assigned_total counter
+krishiv_tasks_assigned_total {tasks_assigned}
 ",
         running = m.running_task_count(),
         retries = m.retry_count(),
@@ -206,6 +215,9 @@ krishiv_shuffle_bytes_written_total {shuffle_bytes}
         hb_age = max_hb_age,
         shuffle_partitions = m.shuffle_partitions_available,
         shuffle_bytes = m.shuffle_bytes_written,
+        jobs_submitted = sched.jobs_submitted_total,
+        checkpoint_epochs = sched.checkpoint_epochs_total,
+        tasks_assigned = sched.tasks_assigned_total,
     );
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],

@@ -34,8 +34,10 @@ from .krishiv import (  # noqa: F401 — re-export native extension symbols
     ModeError,
     # Core types
     Session,
+    Schema,
     DataFrame,
     Stream,
+    KeyedStream,
     WindowedStream,
     Batch,
     # Sinks
@@ -46,6 +48,9 @@ from .krishiv import (  # noqa: F401 — re-export native extension symbols
     read_parquet,
     read_kafka,
 )
+from . import krishiv as _native
+
+windows = _native.windows
 
 import asyncio as _asyncio
 

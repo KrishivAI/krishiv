@@ -1,0 +1,30 @@
+name: Python package
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/krishiv-python/**"
+      - ".github/workflows/python-package.yml"
+  pull_request:
+    paths:
+      - "crates/krishiv-python/**"
+      - ".github/workflows/python-package.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install maturin
+        run: pip install "maturin>=1.7,<2.0" pytest
+      - name: Build and install krishiv-python
+        working-directory: crates/krishiv-python
+        run: maturin develop --release
+      - name: Pytest
+        working-directory: crates/krishiv-python
+        run: pytest python/tests/ -q

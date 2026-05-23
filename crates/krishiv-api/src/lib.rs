@@ -418,12 +418,12 @@ impl Session {
 
     /// Create a bounded local memory stream.
     pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Stream {
-        Stream::for_session(name, StreamMode::Bounded, batches, self.mode)
+        Stream::for_session(name, StreamMode::Bounded, batches, self.mode, self.coordinator_url.clone())
     }
 
     /// Create an unbounded local memory stream placeholder.
     pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Stream {
-        Stream::for_session(name, StreamMode::Unbounded, Vec::new(), self.mode)
+        Stream::for_session(name, StreamMode::Unbounded, Vec::new(), self.mode, self.coordinator_url.clone())
     }
 }
 
@@ -590,13 +590,14 @@ pub struct Stream {
     name: String,
     mode: StreamMode,
     execution_mode: ExecutionMode,
+    coordinator_url: Option<String>,
     batches: Vec<StreamBatch>,
 }
 
 impl Stream {
     /// Create a stream.
     pub fn new(name: impl Into<String>, mode: StreamMode, batches: Vec<StreamBatch>) -> Self {
-        Self::for_session(name, mode, batches, ExecutionMode::Embedded)
+        Self::for_session(name, mode, batches, ExecutionMode::Embedded, None)
     }
 
     fn for_session(
@@ -604,11 +605,13 @@ impl Stream {
         mode: StreamMode,
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
+        coordinator_url: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
             mode,
             execution_mode,
+            coordinator_url,
             batches,
         }
     }
@@ -646,7 +649,7 @@ impl Stream {
             self.execution_mode,
             &self.name,
             ExecutionKind::Streaming,
-            None,
+            self.coordinator_url.as_deref(),
         )?;
         Ok(self.batches.clone())
     }
@@ -666,6 +669,7 @@ impl Stream {
             self.mode,
             self.batches.iter().map(&mut f).collect(),
             self.execution_mode,
+            self.coordinator_url.clone(),
         ))
     }
 
@@ -687,6 +691,7 @@ impl Stream {
                 .cloned()
                 .collect(),
             self.execution_mode,
+            self.coordinator_url.clone(),
         ))
     }
 
@@ -820,6 +825,25 @@ impl WindowedStream {
     /// The underlying keyed stream.
     pub fn keyed_stream(&self) -> &KeyedStream {
         &self.keyed
+    }
+
+    pub fn plan_fragment(&self, agg: &str, agg_col: Option<&str>) -> String {
+        let event_time = self.event_time_column().unwrap_or("event_time");
+        let mut fragment = format!(
+            "stream:tw:key={}:time={}:win={}:lag={}",
+            self.key_column(),
+            event_time,
+            self.window_size_ms(),
+            self.watermark_lag_ms()
+        );
+        match agg {
+            "sum" => {
+                let col = agg_col.unwrap_or("value");
+                fragment.push_str(&format!(":agg=sum:col={col}"));
+            }
+            _ => fragment.push_str(":agg=count"),
+        }
+        fragment
     }
 }
 
@@ -1251,6 +1275,21 @@ mod tests {
         assert_eq!(windowed.event_time_column(), Some("ts"));
         assert_eq!(windowed.watermark_lag_ms(), 1000);
         assert_eq!(windowed.window_size_ms(), 60_000);
+    }
+
+    #[test]
+    fn windowed_stream_plan_fragment_matches_executor_format() {
+        let session = Session::builder().build().unwrap();
+        let windowed = session
+            .memory_stream("events", vec![])
+            .key_by("user_id")
+            .with_event_time("ts")
+            .watermark(WatermarkSpec::fixed_lag_ms(1000))
+            .tumbling_window(60_000);
+        assert_eq!(
+            windowed.plan_fragment("count", None),
+            "stream:tw:key=user_id:time=ts:win=60000:lag=1000:agg=count"
+        );
     }
 
     #[test]

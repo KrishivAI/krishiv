@@ -201,7 +201,9 @@ static GLOBAL_AUDIT_SINK: std::sync::OnceLock<Box<dyn AuditSink + Send + Sync>> 
 // Stores a hash of `(principal, action_name, detail)` for the most recently
 // emitted event.  If two consecutive calls produce the same key the second
 // emission is suppressed and a warning is logged instead.
-static LAST_AUDIT_KEY: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+thread_local! {
+    static LAST_AUDIT_KEY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
 
 /// Compute a stable 64-bit dedup key for an audit event.
 fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
@@ -264,18 +266,22 @@ pub fn audit_log(principal: &str, action: &AuditAction<'_>, outcome: AuditOutcom
 
     // P0.21 — Deduplication: skip if this event is identical to the last one.
     let key = audit_dedup_key(principal, action_name, &detail);
-    {
-        let mut last = LAST_AUDIT_KEY.lock().unwrap_or_else(|p| p.into_inner());
-        if *last == Some(key) {
+    let suppressed = LAST_AUDIT_KEY.with(|last| {
+        if last.get() == Some(key) {
             tracing::warn!(
                 target: "krishiv::audit",
                 principal = principal,
                 action = action_name,
                 "duplicate audit event suppressed",
             );
-            return;
+            true
+        } else {
+            last.set(Some(key));
+            false
         }
-        *last = Some(key);
+    });
+    if suppressed {
+        return;
     }
 
     let event = AuditEvent {
@@ -679,25 +685,19 @@ mod tests {
 
     // ── P0.21 — Audit deduplication ──────────────────────────────────────────
 
+    static AUDIT_DEDUP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn audit_log_dedup_suppresses_consecutive_identical_events() {
-        // Reset the global dedup state so this test is not affected by other tests.
-        {
-            let mut last = LAST_AUDIT_KEY.lock().unwrap();
-            *last = None;
-        }
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
+        super::LAST_AUDIT_KEY.with(|last| last.set(None));
 
-        // Use a thread-local collector; we can't replace the global sink mid-test
-        // because it is a OnceLock and may already be initialised.  Instead we
-        // verify dedup by inspecting LAST_AUDIT_KEY directly.
-
-        // First call – should be emitted (key updated).
         audit_log(
             "dedup_user",
             &AuditAction::JobSubmitted { job_id: "dup-job" },
             AuditOutcome::Allowed,
         );
-        let key_after_first = *LAST_AUDIT_KEY.lock().unwrap();
+        let key_after_first = LAST_AUDIT_KEY.with(|last| last.get());
         assert!(key_after_first.is_some(), "key must be set after first emission");
 
         // Second identical call – should be suppressed (key unchanged).
@@ -706,7 +706,7 @@ mod tests {
             &AuditAction::JobSubmitted { job_id: "dup-job" },
             AuditOutcome::Allowed,
         );
-        let key_after_second = *LAST_AUDIT_KEY.lock().unwrap();
+        let key_after_second = LAST_AUDIT_KEY.with(|last| last.get());
         assert_eq!(
             key_after_first, key_after_second,
             "duplicate event must not change the stored key"
@@ -718,7 +718,7 @@ mod tests {
             &AuditAction::JobSubmitted { job_id: "different-job" },
             AuditOutcome::Allowed,
         );
-        let key_after_different = *LAST_AUDIT_KEY.lock().unwrap();
+        let key_after_different = LAST_AUDIT_KEY.with(|last| last.get());
         assert_ne!(
             key_after_first, key_after_different,
             "a different event must update the stored key"
