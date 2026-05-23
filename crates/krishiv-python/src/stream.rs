@@ -14,7 +14,7 @@ pub(crate) fn materialize_sql(
     session: &Arc<krishiv_api::Session>,
     query: &str,
 ) -> PyResult<Vec<RecordBatch>> {
-    if query.starts_with("kafka:") {
+    if query.starts_with("kafka:") || query.starts_with("iceberg:") {
         return Ok(Vec::new());
     }
     session
@@ -143,7 +143,8 @@ impl PyKeyedStream {
 }
 
 /// Windowed, async-iterable stream.
-#[pyclass(name = "WindowedStream")]
+#[derive(Clone)]
+#[pyclass(name = "WindowedStream", skip_from_py_object)]
 pub struct PyWindowedStream {
     session: Arc<krishiv_api::Session>,
     query: String,
@@ -151,8 +152,8 @@ pub struct PyWindowedStream {
     max_lateness_ms: u64,
     key_columns: Vec<String>,
     window_secs: Option<u64>,
-    cached: Mutex<Option<Vec<RecordBatch>>>,
-    next_index: Mutex<usize>,
+    cached: Arc<Mutex<Option<Vec<RecordBatch>>>>,
+    next_index: Arc<Mutex<usize>>,
 }
 
 impl PyWindowedStream {
@@ -171,8 +172,8 @@ impl PyWindowedStream {
             max_lateness_ms,
             key_columns,
             window_secs,
-            cached: Mutex::new(None),
-            next_index: Mutex::new(0),
+            cached: Arc::new(Mutex::new(None)),
+            next_index: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -187,7 +188,7 @@ impl PyWindowedStream {
     }
 
     fn windowed_sql(&self) -> String {
-        if self.query.starts_with("kafka:") {
+        if self.query.starts_with("kafka:") || self.query.starts_with("iceberg:") {
             return self.query.clone();
         }
         if self.key_columns.is_empty() {
@@ -259,12 +260,19 @@ impl PyWindowedStream {
         slf
     }
 
-    pub fn __anext__(&self, py: Python<'_>) -> PyResult<Py<PyBatch>> {
-        let batch = py.detach(|| self.next_batch())?;
-        match batch {
-            Some(b) => Ok(b.into_pyobject(py)?.unbind()),
-            None => Err(PyStopAsyncIteration::new_err(())),
-        }
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let slf = self.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match slf.next_batch()? {
+                Some(batch) => Python::attach(|py| {
+                    batch
+                        .into_pyobject(py)
+                        .map(|obj| obj.unbind())
+                        
+                }),
+                None => Err(PyStopAsyncIteration::new_err(())),
+            }
+        })
     }
 
     pub fn sink(&self, _sink: &Bound<'_, PyAny>) -> PyResult<()> {

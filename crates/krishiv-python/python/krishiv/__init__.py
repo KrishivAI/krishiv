@@ -19,6 +19,7 @@ from .krishiv import (
     Stream,
     WindowedStream,
     read_kafka,
+    read_iceberg,
     read_parquet,
 )
 
@@ -111,6 +112,7 @@ __all__ = [
     "agg",
     "connect_async",
     "read_kafka",
+    "read_iceberg",
     "read_parquet",
     "sinks",
     "windows",

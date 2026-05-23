@@ -1,6 +1,4 @@
-"""Async-friendly streaming helpers."""
-
-import asyncio
+"""Native asyncio iteration over windowed streams."""
 
 import pytest
 
@@ -8,12 +6,17 @@ import krishiv as ks
 
 
 @pytest.mark.asyncio
-async def test_async_collect_local_sql():
+async def test_native_async_iteration_local_sql():
     session = ks.Session.local()
     stream = session.stream("SELECT 1 AS n", "ts", 0)
     windowed = stream.tumbling_window(1)
-    batches = await asyncio.to_thread(windowed.collect)
-    assert isinstance(batches, list)
+    seen = 0
+    async for batch in windowed:
+        assert batch.num_rows >= 1
+        seen += 1
+        if seen >= 1:
+            break
+    assert seen == 1
 
 
 @pytest.mark.asyncio

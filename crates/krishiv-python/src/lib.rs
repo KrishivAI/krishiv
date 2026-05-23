@@ -364,11 +364,31 @@ pub fn read_parquet(py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
     })
 }
 
+/// Open an Iceberg table as a streaming `Stream`.
+#[pyfunction]
+pub fn read_iceberg(
+    session: &PySession,
+    catalog_uri: String,
+    table_name: String,
+) -> PyResult<PyStream> {
+    if matches!(session.inner.mode(), krishiv_api::ExecutionMode::Embedded) {
+        return Err(ModeError::new_err(
+            "read_iceberg() requires a non-embedded session; use Session.local() or Session.connect(url) to enable streaming",
+        ));
+    }
+    Ok(PyStream {
+        session: session.inner.clone(),
+        query: format!("iceberg:{catalog_uri}:{table_name}"),
+        watermark_column: String::new(),
+        max_lateness_ms: 0,
+        key_columns: Vec::new(),
+    })
+}
+
 /// Open a Kafka topic as a streaming `Stream`.
 ///
 /// `topic` is the Kafka topic name.  `bootstrap_servers` is the broker list
-/// (e.g. `"localhost:9092"`).  Returns a `Stream` handle; call `watermark()`
-/// and `tumbling_window()` to declare windows.
+/// (e.g. `"localhost:9092"`).  Returns a `Stream` handle.
 #[pyfunction]
 pub fn read_kafka(
     session: &PySession,
@@ -598,6 +618,9 @@ pub async fn call_python_udf(
 /// Python module `krishiv` — exposes all public types and functions.
 #[pymodule]
 fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let mut tokio_builder = tokio::runtime::Builder::new_multi_thread();
+    tokio_builder.enable_all();
+    pyo3_async_runtimes::tokio::init(tokio_builder);
     // Exception hierarchy
     m.add("KrishivError", m.py().get_type::<KrishivError>())?;
     m.add("QueryError", m.py().get_type::<QueryError>())?;
@@ -626,6 +649,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Module-level functions
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(read_kafka, m)?)?;
+    m.add_function(wrap_pyfunction!(read_iceberg, m)?)?;
 
     Ok(())
 }

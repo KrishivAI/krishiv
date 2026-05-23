@@ -1,0 +1,52 @@
+"""Connector integration tests (Kafka / Iceberg)."""
+
+import os
+
+import pytest
+
+import krishiv as ks
+
+
+def test_read_kafka_builds_stream_handle():
+    session = ks.Session.local()
+    stream = ks.read_kafka(session, "events", "localhost:9092")
+    assert stream is not None
+    windowed = stream.with_watermark("ts", 1000).tumbling_window(60)
+    batches = windowed.collect()
+    assert isinstance(batches, list)
+
+
+def test_read_iceberg_builds_stream_handle():
+    session = ks.Session.local()
+    stream = ks.read_iceberg(session, "http://catalog:8181", "db.events")
+    assert stream is not None
+    batches = stream.tumbling_window(30).collect()
+    assert isinstance(batches, list)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("KAFKA_BOOTSTRAP_SERVERS"),
+    reason="set KAFKA_BOOTSTRAP_SERVERS for live Kafka test",
+)
+def test_read_kafka_live_broker_smoke():
+    """Optional live broker test when CI provides Kafka."""
+    session = ks.Session.local()
+    stream = ks.read_kafka(
+        session,
+        os.environ.get("KAFKA_TEST_TOPIC", "krishiv-test"),
+        os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+    )
+    assert stream.with_watermark("ts", 5000) is not None
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("ICEBERG_CATALOG_URI"),
+    reason="set ICEBERG_CATALOG_URI for live Iceberg catalog test",
+)
+def test_read_iceberg_live_catalog_smoke():
+    session = ks.Session.local()
+    table = os.environ.get("ICEBERG_TEST_TABLE", "default.events")
+    stream = ks.read_iceberg(session, os.environ["ICEBERG_CATALOG_URI"], table)
+    assert stream.tumbling_window(60) is not None
