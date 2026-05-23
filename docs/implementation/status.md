@@ -40,3 +40,11 @@ cargo check -p krishiv-api -p krishiv-python
 ### Next Task
 
 - Optional: wire `deltalake-rs` when Arrow versions align; Nessie/Glue live CI; Python `write_delta` / `alter_table` partition helpers.
+
+
+## Documentation Update (2026-05-23)
+
+- Added a root `README.md` focused on end-user onboarding with quick start commands for CLI and API examples.
+- Linked architecture roadmap and implementation trackers for release-aware adoption.
+- Documented execution-mode selection guidance for Embedded/SingleNode/Distributed starts.
+
