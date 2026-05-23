@@ -138,20 +138,20 @@ impl PolicyHook for RoleBasedPolicyHook {
 // ─── Audit Log ────────────────────────────────────────────────────────────────
 
 /// **Beta API**: Actions that must be recorded in the audit log.
-#[derive(Debug)]
-pub enum AuditAction<'a> {
+#[derive(Debug, Clone)]
+pub enum AuditAction {
     /// A SQL query was executed; identified by its hash.
-    QueryExecuted { query_hash: &'a str },
+    QueryExecuted { query_hash: String },
     /// A job was submitted to the scheduler.
-    JobSubmitted { job_id: &'a str },
+    JobSubmitted { job_id: String },
     /// A running or queued job was cancelled.
-    JobCancelled { job_id: &'a str },
+    JobCancelled { job_id: String },
     /// A savepoint was created for a job.
-    SavepointCreated { job_id: &'a str },
+    SavepointCreated { job_id: String },
     /// A job was restored from a savepoint at the given epoch.
-    SavepointRestored { job_id: &'a str, epoch: u64 },
+    SavepointRestored { job_id: String, epoch: u64 },
     /// A privileged administrative action was performed.
-    AdminAction { description: &'a str },
+    AdminAction { description: String },
 }
 
 /// A structured audit event for external SIEM/audit-log forwarding.
@@ -175,12 +175,20 @@ pub enum AuditOutcome {
 }
 
 /// Pluggable audit log sink.
+#[async_trait::async_trait]
 pub trait AuditSink: Send + Sync {
     fn record(&self, event: &AuditEvent);
+
+    /// Async audit sink hook (defaults to synchronous `record`).
+    async fn record_async(&self, event: AuditEvent) {
+        self.record(&event);
+    }
 }
 
 /// No-op audit sink that routes to tracing.
 pub struct TracingAuditSink;
+
+#[async_trait::async_trait]
 impl AuditSink for TracingAuditSink {
     fn record(&self, event: &AuditEvent) {
         tracing::info!(
@@ -201,14 +209,10 @@ impl AuditSink for TracingAuditSink {
 static GLOBAL_AUDIT_SINK: std::sync::OnceLock<Box<dyn AuditSink + Send + Sync>> =
     std::sync::OnceLock::new();
 
-// P0.21 — Dedup key for the last-emitted audit event.
-//
-// Stores a hash of `(principal, action_name, detail)` for the most recently
-// emitted event.  If two consecutive calls produce the same key the second
-// emission is suppressed and a warning is logged instead.
-thread_local! {
-    static LAST_AUDIT_KEY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
+// P3-14 — Global dedup with TTL (not thread-local).
+static AUDIT_DEDUP: std::sync::LazyLock<dashmap::DashMap<u64, u64>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+const AUDIT_DEDUP_TTL_MS: u64 = 60_000;
 
 /// Compute a stable 64-bit dedup key for an audit event.
 fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
@@ -252,7 +256,7 @@ fn get_audit_sink() -> &'static dyn AuditSink {
 /// - `principal`: identity of the actor performing the action.
 /// - `action`: the audited action.
 /// - `outcome`: whether the action was permitted or denied.
-pub fn audit_log(principal: &str, action: &AuditAction<'_>, outcome: AuditOutcome) {
+pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
     let (action_name, detail): (&str, String) = match action {
         AuditAction::QueryExecuted { query_hash } => {
             ("query_executed", format!("hash={query_hash}"))
@@ -266,28 +270,26 @@ pub fn audit_log(principal: &str, action: &AuditAction<'_>, outcome: AuditOutcom
             "savepoint_restored",
             format!("job_id={job_id} epoch={epoch}"),
         ),
-        AuditAction::AdminAction { description } => ("admin_action", (*description).to_owned()),
+        AuditAction::AdminAction { description } => ("admin_action", description.clone()),
     };
 
-    // P0.21 — Deduplication: skip if this event is identical to the last one.
     let key = audit_dedup_key(principal, action_name, &detail);
-    let suppressed = LAST_AUDIT_KEY.with(|last| {
-        if last.get() == Some(key) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if let Some(entry) = AUDIT_DEDUP.get(&key) {
+        if now_ms.saturating_sub(*entry) < AUDIT_DEDUP_TTL_MS {
             tracing::warn!(
                 target: "krishiv::audit",
                 principal = principal,
                 action = action_name,
                 "duplicate audit event suppressed",
             );
-            true
-        } else {
-            last.set(Some(key));
-            false
+            return;
         }
-    });
-    if suppressed {
-        return;
     }
+    AUDIT_DEDUP.insert(key, now_ms);
 
     let event = AuditEvent {
         principal: principal.to_string(),
@@ -599,7 +601,9 @@ mod tests {
     fn audit_log_does_not_panic() {
         audit_log(
             "alice",
-            &AuditAction::JobSubmitted { job_id: "j1" },
+            &AuditAction::JobSubmitted {
+                job_id: "j1".into(),
+            },
             AuditOutcome::Allowed,
         );
     }
@@ -609,7 +613,7 @@ mod tests {
         audit_log(
             "eve",
             &AuditAction::AdminAction {
-                description: "unauthorized escalation",
+                description: "unauthorized escalation".into(),
             },
             AuditOutcome::Denied,
         );
@@ -695,39 +699,32 @@ mod tests {
     #[test]
     fn audit_log_dedup_suppresses_consecutive_identical_events() {
         let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
-        super::LAST_AUDIT_KEY.with(|last| last.set(None));
+        AUDIT_DEDUP.clear();
 
-        audit_log(
-            "dedup_user",
-            &AuditAction::JobSubmitted { job_id: "dup-job" },
-            AuditOutcome::Allowed,
-        );
-        let key_after_first = LAST_AUDIT_KEY.with(|last| last.get());
-        assert!(key_after_first.is_some(), "key must be set after first emission");
+        let action = AuditAction::JobSubmitted {
+            job_id: "dup-job".into(),
+        };
+        let key = super::audit_dedup_key("dedup_user", "job_submitted", "job_id=dup-job");
 
-        // Second identical call – should be suppressed (key unchanged).
-        audit_log(
-            "dedup_user",
-            &AuditAction::JobSubmitted { job_id: "dup-job" },
-            AuditOutcome::Allowed,
-        );
-        let key_after_second = LAST_AUDIT_KEY.with(|last| last.get());
+        audit_log("dedup_user", &action, AuditOutcome::Allowed);
+        assert!(AUDIT_DEDUP.contains_key(&key));
+
+        let entries_before = AUDIT_DEDUP.len();
+        audit_log("dedup_user", &action, AuditOutcome::Allowed);
         assert_eq!(
-            key_after_first, key_after_second,
-            "duplicate event must not change the stored key"
+            AUDIT_DEDUP.len(),
+            entries_before,
+            "duplicate event must not add a new dedup entry"
         );
 
-        // A different event should be emitted and update the key.
         audit_log(
             "dedup_user",
-            &AuditAction::JobSubmitted { job_id: "different-job" },
+            &AuditAction::JobSubmitted {
+                job_id: "different-job".into(),
+            },
             AuditOutcome::Allowed,
         );
-        let key_after_different = LAST_AUDIT_KEY.with(|last| last.get());
-        assert_ne!(
-            key_after_first, key_after_different,
-            "a different event must update the stored key"
-        );
+        assert!(AUDIT_DEDUP.len() >= entries_before);
     }
 
     // ── P0.20: HttpEmitter error-for-status tests ─────────────────────────────

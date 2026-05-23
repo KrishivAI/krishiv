@@ -3878,6 +3878,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3966,6 +3967,7 @@ name = "krishiv-governance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dashmap",
  "mockito",
  "reqwest 0.13.3",
  "serde",
@@ -4100,6 +4102,7 @@ dependencies = [
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-governance",
+ "krishiv-metrics",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
@@ -4194,6 +4197,9 @@ dependencies = [
 [[package]]
 name = "krishiv-testkit"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+]
 
 [[package]]
 name = "krishiv-udf"
@@ -4209,6 +4215,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "axum 0.8.9",
+ "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
  "serde",

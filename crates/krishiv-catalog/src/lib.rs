@@ -23,6 +23,8 @@ use std::fmt;
 pub enum CatalogError {
     /// A requested table was not found in the catalog.
     TableNotFound { name: String },
+    /// Table already exists and `if_not_exists` was false.
+    TableAlreadyExists { name: String },
     /// A requested schema was not found.
     SchemaNotFound { name: String },
     /// The provided schema is structurally invalid.
@@ -34,6 +36,9 @@ impl fmt::Display for CatalogError {
         match self {
             CatalogError::TableNotFound { name } => {
                 write!(f, "table not found: '{name}'")
+            }
+            CatalogError::TableAlreadyExists { name } => {
+                write!(f, "table already exists: '{name}'")
             }
             CatalogError::SchemaNotFound { name } => {
                 write!(f, "schema not found: '{name}'")
@@ -72,8 +77,10 @@ pub enum FieldType {
     Binary,
     Timestamp,
     Date32,
-    List,
-    Struct,
+    /// List of `item_type` elements.
+    List(Box<FieldType>),
+    /// Struct with named fields.
+    Struct(Vec<CatalogField>),
 }
 
 impl fmt::Display for FieldType {
@@ -94,8 +101,10 @@ impl fmt::Display for FieldType {
             FieldType::Binary => "Binary",
             FieldType::Timestamp => "Timestamp",
             FieldType::Date32 => "Date32",
-            FieldType::List => "List",
-            FieldType::Struct => "Struct",
+            FieldType::List(inner) => return write!(f, "List<{inner}>"),
+            FieldType::Struct(fields) => {
+                return write!(f, "Struct({} fields)", fields.len());
+            }
         };
         f.write_str(s)
     }
@@ -124,18 +133,21 @@ impl FieldType {
             FieldType::Binary => DataType::Binary,
             FieldType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
             FieldType::Date32 => DataType::Date32,
-            FieldType::List => {
-                // A List without an explicit item type; use Int64 as a default.
-                DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    DataType::Int64,
-                    true,
-                )))
-            }
-            FieldType::Struct => {
-                // An empty Struct; callers with nested fields should build the
-                // Arrow schema directly.
-                DataType::Struct(arrow::datatypes::Fields::empty())
+            FieldType::List(item) => DataType::List(std::sync::Arc::new(
+                arrow::datatypes::Field::new("item", item.to_arrow(), true),
+            )),
+            FieldType::Struct(fields) => {
+                let arrow_fields: arrow::datatypes::Fields = fields
+                    .iter()
+                    .map(|f| {
+                        std::sync::Arc::new(arrow::datatypes::Field::new(
+                            f.name(),
+                            f.field_type().to_arrow(),
+                            f.nullable(),
+                        ))
+                    })
+                    .collect();
+                DataType::Struct(arrow_fields)
             }
         }
     }
@@ -447,6 +459,9 @@ impl CatalogProvider for InMemoryCatalog {
 
     fn register_table(&mut self, metadata: TableMetadata) -> CatalogResult<()> {
         let name = metadata.name().to_string();
+        if self.tables.contains_key(&name) {
+            return Err(CatalogError::TableAlreadyExists { name });
+        }
         self.tables.insert(name, TableMetadataProvider { metadata });
         Ok(())
     }

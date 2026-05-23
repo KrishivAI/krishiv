@@ -549,6 +549,113 @@ impl Default for AqeOptimizer {
     }
 }
 
+// ── Production optimizer rules (P2-3) ───────────────────────────────────────────
+
+/// Remove duplicate column names from `Project` nodes.
+pub struct ProjectionPruningRule;
+
+impl OptimizerRule for ProjectionPruningRule {
+    fn name(&self) -> &str {
+        "projection-pruning"
+    }
+
+    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let mut nodes: Vec<PlanNode> = plan.nodes().to_vec();
+        let mut changed = false;
+        for node in &mut nodes {
+            if let Some(NodeOp::Project { columns }) = node.op() {
+                let mut pruned = columns.clone();
+                pruned.sort();
+                pruned.dedup();
+                if pruned.len() != columns.len() {
+                    changed = true;
+                    *node = node.clone().with_op(NodeOp::Project { columns: pruned });
+                }
+            }
+        }
+        changed.then(|| {
+            let mut out = LogicalPlan::new(plan.name(), plan.kind());
+            for node in nodes {
+                out.add_node(node);
+            }
+            out
+        })
+    }
+}
+
+/// Move `Filter` nodes before `Join` when the filter only depends on the scan side.
+pub struct PredicatePushdownRule;
+
+impl OptimizerRule for PredicatePushdownRule {
+    fn name(&self) -> &str {
+        "predicate-pushdown"
+    }
+
+    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let nodes = plan.nodes();
+        let mut filter_idx = None;
+        let mut join_idx = None;
+        for (i, node) in nodes.iter().enumerate() {
+            match node.op() {
+                Some(NodeOp::Filter) => filter_idx = Some(i),
+                Some(NodeOp::Join { .. }) => join_idx = Some(i),
+                _ => {}
+            }
+        }
+        let (Some(fi), Some(ji)) = (filter_idx, join_idx) else {
+            return None;
+        };
+        if fi <= ji {
+            return None;
+        }
+        let mut reordered = nodes.to_vec();
+        let filter_node = reordered.remove(fi);
+        reordered.insert(ji, filter_node);
+        let mut out = LogicalPlan::new(plan.name(), plan.kind());
+        for node in reordered {
+            out.add_node(node);
+        }
+        Some(out)
+    }
+}
+
+/// Drop no-op `Project` nodes that select zero columns.
+pub struct ConstantFoldingRule;
+
+impl OptimizerRule for ConstantFoldingRule {
+    fn name(&self) -> &str {
+        "constant-folding"
+    }
+
+    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let mut nodes: Vec<PlanNode> = plan.nodes().to_vec();
+        let before = nodes.len();
+        nodes.retain(|node| {
+            !matches!(
+                node.op(),
+                Some(NodeOp::Project { columns }) if columns.is_empty()
+            )
+        });
+        if nodes.len() == before {
+            return None;
+        }
+        let mut out = LogicalPlan::new(plan.name(), plan.kind());
+        for node in nodes {
+            out.add_node(node);
+        }
+        Some(out)
+    }
+}
+
+/// Default logical optimizer with production rules enabled.
+pub fn default_logical_optimizer() -> Optimizer {
+    let mut optimizer = Optimizer::new();
+    optimizer.add_rule(Box::new(ProjectionPruningRule));
+    optimizer.add_rule(Box::new(PredicatePushdownRule));
+    optimizer.add_rule(Box::new(ConstantFoldingRule));
+    optimizer
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

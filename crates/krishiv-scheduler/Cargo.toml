@@ -12,6 +12,7 @@ sqlite = ["dep:rusqlite"]
 axum = { workspace = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-governance = { path = "../krishiv-governance" }
+krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-sql = { path = "../krishiv-sql" }

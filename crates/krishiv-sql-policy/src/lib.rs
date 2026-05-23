@@ -73,7 +73,7 @@ impl PolicyEnforcingSqlEngine {
                 audit_log(
                     principal.subject.as_str(),
                     &AuditAction::QueryExecuted {
-                        query_hash: &query_hash,
+                        query_hash: query_hash.clone(),
                     },
                     AuditOutcome::Denied,
                 );
@@ -99,7 +99,7 @@ impl PolicyEnforcingSqlEngine {
         audit_log(
             principal.subject.as_str(),
             &AuditAction::QueryExecuted {
-                query_hash: &query_hash,
+                query_hash,
             },
             AuditOutcome::Allowed,
         );

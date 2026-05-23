@@ -2,40 +2,34 @@
 
 ## Current Phase
 
-**Gap mitigation Sprint 1 (P0) — in progress (2026-05-23)**
+**Gap mitigation (all sprints) — in progress on PR #36 (2026-05-23)**
 
 Plan: [`docs/engineering/gap-mitigation-plan.md`](../engineering/gap-mitigation-plan.md)
 
 Branch: `cursor/gap-mitigation-7aa2`
 
-## Sprint 1 P0 completed this session
+## Completed this session (continued)
 
-| ID | Fix |
-|----|-----|
-| P0-1/2 | Wired orphaned `krishiv-exec`, `krishiv-sql`, `krishiv-plan` modules; added `ExecError::IncompatibleSchemaEvolution`, `NodeOp::{Create,Refresh,Drop}LiveTable` |
-| P0-3 | Declared `transactional_kafka`, `two_phase_parquet_s3`, `cdc_router` in `krishiv-connectors` |
-| P0-4 | `SharedCoordinator::spawn_orchestration_loops()` in coordinator binary + operator |
-| P0-7/8 | `GrpcCoordinatorService` gRPC client pooling; executor lease generation updated after register/heartbeat |
-| P0-9/10 | Catalog `MemTable` scans via `register_table_with_batches`; `SqlEngine::with_in_memory_catalog` |
-| P0-13 | Shared `RAG_VECTOR_SINKS` registry between `rag_index` / `rag_query` |
-| P0-12 | Wired Python split modules into `lib.rs`: mod declarations, `pub use`, submodule registration via `#[pymodule]`, removed duplicate inline pyclasses; `session.rs` uses `crate::RUNTIME`; added deps (`pyo3-arrow`, `krishiv-exec`, `krishiv-governance`, `krishiv-state`, `sha2`) |
+| Tier | Items |
+|------|--------|
+| P0 | P0-5/6 leader election + finalizer; P0-11 Weaviate query; P0-14 Spark CAST; P0-15 audit call sites; P0-16 KrishivMetrics + Prometheus text |
+| P1 | P1-1/2/3 checkpoint fencing, stale epoch, fsync; P3-6 list_valid_epochs warns/propagates |
+| P2 | P2-3 ProjectionPruning, PredicatePushdown, ConstantFolding rules; P2-6 krishiv-testkit helpers |
+| P3 | P3-14 DashMap audit dedup; P3-15 record_async; P3-16 owned AuditAction; P3-17 metrics shutdown; P3-21/22 UI shuffle bytes + active readyz; P3-23–25 catalog TableAlreadyExists + List/Struct types |
 
-## Not done (Sprint 1 remainder)
+## Prior commits on branch
 
-- **P0-5/6, P0-11, P0-14–16**: K8s leader election, finalizer, Weaviate query, Spark CAST, audit call sites, OTel metrics.
+Sprint 1 P0 (modules, coordinator ticks, catalog SQL, Python wiring, RAG sink), P1 shuffle/state/lakehouse/connectors/executor, checkpoint ACK, etc.
 
-## Validation (this session)
+## Validation
 
 ```bash
 cargo check --workspace
-cargo test -p krishiv-scheduler task_launch_drives_to_running
-cargo test -p krishiv-executor --lib lease_generation_updated_after_reregister
-cargo test -p krishiv-sql --lib catalog_table_resolved_in_sql
-cargo test -p krishiv-catalog --lib catalog_scan_returns_registered_row_count
-cargo test -p krishiv-exec -p krishiv-plan -p krishiv-connectors --lib
-cargo check -p krishiv-python   # P0-12 module wiring (lib tests need libstdc++ for fastembed/ort)
+cargo test -p krishiv-checkpoint -p krishiv-governance -p krishiv-optimizer -p krishiv-catalog -p krishiv-metrics -p krishiv-ui -p krishiv-scheduler -p krishiv-sql-policy -p krishiv-vector-sinks --lib
 ```
+
+Note: `krishiv-python` / `krishiv-ai` lib tests need `libstdc++` (ONNX). `krishiv-executor` integration test `barrier_injection` needs `barrier_transport` module.
 
 ## Next command
 
-Continue Sprint 1: P0-5/6 K8s leader election + finalizer, then Sprint 2 items (P1 checkpoint/shuffle/state).
+Continue remaining P2/P3 items (shuffle lock poison, flight-sql PolicyEnforcingSqlEngine direct wire, coalesce exec, object-store checkpoint, nexmark benches, P3 AI/python items).

@@ -1781,10 +1781,11 @@ impl Coordinator {
         self.index_streaming_tasks(&inserted_job_id);
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        krishiv_metrics::global_metrics().inc_tasks_submitted();
         krishiv_governance::audit_log(
             "scheduler",
             &krishiv_governance::AuditAction::JobSubmitted {
-                job_id: inserted_job_id.as_str(),
+                job_id: inserted_job_id.to_string(),
             },
             krishiv_governance::AuditOutcome::Allowed,
         );

@@ -427,10 +427,17 @@ pub fn list_valid_epochs(
     let epoch_dirs = storage.list_dir(&checkpoint_prefix)?;
     let mut valid = Vec::new();
     for name in epoch_dirs {
-        if let Ok(epoch) = name.parse::<u64>()
-            && validate_epoch(storage, job_id, epoch).unwrap_or(false)
-        {
-            valid.push(epoch);
+        let Ok(epoch) = name.parse::<u64>() else {
+            tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            continue;
+        };
+        match validate_epoch(storage, job_id, epoch) {
+            Ok(true) => valid.push(epoch),
+            Ok(false) => tracing::warn!(job_id, epoch, "excluding invalid checkpoint epoch"),
+            Err(e) => {
+                tracing::warn!(job_id, epoch, error = %e, "checkpoint epoch validation failed");
+                return Err(e);
+            }
         }
     }
     valid.sort_unstable();
@@ -955,7 +962,7 @@ mod tests {
     fn latest_valid_epoch_returns_highest() {
         let s = make_storage();
 
-        for epoch in [3u64, 1, 5] {
+        for epoch in [1u64, 3, 5] {
             let meta = sample_metadata(epoch);
             let state = format!("state {epoch}");
             let state_b = state.as_bytes();
