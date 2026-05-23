@@ -12,10 +12,21 @@ use arrow::array::Array;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+mod as_of;
 mod delta;
+mod delta_lake;
+mod hudi;
+mod local_delta;
+mod partition_spec;
 mod two_phase;
 
+pub use as_of::{AsOfSpec};
 pub use delta::{DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore};
+pub use hudi::{write_hudi_cow_fixture, HudiQueryType, HudiSnapshotReader};
+pub use partition_spec::{PartitionSpecResolver, PartitionSpecVersion};
+pub use delta_lake::{
+    merge_delta, write_delta, DeltaTableHandle, DeltaWriteMode, MergeDeltaResult,
+};
 pub use two_phase::{
     IcebergTwoPhaseCommit, MemoryIcebergTwoPhaseCommit, StagedSnapshot, KAFKA_OFFSETS_SUMMARY_KEY,
     kafka_offsets_json, parse_kafka_offsets_json,
@@ -59,6 +70,9 @@ impl fmt::Display for LakehouseError {
 }
 
 impl std::error::Error for LakehouseError {}
+
+/// Convenience result alias for lakehouse operations.
+pub type LakehouseResult<T> = Result<T, LakehouseError>;
 
 impl From<iceberg::Error> for LakehouseError {
     fn from(e: iceberg::Error) -> Self {
@@ -226,6 +240,12 @@ impl LakehouseTable for MemoryLakehouseTable {
 
     async fn scan(&self, opts: &IcebergScanOptions) -> Result<Vec<RecordBatch>, LakehouseError> {
         let batches = self.batches.lock().await;
+        if let Some(target) = opts.snapshot_id {
+            let snap = self.next_snapshot.load(Ordering::SeqCst);
+            if target != snap {
+                return Ok(Vec::new());
+            }
+        }
 
         // Filter columns if requested
         let filtered: Vec<RecordBatch> = if let Some(cols) = &opts.columns {

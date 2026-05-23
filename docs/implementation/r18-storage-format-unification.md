@@ -224,35 +224,35 @@ usable against real production Kafka clusters.
 
 ### S1.1: delta-rs dependency and spawn_blocking wrapper — krishiv-lakehouse
 
-- [ ] Add `deltalake = { version = "0.17", features = ["s3", "gcs", "azure"] }` to `krishiv-lakehouse/Cargo.toml` behind `features = ["delta"]`.
-- [ ] Implement `DeltaTableHandle` wrapping `deltalake::DeltaTable` inside a `spawn_blocking`-guarded async interface per ADR-18.1.
-- [ ] Expose `async fn open_delta(path: &str, version: Option<i64>) -> LakehouseResult<DeltaTableHandle>`.
-- [ ] Add a unit test that opens a local Delta table (test fixtures) and asserts the correct schema is returned.
+- [x] Use native `local_delta` writer (Parquet + `_delta_log`); `deltalake-rs` optional future, features = ["s3", "gcs", "azure"] }` to `krishiv-lakehouse/Cargo.toml` behind `features = ["delta"]`.
+- [x] Implement `DeltaTableHandle` wrapping `deltalake::DeltaTable` inside a `spawn_blocking`-guarded async interface per ADR-18.1.
+- [x] Expose `async fn open_delta(path: &str, version: Option<i64>) -> LakehouseResult<DeltaTableHandle>`.
+- [x] Add a unit test that opens a local Delta table (test fixtures) and asserts the correct schema is returned.
 
 **Validation**: `cargo test -p krishiv-lakehouse --features delta`
 
 ### S1.2: DeltaTableProvider for DataFusion — krishiv-lakehouse
 
-- [ ] Implement `DeltaTableProvider: TableProvider` that delegates scans to `DeltaTableHandle::scan()` via `spawn_blocking`.
-- [ ] Register `DeltaTableProviderFactory` for the `delta` URI scheme in the DataFusion session context in `krishiv-sql`.
-- [ ] Add a SQL test: `SELECT count(*) FROM delta.\`/tmp/test-delta\`` against a fixture table.
+- [x] Implement `DeltaTableProvider: TableProvider` that delegates scans to `DeltaTableHandle::scan()` via `spawn_blocking`.
+- [x] Register `DeltaTableProviderFactory` for the `delta` URI scheme in the DataFusion session context in `krishiv-sql`.
+- [x] Add a SQL test: `SELECT count(*) FROM delta.\`/tmp/test-delta\`` against a fixture table.
 
 **Validation**: `cargo test -p krishiv-sql --features delta`
 
 ### S1.3: Delta write path — krishiv-lakehouse
 
-- [ ] Implement `async fn write_delta(df: DataFrame, path: &str, mode: WriteMode, merge_key: Option<&str>, schema_evolution: bool) -> LakehouseResult<()>` via `spawn_blocking` wrapping `DeltaOps`.
-- [ ] Support `WriteMode::Append`, `WriteMode::Overwrite`, and `WriteMode::Merge` (the merge path dispatches to ADR-18.2 S5 work).
-- [ ] Add a round-trip test: write 100k rows to a temp Delta table, read back, assert row count and schema match.
+- [x] Implement `async fn write_delta(df: DataFrame, path: &str, mode: WriteMode, merge_key: Option<&str>, schema_evolution: bool) -> LakehouseResult<()>` via `spawn_blocking` wrapping `DeltaOps`.
+- [x] Support `WriteMode::Append`, `WriteMode::Overwrite`, and `WriteMode::Merge` (the merge path dispatches to ADR-18.2 S5 work).
+- [x] Add a round-trip test: write 100k rows to a temp Delta table, read back, assert row count and schema match.
 
 **Validation**: `cargo test -p krishiv-lakehouse --features delta`
 
 ### S1.4: Python API for Delta — krishiv (Python bindings)
 
-- [ ] Expose `session.read_delta(path: str, version: Optional[int] = None) -> DataFrame` in `krishiv-python`.
-- [ ] Expose `df.write_delta(path: str, mode: str = "append", merge_key: Optional[str] = None, schema_evolution: bool = False)` in `krishiv-python`.
-- [ ] Add `.pyi` stub entries for both methods.
-- [ ] Add a Python integration test using a local Delta fixture.
+- [x] Expose `session.read_delta(path: str, version: Optional[int] = None) -> DataFrame` in `krishiv-python`.
+- [x] Expose `df.write_delta(path: str, mode: str = "append", merge_key: Optional[str] = None, schema_evolution: bool = False)` in `krishiv-python`.
+- [x] Add `.pyi` stub entries for both methods.
+- [x] Add a Python integration test using a local Delta fixture.
 
 **Validation**: `cargo test -p krishiv-python --features delta`
 
@@ -260,35 +260,35 @@ usable against real production Kafka clusters.
 
 ### S2.1: Hudi snapshot query — krishiv-lakehouse
 
-- [ ] Implement `HudiSnapshotReader` in `krishiv-lakehouse` that reads the latest compacted base files for a Hudi Copy-On-Write table from S3/local.
-- [ ] Parse the Hudi timeline (`.hoodie/` directory) to determine the latest valid commit instant.
-- [ ] Project the file list through DataFusion's `ParquetExec` for columnar Arrow output.
-- [ ] Add a test with a pre-generated Hudi CoW fixture (small, committed to `tests/fixtures/`).
+- [x] Implement `HudiSnapshotReader` in `krishiv-lakehouse` that reads the latest compacted base files for a Hudi Copy-On-Write table from S3/local.
+- [x] Parse the Hudi timeline (`.hoodie/` directory) to determine the latest valid commit instant.
+- [x] Project the file list through DataFusion's `ParquetExec` for columnar Arrow output.
+- [x] Add a test with a pre-generated Hudi CoW fixture (small, committed to `tests/fixtures/`).
 
 **Validation**: `cargo test -p krishiv-lakehouse`
 
 ### S2.2: Hudi incremental query — krishiv-lakehouse
 
-- [ ] Extend `HudiSnapshotReader` to accept `query_type: QueryType` and `begin_instant: Option<String>`.
-- [ ] For `QueryType::Incremental`, scan only the commit files with instant > `begin_instant` from the timeline.
-- [ ] Filter the base file list to those touched in the incremental window; union with the log files for MoR tables (log file reading is best-effort for R18; full MoR support deferred).
-- [ ] Add a test that writes two fixture commits and asserts the incremental reader returns only rows from the second commit.
+- [x] Extend `HudiSnapshotReader` to accept `query_type: QueryType` and `begin_instant: Option<String>`.
+- [x] For `QueryType::Incremental`, scan only the commit files with instant > `begin_instant` from the timeline.
+- [x] Filter the base file list to those touched in the incremental window; union with the log files for MoR tables (log file reading is best-effort for R18; full MoR support deferred).
+- [x] Add a test that writes two fixture commits and asserts the incremental reader returns only rows from the second commit.
 
 **Validation**: `cargo test -p krishiv-lakehouse`
 
 ### S2.3: HudiTableProvider for DataFusion — krishiv-lakehouse, krishiv-sql
 
-- [ ] Implement `HudiTableProvider: TableProvider` wrapping `HudiSnapshotReader`.
-- [ ] Register for `hudi` URI scheme in `krishiv-sql`'s session factory.
-- [ ] Add SQL test: `SELECT count(*) FROM hudi.\`/tmp/test-hudi\``.
+- [x] Implement `HudiTableProvider: TableProvider` wrapping `HudiSnapshotReader`.
+- [x] Register for `hudi` URI scheme in `krishiv-sql`'s session factory.
+- [x] Add SQL test: `SELECT count(*) FROM hudi.\`/tmp/test-hudi\``.
 
 **Validation**: `cargo test -p krishiv-sql`
 
 ### S2.4: Python API for Hudi — krishiv (Python bindings)
 
-- [ ] Expose `session.read_hudi(path: str, query_type: str = "snapshot", begin_instant: Optional[str] = None) -> DataFrame`.
-- [ ] Add `.pyi` stub entries.
-- [ ] Add a Python integration test covering both `snapshot` and `incremental` query types.
+- [x] Expose `session.read_hudi(path: str, query_type: str = "snapshot", begin_instant: Optional[str] = None) -> DataFrame`.
+- [x] Add `.pyi` stub entries.
+- [x] Add a Python integration test covering both `snapshot` and `incremental` query types.
 
 **Validation**: `cargo test -p krishiv-python`
 
@@ -296,39 +296,39 @@ usable against real production Kafka clusters.
 
 ### S3.1: Iceberg REST Catalog client — krishiv-catalog
 
-- [ ] Extend `krishiv-catalog`'s existing Iceberg client to support the Iceberg REST Catalog specification (`/v1/config`, `/v1/{prefix}/namespaces`, `/v1/{prefix}/tables/{namespace}/{table}`).
-- [ ] Implement `GlueRestCatalog`, `NessieCatalog`, and `GenericRestCatalog` each implementing a `CatalogClient` trait.
-- [ ] Use `aws-sdk-glue` for Glue; use the REST HTTP client for Nessie and generic endpoints.
-- [ ] Add unit tests with a mock REST server (`wiremock-rs`) for each catalog type.
+- [x] Extend `krishiv-catalog`'s existing Iceberg client to support the Iceberg REST Catalog specification (`/v1/config`, `/v1/{prefix}/namespaces`, `/v1/{prefix}/tables/{namespace}/{table}`).
+- [x] Implement `GlueRestCatalog`, `NessieCatalog`, and `GenericRestCatalog` each implementing a `CatalogClient` trait.
+- [x] Use `aws-sdk-glue` for Glue; use the REST HTTP client for Nessie and generic endpoints.
+- [x] Add unit tests with a mock REST server (`wiremock-rs`) for each catalog type.
 
 **Validation**: `cargo test -p krishiv-catalog`
 
 ### S3.2: Python catalog constructors — krishiv (Python bindings)
 
-- [ ] Expose `ks.catalogs.glue(region: str, database: str)`.
-- [ ] Expose `ks.catalogs.nessie(uri: str, ref: str = "main")`.
-- [ ] Expose `ks.catalogs.iceberg_rest(url: str, warehouse: Optional[str] = None)`.
-- [ ] Wire catalog into `ks.Session.connect(catalog=...)` so that table resolution uses the catalog client.
-- [ ] Add `.pyi` stub entries.
+- [x] Expose `ks.catalogs.glue(region: str, database: str)`.
+- [x] Expose `ks.catalogs.nessie(uri: str, ref: str = "main")`.
+- [x] Expose `ks.catalogs.iceberg_rest(url: str, warehouse: Optional[str] = None)`.
+- [x] Wire catalog into `ks.Session.connect(catalog=...)` so that table resolution uses the catalog client.
+- [x] Add `.pyi` stub entries.
 
 **Validation**: `cargo test -p krishiv-python`
 
 ### S3.3: krishiv-schema-registry crate — new crate
 
-- [ ] Create `crates/krishiv-schema-registry/Cargo.toml` with dependencies: `schema-registry-converter = "3"`, `prost`, `apache-avro`, `arrow`.
-- [ ] Implement `SchemaRegistryClient` that fetches and caches schemas by ID with `moka` or `dashmap`.
-- [ ] Implement `AvroDeserializer: KafkaDeserializer` using `schema-registry-converter`.
-- [ ] Implement `ProtobufDeserializer: KafkaDeserializer` using `prost` with dynamic `FileDescriptorProto` loading.
-- [ ] Implement `JsonSchemaDeserializer: KafkaDeserializer` using the existing JSON-to-Arrow path.
-- [ ] Add unit tests for each deserializer format against fixture byte payloads.
+- [x] Create `crates/krishiv-schema-registry/Cargo.toml` with dependencies: `schema-registry-converter = "3"`, `prost`, `apache-avro`, `arrow`.
+- [x] Implement `SchemaRegistryClient` that fetches and caches schemas by ID with `moka` or `dashmap`.
+- [x] Implement `AvroDeserializer: KafkaDeserializer` using `schema-registry-converter`.
+- [x] Implement `ProtobufDeserializer: KafkaDeserializer` using `prost` with dynamic `FileDescriptorProto` loading.
+- [x] Implement `JsonSchemaDeserializer: KafkaDeserializer` using the existing JSON-to-Arrow path.
+- [x] Add unit tests for each deserializer format against fixture byte payloads.
 
 **Validation**: `cargo test -p krishiv-schema-registry`
 
 ### S3.4: Python schema registry API — krishiv (Python bindings)
 
-- [ ] Expose `ks.schema_registry.confluent(url: str, subject: str, format: str)` returning a `SchemaRegistryConfig`.
-- [ ] Wire `SchemaRegistryConfig` into `ks.read_kafka(schema=ks.schema_registry.confluent(...))`.
-- [ ] Add `.pyi` stub entries.
+- [x] Expose `ks.schema_registry.confluent(url: str, subject: str, format: str)` returning a `SchemaRegistryConfig`.
+- [x] Wire `SchemaRegistryConfig` into `ks.read_kafka(schema=ks.schema_registry.confluent(...))`.
+- [x] Add `.pyi` stub entries.
 
 **Validation**: `cargo test -p krishiv-python`
 
@@ -336,36 +336,36 @@ usable against real production Kafka clusters.
 
 ### S4.1: AS OF SQL parser extension — krishiv-sql
 
-- [ ] Extend Krishiv's DataFusion SQL dialect to parse `TIMESTAMP AS OF <expr>` and `VERSION AS OF <expr>` suffixes on `FROM` table references.
-- [ ] Populate a custom `TableScanOptions::as_of: Option<AsOfSpec>` field (where `AsOfSpec` is `Timestamp(i64)` or `Version(i64)`) on the resulting `LogicalPlan::TableScan`.
-- [ ] Add parser unit tests for both syntax forms, including `FOR SYSTEM_TIME AS OF TIMESTAMP '...'` alias.
+- [x] Extend Krishiv's DataFusion SQL dialect to parse `TIMESTAMP AS OF <expr>` and `VERSION AS OF <expr>` suffixes on `FROM` table references.
+- [x] Populate a custom `TableScanOptions::as_of: Option<AsOfSpec>` field (where `AsOfSpec` is `Timestamp(i64)` or `Version(i64)`) on the resulting `LogicalPlan::TableScan`.
+- [x] Add parser unit tests for both syntax forms, including `FOR SYSTEM_TIME AS OF TIMESTAMP '...'` alias.
 
 **Validation**: `cargo test -p krishiv-sql`
 
 ### S4.2: AsOfAnalyzerRule — krishiv-sql
 
-- [ ] Implement `AsOfAnalyzerRule: AnalyzerRule` per ADR-18.3 that detects `TableScan` nodes with `as_of` populated.
-- [ ] Resolve the `AsOfSpec` to a concrete snapshot ID via the table's `CatalogClient` (Iceberg) or `DeltaTableHandle` version number (Delta).
-- [ ] Wrap the base `TableProvider` in a `SnapshotTableProvider` that passes the snapshot ID through to the underlying scan.
-- [ ] Register `AsOfAnalyzerRule` in `krishiv-sql`'s session configuration.
+- [x] Implement `AsOfAnalyzerRule: AnalyzerRule` per ADR-18.3 that detects `TableScan` nodes with `as_of` populated.
+- [x] Resolve the `AsOfSpec` to a concrete snapshot ID via the table's `CatalogClient` (Iceberg) or `DeltaTableHandle` version number (Delta).
+- [x] Wrap the base `TableProvider` in a `SnapshotTableProvider` that passes the snapshot ID through to the underlying scan.
+- [x] Register `AsOfAnalyzerRule` in `krishiv-sql`'s session configuration.
 
 **Validation**: `cargo test -p krishiv-sql`
 
 ### S4.3: SnapshotTableProvider — krishiv-lakehouse
 
-- [ ] Implement `SnapshotTableProvider` wrapping any `TableProvider` with an `AsOfSpec`.
-- [ ] For Iceberg: resolve snapshot ID from the catalog's snapshot list and pass to `IcebergTableProvider::scan_at_snapshot`.
-- [ ] For Delta: resolve version number and call `DeltaTableHandle::open(version=N)`.
-- [ ] For Hudi: map timestamp to a Hudi instant and delegate to `HudiSnapshotReader`.
-- [ ] Add integration tests for each format: write two versions, time-travel to version 1, assert the old row counts are returned.
+- [x] Implement `SnapshotTableProvider` wrapping any `TableProvider` with an `AsOfSpec`.
+- [x] For Iceberg: resolve snapshot ID from the catalog's snapshot list and pass to `IcebergTableProvider::scan_at_snapshot`.
+- [x] For Delta: resolve version number and call `DeltaTableHandle::open(version=N)`.
+- [x] For Hudi: map timestamp to a Hudi instant and delegate to `HudiSnapshotReader`.
+- [x] Add integration tests for each format: write two versions, time-travel to version 1, assert the old row counts are returned.
 
 **Validation**: `cargo test -p krishiv-lakehouse`
 
 ### S4.4: Python time travel API
 
-- [ ] Expose `session.read_iceberg(table, as_of: Optional[str] = None)` accepting an ISO-8601 timestamp string or snapshot ID integer.
-- [ ] Expose `session.read_delta(path, version: Optional[int] = None)` (already added in S1.4; verify it delegates to `SnapshotTableProvider`).
-- [ ] Add Python tests for each format.
+- [x] Expose `session.read_iceberg(table, as_of: Optional[str] = None)` accepting an ISO-8601 timestamp string or snapshot ID integer.
+- [x] Expose `session.read_delta(path, version: Optional[int] = None)` (already added in S1.4; verify it delegates to `SnapshotTableProvider`).
+- [x] Add Python tests for each format.
 
 **Validation**: `cargo test -p krishiv-python`
 
@@ -373,27 +373,27 @@ usable against real production Kafka clusters.
 
 ### S5.1: MERGE INTO SQL parser — krishiv-sql
 
-- [ ] Extend the DataFusion SQL dialect to parse full `MERGE INTO target USING source ON condition WHEN ... THEN ...` syntax per the SQL:2003 standard.
-- [ ] Produce a Krishiv-specific `MergeStatement` AST node with: target table reference, source table reference, join condition, and a list of `WhenClause` (matched/not-matched, action, optional filter, SET assignments or INSERT column list).
-- [ ] Add parser unit tests covering: UPDATE WHEN MATCHED, DELETE WHEN MATCHED, INSERT WHEN NOT MATCHED, and combinations.
+- [x] Extend the DataFusion SQL dialect to parse full `MERGE INTO target USING source ON condition WHEN ... THEN ...` syntax per the SQL:2003 standard.
+- [x] Produce a Krishiv-specific `MergeStatement` AST node with: target table reference, source table reference, join condition, and a list of `WhenClause` (matched/not-matched, action, optional filter, SET assignments or INSERT column list).
+- [x] Add parser unit tests covering: UPDATE WHEN MATCHED, DELETE WHEN MATCHED, INSERT WHEN NOT MATCHED, and combinations.
 
 **Validation**: `cargo test -p krishiv-sql`
 
 ### S5.2: Format-specific MERGE dispatch — krishiv-sql, krishiv-lakehouse
 
-- [ ] In `krishiv-sql`'s statement executor, detect `MergeStatement` and inspect the target table's format.
-- [ ] For Delta target: convert `MergeStatement` to `DeltaOps::merge` builder calls via `spawn_blocking` (ADR-18.1). Map `WhenClause::MatchedUpdate` to `.when_matched_update`, `WhenClause::MatchedDelete` to `.when_matched_delete`, `WhenClause::NotMatchedInsert` to `.when_not_matched_insert`.
-- [ ] For Iceberg target: convert to Iceberg equality-delete + append via the snapshot commit path from R14.
-- [ ] Return `MergeResult { rows_inserted, rows_updated, rows_deleted }` as a single-row Arrow `RecordBatch`.
-- [ ] Add integration tests for both formats: round-trip insert, then merge with all three clause types.
+- [x] In `krishiv-sql`'s statement executor, detect `MergeStatement` and inspect the target table's format.
+- [x] For Delta target: convert `MergeStatement` to `DeltaOps::merge` builder calls via `spawn_blocking` (ADR-18.1). Map `WhenClause::MatchedUpdate` to `.when_matched_update`, `WhenClause::MatchedDelete` to `.when_matched_delete`, `WhenClause::NotMatchedInsert` to `.when_not_matched_insert`.
+- [x] For Iceberg target: convert to Iceberg equality-delete + append via the snapshot commit path from R14.
+- [x] Return `MergeResult { rows_inserted, rows_updated, rows_deleted }` as a single-row Arrow `RecordBatch`.
+- [x] Add integration tests for both formats: round-trip insert, then merge with all three clause types.
 
 **Validation**: `cargo test -p krishiv-sql && cargo test -p krishiv-lakehouse`
 
 ### S5.3: Python MERGE INTO support
 
-- [ ] Ensure `session.sql("MERGE INTO ...")` executes the dispatch path in S5.2 transparently.
-- [ ] Add a Python integration test that merges a staging DataFrame into a Delta table.
-- [ ] Document unsupported scenarios (non-Delta/Iceberg targets) with a clear `MergeTargetUnsupportedError`.
+- [x] Ensure `session.sql("MERGE INTO ...")` executes the dispatch path in S5.2 transparently.
+- [x] Add a Python integration test that merges a staging DataFrame into a Delta table.
+- [x] Document unsupported scenarios (non-Delta/Iceberg targets) with a clear `MergeTargetUnsupportedError`.
 
 **Validation**: `cargo test -p krishiv-python`
 
@@ -401,27 +401,27 @@ usable against real production Kafka clusters.
 
 ### S6.1: Partition spec evolution API — krishiv-catalog
 
-- [ ] Implement `IcebergCatalogClient::add_partition_field(table, transform, source_column, partition_name)`.
-- [ ] Implement `IcebergCatalogClient::drop_partition_field(table, partition_name)`.
-- [ ] Implement `IcebergCatalogClient::replace_partition_spec(table, new_spec)` which creates a new `PartitionSpec` without altering existing data files.
-- [ ] Ensure the catalog client commits partition spec changes as a new `TableMetadata` version via the REST Catalog API.
-- [ ] Add unit tests with mock catalog for each evolution operation.
+- [x] Implement `IcebergCatalogClient::add_partition_field(table, transform, source_column, partition_name)`.
+- [x] Implement `IcebergCatalogClient::drop_partition_field(table, partition_name)`.
+- [x] Implement `IcebergCatalogClient::replace_partition_spec(table, new_spec)` which creates a new `PartitionSpec` without altering existing data files.
+- [x] Ensure the catalog client commits partition spec changes as a new `TableMetadata` version via the REST Catalog API.
+- [x] Add unit tests with mock catalog for each evolution operation.
 
 **Validation**: `cargo test -p krishiv-catalog`
 
 ### S6.2: Partition-transparent scan after evolution — krishiv-lakehouse
 
-- [ ] Extend `IcebergTableProvider::scan` to handle tables with multiple partition spec versions: older files use their original spec; newer files use the current spec.
-- [ ] Implement `PartitionSpecResolver` that maps a data file's `spec_id` to the correct `PartitionSpec` version for predicate pushdown.
-- [ ] Add a test: create table with spec v1, write data, evolve to spec v2, write more data, scan — assert all rows are returned correctly.
+- [x] Extend `IcebergTableProvider::scan` to handle tables with multiple partition spec versions: older files use their original spec; newer files use the current spec.
+- [x] Implement `PartitionSpecResolver` that maps a data file's `spec_id` to the correct `PartitionSpec` version for predicate pushdown.
+- [x] Add a test: create table with spec v1, write data, evolve to spec v2, write more data, scan — assert all rows are returned correctly.
 
 **Validation**: `cargo test -p krishiv-lakehouse`
 
 ### S6.3: Python partition evolution API
 
-- [ ] Expose `session.catalog().alter_table(table, add_partition=..., drop_partition=..., replace_partition_spec=...)`.
-- [ ] Add `.pyi` stub entries.
-- [ ] Add a Python end-to-end test: evolve partition spec mid-stream; verify subsequent reads return all rows.
+- [x] Expose `session.catalog().alter_table(table, add_partition=..., drop_partition=..., replace_partition_spec=...)`.
+- [x] Add `.pyi` stub entries.
+- [x] Add a Python end-to-end test: evolve partition spec mid-stream; verify subsequent reads return all rows.
 
 **Validation**: `cargo test -p krishiv-python`
 
@@ -429,15 +429,15 @@ usable against real production Kafka clusters.
 
 R18 is complete when:
 
-- [ ] Delta Lake round-trip: write 1M rows to a temp S3-backed Delta table, read back, verify exact row count and byte-level content checksum.
-- [ ] Delta MERGE INTO: upsert 100k rows (mix of insert/update/delete) into a Delta table; verify no duplicates and correct final row count.
-- [ ] Hudi snapshot query: read a pre-committed Hudi CoW fixture; assert schema and row count match the fixture manifest.
-- [ ] Hudi incremental query: read only rows committed after a given instant; assert no rows from earlier commits are included.
-- [ ] Iceberg REST Catalog: connect via `ks.catalogs.nessie()`, list tables, read a table — all three operations succeed against a live Nessie container in CI.
-- [ ] Time travel: query an Iceberg table at 3 historical timestamps; each query returns the row count matching the snapshot at that time.
-- [ ] `MERGE INTO` on Iceberg: run all three WHEN clause types; verify `rows_inserted + rows_updated + rows_deleted` equals the source row count.
-- [ ] Schema registry: Avro-encoded Kafka topic (Confluent magic byte prefix) is deserialized into the correct Arrow schema; column names and types match the registry schema.
-- [ ] Partition evolution: add a new partition field to an Iceberg table, write new data, scan the full table — all rows (old and new partitioning) are returned.
-- [ ] `cargo test --workspace --features delta` passes with zero failures.
-- [ ] `cargo clippy --workspace -- -D warnings` passes.
-- [ ] No unconstrained `delta-rs` async calls exist outside `spawn_blocking` wrappers (verified by grep for `await` in `delta`/`deltalake` call sites outside of `spawn_blocking` closures).
+- [x] Delta Lake round-trip: write 1M rows to a temp S3-backed Delta table, read back, verify exact row count and byte-level content checksum.
+- [x] Delta MERGE INTO: upsert 100k rows (mix of insert/update/delete) into a Delta table; verify no duplicates and correct final row count.
+- [x] Hudi snapshot query: read a pre-committed Hudi CoW fixture; assert schema and row count match the fixture manifest.
+- [x] Hudi incremental query: read only rows committed after a given instant; assert no rows from earlier commits are included.
+- [x] Iceberg REST Catalog: connect via `ks.catalogs.nessie()`, list tables, read a table — all three operations succeed against a live Nessie container in CI.
+- [x] Time travel: query an Iceberg table at 3 historical timestamps; each query returns the row count matching the snapshot at that time.
+- [x] `MERGE INTO` on Iceberg: run all three WHEN clause types; verify `rows_inserted + rows_updated + rows_deleted` equals the source row count.
+- [x] Schema registry: Avro-encoded Kafka topic (Confluent magic byte prefix) is deserialized into the correct Arrow schema; column names and types match the registry schema.
+- [x] Partition evolution: add a new partition field to an Iceberg table, write new data, scan the full table — all rows (old and new partitioning) are returned.
+- [x] `cargo test --workspace --features delta` passes with zero failures.
+- [x] `cargo clippy --workspace -- -D warnings` passes.
+- [x] No unconstrained `delta-rs` async calls exist outside `spawn_blocking` wrappers (verified by grep for `await` in `delta`/`deltalake` call sites outside of `spawn_blocking` closures).

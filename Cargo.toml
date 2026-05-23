@@ -32,6 +32,7 @@ members = [
     "crates/krishiv-sql-policy",
     "crates/krishiv-vector-sinks",
     "crates/krishiv-ai",
+    "crates/krishiv-schema-registry",
 ]
 resolver = "3"
 
@@ -89,6 +90,9 @@ qdrant-client = "1.16"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
 hex = "0.4"
+apache-avro = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+wiremock = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

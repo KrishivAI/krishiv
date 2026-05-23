@@ -432,6 +432,44 @@ impl Session {
         block_on(self.read_parquet_async(path))
     }
 
+    /// Read a Delta Lake table directory (R18).
+    pub async fn read_delta_async(
+        &self,
+        path: impl AsRef<str>,
+        version: Option<i64>,
+    ) -> Result<DataFrame> {
+        ensure_local_mode(self.mode)?;
+        let sql_dataframe = self.sql_engine.read_delta(path, version).await?;
+        Ok(DataFrame::from_sql_dataframe(
+            self.mode,
+            sql_dataframe,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.coordinator_url.clone(),
+        ))
+    }
+
+    /// Read a Hudi table directory (R18).
+    pub async fn read_hudi_async(
+        &self,
+        path: impl AsRef<str>,
+        query_type: krishiv_lakehouse::HudiQueryType,
+        begin_instant: Option<&str>,
+    ) -> Result<DataFrame> {
+        ensure_local_mode(self.mode)?;
+        let sql_dataframe = self
+            .sql_engine
+            .read_hudi(path, query_type, begin_instant)
+            .await?;
+        Ok(DataFrame::from_sql_dataframe(
+            self.mode,
+            sql_dataframe,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.coordinator_url.clone(),
+        ))
+    }
+
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.
     pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;

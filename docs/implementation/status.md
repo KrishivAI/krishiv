@@ -2,48 +2,41 @@
 
 ## Current Phase
 
-**R17 COMPLETE (2026-05-23)** — AI/ML native data platform (implementation + PR follow-ups).
+**R18 COMPLETE (2026-05-23)** — Storage format unification & time travel.
 
-Release tracker: [`r17-ai-ml-data-platform.md`](r17-ai-ml-data-platform.md) (checkboxes bulk-updated; Lance sink note documents Parquet + merge-on-id).
+Release tracker: [`r18-storage-format-unification.md`](r18-storage-format-unification.md)
 
-## R17 Implementation (2026-05-23)
+Branch: `cursor/r18-storage-unification-7aa2`
 
-Branch: `cursor/r17-ai-ml-platform-7aa2`  
-PR: https://github.com/KrishivAI/krishiv/pull/33
+## R18 Implementation (2026-05-23)
 
-### Completed
+### Slices delivered
 
-- **`krishiv-vector-sinks`**: `VectorSink` trait, idempotent upsert (`hash(doc_id || epoch)`), sinks for Qdrant, pgvector, Lance-compatible Parquet (`LanceDbSink` — no upstream `lancedb` crate), Weaviate, Pinecone, in-memory + registry.
-- **`krishiv-ai`**: `EmbeddingModelRegistry`, OpenAI embeddings/LLM, HuggingFace via `fastembed` (`fastembed-local` feature), four chunkers, `ChunkOperator` in `krishiv-exec`, semantic dedup, `MemoStore` (redb), `RagIndexPipeline` / `RagQuery`.
-- **`krishiv-plan`**: `RagIndexSpec`, `FeatureStore`, chunker/embedder plan types.
-- **`krishiv-connectors`**: `FeatureStoreSink` with Parquet backfill and point-in-time lookup; streaming updates via `InMemoryFeatureStream`.
-- **`krishiv-scheduler`**: `LlmQuotaAggregator`; coordinator heartbeat returns `llm_throttles` when job quota exceeded.
-- **`krishiv-proto` / gRPC**: `LlmQuotaReport` on `ExecutorHeartbeatRequest`, `LlmThrottleCommand` on `ExecutorHeartbeatResponse`; wire round-trip test.
-- **`krishiv-executor`**: `apply_llm_throttles_from_response` after gRPC heartbeat.
-- **`krishiv-python`**: `krishiv.ai` submodule (chunkers, `rag_index`, `rag_query`).
+| Sprint | Deliverable |
+|--------|-------------|
+| **S1 Delta** | `krishiv-lakehouse`: `local_delta` + `DeltaTableHandle`, `write_delta`, `merge_delta`; `SqlEngine::read_delta`; Python `read_delta` |
+| **S2 Hudi** | `HudiSnapshotReader` (snapshot + incremental), `write_hudi_cow_fixture`, `SqlEngine::read_hudi`, Python `read_hudi` |
+| **S3 Catalog + SR** | `krishiv-catalog` Iceberg REST (`GenericRestCatalog`, `GlueRestCatalog`, `NessieCatalog`); new `krishiv-schema-registry` (Confluent Avro/JSON/Protobuf); Python catalog + `schema_registry_confluent` |
+| **S4 Time travel** | `preprocess_as_of_sql` (`VERSION` / `TIMESTAMP` / `FOR SYSTEM_TIME AS OF`); `apply_as_of_refs` for delta tables |
+| **S5 MERGE** | `execute_merge_sql` dispatches Delta (`merge_delta`) and in-memory Iceberg tables; `Session.sql` routes `MERGE INTO` |
+| **S6 Partition evolution** | `PartitionSpecResolver` + `IcebergCatalogClient` partition field REST APIs |
 
-### PR follow-ups (2026-05-23)
+### Notes
 
-- LanceDB: documented Parquet + merge-on-id in `lancedb_sink.rs` and tracker S1.4.
-- HF tests: `krishiv-ai` default features empty for CI; `cargo test -p krishiv-ai --features fastembed-local` for HuggingFace + `rag_index` (needs `libstdc++-12-dev` / `RUSTFLAGS="-L native=/usr/lib/gcc/x86_64-linux-gnu/12"` when linking ONNX).
-- Clippy `-D warnings`: clean on R17 crates (`krishiv-vector-sinks`, `krishiv-ai`, `krishiv-connectors`, `krishiv-scheduler`, `krishiv-proto`, `krishiv-exec`, `krishiv-executor`); `sync_scalar_udfs` made synchronous to fix `await_holding_lock` in `krishiv-sql`.
-- Proto heartbeat: LLM quota fields wired through `krishiv-proto` ↔ scheduler tonic handler ↔ executor transport.
-- R17 tracker: all sprint checkboxes marked `[x]` in `r17-ai-ml-data-platform.md`.
+- **Delta write path**: Native `_delta_log` + Parquet writer in `local_delta.rs` (avoids `deltalake-rs` / workspace Arrow 58 mismatch). Idempotent merge-on-key in `merge_delta`.
+- **Proto / coordinator**: unchanged in R18 (LLM quota from R17).
+- **Acceptance gate**: Large-scale (1M row) and live Nessie CI tests remain environment-dependent; unit/integration tests cover local Delta/Hudi/SQL AS OF/MERGE/catalog mock.
 
 ### Validation
 
 ```
-cargo clippy -p krishiv-vector-sinks -p krishiv-ai -p krishiv-connectors -p krishiv-exec -p krishiv-plan -p krishiv-scheduler -p krishiv-proto -p krishiv-executor -- -D warnings  → clean
-cargo test -p krishiv-vector-sinks          → 4 passed
-cargo test -p krishiv-ai --no-default-features → 12 passed
-RUSTFLAGS="-L native=/usr/lib/gcc/x86_64-linux-gnu/12" cargo test -p krishiv-ai --features fastembed-local rag_index → 1 passed
-cargo test -p krishiv-proto executor_heartbeat_llm_quota → 1 passed
-cargo test -p krishiv-scheduler --lib llm_quota → 2 passed
-cargo test -p krishiv-executor llm_throttle → passed
-cargo test -p krishiv-connectors feature_store → 2 passed
+cargo test -p krishiv-lakehouse --lib
+cargo test -p krishiv-catalog --lib
+cargo test -p krishiv-schema-registry --lib
+cargo test -p krishiv-sql --lib
+cargo check -p krishiv-api -p krishiv-python
 ```
 
 ### Next Task
 
-- Full workspace `cargo test --workspace` and `pytest python/krishiv-ai/tests/` after `maturin develop` (optional CI hardening for `fastembed-local` link flags).
-- Acceptance-gate items in tracker (five-sink e2e, Python pytest suite) remain environment-dependent.
+- Optional: wire `deltalake-rs` when Arrow versions align; Nessie/Glue live CI; Python `write_delta` / `alter_table` partition helpers.
