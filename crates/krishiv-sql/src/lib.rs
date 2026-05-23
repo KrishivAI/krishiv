@@ -300,13 +300,11 @@ impl SqlDataFrame {
     pub async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
         use datafusion::physical_plan::collect as df_collect;
 
-        let ctx = SessionContext::new();
-        let physical_plan = ctx
-            .state()
-            .create_physical_plan(self.dataframe.logical_plan())
-            .await?;
+        let df = self.dataframe.clone();
+        let task_ctx = df.task_ctx();
+        let physical_plan = df.create_physical_plan().await?;
 
-        let batches = df_collect(physical_plan.clone(), ctx.task_ctx()).await?;
+        let batches = df_collect(physical_plan.clone(), task_ctx.into()).await?;
 
         let mut output_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let mut cpu_nanos: u64 = 0;
@@ -739,6 +737,45 @@ mod tests {
         assert_eq!(
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             1
+        );
+    }
+
+    // ── GAP-RT-06: collect_with_stats uses the DataFrame's own context ──────────
+
+    #[tokio::test]
+    async fn collect_with_stats_uses_registered_table() {
+        use std::sync::Arc;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let engine = SqlEngine::new();
+
+        // Register a record batch as a table.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let col = Int64Array::from(vec![1i64, 2i64, 3i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        engine
+            .register_record_batches("rt06_table", vec![batch])
+            .await
+            .unwrap();
+
+        // Query that table via collect_with_stats.
+        let dataframe = engine
+            .sql("SELECT id FROM rt06_table")
+            .await
+            .expect("sql should succeed");
+        let (batches, stats) = dataframe
+            .collect_with_stats()
+            .await
+            .expect("collect_with_stats should succeed with registered table");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "expected 3 rows from registered table, got {total_rows} (stats: {stats:?})"
         );
     }
 }

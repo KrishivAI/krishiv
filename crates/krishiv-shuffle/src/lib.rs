@@ -7,9 +7,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -317,11 +316,23 @@ impl LocalShuffleStore {
     /// compression codec before writing.
     ///
     /// 1. Compresses `data` with the configured codec.
-    /// 2. Creates `{base_dir}/{staging_name}` (including parent dirs).
-    /// 3. Writes the compressed bytes.
-    /// 4. Atomically renames staging path → final path.
+    /// 2. Prepends a 4-byte magic header: `[0x4B, 0x53, 0x48, codec_byte]`
+    ///    where `codec_byte` is `0x00` for None, `0x01` for Lz4, `0x02` for Zstd.
+    /// 3. Creates `{base_dir}/{staging_name}` (including parent dirs).
+    /// 4. Writes the header + compressed bytes.
+    /// 5. Atomically renames staging path → final path.
     pub async fn write_partition(&self, path: &ShufflePath, data: &[u8]) -> ShuffleResult<()> {
         let compressed = self.compression.compress(data)?;
+        let codec_byte = match self.compression {
+            ShuffleCompression::None => 0x00u8,
+            ShuffleCompression::Lz4 => 0x01u8,
+            ShuffleCompression::Zstd => 0x02u8,
+        };
+        // Prepend KSH magic header: [0x4B, 0x53, 0x48, codec_byte]
+        let mut payload = Vec::with_capacity(4 + compressed.len());
+        payload.extend_from_slice(&[0x4B, 0x53, 0x48, codec_byte]);
+        payload.extend_from_slice(&compressed);
+
         let staging = self.base_dir.join(path.staging_name());
         let final_path = self.base_dir.join(path.final_name());
 
@@ -330,18 +341,50 @@ impl LocalShuffleStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        tokio::fs::write(&staging, &compressed).await?;
+        tokio::fs::write(&staging, &payload).await?;
         tokio::fs::rename(&staging, &final_path).await?;
         Ok(())
     }
 
-    /// Read the bytes for a partition, decompressing with the configured codec.
+    /// Read the bytes for a partition, decompressing with the codec indicated
+    /// in the file's magic header (not the current store config).
+    ///
+    /// File format: `[0x4B, 0x53, 0x48, codec_byte] ++ compressed_data`
+    /// - Magic bytes `0x4B 0x53 0x48` = "KSH"
+    /// - `codec_byte`: `0x00` = None, `0x01` = Lz4, `0x02` = Zstd
     ///
     /// Returns `PartitionNotFound` if the final path does not exist.
+    /// Returns `Io` error if the magic bytes are invalid or the codec byte is unknown.
     pub async fn read_partition(&self, path: &ShufflePath) -> ShuffleResult<Vec<u8>> {
         let final_path = self.base_dir.join(path.final_name());
         match tokio::fs::read(&final_path).await {
-            Ok(bytes) => self.compression.decompress(&bytes),
+            Ok(bytes) => {
+                // Validate and parse the KSH magic header.
+                if bytes.len() < 4 {
+                    return Err(ShuffleError::Io(format!(
+                        "shuffle file too short to contain header: {}",
+                        final_path.display()
+                    )));
+                }
+                if bytes[0] != 0x4B || bytes[1] != 0x53 || bytes[2] != 0x48 {
+                    return Err(ShuffleError::Io(format!(
+                        "invalid shuffle file magic bytes in: {}",
+                        final_path.display()
+                    )));
+                }
+                let codec = match bytes[3] {
+                    0x00 => ShuffleCompression::None,
+                    0x01 => ShuffleCompression::Lz4,
+                    0x02 => ShuffleCompression::Zstd,
+                    other => {
+                        return Err(ShuffleError::Io(format!(
+                            "unknown shuffle codec byte 0x{other:02X} in: {}",
+                            final_path.display()
+                        )));
+                    }
+                };
+                codec.decompress(&bytes[4..])
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(ShuffleError::PartitionNotFound {
                     path: final_path.display().to_string(),
@@ -552,14 +595,14 @@ impl HashPartitioner {
 // ── Hashing helpers ───────────────────────────────────────────────────────────
 
 fn hash_i64(value: i64, buckets: u32) -> u32 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    hasher.write(&value.to_le_bytes());
     (hasher.finish() % buckets as u64) as u32
 }
 
 fn hash_str(value: &str, buckets: u32) -> u32 {
-    let mut hasher = DefaultHasher::new();
-    value.as_bytes().hash(&mut hasher);
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    hasher.write(value.as_bytes());
     (hasher.finish() % buckets as u64) as u32
 }
 
@@ -1075,8 +1118,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     use std::sync::Arc;
 
     use arrow::array::{Array, Int32Array, StringArray};
@@ -1312,6 +1354,34 @@ mod tests {
         assert_eq!(read_back, data, "Zstd write/read round-trip must be byte-exact");
     }
 
+    /// GAP-SH-02: Verify that the header codec byte governs decompression even
+    /// when the reader store has a different codec configured.
+    ///
+    /// Write a partition with `CompressionCodec::None` (header byte = 0x00),
+    /// then read it back through a store configured with `CompressionCodec::Lz4`.
+    /// The reader must use the None codec recorded in the header and return the
+    /// original uncompressed bytes without corruption.
+    #[tokio::test]
+    async fn shuffle_codec_header_mismatch_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::None);
+        let read_store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
+
+        let path = ShufflePath::new("job-mismatch", "stage-0", 0);
+        let data: Vec<u8> = (0u8..=127).cycle().take(256).collect();
+
+        // Write with None codec — header byte 0x00 is embedded in the file.
+        write_store.write_partition(&path, &data).await.unwrap();
+
+        // Read with a store configured for Lz4 — must use the header's None codec,
+        // not Lz4, and return the original bytes without error or corruption.
+        let read_back = read_store.read_partition(&path).await.unwrap();
+        assert_eq!(
+            read_back, data,
+            "read_partition must use the codec from the file header, not the store config"
+        );
+    }
+
     // ── Orphan detection ──────────────────────────────────────────────────
 
     fn write_ipc_file(base: &std::path::Path, job_id: &str, stage_id: &str, partition_id: u32) {
@@ -1438,10 +1508,10 @@ mod tests {
         let partitioner = HashPartitioner::new("key", buckets);
         let partitions = partitioner.partition(&batch).unwrap();
 
-        // Verify each row ends up in the expected bucket.
+        // Verify each row ends up in the expected bucket using XxHash64 (stable hash).
         for &v in &values {
-            let mut hasher = DefaultHasher::new();
-            (v as i64).hash(&mut hasher);
+            let mut hasher = twox_hash::XxHash64::with_seed(0);
+            hasher.write(&(v as i64).to_le_bytes());
             let expected_bucket = (hasher.finish() % buckets as u64) as usize;
             let arr = partitions[expected_bucket]
                 .column(0)
@@ -1475,8 +1545,8 @@ mod tests {
         let partitions = partitioner.partition(&batch).unwrap();
 
         for &v in &values {
-            let mut hasher = DefaultHasher::new();
-            v.as_bytes().hash(&mut hasher);
+            let mut hasher = twox_hash::XxHash64::with_seed(0);
+            hasher.write(v.as_bytes());
             let expected_bucket = (hasher.finish() % buckets as u64) as usize;
             let arr = partitions[expected_bucket]
                 .column(0)

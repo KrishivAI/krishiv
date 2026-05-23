@@ -15,6 +15,14 @@ service ExecutorTask {
   rpc CancelTask(TaskCancellationRequest) returns (TaskStatusResponse);
 }
 
+// Management API for CLI-to-coordinator operations (GAP-RT-04).
+service CoordinatorManagement {
+  rpc TriggerSavepoint(TriggerSavepointRequest) returns (TriggerSavepointResponse);
+  rpc RestoreJob(RestoreJobRequest) returns (RestoreJobResponse);
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  rpc InspectState(InspectStateRequest) returns (InspectStateResponse);
+}
+
 message TransportVersion {
   uint32 major = 1;
   uint32 minor = 2;
@@ -266,6 +274,57 @@ message CheckpointAckStaleEpoch {
 }
 
 message CheckpointAckJobNotFound {}
+
+// ── CoordinatorManagement messages ──────────────────────────────────────────
+
+message TriggerSavepointRequest {
+  string job_id = 1;
+  string label = 2;
+}
+
+message TriggerSavepointResponse {
+  uint64 epoch = 1;
+  string message = 2;
+}
+
+message RestoreJobRequest {
+  string job_id = 1;
+  uint64 epoch = 2;
+  string storage_path = 3;
+}
+
+message RestoreJobResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ListCheckpointsRequest {
+  string job_id = 1;
+}
+
+message CheckpointEpochInfo {
+  uint64 epoch = 1;
+  bool is_savepoint = 2;
+  string savepoint_label = 3;
+}
+
+message ListCheckpointsResponse {
+  repeated CheckpointEpochInfo epochs = 1;
+}
+
+message InspectStateRequest {
+  string job_id = 1;
+  string operator_id = 2;
+}
+
+message StateSnapshotInfo {
+  string task_id = 1;
+  string snapshot_path = 2;
+}
+
+message InspectStateResponse {
+  repeated StateSnapshotInfo snapshots = 1;
+}
 
 enum TransportDisposition {
   TRANSPORT_DISPOSITION_UNSPECIFIED = 0;

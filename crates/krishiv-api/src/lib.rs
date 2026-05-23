@@ -349,6 +349,11 @@ impl Session {
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;
+        if self.policy_engine.is_some() {
+            return Err(KrishivError::AccessDenied {
+                reason: "session has a policy engine configured; use sql_as() to execute SQL with an authenticated principal".into(),
+            });
+        }
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
         Ok(DataFrame::from_sql_dataframe(
@@ -1414,6 +1419,27 @@ mod tests {
         let result = df.collect_async().await.unwrap();
 
         assert_eq!(result.row_count(), 3);
+    }
+
+    // ── GAP-RT-05: sql() / sql_async() fail-closed when policy engine is set ───
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_sql_async_fails_when_policy_configured() {
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key-rt05".into(),
+            "alice".into(),
+            Role::Reader,
+        )]));
+        let session = SessionBuilder::new()
+            .with_auth(auth)
+            .with_policy(Arc::new(AllowAllPolicy))
+            .build()
+            .unwrap();
+        let result = session.sql("SELECT 1");
+        assert!(
+            matches!(result, Err(KrishivError::AccessDenied { .. })),
+            "expected AccessDenied but got: {result:?}"
+        );
     }
 
     // ── S6.1: SessionBuilder::with_coordinator ────────────────────────────────

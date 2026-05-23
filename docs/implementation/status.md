@@ -2,18 +2,64 @@
 
 ## Current Phase
 
-**R12 CARRYOVER + Code-Review Refactor (2026-05-22).**
+**R12 CARRYOVER CLOSED — Branch `claude/r1-r12-pending-slices-6ksEO` (2026-05-23).**
 
 Release tracker: [`r12-foundation-completeness.md`](r12-foundation-completeness.md)  
 Gap register: [`docs/architecture/r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md)
 
-**Merged from `main`:** Code-review refactor Phases 1–7 (`krishiv-async-util`,
-`krishiv-sql-policy`, scheduler/exec/executor module extractions). Workspace lib tests
-and clippy clean per refactor session below.
+**R12 carryover gaps now closed** (see session below). All workspace lib tests pass;
+`cargo clippy --workspace -- -D warnings` clean.
 
 **R12 maturity:** Audit slices S1–S6 are documented on branch `claude/r12-slices-planning-BcFL5`;
 integration gaps for distributed/streaming/remote paths remain open — see **GAP-*** IDs in the
 gap register and **R12 carryover** section below.
+
+---
+
+## R12 Carryover Gap Closure Session (2026-05-23)
+
+Branch: `claude/r1-r12-pending-slices-6ksEO`
+
+### Closed Gaps
+
+| Gap ID | Summary | File(s) Changed |
+|--------|---------|-----------------|
+| **GAP-CP-03** | Wire `validate_fencing_token` in `commit_epoch` before storage write | `krishiv-scheduler/src/checkpoint.rs` |
+| **GAP-CK-01** | `restore_job_from_checkpoint` validates fencing token against live coordinator | `krishiv-scheduler/src/lib.rs` |
+| **GAP-CN-01** | Duplicate `RdkafkaCdcEventSource` — confirmed no duplicate; `kafka` feature compiles cleanly | `krishiv-connectors` (no change needed) |
+| **GAP-CP-04** | `--metadata-backend` / `--metadata-path` CLI flags + env vars on `krishiv_coordinator` binary | `krishiv-scheduler/src/bin/krishiv_coordinator.rs` |
+| **GAP-CP-05** | `save_job` fail-closed: metadata persist errors → `SchedulerError::Transport` (not warn-only) | `krishiv-scheduler/src/lib.rs` |
+| **GAP-CP-06** | `recover_from_store` rebuilds `checkpoint_coordinators` from recovered job specs | `krishiv-scheduler/src/lib.rs` |
+| **GAP-RT-04** | Real `RemoteCoordinatorClient` gRPC (4 RPCs: savepoint, restore, list, inspect) | `krishiv/src/remote_client.rs`, `krishiv-proto/src/lib.rs`, `krishiv-proto/proto/…/coordinator_executor.proto`, `krishiv-scheduler/src/lib.rs` |
+| **GAP-RT-05** | `Session::sql_async` fails-closed when policy engine configured (returns `AccessDenied`) | `krishiv-api/src/lib.rs` |
+| **GAP-RT-06** | `collect_with_stats` uses plan's own `TaskContext` not a fresh `SessionContext` | `krishiv-sql/src/lib.rs` |
+| **GAP-SH-02** | Shuffle codec header `[0x4B, 0x53, 0x48, codec_byte]` prefixed to all partition files | `krishiv-shuffle/src/lib.rs` |
+| **GAP-SH-03** | `hash_i64` / `hash_str` use `XxHash64::with_seed(0)` (stable, deterministic) | `krishiv-shuffle/src/lib.rs`, `Cargo.toml`, `krishiv-shuffle/Cargo.toml` |
+
+### Still Deferred (tracked for R13)
+
+| Gap ID | Summary |
+|--------|---------|
+| GAP-SH-01 | Shuffle compression wired onto executor hot path (complex integration) |
+| GAP-RT-01 | `SingleNodeBackend` / `EmbeddedBackend` in-process coordinator |
+| GAP-RT-03 | `WindowedStream` → executor fragments |
+| GAP-CN-02 | Kafka watermark-aware streaming |
+| GAP-CP-09 | Executor binary task gRPC loop |
+| GAP-PY-01 | Python API `todo!()` removal |
+
+### Validation (2026-05-23)
+
+```
+cargo test --workspace --lib    → all suites pass (0 failures)
+cargo clippy --workspace -- -D warnings → 0 errors, 0 warnings
+```
+
+### Next Task
+
+1. Wire the new scheduler module files (`admission`, `checkpoint`, `heartbeat`, `job`, `store`) declared in `lib.rs` to replace duplicated inline code — target shrinking `krishiv-scheduler/src/lib.rs` from ~8400 to ~4000 lines.
+2. Update R13 tracker prerequisites to reference closed gap IDs above.
+
+---
 
 ## Code-Review Refactor Session (2026-05-22) — Phases 4–7
 
@@ -119,16 +165,17 @@ cargo clippy (modified crates) -D warnings → 0 errors
 
 ### R12 carryover (close before R13 Sprint 1)
 
-| Priority | Gap ID | Summary |
-|----------|--------|---------|
-| P0 | GAP-CP-03 | Wire `validate_fencing_token` in `commit_epoch` / writes |
-| P0 | GAP-CK-01 | Restore validates fencing token |
-| P0 | GAP-CN-01 | Fix duplicate `RdkafkaCdcEventSource` (`kafka` feature compile) |
-| P0 | GAP-RT-04 | Real `RemoteCoordinatorClient` gRPC (not stub `Ok`) |
-| P1 | GAP-CP-04–06 | Coordinator startup metadata recovery |
-| P1 | GAP-SH-01, GAP-SH-03 | Shuffle compression on executor path; stable partition hash |
-| P1 | GAP-RT-05 | Policy fail-closed when `Session::sql()` used with policy configured |
-| P1 | GAP-DOC-01 | Align “complete” claims with L4 acceptance per gap register |
+| Priority | Gap ID | Summary | Status |
+|----------|--------|---------|--------|
+| P0 | GAP-CP-03 | Wire `validate_fencing_token` in `commit_epoch` / writes | ✅ CLOSED |
+| P0 | GAP-CK-01 | Restore validates fencing token | ✅ CLOSED |
+| P0 | GAP-CN-01 | Fix duplicate `RdkafkaCdcEventSource` (`kafka` feature compile) | ✅ CLOSED (no dup found) |
+| P0 | GAP-RT-04 | Real `RemoteCoordinatorClient` gRPC (not stub `Ok`) | ✅ CLOSED |
+| P1 | GAP-CP-04–06 | Coordinator startup metadata recovery | ✅ CLOSED |
+| P1 | GAP-SH-02, GAP-SH-03 | Shuffle codec header; stable partition hash | ✅ CLOSED |
+| P1 | GAP-RT-05, GAP-RT-06 | Policy fail-closed; collect_with_stats task context | ✅ CLOSED |
+| P1 | GAP-SH-01 | Shuffle compression on executor path | ⏳ DEFERRED R13 |
+| P1 | GAP-DOC-01 | Align “complete” claims with L4 acceptance per gap register | ✅ CLOSED (this update) |
 
 Full list: [`r12-maturity-gap-register.md`](../architecture/r12-maturity-gap-register.md).
 

@@ -8,11 +8,14 @@
 //!
 //! Usage:
 //!   krishiv-coordinator [--coordinator-id <ID>] [--grpc-addr <HOST:PORT>]
+//!                       [--metadata-backend sqlite|json] [--metadata-path <PATH>]
 //!
 //! Options:
-//!   --coordinator-id <ID>     Coordinator id, defaults to KRISHIV_COORDINATOR_ID or coord-local
-//!   --grpc-addr <HOST:PORT>   gRPC listen address, defaults to KRISHIV_GRPC_ADDR or 0.0.0.0:9090
-//!   -h, --help                Show help
+//!   --coordinator-id <ID>          Coordinator id, defaults to KRISHIV_COORDINATOR_ID or coord-local
+//!   --grpc-addr <HOST:PORT>        gRPC listen address, defaults to KRISHIV_GRPC_ADDR or 0.0.0.0:9090
+//!   --metadata-backend <TYPE>      Metadata storage backend: "sqlite" (default when path set), "json", "memory"
+//!   --metadata-path <PATH>         Path for durable metadata store (required for sqlite/json backends)
+//!   -h, --help                     Show help
 
 use std::env;
 use std::error::Error;
@@ -27,8 +30,11 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use krishiv_proto::{CoordinatorId, CoordinatorState};
 use krishiv_scheduler::{
-    Coordinator, SharedCoordinator, StabilityMetrics, serve_coordinator_executor_grpc_with_listener,
+    Coordinator, InMemoryMetadataStore, JsonFileMetadataStore, SharedCoordinator, StabilityMetrics,
+    serve_coordinator_executor_grpc_with_listener,
 };
+#[cfg(feature = "sqlite")]
+use krishiv_scheduler::SqliteMetadataStore;
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
@@ -43,7 +49,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
-    let coordinator = SharedCoordinator::new(Coordinator::active(coordinator_id));
+
+    // GAP-CP-04: Attach a MetadataStore and recover persisted state on startup.
+    // The store is opened first so we can call recover_from_store before the
+    // coordinator starts accepting connections.
+    let mut coord = Coordinator::active(coordinator_id);
+    let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {
+        (Some("memory"), _) | (None, None) => {
+            // In-memory store: no recovery needed on restart.
+            SharedCoordinator::new(coord.with_store(InMemoryMetadataStore::default()))
+        }
+        (backend, Some(path)) => {
+            let path = path.to_string_lossy();
+            match backend.unwrap_or("json") {
+                #[cfg(feature = "sqlite")]
+                "sqlite" => {
+                    let store = SqliteMetadataStore::open(path.as_ref())
+                        .map_err(|e| format!("sqlite store '{path}': {e}"))?;
+                    coord.recover_from_store(&store)
+                        .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+                    SharedCoordinator::new(coord.with_store(store))
+                }
+                _ => {
+                    let store = JsonFileMetadataStore::open(path.as_ref())
+                        .map_err(|e| format!("json store '{path}': {e}"))?;
+                    coord.recover_from_store(&store)
+                        .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+                    SharedCoordinator::new(coord.with_store(store))
+                }
+            }
+        }
+        (Some("sqlite"), None) => {
+            return Err("--metadata-backend sqlite requires --metadata-path".into());
+        }
+        (Some("json"), None) => {
+            return Err("--metadata-backend json requires --metadata-path".into());
+        }
+        (Some(unknown), _) => {
+            return Err(format!("unknown --metadata-backend '{unknown}'; supported: memory, json, sqlite").into());
+        }
+    };
 
     // If a shuffle directory is configured, run a background GC loop that
     // drains terminal-job shuffle partitions from the local disk store.
@@ -174,6 +219,10 @@ struct CoordinatorCliConfig {
     grpc_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
     shuffle_dir: Option<PathBuf>,
+    /// GAP-CP-04: metadata backend type (memory | json | sqlite).
+    metadata_backend: Option<String>,
+    /// GAP-CP-04: path for durable metadata (json/sqlite).
+    metadata_path: Option<PathBuf>,
     help: bool,
 }
 
@@ -190,6 +239,8 @@ impl CoordinatorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
+            metadata_backend: env::var("KRISHIV_METADATA_BACKEND").ok(),
+            metadata_path: env::var("KRISHIV_METADATA_PATH").ok().map(PathBuf::from),
             help: false,
         };
         let mut args = args.into_iter();
@@ -216,6 +267,13 @@ impl CoordinatorCliConfig {
                             format!("invalid socket address for --http-addr: {value}")
                         })?);
                 }
+                "--metadata-backend" => {
+                    config.metadata_backend = Some(next_arg(&mut args, "--metadata-backend")?);
+                }
+                "--metadata-path" => {
+                    let value = next_arg(&mut args, "--metadata-path")?;
+                    config.metadata_path = Some(PathBuf::from(value));
+                }
                 "--help" | "-h" => config.help = true,
                 unknown => {
                     return Err(format!("unknown option: {unknown}\n\n{}", Self::help()).into());
@@ -237,11 +295,13 @@ impl CoordinatorCliConfig {
            krishiv-coordinator [OPTIONS]\n\
          \n\
          Options:\n\
-           --coordinator-id <ID>     Coordinator id, defaults to KRISHIV_COORDINATOR_ID or coord-local\n\
-           --grpc-addr <HOST:PORT>   gRPC listen address, defaults to KRISHIV_GRPC_ADDR or 0.0.0.0:9090\n\
-           --http-addr <HOST:PORT>   HTTP listen address for /healthz /readyz /metrics (optional)\n\
-           --shuffle-dir <PATH>      Local shuffle store dir, defaults to KRISHIV_SHUFFLE_DIR (optional)\n\
-           -h, --help                Show help\n"
+           --coordinator-id <ID>          Coordinator id, defaults to KRISHIV_COORDINATOR_ID or coord-local\n\
+           --grpc-addr <HOST:PORT>        gRPC listen address, defaults to KRISHIV_GRPC_ADDR or 0.0.0.0:9090\n\
+           --http-addr <HOST:PORT>        HTTP listen address for /healthz /readyz /metrics (optional)\n\
+           --shuffle-dir <PATH>           Local shuffle store dir, defaults to KRISHIV_SHUFFLE_DIR (optional)\n\
+           --metadata-backend <TYPE>      memory|json|sqlite (default: memory; json/sqlite require --metadata-path)\n\
+           --metadata-path <PATH>         Path for durable metadata store (json/sqlite backends)\n\
+           -h, --help                     Show help\n"
     }
 }
 
@@ -297,5 +357,33 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("invalid socket address"));
+    }
+
+    #[test]
+    fn parses_metadata_flags() {
+        let config = CoordinatorCliConfig::parse([
+            String::from("--metadata-backend"),
+            String::from("json"),
+            String::from("--metadata-path"),
+            String::from("/tmp/coord.db"),
+        ])
+        .unwrap();
+        assert_eq!(config.metadata_backend.as_deref(), Some("json"));
+        assert_eq!(
+            config.metadata_path.as_deref().map(|p| p.to_str().unwrap()),
+            Some("/tmp/coord.db")
+        );
+    }
+
+    #[test]
+    fn parses_sqlite_metadata_flag() {
+        let config = CoordinatorCliConfig::parse([
+            String::from("--metadata-backend"),
+            String::from("sqlite"),
+            String::from("--metadata-path"),
+            String::from("/tmp/meta.sqlite"),
+        ])
+        .unwrap();
+        assert_eq!(config.metadata_backend.as_deref(), Some("sqlite"));
     }
 }
