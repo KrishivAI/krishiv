@@ -1375,6 +1375,16 @@ impl Coordinator {
         self.state
     }
 
+    /// Promote a standby coordinator to active leader (P0-5 / P3-19).
+    pub fn promote_to_active(&mut self) {
+        self.state = CoordinatorState::Active;
+    }
+
+    /// Demote to standby when leadership is lost.
+    pub fn demote_to_standby(&mut self) {
+        self.state = CoordinatorState::Standby;
+    }
+
     /// Coordinator config.
     pub fn config(&self) -> CoordinatorConfig {
         self.config
@@ -1771,6 +1781,13 @@ impl Coordinator {
         self.index_streaming_tasks(&inserted_job_id);
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::JobSubmitted {
+                job_id: inserted_job_id.as_str(),
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
         Ok(SubmitOutcome::Accepted)
     }
 

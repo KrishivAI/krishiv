@@ -4,9 +4,10 @@ use std::error::Error;
 use std::net::SocketAddr;
 
 use krishiv_operator::{
-    BootstrapExecutor, KubernetesControllerConfig, KubernetesControllerRuntime,
+    BootstrapExecutor, K8sLeaseElection, KubernetesControllerConfig, KubernetesControllerRuntime,
     run_kubernetes_controller_runtime_with_client,
 };
+use krishiv_scheduler::{LeaderElection, SharedCoordinator};
 use krishiv_proto::CoordinatorId;
 use krishiv_scheduler::serve_coordinator_executor_grpc_with_listener;
 use krishiv_ui::{UiState, serve};
@@ -31,6 +32,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::try_default().await?;
     // P0-4: embedded coordinator must tick heartbeats and launch assigned tasks.
     runtime.coordinator().spawn_orchestration_loops();
+    spawn_coordinator_leader_election(
+        runtime.coordinator(),
+        client.clone(),
+        controller_config.namespace().map(str::to_string),
+        controller_config.coordinator_id().as_str().to_string(),
+    );
     if config.status_addr.is_some() || config.executor_grpc_addr.is_some() {
         run_controller_with_servers(
             client,
@@ -121,6 +128,33 @@ async fn run_controller_with_servers(
     }
 
     Ok(())
+}
+
+fn spawn_coordinator_leader_election(
+    coordinator: SharedCoordinator,
+    client: kube::Client,
+    namespace: Option<String>,
+    coordinator_id: String,
+) {
+    let ns = namespace.unwrap_or_else(|| "krishiv-system".to_string());
+    let election = std::sync::Arc::new(
+        K8sLeaseElection::new(&coordinator_id, &ns, &coordinator_id).with_kube_client(client),
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            if election.try_acquire().await {
+                if let Ok(mut c) = coordinator.write() {
+                    c.promote_to_active();
+                }
+            } else if election.is_leader() {
+                let _ = election.renew().await;
+            } else if let Ok(mut c) = coordinator.write() {
+                c.demote_to_standby();
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

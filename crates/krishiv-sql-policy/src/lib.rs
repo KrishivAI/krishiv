@@ -10,7 +10,9 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
+use krishiv_governance::{
+    audit_log, AuditAction, AuditOutcome, AuthProvider, MaskingRule, PolicyHook, Principal,
+};
 use krishiv_sql::{SqlEngine, SqlError, SqlResult, referenced_table_names};
 
 /// Wraps [`SqlEngine`] and enforces table-access and column-masking policy.
@@ -63,9 +65,18 @@ impl PolicyEnforcingSqlEngine {
         principal: &Principal,
         query: &str,
     ) -> SqlResult<Vec<RecordBatch>> {
+        use sha2::{Digest, Sha256};
+        let query_hash = format!("{:x}", Sha256::digest(query.as_bytes()));
         let table_names = referenced_table_names(query)?;
         for table_name in &table_names {
             if !self.policy.check_table_access(principal, table_name) {
+                audit_log(
+                    principal.subject.as_str(),
+                    &AuditAction::QueryExecuted {
+                        query_hash: &query_hash,
+                    },
+                    AuditOutcome::Denied,
+                );
                 return Err(SqlError::AccessDenied {
                     reason: format!(
                         "principal '{}' denied access to table '{}'",
@@ -75,8 +86,8 @@ impl PolicyEnforcingSqlEngine {
             }
         }
 
-        // Execute query via inner engine
-        let df = self.inner.sql(query).await?;
+        let effective_sql = apply_row_predicates(query, principal, &table_names, self.policy.as_ref());
+        let df = self.inner.sql(&effective_sql).await?;
         let batches = df.collect().await?;
 
         // Apply column masking
@@ -85,8 +96,37 @@ impl PolicyEnforcingSqlEngine {
             .map(|batch| apply_masking(batch, principal, &table_names, self.policy.as_ref()))
             .collect::<SqlResult<Vec<_>>>()?;
 
+        audit_log(
+            principal.subject.as_str(),
+            &AuditAction::QueryExecuted {
+                query_hash: &query_hash,
+            },
+            AuditOutcome::Allowed,
+        );
         Ok(masked)
     }
+}
+
+fn apply_row_predicates(
+    query: &str,
+    principal: &Principal,
+    table_names: &[String],
+    policy: &dyn PolicyHook,
+) -> String {
+    let mut preds: Vec<String> = table_names
+        .iter()
+        .filter_map(|t| policy.row_predicate(principal, t))
+        .collect();
+    if preds.is_empty() {
+        return query.to_string();
+    }
+    if preds.len() == 1 {
+        return format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {}", preds[0]);
+    }
+    format!(
+        "SELECT * FROM ({query}) AS __krishiv_rls WHERE {}",
+        preds.join(" AND ")
+    )
 }
 
 /// Apply column-masking rules from `policy` to a single [`RecordBatch`].

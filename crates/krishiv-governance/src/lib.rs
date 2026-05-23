@@ -84,6 +84,11 @@ pub trait PolicyHook: Send + Sync {
         table: &str,
         column: &str,
     ) -> Option<MaskingRule>;
+
+    /// Optional SQL predicate injected before execution (row-level security).
+    fn row_predicate(&self, _principal: &Principal, _table: &str) -> Option<String> {
+        None
+    }
 }
 
 /// **Beta API**: No-op hook that allows everything and masks nothing.

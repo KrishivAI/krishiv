@@ -637,6 +637,9 @@ pub async fn reconcile_dynamic_object_with_runtime(
             .map_err(|_| OperatorError::CoordinatorLockPoisoned)?;
         runtime.reconciler.reconcile(&mut coordinator, &resource)?
     };
+    if outcome.action() == ReconcileAction::FinalizerAdded {
+        patch_krishivjob_finalizer(jobs, &resource).await?;
+    }
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
 
     Ok(KubernetesReconcileReport {
@@ -687,6 +690,26 @@ pub const FIELD_MANAGER: &str = "krishiv-operator";
 /// `Patch::Apply` with a `fieldManager` preserves `resourceVersion` semantics
 /// so concurrent updates from multiple controllers do not silently overwrite
 /// each other (P0.12 fix).
+/// Patch `metadata.finalizers` to include the Krishiv job finalizer (P0-6).
+pub async fn patch_krishivjob_finalizer(
+    jobs: &Api<DynamicObject>,
+    resource: &KrishivJobResource,
+) -> OperatorResult<()> {
+    let mut finalizers = resource.metadata.finalizers.clone();
+    if !finalizers.iter().any(|f| f == FINALIZER) {
+        finalizers.push(FINALIZER.to_string());
+    }
+    let patch = json!({ "metadata": { "finalizers": finalizers } });
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    jobs.patch(
+        &resource.metadata.name,
+        &params,
+        &Patch::Apply(&patch),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn patch_krishivjob_status(
     jobs: &Api<DynamicObject>,
     resource: &KrishivJobResource,

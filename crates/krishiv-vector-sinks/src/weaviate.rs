@@ -119,11 +119,48 @@ impl VectorSink for WeaviateSink {
         if !response.status().is_success() {
             return Err(VectorSinkError::Query(response.status().to_string()));
         }
-        let _payload: serde_json::Value = response
+        let payload: serde_json::Value = response
             .json()
             .await
             .map_err(|e| VectorSinkError::Query(e.to_string()))?;
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        let Some(hits) = payload
+            .pointer(&format!("/data/Get/{}/", self.class_name))
+            .and_then(|v| v.as_array())
+        else {
+            return Ok(out);
+        };
+        for hit in hits {
+            let score = hit
+                .pointer("/_additional/score")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f32>().ok())
+                .or_else(|| hit.get("score").and_then(|v| v.as_f64()).map(|f| f as f32))
+                .unwrap_or(0.0);
+            let props = hit.get("properties").or_else(|| hit.get("_additional"));
+            let text = props
+                .and_then(|p| p.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let chunk_index = props
+                .and_then(|p| p.get("chunk_index"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as usize;
+            let doc_id = props
+                .and_then(|p| p.get("doc_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push(ScoredChunk {
+                doc_id,
+                chunk_index,
+                text,
+                score,
+                payload: HashMap::new(),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -131,6 +168,32 @@ impl VectorSink for WeaviateSink {
 mod tests {
     use super::*;
     use crate::traits::VectorSink;
+
+    #[tokio::test]
+    async fn weaviate_query_returns_results() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::json!({
+            "data": {
+                "Get": {
+                    "Document": [{
+                        "properties": { "text": "hello", "chunk_index": 2 },
+                        "_additional": { "score": "0.91" }
+                    }]
+                }
+            }
+        });
+        let _m = server
+            .mock("POST", "/v1/graphql")
+            .with_status(200)
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        let sink = WeaviateSink::new(server.url(), "Document", None);
+        let hits = sink.query_nearest(&[0.1, 0.2], 1, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "hello");
+        assert_eq!(hits[0].chunk_index, 2);
+    }
 
     #[tokio::test]
     async fn weaviate_upsert_is_idempotent_with_mock() {
