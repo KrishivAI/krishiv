@@ -5,6 +5,12 @@
 //! This crate defines `TableProvider`, `CatalogProvider`, schema types, and
 //! column statistics. An in-memory reference implementation is included.
 
+pub mod iceberg_rest;
+pub use iceberg_rest::{
+    GenericRestCatalog, GlueRestCatalog, IcebergCatalogClient, IcebergTableId, NessieCatalog,
+    PartitionFieldSpec, RestCatalogConfig,
+};
+
 use std::collections::BTreeMap;
 use std::fmt;
 

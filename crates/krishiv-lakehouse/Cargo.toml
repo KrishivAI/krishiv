@@ -8,15 +8,19 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 iceberg = { workspace = true }
+parquet = { workspace = true }
 redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+url = "2"
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
 
 [features]
 default = []
+delta = []
 kafka = ["dep:rdkafka"]
 exactly-once-integration = []
 

@@ -11,6 +11,7 @@ krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
+krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-sql-policy = { path = "../krishiv-sql-policy" }
 krishiv-udf = { path = "../krishiv-udf" }

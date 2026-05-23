@@ -12,6 +12,10 @@ path = "src/lib.rs"
 
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
+krishiv-catalog = { path = "../krishiv-catalog" }
+krishiv-lakehouse = { path = "../krishiv-lakehouse" }
+krishiv-schema-registry = { path = "../krishiv-schema-registry" }
+krishiv-sql = { path = "../krishiv-sql" }
 krishiv-ai = { path = "../krishiv-ai", features = ["fastembed-local"] }
 krishiv-udf = { path = "../krishiv-udf" }
 krishiv-vector-sinks = { path = "../krishiv-vector-sinks" }

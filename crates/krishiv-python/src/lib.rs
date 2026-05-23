@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 mod ai;
+mod lakehouse;
 
 // ---------------------------------------------------------------------------
 // Exception hierarchy (GAP-PY-01)
@@ -751,6 +752,13 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Module-level functions
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(read_kafka, m)?)?;
+    m.add_function(wrap_pyfunction!(lakehouse::read_delta, m)?)?;
+    m.add_function(wrap_pyfunction!(lakehouse::read_hudi, m)?)?;
+    m.add_function(wrap_pyfunction!(lakehouse::schema_registry_confluent, m)?)?;
+    m.add_class::<lakehouse::PySchemaRegistryConfig>()?;
+    m.add_class::<lakehouse::PyGlueCatalog>()?;
+    m.add_class::<lakehouse::PyNessieCatalog>()?;
+    m.add_class::<lakehouse::PyIcebergRestCatalog>()?;
 
     ai::register_ai_module(m.py(), m)?;
 

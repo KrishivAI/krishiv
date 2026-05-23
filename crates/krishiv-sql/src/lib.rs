@@ -20,7 +20,10 @@ use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, 
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+mod lakehouse;
 mod udf;
+
+pub use lakehouse::{preprocess_as_of_sql, AsOfTableRef, MergeResult, MergeTargetUnsupportedError};
 
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
@@ -220,6 +223,32 @@ impl SqlEngine {
         Ok(())
     }
 
+    /// Read a local Delta table directory into a DataFrame.
+    pub async fn read_delta(
+        &self,
+        path: impl AsRef<str>,
+        version: Option<i64>,
+    ) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref();
+        let table = format!("delta_{}", path.replace(['/', '.', '-'], "_"));
+        lakehouse::register_delta_uri(&self.context, &table, path, version).await?;
+        self.sql(format!("SELECT * FROM {table}")).await
+    }
+
+    /// Read a Hudi table directory.
+    pub async fn read_hudi(
+        &self,
+        path: impl AsRef<str>,
+        query_type: krishiv_lakehouse::HudiQueryType,
+        begin_instant: Option<&str>,
+    ) -> SqlResult<SqlDataFrame> {
+        let path = path.as_ref();
+        let table = format!("hudi_{}", path.replace(['/', '.', '-'], "_"));
+        lakehouse::register_hudi_uri(&self.context, &table, path, query_type, begin_instant)
+            .await?;
+        self.sql(format!("SELECT * FROM {table}")).await
+    }
+
     /// Plan a SQL query with DataFusion.
     pub async fn sql(&self, query: impl AsRef<str>) -> SqlResult<SqlDataFrame> {
         let query = query.as_ref();
@@ -228,7 +257,25 @@ impl SqlEngine {
         }
 
         self.sync_scalar_udfs().await?;
-        let dataframe = self.context.sql(query).await?;
+
+        if query.trim_start().to_ascii_uppercase().starts_with("MERGE INTO") {
+            let batches = lakehouse::execute_merge_sql(&self.context, query).await?;
+            lakehouse::register_scan_batches(&self.context, "_krishiv_merge_result", batches)
+                .await?;
+            let dataframe = self
+                .context
+                .sql("SELECT * FROM _krishiv_merge_result")
+                .await?;
+            return Ok(SqlDataFrame::new("merge", dataframe));
+        }
+
+        let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query).map_err(|e| {
+            SqlError::DataFusion {
+                message: e,
+            }
+        })?;
+        lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;
+        let dataframe = self.context.sql(&rewritten).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe))
     }
 
