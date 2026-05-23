@@ -97,6 +97,18 @@ impl Source for ParquetSource {
     }
 }
 
+impl ParquetSource {
+    /// Reset the read cursor back to position 0.
+    ///
+    /// After calling `reset()`, the next call to [`Source::read_batch`] will
+    /// return the first batch again, fulfilling the "rewindable" capability
+    /// advertised by [`Source::capabilities`].
+    pub fn reset(&mut self) -> Result<(), ConnectorError> {
+        self.cursor = 0;
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ParquetSink
 // ---------------------------------------------------------------------------
@@ -247,6 +259,56 @@ mod tests {
         assert!(!caps.is_unbounded());
         assert!(!caps.is_rewindable());
         assert!(!caps.is_transactional());
+    }
+
+    #[tokio::test]
+    async fn parquet_source_reset_restores_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rewind.parquet");
+
+        // Write a single batch with two rows.
+        let batch = make_batch(&[10, 20], &["foo", "bar"]);
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut source = ParquetSource::open(&path).unwrap();
+
+        // First read — should return the batch.
+        let first = source.read_batch().await.unwrap();
+        assert!(first.is_some(), "first read should return a batch");
+        let first_batch = first.unwrap();
+        assert_eq!(first_batch.num_rows(), 2);
+
+        // Source is now exhausted.
+        let exhausted = source.read_batch().await.unwrap();
+        assert!(exhausted.is_none(), "source should be exhausted");
+
+        // Reset and read again — should return the same batch.
+        source.reset().unwrap();
+        let after_reset = source.read_batch().await.unwrap();
+        assert!(after_reset.is_some(), "read after reset should return a batch");
+        let reset_batch = after_reset.unwrap();
+        assert_eq!(
+            reset_batch.num_rows(),
+            first_batch.num_rows(),
+            "batch after reset must have same row count as first read"
+        );
+
+        // Verify the data matches.
+        use arrow::array::Int32Array;
+        let orig_ids = first_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let reset_ids = reset_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(orig_ids.values(), reset_ids.values(), "data must match after reset");
     }
 
     #[tokio::test]

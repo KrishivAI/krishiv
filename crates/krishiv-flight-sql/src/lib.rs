@@ -226,6 +226,15 @@ impl FlightSqlService for KrishivFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        // Default deny: if auth is configured but no policy engine is set,
+        // operators who configure authentication expect policy enforcement too.
+        if self.auth.is_some() && self.policy.is_none() {
+            return Err(Status::permission_denied(
+                "auth is configured but no policy engine is set; \
+                 configure a PolicyHook or use an unauthenticated service",
+            ));
+        }
+
         // Authenticate if an auth provider is configured.
         self.authenticate_request(&request)?;
 
@@ -249,6 +258,15 @@ impl FlightSqlService for KrishivFlightSqlService {
         ticket: TicketStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        // Default deny: if auth is configured but no policy engine is set,
+        // operators who configure authentication expect policy enforcement too.
+        if self.auth.is_some() && self.policy.is_none() {
+            return Err(Status::permission_denied(
+                "auth is configured but no policy engine is set; \
+                 configure a PolicyHook or use an unauthenticated service",
+            ));
+        }
+
         // Authenticate if an auth provider is configured.
         let token = self.bearer_token(&request)?;
         let principal = self.authenticate_request(&request)?;
@@ -423,9 +441,60 @@ mod tests {
 
     // ── Auth tests ────────────────────────────────────────────────────────────
 
+    // GAP-GV-03: when auth is configured without a policy engine the service
+    // must return PermissionDenied before any token inspection.
+    #[tokio::test]
+    async fn auth_without_policy_is_denied() {
+        // Service with auth but no policy — default deny must fire.
+        let svc = make_auth_service();
+
+        // do_get_statement: no token
+        let ticket = TicketStatementQuery {
+            statement_handle: b"SELECT 1".to_vec().into(),
+        };
+        let result = svc
+            .do_get_statement(ticket, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_err(), "auth-without-policy must be denied");
+        assert_eq!(
+            result.err().unwrap().code(),
+            tonic::Code::PermissionDenied,
+            "auth-without-policy must return PermissionDenied"
+        );
+
+        // do_get_statement: valid token — still denied because no policy
+        let ticket2 = TicketStatementQuery {
+            statement_handle: b"SELECT 42".to_vec().into(),
+        };
+        let mut req2 = Request::new(Ticket::new(vec![]));
+        req2.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer secret-key"),
+        );
+        let result2 = svc.do_get_statement(ticket2, req2).await;
+        assert!(result2.is_err());
+        assert_eq!(result2.err().unwrap().code(), tonic::Code::PermissionDenied);
+
+        // get_flight_info_statement: valid token — still denied because no policy
+        let cmd = CommandStatementQuery {
+            query: "SELECT 1".to_string(),
+            transaction_id: None,
+        };
+        let descriptor = FlightDescriptor::new_cmd(vec![]);
+        let mut req3 = Request::new(descriptor);
+        req3.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer secret-key"),
+        );
+        let result3 = svc.get_flight_info_statement(cmd, req3).await;
+        assert!(result3.is_err());
+        assert_eq!(result3.err().unwrap().code(), tonic::Code::PermissionDenied);
+    }
+
+    // Auth enforcement tests use auth+policy (the complete, non-deny-default config).
     #[tokio::test]
     async fn auth_required_rejects_missing_token_on_get_flight_info() {
-        let svc = make_auth_service();
+        let svc = make_auth_policy_service();
         let cmd = CommandStatementQuery {
             query: "SELECT 1".to_string(),
             transaction_id: None,
@@ -441,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_rejects_invalid_token_on_get_flight_info() {
-        let svc = make_auth_service();
+        let svc = make_auth_policy_service();
         let cmd = CommandStatementQuery {
             query: "SELECT 1".to_string(),
             transaction_id: None,
@@ -459,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_accepts_valid_token_on_get_flight_info() {
-        let svc = make_auth_service();
+        let svc = make_auth_policy_service();
         let cmd = CommandStatementQuery {
             query: "SELECT 1".to_string(),
             transaction_id: None,
@@ -476,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_rejects_missing_token_on_do_get() {
-        let svc = make_auth_service();
+        let svc = make_auth_policy_service();
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT 1".to_vec().into(),
         };
@@ -490,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_rejects_invalid_token_on_do_get() {
-        let svc = make_auth_service();
+        let svc = make_auth_policy_service();
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT 1".to_vec().into(),
         };
@@ -506,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_required_accepts_valid_token_on_do_get() {
-        let svc = make_auth_service();
+        let svc = make_auth_policy_service();
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT 42 AS val".to_vec().into(),
         };
