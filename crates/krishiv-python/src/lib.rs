@@ -20,6 +20,7 @@ pub use batch::{make_example_batch, PyBatch};
 pub use errors::{
     AuthorizationError, CheckpointError, ConnectorError, KrishivError, ModeError, QueryError,
     SchemaError,
+    UdfError,
 };
 
 use pyo3::prelude::*;
@@ -61,6 +62,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(register_state_migration, m)?)?;
     m.add_function(wrap_pyfunction!(state_migration, m)?)?;
     m.add_function(wrap_pyfunction!(apply_state_migration, m)?)?;
+    m.add_function(wrap_pyfunction!(udf::udf, m)?)?;
 
     agg::register_agg_module(py, m)?;
     windows::register_windows_module(py, m)?;
@@ -116,5 +118,15 @@ mod tests {
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         let result = rt.block_on(call_python_udf(udf, batch));
         assert!(matches!(result, Err(krishiv_udf::UdfError::Panic(_))));
+    }
+
+    #[test]
+    fn session_scalar_udf_names_roundtrip() {
+        let session = krishiv_api::SessionBuilder::new().build().unwrap();
+        assert!(session.scalar_udf_names().is_empty());
+        session.register_scalar_udf(Arc::new(krishiv_udf::MultiplyScalarUdf::new(
+            "triple", "v", 3,
+        )));
+        assert_eq!(session.scalar_udf_names(), vec!["triple".to_string()]);
     }
 }

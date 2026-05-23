@@ -10,6 +10,7 @@ from .krishiv import (  # noqa: F401
     KafkaSink,
     KrishivError,
     ModeError,
+    UdfError,
     ParquetSink,
     QueryError,
     Schema,
@@ -25,6 +26,7 @@ from .krishiv import (  # noqa: F401
     read_iceberg,
     register_state_migration,
     state_migration,
+    udf,
 )
 
 from .krishiv import agg
@@ -47,6 +49,7 @@ __all__ = [
     "CheckpointError",
     "AuthorizationError",
     "ModeError",
+    "UdfError",
     "Session",
     "DataFrame",
     "Schema",
@@ -67,4 +70,5 @@ __all__ = [
     "connect_async",
     "agg",
     "windows",
+    "udf",
 ]
