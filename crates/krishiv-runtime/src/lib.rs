@@ -9,7 +9,10 @@
 use std::error::Error;
 use std::fmt;
 
+use krishiv_async_util::block_on;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
+
+mod flight_client;
 
 // tracing is used for debug-level plan delegation logging.
 use tracing::debug;
@@ -352,12 +355,8 @@ impl ExecutionBackend for SingleNodeBackend {
     }
 }
 
-/// Distributed backend that routes plan execution to a remote coordinator.
-///
-/// The `flight_url` is the Arrow Flight endpoint of the remote coordinator
-/// (e.g. `http://coordinator:50051`).  In the current release slice the
-/// transport is a stub that logs the submission and returns success; full
-/// gRPC dispatch lands in R13.
+/// Distributed backend that routes plan execution to a remote coordinator
+/// via Arrow Flight SQL (GAP-RT-01 / ADR-12.3).
 #[derive(Debug, Clone)]
 pub struct DistributedBackend {
     flight_url: String,
@@ -386,14 +385,51 @@ impl ExecutionBackend for DistributedBackend {
             coordinator = %self.flight_url,
             plan = %plan.name(),
             kind = %plan.kind(),
-            "DistributedBackend: forwarding plan to remote coordinator"
+            sql = %flight_client::plan_to_sql(plan),
+            "DistributedBackend: submitting plan via Flight SQL"
         );
+        block_on(flight_client::execute_remote_plan(&self.flight_url, plan))?;
         Ok(ExecutionReport::new(
             self.backend_name(),
             plan.name(),
             plan.kind(),
             true,
         ))
+    }
+}
+
+#[cfg(test)]
+mod distributed_flight_tests {
+    use std::net::SocketAddr;
+
+    use krishiv_flight_sql::make_flight_sql_server;
+    use krishiv_plan::{ExecutionKind, PhysicalPlan};
+    use tonic::transport::Server;
+
+    use super::{DistributedBackend, ExecutionBackend};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distributed_backend_submits_plan_over_flight_sql() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(make_flight_sql_server())
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+
+        let url = format!("http://{addr}");
+        let mut backend = DistributedBackend::new(url);
+        let plan = PhysicalPlan::new("SELECT 1 AS n", ExecutionKind::Batch);
+        let report = backend.execute(&plan).expect("execute");
+        assert!(report.accepted());
+        server.abort();
     }
 }
 

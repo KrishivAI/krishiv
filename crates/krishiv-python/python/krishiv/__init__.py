@@ -1,92 +1,119 @@
-"""Krishiv — hybrid batch and streaming compute engine.
+"""Krishiv — hybrid batch and streaming compute engine."""
 
-Pure-Python facade that re-exports the native extension and adds
-``connect_async`` for asyncio-first workflows.
-
-Usage::
-
-    import krishiv
-
-    # Embedded SQL
-    session = krishiv.Session.embedded()
-    df = session.sql("SELECT 1 AS n")
-    print(df.collect())
-
-    # Connect to a distributed coordinator
-    session = krishiv.Session.connect("http://coordinator:50051")
-
-    # Stream with tumbling windows
-    session = krishiv.Session.local()
-    stream = session.stream("events", watermark_column="ts", max_lateness_ms=5000)
-    windowed = stream.tumbling_window(60)
-    async for batch in windowed:
-        process(batch)
-"""
-
-from .krishiv import (  # noqa: F401 — re-export native extension symbols
-    # Exception hierarchy
-    KrishivError,
-    QueryError,
-    SchemaError,
-    ConnectorError,
-    CheckpointError,
+from .krishiv import (
     AuthorizationError,
-    ModeError,
-    # Core types
-    Session,
+    Batch,
+    CheckpointError,
+    ConnectorError,
     DataFrame,
+    IcebergSink,
+    KafkaSink,
+    KeyedStream,
+    KrishivError,
+    ModeError,
+    ParquetSink,
+    QueryError,
+    Schema,
+    SchemaError,
+    Session,
     Stream,
     WindowedStream,
-    Batch,
-    # Sinks
-    ParquetSink,
-    KafkaSink,
-    IcebergSink,
-    # Module-level functions
-    read_parquet,
     read_kafka,
+    read_iceberg,
+    read_parquet,
 )
 
 import asyncio as _asyncio
 
 
-async def connect_async(url: str) -> "Session":
-    """Open a distributed session to ``url`` without blocking the event loop.
+class _Windows:
+    @staticmethod
+    def tumbling(size_ms: int) -> tuple[str, int]:
+        return ("tumbling", size_ms)
 
-    This coroutine runs the session builder on a thread-pool executor so the
-    asyncio event loop is never blocked during connection setup.
+    @staticmethod
+    def sliding(size_ms: int, slide_ms: int) -> tuple[str, int, int]:
+        return ("sliding", size_ms, slide_ms)
 
-    Args:
-        url: Coordinator Arrow Flight endpoint, e.g. ``http://coordinator:50051``.
+    @staticmethod
+    def session(gap_ms: int) -> tuple[str, int]:
+        return ("session", gap_ms)
 
-    Returns:
-        A :class:`Session` in distributed mode.
-    """
+
+windows = _Windows()
+
+
+class _Agg:
+    @staticmethod
+    def sum(column: str) -> tuple[str, str]:
+        return ("sum", column)
+
+    @staticmethod
+    def count() -> tuple[str, None]:
+        return ("count", None)
+
+    @staticmethod
+    def max(column: str) -> tuple[str, str]:
+        return ("max", column)
+
+    @staticmethod
+    def min(column: str) -> tuple[str, str]:
+        return ("min", column)
+
+    @staticmethod
+    def mean(column: str) -> tuple[str, str]:
+        return ("mean", column)
+
+
+agg = _Agg()
+
+
+class _Sinks:
+    @staticmethod
+    def parquet(path: str, partition_by: str | None = None) -> ParquetSink:
+        return ParquetSink(path)
+
+    @staticmethod
+    def kafka(bootstrap_servers: str, topic: str) -> KafkaSink:
+        return KafkaSink(topic, bootstrap_servers)
+
+    @staticmethod
+    def iceberg(catalog_uri: str, table_name: str) -> IcebergSink:
+        return IcebergSink(catalog_uri, table_name)
+
+
+sinks = _Sinks()
+
+
+async def connect_async(url: str) -> Session:
+    """Connect to a remote coordinator without blocking the asyncio loop."""
     loop = _asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: Session.connect(url))
 
 
 __all__ = [
-    # Exceptions
-    "KrishivError",
-    "QueryError",
-    "SchemaError",
-    "ConnectorError",
-    "CheckpointError",
     "AuthorizationError",
-    "ModeError",
-    # Core types
-    "Session",
+    "Batch",
+    "CheckpointError",
+    "ConnectorError",
     "DataFrame",
+    "IcebergSink",
+    "KafkaSink",
+    "KeyedStream",
+    "KrishivError",
+    "ModeError",
+    "ParquetSink",
+    "QueryError",
+    "Schema",
+    "SchemaError",
+    "Session",
     "Stream",
     "WindowedStream",
-    "Batch",
-    # Sinks
-    "ParquetSink",
-    "KafkaSink",
-    "IcebergSink",
-    # Functions
-    "read_parquet",
-    "read_kafka",
+    "agg",
     "connect_async",
+    "read_kafka",
+    "read_iceberg",
+    "read_parquet",
+    "sinks",
+    "windows",
 ]

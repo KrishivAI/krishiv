@@ -7,7 +7,15 @@ license.workspace = true
 
 [dependencies]
 krishiv-plan = { path = "../krishiv-plan" }
+krishiv-async-util = { path = "../krishiv-async-util" }
+arrow-flight = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+krishiv-flight-sql = { path = "../krishiv-flight-sql" }
+tokio = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

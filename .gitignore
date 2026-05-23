@@ -1,3 +1,11 @@
 /target/
 /.DS_Store
 /.claude/worktrees/
+**/krishiv*.so
+
+# Python build artifacts
+crates/krishiv-python/.venv/
+crates/krishiv-python/dist/
+**/__pycache__/
+*.pyc
+

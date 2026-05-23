@@ -26,6 +26,14 @@ pyo3::create_exception!(krishiv, CheckpointError, KrishivError);
 pyo3::create_exception!(krishiv, AuthorizationError, KrishivError);
 pyo3::create_exception!(krishiv, ModeError, KrishivError);
 
+mod batch;
+mod schema;
+mod stream;
+
+pub use batch::PyBatch;
+pub use schema::PySchema;
+pub use stream::{PyKeyedStream, PyStream, PyWindowedStream};
+
 // ---------------------------------------------------------------------------
 // Embedded Tokio runtime — module-private
 // ---------------------------------------------------------------------------
@@ -101,23 +109,26 @@ impl PySession {
     /// Reads `KRISHIV_MODE` (`embedded` | `local` | `distributed`) and
     /// `KRISHIV_COORDINATOR_URL` for the coordinator endpoint.
     #[classmethod]
-    pub fn from_env(_cls: &Bound<'_, pyo3::types::PyType>) -> PyResult<Self> {
+    pub fn from_env(cls: &Bound<'_, pyo3::types::PyType>) -> PyResult<Self> {
+        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR")
+            && !url.is_empty()
+        {
+            return Self::connect(cls, url);
+        }
+        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL")
+            && !url.is_empty()
+        {
+            return Self::connect(cls, url);
+        }
         let mode = std::env::var("KRISHIV_MODE").unwrap_or_default();
-        let coordinator_url = std::env::var("KRISHIV_COORDINATOR_URL").ok();
-
         let builder = krishiv_api::SessionBuilder::new();
         let builder = match mode.to_lowercase().as_str() {
-            "local" | "single-node" => {
+            "embedded" => builder,
+            "distributed" => builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed),
+            "local" | "single-node" | "" => {
                 builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
             }
-            "distributed" => {
-                if let Some(url) = coordinator_url {
-                    builder.with_coordinator(url)
-                } else {
-                    builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed)
-                }
-            }
-            _ => builder, // embedded
+            _ => builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode),
         };
         builder
             .build()
@@ -196,6 +207,7 @@ impl PySession {
             query,
             watermark_column,
             max_lateness_ms,
+            key_columns: Vec::new(),
         })
     }
 }
@@ -238,144 +250,6 @@ impl PyDataFrame {
 
     pub fn __repr__(&self) -> String {
         "DataFrame(<pending>)".to_string()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PyStream
-// ---------------------------------------------------------------------------
-
-/// **Beta API**: A streaming source handle produced by `Session.stream()`.
-///
-/// Call `watermark(column, max_lateness_ms)` to declare the event-time watermark,
-/// then chain window operations.
-#[pyclass(name = "Stream")]
-pub struct PyStream {
-    session: Arc<krishiv_api::Session>,
-    query: String,
-    watermark_column: String,
-    max_lateness_ms: u64,
-}
-
-#[pymethods]
-impl PyStream {
-    /// Set or override the watermark column and late-arrival tolerance.
-    pub fn watermark(
-        &self,
-        column: String,
-        max_lateness_ms: u64,
-    ) -> PyResult<PyWindowedStream> {
-        Ok(PyWindowedStream {
-            session: self.session.clone(),
-            query: self.query.clone(),
-            watermark_column: column,
-            max_lateness_ms,
-            window_secs: None,
-        })
-    }
-
-    /// Apply a tumbling window and return an async-iterable result stream.
-    ///
-    /// `window_secs` is the window duration in seconds.
-    pub fn tumbling_window(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
-        Ok(PyWindowedStream {
-            session: self.session.clone(),
-            query: self.query.clone(),
-            watermark_column: self.watermark_column.clone(),
-            max_lateness_ms: self.max_lateness_ms,
-            window_secs: Some(window_secs),
-        })
-    }
-
-    pub fn __repr__(&self) -> String {
-        format!("Stream(query={:?}, watermark={})", self.query, self.watermark_column)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PyWindowedStream
-// ---------------------------------------------------------------------------
-
-/// **Beta API**: A windowed stream that is async-iterable from Python.
-///
-/// Yields batches from each completed window.  Use `async for batch in stream:`.
-#[pyclass(name = "WindowedStream")]
-pub struct PyWindowedStream {
-    session: Arc<krishiv_api::Session>,
-    query: String,
-    watermark_column: String,
-    max_lateness_ms: u64,
-    window_secs: Option<u64>,
-}
-
-#[pymethods]
-impl PyWindowedStream {
-    /// Apply a tumbling window of `window_secs` seconds.
-    pub fn tumbling_window(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
-        Ok(PyWindowedStream {
-            session: self.session.clone(),
-            query: self.query.clone(),
-            watermark_column: self.watermark_column.clone(),
-            max_lateness_ms: self.max_lateness_ms,
-            window_secs: Some(window_secs),
-        })
-    }
-
-    /// Collect all batches currently available in a bounded stream.
-    ///
-    /// Returns an empty list for unbounded sources (async consumption via __anext__).
-    pub fn collect(&self, _py: Python<'_>) -> PyResult<Vec<PyBatch>> {
-        Ok(vec![])
-    }
-
-    /// Async iterator support — makes `async for batch in stream` work.
-    pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    /// Return the next batch or raise `StopAsyncIteration`.
-    ///
-    /// The GIL is released while polling for the next window result.
-    pub fn __anext__(&self, _py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
-        // R14 will wire a real async receiver from the executor streaming loop.
-        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
-    }
-
-    pub fn __repr__(&self) -> String {
-        format!(
-            "WindowedStream(watermark={}, window={:?}s)",
-            self.watermark_column, self.window_secs
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PyBatch — Arrow IPC batch handle
-// ---------------------------------------------------------------------------
-
-/// **Beta API**: One record batch result from a query or stream window.
-#[pyclass(name = "Batch")]
-pub struct PyBatch {
-    num_rows: usize,
-    num_columns: usize,
-}
-
-#[pymethods]
-impl PyBatch {
-    /// Number of rows in this batch.
-    #[getter]
-    pub fn num_rows(&self) -> usize {
-        self.num_rows
-    }
-
-    /// Number of columns in this batch.
-    #[getter]
-    pub fn num_columns(&self) -> usize {
-        self.num_columns
-    }
-
-    pub fn __repr__(&self) -> String {
-        format!("Batch(rows={}, columns={})", self.num_rows, self.num_columns)
     }
 }
 
@@ -490,11 +364,31 @@ pub fn read_parquet(py: Python<'_>, path: String) -> PyResult<PyDataFrame> {
     })
 }
 
+/// Open an Iceberg table as a streaming `Stream`.
+#[pyfunction]
+pub fn read_iceberg(
+    session: &PySession,
+    catalog_uri: String,
+    table_name: String,
+) -> PyResult<PyStream> {
+    if matches!(session.inner.mode(), krishiv_api::ExecutionMode::Embedded) {
+        return Err(ModeError::new_err(
+            "read_iceberg() requires a non-embedded session; use Session.local() or Session.connect(url) to enable streaming",
+        ));
+    }
+    Ok(PyStream {
+        session: session.inner.clone(),
+        query: format!("iceberg:{catalog_uri}:{table_name}"),
+        watermark_column: String::new(),
+        max_lateness_ms: 0,
+        key_columns: Vec::new(),
+    })
+}
+
 /// Open a Kafka topic as a streaming `Stream`.
 ///
 /// `topic` is the Kafka topic name.  `bootstrap_servers` is the broker list
-/// (e.g. `"localhost:9092"`).  Returns a `Stream` handle; call `watermark()`
-/// and `tumbling_window()` to declare windows.
+/// (e.g. `"localhost:9092"`).  Returns a `Stream` handle.
 #[pyfunction]
 pub fn read_kafka(
     session: &PySession,
@@ -512,6 +406,7 @@ pub fn read_kafka(
         query: format!("kafka:{topic}:{bootstrap_servers}"),
         watermark_column: String::new(),
         max_lateness_ms: 0,
+        key_columns: Vec::new(),
     })
 }
 
@@ -723,6 +618,9 @@ pub async fn call_python_udf(
 /// Python module `krishiv` — exposes all public types and functions.
 #[pymodule]
 fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let mut tokio_builder = tokio::runtime::Builder::new_multi_thread();
+    tokio_builder.enable_all();
+    pyo3_async_runtimes::tokio::init(tokio_builder);
     // Exception hierarchy
     m.add("KrishivError", m.py().get_type::<KrishivError>())?;
     m.add("QueryError", m.py().get_type::<QueryError>())?;
@@ -735,9 +633,11 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Session and DataFrame
     m.add_class::<PySession>()?;
     m.add_class::<PyDataFrame>()?;
+    m.add_class::<PySchema>()?;
 
     // Streaming types
     m.add_class::<PyStream>()?;
+    m.add_class::<PyKeyedStream>()?;
     m.add_class::<PyWindowedStream>()?;
     m.add_class::<PyBatch>()?;
 
@@ -749,6 +649,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Module-level functions
     m.add_function(wrap_pyfunction!(read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(read_kafka, m)?)?;
+    m.add_function(wrap_pyfunction!(read_iceberg, m)?)?;
 
     Ok(())
 }
@@ -760,8 +661,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::Schema;
-    use arrow::record_batch::RecordBatch;
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use krishiv_udf::ScalarUdf;
 
     #[test]
@@ -801,6 +702,12 @@ mod tests {
 
     #[test]
     fn call_python_udf_panic_becomes_udf_error() {
+        static EMPTY_SCHEMA: std::sync::LazyLock<Schema> =
+            std::sync::LazyLock::new(Schema::empty);
+        static OUT_FIELD: std::sync::LazyLock<Field> = std::sync::LazyLock::new(|| {
+            Field::new("out", DataType::Int64, true)
+        });
+
         #[derive(Debug)]
         struct PanicUdf;
 
@@ -809,10 +716,10 @@ mod tests {
                 "panic"
             }
             fn input_schema(&self) -> &Schema {
-                todo!()
+                &EMPTY_SCHEMA
             }
             fn output_field(&self) -> &Field {
-                todo!()
+                &OUT_FIELD
             }
             fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
                 panic!("intentional panic from test")
