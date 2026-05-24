@@ -2273,6 +2273,8 @@ mod tests {
 // the full gRPC/Flight service trait implementation. The `arrow-flight` crate is
 // retained as a dependency for future upgrade to the full Flight protocol.
 
+pub mod shuffle_svc;
+
 pub mod flight {
     use std::io;
     use std::net::SocketAddr;

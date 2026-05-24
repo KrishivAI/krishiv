@@ -139,8 +139,17 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["help", "checkpoints"] => CliResponse::ok(checkpoints_help()),
         ["help", "compat"] => CliResponse::ok(compat_help()),
         ["help", "local"] => CliResponse::ok(crate::local_cluster::local_help()),
+        ["help", "daemons"] | ["help", "daemon"] => crate::daemon_cmd::help_daemons(),
         ["local", rest @ ..] => crate::local_cluster::run_local(rest),
         ["cluster", rest @ ..] => crate::cluster_cmd::run_cluster(rest),
+        ["coordinator", ..] | ["clusterd", ..] | ["executor", ..] | ["job-coordinator", ..]
+        | ["flight-server", ..] | ["shuffle-svc", ..] => CliResponse::err(
+            format!(
+                "daemon commands must run via the krishiv binary entrypoint\n\n{}",
+                crate::daemon_cmd::daemons_help()
+            ),
+            2,
+        ),
         ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
@@ -175,7 +184,13 @@ pub fn main_help() -> String {
            compat       PySpark migration compatibility tools (R15)\n\
            local        Start/stop/status a Spark-like local cluster\n\
            cluster      Start/stop/status bare-metal clusterd + executors\n\
-           help         Show help for a command\n\
+           coordinator  Run active coordinator (distributed)\n\
+           clusterd     Run cluster control plane (CCP)\n\
+           job-coordinator  Run per-job coordinator (JCP)\n\
+           executor     Run data-plane executor worker\n\
+           flight-server  Run Arrow Flight SQL endpoint\n\
+           shuffle-svc  Run optional shuffle HTTP service\n\
+           help         Show help for a command (try: krishiv help daemons)\n\
          \n\
          Options:\n\
            -c, --coordinator <URL>  Remote coordinator URL (or set KRISHIV_COORDINATOR)\n\
