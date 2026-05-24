@@ -20,12 +20,12 @@ Krishiv's distributed mode supports two deployment targets. The core runtime —
 
 ### How It Works
 
-The Krishiv Kubernetes operator watches `KrishivJob` CRDs. When a job is submitted, the operator:
-1. Creates a coordinator pod with the job spec.
-2. Creates executor pods (count from job spec).
-3. Executors register with coordinator via gRPC on startup.
-4. Coordinator assigns tasks; executors run them.
-5. On completion, operator finalizer cleans up pods and shuffle artifacts.
+The Krishiv Kubernetes operator (cluster control plane) watches `KrishivJob` CRDs. When a job is submitted:
+1. The CCP reconciles the job into the shared coordinator and executor pool.
+2. When `spec.dedicatedCoordinator` is true, a per-job orchestration loop ([`JobCoordinator`](../../crates/krishiv-scheduler/src/job_coordinator.rs)) drives task launch for that job.
+3. Executors (static pool Deployment) register with the CCP via gRPC.
+4. Optional: a dedicated `krishiv-job-coordinator` process can share durable metadata on bare metal (see `krishiv-job-coordinator` binary).
+5. On delete, the finalizer cancels the scheduler job; shuffle GC runs on the CCP tick loop.
 
 ### Setup
 

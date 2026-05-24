@@ -310,6 +310,13 @@ impl SessionBuilder {
         self
     }
 
+    /// gRPC coordinator address (control plane), separate from the Flight SQL URL.
+    #[must_use]
+    pub fn with_coordinator_grpc(mut self, url: impl Into<String>) -> Self {
+        self.local_cluster_grpc = Some(url.into());
+        self
+    }
+
     /// Attach streaming operator state TTL (wired to `krishiv-state` backends).
     #[must_use]
     pub fn with_state_ttl(mut self, ttl: StateTtlConfig) -> Self {
@@ -584,6 +591,65 @@ impl Session {
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Execute SQL on the local `SqlEngine` only (embedded / single-node path).
+    ///
+    /// Never routes to a remote Flight endpoint, even in distributed mode.
+    pub fn execute_local(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        block_on(self.execute_local_async(query))
+    }
+
+    /// Async variant of [`Self::execute_local`].
+    pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        if self.policy_engine.is_some() {
+            return Err(KrishivError::AccessDenied {
+                reason: "session has a policy engine configured; use sql_as() for authorized execution".into(),
+            });
+        }
+        let sql_dataframe = self.sql_engine.sql(query.as_ref()).await?;
+        Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Execute SQL through the session [`ExecutionRuntime`] (remote when configured).
+    pub fn execute_remote(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        block_on(self.execute_remote_async(query))
+    }
+
+    /// Async variant of [`Self::execute_remote`].
+    pub async fn execute_remote_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
+        if self.coordinator_url.is_none() {
+            return Err(KrishivError::unsupported(
+                "execute_remote requires SessionBuilder::with_coordinator(flight_url)",
+            ));
+        }
+        if self.mode == ExecutionMode::Embedded {
+            return Err(KrishivError::unsupported(
+                "execute_remote is not valid in embedded mode; use execute_local",
+            ));
+        }
+        if self.mode == ExecutionMode::Distributed && !self.runtime.uses_remote_execution() {
+            return Err(KrishivError::unsupported(
+                "distributed remote execution requires SessionBuilder::with_remote_execution(true)",
+            ));
+        }
+        let query = query.as_ref();
+        let tables = self
+            .registered_parquet
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+            .collect::<Vec<_>>();
+        let batches = runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables).await?;
+        Ok(DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        ))
     }
 
     /// Execute SQL authenticated as the principal identified by `api_key`.

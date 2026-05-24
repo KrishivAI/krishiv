@@ -88,14 +88,25 @@ pub enum TaskUpdateOutcome {
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod admission;
 pub mod checkpoint;
+pub mod cluster_control;
+pub mod coordinator_daemon;
 pub mod heartbeat;
 pub mod in_process;
 pub mod job;
+pub mod job_coordinator;
 pub mod llm_quota;
+pub mod transport;
 
+pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
+pub use coordinator_daemon::{
+    CoordinatorDaemonConfig, build_shared_coordinator, coordinator_http_router,
+    run_cluster_control_plane, spawn_coordinator_sidecars,
+};
 pub use in_process::{
     InProcessCoordinatorBridge, IN_PROCESS_TASK_ENDPOINT, is_in_process_task_endpoint,
 };
+pub use job_coordinator::JobCoordinator;
+pub use transport::CoordinatorExecutorTransport;
 pub(crate) mod store;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
@@ -1759,6 +1770,36 @@ impl Coordinator {
     pub fn persist_jobs_to_store(&self, store: &mut dyn MetadataStore) -> SchedulerResult<()> {
         for record in self.jobs.values() {
             store.save_job(record)?;
+        }
+        Ok(())
+    }
+
+    /// Reload one job record from the attached metadata store into memory.
+    ///
+    /// Used by per-job coordinator processes that share a durable metadata file
+    /// with the cluster control plane (ADR-DIST-01).
+    pub fn sync_job_from_metadata_store(&mut self, job_id: &JobId) -> SchedulerResult<()> {
+        let store = self.store.as_ref().ok_or_else(|| SchedulerError::Transport {
+            message: "coordinator has no metadata store".to_string(),
+        })?;
+        let record = {
+            let guard = store
+                .lock()
+                .map_err(|_| SchedulerError::Transport {
+                    message: "metadata store lock poisoned".to_string(),
+                })?;
+            guard
+                .jobs()
+                .iter()
+                .find(|j| j.job_id() == job_id)
+                .cloned()
+        };
+        if let Some(record) = record {
+            let streaming = record.spec.kind() == JobKind::Streaming;
+            self.jobs.insert(job_id.clone(), record);
+            if streaming {
+                self.index_streaming_tasks(job_id);
+            }
         }
         Ok(())
     }

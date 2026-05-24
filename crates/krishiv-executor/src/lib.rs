@@ -95,10 +95,19 @@ impl ExecutionModel {
     /// Everything else is treated as batch (existing behaviour is preserved).
     pub fn from_fragment(fragment: &str) -> Self {
         if fragment.starts_with("stream:") {
-            Self::Streaming
-        } else {
-            Self::Batch
+            return Self::Streaming;
         }
+        if let Some(op) = krishiv_plan::decode_task_fragment(fragment) {
+            return match op {
+                krishiv_plan::NodeOp::TumblingWindow { .. }
+                | krishiv_plan::NodeOp::SlidingWindow { .. }
+                | krishiv_plan::NodeOp::SessionWindow { .. }
+                | krishiv_plan::NodeOp::StreamSource { .. }
+                | krishiv_plan::NodeOp::Watermark { .. } => Self::Streaming,
+                _ => Self::Batch,
+            };
+        }
+        Self::Batch
     }
 }
 

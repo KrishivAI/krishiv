@@ -1111,15 +1111,5 @@ fn job_spec_from_plan_parts(
 }
 
 fn plan_node_description(node: &PlanNode) -> String {
-    if node.inputs().is_empty() {
-        format!("{} [{}] {}", node.id(), node.kind(), node.label())
-    } else {
-        format!(
-            "{} [{}] {} <- {}",
-            node.id(),
-            node.kind(),
-            node.label(),
-            node.inputs().join(", ")
-        )
-    }
+    krishiv_plan::encode_task_fragment(node)
 }
