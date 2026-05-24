@@ -44,7 +44,7 @@
 
   <g transform="translate(300 0)">
     <text x="0" y="132" fill="url(#word)" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="72" font-weight="760" letter-spacing="0">Krishiv</text>
-    <text x="4" y="174" fill="#AAB7CF" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="520" letter-spacing="0">Rust-native hybrid compute</text>
+    <text x="4" y="174" fill="#AAB7CF" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="520" letter-spacing="0">Unified runtime for queries, streams, and AI pipelines</text>
 
     <g transform="translate(416 92)">
       <rect x="0" y="0" width="152" height="34" rx="17" fill="#111827" stroke="#24324A"/>
