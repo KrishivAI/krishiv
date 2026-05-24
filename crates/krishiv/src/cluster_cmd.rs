@@ -2,11 +2,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use crate::cli::CliResponse;
+use crate::process_util::spawn_krishiv_daemon;
 
 const DEFAULT_CLUSTER_DIR: &str = ".krishiv/cluster";
 
@@ -100,40 +101,41 @@ fn cluster_start(args: &[&str]) -> CliResponse {
     };
     fs::create_dir_all(&data_dir).ok();
     let metadata_path = data_dir.join("metadata.json");
-    let clusterd = Command::new("krishiv-clusterd")
-        .args([
+    let meta = metadata_path.to_str().unwrap_or("/tmp/krishiv-metadata.json");
+    let clusterd_pid = spawn_krishiv_daemon(
+        "clusterd",
+        &[
             "--grpc-addr",
             "127.0.0.1:9090",
             "--metadata-backend",
             "json",
             "--metadata-path",
-            metadata_path.to_str().unwrap_or("/tmp/krishiv-metadata.json"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let clusterd_pid = clusterd.ok().map(|c| c.id());
+            meta,
+        ],
+    )
+    .ok();
     let mut executor_pids = Vec::new();
     for i in 0..executor_count {
         let port = 50055u16 + i as u16;
         let barrier_port = 50056u16 + i as u16;
-        let child = Command::new("krishiv-executor")
-            .args([
+        let task_addr = format!("127.0.0.1:{port}");
+        let barrier_addr = format!("127.0.0.0:{barrier_port}");
+        let exec_id = format!("exec-{i}");
+        if let Ok(pid) = spawn_krishiv_daemon(
+            "executor",
+            &[
                 "--connect",
                 "--executor-id",
-                &format!("exec-{i}"),
+                &exec_id,
                 "--coordinator",
                 "http://127.0.0.1:9090",
                 "--task-grpc-addr",
-                &format!("127.0.0.1:{port}"),
+                &task_addr,
                 "--barrier-grpc-addr",
-                &format!("127.0.0.0:{barrier_port}"),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        if let Ok(c) = child {
-            executor_pids.push(c.id());
+                &barrier_addr,
+            ],
+        ) {
+            executor_pids.push(pid);
         }
     }
     let cfg = ClusterConfig {

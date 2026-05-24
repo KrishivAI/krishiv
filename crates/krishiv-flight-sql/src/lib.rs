@@ -359,6 +359,26 @@ pub fn make_flight_sql_server()
     )
 }
 
+/// Run the Arrow Flight SQL server (env `KRISHIV_FLIGHT_ADDR`, default `127.0.0.1:50051`).
+pub async fn run_flight_server_from_env() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr: std::net::SocketAddr = std::env::var("KRISHIV_FLIGHT_ADDR")
+        .unwrap_or_else(|_| String::from("127.0.0.1:50051"))
+        .parse()?;
+    run_flight_server(addr).await
+}
+
+/// Run the Arrow Flight SQL server on `addr`.
+pub async fn run_flight_server(
+    addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("krishiv-flight-server listening on http://{addr}");
+    tonic::transport::Server::builder()
+        .add_service(make_flight_sql_server())
+        .serve(addr)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

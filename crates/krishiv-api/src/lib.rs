@@ -17,7 +17,7 @@ use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
-    build_execution_runtime, BatchTableRegistration, ExecutionRuntime, InProcessCluster, JobId,
+    build_execution_runtime, BatchTableRegistration, ExecutionRuntime, JobId,
     JobState, RuntimeMode,
 };
 use krishiv_sql::{SqlDataFrame, SqlEngine};
@@ -28,8 +28,8 @@ pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_exec::{AggExpr, AggFunction};
 pub use krishiv_runtime::{
-    ClusterEndpoints, InProcessStreamingRuntime, LocalWindowExecutionSpec, LocalWindowKind,
-    execute_windowed_stream, is_streaming_plan,
+    ClusterEndpoints, InProcessCluster, InProcessStreamingRuntime, LocalWindowExecutionSpec,
+    LocalWindowKind, execute_windowed_stream, is_streaming_plan,
 };
 pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
 pub use krishiv_state::TtlConfig;
@@ -194,6 +194,8 @@ pub struct SessionBuilder {
     state_ttl: Option<StateTtlConfig>,
     /// When true, route data-plane work to the remote Flight endpoint (no local fallback).
     remote_execution: bool,
+    /// Reuse an existing in-process cluster (continuous stream registry, coordinator bridge).
+    in_process_cluster: Option<Arc<InProcessCluster>>,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -206,6 +208,10 @@ impl fmt::Debug for SessionBuilder {
             .field("local_cluster_grpc", &self.local_cluster_grpc)
             .field("state_ttl", &self.state_ttl)
             .field("remote_execution", &self.remote_execution)
+            .field(
+                "in_process_cluster",
+                &self.in_process_cluster.as_ref().map(|_| "<InProcessCluster>"),
+            )
             .finish()
     }
 }
@@ -220,6 +226,7 @@ impl Default for SessionBuilder {
             local_cluster_grpc: None,
             state_ttl: None,
             remote_execution: remote_execution_from_env(),
+            in_process_cluster: None,
         }
     }
 }
@@ -324,6 +331,13 @@ impl SessionBuilder {
         self
     }
 
+    /// Reuse an existing [`InProcessCluster`] (shared continuous stream registry).
+    #[must_use]
+    pub fn with_in_process_cluster(mut self, cluster: Arc<InProcessCluster>) -> Self {
+        self.in_process_cluster = Some(cluster);
+        self
+    }
+
     /// Build a session.
     pub fn build(self) -> Result<Session> {
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
@@ -336,11 +350,12 @@ impl SessionBuilder {
             )),
             _ => None,
         };
-        let local_cluster = Arc::new(
-            InProcessCluster::new().map_err(|e| KrishivError::Runtime {
+        let local_cluster = match self.in_process_cluster {
+            Some(cluster) => cluster,
+            None => Arc::new(InProcessCluster::new().map_err(|e| KrishivError::Runtime {
                 message: e.to_string(),
-            })?,
-        );
+            })?),
+        };
         let runtime = build_execution_runtime(
             execution_mode_to_runtime_mode(self.mode),
             Arc::clone(&local_cluster),

@@ -1,5 +1,6 @@
 //! Shared coordinator / clusterd startup (bare metal + VM).
 
+use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,10 +18,12 @@ use tokio::time::{Duration, interval};
 
 use crate::{
     ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore,
-    SharedCoordinator, StabilityMetrics, serve_coordinator_executor_grpc_with_listener,
+    JobCoordinator, SharedCoordinator, StabilityMetrics,
+    serve_coordinator_executor_grpc_with_listener,
 };
 #[cfg(feature = "sqlite")]
 use crate::SqliteMetadataStore;
+use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,4 +237,257 @@ krishiv_max_executor_heartbeat_age_ticks {hb_age}
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+/// Parse coordinator-family daemon flags (`krishiv-coordinator`, `krishiv-clusterd`, `krishiv clusterd`, …).
+pub fn parse_coordinator_daemon_config(
+    args: impl IntoIterator<Item = String>,
+) -> Result<CoordinatorDaemonConfig, Box<dyn Error>> {
+    let mut config = CoordinatorDaemonConfig {
+        coordinator_id: env::var("KRISHIV_COORDINATOR_ID")
+            .unwrap_or_else(|_| String::from("coord-local")),
+        grpc_addr: env::var("KRISHIV_GRPC_ADDR")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| "0.0.0.0:9090".parse().unwrap()),
+        http_addr: env::var("KRISHIV_HTTP_ADDR")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
+        metadata_backend: env::var("KRISHIV_METADATA_BACKEND").ok(),
+        metadata_path: env::var("KRISHIV_METADATA_PATH").ok().map(PathBuf::from),
+        help: false,
+    };
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--coordinator-id" => {
+                config.coordinator_id = next_daemon_arg(&mut args, "--coordinator-id")?;
+            }
+            "--grpc-addr" => {
+                let value = next_daemon_arg(&mut args, "--grpc-addr")?;
+                config.grpc_addr = value
+                    .parse()
+                    .map_err(|_| format!("invalid socket address for --grpc-addr: {value}"))?;
+            }
+            "--http-addr" => {
+                let value = next_daemon_arg(&mut args, "--http-addr")?;
+                config.http_addr = Some(value.parse().map_err(|_| {
+                    format!("invalid socket address for --http-addr: {value}")
+                })?);
+            }
+            "--shuffle-dir" => {
+                config.shuffle_dir =
+                    Some(PathBuf::from(next_daemon_arg(&mut args, "--shuffle-dir")?));
+            }
+            "--metadata-backend" => {
+                config.metadata_backend = Some(next_daemon_arg(&mut args, "--metadata-backend")?);
+            }
+            "--metadata-path" => {
+                config.metadata_path =
+                    Some(PathBuf::from(next_daemon_arg(&mut args, "--metadata-path")?));
+            }
+            "--help" | "-h" => config.help = true,
+            unknown => {
+                return Err(format!("unknown option: {unknown}\n\n{}", coordinator_daemon_help()).into());
+            }
+        }
+    }
+    if config.coordinator_id.trim().is_empty() {
+        return Err("coordinator id cannot be empty".into());
+    }
+    Ok(config)
+}
+
+fn next_daemon_arg(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<String, Box<dyn Error>> {
+    args.next()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("missing value for {flag}").into())
+}
+
+/// Help text for coordinator-family daemons.
+pub fn coordinator_daemon_help() -> &'static str {
+    "Run a Krishiv coordinator or cluster control plane.\n\
+     \n\
+     Usage:\n\
+       krishiv coordinator [OPTIONS]\n\
+       krishiv clusterd [OPTIONS]\n\
+     \n\
+     Options:\n\
+       --coordinator-id <ID>     Coordinator id (KRISHIV_COORDINATOR_ID, default coord-local)\n\
+       --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:9090)\n\
+       --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
+       --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
+       --metadata-backend <TYPE>   memory | json | sqlite\n\
+       --metadata-path <PATH>      Durable metadata path (required for json/sqlite)\n\
+       -h, --help                  Show help\n"
+}
+
+/// Standalone active coordinator (bare metal / VM).
+pub async fn run_standalone_coordinator(
+    config: CoordinatorDaemonConfig,
+) -> Result<(), Box<dyn Error>> {
+    let coordinator = build_shared_coordinator(&config)?;
+    spawn_coordinator_sidecars(&coordinator, &config).await?;
+    let listener = TcpListener::bind(config.grpc_addr).await?;
+    println!(
+        "Krishiv coordinator {} gRPC listening on {}",
+        config.coordinator_id,
+        listener.local_addr()?
+    );
+    serve_coordinator_executor_grpc_with_listener(listener, coordinator).await?;
+    Ok(())
+}
+
+/// Cluster control plane daemon (`krishiv-clusterd`).
+pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
+    let shared = build_shared_coordinator(&config)?;
+    let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
+        .map_err(|error| format!("invalid coordinator id: {error}"))?;
+    let ccp = Arc::new(ClusterControlPlane::from_shared(coordinator_id, shared.clone()));
+    spawn_coordinator_sidecars(&shared, &config).await?;
+    let listener = TcpListener::bind(config.grpc_addr).await?;
+    println!(
+        "Krishiv clusterd (CCP) {} gRPC listening on {}",
+        config.coordinator_id,
+        listener.local_addr()?
+    );
+    run_cluster_control_plane(ccp, listener).await
+}
+
+/// Per-job coordinator process configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCoordinatorDaemonConfig {
+    pub job_id: String,
+    pub metadata_path: PathBuf,
+    pub help: bool,
+}
+
+/// Parse `krishiv job-coordinator` flags.
+pub fn parse_job_coordinator_daemon_config(
+    args: impl IntoIterator<Item = String>,
+) -> Result<JobCoordinatorDaemonConfig, Box<dyn Error>> {
+    let mut config = JobCoordinatorDaemonConfig {
+        job_id: String::new(),
+        metadata_path: PathBuf::new(),
+        help: false,
+    };
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--job-id" => config.job_id = next_daemon_arg(&mut args, "--job-id")?,
+            "--metadata-path" => {
+                config.metadata_path = PathBuf::from(next_daemon_arg(&mut args, "--metadata-path")?);
+            }
+            "--help" | "-h" => config.help = true,
+            unknown => {
+                return Err(format!("unknown option: {unknown}\n\n{}", job_coordinator_daemon_help()).into());
+            }
+        }
+    }
+    Ok(config)
+}
+
+pub fn job_coordinator_daemon_help() -> &'static str {
+    "Run a per-job coordinator (JCP) sharing durable metadata with the cluster control plane.\n\
+     \n\
+     Usage:\n\
+       krishiv job-coordinator --job-id <ID> --metadata-path <PATH>\n\
+     \n\
+     Optional env KRISHIV_JOB_SPEC_JSON for first-time job submit.\n"
+}
+
+/// Run the per-job coordinator loop.
+pub async fn run_job_coordinator_daemon(
+    jcp_config: JobCoordinatorDaemonConfig,
+) -> Result<(), Box<dyn Error>> {
+    if jcp_config.job_id.is_empty() {
+        return Err("--job-id is required".into());
+    }
+    if jcp_config.metadata_path.as_os_str().is_empty() {
+        return Err("--metadata-path is required".into());
+    }
+    let job_id_str = jcp_config.job_id.clone();
+    let job_id = JobId::try_new(&job_id_str).map_err(|e| format!("invalid job id: {e}"))?;
+    let config = CoordinatorDaemonConfig {
+        coordinator_id: format!("jcp-{job_id_str}"),
+        grpc_addr: "127.0.0.1:0".parse().unwrap(),
+        http_addr: None,
+        shuffle_dir: None,
+        metadata_backend: Some(String::from("json")),
+        metadata_path: Some(jcp_config.metadata_path),
+        help: false,
+    };
+    let shared = build_shared_coordinator(&config)?;
+    if let Ok(spec_json) = env::var("KRISHIV_JOB_SPEC_JSON") {
+        submit_job_from_env_spec(&shared, &job_id, &spec_json)?;
+    }
+    let jcp = JobCoordinator::new(job_id.clone(), shared.clone());
+    jcp.spawn_job_orchestration_loops();
+    println!("Krishiv job coordinator running for job {job_id}");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        if let Ok(mut coord) = shared.write() {
+            let _ = coord.sync_job_from_metadata_store(&job_id);
+        }
+    }
+}
+
+fn submit_job_from_env_spec(
+    shared: &SharedCoordinator,
+    job_id: &JobId,
+    spec_json: &str,
+) -> Result<(), Box<dyn Error>> {
+    #[derive(serde::Deserialize)]
+    struct JobSpecEnv {
+        job_id: String,
+        name: String,
+        mode: String,
+        tasks: usize,
+    }
+    let env_spec: JobSpecEnv = serde_json::from_str(spec_json)
+        .map_err(|e| format!("KRISHIV_JOB_SPEC_JSON: {e}"))?;
+    let kind = match env_spec.mode.as_str() {
+        "streaming" => JobKind::Streaming,
+        _ => JobKind::Batch,
+    };
+    let submit_id =
+        JobId::try_new(&env_spec.job_id).map_err(|e| format!("job spec job_id: {e}"))?;
+    if submit_id != *job_id {
+        return Err("KRISHIV_JOB_SPEC_JSON job_id must match --job-id".into());
+    }
+    let mut coord = shared.write().map_err(|_| "lock poisoned")?;
+    if coord.job_snapshot(job_id).is_err() {
+        let stage_id = StageId::try_new("stage-1").map_err(|e| e.to_string())?;
+        let mut stage = StageSpec::new(stage_id, format!("{}-stage", env_spec.name));
+        for i in 1..=env_spec.tasks.max(1) {
+            let task_id = TaskId::try_new(format!("task-{i}")).map_err(|e| e.to_string())?;
+            stage = stage.with_task(TaskSpec::new(task_id, format!("task-{i}")));
+        }
+        let spec = JobSpec::new(job_id.clone(), env_spec.name, kind).with_stage(stage);
+        coord.submit_job(spec).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::parse_coordinator_daemon_config;
+
+    #[test]
+    fn parses_defaults() {
+        let config = parse_coordinator_daemon_config(std::iter::empty::<String>()).unwrap();
+        assert_eq!(config.coordinator_id, "coord-local");
+        assert_eq!(config.grpc_addr.port(), 9090);
+        assert!(!config.help);
+    }
+
+    #[test]
+    fn parses_help_flag() {
+        let config = parse_coordinator_daemon_config([String::from("--help")]).unwrap();
+        assert!(config.help);
+    }
 }

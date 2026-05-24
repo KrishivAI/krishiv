@@ -2,11 +2,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use crate::cli::CliResponse;
+use crate::process_util::{spawn_krishiv_daemon, spawn_krishiv_daemon_with_env};
 
 const DEFAULT_DATA_DIR: &str = ".krishiv/local";
 const CONFIG_FILE: &str = "cluster.json";
@@ -116,8 +117,10 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     let grpc_addr = "127.0.0.1:9090";
     let http_addr = "127.0.0.1:8080";
 
-    let coordinator = Command::new("krishiv-coordinator")
-        .args([
+    let meta = meta_path.to_str().unwrap_or("coordinator-meta.json");
+    let coordinator_pid = match spawn_krishiv_daemon(
+        "coordinator",
+        &[
             "--grpc-addr",
             grpc_addr,
             "--http-addr",
@@ -125,19 +128,15 @@ fn run_local_start(args: &[&str]) -> CliResponse {
             "--metadata-backend",
             "json",
             "--metadata-path",
-            meta_path.to_str().unwrap_or("coordinator-meta.json"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let coordinator = match coordinator {
-        Ok(c) => c,
+            meta,
+        ],
+    ) {
+        Ok(pid) => pid,
         Err(e) => {
             return CliResponse::err(
                 format!(
-                    "failed to spawn krishiv-coordinator: {e}\n\
-                     Build with: cargo build -p krishiv-scheduler --bin krishiv-coordinator\n"
+                    "failed to spawn krishiv coordinator: {e}\n\
+                     Build with: cargo build -p krishiv --bin krishiv\n"
                 ),
                 1,
             );
@@ -146,20 +145,18 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let flight = Command::new("krishiv-flight-server")
-        .env("KRISHIV_FLIGHT_ADDR", "127.0.0.1:50051")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let flight = match flight {
-        Ok(f) => f,
+    let flight_pid = match spawn_krishiv_daemon_with_env(
+        "flight-server",
+        &[],
+        &[("KRISHIV_FLIGHT_ADDR", "127.0.0.1:50051")],
+    ) {
+        Ok(pid) => pid,
         Err(e) => {
-            let _ = coordinator.kill();
+            let _ = Command::new("kill").arg(coordinator_pid.to_string()).status();
             return CliResponse::err(
                 format!(
-                    "failed to spawn krishiv-flight-server: {e}\n\
-                     Build with: cargo build -p krishiv-flight-sql --bin krishiv-flight-server\n"
+                    "failed to spawn krishiv flight-server: {e}\n\
+                     Build with: cargo build -p krishiv --bin krishiv\n"
                 ),
                 1,
             );
@@ -168,24 +165,24 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let executor = Command::new("krishiv-executor")
-        .args([
+    let executor_pid = match spawn_krishiv_daemon(
+        "executor",
+        &[
             "--connect",
+            "--coordinator",
             &format!("http://{grpc_addr}"),
             "--executor-id",
             "local-exec-1",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let executor = match executor {
-        Ok(e) => e,
+        ],
+    ) {
+        Ok(pid) => pid,
         Err(err) => {
+            let _ = Command::new("kill").arg(coordinator_pid.to_string()).status();
+            let _ = Command::new("kill").arg(flight_pid.to_string()).status();
             return CliResponse::err(
                 format!(
-                    "failed to spawn krishiv-executor: {err}\n\
-                     Build with: cargo build -p krishiv-executor --bin krishiv-executor\n"
+                    "failed to spawn krishiv executor: {err}\n\
+                     Build with: cargo build -p krishiv --bin krishiv\n"
                 ),
                 1,
             );
@@ -198,9 +195,9 @@ fn run_local_start(args: &[&str]) -> CliResponse {
         coordinator_flight: String::from("http://127.0.0.1:50051"),
         executor_id: String::from("local-exec-1"),
         data_dir: data_dir.clone(),
-        coordinator_pid: Some(coordinator.id()),
-        executor_pid: Some(executor.id()),
-        flight_pid: Some(flight.id()),
+        coordinator_pid: Some(coordinator_pid),
+        executor_pid: Some(executor_pid),
+        flight_pid: Some(flight_pid),
     };
 
     match config.save() {

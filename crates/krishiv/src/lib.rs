@@ -98,11 +98,42 @@ pub type Result<T> = std::result::Result<T, KrishivError>;
 pub mod cli;
 pub mod compat;
 #[doc(hidden)]
+pub mod daemon_cmd;
+#[doc(hidden)]
+pub mod process_util;
+#[doc(hidden)]
 pub mod remote_client;
 
 #[doc(hidden)]
 pub mod cluster_cmd;
 pub mod local_cluster;
+#[doc(hidden)]
+pub mod query_cli;
+#[doc(hidden)]
+pub mod stream_cmd;
+#[doc(hidden)]
+pub mod table_cmd;
+
+/// Distributed control-plane and data-plane building blocks for advanced embedding.
+///
+/// Most applications use [`Session`] only; operators and custom tooling can use these
+/// types to run coordinators and executors in-process or compose custom deployments.
+pub mod distributed {
+    pub use krishiv_scheduler::{
+        ClusterControlPlane, Coordinator, CoordinatorDaemonConfig, JobCoordinator,
+        JobCoordinatorDaemonConfig, SharedCoordinator, build_shared_coordinator,
+        coordinator_daemon_help, coordinator_http_router, job_coordinator_daemon_help,
+        parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
+        run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
+        run_standalone_coordinator, spawn_coordinator_sidecars,
+    };
+    pub use krishiv_executor::{
+        ExecutorConfig, ExecutorRuntime, ExecutorTaskRunner, GrpcCoordinatorService,
+    };
+    pub use krishiv_proto::{
+        CoordinatorId, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec,
+    };
+}
 
 /// Convenient glob import for the most common Krishiv types.
 ///

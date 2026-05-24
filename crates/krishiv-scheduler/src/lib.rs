@@ -107,8 +107,11 @@ pub use barrier_tracker::CheckpointBarrierTracker;
 
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use coordinator_daemon::{
-    CoordinatorDaemonConfig, build_shared_coordinator, coordinator_http_router,
-    run_cluster_control_plane, spawn_coordinator_sidecars,
+    CoordinatorDaemonConfig, JobCoordinatorDaemonConfig, build_shared_coordinator,
+    coordinator_daemon_help, coordinator_http_router, job_coordinator_daemon_help,
+    parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
+    run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
+    run_standalone_coordinator, spawn_coordinator_sidecars,
 };
 pub use in_process::{
     InProcessCoordinatorBridge, IN_PROCESS_TASK_ENDPOINT, is_in_process_task_endpoint,

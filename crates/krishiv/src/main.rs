@@ -17,6 +17,9 @@ fn main() {
     });
 
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Some(code) = krishiv::daemon_cmd::try_run_daemon(&args) {
+        process::exit(code);
+    }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let response = krishiv::cli::dispatch(&arg_refs);
 
