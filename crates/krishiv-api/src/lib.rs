@@ -11,15 +11,14 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
-    build_execution_runtime, BatchTableRegistration, DistributedBackend, EmbeddedBackend,
-    ExecutionBackend, ExecutionRuntime, InProcessCluster, JobId, JobState, RuntimeMode,
-    SingleNodeBackend,
+    build_execution_runtime, BatchTableRegistration, ExecutionRuntime, InProcessCluster, JobId,
+    JobState, RuntimeMode,
 };
 use krishiv_sql::{SqlDataFrame, SqlEngine};
 use krishiv_sql_policy::PolicyEnforcingSqlEngine;
@@ -193,6 +192,8 @@ pub struct SessionBuilder {
     coordinator_url: Option<String>,
     local_cluster_grpc: Option<String>,
     state_ttl: Option<StateTtlConfig>,
+    /// When true, route data-plane work to the remote Flight endpoint (no local fallback).
+    remote_execution: bool,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -204,6 +205,7 @@ impl fmt::Debug for SessionBuilder {
             .field("coordinator_url", &self.coordinator_url)
             .field("local_cluster_grpc", &self.local_cluster_grpc)
             .field("state_ttl", &self.state_ttl)
+            .field("remote_execution", &self.remote_execution)
             .finish()
     }
 }
@@ -217,8 +219,32 @@ impl Default for SessionBuilder {
             coordinator_url: None,
             local_cluster_grpc: None,
             state_ttl: None,
+            remote_execution: remote_execution_from_env(),
         }
     }
+}
+
+fn remote_execution_from_env() -> bool {
+    std::env::var("KRISHIV_REMOTE_EXEC")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
+    static RUNTIME: OnceLock<Arc<dyn ExecutionRuntime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let cluster = Arc::new(
+                InProcessCluster::new().expect("shared embedded in-process cluster"),
+            );
+            build_execution_runtime(RuntimeMode::Embedded, cluster, None, false)
+        })
+        .clone()
 }
 
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
@@ -276,6 +302,14 @@ impl SessionBuilder {
         self
     }
 
+    /// When true, batch and streaming data-plane work is routed to the remote Flight
+    /// endpoint instead of the session-embedded in-process cluster.
+    #[must_use]
+    pub fn with_remote_execution(mut self, enabled: bool) -> Self {
+        self.remote_execution = enabled;
+        self
+    }
+
     /// Attach streaming operator state TTL (wired to `krishiv-state` backends).
     #[must_use]
     pub fn with_state_ttl(mut self, ttl: StateTtlConfig) -> Self {
@@ -304,6 +338,7 @@ impl SessionBuilder {
             execution_mode_to_runtime_mode(self.mode),
             Arc::clone(&local_cluster),
             self.coordinator_url.clone(),
+            self.remote_execution,
         );
         Ok(Session {
             mode: self.mode,
@@ -570,15 +605,32 @@ impl Session {
                 reason: e.to_string(),
             })?;
         let query_str = query.as_ref();
-        let batches = engine
-            .execute_as(&principal, query_str)
-            .await
+        let effective_sql = engine
+            .prepare_authorized_query(&principal, query_str)
+            .map_err(KrishivError::from)?;
+        let tables = self
+            .registered_parquet
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+            .collect::<Vec<_>>();
+        let batches = runtime_collect_batch_sql(
+            Arc::clone(&self.runtime),
+            &effective_sql,
+            &tables,
+        )
+        .await?;
+        let masked = engine
+            .mask_result_batches(&principal, query_str, batches)
             .map_err(KrishivError::from)?;
         Ok(DataFrame::from_batches(
             self.mode,
-            batches,
+            masked,
             self.jobs.clone(),
             self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
         ))
     }
 
@@ -692,11 +744,7 @@ impl DataFrame {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: None,
-            runtime: build_execution_runtime(
-                RuntimeMode::Embedded,
-                Arc::new(InProcessCluster::new().expect("in-process cluster")),
-                None,
-            ),
+            runtime: shared_embedded_runtime(),
             registered_parquet: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -734,6 +782,8 @@ impl DataFrame {
         batches: Vec<RecordBatch>,
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
+        runtime: Arc<dyn ExecutionRuntime>,
+        registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
     ) -> Self {
         let logical_plan = LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
         Self {
@@ -745,12 +795,8 @@ impl DataFrame {
             jobs,
             next_job_id,
             coordinator_url: None,
-            runtime: build_execution_runtime(
-                RuntimeMode::Embedded,
-                Arc::new(InProcessCluster::new().expect("in-process cluster")),
-                None,
-            ),
-            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
+            runtime,
+            registered_parquet,
         }
     }
     pub fn logical_plan(&self) -> &LogicalPlan {
@@ -764,7 +810,9 @@ impl DataFrame {
 
     /// Asynchronously explain the current plan.
     pub async fn explain_async(&self) -> Result<String> {
-        ensure_local_mode(self.mode)?;
+        if let Some(query) = self.sql_query.as_deref() {
+            return self.runtime.explain_sql(query).map_err(KrishivError::from);
+        }
         match &self.sql_dataframe {
             Some(dataframe) => dataframe.explain().await.map_err(Into::into),
             None => Ok(self.logical_plan.describe()),
@@ -802,18 +850,16 @@ impl DataFrame {
                 .iter()
                 .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
                 .collect::<Vec<_>>();
-            self.runtime
-                .collect_batch_sql(query, &tables)
+            runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables)
+                .await
                 .map(QueryResult::new)
-                .map_err(KrishivError::from)
-        } else if let Err(error) = accept_plan_with_backend(
-            self.mode,
-            self.logical_plan.name(),
-            self.logical_plan.kind(),
-            self.coordinator_url.as_deref(),
-        ) {
-            Err(error)
         } else {
+            self.runtime
+                .accept_plan(&PhysicalPlan::new(
+                    self.logical_plan.name(),
+                    self.logical_plan.kind(),
+                ))
+                .map_err(KrishivError::from)?;
             match &self.sql_dataframe {
                 Some(dataframe) => dataframe
                     .collect()
@@ -883,12 +929,6 @@ impl Stream {
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
     ) -> Self {
-        let cluster = InProcessCluster::new().expect("in-process cluster");
-        let runtime = build_execution_runtime(
-            execution_mode_to_runtime_mode(execution_mode),
-            Arc::new(cluster),
-            None,
-        );
         Self::for_session(
             name,
             mode,
@@ -896,7 +936,7 @@ impl Stream {
             execution_mode,
             None,
             None,
-            runtime,
+            shared_embedded_runtime(),
         )
     }
 
@@ -1447,45 +1487,19 @@ fn parquet_scan_table_name(path: &Path) -> String {
     format!("_krishiv_parquet_{sanitized}")
 }
 
-fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
-    if mode == ExecutionMode::Distributed {
-        return Err(KrishivError::unsupported(
-            "operation requires embedded or single-node mode; use SessionBuilder without \
-             with_coordinator, or use distributed APIs explicitly",
-        ));
-    }
-    Ok(())
-}
-
-fn accept_plan_with_backend(
-    mode: ExecutionMode,
-    plan_name: &str,
-    kind: ExecutionKind,
-    coordinator_url: Option<&str>,
-) -> Result<()> {
-    let physical_plan = PhysicalPlan::new(plan_name, kind);
-
-    match mode {
-        ExecutionMode::Embedded => {
-            let mut backend = EmbeddedBackend::default();
-            backend.execute(&physical_plan)?;
-        }
-        ExecutionMode::SingleNode => {
-            let mut backend = SingleNodeBackend;
-            backend.execute(&physical_plan)?;
-        }
-        ExecutionMode::Distributed => {
-            let url = coordinator_url.ok_or_else(|| {
-                KrishivError::unsupported(
-                    "distributed mode requires a coordinator URL; use SessionBuilder::with_coordinator",
-                )
-            })?;
-            let mut backend = DistributedBackend::new(url);
-            backend.execute(&physical_plan)?;
-        }
-    }
-
-    Ok(())
+async fn runtime_collect_batch_sql(
+    runtime: Arc<dyn ExecutionRuntime>,
+    query: &str,
+    tables: &[BatchTableRegistration],
+) -> Result<Vec<RecordBatch>> {
+    let query = query.to_owned();
+    let tables = tables.to_vec();
+    tokio::task::spawn_blocking(move || runtime.collect_batch_sql(&query, &tables))
+        .await
+        .map_err(|e| KrishivError::Runtime {
+            message: format!("runtime collect task failed: {e}"),
+        })?
+        .map_err(KrishivError::from)
 }
 
 #[cfg(test)]
@@ -2214,5 +2228,38 @@ mod tests {
             .collect()
             .expect("multi-source collect");
         assert!(!out.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_execution_without_fallback_uses_flight_server() {
+        use std::net::SocketAddr;
+
+        use krishiv_flight_sql::make_flight_sql_server;
+        use tonic::transport::Server;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(make_flight_sql_server())
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+
+        let url = format!("http://{addr}");
+        let session = Session::builder()
+            .with_coordinator(&url)
+            .with_remote_execution(true)
+            .build()
+            .unwrap();
+        assert!(session.execution_runtime().uses_remote_execution());
+        let df = session.sql_async("SELECT 99 AS n").await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 1);
+        server.abort();
     }
 }

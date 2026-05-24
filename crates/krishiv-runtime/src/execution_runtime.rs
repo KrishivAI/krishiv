@@ -61,6 +61,11 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Execution mode label for telemetry.
     fn mode(&self) -> RuntimeMode;
 
+    /// Whether data-plane work is routed to a remote Flight endpoint (no local fallback).
+    fn uses_remote_execution(&self) -> bool {
+        false
+    }
+
     /// Accept or dispatch a physical plan (batch or streaming).
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
 
@@ -78,6 +83,9 @@ pub trait ExecutionRuntime: Send + Sync {
         query: &str,
         tables: &[BatchTableRegistration],
     ) -> RuntimeResult<Vec<RecordBatch>>;
+
+    /// Explain a SQL query (plan metadata only).
+    fn explain_sql(&self, query: &str) -> RuntimeResult<String>;
 
     /// Register a continuous streaming job (long-running operator).
     fn register_continuous_stream(
@@ -178,6 +186,10 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
             .collect_batch_sql(query, &tables_to_batch_sql(tables))
     }
 
+    fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
+        krishiv_sql::explain_sql(query).map_err(|e| RuntimeError::transport(e.to_string()))
+    }
+
     fn register_continuous_stream(
         &self,
         job_id: &str,
@@ -242,6 +254,10 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         self.session_mode
     }
 
+    fn uses_remote_execution(&self) -> bool {
+        self.local_fallback.is_none()
+    }
+
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         if self.local_fallback.is_some() {
             return self.local_accept_plan(plan);
@@ -259,10 +275,13 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         if let Some(cluster) = &self.local_fallback {
             return cluster.collect_bounded_window(topic, input_batches, spec);
         }
-        use krishiv_exec::execute_bounded_window;
-        use crate::in_process_cluster::local_spec_to_plan_spec;
-        execute_bounded_window(input_batches, &local_spec_to_plan_spec(spec))
-            .map_err(|e| RuntimeError::transport(e.to_string()))
+        use krishiv_async_util::block_on;
+        block_on(crate::flight_client::execute_remote_bounded_window(
+            &self.flight_url,
+            topic,
+            input_batches,
+            spec,
+        ))
     }
 
     fn collect_batch_sql(
@@ -274,7 +293,19 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             return cluster.collect_batch_sql(query, &tables_to_batch_sql(tables));
         }
         use krishiv_async_util::block_on;
-        block_on(crate::flight_client::execute_remote_sql(
+        block_on(crate::flight_client::execute_remote_batch_sql(
+            &self.flight_url,
+            query,
+            &tables_to_batch_sql(tables),
+        ))
+    }
+
+    fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
+        if self.local_fallback.is_some() {
+            return krishiv_sql::explain_sql(query).map_err(|e| RuntimeError::transport(e.to_string()));
+        }
+        use krishiv_async_util::block_on;
+        block_on(crate::flight_client::execute_remote_explain(
             &self.flight_url,
             query,
         ))
@@ -285,12 +316,15 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<()> {
-        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
-            RuntimeError::unsupported(
-                "continuous streaming requires a local cluster fallback in distributed mode",
-            )
-        })?;
-        cluster.register_continuous_job(job_id, spec)
+        if let Some(cluster) = &self.local_fallback {
+            return cluster.register_continuous_job(job_id, spec);
+        }
+        use krishiv_async_util::block_on;
+        block_on(crate::flight_client::execute_remote_continuous_register(
+            &self.flight_url,
+            job_id,
+            spec,
+        ))
     }
 
     fn push_continuous_stream_input(
@@ -298,21 +332,26 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         batches: Vec<RecordBatch>,
     ) -> RuntimeResult<()> {
-        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
-            RuntimeError::unsupported(
-                "continuous streaming requires a local cluster fallback in distributed mode",
-            )
-        })?;
-        cluster.push_continuous_input(job_id, batches)
+        if let Some(cluster) = &self.local_fallback {
+            return cluster.push_continuous_input(job_id, batches);
+        }
+        use krishiv_async_util::block_on;
+        block_on(crate::flight_client::execute_remote_continuous_push(
+            &self.flight_url,
+            job_id,
+            batches,
+        ))
     }
 
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
-            RuntimeError::unsupported(
-                "continuous streaming requires a local cluster fallback in distributed mode",
-            )
-        })?;
-        cluster.drain_continuous_job(job_id)
+        if let Some(cluster) = &self.local_fallback {
+            return cluster.drain_continuous_job(job_id);
+        }
+        use krishiv_async_util::block_on;
+        block_on(crate::flight_client::execute_remote_continuous_drain(
+            &self.flight_url,
+            job_id,
+        ))
     }
 
     fn flight_url(&self) -> Option<&str> {
@@ -325,6 +364,7 @@ pub fn build_execution_runtime(
     mode: RuntimeMode,
     cluster: Arc<InProcessCluster>,
     coordinator_flight_url: Option<String>,
+    remote_execution: bool,
 ) -> Arc<dyn ExecutionRuntime> {
     match mode {
         RuntimeMode::Embedded => {
@@ -332,10 +372,11 @@ pub fn build_execution_runtime(
         }
         RuntimeMode::SingleNode => {
             if let Some(url) = coordinator_flight_url {
-                Arc::new(
-                    RemoteExecutionRuntime::new(url, RuntimeMode::SingleNode)
-                        .with_local_fallback(Arc::clone(&cluster)),
-                )
+                let mut remote = RemoteExecutionRuntime::new(url, RuntimeMode::SingleNode);
+                if !remote_execution {
+                    remote = remote.with_local_fallback(Arc::clone(&cluster));
+                }
+                Arc::new(remote)
             } else {
                 Arc::new(InProcessExecutionRuntime::single_node(cluster))
             }
@@ -343,10 +384,11 @@ pub fn build_execution_runtime(
         RuntimeMode::Distributed => {
             let url = coordinator_flight_url
                 .unwrap_or_else(|| String::from("http://127.0.0.1:50051"));
-            Arc::new(
-                RemoteExecutionRuntime::new(url, RuntimeMode::Distributed)
-                    .with_local_fallback(Arc::clone(&cluster)),
-            )
+            let mut remote = RemoteExecutionRuntime::new(url, RuntimeMode::Distributed);
+            if !remote_execution {
+                remote = remote.with_local_fallback(Arc::clone(&cluster));
+            }
+            Arc::new(remote)
         }
     }
 }

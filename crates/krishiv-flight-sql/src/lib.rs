@@ -2,6 +2,8 @@
 //! Flight SQL service — thin adapter over the Krishiv Session API.
 //! **Beta API**: may change between minor releases.
 
+mod host;
+
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -18,16 +20,18 @@ use futures::{Stream, stream};
 use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
 
-use krishiv_api::SessionBuilder;
 use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
 use krishiv_sql::SqlEngine;
 use krishiv_sql_policy::PolicyEnforcingSqlEngine;
 
+pub use host::FlightExecutionHost;
+
 /// **Beta API**: may change between minor releases.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct KrishivFlightSqlService {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
+    host: FlightExecutionHost,
 }
 
 impl std::fmt::Debug for KrishivFlightSqlService {
@@ -40,9 +44,22 @@ impl std::fmt::Debug for KrishivFlightSqlService {
 }
 
 impl KrishivFlightSqlService {
-    /// Create a new `KrishivFlightSqlService` with no auth or policy.
-    pub fn new() -> Self {
-        Self::default()
+    /// Create a new `KrishivFlightSqlService` with a shared server-side cluster.
+    pub fn new() -> Result<Self, Status> {
+        Ok(Self {
+            auth: None,
+            policy: None,
+            host: FlightExecutionHost::new()?,
+        })
+    }
+
+    /// Attach a pre-built execution host (tests / custom wiring).
+    pub fn with_host(host: FlightExecutionHost) -> Self {
+        Self {
+            auth: None,
+            policy: None,
+            host,
+        }
     }
 
     /// Attach an [`AuthProvider`] to this service.
@@ -63,16 +80,15 @@ impl KrishivFlightSqlService {
         self
     }
 
-    #[allow(clippy::result_large_err)]
-    fn make_session(&self) -> Result<krishiv_api::Session, Status> {
-        let mut builder = SessionBuilder::new();
-        if let Some(auth) = &self.auth {
-            builder = builder.with_auth(auth.clone());
+    fn policy_engine(&self) -> Option<PolicyEnforcingSqlEngine> {
+        match (&self.auth, &self.policy) {
+            (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
+                SqlEngine::new(),
+                auth.clone(),
+                policy.clone(),
+            )),
+            _ => None,
         }
-        if let Some(policy) = &self.policy {
-            builder = builder.with_policy(policy.clone());
-        }
-        builder.build().map_err(|e| Status::internal(e.to_string()))
     }
 
     #[allow(clippy::result_large_err)]
@@ -276,18 +292,28 @@ impl FlightSqlService for KrishivFlightSqlService {
         let query = std::str::from_utf8(&ticket.statement_handle)
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
 
-        let batches = if let (Some(auth), Some(policy)) = (&self.auth, &self.policy) {
+        let batches = if let Some(engine) = self.policy_engine() {
             let token = token
                 .as_deref()
                 .ok_or_else(|| Status::unauthenticated("missing Bearer token"))?;
-            let engine =
-                PolicyEnforcingSqlEngine::new(SqlEngine::new(), auth.clone(), policy.clone());
-            let principal = engine
+            let auth_principal = engine
                 .authenticate(token)
                 .map_err(|e| Status::permission_denied(e.to_string()))?;
-            engine
-                .execute_as(&principal, query)
+            let prepared = engine
+                .prepare_authorized_query(&auth_principal, query)
+                .map_err(|e| match e {
+                    krishiv_sql::SqlError::AccessDenied { reason } => {
+                        Status::permission_denied(reason)
+                    }
+                    other => Status::internal(other.to_string()),
+                })?;
+            let raw = self
+                .host
+                .execute_sql(&prepared)
                 .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            engine
+                .mask_result_batches(&auth_principal, query, raw)
                 .map_err(|e| match e {
                     krishiv_sql::SqlError::AccessDenied { reason } => {
                         Status::permission_denied(reason)
@@ -295,16 +321,12 @@ impl FlightSqlService for KrishivFlightSqlService {
                     other => Status::internal(other.to_string()),
                 })?
         } else {
-            let session = self.make_session()?;
-            let df = session
-                .sql_async(query)
+            let raw = self
+                .host
+                .execute_sql(query)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let result = df
-                .collect_async()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            self.apply_policy_masking(&principal, "", result.batches().to_vec())?
+            self.apply_policy_masking(&principal, "", raw)?
         };
 
         let schema: Arc<Schema> = if batches.is_empty() {
@@ -332,7 +354,9 @@ impl FlightSqlService for KrishivFlightSqlService {
 /// **Beta API**: may change between minor releases.
 pub fn make_flight_sql_server()
 -> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService> {
-    arrow_flight::flight_service_server::FlightServiceServer::new(KrishivFlightSqlService::new())
+    arrow_flight::flight_service_server::FlightServiceServer::new(
+        KrishivFlightSqlService::new().expect("flight host"),
+    )
 }
 
 #[cfg(test)]
@@ -348,7 +372,9 @@ mod tests {
             "alice".to_string(),
             Role::Reader,
         )]));
-        KrishivFlightSqlService::new().with_auth(auth)
+        KrishivFlightSqlService::new()
+            .expect("flight host")
+            .with_auth(auth)
     }
 
     struct DenySecretPolicy;
@@ -374,13 +400,12 @@ mod tests {
 
     #[test]
     fn service_is_default_constructible() {
-        let _ = KrishivFlightSqlService::default();
+        let _ = KrishivFlightSqlService::new().expect("flight host");
     }
 
     #[test]
     fn make_session_returns_ok() {
-        let svc = KrishivFlightSqlService::new();
-        assert!(svc.make_session().is_ok());
+        let _ = KrishivFlightSqlService::new().expect("flight host");
     }
 
     #[test]
@@ -390,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_flight_info_encodes_query_into_ticket() {
-        let svc = KrishivFlightSqlService::new();
+        let svc = KrishivFlightSqlService::new().expect("flight host");
         let cmd = CommandStatementQuery {
             query: "SELECT 42".to_string(),
             transaction_id: None,
@@ -407,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn do_get_statement_executes_select_1() {
-        let svc = KrishivFlightSqlService::new();
+        let svc = KrishivFlightSqlService::new().expect("flight host");
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT 1 AS n".to_vec().into(),
         };
@@ -423,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn do_get_statement_invalid_utf8_returns_invalid_argument() {
-        let svc = KrishivFlightSqlService::new();
+        let svc = KrishivFlightSqlService::new().expect("flight host");
         let ticket = TicketStatementQuery {
             statement_handle: vec![0xFF, 0xFE].into(),
         };
@@ -606,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn no_auth_configured_allows_any_request() {
         // Service with no auth provider — should pass through without auth check.
-        let svc = KrishivFlightSqlService::new();
+        let svc = KrishivFlightSqlService::new().expect("flight host");
         let ticket = TicketStatementQuery {
             statement_handle: b"SELECT 1".to_vec().into(),
         };

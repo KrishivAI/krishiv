@@ -22,6 +22,8 @@ pub struct LocalClusterConfig {
     pub coordinator_pid: Option<u32>,
     #[serde(default)]
     pub executor_pid: Option<u32>,
+    #[serde(default)]
+    pub flight_pid: Option<u32>,
 }
 
 impl LocalClusterConfig {
@@ -144,6 +146,28 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     std::thread::sleep(std::time::Duration::from_millis(500));
 
+    let flight = Command::new("krishiv-flight-server")
+        .env("KRISHIV_FLIGHT_ADDR", "127.0.0.1:50051")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let flight = match flight {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = coordinator.kill();
+            return CliResponse::err(
+                format!(
+                    "failed to spawn krishiv-flight-server: {e}\n\
+                     Build with: cargo build -p krishiv-flight-sql --bin krishiv-flight-server\n"
+                ),
+                1,
+            );
+        }
+    };
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
     let executor = Command::new("krishiv-executor")
         .args([
             "--connect",
@@ -176,6 +200,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
         data_dir: data_dir.clone(),
         coordinator_pid: Some(coordinator.id()),
         executor_pid: Some(executor.id()),
+        flight_pid: Some(flight.id()),
     };
 
     match config.save() {
@@ -206,6 +231,9 @@ fn run_local_stop(args: &[&str]) -> CliResponse {
         Ok(c) => c,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
+    if let Some(pid) = config.flight_pid {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
     if let Some(pid) = config.executor_pid {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
@@ -228,8 +256,9 @@ fn run_local_status(args: &[&str]) -> CliResponse {
              HTTP:    {}\n\
              Flight:  {}\n\
              coordinator pid: {:?}\n\
-             executor pid: {:?}\n",
-            c.coordinator_grpc, c.coordinator_http, c.coordinator_flight, c.coordinator_pid, c.executor_pid
+             executor pid: {:?}\n\
+             flight pid: {:?}\n",
+            c.coordinator_grpc, c.coordinator_http, c.coordinator_flight, c.coordinator_pid, c.executor_pid, c.flight_pid
         )),
         Err(e) => CliResponse::err(format!("{e}\n"), 1),
     }

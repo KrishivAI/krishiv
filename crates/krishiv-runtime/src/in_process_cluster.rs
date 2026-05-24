@@ -120,7 +120,7 @@ pub(crate) fn local_spec_to_plan_spec(spec: &LocalWindowExecutionSpec) -> Window
     }
 }
 
-pub(crate) fn plan_spec_to_local(spec: &WindowExecutionSpec) -> LocalWindowExecutionSpec {
+pub fn plan_spec_to_local(spec: &WindowExecutionSpec) -> LocalWindowExecutionSpec {
     use krishiv_exec::{AggExpr, AggFunction};
     use krishiv_plan::window::WindowAggKind;
 

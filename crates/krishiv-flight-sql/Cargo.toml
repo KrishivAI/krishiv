@@ -12,6 +12,8 @@ bytes = { workspace = true }
 futures = { workspace = true }
 krishiv-api = { path = "../krishiv-api" }
 krishiv-governance = { path = "../krishiv-governance" }
+krishiv-plan = { path = "../krishiv-plan" }
+krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-sql-policy = { path = "../krishiv-sql-policy" }
 sha2 = { workspace = true }
@@ -25,6 +27,10 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "krishiv-flight-server"
+path = "src/bin/krishiv_flight_server.rs"
 
 [lints]
 workspace = true

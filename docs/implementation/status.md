@@ -2,6 +2,21 @@
 
 ## Current Phase
 
+**Unified execution mode parity (2026-05-24).** Branch `cursor/unified-execution-phase0-1-7ffe` (PR #43):
+- **C2:** `SessionBuilder::with_remote_execution(true)` + `KRISHIV_REMOTE_EXEC=1` disables local fallback; data plane routes to Flight.
+- **C3:** Flight comment protocol for catalog sync (`krishiv-register-parquet`) + shared `FlightExecutionHost` on server.
+- **C4:** `sql_as` authorizes client-side, executes via `collect_batch_sql`, masks results.
+- **Remote streaming:** bounded window + continuous register/push/drain over Flight protocol.
+- **explain_async:** `ExecutionRuntime::explain_sql` (local + remote).
+- **Python:** `submit_stream_job`, `push_stream_job_input`, `poll_stream_job`; `stream_exec` single async collect path.
+- **Local cluster:** `krishiv local start` spawns `krishiv-flight-server` on `:50051`.
+- **Cleanup:** removed `accept_plan_with_backend`; shared embedded runtime for orphan `DataFrame`/`Stream::new`.
+- **Test:** `remote_execution_without_fallback_uses_flight_server`.
+
+```bash
+cargo +stable test -p krishiv-plan -p krishiv-exec -p krishiv-runtime -p krishiv-executor -p krishiv-api -p krishiv-flight-sql -p krishiv-sql-policy --lib
+```
+
 **Unified execution (2026-05-24).** Branch `cursor/unified-execution-phase0-1-7ffe`:
 - **ADR-13.1–13.7:** `ExecutionRuntime`, session-scoped `InProcessCluster`, unified `execute_bounded_window` for all window kinds (tumbling/sliding/session), TTL, full agg support.
 - **Fragments:** `stream:tw|sw|ses` encoding in `krishiv-plan::window`; executor delegates to operator runtime (canonical watermark semantics).

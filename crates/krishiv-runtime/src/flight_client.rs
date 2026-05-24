@@ -6,6 +6,12 @@ use futures::TryStreamExt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 use tonic::transport::{Channel, Endpoint};
 
+use crate::flight_protocol::{
+    encode_batch_sql, encode_bounded_window, encode_continuous_drain, encode_continuous_push,
+    encode_continuous_register, encode_explain_sql,
+};
+use crate::in_process::BatchSqlTable;
+use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
 
 /// Map a physical plan to a SQL statement understood by the Krishiv Flight SQL service.
@@ -91,6 +97,88 @@ pub async fn execute_remote_sql(
         batches.push(batch);
     }
     Ok(batches)
+}
+
+/// Execute batch SQL remotely with catalog sync directives.
+pub async fn execute_remote_batch_sql(
+    flight_url: &str,
+    query: &str,
+    tables: &[BatchSqlTable],
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    let sql = encode_batch_sql(query, tables);
+    execute_remote_sql(flight_url, &sql).await
+}
+
+/// Explain SQL remotely via Flight.
+pub async fn execute_remote_explain(flight_url: &str, query: &str) -> RuntimeResult<String> {
+    let sql = encode_explain_sql(query);
+    let batches = execute_remote_sql(flight_url, &sql).await?;
+    Ok(flight_explain_from_batches(&batches))
+}
+
+fn flight_explain_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> String {
+    use arrow::array::Array;
+    use arrow::array::StringArray;
+
+    let mut lines = Vec::new();
+    for batch in batches {
+        for col_idx in 0..batch.num_columns() {
+            if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
+                for row in 0..batch.num_rows() {
+                    if !arr.is_null(row) {
+                        lines.push(arr.value(row).to_string());
+                    }
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        String::from("(no explain output)")
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Register a continuous streaming job on the remote Flight host.
+pub async fn execute_remote_continuous_register(
+    flight_url: &str,
+    job_id: &str,
+    spec: &LocalWindowExecutionSpec,
+) -> RuntimeResult<()> {
+    let sql = encode_continuous_register(job_id, spec);
+    let _ = execute_remote_sql(flight_url, &sql).await?;
+    Ok(())
+}
+
+/// Push input batches to a remote continuous streaming job.
+pub async fn execute_remote_continuous_push(
+    flight_url: &str,
+    job_id: &str,
+    batches: Vec<arrow::record_batch::RecordBatch>,
+) -> RuntimeResult<()> {
+    let sql = encode_continuous_push(job_id, &batches)?;
+    let _ = execute_remote_sql(flight_url, &sql).await?;
+    Ok(())
+}
+
+/// Drain output from a remote continuous streaming job.
+pub async fn execute_remote_continuous_drain(
+    flight_url: &str,
+    job_id: &str,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    let sql = encode_continuous_drain(job_id);
+    execute_remote_sql(flight_url, &sql).await
+}
+
+/// Execute a bounded window pipeline on the remote Flight host.
+pub async fn execute_remote_bounded_window(
+    flight_url: &str,
+    topic: &str,
+    input_batches: Vec<arrow::record_batch::RecordBatch>,
+    spec: &LocalWindowExecutionSpec,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    let sql = encode_bounded_window(topic, spec, &input_batches)?;
+    execute_remote_sql(flight_url, &sql).await
 }
 
 #[cfg(test)]

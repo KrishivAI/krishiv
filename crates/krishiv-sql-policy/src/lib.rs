@@ -100,6 +100,65 @@ impl PolicyEnforcingSqlEngine {
         );
         Ok(masked)
     }
+
+    /// Check table access and return SQL with row-level predicates applied.
+    ///
+    /// Used when execution is routed through [`ExecutionRuntime::collect_batch_sql`]
+    /// instead of local DataFusion.
+    pub fn prepare_authorized_query(
+        &self,
+        principal: &Principal,
+        query: &str,
+    ) -> SqlResult<String> {
+        use sha2::{Digest, Sha256};
+        let query_hash = format!("{:x}", Sha256::digest(query.as_bytes()));
+        let table_names = referenced_table_names(query)?;
+        for table_name in &table_names {
+            if !self.policy.check_table_access(principal, table_name) {
+                audit_log(
+                    principal.subject.as_str(),
+                    &AuditAction::QueryExecuted {
+                        query_hash: query_hash.clone(),
+                    },
+                    AuditOutcome::Denied,
+                );
+                return Err(SqlError::AccessDenied {
+                    reason: format!(
+                        "principal '{}' denied access to table '{}'",
+                        principal.subject, table_name
+                    ),
+                });
+            }
+        }
+        Ok(apply_row_predicates(
+            query,
+            principal,
+            &table_names,
+            self.policy.as_ref(),
+        ))
+    }
+
+    /// Apply column masking to batches produced by a remote or coordinator SQL path.
+    pub fn mask_result_batches(
+        &self,
+        principal: &Principal,
+        query: &str,
+        batches: Vec<RecordBatch>,
+    ) -> SqlResult<Vec<RecordBatch>> {
+        use sha2::{Digest, Sha256};
+        let query_hash = format!("{:x}", Sha256::digest(query.as_bytes()));
+        let table_names = referenced_table_names(query)?;
+        let masked = batches
+            .iter()
+            .map(|batch| apply_masking(batch, principal, &table_names, self.policy.as_ref()))
+            .collect::<SqlResult<Vec<_>>>()?;
+        audit_log(
+            principal.subject.as_str(),
+            &AuditAction::QueryExecuted { query_hash },
+            AuditOutcome::Allowed,
+        );
+        Ok(masked)
+    }
 }
 
 fn apply_row_predicates(

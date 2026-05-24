@@ -36,8 +36,8 @@ fn resolve_input_batches(
     }
     let upper = pipeline.source_id.to_ascii_uppercase();
     if upper.contains("SELECT") || upper.contains("FROM") {
-        let df = block_on_async(pipeline.session.sql(&pipeline.source_id))?;
-        let result = df.collect()?;
+        let df = block_on_async(pipeline.session.sql_async(&pipeline.source_id))?;
+        let result = block_on_async(df.collect_async())?;
         return Ok(result.batches().to_vec());
     }
     Err(krishiv_api::KrishivError::unsupported(
