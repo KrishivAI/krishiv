@@ -19,7 +19,9 @@ pub mod incremental;
 pub mod key_group;
 pub mod migration;
 
-pub use migration::{SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry};
+pub use migration::{
+    SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry,
+};
 
 use krishiv_async_util::unix_now_ms;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -1065,7 +1067,9 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         let entries = decode_snapshot_entries(&raw_snap)?;
         let mut out = Vec::new();
         out.extend_from_slice(&1u32.to_le_bytes()); // version
-        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        let count_offset = out.len();
+        out.extend_from_slice(&0u64.to_le_bytes()); // placeholder; patched after filtering
+        let mut written = 0u64;
         for (op_id, state_name, key, ttl_encoded_value) in &entries {
             // Strip the 8-byte TTL prefix if present; skip expired / corrupt entries.
             if ttl_encoded_value.len() < 8 {
@@ -1094,7 +1098,9 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
             out.extend_from_slice(key);
             out.extend_from_slice(&(raw_value.len() as u64).to_le_bytes());
             out.extend_from_slice(raw_value);
+            written += 1;
         }
+        out[count_offset..count_offset + 8].copy_from_slice(&written.to_le_bytes());
         Ok(out)
     }
 

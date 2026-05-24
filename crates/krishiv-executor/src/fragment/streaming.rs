@@ -325,7 +325,7 @@ pub(crate) async fn execute_streaming_fragment(
                     }
                     watermark.advance(event_time_ms);
                     let new_wm = watermark.current_watermark_ms();
-                    let row_batch = batch.slice(row, row + 1);
+                    let row_batch = batch.slice(row, 1);
                     let output = window_op.process_batch(&row_batch, new_wm).map_err(|e| {
                         ExecutorError::LocalExecution {
                             message: format!("streaming window process_batch failed: {e}"),

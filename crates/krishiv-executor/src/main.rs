@@ -38,7 +38,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
     let http_addr = config.http_addr;
     let task_grpc_addr = config.task_grpc_addr;
-    let runtime = ExecutorRuntime::new(config.into_executor_config()?);
+    let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
 
     // Start optional HTTP health server (/healthz, /readyz, /metrics).
     if let Some(addr) = http_addr {
@@ -57,9 +57,9 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
     match mode {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
-        ExecutorMode::RegisterOnce => register_once(&runtime).await.map(|_| ()),
+        ExecutorMode::RegisterOnce => register_once(&runtime).await,
         ExecutorMode::Connect => {
-            heartbeat_loop(&runtime, heartbeat_interval_secs, task_grpc_addr).await
+            heartbeat_loop(&mut runtime, heartbeat_interval_secs, task_grpc_addr).await
         }
     }
 }
@@ -133,7 +133,7 @@ async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
 }
 
 async fn heartbeat_loop(
-    runtime: &ExecutorRuntime,
+    runtime: &mut ExecutorRuntime,
     heartbeat_interval_secs: u64,
     task_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
@@ -162,7 +162,10 @@ async fn heartbeat_loop(
     tokio::spawn(async move {
         let runner = ExecutorTaskRunner::new(runner_inbox);
         loop {
-            let coord = GrpcCoordinatorService::new(runner_endpoint.clone());
+            let coord = GrpcCoordinatorService::new(
+                runner_endpoint.clone(),
+                krishiv_proto::LeaseGeneration::initial(),
+            );
             match runner.run_next_with(&coord).await {
                 Ok(Some(_report)) => {}
                 Ok(None) => {
@@ -185,6 +188,7 @@ async fn heartbeat_loop(
                     .heartbeat_with_grpc_endpoint()
                     .await
                     .map_err(|error| error.to_string())?;
+                // Lease generation is updated inside heartbeat_with_grpc_endpoint (GAP-C4).
                 println!(
                     "heartbeat response version={} lease_generation={} disposition={} message={}",
                     heartbeat.version(),

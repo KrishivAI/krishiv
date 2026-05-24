@@ -9,17 +9,17 @@ use krishiv_proto::{
 };
 use krishiv_sql::SqlEngine;
 
-use crate::{ExecutorError, ExecutorResult};
-use crate::runner::{
-    ExecutorTaskOutput, ExecutorTaskRunner, KAFKA_TO_PARQUET_FRAGMENT,
-    MEMORY_KAFKA_PARTITION_PREFIX, OBJECT_PARQUET_SINK_PREFIX, PARQUET_SINK_PREFIX,
-    SHUFFLE_WRITE_PREFIX,
-};
 use super::common::{
     parse_local_parquet_partitions, read_connector_parquet_partitions,
     read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
     write_object_parquet_sink,
 };
+use crate::runner::{
+    ExecutorTaskOutput, ExecutorTaskRunner, KAFKA_TO_PARQUET_FRAGMENT,
+    MEMORY_KAFKA_PARTITION_PREFIX, OBJECT_PARQUET_SINK_PREFIX, PARQUET_SINK_PREFIX,
+    SHUFFLE_WRITE_PREFIX,
+};
+use crate::{ExecutorError, ExecutorResult};
 
 /// Execute a batch (terminal) stage fragment.
 pub(crate) async fn execute_batch_fragment(
@@ -133,13 +133,12 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
 
-        let dataframe =
-            engine
-                .sql(query)
-                .await
-                .map_err(|error| ExecutorError::LocalExecution {
-                    message: error.to_string(),
-                })?;
+        let dataframe = engine
+            .sql(query)
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: error.to_string(),
+            })?;
         let (batches, sql_stats) = dataframe.collect_with_stats().await.map_err(|error| {
             ExecutorError::LocalExecution {
                 message: error.to_string(),

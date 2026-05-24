@@ -5,9 +5,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::{ExecError, ExecResult};
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
+use crate::{ExecError, ExecResult};
 
 /// Configuration for a session event-time window operator (R5.2).
 ///

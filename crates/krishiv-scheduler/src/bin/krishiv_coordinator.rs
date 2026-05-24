@@ -133,24 +133,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    // GAP-C1: Drive heartbeat eviction and task launch on a periodic tick.
-    let tick_coordinator = coordinator.clone();
-    let tick_period_ms = tick_coordinator
-        .read()
-        .map(|c| c.config().tick_period_ms())
-        .unwrap_or(1_000);
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_millis(tick_period_ms));
-        loop {
-            ticker.tick().await;
-            if let Ok(mut coord) = tick_coordinator.write() {
-                if let Err(e) = coord.coordinator_tick() {
-                    tracing::warn!(error = %e, "coordinator tick failed");
-                }
-            }
-        }
-    });
-
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
         "Krishiv coordinator {} gRPC listening on {}",
@@ -225,6 +207,9 @@ krishiv_shuffle_bytes_written_total {shuffle_bytes}
         shuffle_partitions = m.shuffle_partitions_available,
         shuffle_bytes = m.shuffle_bytes_written,
     );
+    let mut body = body;
+    body.push('\n');
+    body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
