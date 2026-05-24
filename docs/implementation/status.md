@@ -2,13 +2,13 @@
 
 ## Current Phase
 
-**ADR-12.4 follow-ups (2026-05-24).** Branch `cursor/adr124-memory-stream-ttl-cbbd` (extends embedded/streaming fixes):
+**ADR-12.4 follow-ups (2026-05-24).** Branch `cursor/adr124-memory-stream-ttl-cbbd` (extends embedded/streaming fixes on `main`):
 - **ADR-12.4:** `InProcessCoordinatorBridge` + `InProcessStreamingRuntime` — coordinator submits jobs, pushes assignments to `ExecutorAssignmentInbox`, executor runs via `ExecutorTaskRunner::run_next_with` (no tonic for `inprocess://` endpoints).
 - **State TTL:** `LocalWindowExecutionSpec.state_ttl_ms` wires `TtlStateBackend` + `StateBackedTumblingWindowOperator` in `local_streaming` and session `StateTtlConfig` on streams.
 - **Memory streams:** `Session::memory_stream` / `register_memory_stream`; windowed `collect()` uses in-process path for Embedded/SingleNode; Python `memory_stream()` + `memory:<name>` sources use same path.
 - **Stream-kafka contract:** In-process fragments use canonical `key=key:time=ts` columns matching `stream-kafka:` partition encoding.
 
-**Embedded batch/streaming fixes (2026-05-24).** Branch `cursor/fix-embedded-batch-streaming-cbbd` (merged intent):
+**Embedded batch/streaming fixes (2026-05-24).** Merged via PR #41 on `main`; also on this branch:
 - Runtime backends accept batch plans without bogus `SqlEngine` re-execution; embedded redirects streaming to single-node.
 - `local_streaming` executes tumbling/sliding/session windows via `krishiv-exec`.
 - API: `WindowedStream::collect`, `ensure_local_mode`, stream `coordinator_url`, `StateTtlConfig` → `TtlConfig`.
