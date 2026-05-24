@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+axum = { workspace = true }
 dashmap = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
@@ -25,3 +26,8 @@ zstd = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "krishiv-shuffle-svc"
+path = "src/bin/krishiv_shuffle_svc.rs"
+

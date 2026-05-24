@@ -70,6 +70,8 @@ pub struct ExecutorConfig {
     slots: usize,
     coordinator_endpoint: String,
     lease_generation: LeaseGeneration,
+    task_endpoint: Option<String>,
+    barrier_endpoint: Option<String>,
 }
 
 impl ExecutorConfig {
@@ -100,7 +102,27 @@ impl ExecutorConfig {
             slots,
             coordinator_endpoint,
             lease_generation: LeaseGeneration::initial(),
+            task_endpoint: None,
+            barrier_endpoint: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_task_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        if !endpoint.trim().is_empty() {
+            self.task_endpoint = Some(endpoint);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_barrier_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        if !endpoint.trim().is_empty() {
+            self.barrier_endpoint = Some(endpoint);
+        }
+        self
     }
 
     /// Executor id.
@@ -135,7 +157,14 @@ impl ExecutorConfig {
 
     /// Build an executor descriptor for registration.
     pub fn descriptor(&self) -> ExecutorDescriptor {
-        ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots)
+        let mut d = ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots);
+        if let Some(ep) = &self.task_endpoint {
+            d = d.with_task_endpoint(ep);
+        }
+        if let Some(ep) = &self.barrier_endpoint {
+            d = d.with_barrier_endpoint(ep);
+        }
+        d
     }
 }
 
@@ -159,6 +188,20 @@ impl ExecutorRuntime {
     /// Apply coordinator-issued lease generation from register/heartbeat responses.
     pub fn apply_lease_generation(&mut self, lease_generation: LeaseGeneration) {
         self.config.set_lease_generation(lease_generation);
+    }
+
+    /// Update advertised task/barrier gRPC endpoints after listeners bind.
+    pub fn set_advertised_endpoints(
+        &mut self,
+        task_endpoint: Option<String>,
+        barrier_endpoint: Option<String>,
+    ) {
+        if let Some(ep) = task_endpoint {
+            self.config = self.config.clone().with_task_endpoint(ep);
+        }
+        if let Some(ep) = barrier_endpoint {
+            self.config = self.config.clone().with_barrier_endpoint(ep);
+        }
     }
 
     /// Build the versioned registration request this executor will send.

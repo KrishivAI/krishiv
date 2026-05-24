@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use krishiv_checkpoint::{
-    CheckpointMetadata, LocalFsCheckpointStorage, read_epoch_metadata, validate_epoch,
-    validate_fencing_token,
+    CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
+    validate_epoch, validate_fencing_token,
 };
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
@@ -90,12 +90,20 @@ pub mod admission;
 pub mod checkpoint;
 pub mod cluster_control;
 pub mod coordinator_daemon;
+pub mod federation_http;
 pub mod heartbeat;
 pub mod in_process;
 pub mod job;
 pub mod job_coordinator;
 pub mod llm_quota;
 pub mod transport;
+
+mod barrier_client;
+mod barrier_dispatch;
+mod barrier_tracker;
+
+pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
+pub use barrier_tracker::CheckpointBarrierTracker;
 
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use coordinator_daemon::{
@@ -123,7 +131,7 @@ pub use job::{
     JobSnapshot, JobDetailSnapshot, StageSnapshot, TaskSnapshot,
     StabilityMetrics,
     job_spec_from_logical_plan, job_spec_from_physical_plan,
-    StaticScheduler,
+    SlotAwareScheduler, StaticScheduler,
 };
 pub(crate) use job::validate_job;
 pub use store::{
@@ -433,6 +441,8 @@ pub struct Coordinator {
     /// Avoids a full TCP+TLS handshake per task assignment push.
     executor_channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
     checkpoint_notify_sent: HashSet<(JobId, ExecutorId, u64)>,
+    /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
+    barrier_dispatch_sent: HashSet<(JobId, u64)>,
     /// Aggregates LLM quota reports across executors (R17).
     llm_quota_aggregator: llm_quota::LlmQuotaAggregator,
 }
@@ -538,6 +548,21 @@ impl SharedCoordinator {
                 interval.tick().await;
                 if let Err(error) = launch.drive_pending_task_launches().await {
                     eprintln!("coordinator task launch tick failed: {error}");
+                }
+            }
+        });
+        let barriers = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                if let Err(error) = drive_barrier_dispatches(
+                    &barriers,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                {
+                    eprintln!("coordinator barrier dispatch failed: {error}");
                 }
             }
         });
@@ -1355,6 +1380,7 @@ impl Coordinator {
             streaming_task_index: HashMap::new(),
             executor_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             checkpoint_notify_sent: HashSet::new(),
+            barrier_dispatch_sent: HashSet::new(),
             llm_quota_aggregator: llm_quota::LlmQuotaAggregator::new(
                 config.llm_quota_requests_per_minute,
                 config.llm_quota_tokens_per_minute,
@@ -1861,7 +1887,7 @@ impl Coordinator {
                 Ok(storage) => {
                     let mut coord = CheckpointCoordinator::new(
                         job_id.clone(),
-                        Arc::new(storage),
+                        storage,
                         interval_ms,
                         task_count,
                     );
@@ -1883,8 +1909,8 @@ impl Coordinator {
         Ok(())
     }
 
-    fn open_checkpoint_storage(path: &str) -> SchedulerResult<LocalFsCheckpointStorage> {
-        LocalFsCheckpointStorage::new(path).map_err(|e| SchedulerError::InvalidJob {
+    fn open_checkpoint_storage(path: &str) -> SchedulerResult<Arc<dyn CheckpointStorage>> {
+        open_checkpoint_storage_from_uri(path).map_err(|e| SchedulerError::InvalidJob {
             message: format!("failed to open checkpoint storage at {path}: {e}"),
         })
     }
@@ -1945,7 +1971,7 @@ impl Coordinator {
             let storage = Self::open_checkpoint_storage(storage_path)?;
             let ckpt_coord = CheckpointCoordinator::new(
                 spec.job_id().clone(),
-                Arc::new(storage),
+                storage,
                 interval_ms,
                 0,
             );
@@ -1954,7 +1980,7 @@ impl Coordinator {
         }
 
         let executors = self.executors.schedulable_executors();
-        let assignments = StaticScheduler::place(&spec, &executors)?;
+        let assignments = SlotAwareScheduler::place(&spec, &executors)?;
         let job_id = spec.job_id().clone();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
@@ -2070,7 +2096,7 @@ impl Coordinator {
     ) -> SchedulerResult<CheckpointMetadata> {
         let storage = Self::open_checkpoint_storage(storage_path)?;
 
-        let meta = read_epoch_metadata(&storage, job_id.as_str(), epoch).map_err(|e| {
+        let meta = read_epoch_metadata(storage.as_ref(), job_id.as_str(), epoch).map_err(|e| {
             SchedulerError::InvalidJob {
                 message: format!("cannot read checkpoint epoch {epoch}: {e}"),
             }
@@ -2080,7 +2106,7 @@ impl Coordinator {
             message: format!("checkpoint epoch {epoch} not found for job {job_id}"),
         })?;
 
-        validate_epoch(&storage, job_id.as_str(), epoch).map_err(|e| {
+        validate_epoch(storage.as_ref(), job_id.as_str(), epoch).map_err(|e| {
             SchedulerError::InvalidJob {
                 message: format!("checkpoint epoch {epoch} failed integrity check: {e}"),
             }

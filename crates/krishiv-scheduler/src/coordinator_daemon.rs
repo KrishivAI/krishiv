@@ -9,7 +9,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use krishiv_proto::{CoordinatorId, CoordinatorState};
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
@@ -164,10 +164,19 @@ pub async fn spawn_coordinator_sidecars(
 }
 
 pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
+    use crate::federation_http::{
+        federation_cancel_job, federation_job_status, federation_submit_job,
+    };
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/federation/v1/jobs", post(federation_submit_job))
+        .route("/federation/v1/jobs/:job_id", get(federation_job_status))
+        .route(
+            "/federation/v1/jobs/:job_id/cancel",
+            post(federation_cancel_job),
+        )
         .with_state(coordinator)
 }
 

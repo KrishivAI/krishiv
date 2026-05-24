@@ -3,13 +3,13 @@
 use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
-use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBackend};
+use krishiv_state::{RedbStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::window::MultiSourceWatermarkState;
 use crate::{
     AggExpr, AggFunction, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
     SlidingWindowOperator, SlidingWindowSpec, StateBackedTumblingWindowOperator,
-    TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
+    TumblingWindowSpec, WatermarkState,
 };
 
 pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
@@ -135,7 +135,7 @@ pub fn execute_bounded_window(
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
     let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
-    let mut multi_watermark = MultiSourceWatermarkState::new();
+    let mut multi_watermark = MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
     let mut output = Vec::new();
 
     match spec.window_kind {
@@ -146,40 +146,31 @@ pub fn execute_bounded_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            if let Some(ttl_ms) = spec.state_ttl_ms {
-                let inner = InMemoryStateBackend::new();
-                let state: Box<dyn StateBackend> =
-                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
-                let mut op = StateBackedTumblingWindowOperator::new(
-                    tw_spec,
-                    state,
-                    "window-exec",
-                    "tumbling",
-                )
+            let redb = RedbStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-                for batch in &input_batches {
-                    let wm = advance_effective_watermark(
-                        batch,
-                        spec,
-                        &mut single_watermark,
-                        &mut multi_watermark,
-                    )?;
-                    output.extend(op.process_batch(batch, wm)?);
-                }
-                output.extend(op.flush_closed_windows(i64::MAX)?);
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
             } else {
-                let mut op = TumblingWindowOperator::new(tw_spec);
-                for batch in &input_batches {
-                    let wm = advance_effective_watermark(
-                        batch,
-                        spec,
-                        &mut single_watermark,
-                        &mut multi_watermark,
-                    )?;
-                    output.extend(op.process_batch(batch, wm)?);
-                }
-                output.extend(op.flush_closed_windows(i64::MAX)?);
+                Box::new(redb)
+            };
+            let mut op = StateBackedTumblingWindowOperator::new(
+                tw_spec,
+                state,
+                "window-exec",
+                "tumbling",
+            )
+            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            for batch in &input_batches {
+                multi_watermark.apply_idle_source_policy();
+                let wm = advance_effective_watermark(
+                    batch,
+                    spec,
+                    &mut single_watermark,
+                    &mut multi_watermark,
+                )?;
+                output.extend(op.process_batch(batch, wm)?);
             }
+            output.extend(op.flush_closed_windows(i64::MAX)?);
         }
         WindowKind::Sliding => {
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);

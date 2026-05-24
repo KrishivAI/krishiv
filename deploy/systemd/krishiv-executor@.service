@@ -1,0 +1,17 @@
+[Unit]
+Description=Krishiv executor %i
+After=krishiv-clusterd.service
+Requires=krishiv-clusterd.service
+
+[Service]
+Type=simple
+User=krishiv
+Group=krishiv
+Environment=KRISHIV_COORDINATOR_ENDPOINT=http://127.0.0.1:9090
+Environment=KRISHIV_EXECUTOR_ID=exec-%i
+ExecStart=/usr/local/bin/krishiv-executor --connect --executor-id exec-%i --coordinator http://127.0.0.1:9090 --task-grpc-addr 0.0.0.0:5005%i --barrier-grpc-addr 0.0.0.0:5006%i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

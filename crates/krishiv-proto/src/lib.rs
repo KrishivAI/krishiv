@@ -826,6 +826,7 @@ pub struct ExecutorDescriptor {
     host: String,
     slots: usize,
     task_endpoint: Option<String>,
+    barrier_endpoint: Option<String>,
 }
 
 impl ExecutorDescriptor {
@@ -836,6 +837,7 @@ impl ExecutorDescriptor {
             host: host.into(),
             slots,
             task_endpoint: None,
+            barrier_endpoint: None,
         }
     }
 
@@ -845,6 +847,16 @@ impl ExecutorDescriptor {
         let endpoint = endpoint.into();
         if !endpoint.trim().is_empty() {
             self.task_endpoint = Some(endpoint);
+        }
+        self
+    }
+
+    /// Attach the executor-owned barrier gRPC endpoint (BarrierService).
+    #[must_use]
+    pub fn with_barrier_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        if !endpoint.trim().is_empty() {
+            self.barrier_endpoint = Some(endpoint);
         }
         self
     }
@@ -867,6 +879,11 @@ impl ExecutorDescriptor {
     /// Optional executor-owned task assignment endpoint.
     pub fn task_endpoint(&self) -> Option<&str> {
         self.task_endpoint.as_deref()
+    }
+
+    /// Optional executor-owned barrier service endpoint.
+    pub fn barrier_endpoint(&self) -> Option<&str> {
+        self.barrier_endpoint.as_deref()
     }
 }
 
@@ -3447,6 +3464,7 @@ pub mod wire {
             host: value.host().to_owned(),
             slots: value.slots() as u64,
             task_endpoint: value.task_endpoint().unwrap_or_default().to_owned(),
+            barrier_endpoint: value.barrier_endpoint().unwrap_or_default().to_owned(),
         }
     }
 
@@ -3464,6 +3482,9 @@ pub mod wire {
         );
         if !value.task_endpoint.is_empty() {
             descriptor = descriptor.with_task_endpoint(value.task_endpoint);
+        }
+        if !value.barrier_endpoint.is_empty() {
+            descriptor = descriptor.with_barrier_endpoint(value.barrier_endpoint);
         }
         Ok(descriptor)
     }

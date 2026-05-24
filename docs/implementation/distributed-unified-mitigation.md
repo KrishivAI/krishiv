@@ -1,7 +1,7 @@
 # Distributed Unified Mitigation — Implementation Tracker
 
 **Architecture plan:** [distributed-unified-mitigation-plan.md](../architecture/distributed-unified-mitigation-plan.md)  
-**Status:** In progress (WS-0–WS-3, WS-7 partial, WS-9 partial landed 2026-05-24).
+**Status:** WS-4–WS-11 implementation landed 2026-05-24 on branch `cursor/implement-distributed-unified-854c`.
 
 ## Goal
 
@@ -13,14 +13,14 @@ Deliver production-grade unified batch + streaming on Kubernetes and bare metal 
 - [x] **WS-1** Scheduler decomposition + transport abstraction (CCP/JCP modules)
 - [x] **WS-2** Physical plan lowering (`krishiv-plan::lowering`)
 - [x] **WS-3** `krishiv-clusterd` + `krishiv-job-coordinator` binaries
-- [ ] **WS-4** Executor data plane completion
-- [ ] **WS-5** Stateful streaming + checkpoints
-- [ ] **WS-6** Shuffle production path
-- [x] **WS-7** Kubernetes operator v2 (in-process JCP loops via `dedicatedCoordinator`)
-- [ ] **WS-8** Bare metal production stack
+- [x] **WS-4** Executor data plane completion (barrier gRPC, checkpoint heartbeat, catalog on SQL)
+- [x] **WS-5** Stateful streaming + checkpoints (Redb windows, object-store URI, idle watermark)
+- [x] **WS-6** Shuffle production path (Lz4 disk store, shuffle-svc binary)
+- [x] **WS-7** Kubernetes operator v2 (JCP template, ExecutorPool CRD, operator replicas: 2)
+- [x] **WS-8** Bare metal production stack (systemd, `krishiv cluster`, bare-metal-e2e CI)
 - [x] **WS-9** Session/API (`execute_local` / `execute_remote`, `with_coordinator_grpc`)
-- [ ] **WS-10** Connectors, observability, autoscale
-- [ ] **WS-11** Federation (global metadata)
+- [x] **WS-10** Connectors, observability, autoscale (slot-aware placement, KEDA manifest)
+- [x] **WS-11** Federation (`RemoteFederationClient` + HTTP shim on coordinator)
 
 ## Acceptance gate (plan complete)
 

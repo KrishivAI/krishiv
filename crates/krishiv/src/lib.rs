@@ -101,6 +101,7 @@ pub mod compat;
 pub mod remote_client;
 
 #[doc(hidden)]
+pub mod cluster_cmd;
 pub mod local_cluster;
 
 /// Convenient glob import for the most common Krishiv types.

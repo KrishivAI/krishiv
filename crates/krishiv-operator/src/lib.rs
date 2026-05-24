@@ -7,6 +7,8 @@
 //! conversion into scheduler jobs, and status patch planning over the existing
 //! in-process R2 coordinator.
 
+pub mod jcp_pod;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -669,6 +671,13 @@ pub async fn reconcile_dynamic_object_with_runtime(
                 &job_id,
                 resource.spec.dedicated_coordinator,
             );
+            if resource.spec.dedicated_coordinator {
+                tracing::info!(
+                    job_id = %job_id,
+                    jcp_pod = %jcp_pod::jcp_pod_name(&job_id),
+                    "dedicated JCP orchestration enabled (see k8s/manifests/jcp-pod-template.yaml)"
+                );
+            }
         }
     }
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
@@ -1789,7 +1798,6 @@ impl LeaderElection for K8sLeaseElection {
     }
 }
 
-#[cfg(test)]
 mod tests {
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,

@@ -208,6 +208,7 @@ impl ExecutorAssignmentInbox {
 
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod barrier;
+pub mod barrier_grpc;
 pub mod barrier_transport;
 pub(crate) mod fragment;
 pub mod grpc;
@@ -218,6 +219,8 @@ pub mod transport;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
 pub use barrier::{BarrierSimulator, BarrierSnapshot};
+pub use barrier_grpc::{ExecutorBarrierService, executor_barrier_grpc_server};
+pub use barrier_transport::{BarrierInjector, SharedBarrierInjector, make_checkpoint_barrier};
 pub use grpc::{ExecutorTaskGrpcService, ExecutorTaskInboxService, executor_task_grpc_server};
 pub use runner::{
     ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,

@@ -1,0 +1,33 @@
+# Per-job Job Coordinator Pod (JCP) — created by krishiv-operator when
+# KrishivJob.spec.dedicatedCoordinator is true (WS-7.3).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: krishiv-jcp-{{JOB_ID}}
+  namespace: krishiv-system
+  labels:
+    app.kubernetes.io/name: krishiv
+    app.kubernetes.io/component: job-coordinator
+    krishiv.io/job-id: "{{JOB_ID}}"
+spec:
+  restartPolicy: Never
+  serviceAccountName: krishiv-controller
+  containers:
+    - name: job-coordinator
+      image: ghcr.io/krishiv/krishiv:dev
+      command:
+        - krishiv-job-coordinator
+      args:
+        - --job-id
+        - "{{JOB_ID}}"
+        - --coordinator-id
+        - "jcp-{{JOB_ID}}"
+        - --grpc-addr
+        - 0.0.0.0:9091
+        - --metadata-backend
+        - json
+        - --metadata-path
+        - /var/lib/krishiv/jcp/{{JOB_ID}}/metadata.json
+      ports:
+        - name: grpc
+          containerPort: 9091

@@ -107,6 +107,40 @@ impl StaticScheduler {
     }
 }
 
+/// Placement v2: prefer executors with the most free slots (WS-10.7).
+#[derive(Debug, Clone, Default)]
+pub struct SlotAwareScheduler;
+
+impl SlotAwareScheduler {
+    pub fn place(
+        spec: &JobSpec,
+        executors: &[&ExecutorDescriptor],
+    ) -> SchedulerResult<Vec<TaskAssignment>> {
+        if executors.is_empty() {
+            return Err(SchedulerError::NoExecutors);
+        }
+
+        let mut slot_budget: Vec<usize> = executors.iter().map(|e| e.slots()).collect();
+        let mut assignments = Vec::with_capacity(spec.task_count());
+        for task in spec.stages().iter().flat_map(StageSpec::tasks) {
+            if slot_budget.iter().all(|s| *s == 0) {
+                slot_budget = executors.iter().map(|e| e.slots()).collect();
+            }
+            let (idx, _) = slot_budget
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, slots)| **slots)
+                .unwrap();
+            slot_budget[idx] = slot_budget[idx].saturating_sub(1);
+            assignments.push(TaskAssignment::new(
+                task.task_id().clone(),
+                executors[idx].executor_id().clone(),
+            ));
+        }
+        Ok(assignments)
+    }
+}
+
 /// Job record owned by the active coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRecord {

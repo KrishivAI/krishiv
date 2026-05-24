@@ -64,15 +64,36 @@ impl WatermarkState {
 /// The effective watermark is `min(watermark_source_0, watermark_source_1, …)`.
 /// A window is only closed when the effective watermark passes the window end,
 /// so a stalled source holds back all windows.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct MultiSourceWatermarkState {
     source_watermarks: HashMap<String, i64>,
+    last_update_ms: HashMap<String, u64>,
+    idle_timeout_ms: Option<u64>,
+    idle_watermark_ms: i64,
+}
+
+impl Default for MultiSourceWatermarkState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MultiSourceWatermarkState {
     /// Create an empty multi-source watermark tracker.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            source_watermarks: HashMap::new(),
+            last_update_ms: HashMap::new(),
+            idle_timeout_ms: None,
+            idle_watermark_ms: i64::MAX,
+        }
+    }
+
+    /// Advance idle sources to `idle_watermark_ms` after `timeout_ms` without updates (ADR-DIST-17).
+    pub fn with_idle_source_policy(mut self, timeout_ms: u64, idle_watermark_ms: i64) -> Self {
+        self.idle_timeout_ms = Some(timeout_ms);
+        self.idle_watermark_ms = idle_watermark_ms;
+        self
     }
 
     /// Update the watermark for `source_id` (monotonic — decreasing values are ignored).
@@ -83,6 +104,26 @@ impl MultiSourceWatermarkState {
             .or_insert(i64::MIN);
         if watermark_ms > *entry {
             *entry = watermark_ms;
+        }
+        self.last_update_ms.insert(source_id.to_owned(), wall_ms());
+    }
+
+    /// Apply idle-source policy using current wall clock.
+    pub fn apply_idle_source_policy(&mut self) {
+        let Some(timeout_ms) = self.idle_timeout_ms else {
+            return;
+        };
+        let now = wall_ms();
+        for (source_id, last) in &self.last_update_ms.clone() {
+            if now.saturating_sub(*last) >= timeout_ms {
+                let entry = self
+                    .source_watermarks
+                    .entry(source_id.clone())
+                    .or_insert(i64::MIN);
+                if self.idle_watermark_ms > *entry {
+                    *entry = self.idle_watermark_ms;
+                }
+            }
         }
     }
 
@@ -100,4 +141,11 @@ impl MultiSourceWatermarkState {
     pub fn source_count(&self) -> usize {
         self.source_watermarks.len()
     }
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
