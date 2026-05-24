@@ -93,13 +93,6 @@ impl CliResponse {
 }
 
 #[derive(Debug, Clone)]
-struct QueryCommand {
-    query: String,
-    mode: ExecutionMode,
-    parquet_tables: Vec<(String, PathBuf)>,
-}
-
-#[derive(Debug, Clone)]
 struct SubmitCommand {
     job_id: String,
     name: String,
@@ -117,8 +110,18 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
 
     match args {
         [] | ["--help"] | ["-h"] | ["help"] => CliResponse::ok(main_help()),
-        ["sql"] | ["sql", "--help"] | ["sql", "-h"] => CliResponse::ok(sql_help()),
-        ["explain"] | ["explain", "--help"] | ["explain", "-h"] => CliResponse::ok(explain_help()),
+        ["sql"] | ["sql", "--help"] | ["sql", "-h"] => {
+            CliResponse::ok(crate::query_cli::sql_help())
+        }
+        ["explain"] | ["explain", "--help"] | ["explain", "-h"] => {
+            CliResponse::ok(crate::query_cli::explain_help())
+        }
+        ["stream"] | ["stream", "--help"] | ["stream", "-h"] => {
+            CliResponse::ok(crate::stream_cmd::stream_help())
+        }
+        ["table"] | ["table", "--help"] | ["table", "-h"] => {
+            CliResponse::ok(crate::table_cmd::table_help())
+        }
         ["submit"] | ["submit", "--help"] | ["submit", "-h"] => CliResponse::ok(submit_help()),
         ["jobs", "--help"] | ["jobs", "-h"] => CliResponse::ok(jobs_help()),
         ["state"] | ["state", "--help"] | ["state", "-h"] => CliResponse::ok(state_help()),
@@ -129,8 +132,10 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["local"] | ["local", "--help"] | ["local", "-h"] => {
             CliResponse::ok(crate::local_cluster::local_help())
         }
-        ["help", "sql"] => CliResponse::ok(sql_help()),
-        ["help", "explain"] => CliResponse::ok(explain_help()),
+        ["help", "sql"] => CliResponse::ok(crate::query_cli::sql_help()),
+        ["help", "explain"] => CliResponse::ok(crate::query_cli::explain_help()),
+        ["help", "stream"] => CliResponse::ok(crate::stream_cmd::stream_help()),
+        ["help", "table"] => CliResponse::ok(crate::table_cmd::table_help()),
         ["help", "submit"] => CliResponse::ok(submit_help()),
         ["help", "jobs"] => CliResponse::ok(jobs_help()),
         ["help", "state"] => CliResponse::ok(state_help()),
@@ -153,6 +158,8 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
+        ["stream", rest @ ..] => crate::stream_cmd::run_stream(rest),
+        ["table", rest @ ..] => crate::table_cmd::run_table(rest),
         ["submit", rest @ ..] => run_submit(rest),
         ["jobs", rest @ ..] => run_jobs(rest),
         ["state", rest @ ..] => run_state(rest, &coordinator_mode),
@@ -173,8 +180,10 @@ pub fn main_help() -> String {
            krishiv [OPTIONS] <COMMAND>\n\
          \n\
          Commands:\n\
-           sql          Run a local SQL query\n\
+           sql          Run SQL (--local, --remote, --api-key)\n\
            explain      Show logical/physical plan information\n\
+           stream       Continuous streaming jobs (submit, push, poll)\n\
+           table        Read parquet, delta, or hudi tables\n\
            submit       Submit a distributed job to the R2 local scheduler\n\
            jobs         List local jobs for this process\n\
            state        Inspect streaming operator state metadata (R5.2)\n\
@@ -254,32 +263,6 @@ fn run_compat_analyze(args: &[&str]) -> CliResponse {
     }
 }
 
-pub fn sql_help() -> String {
-    String::from(
-        "Run a local SQL query.\n\
-         \n\
-         Usage:\n\
-           krishiv sql --query <SQL> [--parquet <table=path>] [--mode <embedded|single-node>]\n\
-         \n\
-         Examples:\n\
-           krishiv sql --query \"select 1 as value\"\n\
-           krishiv sql --parquet people=./people.parquet --query \"select count(*) from people\"\n",
-    )
-}
-
-pub fn explain_help() -> String {
-    String::from(
-        "Show logical and physical plan information.\n\
-         \n\
-         Usage:\n\
-           krishiv explain --query <SQL> [--parquet <table=path>] [--mode <embedded|single-node>]\n\
-         \n\
-         Examples:\n\
-           krishiv explain --query \"select 1 as value\"\n\
-           krishiv explain --parquet people=./people.parquet --query \"select * from people\"\n",
-    )
-}
-
 pub fn submit_help() -> String {
     String::from(
         "Submit a distributed job to the R2 local scheduler.\n\
@@ -312,40 +295,26 @@ pub fn jobs_help() -> String {
 }
 
 fn run_sql(args: &[&str]) -> CliResponse {
-    let command = match parse_query_command(args) {
+    let command = match crate::query_cli::parse_query_command(args) {
         Ok(command) => command,
-        Err(message) => return CliResponse::err(format!("{message}\n\n{}", sql_help()), 2),
+        Err(message) => {
+            return CliResponse::err(format!("{message}\n\n{}", crate::query_cli::sql_help()), 2)
+        }
     };
-    let session = match build_session(&command) {
-        Ok(session) => session,
-        Err(message) => return CliResponse::err(format!("{message}\n"), 1),
-    };
-    match session
-        .sql(&command.query)
-        .and_then(|dataframe| dataframe.collect())
-        .and_then(|result| result.pretty())
-    {
-        Ok(output) => CliResponse::ok(format!("{output}\n")),
-        Err(error) => CliResponse::err(format!("{error}\n"), 1),
-    }
+    crate::query_cli::run_sql(&command)
 }
 
 fn run_explain(args: &[&str]) -> CliResponse {
-    let command = match parse_query_command(args) {
+    let command = match crate::query_cli::parse_query_command(args) {
         Ok(command) => command,
-        Err(message) => return CliResponse::err(format!("{message}\n\n{}", explain_help()), 2),
+        Err(message) => {
+            return CliResponse::err(
+                format!("{message}\n\n{}", crate::query_cli::explain_help()),
+                2,
+            )
+        }
     };
-    let session = match build_session(&command) {
-        Ok(session) => session,
-        Err(message) => return CliResponse::err(format!("{message}\n"), 1),
-    };
-    match session
-        .sql(&command.query)
-        .and_then(|dataframe| dataframe.explain())
-    {
-        Ok(output) => CliResponse::ok(format!("{output}\n")),
-        Err(error) => CliResponse::err(format!("{error}\n"), 1),
-    }
+    crate::query_cli::run_explain(&command)
 }
 
 fn run_submit(args: &[&str]) -> CliResponse {
@@ -634,81 +603,6 @@ fn render_distributed_jobs(jobs: &[JobSnapshot]) -> String {
     output
 }
 
-fn build_session(command: &QueryCommand) -> Result<Session, String> {
-    let mut builder = Session::builder().with_execution_mode(command.mode);
-    if command.mode == ExecutionMode::SingleNode {
-        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR") {
-            if !url.trim().is_empty() {
-                builder = builder.with_local_cluster(url);
-            }
-        }
-    }
-    if command.mode == ExecutionMode::Distributed {
-        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR") {
-            if !url.trim().is_empty() {
-                builder = builder.with_coordinator(url);
-            }
-        }
-    }
-    let session = builder.build().map_err(|e| e.to_string())?;
-    for (table, path) in &command.parquet_tables {
-        if !path.exists() {
-            return Err(format!(
-                "DataFusion error: parquet file not found: {}",
-                path.display()
-            ));
-        }
-        session
-            .register_parquet(table, path)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(session)
-}
-
-fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
-    let mut query = None;
-    let mut mode = ExecutionMode::Embedded;
-    let mut parquet_tables = Vec::new();
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx] {
-            "--query" | "-q" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| String::from("missing value for --query"))?;
-                query = Some((*value).to_owned());
-            }
-            "--mode" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| String::from("missing value for --mode"))?;
-                mode = parse_mode(value)?;
-            }
-            "--parquet" => {
-                idx += 1;
-                let value = args
-                    .get(idx)
-                    .ok_or_else(|| String::from("missing value for --parquet"))?;
-                parquet_tables.push(parse_parquet_spec(value)?);
-            }
-            "--help" | "-h" => return Err(String::from("help requested")),
-            unknown => return Err(format!("unknown option: {unknown}")),
-        }
-        idx += 1;
-    }
-    let query = query.ok_or_else(|| String::from("missing required --query <SQL>"))?;
-    if query.trim().is_empty() {
-        return Err(String::from("query cannot be empty"));
-    }
-    Ok(QueryCommand {
-        query,
-        mode,
-        parquet_tables,
-    })
-}
-
 fn parse_submit_command(args: &[&str]) -> Result<SubmitCommand, String> {
     let mut job_id = String::from("job-1");
     let mut name = String::from("demo-distributed-job");
@@ -798,28 +692,6 @@ fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
         return Err(format!("{flag} must be greater than zero"));
     }
     Ok(parsed)
-}
-
-fn parse_mode(value: &str) -> Result<ExecutionMode, String> {
-    match value {
-        "embedded" => Ok(ExecutionMode::Embedded),
-        "single-node" => Ok(ExecutionMode::SingleNode),
-        "distributed" => Ok(ExecutionMode::Distributed),
-        other => Err(format!("unsupported mode: {other}")),
-    }
-}
-
-fn parse_parquet_spec(value: &str) -> Result<(String, PathBuf), String> {
-    let (table, path) = value
-        .split_once('=')
-        .ok_or_else(|| String::from("--parquet must use table=path"))?;
-    if table.trim().is_empty() {
-        return Err(String::from("parquet table name cannot be empty"));
-    }
-    if path.trim().is_empty() {
-        return Err(String::from("parquet path cannot be empty"));
-    }
-    Ok((table.to_owned(), PathBuf::from(path)))
 }
 
 // ── R6: savepoint ─────────────────────────────────────────────────────────────
@@ -1159,10 +1031,43 @@ mod tests {
     }
 
     #[test]
+    fn sql_local_flag_is_accepted() {
+        let response = dispatch(&["sql", "--local", "--query", "select 2 as value"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("2"));
+    }
+
+    #[test]
+    fn sql_api_key_requires_env() {
+        let response = dispatch(&["sql", "--api-key", "k", "--query", "select 1"]);
+        assert_eq!(response.exit_code, 1);
+        assert!(response.stderr.contains("KRISHIV_API_KEYS"));
+    }
+
+    #[test]
+    fn stream_submit_lists_job() {
+        let response = dispatch(&["stream", "submit", "--job-id", "cli-events"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(response.stdout.contains("cli-events"));
+    }
+
+    #[test]
+    fn top_level_help_lists_stream_and_table() {
+        let response = dispatch(&["--help"]);
+        assert!(response.stdout.contains("stream"));
+        assert!(response.stdout.contains("table"));
+    }
+
+    #[test]
     fn explain_command_returns_plan() {
         let response = dispatch(&["explain", "--query", "select 1 as value"]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);
-        assert!(response.stdout.contains("logical_plan"));
+        assert!(
+            response.stdout.contains("logical plan:")
+                || response.stdout.contains("logical_plan"),
+            "{}",
+            response.stdout
+        );
     }
 
     #[test]

@@ -107,6 +107,12 @@ pub mod remote_client;
 #[doc(hidden)]
 pub mod cluster_cmd;
 pub mod local_cluster;
+#[doc(hidden)]
+pub mod query_cli;
+#[doc(hidden)]
+pub mod stream_cmd;
+#[doc(hidden)]
+pub mod table_cmd;
 
 /// Distributed control-plane and data-plane building blocks for advanced embedding.
 ///

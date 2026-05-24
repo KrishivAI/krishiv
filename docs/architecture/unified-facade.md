@@ -38,16 +38,22 @@ For operators and custom deployments that embed daemons:
 - `ExecutorConfig`, `ExecutorRuntime`, `ExecutorTaskRunner`, `GrpcCoordinatorService`
 - Proto IDs: `JobId`, `ExecutorId`, `CoordinatorId`, …
 
-## CLI gaps (client commands not yet mirrored)
+## Client CLI (Session API mirrors)
 
-| Session / API | CLI today | Suggested CLI |
-|---------------|-----------|---------------|
-| `execute_local` / `execute_remote` | `sql --mode` only | `krishiv sql --local` / `--remote` |
-| `submit_stream_job` | — | `krishiv stream submit` |
-| `push_stream_job_input` / `poll_stream_job` | — | `krishiv stream push` / `poll` |
-| `sql_as` (auth) | — | `krishiv sql --api-key` |
-| `read_delta_async` / `read_hudi_async` | — | `krishiv table read --format delta` |
-| Remote coordinator gRPC on Session | `-c` / `KRISHIV_COORDINATOR` | ✓ (partial) |
+| Session / API | CLI |
+|---------------|-----|
+| `sql` / `sql_async` | `krishiv sql --query …` |
+| `execute_local` | `krishiv sql --local --query …` |
+| `execute_remote` | `krishiv sql --remote -c <URL> --query …` |
+| `sql_as` | `krishiv sql --api-key <KEY> --query …` (requires `KRISHIV_API_KEYS`) |
+| `submit_stream_job` | `krishiv stream submit --job-id …` |
+| `push_stream_job_input` | `krishiv stream push --job-id … --parquet <path>` |
+| `poll_stream_job` | `krishiv stream poll --job-id …` |
+| `read_parquet` / `read_delta_async` / `read_hudi_async` | `krishiv table read --path … --format parquet\|delta\|hudi` |
+| Window kinds (tumbling / sliding / session) | `krishiv stream submit --window tumbling\|sliding\|session` + size/slide/gap flags |
+| Remote coordinator | `-c` / `KRISHIV_COORDINATOR` on client commands |
+
+Stream submit/push/poll share one in-process cluster per `krishiv` process (via `SessionBuilder::with_in_process_cluster`).
 
 ## Out of scope for the main crate (by design)
 
