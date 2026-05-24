@@ -1,0 +1,17 @@
+[Unit]
+Description=Krishiv cluster control plane (krishiv-clusterd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=krishiv
+Group=krishiv
+Environment=KRISHIV_METADATA_PATH=/var/lib/krishiv/metadata.json
+ExecStart=/usr/local/bin/krishiv-clusterd --grpc-addr 0.0.0.0:9090 --metadata-backend json --metadata-path /var/lib/krishiv/metadata.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,20 @@
 
 ## Current Phase
 
+**Distributed unified mitigation (2026-05-24).** Branch `cursor/implement-distributed-unified-854c`:
+- **CCP/JCP:** `ClusterControlPlane`, `JobCoordinator`, `coordinator_daemon` shared startup.
+- **Lowering:** `krishiv-plan::lowering` encodes `NodeOp` → executor fragments (batch SQL + `stream:tw|sw|ses`).
+- **Binaries:** `krishiv-clusterd`, `krishiv-job-coordinator` for bare-metal multi-process.
+- **Operator:** `spec.dedicatedCoordinator` spawns per-job orchestration loops (in-process JCP); JCP pod template + `KrishivExecutorPool` CRD; operator `replicas: 2`.
+- **WS-4–11:** Barrier gRPC dispatch, object-store checkpoints (`s3://`), Redb window state, shuffle-svc, slot-aware placement, KEDA manifest, `krishiv cluster` CLI, systemd units, `RemoteFederationClient`, bare-metal CI.
+- **API:** `Session::execute_local` / `execute_remote`, `with_coordinator_grpc`.
+- **Tests:** `krishiv-scheduler/tests/distributed_e2e.rs`, `scripts/audit-fencing.sh`.
+
+```bash
+cargo +stable test -p krishiv-scheduler -p krishiv-operator -p krishiv-api -p krishiv-plan -p krishiv-runtime
+cargo +stable test -p krishiv-scheduler --test distributed_e2e
+```
+
 **Unified execution mode parity (2026-05-24).** Branch `cursor/unified-execution-phase0-1-7ffe` (PR #43):
 - **C2:** `SessionBuilder::with_remote_execution(true)` + `KRISHIV_REMOTE_EXEC=1` disables local fallback; data plane routes to Flight.
 - **C3:** Flight comment protocol for catalog sync (`krishiv-register-parquet`) + shared `FlightExecutionHost` on server.

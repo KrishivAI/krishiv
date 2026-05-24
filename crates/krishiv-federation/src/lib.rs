@@ -80,6 +80,111 @@ pub struct JobStatusResponse {
     pub state: String,
 }
 
+// ── RemoteFederationClient ────────────────────────────────────────────────────
+
+/// gRPC/HTTP federation client that forwards to a regional coordinator (WS-11 / ADR-19.1).
+#[derive(Debug, Clone)]
+pub struct RemoteFederationClient {
+    pub region: RegionId,
+    pub coordinator_url: String,
+    http: reqwest::Client,
+}
+
+impl RemoteFederationClient {
+    pub fn new(region: RegionId, coordinator_url: impl Into<String>) -> Self {
+        Self {
+            region,
+            coordinator_url: coordinator_url.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn federation_url(&self, path: &str) -> String {
+        format!(
+            "{}/federation/v1{}",
+            self.coordinator_url.trim_end_matches('/'),
+            path
+        )
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SubmitJobBody<'a> {
+    job_id: &'a str,
+    spec_json: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct SubmitJobResponse {
+    remote_job_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct JobStatusBody {
+    remote_job_id: String,
+    state: String,
+}
+
+#[async_trait]
+impl FederationClient for RemoteFederationClient {
+    async fn submit_job(&self, job_id: &str, spec_json: &str) -> FederationResult<String> {
+        let resp = self
+            .http
+            .post(self.federation_url("/jobs"))
+            .json(&SubmitJobBody { job_id, spec_json })
+            .send()
+            .await
+            .map_err(|e| FederationError(format!("submit_job HTTP: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(FederationError(format!(
+                "submit_job HTTP {}",
+                resp.status()
+            )));
+        }
+        let body: SubmitJobResponse = resp
+            .json()
+            .await
+            .map_err(|e| FederationError(format!("submit_job decode: {e}")))?;
+        Ok(body.remote_job_id)
+    }
+
+    async fn job_status(&self, remote_job_id: &str) -> FederationResult<JobStatusResponse> {
+        let url = self.federation_url(&format!("/jobs/{remote_job_id}"));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| FederationError(format!("job_status HTTP: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(FederationError(format!("job_status HTTP {}", resp.status())));
+        }
+        let body: JobStatusBody = resp
+            .json()
+            .await
+            .map_err(|e| FederationError(format!("job_status decode: {e}")))?;
+        Ok(JobStatusResponse {
+            remote_job_id: body.remote_job_id,
+            state: body.state,
+        })
+    }
+
+    async fn cancel_job(&self, remote_job_id: &str) -> FederationResult<()> {
+        let url = self.federation_url(&format!("/jobs/{remote_job_id}/cancel"));
+        let resp = self
+            .http
+            .post(url)
+            .send()
+            .await
+            .map_err(|e| FederationError(format!("cancel_job HTTP: {e}")))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(FederationError(format!("cancel_job HTTP {}", resp.status())))
+        }
+    }
+}
+
 // ── SingleRegionFederationClient ──────────────────────────────────────────────
 
 /// In-process short-circuit client used when Krishiv runs in a single region.
@@ -264,6 +369,15 @@ mod tests {
             SingleRegionFederationClient::new(RegionId::new("us-east-1"), "http://localhost:7070");
         let result = client.submit_job("job-123", "{}").await.unwrap();
         assert_eq!(result, "job-123");
+    }
+
+    #[tokio::test]
+    async fn remote_client_requires_live_coordinator() {
+        let client = RemoteFederationClient::new(
+            RegionId::new("us-west-2"),
+            "http://127.0.0.1:1",
+        );
+        assert!(client.submit_job("job-1", "{}").await.is_err());
     }
 
     #[tokio::test]

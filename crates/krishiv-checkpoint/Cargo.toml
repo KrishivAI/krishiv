@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 krishiv-state = { path = "../krishiv-state" }
 futures = { workspace = true }
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["aws", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

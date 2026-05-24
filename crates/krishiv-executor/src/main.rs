@@ -9,10 +9,15 @@ use axum::Router;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use krishiv_checkpoint::LocalFsCheckpointStorage;
 use krishiv_executor::{
-    ExecutorAssignmentInbox, ExecutorConfig, ExecutorRuntime, ExecutorTaskRunner,
-    GrpcCoordinatorService, serve_executor_task_grpc_with_listener,
+    ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
+    ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector,
+    executor_barrier_grpc_server, serve_executor_task_grpc_with_listener,
 };
+use krishiv_proto::{InitiateCheckpointRequest, JobId};
+use krishiv_state::RedbStateBackend;
+use tonic::transport::Server;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -38,6 +43,7 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
     let http_addr = config.http_addr;
     let task_grpc_addr = config.task_grpc_addr;
+    let barrier_grpc_addr = config.barrier_grpc_addr;
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
 
     // Start optional HTTP health server (/healthz, /readyz, /metrics).
@@ -59,7 +65,13 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
         ExecutorMode::RegisterOnce => register_once(&runtime).await,
         ExecutorMode::Connect => {
-            heartbeat_loop(&mut runtime, heartbeat_interval_secs, task_grpc_addr).await
+            heartbeat_loop(
+                &mut runtime,
+                heartbeat_interval_secs,
+                task_grpc_addr,
+                barrier_grpc_addr,
+            )
+            .await
         }
     }
 }
@@ -136,6 +148,7 @@ async fn heartbeat_loop(
     runtime: &mut ExecutorRuntime,
     heartbeat_interval_secs: u64,
     task_grpc_addr: Option<SocketAddr>,
+    barrier_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
     register_once(runtime).await?;
 
@@ -148,6 +161,8 @@ async fn heartbeat_loop(
             .await
             .map_err(|e| format!("failed to bind task gRPC addr {addr}: {e}"))?;
         let bound_addr = task_listener.local_addr().unwrap();
+        let endpoint = format!("http://{bound_addr}");
+        runtime.set_advertised_endpoints(Some(endpoint.clone()), None);
         println!("Krishiv executor task gRPC listening on {bound_addr}");
         let server_inbox = inbox.clone();
         tokio::spawn(async move {
@@ -155,18 +170,48 @@ async fn heartbeat_loop(
         });
     }
 
+    if let Some(addr) = barrier_grpc_addr {
+        let barrier_listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind barrier gRPC addr {addr}: {e}"))?;
+        let bound_addr = barrier_listener.local_addr().unwrap();
+        let endpoint = format!("http://{bound_addr}");
+        runtime.set_advertised_endpoints(None, Some(endpoint.clone()));
+        println!("Krishiv executor barrier gRPC listening on {bound_addr}");
+        let injector: SharedBarrierInjector = Default::default();
+        let barrier_service =
+            ExecutorBarrierService::new(injector, runtime.config().executor_id().as_str());
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(executor_barrier_grpc_server(barrier_service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    barrier_listener,
+                ))
+                .await;
+        });
+        // Re-register so coordinator learns barrier endpoint.
+        let _ = runtime.register_with_grpc_endpoint().await;
+    }
+
+    let checkpoint_dir = env::var("KRISHIV_CHECKPOINT_STORAGE")
+        .unwrap_or_else(|_| String::from("/tmp/krishiv-checkpoints"));
+    let checkpoint_storage = LocalFsCheckpointStorage::new(&checkpoint_dir)
+        .map_err(|e| format!("checkpoint storage at {checkpoint_dir}: {e}"))?;
+    let state_backend = RedbStateBackend::ephemeral().map_err(|e| e.to_string())?;
+
     // Spawn the task runner loop: pop assignments from the inbox and run them,
     // reporting status to the coordinator endpoint.
     let runner_inbox = inbox.clone();
     let runner_endpoint = runtime.config().coordinator_endpoint().to_owned();
+    let runner = std::sync::Arc::new(ExecutorTaskRunner::new(runner_inbox));
+    let runner_loop = runner.clone();
     tokio::spawn(async move {
-        let runner = ExecutorTaskRunner::new(runner_inbox);
         loop {
             let coord = GrpcCoordinatorService::new(
                 runner_endpoint.clone(),
                 krishiv_proto::LeaseGeneration::initial(),
             );
-            match runner.run_next_with(&coord).await {
+            match runner_loop.run_next_with(&coord).await {
                 Ok(Some(_report)) => {}
                 Ok(None) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -196,6 +241,27 @@ async fn heartbeat_loop(
                     heartbeat.disposition(),
                     heartbeat.message().unwrap_or("")
                 );
+                for cmd in heartbeat.checkpoint_commands() {
+                    if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
+                        let req = InitiateCheckpointRequest {
+                            job_id,
+                            epoch: cmd.epoch,
+                            fencing_token: cmd.fencing_token,
+                        };
+                        let coord = GrpcCoordinatorService::new(
+                            runtime.config().coordinator_endpoint().to_owned(),
+                            runtime.config().lease_generation(),
+                        );
+                        let _ = runner
+                            .initiate_checkpoint_for_job(
+                                &req,
+                                &state_backend,
+                                &checkpoint_storage,
+                                &coord,
+                            )
+                            .await;
+                    }
+                }
             }
             _ = sigterm.recv() => {
                 println!("SIGTERM received — deregistering and shutting down");
@@ -217,6 +283,8 @@ struct ExecutorCliConfig {
     http_addr: Option<SocketAddr>,
     /// GAP-CP-09: Address for the executor task gRPC server.
     task_grpc_addr: Option<SocketAddr>,
+    /// BarrierService gRPC listen address (WS-4).
+    barrier_grpc_addr: Option<SocketAddr>,
     help: bool,
 }
 
@@ -251,6 +319,10 @@ impl ExecutorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .or_else(|| "0.0.0.0:50055".parse().ok()),
+            barrier_grpc_addr: env::var("KRISHIV_BARRIER_GRPC_ADDR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| "0.0.0.0:50056".parse().ok()),
             help: false,
         };
         let mut args = args.into_iter();
@@ -288,6 +360,16 @@ impl ExecutorCliConfig {
                     } else {
                         config.task_grpc_addr = Some(value.parse().map_err(|_| {
                             format!("invalid socket address for --task-grpc-addr: {value}")
+                        })?);
+                    }
+                }
+                "--barrier-grpc-addr" => {
+                    let value = next_arg(&mut args, "--barrier-grpc-addr")?;
+                    if value == "off" {
+                        config.barrier_grpc_addr = None;
+                    } else {
+                        config.barrier_grpc_addr = Some(value.parse().map_err(|_| {
+                            format!("invalid socket address for --barrier-grpc-addr: {value}")
                         })?);
                     }
                 }

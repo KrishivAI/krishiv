@@ -95,10 +95,19 @@ impl ExecutionModel {
     /// Everything else is treated as batch (existing behaviour is preserved).
     pub fn from_fragment(fragment: &str) -> Self {
         if fragment.starts_with("stream:") {
-            Self::Streaming
-        } else {
-            Self::Batch
+            return Self::Streaming;
         }
+        if let Some(op) = krishiv_plan::decode_task_fragment(fragment) {
+            return match op {
+                krishiv_plan::NodeOp::TumblingWindow { .. }
+                | krishiv_plan::NodeOp::SlidingWindow { .. }
+                | krishiv_plan::NodeOp::SessionWindow { .. }
+                | krishiv_plan::NodeOp::StreamSource { .. }
+                | krishiv_plan::NodeOp::Watermark { .. } => Self::Streaming,
+                _ => Self::Batch,
+            };
+        }
+        Self::Batch
     }
 }
 
@@ -199,6 +208,7 @@ impl ExecutorAssignmentInbox {
 
 // ── Sub-modules ────────────────────────────────────────────────────────────────
 pub mod barrier;
+pub mod barrier_grpc;
 pub mod barrier_transport;
 pub(crate) mod fragment;
 pub mod grpc;
@@ -209,6 +219,8 @@ pub mod transport;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
 pub use barrier::{BarrierSimulator, BarrierSnapshot};
+pub use barrier_grpc::{ExecutorBarrierService, executor_barrier_grpc_server};
+pub use barrier_transport::{BarrierInjector, SharedBarrierInjector, make_checkpoint_barrier};
 pub use grpc::{ExecutorTaskGrpcService, ExecutorTaskInboxService, executor_task_grpc_server};
 pub use runner::{
     ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,

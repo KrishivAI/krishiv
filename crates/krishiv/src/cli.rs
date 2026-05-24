@@ -140,6 +140,7 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["help", "compat"] => CliResponse::ok(compat_help()),
         ["help", "local"] => CliResponse::ok(crate::local_cluster::local_help()),
         ["local", rest @ ..] => crate::local_cluster::run_local(rest),
+        ["cluster", rest @ ..] => crate::cluster_cmd::run_cluster(rest),
         ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
@@ -173,6 +174,7 @@ pub fn main_help() -> String {
            checkpoints  List checkpoints for a streaming job (R6)\n\
            compat       PySpark migration compatibility tools (R15)\n\
            local        Start/stop/status a Spark-like local cluster\n\
+           cluster      Start/stop/status bare-metal clusterd + executors\n\
            help         Show help for a command\n\
          \n\
          Options:\n\

@@ -24,8 +24,10 @@
 
 pub mod object_store;
 pub mod rescaling;
+pub mod storage_uri;
 
 pub use object_store::ObjectStoreCheckpointStorage;
+pub use storage_uri::open_checkpoint_storage_from_uri;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

@@ -7,9 +7,12 @@
 //! conversion into scheduler jobs, and status patch planning over the existing
 //! in-process R2 coordinator.
 
+pub mod jcp_pod;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use k8s_openapi::api::coordination::v1::Lease;
@@ -19,8 +22,8 @@ use krishiv_proto::{
     JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
-    Coordinator, JobSnapshot, LeaderElection, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy,
-    ResourceUsage, SchedulerError, SharedCoordinator, SubmitOutcome,
+    Coordinator, JobCoordinator, JobSnapshot, LeaderElection, NamespaceQuotaSnapshot,
+    QueueManager, QuotaPolicy, ResourceUsage, SchedulerError, SharedCoordinator, SubmitOutcome,
 };
 use kube::Client;
 use kube::api::{Api, ObjectMeta as KubeObjectMeta, Patch, PatchParams, PostParams};
@@ -250,6 +253,10 @@ pub struct KrishivJobSpec {
     /// Optional labels propagated to future runtime objects.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// When true, the operator runs a per-job orchestration loop (JCP) in addition
+    /// to the cluster control plane tick loops (ADR-DIST-01).
+    #[serde(default, rename = "dedicatedCoordinator")]
+    pub dedicated_coordinator: bool,
 }
 
 impl KrishivJobSpec {
@@ -264,6 +271,7 @@ impl KrishivJobSpec {
             args: Vec::new(),
             restart_policy: RestartPolicy::Never,
             labels: BTreeMap::new(),
+            dedicated_coordinator: false,
         }
     }
 
@@ -647,13 +655,31 @@ pub async fn reconcile_dynamic_object_with_runtime(
     object: DynamicObject,
 ) -> OperatorResult<KubernetesReconcileReport> {
     let resource = resource_from_dynamic_object(&object)?;
-    let outcome = {
+    let (outcome, job_id) = {
         let mut coordinator = runtime
             .coordinator
             .write()
             .map_err(|_| OperatorError::CoordinatorLockPoisoned)?;
-        runtime.reconciler.reconcile(&mut coordinator, &resource)?
+        let job_id = scheduler_job_id(&resource).ok();
+        let outcome = runtime.reconciler.reconcile(&mut coordinator, &resource)?;
+        (outcome, job_id)
     };
+    if matches!(outcome.action(), ReconcileAction::Submitted) {
+        if let Some(job_id) = job_id {
+            runtime.reconciler.ensure_dedicated_job_loop(
+                &runtime.coordinator,
+                &job_id,
+                resource.spec.dedicated_coordinator,
+            );
+            if resource.spec.dedicated_coordinator {
+                tracing::info!(
+                    job_id = %job_id,
+                    jcp_pod = %jcp_pod::jcp_pod_name(&job_id),
+                    "dedicated JCP orchestration enabled (see k8s/manifests/jcp-pod-template.yaml)"
+                );
+            }
+        }
+    }
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
 
     Ok(KubernetesReconcileReport {
@@ -759,6 +785,8 @@ pub fn krishivjob_api(
 #[derive(Debug, Clone)]
 pub struct KrishivJobReconciler {
     coordinator_id: CoordinatorId,
+    /// Tracks jobs that already have a dedicated in-process JCP loop.
+    dedicated_loops: Arc<std::sync::Mutex<std::collections::HashSet<JobId>>>,
 }
 
 fn watcher_config(config: &KubernetesControllerConfig) -> watcher::Config {
@@ -792,7 +820,30 @@ fn register_bootstrap_executor(
 impl KrishivJobReconciler {
     /// Create a reconciler for one active coordinator.
     pub fn new(coordinator_id: CoordinatorId) -> Self {
-        Self { coordinator_id }
+        Self {
+            coordinator_id,
+            dedicated_loops: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// Start a per-job orchestration loop when `dedicatedCoordinator` is enabled.
+    pub fn ensure_dedicated_job_loop(
+        &self,
+        cluster: &SharedCoordinator,
+        job_id: &JobId,
+        enabled: bool,
+    ) {
+        if !enabled {
+            return;
+        }
+        let Ok(mut guard) = self.dedicated_loops.lock() else {
+            return;
+        };
+        if !guard.insert(job_id.clone()) {
+            return;
+        }
+        drop(guard);
+        JobCoordinator::new(job_id.clone(), cluster.clone()).spawn_job_orchestration_loops();
     }
 
     /// Active coordinator id used in status patches.
@@ -1747,7 +1798,6 @@ impl LeaderElection for K8sLeaseElection {
     }
 }
 
-#[cfg(test)]
 mod tests {
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
@@ -2458,6 +2508,8 @@ mod tests {
             operator_snapshots: vec![],
             is_savepoint: false,
             savepoint_label: None,
+            iceberg_snapshot_id: None,
+            kafka_offsets: None,
         };
         // Epoch 1 commit succeeds (current token = 1, meta token = 1).
         assert!(validate_fencing_token(&meta_epoch1, coord_a.fencing_token()).is_ok());

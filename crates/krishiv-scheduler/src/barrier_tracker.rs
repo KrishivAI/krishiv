@@ -12,6 +12,7 @@ pub struct CheckpointBarrierTracker {
     pub job_id: String,
     expected_tasks: HashSet<String>,
     received_acks: HashSet<String>,
+    ack_details: Vec<BarrierAck>,
     started_at: Instant,
     timeout: Duration,
 }
@@ -28,6 +29,7 @@ impl CheckpointBarrierTracker {
             job_id: job_id.into(),
             expected_tasks: expected_tasks.into_iter().collect(),
             received_acks: HashSet::new(),
+            ack_details: Vec::new(),
             started_at: Instant::now(),
             timeout,
         }
@@ -38,7 +40,12 @@ impl CheckpointBarrierTracker {
             return false;
         }
         self.received_acks.insert(ack.task_id.clone());
+        self.ack_details.push(ack.clone());
         self.is_complete()
+    }
+
+    pub fn collected_acks(&self) -> &[BarrierAck] {
+        &self.ack_details
     }
 
     pub fn is_complete(&self) -> bool {

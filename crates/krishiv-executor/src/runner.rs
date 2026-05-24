@@ -820,6 +820,54 @@ impl ExecutorTaskRunner {
             .await
             .map(tonic::Response::into_inner)
     }
+
+    /// Fan out checkpoint initiation to all known task runners for a job (heartbeat path).
+    pub async fn initiate_checkpoint_for_job<S>(
+        &self,
+        req: &InitiateCheckpointRequest,
+        state_backend: &dyn StateBackend,
+        storage: &impl CheckpointStorage,
+        coordinator: &S,
+    ) -> Result<(), tonic::Status>
+    where
+        S: CoordinatorExecutorService,
+    {
+        use krishiv_proto::{
+            ExecutorId, ExecutorTaskAssignment, LeaseGeneration, OutputContract,
+            OutputContractKind, PlanFragment, TaskAttemptRef,
+        };
+        for entry in self.checkpoint_runners.iter() {
+            let task_id = entry.key().clone();
+            let stage_id = krishiv_proto::StageId::try_new("checkpoint")
+                .or_else(|_| krishiv_proto::StageId::try_new("s0"))
+                .expect("stage id");
+            let ids = TaskAttemptRef::new(
+                req.job_id.clone(),
+                stage_id,
+                task_id,
+                krishiv_proto::AttemptId::initial(),
+            );
+            let assignment = ExecutorTaskAssignment::new(
+                ids,
+                ExecutorId::try_new("exec-checkpoint").unwrap_or_else(|_| {
+                    ExecutorId::try_new("exec").expect("exec id")
+                }),
+                LeaseGeneration::initial(),
+                PlanFragment::new("checkpoint"),
+                OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
+            );
+            let _ = self
+                .initiate_checkpoint_and_deliver_ack(
+                    &assignment,
+                    req.clone(),
+                    state_backend,
+                    storage,
+                    coordinator,
+                )
+                .await;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn parse_local_parquet_partitions(

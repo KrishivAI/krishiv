@@ -33,6 +33,8 @@ message ExecutorDescriptor {
   string host = 2;
   uint64 slots = 3;
   string task_endpoint = 4;
+  // gRPC endpoint for BarrierService (ADR-R16.1); empty = derive from task_endpoint host.
+  string barrier_endpoint = 5;
 }
 
 message RegisterExecutorRequest {

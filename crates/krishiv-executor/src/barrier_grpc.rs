@@ -49,10 +49,12 @@ impl BarrierService for ExecutorBarrierService {
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 injector.enqueue(barrier.clone());
+                let ack_task_id = task_id_from_checkpoint_id(&barrier.checkpoint_id)
+                    .unwrap_or_else(|| task_id.clone());
                 let ack = BarrierAck {
                     epoch: barrier.epoch,
                     job_id: barrier.job_id.clone(),
-                    task_id: task_id.clone(),
+                    task_id: ack_task_id,
                     state_handle: Some(StateHandle {
                         backend_kind: "redb".into(),
                         checkpoint_uri: format!(
@@ -74,6 +76,17 @@ impl BarrierService for ExecutorBarrierService {
 }
 
 /// Client helper: send one barrier and wait for matching ack (tests / coordinator).
+/// Parse `task:<task_id>/...` from checkpoint id (coordinator → executor contract).
+fn task_id_from_checkpoint_id(checkpoint_id: &str) -> Option<String> {
+    let rest = checkpoint_id.strip_prefix("task:")?;
+    let task_id = rest.split('/').next()?;
+    if task_id.is_empty() {
+        None
+    } else {
+        Some(task_id.to_owned())
+    }
+}
+
 pub async fn send_barrier_and_wait_ack(
     client: &mut krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient<
         tonic::transport::Channel,
