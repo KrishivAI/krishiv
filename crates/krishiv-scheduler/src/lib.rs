@@ -7,7 +7,7 @@
 //! executors; R3.1 maps coordinator/executor contracts to a networked gRPC
 //! service.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
@@ -26,7 +26,9 @@ use krishiv_proto::{
     DeregisterExecutorRequest,
     DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
     ExecutorHeartbeatResponse, ExecutorId, ExecutorTaskAssignment,
-    HeartbeatHotKeyReport, HeartbeatThrottleCommand, InitiateCheckpointRequest,
+    HeartbeatHotKeyReport, HeartbeatThrottleCommand, InitiateCheckpointCommand,
+    InitiateCheckpointRequest,
+    LlmThrottleCommand,
     InspectStateRequest, InspectStateResponse, ListCheckpointsRequest, ListCheckpointsResponse,
     JobId, JobKind, JobSpec, LeaseGeneration,
     RegisterExecutorRequest, RegisterExecutorResponse,
@@ -88,6 +90,7 @@ pub mod admission;
 pub mod checkpoint;
 pub mod heartbeat;
 pub mod job;
+pub mod llm_quota;
 pub(crate) mod store;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
@@ -140,6 +143,10 @@ pub struct CoordinatorConfig {
     /// Used to convert tick counts into elapsed-time estimates for the
     /// per-job checkpoint interval timer.  Defaults to 1 000 ms (1 second).
     tick_period_ms: u64,
+    /// Job-level LLM request quota per minute (R17).
+    llm_quota_requests_per_minute: u32,
+    /// Job-level LLM token quota per minute (R17).
+    llm_quota_tokens_per_minute: u64,
 }
 
 impl CoordinatorConfig {
@@ -151,7 +158,17 @@ impl CoordinatorConfig {
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
             tick_period_ms: 1_000,
+            llm_quota_requests_per_minute: 100,
+            llm_quota_tokens_per_minute: 10_000,
         }
+    }
+
+    /// Override job-level LLM request quota (R17).
+    #[must_use]
+    pub fn with_llm_quota(mut self, requests_per_minute: u32, tokens_per_minute: u64) -> Self {
+        self.llm_quota_requests_per_minute = requests_per_minute;
+        self.llm_quota_tokens_per_minute = tokens_per_minute;
+        self
     }
 
     /// Set the memory threshold above which executors are skipped for placement.
@@ -258,6 +275,17 @@ pub struct ThrottleDecision {
     pub source_id: String,
     /// Maximum rows per second (`None` clears the throttle).
     pub rows_per_second: Option<u64>,
+}
+
+/// Side effects returned from a successful executor heartbeat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutorHeartbeatEffects {
+    /// Source-operator throttle directives (R7.2).
+    pub source_throttles: Vec<ThrottleDecision>,
+    /// LLM UDF throttle directives (R17).
+    pub llm_throttles: Vec<LlmThrottleCommand>,
+    pub checkpoint_commands: Vec<InitiateCheckpointCommand>,
+    pub lease_generation: LeaseGeneration,
 }
 
 /// Scheduler and coordinator errors.
@@ -388,6 +416,9 @@ pub struct Coordinator {
     /// P1.2: Cached gRPC channels keyed by executor endpoint string.
     /// Avoids a full TCP+TLS handshake per task assignment push.
     executor_channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+    checkpoint_notify_sent: HashSet<(JobId, ExecutorId, u64)>,
+    /// Aggregates LLM quota reports across executors (R17).
+    llm_quota_aggregator: llm_quota::LlmQuotaAggregator,
 }
 
 impl fmt::Debug for Coordinator {
@@ -427,6 +458,74 @@ impl SharedCoordinator {
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Coordinator>> {
         self.inner.write()
     }
+
+    /// Advance the heartbeat clock by one tick (P0-4).
+    pub fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
+        self.write()
+            .map_err(|_| SchedulerError::Transport {
+                message: "coordinator lock poisoned".to_string(),
+            })?
+            .advance_heartbeat_clock(1)
+    }
+
+    /// Launch and push all assigned tasks for non-terminal jobs (P0-4).
+    pub async fn drive_pending_task_launches(&self) -> SchedulerResult<usize> {
+        let job_ids = {
+            let coord = self.read().map_err(|_| SchedulerError::Transport {
+                message: "coordinator lock poisoned".to_string(),
+            })?;
+            coord
+                .jobs
+                .iter()
+                .filter(|(_, job)| !job.state().is_terminal())
+                .map(|(job_id, _)| job_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut launched = 0usize;
+        for job_id in job_ids {
+            let targets = {
+                let mut coord = self.write().map_err(|_| SchedulerError::Transport {
+                    message: "coordinator lock poisoned".to_string(),
+                })?;
+                let assignments = coord.launch_assigned_task_assignments(&job_id)?;
+                coord.resolve_assignment_targets(assignments)?
+            };
+            let channels = {
+                let coord = self.read().map_err(|_| SchedulerError::Transport {
+                    message: "coordinator lock poisoned".to_string(),
+                })?;
+                coord.executor_channels.clone()
+            };
+            let responses =
+                Coordinator::deliver_assignment_targets_with_channels(channels, targets).await?;
+            launched = launched.saturating_add(responses.len());
+        }
+        Ok(launched)
+    }
+
+    /// Spawn background heartbeat and task-launch loops for standalone deployments (P0-4).
+    pub fn spawn_orchestration_loops(&self) {
+        let heartbeat = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(error) = heartbeat.advance_heartbeat_tick() {
+                    eprintln!("coordinator heartbeat tick failed: {error}");
+                }
+            }
+        });
+        let launch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if let Err(error) = launch.drive_pending_task_launches().await {
+                    eprintln!("coordinator task launch tick failed: {error}");
+                }
+            }
+        });
+    }
 }
 
 /// Tonic-shaped adapter that exposes coordinator/executor RPCs over a shared coordinator.
@@ -455,6 +554,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         // GAP-CP-08: Extract auth context for every handler.
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -491,6 +591,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "deregister_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -533,6 +634,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -562,19 +664,23 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         if !request.hot_key_reports().is_empty() {
             heartbeat = heartbeat.with_hot_key_reports(request.hot_key_reports().to_vec());
         }
+        if !request.llm_quota_reports().is_empty() {
+            heartbeat = heartbeat.with_llm_quota_reports(request.llm_quota_reports().to_vec());
+        }
         let mut coordinator = self
             .coordinator
             .write()
             .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {
-            Ok(throttle_cmds) => {
+            Ok(effects) => {
                 let mut resp = ExecutorHeartbeatResponse::new(
-                    request.lease_generation(),
+                    effects.lease_generation,
                     TransportDisposition::Accepted,
                 );
-                if !throttle_cmds.is_empty() {
-                    let wire_cmds: Vec<HeartbeatThrottleCommand> = throttle_cmds
+                if !effects.source_throttles.is_empty() {
+                    let wire_cmds: Vec<HeartbeatThrottleCommand> = effects
+                        .source_throttles
                         .into_iter()
                         .map(|c| HeartbeatThrottleCommand {
                             source_id: c.source_id,
@@ -582,6 +688,12 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                         })
                         .collect();
                     resp = resp.with_throttle_commands(wire_cmds);
+                }
+                if !effects.llm_throttles.is_empty() {
+                    resp = resp.with_llm_throttles(effects.llm_throttles);
+                }
+                if !effects.checkpoint_commands.is_empty() {
+                    resp = resp.with_checkpoint_commands(effects.checkpoint_commands);
                 }
                 resp
             }
@@ -605,6 +717,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "task_status");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -669,6 +782,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
         // GAP-CK-03: commit_epoch() calls sync disk I/O via LocalFsCheckpointStorage.
@@ -1022,6 +1136,35 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
     }
 }
 
+// ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
+
+static GRPC_AUTH_PROVIDER: std::sync::OnceLock<Arc<dyn krishiv_governance::AuthProvider>> =
+    std::sync::OnceLock::new();
+
+/// Install a process-wide auth provider for coordinator gRPC (optional).
+pub fn set_grpc_auth_provider(provider: Arc<dyn krishiv_governance::AuthProvider>) {
+    let _ = GRPC_AUTH_PROVIDER.set(provider);
+}
+
+/// Validate `auth` when a provider is configured; otherwise allow anonymous access.
+pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
+    let Some(provider) = GRPC_AUTH_PROVIDER.get() else {
+        return Ok(());
+    };
+    match auth {
+        AuthContext::Bearer { subject } => {
+            if provider.authenticate(subject).is_some() {
+                Ok(())
+            } else {
+                Err(tonic::Status::unauthenticated("invalid API key"))
+            }
+        }
+        AuthContext::Anonymous => Err(tonic::Status::unauthenticated(
+            "missing Bearer token",
+        )),
+    }
+}
+
 // ── R8 auth interceptor skeleton ─────────────────────────────────────────────
 
 /// Authentication context extracted by the auth interceptor.
@@ -1088,13 +1231,26 @@ pub fn coordinator_executor_grpc_server(
     )
 }
 
+/// Build the coordinator management gRPC service (GAP-RT-04).
+pub fn coordinator_management_grpc_server(
+    coordinator: SharedCoordinator,
+) -> wire::v1::coordinator_management_server::CoordinatorManagementServer<
+    CoordinatorManagementGrpcService,
+> {
+    wire::v1::coordinator_management_server::CoordinatorManagementServer::new(
+        CoordinatorManagementGrpcService::new(coordinator),
+    )
+}
+
 /// Serve the coordinator/executor gRPC API on a socket address.
 pub async fn serve_coordinator_executor_grpc(
     addr: SocketAddr,
     coordinator: SharedCoordinator,
 ) -> Result<(), tonic::transport::Error> {
+    let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
         .add_service(coordinator_executor_grpc_server(coordinator))
+        .add_service(coordinator_management_grpc_server(coordinator_for_management))
         .serve(addr)
         .await
 }
@@ -1104,8 +1260,10 @@ pub async fn serve_coordinator_executor_grpc_with_listener(
     listener: tokio::net::TcpListener,
     coordinator: SharedCoordinator,
 ) -> Result<(), tonic::transport::Error> {
+    let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
         .add_service(coordinator_executor_grpc_server(coordinator))
+        .add_service(coordinator_management_grpc_server(coordinator_for_management))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
 }
@@ -1180,25 +1338,22 @@ impl Coordinator {
             adaptive_override: AdaptiveOverrideConfig::default(),
             streaming_task_index: HashMap::new(),
             executor_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            checkpoint_notify_sent: HashSet::new(),
+            llm_quota_aggregator: llm_quota::LlmQuotaAggregator::new(
+                config.llm_quota_requests_per_minute,
+                config.llm_quota_tokens_per_minute,
+            ),
         }
     }
 
     /// Create a new active coordinator with a process-unique identifier.
     pub fn new_active(config: Option<CoordinatorConfig>) -> Self {
-        Self::build(
-            Self::generate_id(),
-            config.unwrap_or_default(),
-            CoordinatorState::Active,
-        )
+        Self::try_new_active(config).expect("coordinator id generation")
     }
 
     /// Create a new standby coordinator with a process-unique identifier.
     pub fn new_standby(config: Option<CoordinatorConfig>) -> Self {
-        Self::build(
-            Self::generate_id(),
-            config.unwrap_or_default(),
-            CoordinatorState::Standby,
-        )
+        Self::try_new_standby(config).expect("coordinator id generation")
     }
 
     /// Generate a process-unique `CoordinatorId`.
@@ -1206,11 +1361,31 @@ impl Coordinator {
     /// Uses a process-local atomic counter so that multiple coordinator
     /// instances (e.g. during distributed tests or multi-API-server deployments)
     /// each receive a distinct identity without requiring an external ID service.
-    fn generate_id() -> CoordinatorId {
+    fn generate_id() -> SchedulerResult<CoordinatorId> {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         CoordinatorId::try_new(format!("coordinator-{n}"))
-            .expect("generated coordinator id is always valid")
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: format!("generated coordinator id invalid: {e}"),
+            })
+    }
+
+    /// Create a new active coordinator, returning an error if id generation fails.
+    pub fn try_new_active(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
+        Ok(Self::build(
+            Self::generate_id()?,
+            config.unwrap_or_default(),
+            CoordinatorState::Active,
+        ))
+    }
+
+    /// Create a new standby coordinator, returning an error if id generation fails.
+    pub fn try_new_standby(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
+        Ok(Self::build(
+            Self::generate_id()?,
+            config.unwrap_or_default(),
+            CoordinatorState::Standby,
+        ))
     }
 
     pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
@@ -1269,6 +1444,16 @@ impl Coordinator {
         self.state
     }
 
+    /// Promote a standby coordinator to active leader (P0-5 / P3-19).
+    pub fn promote_to_active(&mut self) {
+        self.state = CoordinatorState::Active;
+    }
+
+    /// Demote to standby when leadership is lost.
+    pub fn demote_to_standby(&mut self) {
+        self.state = CoordinatorState::Standby;
+    }
+
     /// Coordinator config.
     pub fn config(&self) -> CoordinatorConfig {
         self.config
@@ -1305,17 +1490,36 @@ impl Coordinator {
     pub fn executor_heartbeat(
         &mut self,
         heartbeat: ExecutorHeartbeat,
-    ) -> SchedulerResult<Vec<ThrottleDecision>> {
+    ) -> SchedulerResult<ExecutorHeartbeatEffects> {
         self.ensure_active()?;
+        let executor_id = heartbeat.executor_id().clone();
+        let fallback_lease = heartbeat.lease_generation();
         let streaming_states: Vec<StreamingTaskState> = heartbeat.streaming_task_states().to_vec();
         let hot_key_reports = heartbeat.hot_key_reports().to_vec();
+        let llm_reports = heartbeat.llm_quota_reports().to_vec();
         self.executors.heartbeat(heartbeat)?;
         for state in &streaming_states {
             self.apply_streaming_task_state(state);
         }
         // R7.2 Group D: process hot-key reports and record adaptive decisions.
         self.process_hot_key_reports(&hot_key_reports);
-        Ok(Vec::new())
+        if !llm_reports.is_empty() {
+            self.llm_quota_aggregator.ingest(&llm_reports);
+        }
+        let llm_throttles = self.llm_quota_aggregator.evaluate_and_reset();
+        let checkpoint_commands =
+            self.pending_initiate_checkpoints_for_executor(&executor_id);
+        let lease_generation = self
+            .executors
+            .find_executor(&executor_id)
+            .map(|e| e.lease_generation())
+            .unwrap_or(fallback_lease);
+        Ok(ExecutorHeartbeatEffects {
+            source_throttles: Vec::new(),
+            llm_throttles,
+            checkpoint_commands,
+            lease_generation,
+        })
     }
 
     /// Record adaptive decisions for incoming hot-key reports.
@@ -1446,13 +1650,89 @@ impl Coordinator {
             evicted.push(lost_id.clone());
         }
 
-        // Drive per-job checkpoint interval timers.
+        // Drive per-job checkpoint interval timers (SCH-3: quorum = running tasks).
         let elapsed_ms = ticks.saturating_mul(self.config.tick_period_ms());
-        for coord in self.checkpoint_coordinators.values_mut() {
-            coord.try_tick(elapsed_ms);
+        let job_ids: Vec<JobId> = self.checkpoint_coordinators.keys().cloned().collect();
+        for job_id in job_ids {
+            let running = self.running_task_count_for_job(&job_id);
+            if let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) {
+                coord.set_expected_task_count(running);
+                coord.try_tick(elapsed_ms);
+            }
         }
 
         Ok(evicted)
+    }
+
+    /// Count tasks in `Running` or `Assigned` state for a job (checkpoint quorum size).
+    fn running_task_count_for_job(&self, job_id: &JobId) -> usize {
+        self.jobs.get(job_id).map_or(0, |job| {
+            job.stages
+                .iter()
+                .flat_map(|stage| stage.tasks())
+                .filter(|task| {
+                    matches!(
+                        task.state(),
+                        TaskState::Running | TaskState::Assigned
+                    )
+                })
+                .count()
+        })
+    }
+
+    pub fn coordinator_tick(&mut self) -> SchedulerResult<()> {
+        self.advance_heartbeat_clock(1)?;
+        for job_id in self.jobs.keys().cloned().collect::<Vec<_>>() {
+            let _ = self.launch_assigned_task_assignments(&job_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn pending_initiate_checkpoints_for_executor(
+        &mut self,
+        executor_id: &ExecutorId,
+    ) -> Vec<InitiateCheckpointCommand> {
+        let mut out = Vec::new();
+        for (job_id, coord) in &self.checkpoint_coordinators {
+            let epoch = match &coord.state {
+                CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+                _ => continue,
+            };
+            if !self.executor_has_running_task_in_job(executor_id, job_id) {
+                continue;
+            }
+            let key = (job_id.clone(), executor_id.clone(), epoch);
+            if self.checkpoint_notify_sent.contains(&key) {
+                continue;
+            }
+            out.push(InitiateCheckpointCommand {
+                job_id: job_id.clone(),
+                epoch,
+                fencing_token: coord.fencing_token,
+            });
+            self.checkpoint_notify_sent.insert(key);
+        }
+        out
+    }
+
+    fn clear_checkpoint_notify_for_epoch(&mut self, job_id: &JobId, epoch: u64) {
+        self.checkpoint_notify_sent
+            .retain(|(jid, _, e)| jid != job_id || *e != epoch);
+    }
+
+    fn executor_has_running_task_in_job(
+        &self,
+        executor_id: &ExecutorId,
+        job_id: &JobId,
+    ) -> bool {
+        self.jobs.get(job_id).is_some_and(|job| {
+            job.stages.iter().any(|stage| {
+                stage.tasks().iter().any(|task| {
+                    task.state() == TaskState::Running
+                        && task.assigned_executor() == Some(executor_id)
+                })
+            })
+        })
     }
 
     /// Returns true if the executor owns at least one Running task in a streaming job.
@@ -1617,12 +1897,11 @@ impl Coordinator {
             )
         {
             let storage = Self::open_checkpoint_storage(storage_path)?;
-            let task_count: usize = spec.stages().iter().map(|s| s.tasks().len()).sum();
             let ckpt_coord = CheckpointCoordinator::new(
                 spec.job_id().clone(),
                 Arc::new(storage),
                 interval_ms,
-                task_count,
+                0,
             );
             self.checkpoint_coordinators
                 .insert(spec.job_id().clone(), ckpt_coord);
@@ -1657,6 +1936,14 @@ impl Coordinator {
         self.index_streaming_tasks(&inserted_job_id);
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        krishiv_metrics::global_metrics().inc_tasks_submitted();
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::JobSubmitted {
+                job_id: inserted_job_id.to_string(),
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1680,12 +1967,13 @@ impl Coordinator {
             None => CheckpointAckResponse::JobNotFound,
             Some(coord) => {
                 let current_epoch = coord.current_epoch();
-                match coord.receive_ack(ack) {
-                    Ok(_) => {
-                        // GAP-OB-01: Count completed checkpoint epochs.
+                match coord.receive_ack(ack.clone()) {
+                    Ok(true) => {
+                        self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
                         CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                         CheckpointAckResponse::Accepted
                     }
+                    Ok(false) => CheckpointAckResponse::Accepted,
                     Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
                 }
             }
@@ -1697,15 +1985,19 @@ impl Coordinator {
     /// Returns the savepoint epoch number.  Fails if no `CheckpointCoordinator`
     /// exists for this job (i.e. the job was not submitted with checkpoint config).
     pub fn savepoint_job(&mut self, job_id: &JobId, label: Option<String>) -> SchedulerResult<u64> {
+        let running = self.running_task_count_for_job(job_id);
         match self.checkpoint_coordinators.get_mut(job_id) {
             None => Err(SchedulerError::InvalidJob {
                 message: format!(
                     "no checkpoint coordinator for job {job_id}; job must be streaming with checkpoint config"
                 ),
             }),
-            Some(coord) => coord
-                .initiate_savepoint(label)
-                .map_err(|e| SchedulerError::InvalidJob { message: e }),
+            Some(coord) => {
+                coord.set_expected_task_count(running.max(1));
+                coord
+                    .initiate_savepoint(label)
+                    .map_err(|e| SchedulerError::InvalidJob { message: e })
+            }
         }
     }
 
@@ -1795,6 +2087,7 @@ impl Coordinator {
         // Validate job exists first.
         self.find_job(job_id)?;
 
+        let running = self.running_task_count_for_job(job_id);
         let coord = self
             .checkpoint_coordinators
             .get_mut(job_id)
@@ -1804,6 +2097,7 @@ impl Coordinator {
                      job must be streaming with checkpoint_interval_ms set"
                 ),
             })?;
+        coord.set_expected_task_count(running);
 
         let epoch = coord
             .initiate()
@@ -1948,12 +2242,11 @@ impl Coordinator {
         }
     }
 
-    /// Launch assigned tasks and push them to executor-owned task endpoints.
-    pub async fn push_assigned_task_assignments(
-        &mut self,
-        job_id: &JobId,
-    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
-        let assignments = self.launch_assigned_task_assignments(job_id)?;
+    /// Resolve executor task endpoints for launched assignments.
+    pub fn resolve_assignment_targets(
+        &self,
+        assignments: Vec<ExecutorTaskAssignment>,
+    ) -> SchedulerResult<Vec<(String, ExecutorTaskAssignment)>> {
         let mut targets = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let endpoint = self
@@ -1970,11 +2263,25 @@ impl Coordinator {
                 .to_owned();
             targets.push((endpoint, assignment));
         }
+        Ok(targets)
+    }
 
+    /// Push pre-resolved assignments to executor task endpoints.
+    pub async fn deliver_assignment_targets(
+        &self,
+        targets: Vec<(String, ExecutorTaskAssignment)>,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+        let channels = self.executor_channels.clone();
+        Self::deliver_assignment_targets_with_channels(channels, targets).await
+    }
+
+    async fn deliver_assignment_targets_with_channels(
+        channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+        targets: Vec<(String, ExecutorTaskAssignment)>,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
         let mut responses = Vec::with_capacity(targets.len());
         for (endpoint, assignment) in targets {
-            // P1.2: Reuse cached gRPC channel; avoid TCP+TLS handshake per task.
-            let channel = self.get_or_connect_channel(&endpoint).await?;
+            let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
             let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
             let response = client
                 .assign_task(wire::executor_task_assignment_to_wire(assignment))
@@ -1992,6 +2299,16 @@ impl Coordinator {
             );
         }
         Ok(responses)
+    }
+
+    /// Launch assigned tasks and push them to executor-owned task endpoints.
+    pub async fn push_assigned_task_assignments(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+        let assignments = self.launch_assigned_task_assignments(job_id)?;
+        let targets = self.resolve_assignment_targets(assignments)?;
+        self.deliver_assignment_targets(targets).await
     }
 
     /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
@@ -2160,7 +2477,14 @@ impl Coordinator {
         &self,
         endpoint: &str,
     ) -> SchedulerResult<tonic::transport::Channel> {
-        let mut map = self.executor_channels.lock().await;
+        Self::get_or_connect_channel_on_map(&self.executor_channels, endpoint).await
+    }
+
+    async fn get_or_connect_channel_on_map(
+        channels: &Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+        endpoint: &str,
+    ) -> SchedulerResult<tonic::transport::Channel> {
+        let mut map = channels.lock().await;
         if let Some(ch) = map.get(endpoint) {
             return Ok(ch.clone());
         }
@@ -2785,6 +3109,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(responses[0].disposition(), TransportDisposition::Accepted);
+        assert_eq!(recorded.lock().unwrap().as_slice(), &["task-1".to_owned()]);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn task_launch_drives_to_running() {
+        let service = RecordingExecutorTaskService::default();
+        let recorded = service.task_ids.clone();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping task_launch_drives_to_running: loopback denied");
+                return;
+            }
+            Err(error) => panic!("failed to bind executor task gRPC listener: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(wire::v1::executor_task_server::ExecutorTaskServer::new(
+                    service,
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let executor_id = ExecutorId::try_new("exec-launch").unwrap();
+        let job_id = JobId::try_new("job-launch").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-launch").unwrap());
+        coordinator
+            .register_executor(
+                ExecutorDescriptor::new(executor_id, "pod-launch", 1)
+                    .with_task_endpoint(format!("http://{addr}")),
+            )
+            .unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+
+        let shared = SharedCoordinator::new(coordinator);
+        let launched = shared.drive_pending_task_launches().await.unwrap();
+        assert_eq!(launched, 1);
         assert_eq!(recorded.lock().unwrap().as_slice(), &["task-1".to_owned()]);
 
         server.abort();
@@ -4852,11 +5221,11 @@ mod tests {
         coordinator.submit_job(spec).unwrap();
 
         // Initiate an epoch on the coordinator's checkpoint coordinator.
-        let _ = coordinator
-            .checkpoint_coordinator_mut(&job_id)
-            .unwrap()
-            .initiate()
-            .unwrap();
+        {
+            let coord = coordinator.checkpoint_coordinator_mut(&job_id).unwrap();
+            coord.set_expected_task_count(1);
+            coord.initiate().unwrap();
+        }
 
         // Route an ack through the coordinator.
         let ack = make_ack(&job_id, "task-1", 1, FencingToken::initial(), None);
@@ -5240,8 +5609,9 @@ mod tests {
 
         // Accumulate 4 000 ms — below the 5 000 ms interval.
         assert_eq!(coord.try_tick(4_000), None, "not yet due");
-        // Cross the threshold: 4 000 + 2 000 = 6 000 >= 5 000.
-        assert_eq!(coord.try_tick(2_000), Some(1), "epoch 1 initiated");
+        assert_eq!(coord.try_tick(2_000), None, "zero running tasks skips initiate");
+        coord.set_expected_task_count(1);
+        assert_eq!(coord.try_tick(5_000), Some(1), "epoch 1 initiated");
         // Epoch 1 is now in AwaitingAcks. Abort it to return to Idle.
         coord.abort_epoch("test reset");
         // Clock resets on initiate: another 5 000 ms triggers epoch 2.
@@ -5813,9 +6183,10 @@ mod tests {
                 source_id: "src-0".into(),
             }]);
 
-        let throttle_cmds = coordinator.executor_heartbeat(heartbeat).unwrap();
+        let effects = coordinator.executor_heartbeat(heartbeat).unwrap();
         // Default config: no throttle commands issued.
-        assert!(throttle_cmds.is_empty());
+        assert!(effects.source_throttles.is_empty());
+        assert!(effects.llm_throttles.is_empty());
 
         let log = coordinator.adaptive_decision_log(&job_id);
         assert_eq!(log.len(), 1);

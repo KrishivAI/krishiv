@@ -387,11 +387,21 @@ impl TaskRunner {
             };
         }
 
-        // Take a state snapshot.
+        // Take a state snapshot (EXE-1: fail-closed — do not ack a new epoch on error).
         let snapshot_bytes = match state_backend.snapshot() {
             Ok(bytes) => bytes,
             Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => Vec::new(),
-            Err(_) => Vec::new(),
+            Err(_) => {
+                return CheckpointAckRequest {
+                    job_id: req.job_id,
+                    operator_id: self.operator_id.clone(),
+                    task_id: self.task_id.clone(),
+                    epoch: self.last_acked_epoch,
+                    fencing_token: req.fencing_token,
+                    source_offsets: vec![],
+                    snapshot_path: None,
+                };
+            }
         };
 
         // Write snapshot if non-empty; suppress phantom path on write failure.

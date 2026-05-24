@@ -607,6 +607,23 @@ pub async fn run_kubernetes_controller_runtime_with_client(
     config: KubernetesControllerConfig,
     runtime: KubernetesControllerRuntime,
 ) -> OperatorResult<()> {
+    let tick_coordinator = runtime.coordinator.clone();
+    let tick_period_ms = tick_coordinator
+        .read()
+        .map(|c| c.config().tick_period_ms())
+        .unwrap_or(1_000);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_period_ms));
+        loop {
+            ticker.tick().await;
+            if let Ok(mut coord) = tick_coordinator.write() {
+                if let Err(e) = coord.coordinator_tick() {
+                    tracing::warn!(error = %e, "embedded coordinator tick failed");
+                }
+            }
+        }
+    });
+
     let jobs = krishivjob_api(client, config.namespace())?;
     let watcher_config = watcher_config(&config);
 
@@ -637,9 +654,6 @@ pub async fn reconcile_dynamic_object_with_runtime(
             .map_err(|_| OperatorError::CoordinatorLockPoisoned)?;
         runtime.reconciler.reconcile(&mut coordinator, &resource)?
     };
-    if outcome.action() == ReconcileAction::FinalizerAdded {
-        patch_krishivjob_finalizer(jobs, &resource).await?;
-    }
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
 
     Ok(KubernetesReconcileReport {
@@ -2444,8 +2458,6 @@ mod tests {
             operator_snapshots: vec![],
             is_savepoint: false,
             savepoint_label: None,
-            iceberg_snapshot_id: None,
-            kafka_offsets: None,
         };
         // Epoch 1 commit succeeds (current token = 1, meta token = 1).
         assert!(validate_fencing_token(&meta_epoch1, coord_a.fencing_token()).is_ok());

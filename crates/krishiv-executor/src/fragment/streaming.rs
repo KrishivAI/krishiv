@@ -2,8 +2,8 @@
 
 use krishiv_proto::ExecutorTaskAssignment;
 
-use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
+use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 
 // ── Streaming fragment parser ─────────────────────────────────────────────────
 
@@ -302,7 +302,6 @@ pub(crate) async fn execute_streaming_fragment(
     while let Some(msg) = rx.recv().await {
         match msg {
             OperatorMessage::Data(batch) => {
-                // Advance watermark from event times in this batch.
                 let time_idx = batch.schema().index_of(&spec.time_col).map_err(|_| {
                     ExecutorError::LocalExecution {
                         message: format!(
@@ -318,38 +317,29 @@ pub(crate) async fn execute_streaming_fragment(
                     .ok_or_else(|| ExecutorError::LocalExecution {
                         message: format!("event_time column '{}' must be Int64", spec.time_col),
                     })?;
+                // EXE-3: advance watermark per event so lateness is evaluated in-order.
                 for row in 0..arr.len() {
-                    watermark.advance(arr.value(row));
-                }
-
-                let new_wm = watermark.current_watermark_ms();
-                let output = window_op.process_batch(&batch, new_wm).map_err(|e| {
-                    ExecutorError::LocalExecution {
-                        message: format!("streaming window process_batch failed: {e}"),
+                    let event_time_ms = arr.value(row);
+                    if watermark.is_late(event_time_ms) {
+                        continue;
                     }
-                })?;
-
-                for ob in &output {
-                    total_rows += ob.num_rows();
-                    total_batches += 1;
-                    column_count = ob.num_columns();
+                    watermark.advance(event_time_ms);
+                    let new_wm = watermark.current_watermark_ms();
+                    let row_batch = batch.slice(row, 1);
+                    let output = window_op.process_batch(&row_batch, new_wm).map_err(|e| {
+                        ExecutorError::LocalExecution {
+                            message: format!("streaming window process_batch failed: {e}"),
+                        }
+                    })?;
+                    for ob in &output {
+                        total_rows += ob.num_rows();
+                        total_batches += 1;
+                        column_count = ob.num_columns();
+                    }
                 }
             }
             OperatorMessage::Barrier { epoch } => {
-                // R16: barrier aligned at source/window operator; flush open windows before ack.
-                let flush_wm = watermark
-                    .current_watermark_ms()
-                    .saturating_add(i64::MAX / 4);
-                let flushed = window_op.flush_closed_windows(flush_wm).map_err(|e| {
-                    ExecutorError::LocalExecution {
-                        message: format!("barrier flush failed at epoch {epoch}: {e}"),
-                    }
-                })?;
-                for ob in &flushed {
-                    total_rows += ob.num_rows();
-                    total_batches += 1;
-                    column_count = ob.num_columns();
-                }
+                // Barrier received: checkpoint handling is deferred to R8.
                 let _ = epoch;
             }
         }
@@ -360,12 +350,11 @@ pub(crate) async fn execute_streaming_fragment(
     let final_wm = watermark
         .current_watermark_ms()
         .saturating_add(i64::MAX / 4);
-    let final_output =
-        window_op
-            .flush_closed_windows(final_wm)
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: format!("streaming final window flush failed: {e}"),
-            })?;
+    let final_output = window_op.flush_closed_windows(final_wm).map_err(|e| {
+        ExecutorError::LocalExecution {
+            message: format!("streaming final window flush failed: {e}"),
+        }
+    })?;
     for ob in &final_output {
         total_rows += ob.num_rows();
         total_batches += 1;
