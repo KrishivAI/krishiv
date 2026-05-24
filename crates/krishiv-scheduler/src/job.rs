@@ -10,9 +10,7 @@ use krishiv_proto::{
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
-use crate::{
-    ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOutcome,
-};
+use crate::{ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOutcome};
 
 /// Result of a `Coordinator::submit_job` call.
 ///

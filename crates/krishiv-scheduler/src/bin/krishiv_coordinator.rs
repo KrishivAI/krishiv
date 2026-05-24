@@ -133,10 +133,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    // Spark Connect requires krishiv-spark-connect + proto (R15); disabled in R16 coordinator binary.
-
-    // P0-4: drive executor heartbeat timeouts and push assigned tasks to executors.
-    coordinator.spawn_orchestration_loops();
+    // GAP-C1: Drive heartbeat eviction and task launch on a periodic tick.
+    let tick_coordinator = coordinator.clone();
+    let tick_period_ms = tick_coordinator
+        .read()
+        .map(|c| c.config().tick_period_ms())
+        .unwrap_or(1_000);
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_millis(tick_period_ms));
+        loop {
+            ticker.tick().await;
+            if let Ok(mut coord) = tick_coordinator.write() {
+                if let Err(e) = coord.coordinator_tick() {
+                    tracing::warn!(error = %e, "coordinator tick failed");
+                }
+            }
+        }
+    });
 
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(

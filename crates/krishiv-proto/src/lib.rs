@@ -7,7 +7,6 @@
 //! maps coordinator/executor gRPC messages into these domain contracts without
 //! making scheduler code depend on Kubernetes details.
 
-
 use std::error::Error;
 use std::fmt;
 
@@ -1909,6 +1908,14 @@ impl ExecutorHeartbeatRequest {
     }
 }
 
+/// Coordinator → executor: begin checkpoint epoch (delivered via heartbeat).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitiateCheckpointCommand {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub fencing_token: FencingToken,
+}
+
 /// Executor heartbeat response sent from coordinator to executor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorHeartbeatResponse {
@@ -1920,6 +1927,7 @@ pub struct ExecutorHeartbeatResponse {
     throttle_commands: Vec<HeartbeatThrottleCommand>,
     /// LLM throttle commands for executor-wide rate limiters (R17).
     llm_throttles: Vec<LlmThrottleCommand>,
+    checkpoint_commands: Vec<InitiateCheckpointCommand>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
 }
@@ -1934,6 +1942,7 @@ impl ExecutorHeartbeatResponse {
             message: None,
             throttle_commands: Vec::new(),
             llm_throttles: Vec::new(),
+            checkpoint_commands: Vec::new(),
             trace_context: None,
         }
     }
@@ -1974,6 +1983,16 @@ impl ExecutorHeartbeatResponse {
     /// LLM throttle commands in this response.
     pub fn llm_throttles(&self) -> &[LlmThrottleCommand] {
         &self.llm_throttles
+    }
+
+    #[must_use]
+    pub fn with_checkpoint_commands(mut self, cmds: Vec<InitiateCheckpointCommand>) -> Self {
+        self.checkpoint_commands = cmds;
+        self
+    }
+
+    pub fn checkpoint_commands(&self) -> &[InitiateCheckpointCommand] {
+        &self.checkpoint_commands
     }
 
     /// Transport version.
@@ -3101,6 +3120,15 @@ pub mod wire {
                 .iter()
                 .map(llm_throttle_command_to_wire)
                 .collect(),
+            initiate_checkpoints: value
+                .checkpoint_commands()
+                .iter()
+                .map(|cmd| v1::InitiateCheckpointCommand {
+                    job_id: cmd.job_id.as_str().to_owned(),
+                    epoch: cmd.epoch,
+                    fencing_token: cmd.fencing_token.as_u64(),
+                })
+                .collect(),
         }
     }
 
@@ -3949,11 +3977,11 @@ mod tests {
     use super::{
         AttemptId, ConnectorCapabilityFlags, DeregisterExecutorRequest, ExecutorDescriptor,
         ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-        ExecutorTaskAssignment, FencingToken, LlmQuotaReport, LlmThrottleCommand,
-        InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState,
-        LeaseGeneration, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
-        OutputContractKind, PlanFragment, RegisterExecutorRequest, StageId, StageSpec,
-        TaskAttemptRef, TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
+        ExecutorTaskAssignment, FencingToken, InputPartition, InputPartitionDescriptor, JobId,
+        JobKind, JobSpec, JobState, LeaseGeneration, LlmQuotaReport, LlmThrottleCommand,
+        MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind,
+        PlanFragment, RegisterExecutorRequest, StageId, StageSpec, TaskAttemptRef,
+        TaskCancellationRequest, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
         TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion,
     };
 
@@ -4280,7 +4308,10 @@ mod tests {
         }]);
         let wire_req = executor_heartbeat_request_to_wire(request.clone());
         let round_trip_req = executor_heartbeat_request_from_wire(wire_req).unwrap();
-        assert_eq!(round_trip_req.llm_quota_reports(), request.llm_quota_reports());
+        assert_eq!(
+            round_trip_req.llm_quota_reports(),
+            request.llm_quota_reports()
+        );
 
         let response = ExecutorHeartbeatResponse::new(
             LeaseGeneration::initial(),
@@ -4400,11 +4431,20 @@ mod tests {
         let round_trip = super::wire::executor_heartbeat_request_from_wire(wire).unwrap();
 
         assert_eq!(round_trip.memory_used_bytes(), request.memory_used_bytes());
-        assert_eq!(round_trip.memory_limit_bytes(), request.memory_limit_bytes());
+        assert_eq!(
+            round_trip.memory_limit_bytes(),
+            request.memory_limit_bytes()
+        );
         assert_eq!(round_trip.active_task_count(), request.active_task_count());
         assert_eq!(round_trip.cpu_cores_used(), request.cpu_cores_used());
-        assert_eq!(round_trip.network_bytes_sent(), request.network_bytes_sent());
-        assert_eq!(round_trip.network_bytes_recv(), request.network_bytes_recv());
+        assert_eq!(
+            round_trip.network_bytes_sent(),
+            request.network_bytes_sent()
+        );
+        assert_eq!(
+            round_trip.network_bytes_recv(),
+            request.network_bytes_recv()
+        );
         assert_eq!(round_trip, request);
     }
 

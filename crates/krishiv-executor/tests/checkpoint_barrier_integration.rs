@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use krishiv_executor::barrier_grpc::{
-    executor_barrier_grpc_server, send_barrier_and_wait_ack, ExecutorBarrierService,
+    ExecutorBarrierService, executor_barrier_grpc_server, send_barrier_and_wait_ack,
 };
 use krishiv_executor::barrier_transport::SharedBarrierInjector;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};

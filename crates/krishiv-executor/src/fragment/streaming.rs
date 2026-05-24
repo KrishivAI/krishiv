@@ -2,8 +2,8 @@
 
 use krishiv_proto::ExecutorTaskAssignment;
 
-use crate::{ExecutorError, ExecutorResult};
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
+use crate::{ExecutorError, ExecutorResult};
 
 // ── Streaming fragment parser ─────────────────────────────────────────────────
 
@@ -360,11 +360,12 @@ pub(crate) async fn execute_streaming_fragment(
     let final_wm = watermark
         .current_watermark_ms()
         .saturating_add(i64::MAX / 4);
-    let final_output = window_op.flush_closed_windows(final_wm).map_err(|e| {
-        ExecutorError::LocalExecution {
-            message: format!("streaming final window flush failed: {e}"),
-        }
-    })?;
+    let final_output =
+        window_op
+            .flush_closed_windows(final_wm)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("streaming final window flush failed: {e}"),
+            })?;
     for ob in &final_output {
         total_rows += ob.num_rows();
         total_batches += 1;

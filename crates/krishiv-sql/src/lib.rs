@@ -16,9 +16,9 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use krishiv_catalog::{datafusion_bridge::DataFusionCatalogBridge, InMemoryCatalog};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
 
-use krishiv_catalog::{datafusion_bridge::DataFusionCatalogBridge, InMemoryCatalog};
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
@@ -248,7 +248,7 @@ impl SqlEngine {
         table_name: impl AsRef<str>,
         batches: Vec<RecordBatch>,
     ) -> SqlResult<()> {
-        use std::sync::Arc;
+        use std::sync::{Arc, RwLock};
         let table_name = table_name.as_ref();
         if table_name.trim().is_empty() {
             return Err(SqlError::EmptyTableName);
@@ -479,9 +479,10 @@ pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan> {
             ExecutionKind::Batch,
         ));
 
+    let optimized = Optimizer::default().optimize(logical_plan);
     Ok(SqlPlan {
         query,
-        logical_plan,
+        logical_plan: optimized.plan,
     })
 }
 
@@ -794,11 +795,11 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_table_resolved_in_sql() {
-        use std::sync::{Arc, RwLock};
 
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
+        use std::sync::{Arc, RwLock};
         use krishiv_catalog::{CatalogField, FieldType, InMemoryCatalog, TableMetadata, TableSchema};
 
         let catalog = Arc::new(RwLock::new(InMemoryCatalog::new()));
@@ -905,7 +906,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_with_stats_uses_registered_table() {
-        use std::sync::Arc;
+        use std::sync::{Arc, RwLock};
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -944,7 +945,7 @@ mod tests {
 
 #[cfg(test)]
 mod udf_sql_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     use krishiv_udf::MultiplyScalarUdf;
 
@@ -962,7 +963,7 @@ mod udf_sql_tests {
             .register_record_batches(
                 "t",
                 vec![{
-                    use std::sync::Arc;
+                    use std::sync::{Arc, RwLock};
                     use arrow::array::Int64Array;
                     use arrow::datatypes::{DataType, Field, Schema};
                     use arrow::record_batch::RecordBatch;

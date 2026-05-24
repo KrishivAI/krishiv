@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-fmt-clippy-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler cmake
+
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
+      - run: cargo check --workspace --exclude krishiv-python --exclude krishiv-chaos
+      - run: cargo test --workspace --lib --exclude krishiv-python --exclude krishiv-chaos

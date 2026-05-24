@@ -9,20 +9,17 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
-    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset, CoordinatorExecutorService,
-    ExecutorTaskAssignment, InitiateCheckpointRequest, InputPartitionDescriptor, TaskAttemptRef,
-    TaskId, TaskOutputMetadata, TaskRuntimeStats, TaskState,
-    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
+    CoordinatorExecutorService, ExecutorTaskAssignment, InitiateCheckpointRequest,
+    InputPartitionDescriptor, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats,
+    TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
 use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
 
 use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult,
-    fragment::{
-        batch::execute_batch_fragment,
-        streaming::execute_streaming_fragment,
-    },
+    fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
 
 pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
@@ -41,9 +38,7 @@ pub(crate) struct LocalParquetPartition {
 }
 
 impl LocalParquetPartition {
-    pub(crate) fn parse(
-        partition: &krishiv_proto::InputPartition,
-    ) -> ExecutorResult<Option<Self>> {
+    pub(crate) fn parse(partition: &krishiv_proto::InputPartition) -> ExecutorResult<Option<Self>> {
         let (table_name, path) = match partition.descriptor() {
             Some(InputPartitionDescriptor::LocalParquet { table_name, path }) => {
                 (table_name.as_str(), path.as_str())
@@ -769,8 +764,7 @@ impl ExecutorTaskRunner {
             .entry(assignment.task_id().clone())
             .or_insert_with(|| TaskRunner::new(assignment.task_id().clone()))
             .clone();
-        let ack =
-            checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage);
+        let ack = checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage);
         self.checkpoint_runners
             .insert(assignment.task_id().clone(), checkpoint_runner);
         coordinator
