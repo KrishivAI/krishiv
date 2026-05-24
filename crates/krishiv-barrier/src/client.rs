@@ -6,7 +6,7 @@ use krishiv_proto::wire::v1::CheckpointBarrier;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::barrier_tracker::CheckpointBarrierTracker;
+use crate::tracker::CheckpointBarrierTracker;
 
 /// Send a checkpoint barrier to an executor and record the returned ack.
 pub async fn inject_barrier(

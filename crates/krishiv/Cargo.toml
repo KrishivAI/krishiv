@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "krishiv"
 path = "src/main.rs"
 
+[features]
+default = ["full"]
+full = []
+
 [dependencies]
 krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-api = { path = "../krishiv-api" }

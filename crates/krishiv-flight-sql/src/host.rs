@@ -39,6 +39,11 @@ impl FlightExecutionHost {
         Arc::clone(&self.cluster)
     }
 
+    /// SQL engine shared with the in-process cluster (policy/catalog alignment).
+    pub fn sql_engine(&self) -> krishiv_sql::SqlEngine {
+        self.cluster.sql_engine()
+    }
+
     pub fn continuous_registry(&self) -> Arc<ContinuousStreamRegistry> {
         Arc::clone(&self.continuous)
     }

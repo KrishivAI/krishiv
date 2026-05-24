@@ -5,6 +5,8 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{encode_stream_fragment, WindowExecutionSpec, WindowKind};
 
+use krishiv_sql::SqlEngine;
+
 use crate::in_process::InProcessStreamingRuntime;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
@@ -13,6 +15,8 @@ use crate::{RuntimeError, RuntimeResult};
 #[derive(Clone)]
 pub struct InProcessCluster {
     inner: Arc<InProcessStreamingRuntime>,
+    /// Shared SQL engine for policy/catalog operations aligned with executor tasks.
+    sql_engine: SqlEngine,
 }
 
 impl InProcessCluster {
@@ -20,7 +24,13 @@ impl InProcessCluster {
     pub fn new() -> RuntimeResult<Self> {
         Ok(Self {
             inner: Arc::new(InProcessStreamingRuntime::new()?),
+            sql_engine: SqlEngine::new(),
         })
+    }
+
+    /// Clone of the session-scoped SQL engine (catalog + UDF state).
+    pub fn sql_engine(&self) -> SqlEngine {
+        self.sql_engine.clone()
     }
 
     /// Execute batch SQL via coordinator → executor (`sql:` task).

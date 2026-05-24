@@ -83,7 +83,7 @@ impl KrishivFlightSqlService {
     fn policy_engine(&self) -> Option<PolicyEnforcingSqlEngine> {
         match (&self.auth, &self.policy) {
             (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
-                SqlEngine::new(),
+                self.host.sql_engine(),
                 auth.clone(),
                 policy.clone(),
             )),

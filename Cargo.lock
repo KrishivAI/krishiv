@@ -3888,6 +3888,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "krishiv-barrier"
+version = "0.1.0"
+dependencies = [
+ "krishiv-proto",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.14.6",
+]
+
+[[package]]
 name = "krishiv-bench"
 version = "0.1.0"
 dependencies = [
@@ -3911,14 +3921,6 @@ dependencies = [
  "tokio",
  "url",
  "wiremock",
-]
-
-[[package]]
-name = "krishiv-cep"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "serde",
 ]
 
 [[package]]
@@ -3975,7 +3977,6 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-ai",
- "krishiv-cep",
  "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-state",
@@ -4020,6 +4021,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "krishiv-flight"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "krishiv-plan",
+ "serde_json",
 ]
 
 [[package]]
@@ -4170,6 +4181,7 @@ dependencies = [
  "krishiv-async-util",
  "krishiv-exec",
  "krishiv-executor",
+ "krishiv-flight",
  "krishiv-flight-sql",
  "krishiv-plan",
  "krishiv-proto",
@@ -4188,6 +4200,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum 0.8.9",
+ "krishiv-barrier",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-governance",
@@ -4238,6 +4251,27 @@ dependencies = [
  "tonic 0.14.6",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "krishiv-spark-connect"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "krishiv-proto",
+ "krishiv-sql",
+ "parquet 58.3.0",
+ "prost 0.14.3",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.14.6",
+ "tonic-prost",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

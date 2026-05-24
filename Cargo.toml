@@ -28,9 +28,13 @@ members = [
     "crates/krishiv-chaos",
     "crates/krishiv-federation",
     "crates/krishiv-async-util",
+    "crates/krishiv-barrier",
+    "crates/krishiv-flight",
+    "crates/krishiv-ai",
+    "crates/krishiv-schema-registry",
+    "crates/krishiv-spark-connect",
     "crates/krishiv-testkit",
     "crates/krishiv-sql-policy",
-    "crates/krishiv-cep",
     "crates/krishiv-vector-sinks",
 ]
 resolver = "3"

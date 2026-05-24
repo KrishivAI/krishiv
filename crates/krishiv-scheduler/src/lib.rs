@@ -98,12 +98,10 @@ pub mod job_coordinator;
 pub mod llm_quota;
 pub mod transport;
 
-mod barrier_client;
 mod barrier_dispatch;
-mod barrier_tracker;
 
-pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
-pub use barrier_tracker::CheckpointBarrierTracker;
+pub use barrier_dispatch::drive_barrier_dispatches;
+pub use krishiv_barrier::{BarrierDispatchPlan, BarrierDispatchTarget, CheckpointBarrierTracker};
 
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use coordinator_daemon::{

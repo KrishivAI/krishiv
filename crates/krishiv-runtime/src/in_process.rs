@@ -31,11 +31,7 @@ fn next_job_id() -> RuntimeResult<JobId> {
 }
 
 /// Parquet table registration forwarded to executor SQL tasks.
-#[derive(Debug, Clone)]
-pub struct BatchSqlTable {
-    pub table_name: String,
-    pub path: PathBuf,
-}
+pub use krishiv_flight::BatchSqlTable;
 
 struct RegistryDrainer(Arc<ContinuousStreamRegistry>);
 

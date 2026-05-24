@@ -1,32 +1,16 @@
 //! Coordinator-side checkpoint barrier dispatch over gRPC (WS-4 / ADR-R16.1).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
+use krishiv_barrier::{
+    inject_barrier, BarrierDispatchPlan, BarrierDispatchTarget, CheckpointBarrierTracker,
+};
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
-use krishiv_proto::{CheckpointAckRequest, ExecutorId, FencingToken, JobId, TaskId};
+use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId, TaskId};
 
-use crate::barrier_client::inject_barrier;
-use crate::barrier_tracker::CheckpointBarrierTracker;
 use crate::heartbeat::ExecutorRecord;
 use crate::{Coordinator, SchedulerResult};
-
-/// One barrier round-trip target for a running task on an executor.
-#[derive(Debug, Clone)]
-pub struct BarrierDispatchTarget {
-    pub executor_id: ExecutorId,
-    pub barrier_endpoint: String,
-    pub task_id: TaskId,
-}
-
-/// Plan for dispatching one checkpoint epoch via BarrierService.
-#[derive(Debug, Clone)]
-pub struct BarrierDispatchPlan {
-    pub job_id: JobId,
-    pub epoch: u64,
-    pub fencing_token: FencingToken,
-    pub targets: Vec<BarrierDispatchTarget>,
-}
 
 impl Coordinator {
     /// Collect executors/tasks that should receive a barrier for in-flight checkpoint epochs.

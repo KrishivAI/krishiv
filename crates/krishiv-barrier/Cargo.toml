@@ -1,0 +1,16 @@
+[package]
+name = "krishiv-barrier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Checkpoint barrier protocol shared by coordinator and executor"
+
+[dependencies]
+krishiv-proto = { path = "../krishiv-proto" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+
+[lints]
+workspace = true

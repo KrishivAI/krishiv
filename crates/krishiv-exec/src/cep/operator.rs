@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_cep::{CepKeyState, CompiledPattern, SequentialPatternMatcher};
+use crate::cep::{CepKeyState, CompiledPattern, SequentialPatternMatcher};
 
 /// Keyed CEP operator executing a compiled sequential pattern.
 #[derive(Debug)]
@@ -46,7 +46,7 @@ impl CepOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use krishiv_cep::Pattern;
+    use crate::cep::pattern::Pattern;
     use std::time::Duration;
 
     #[test]

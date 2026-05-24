@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+krishiv-flight = { path = "../krishiv-flight" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-executor = { path = "../krishiv-executor" }
@@ -26,6 +27,11 @@ base64 = "0.22"
 [dev-dependencies]
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
 tokio = { workspace = true }
+
+[features]
+default = []
+embedded = []
+distributed = []
 
 [lib]
 path = "src/lib.rs"
