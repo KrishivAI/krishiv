@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyType};
 
 use crate::batch::PyBatch;
 use crate::dataframe::PyDataFrame;
-use crate::errors::{ModeError, map_krishiv_error};
+use crate::errors::map_krishiv_error;
 use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
 use crate::stream::PyStream;
@@ -224,12 +224,6 @@ impl PySession {
         watermark_column: String,
         max_lateness_ms: u64,
     ) -> PyResult<PyStream> {
-        if matches!(self.inner.mode(), krishiv_api::ExecutionMode::Embedded) {
-            return Err(ModeError::new_err(
-                "stream() requires a non-embedded session; use Session.local() or \
-                 Session.connect(url) to enable streaming",
-            ));
-        }
         Ok(PyStream::from_pipeline(
             self.inner.clone(),
             query,

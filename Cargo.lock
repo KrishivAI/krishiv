@@ -3848,12 +3848,14 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-async-util",
+ "krishiv-exec",
  "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
  "krishiv-sql-policy",
+ "krishiv-state",
  "krishiv-udf",
  "parquet 58.3.0",
  "tempfile",
@@ -4137,12 +4139,13 @@ dependencies = [
 name = "krishiv-runtime"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "arrow-flight",
  "futures",
  "krishiv-async-util",
+ "krishiv-exec",
  "krishiv-flight-sql",
  "krishiv-plan",
- "krishiv-sql",
  "tokio",
  "tonic 0.14.6",
  "tracing",

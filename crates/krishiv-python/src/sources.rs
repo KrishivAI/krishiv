@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 
 use crate::dataframe::PyDataFrame;
-use crate::errors::{ConnectorError, ModeError};
+use crate::errors::ConnectorError;
 use crate::schema::{PySchema, validate_batch_against_schema_class};
 use crate::session::PySession;
 use crate::stream::PyStream;
@@ -60,12 +60,6 @@ pub fn read_kafka(
     schema: Option<&Bound<'_, PyType>>,
     group_id: Option<String>,
 ) -> PyResult<PyStream> {
-    if matches!(session.inner.mode(), krishiv_api::ExecutionMode::Embedded) {
-        return Err(ModeError::new_err(
-            "read_kafka() requires a non-embedded session; use Session.local() or \
-             Session.connect(url) to enable streaming",
-        ));
-    }
     let _ = (schema, group_id);
     #[cfg(not(feature = "kafka"))]
     {
@@ -93,12 +87,6 @@ pub fn read_iceberg(
     table_name: String,
     schema: Option<&Bound<'_, PyType>>,
 ) -> PyResult<PyStream> {
-    if matches!(session.inner.mode(), krishiv_api::ExecutionMode::Embedded) {
-        return Err(ModeError::new_err(
-            "read_iceberg() requires a non-embedded session; use Session.local() or \
-             Session.connect(url) to enable streaming",
-        ));
-    }
     let _ = schema;
     #[cfg(not(feature = "iceberg"))]
     {

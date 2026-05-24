@@ -36,7 +36,7 @@ def test_from_env_with_coordinator(monkeypatch):
     assert session.mode == "distributed"
 
 
-def test_embedded_stream_raises_mode_error():
+def test_embedded_stream_is_allowed():
     session = ks.Session.embedded()
-    with pytest.raises(ks.ModeError):
-        session.stream("events", "ts", 1000)
+    stream = session.stream("SELECT 1 AS ts", "ts", 1000)
+    assert stream is not None
