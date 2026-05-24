@@ -1,6 +1,7 @@
 //! Batch fragment execution: `execute_batch_fragment` and its helpers.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use krishiv_proto::{
     ExecutorTaskAssignment, InputPartitionDescriptor, OutputContract, OutputContractDescriptor,
@@ -8,17 +9,17 @@ use krishiv_proto::{
 };
 use krishiv_sql::SqlEngine;
 
-use super::common::{
-    parse_local_parquet_partitions, read_connector_parquet_partitions,
-    read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
-    write_object_parquet_sink,
-};
+use crate::{ExecutorError, ExecutorResult};
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, KAFKA_TO_PARQUET_FRAGMENT,
     MEMORY_KAFKA_PARTITION_PREFIX, OBJECT_PARQUET_SINK_PREFIX, PARQUET_SINK_PREFIX,
     SHUFFLE_WRITE_PREFIX,
 };
-use crate::{ExecutorError, ExecutorResult};
+use super::common::{
+    parse_local_parquet_partitions, read_connector_parquet_partitions,
+    read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
+    write_object_parquet_sink,
+};
 
 /// Execute a batch (terminal) stage fragment.
 pub(crate) async fn execute_batch_fragment(
@@ -56,7 +57,13 @@ pub(crate) async fn execute_batch_fragment(
 
     if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
         if let Some(ctx) = &runner.shuffle {
-            return execute_shuffle_write_fragment(assignment, shuffle_spec, ctx).await;
+            return execute_shuffle_write_fragment(
+                Arc::clone(&runner.sql_engine),
+                assignment,
+                shuffle_spec,
+                ctx,
+            )
+            .await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from(
@@ -69,7 +76,13 @@ pub(crate) async fn execute_batch_fragment(
     // R4a typed shuffle write: hash-partition SQL output and write to the in-memory store.
     if let Some(write_cfg) = assignment.shuffle_write() {
         if let Some(store) = &runner.inmem_shuffle {
-            return execute_inmem_shuffle_write(assignment, write_cfg, store).await;
+            return execute_inmem_shuffle_write(
+                Arc::clone(&runner.sql_engine),
+                assignment,
+                write_cfg,
+                store,
+            )
+            .await;
         } else {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from(
@@ -80,7 +93,7 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if let Some(query) = sql_query_from_fragment(fragment) {
-        let engine = SqlEngine::new();
+        let engine = Arc::clone(&runner.sql_engine);
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
             engine
                 .register_parquet(partition.table_name(), partition.path())
@@ -120,12 +133,13 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
 
-        let dataframe = engine
-            .sql(query)
-            .await
-            .map_err(|error| ExecutorError::LocalExecution {
-                message: error.to_string(),
-            })?;
+        let dataframe =
+            engine
+                .sql(query)
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
         let (batches, sql_stats) = dataframe.collect_with_stats().await.map_err(|error| {
             ExecutorError::LocalExecution {
                 message: error.to_string(),
@@ -160,6 +174,7 @@ pub(crate) async fn execute_batch_fragment(
 
 /// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.
 async fn execute_shuffle_write_fragment(
+    engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     spec: &str,
     ctx: &crate::runner::ShuffleContext,
@@ -204,7 +219,6 @@ async fn execute_shuffle_write_fragment(
             ),
         })?;
 
-    let engine = SqlEngine::new();
     for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
         engine
             .register_parquet(partition.table_name(), partition.path())
@@ -340,6 +354,7 @@ async fn execute_shuffle_write_fragment(
 
 /// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
 async fn execute_inmem_shuffle_write(
+    engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
     store: &std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
@@ -349,7 +364,6 @@ async fn execute_inmem_shuffle_write(
     let batches = if let Some(query) =
         sql_query_from_fragment(assignment.plan_fragment().description().trim())
     {
-        let engine = SqlEngine::new();
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
             engine
                 .register_parquet(partition.table_name(), partition.path())

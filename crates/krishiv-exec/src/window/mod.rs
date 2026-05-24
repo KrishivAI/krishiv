@@ -1,12 +1,12 @@
-pub mod session;
-pub mod sliding;
-pub mod state_tumbling;
 pub mod tumbling;
+pub mod sliding;
+pub mod session;
+pub mod state_tumbling;
 
-pub use session::{SessionWindowOperator, SessionWindowSpec};
-pub use sliding::{SlidingWindowOperator, SlidingWindowSpec};
+pub use tumbling::{TumblingWindowSpec, TumblingWindowOperator};
+pub use sliding::{SlidingWindowSpec, SlidingWindowOperator};
+pub use session::{SessionWindowSpec, SessionWindowOperator};
 pub use state_tumbling::StateBackedTumblingWindowOperator;
-pub use tumbling::{TumblingWindowOperator, TumblingWindowSpec};
 
 use std::collections::HashMap;
 

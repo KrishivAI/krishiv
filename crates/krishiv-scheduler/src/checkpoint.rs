@@ -5,7 +5,7 @@ use std::sync::Arc;
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
     OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
-    read_operator_snapshot, write_epoch_metadata, write_manifest,
+    read_epoch_metadata, read_operator_snapshot, write_epoch_metadata, write_manifest,
 };
 use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 
@@ -82,6 +82,11 @@ impl CheckpointCoordinator {
         }
     }
 
+    /// Update quorum size to match currently running tasks (SCH-3).
+    pub fn set_expected_task_count(&mut self, count: usize) {
+        self.expected_task_count = count;
+    }
+
     /// Begin a new checkpoint epoch.
     ///
     /// Returns `Ok(epoch)` with the epoch number that was initiated.
@@ -114,6 +119,9 @@ impl CheckpointCoordinator {
     ///
     /// Returns `Some(epoch)` if a checkpoint was initiated, `None` otherwise.
     pub fn try_tick(&mut self, elapsed_ms: u64) -> Option<u64> {
+        if self.expected_task_count == 0 {
+            return None;
+        }
         if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
             return None;
         }
@@ -300,6 +308,12 @@ impl CheckpointCoordinator {
     pub fn recover_from_storage(&mut self) -> CheckpointResult<Option<u64>> {
         match latest_valid_epoch(self.storage.as_ref(), self.job_id.as_str()) {
             Ok(epoch) => {
+                if let Some(meta) =
+                    read_epoch_metadata(self.storage.as_ref(), self.job_id.as_str(), epoch)?
+                {
+                    self.fencing_token = FencingToken::try_new(meta.fencing_token)
+                        .unwrap_or(self.fencing_token);
+                }
                 self.current_epoch = epoch;
                 self.state = CheckpointCoordinatorState::Committed { epoch };
                 Ok(Some(epoch))
@@ -340,9 +354,7 @@ mod tests {
     use std::sync::Arc;
 
     use krishiv_checkpoint::{CheckpointError, LocalFsCheckpointStorage, write_operator_snapshot};
-    use krishiv_proto::{
-        CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, TaskId,
-    };
+    use krishiv_proto::{CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, TaskId};
 
     use super::CheckpointCoordinator;
 
@@ -384,15 +396,8 @@ mod tests {
         assert_eq!(epoch, 1);
 
         // Write an operator snapshot so the manifest can be built.
-        write_operator_snapshot(
-            storage.as_ref(),
-            "job-fence",
-            1,
-            "op-task-1",
-            "task-1",
-            b"state",
-        )
-        .unwrap();
+        write_operator_snapshot(storage.as_ref(), "job-fence", 1, "op-task-1", "task-1", b"state")
+            .unwrap();
 
         // Ack with the CURRENT fencing token — commit should succeed.
         let ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
@@ -402,11 +407,7 @@ mod tests {
         // The committed metadata must carry the correct fencing token.
         let meta =
             krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-fence", 1).unwrap();
-        assert_eq!(
-            meta.unwrap().fencing_token,
-            2,
-            "committed token must match coordinator token"
-        );
+        assert_eq!(meta.unwrap().fencing_token, 2, "committed token must match coordinator token");
     }
 
     #[test]
@@ -434,9 +435,6 @@ mod tests {
         // the ack-level check. The validate_fencing_token guard in commit_epoch provides
         // an additional defense when tokens in metadata don't match the coordinator.
         let result = coord.receive_ack(ack);
-        assert!(
-            result.is_err(),
-            "ack with stale fencing token must be rejected"
-        );
+        assert!(result.is_err(), "ack with stale fencing token must be rejected");
     }
 }

@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 /// Migrates serialized state bytes from one schema version to another.
-pub type StateMigrationFn =
-    Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, StateMigrationError> + Send + Sync>;
+pub type StateMigrationFn = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, StateMigrationError> + Send + Sync>;
 
 /// Migration failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,12 +36,7 @@ impl StateMigrationRegistry {
     }
 
     /// Apply chained migrations from `from` to `to` inclusive.
-    pub fn migrate(
-        &self,
-        from: u32,
-        to: u32,
-        bytes: &[u8],
-    ) -> Result<Vec<u8>, StateMigrationError> {
+    pub fn migrate(&self, from: u32, to: u32, bytes: &[u8]) -> Result<Vec<u8>, StateMigrationError> {
         if from == to {
             return Ok(bytes.to_vec());
         }
@@ -56,13 +50,12 @@ impl StateMigrationRegistry {
         while version < to {
             let next = version + 1;
             let key = (version, next);
-            let migrator = self
-                .migrations
-                .get(&key)
-                .ok_or_else(|| StateMigrationError {
-                    message: format!("missing migration {version} -> {next}"),
-                })?;
-            current = migrator(&current).map_err(|e| StateMigrationError { message: e.message })?;
+            let migrator = self.migrations.get(&key).ok_or_else(|| StateMigrationError {
+                message: format!("missing migration {version} -> {next}"),
+            })?;
+            current = migrator(&current).map_err(|e| StateMigrationError {
+                message: e.message,
+            })?;
             version = next;
         }
         Ok(current)
@@ -80,12 +73,7 @@ impl SharedStateMigrationRegistry {
         Self::default()
     }
 
-    pub fn register(
-        &self,
-        from: u32,
-        to: u32,
-        f: StateMigrationFn,
-    ) -> Result<(), crate::StateError> {
+    pub fn register(&self, from: u32, to: u32, f: StateMigrationFn) -> Result<(), crate::StateError> {
         self.inner
             .write()
             .map_err(|e| crate::StateError::LockPoisoned {
@@ -117,8 +105,16 @@ mod tests {
     #[test]
     fn chained_migration_applies_in_order() {
         let mut reg = StateMigrationRegistry::new();
-        reg.register(1, 2, Arc::new(|b| Ok([b, b"->2"].concat())));
-        reg.register(2, 3, Arc::new(|b| Ok([b, b"->3"].concat())));
+        reg.register(
+            1,
+            2,
+            Arc::new(|b| Ok([b, b"->2"].concat())),
+        );
+        reg.register(
+            2,
+            3,
+            Arc::new(|b| Ok([b, b"->3"].concat())),
+        );
         let out = reg.migrate(1, 3, b"v1").unwrap();
         assert_eq!(out, b"v1->2->3");
     }

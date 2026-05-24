@@ -607,6 +607,23 @@ pub async fn run_kubernetes_controller_runtime_with_client(
     config: KubernetesControllerConfig,
     runtime: KubernetesControllerRuntime,
 ) -> OperatorResult<()> {
+    let tick_coordinator = runtime.coordinator.clone();
+    let tick_period_ms = tick_coordinator
+        .read()
+        .map(|c| c.config().tick_period_ms())
+        .unwrap_or(1_000);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_period_ms));
+        loop {
+            ticker.tick().await;
+            if let Ok(mut coord) = tick_coordinator.write() {
+                if let Err(e) = coord.coordinator_tick() {
+                    tracing::warn!(error = %e, "embedded coordinator tick failed");
+                }
+            }
+        }
+    });
+
     let jobs = krishivjob_api(client, config.namespace())?;
     let watcher_config = watcher_config(&config);
 
@@ -637,9 +654,6 @@ pub async fn reconcile_dynamic_object_with_runtime(
             .map_err(|_| OperatorError::CoordinatorLockPoisoned)?;
         runtime.reconciler.reconcile(&mut coordinator, &resource)?
     };
-    if outcome.action() == ReconcileAction::FinalizerAdded {
-        patch_krishivjob_finalizer(jobs, &resource).await?;
-    }
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
 
     Ok(KubernetesReconcileReport {
@@ -690,22 +704,6 @@ pub const FIELD_MANAGER: &str = "krishiv-operator";
 /// `Patch::Apply` with a `fieldManager` preserves `resourceVersion` semantics
 /// so concurrent updates from multiple controllers do not silently overwrite
 /// each other (P0.12 fix).
-/// Patch `metadata.finalizers` to include the Krishiv job finalizer (P0-6).
-pub async fn patch_krishivjob_finalizer(
-    jobs: &Api<DynamicObject>,
-    resource: &KrishivJobResource,
-) -> OperatorResult<()> {
-    let mut finalizers = resource.metadata.finalizers.clone();
-    if !finalizers.iter().any(|f| f == FINALIZER) {
-        finalizers.push(FINALIZER.to_string());
-    }
-    let patch = json!({ "metadata": { "finalizers": finalizers } });
-    let params = PatchParams::apply(FIELD_MANAGER).force();
-    jobs.patch(&resource.metadata.name, &params, &Patch::Apply(&patch))
-        .await?;
-    Ok(())
-}
-
 pub async fn patch_krishivjob_status(
     jobs: &Api<DynamicObject>,
     resource: &KrishivJobResource,
@@ -1533,18 +1531,12 @@ impl K8sLeaseElection {
             Ok(Some(l)) => l,
             Ok(None) => {
                 tracing::warn!(lease = %self.lease_name, "k8s_lease: lease not found during renew");
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 return false;
             }
             Err(e) => {
                 tracing::warn!(lease = %self.lease_name, error = %e, "k8s_lease: GET failed during renew");
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 return false;
             }
         };
@@ -1561,10 +1553,7 @@ impl K8sLeaseElection {
                 our_identity = %self.holder_identity,
                 "k8s_lease: holderIdentity mismatch during renew — lost leadership"
             );
-            self.state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_leader = false;
+            self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
             return false;
         }
 
@@ -1592,10 +1581,8 @@ impl K8sLeaseElection {
             .await
         {
             Ok(_) => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .last_renewed_at = Some(std::time::Instant::now());
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).last_renewed_at =
+                    Some(std::time::Instant::now());
                 true
             }
             Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
@@ -1603,10 +1590,7 @@ impl K8sLeaseElection {
                     lease = %self.lease_name,
                     "k8s_lease: PATCH conflict (409) during renew — lost leadership"
                 );
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 false
             }
             Err(e) => {
@@ -1615,10 +1599,7 @@ impl K8sLeaseElection {
                     error = %e,
                     "k8s_lease: PATCH failed during renew"
                 );
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_leader = false;
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
                 false
             }
         }
@@ -1649,10 +1630,7 @@ impl K8sLeaseElection {
                 "k8s_lease: PATCH failed during release (ignoring)"
             );
         }
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_leader = false;
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
     }
 }
 
@@ -1696,16 +1674,10 @@ impl LeaderElection for K8sLeaseElection {
             self.k8s_renew(client).await
         } else {
             // Simulation: renewal succeeds as long as we are still marked leader.
-            let is_leader = self
-                .state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_leader;
+            let is_leader = self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader;
             if is_leader {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .last_renewed_at = Some(std::time::Instant::now());
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).last_renewed_at =
+                    Some(std::time::Instant::now());
             }
             is_leader
         }
@@ -1718,18 +1690,12 @@ impl LeaderElection for K8sLeaseElection {
         if let Some(ref client) = self.client {
             self.k8s_release(client).await;
         } else {
-            self.state
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_leader = false;
+            self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader = false;
         }
     }
 
     fn fencing_token(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .fencing_token
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).fencing_token
     }
 }
 
@@ -2444,8 +2410,6 @@ mod tests {
             operator_snapshots: vec![],
             is_savepoint: false,
             savepoint_label: None,
-            iceberg_snapshot_id: None,
-            kafka_offsets: None,
         };
         // Epoch 1 commit succeeds (current token = 1, meta token = 1).
         assert!(validate_fencing_token(&meta_epoch1, coord_a.fencing_token()).is_ok());
@@ -2523,9 +2487,6 @@ mod tests {
             Some("krishiv-operator"),
             "field manager must be 'krishiv-operator'"
         );
-        assert!(
-            params.force,
-            "force must be true so concurrent apply wins for owned fields"
-        );
+        assert!(params.force, "force must be true so concurrent apply wins for owned fields");
     }
 }

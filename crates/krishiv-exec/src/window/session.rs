@@ -5,9 +5,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::{ExecError, ExecResult};
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
-use crate::{ExecError, ExecResult};
 
 /// Configuration for a session event-time window operator (R5.2).
 ///
@@ -82,6 +82,8 @@ impl SessionWindowOperator {
             })?;
 
         let late_threshold = self.prev_watermark_ms;
+        let gap = self.spec.session_gap_ms as i64;
+        let mut output = Vec::new();
 
         for row in 0..batch.num_rows() {
             let event_time_ms = time_arr.value(row);
@@ -89,11 +91,26 @@ impl SessionWindowOperator {
                 continue;
             }
             let key = format_key_value(batch, key_idx, row)?;
+            if let Some(existing) = self.sessions.get(&key) {
+                if event_time_ms > existing.last_event_time_ms.saturating_add(gap) {
+                    if let Some(s) = self.sessions.remove(&key) {
+                        output.push(self.build_output_batch(
+                            &key,
+                            s.session_start_ms,
+                            s.last_event_time_ms + gap,
+                            &s.agg,
+                        )?);
+                    }
+                }
+            }
             let session = self.sessions.entry(key).or_insert_with(|| SessionState {
                 session_start_ms: event_time_ms,
                 last_event_time_ms: event_time_ms,
                 agg: AggState::new(&self.spec.agg_exprs),
             });
+            if event_time_ms < session.session_start_ms {
+                session.session_start_ms = event_time_ms;
+            }
             if event_time_ms > session.last_event_time_ms {
                 session.last_event_time_ms = event_time_ms;
             }
@@ -101,7 +118,8 @@ impl SessionWindowOperator {
         }
 
         self.prev_watermark_ms = new_watermark_ms;
-        self.flush_closed_sessions(new_watermark_ms)
+        output.extend(self.flush_closed_sessions(new_watermark_ms)?);
+        Ok(output)
     }
 
     /// Flush sessions whose inactivity gap has passed the watermark.
