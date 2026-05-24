@@ -286,6 +286,7 @@ pub(crate) async fn execute_streaming_fragment(
     let mut total_rows: usize = 0;
     let mut total_batches: usize = 0;
     let mut column_count: usize = 0;
+    let mut collected_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
 
     // Wire batches through the bounded backpressure OperatorQueue (R7.2 Group B).
     // The producer task feeds all parsed batches into the queue then drops the
@@ -331,10 +332,11 @@ pub(crate) async fn execute_streaming_fragment(
                             message: format!("streaming window process_batch failed: {e}"),
                         }
                     })?;
-                    for ob in &output {
+                    for ob in output {
                         total_rows += ob.num_rows();
                         total_batches += 1;
                         column_count = ob.num_columns();
+                        collected_batches.push(ob);
                     }
                 }
             }
@@ -355,15 +357,17 @@ pub(crate) async fn execute_streaming_fragment(
             message: format!("streaming final window flush failed: {e}"),
         }
     })?;
-    for ob in &final_output {
+    for ob in final_output {
         total_rows += ob.num_rows();
         total_batches += 1;
         column_count = ob.num_columns();
+        collected_batches.push(ob);
     }
 
     Ok(ExecutorTaskOutput::streaming_window(
         total_rows,
         total_batches,
         column_count,
+        collected_batches,
     ))
 }

@@ -1,7 +1,9 @@
 //! Execute a Python [`StreamPipeline`] through the in-process window runtime.
 
-use krishiv_api::{AggExpr, AggFunction, LocalWindowExecutionSpec, LocalWindowKind};
-use krishiv_runtime::execute_windowed_stream;
+use krishiv_api::{
+    AggExpr, AggFunction, ExecutionMode, LocalWindowExecutionSpec, LocalWindowKind,
+};
+use krishiv_runtime::{execute_windowed_in_process, execute_windowed_stream};
 use pyo3::prelude::*;
 
 use crate::agg::{AggDescriptor, AggKind};
@@ -25,7 +27,16 @@ fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
     }
 }
 
-fn resolve_input_batches(pipeline: &StreamPipeline) -> Result<Vec<arrow::record_batch::RecordBatch>, krishiv_api::KrishivError> {
+fn resolve_input_batches(
+    pipeline: &StreamPipeline,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, krishiv_api::KrishivError> {
+    if let Some(name) = pipeline.source_id.strip_prefix("memory:") {
+        return pipeline.session.memory_stream_batches(name).ok_or_else(|| {
+            krishiv_api::KrishivError::unsupported(format!(
+                "memory stream '{name}' is not registered on this session"
+            ))
+        });
+    }
     let upper = pipeline.source_id.to_ascii_uppercase();
     if upper.contains("SELECT") || upper.contains("FROM") {
         let df = block_on_async(pipeline.session.sql(&pipeline.source_id))?;
@@ -33,7 +44,7 @@ fn resolve_input_batches(pipeline: &StreamPipeline) -> Result<Vec<arrow::record_
         return Ok(result.batches().to_vec());
     }
     Err(krishiv_api::KrishivError::unsupported(
-        "streaming source must be a SQL query from Session.stream(); use memory_stream_collect for in-memory sources",
+        "streaming source must be SQL (Session.stream) or memory:<name> (Session.memory_stream)",
     ))
 }
 
@@ -76,6 +87,7 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
             "streaming execution requires key_by() before window collect",
         )
     })?;
+    let state_ttl_ms = pipeline.session.state_ttl().map(|c| c.ttl_ms());
     let spec = LocalWindowExecutionSpec {
         key_column,
         event_time_column: event_time,
@@ -83,9 +95,21 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         window_kind,
         window_size_ms: window.size_ms,
         agg_exprs,
+        state_ttl_ms,
     };
     let input = resolve_input_batches(pipeline).map_err(map_krishiv_error)?;
-    let output = execute_windowed_stream(input, &spec).map_err(map_krishiv_error)?;
+    let topic = pipeline
+        .source_id
+        .strip_prefix("memory:")
+        .unwrap_or(pipeline.source_id.as_str());
+    let output = match pipeline.session.execution_mode() {
+        ExecutionMode::Embedded | ExecutionMode::SingleNode => {
+            execute_windowed_in_process(topic, input, &spec).map_err(map_krishiv_error)?
+        }
+        ExecutionMode::Distributed => {
+            execute_windowed_stream(input, &spec).map_err(map_krishiv_error)?
+        }
+    };
     Ok(output
         .into_iter()
         .map(|batch| PyBatch::from_record_batch(batch))

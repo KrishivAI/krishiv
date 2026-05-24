@@ -2,7 +2,13 @@
 
 ## Current Phase
 
-**Embedded batch/streaming fixes (2026-05-24).** Branch `cursor/fix-embedded-batch-streaming-cbbd`:
+**ADR-12.4 follow-ups (2026-05-24).** Branch `cursor/adr124-memory-stream-ttl-cbbd` (extends embedded/streaming fixes on `main`):
+- **ADR-12.4:** `InProcessCoordinatorBridge` + `InProcessStreamingRuntime` — coordinator submits jobs, pushes assignments to `ExecutorAssignmentInbox`, executor runs via `ExecutorTaskRunner::run_next_with` (no tonic for `inprocess://` endpoints).
+- **State TTL:** `LocalWindowExecutionSpec.state_ttl_ms` wires `TtlStateBackend` + `StateBackedTumblingWindowOperator` in `local_streaming` and session `StateTtlConfig` on streams.
+- **Memory streams:** `Session::memory_stream` / `register_memory_stream`; windowed `collect()` uses in-process path for Embedded/SingleNode; Python `memory_stream()` + `memory:<name>` sources use same path.
+- **Stream-kafka contract:** In-process fragments use canonical `key=key:time=ts` columns matching `stream-kafka:` partition encoding.
+
+**Embedded batch/streaming fixes (2026-05-24).** Merged via PR #41 on `main`; also on this branch:
 - Runtime backends accept batch plans without bogus `SqlEngine` re-execution; embedded redirects streaming to single-node.
 - `local_streaming` executes tumbling/sliding/session windows via `krishiv-exec`.
 - API: `WindowedStream::collect`, `ensure_local_mode`, stream `coordinator_url`, `StateTtlConfig` → `TtlConfig`.
@@ -23,7 +29,14 @@
 - **GAP-CI1/CI2:** GitHub Actions CI workflow and PR template.
 - **GAP-B1:** `rust-version = "1.92"` in workspace `Cargo.toml`.
 
-### Validation (2026-05-24)
+### Validation (2026-05-24, ADR-12.4 branch)
+
+```bash
+cargo +stable test -p krishiv-runtime -p krishiv-scheduler -p krishiv-executor -p krishiv-api -p krishiv-exec --lib
+# runtime: in_process_windowed_stream_returns_batches; api: tumbling_window_collect_executes_in_embedded_mode
+```
+
+### Validation (2026-05-24, gap closure)
 
 ```bash
 cargo check -p krishiv-exec -p krishiv-sql -p krishiv-runtime -p krishiv-metrics -p krishiv-vector-sinks -p krishiv-scheduler -p krishiv-cep

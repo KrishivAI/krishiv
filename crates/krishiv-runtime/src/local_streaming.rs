@@ -4,8 +4,10 @@ use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
 use krishiv_exec::{
     AggExpr, AggFunction, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
-    SlidingWindowSpec, TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
+    SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,
+    TumblingWindowSpec, WatermarkState,
 };
+use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::RuntimeError;
 
@@ -26,6 +28,8 @@ pub struct LocalWindowExecutionSpec {
     pub window_kind: LocalWindowKind,
     pub window_size_ms: u64,
     pub agg_exprs: Vec<AggExpr>,
+    /// When set, tumbling windows persist accumulators through a TTL-wrapped state backend.
+    pub state_ttl_ms: Option<u64>,
 }
 
 impl LocalWindowExecutionSpec {
@@ -90,19 +94,38 @@ pub fn execute_windowed_stream(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: spec.agg_exprs.clone(),
             };
-            let mut op = TumblingWindowOperator::new(tw_spec);
-            for batch in &input_batches {
-                let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
-                if max_ts > i64::MIN {
-                    watermark.advance(max_ts);
+            if let Some(ttl_ms) = spec.state_ttl_ms {
+                let inner = InMemoryStateBackend::new();
+                let state: Box<dyn StateBackend> =
+                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
+                let mut op = StateBackedTumblingWindowOperator::new(
+                    tw_spec,
+                    state,
+                    "local-stream",
+                    "tumbling",
+                )
+                .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                for batch in &input_batches {
+                    let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
+                    if max_ts > i64::MIN {
+                        watermark.advance(max_ts);
+                    }
+                    let wm = watermark.current_watermark_ms();
+                    output.extend(op.process_batch(batch, wm).map_err(exec_err)?);
                 }
-                let wm = watermark.current_watermark_ms();
-                output.extend(op.process_batch(batch, wm).map_err(exec_err)?);
+                output.extend(op.flush_closed_windows(i64::MAX).map_err(exec_err)?);
+            } else {
+                let mut op = TumblingWindowOperator::new(tw_spec);
+                for batch in &input_batches {
+                    let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
+                    if max_ts > i64::MIN {
+                        watermark.advance(max_ts);
+                    }
+                    let wm = watermark.current_watermark_ms();
+                    output.extend(op.process_batch(batch, wm).map_err(exec_err)?);
+                }
+                output.extend(op.flush_closed_windows(i64::MAX).map_err(exec_err)?);
             }
-            output.extend(
-                op.flush_closed_windows(i64::MAX)
-                    .map_err(exec_err)?,
-            );
         }
         LocalWindowKind::Sliding { slide_ms } => {
             let sw_spec = SlidingWindowSpec {
@@ -185,6 +208,7 @@ mod tests {
             window_kind: LocalWindowKind::Tumbling,
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
         };
         let out =
             execute_windowed_stream(vec![events_batch()], &spec).expect("execute_windowed_stream");

@@ -6,6 +6,7 @@
 //! the hood through `krishiv-sql`, while Arrow record batches are exposed as the
 //! public data interchange shape.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -26,7 +27,8 @@ pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_exec::{AggExpr, AggFunction};
 pub use krishiv_runtime::{
-    LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream, is_streaming_plan,
+    InProcessStreamingRuntime, LocalWindowExecutionSpec, LocalWindowKind,
+    execute_windowed_in_process, execute_windowed_stream, is_streaming_plan,
 };
 pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
 pub use krishiv_state::TtlConfig;
@@ -278,6 +280,7 @@ impl SessionBuilder {
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
             state_ttl: self.state_ttl,
+            memory_streams: Arc::new(RwLock::new(HashMap::new())),
             udf_registry,
         })
     }
@@ -293,6 +296,7 @@ pub struct Session {
     next_job_id: Arc<AtomicU64>,
     coordinator_url: Option<String>,
     state_ttl: Option<StateTtlConfig>,
+    memory_streams: Arc<RwLock<HashMap<String, Vec<RecordBatch>>>>,
     udf_registry: Arc<RwLock<UdfRegistry>>,
 }
 
@@ -331,6 +335,29 @@ impl Session {
     /// Convert session TTL config to a `krishiv-state` [`TtlConfig`].
     pub fn state_ttl_config(&self) -> Option<TtlConfig> {
         self.state_ttl.map(StateTtlConfig::to_ttl_config)
+    }
+
+    /// Register in-memory stream batches for `memory:<name>` pipeline sources.
+    pub fn register_memory_stream(
+        &self,
+        name: impl Into<String>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        ensure_local_mode(self.mode)?;
+        self.memory_streams
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.into(), batches);
+        Ok(())
+    }
+
+    /// Resolve batches previously registered with [`register_memory_stream`].
+    pub fn memory_stream_batches(&self, name: &str) -> Option<Vec<RecordBatch>> {
+        self.memory_streams
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// Known local jobs.
@@ -512,12 +539,17 @@ impl Session {
 
     /// Create a bounded local memory stream.
     pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Stream {
+        let name = name.into();
+        let record_batches: Vec<RecordBatch> =
+            batches.iter().map(|b| b.batch().clone()).collect();
+        let _ = self.register_memory_stream(name.clone(), record_batches);
         Stream::for_session(
             name,
             StreamMode::Bounded,
             batches,
             self.mode,
             self.coordinator_url.clone(),
+            self.state_ttl.map(|c| c.ttl_ms()),
         )
     }
 
@@ -529,6 +561,7 @@ impl Session {
             Vec::new(),
             self.mode,
             self.coordinator_url.clone(),
+            self.state_ttl.map(|c| c.ttl_ms()),
         )
     }
 }
@@ -697,6 +730,7 @@ pub struct Stream {
     mode: StreamMode,
     execution_mode: ExecutionMode,
     coordinator_url: Option<String>,
+    state_ttl_ms: Option<u64>,
     batches: Vec<StreamBatch>,
 }
 
@@ -710,7 +744,7 @@ impl Stream {
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
     ) -> Self {
-        Self::for_session(name, mode, batches, execution_mode, None)
+        Self::for_session(name, mode, batches, execution_mode, None, None)
     }
 
     fn for_session(
@@ -719,12 +753,14 @@ impl Stream {
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
         coordinator_url: Option<String>,
+        state_ttl_ms: Option<u64>,
     ) -> Self {
         Self {
             name: name.into(),
             mode,
             execution_mode,
             coordinator_url,
+            state_ttl_ms,
             batches,
         }
     }
@@ -794,6 +830,7 @@ impl Stream {
             self.batches.iter().map(&mut f).collect(),
             self.execution_mode,
             self.coordinator_url.clone(),
+            self.state_ttl_ms,
         ))
     }
 
@@ -823,6 +860,7 @@ impl Stream {
                 .collect(),
             self.execution_mode,
             self.coordinator_url.clone(),
+            self.state_ttl_ms,
         ))
     }
 
@@ -992,6 +1030,7 @@ fn build_tumbling_spec(
         window_kind: LocalWindowKind::Tumbling,
         window_size_ms,
         agg_exprs,
+        state_ttl_ms: keyed.inner.state_ttl_ms,
     })
 }
 
@@ -1016,7 +1055,14 @@ fn execute_windowed_inner(
         .iter()
         .map(|b| b.batch().clone())
         .collect();
-    let output = execute_windowed_stream(input, &spec).map_err(KrishivError::from)?;
+    let output = match stream.execution_mode {
+        ExecutionMode::Embedded | ExecutionMode::SingleNode => {
+            execute_windowed_in_process(stream.name(), input, &spec).map_err(KrishivError::from)?
+        }
+        ExecutionMode::Distributed => {
+            execute_windowed_stream(input, &spec).map_err(KrishivError::from)?
+        }
+    };
     Ok(output
         .into_iter()
         .enumerate()
@@ -1160,6 +1206,7 @@ impl SessionWindowedStream {
             },
             window_size_ms: self.session_gap_ms,
             agg_exprs,
+            state_ttl_ms: self.keyed.inner.state_ttl_ms,
         };
         execute_windowed_inner(&self.keyed.inner, spec)
     }
@@ -1188,6 +1235,7 @@ impl SlidingWindowedStream {
             },
             window_size_ms: self.window_size_ms,
             agg_exprs,
+            state_ttl_ms: self.keyed.inner.state_ttl_ms,
         };
         execute_windowed_inner(&self.keyed.inner, spec)
     }

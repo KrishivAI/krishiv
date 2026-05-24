@@ -6,6 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
 use krishiv_proto::{
@@ -94,7 +95,7 @@ impl LocalParquetPartition {
 }
 
 /// Result of one executor-side task runner pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorTaskRunReport {
     assignment: ExecutorTaskAssignment,
     output: ExecutorTaskOutput,
@@ -139,7 +140,7 @@ impl ExecutorTaskRunReport {
 }
 
 /// Local executor output metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorTaskOutput {
     pub(crate) kind: ExecutorTaskOutputKind,
     pub(crate) row_count: usize,
@@ -147,6 +148,8 @@ pub struct ExecutorTaskOutput {
     pub(crate) column_count: usize,
     pub(crate) shuffle_partitions: Vec<krishiv_proto::ShufflePartitionOutput>,
     pub(crate) runtime_stats: Option<TaskRuntimeStats>,
+    /// Record batches produced by streaming window operators (in-process / local path).
+    pub(crate) record_batches: Vec<RecordBatch>,
 }
 
 impl ExecutorTaskOutput {
@@ -158,6 +161,7 @@ impl ExecutorTaskOutput {
             column_count,
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
+            record_batches: Vec::new(),
         }
     }
 
@@ -173,6 +177,7 @@ impl ExecutorTaskOutput {
             column_count,
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
+            record_batches: Vec::new(),
         }
     }
 
@@ -184,6 +189,7 @@ impl ExecutorTaskOutput {
             column_count: 0,
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
+            record_batches: Vec::new(),
         }
     }
 
@@ -195,6 +201,7 @@ impl ExecutorTaskOutput {
             column_count: 0,
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
+            record_batches: Vec::new(),
         }
     }
 
@@ -209,6 +216,7 @@ impl ExecutorTaskOutput {
             column_count: 0,
             shuffle_partitions: partitions,
             runtime_stats: None,
+            record_batches: Vec::new(),
         }
     }
 
@@ -217,6 +225,7 @@ impl ExecutorTaskOutput {
         row_count: usize,
         batch_count: usize,
         column_count: usize,
+        record_batches: Vec<RecordBatch>,
     ) -> Self {
         Self {
             kind: ExecutorTaskOutputKind::StreamingWindow,
@@ -225,7 +234,13 @@ impl ExecutorTaskOutput {
             column_count,
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
+            record_batches,
         }
+    }
+
+    /// Batches produced by this task (streaming window or SQL).
+    pub fn record_batches(&self) -> &[RecordBatch] {
+        &self.record_batches
     }
 
     pub(crate) fn with_runtime_stats(mut self, stats: TaskRuntimeStats) -> Self {

@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use krishiv_state::{Namespace, StateBackend, StateResult};
 
 use super::tumbling::{TumblingWindowOperator, TumblingWindowSpec};
-use crate::ExecResult;
+use crate::{ExecError, ExecResult};
 
 pub struct StateBackedTumblingWindowOperator {
     inner: TumblingWindowOperator,
@@ -43,5 +43,17 @@ impl StateBackedTumblingWindowOperator {
 
     pub fn open_window_count(&self) -> usize {
         self.inner.open_window_count()
+    }
+
+    /// Flush closed windows and persist updated state.
+    pub fn flush_closed_windows(
+        &mut self,
+        watermark_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let out = self.inner.flush_closed_windows(watermark_ms)?;
+        self.inner
+            .persist_to_state(self.state.as_mut(), &self.namespace)
+            .map_err(|e| ExecError::Arrow(e.to_string()))?;
+        Ok(out)
     }
 }

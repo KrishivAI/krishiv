@@ -89,8 +89,13 @@ pub enum TaskUpdateOutcome {
 pub mod admission;
 pub mod checkpoint;
 pub mod heartbeat;
+pub mod in_process;
 pub mod job;
 pub mod llm_quota;
+
+pub use in_process::{
+    InProcessCoordinatorBridge, IN_PROCESS_TASK_ENDPOINT, is_in_process_task_endpoint,
+};
 pub(crate) mod store;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
