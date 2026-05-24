@@ -4148,6 +4148,8 @@ dependencies = [
  "krishiv-exec",
  "krishiv-governance",
  "krishiv-lakehouse",
+ "krishiv-plan",
+ "krishiv-runtime",
  "krishiv-schema-registry",
  "krishiv-sql",
  "krishiv-state",

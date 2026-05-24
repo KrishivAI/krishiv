@@ -45,7 +45,7 @@ fn resolve_input_batches(
     ))
 }
 
-pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatch>> {
+pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWindowExecutionSpec> {
     let window = pipeline.window.as_ref().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
             "windowed stream requires tumbling_window() or KeyedStream.window() before collect",
@@ -83,9 +83,9 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         krishiv_api::KrishivError::unsupported(
             "streaming execution requires key_by() before window collect",
         )
-    })?;
+    }).map_err(map_krishiv_error)?;
     let state_ttl_ms = pipeline.session.state_ttl().map(|c| c.ttl_ms());
-    let spec = LocalWindowExecutionSpec {
+    Ok(LocalWindowExecutionSpec {
         key_column,
         event_time_column: event_time,
         watermark_lag_ms: pipeline.max_lateness_ms,
@@ -95,28 +95,13 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         state_ttl_ms,
         source_watermark_lags: std::collections::HashMap::new(),
         source_id_column: None,
-    };
+    })
+}
+
+pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatch>> {
+    let spec = spec_from_pipeline(pipeline)?;
     let input = resolve_input_batches(pipeline).map_err(map_krishiv_error)?;
-    let topic = pipeline
-        .source_id
-        .strip_prefix("memory:")
-        .unwrap_or(pipeline.source_id.as_str());
-    let plan_name = krishiv_runtime::fragment_from_local_spec(&spec);
-    pipeline
-        .session
-        .execution_runtime()
-        .accept_plan(&krishiv_plan::PhysicalPlan::new(
-            plan_name,
-            krishiv_plan::ExecutionKind::Streaming,
-        ))
-        .map_err(map_krishiv_error)?;
-    let output = pipeline
-        .session
-        .execution_runtime()
-        .collect_bounded_window(topic, input, &spec)
-        .map_err(map_krishiv_error)?;
-    Ok(output
-        .into_iter()
-        .map(PyBatch::from_record_batch)
-        .collect())
+    let output = krishiv_api::execute_windowed_stream(input, &spec)
+        .map_err(|e| map_krishiv_error(krishiv_api::KrishivError::from(e)))?;
+    Ok(output.into_iter().map(PyBatch::from_record_batch).collect())
 }

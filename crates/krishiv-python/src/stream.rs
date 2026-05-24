@@ -1,6 +1,6 @@
 //! `Stream`, `KeyedStream`, and `WindowedStream` transformation chain.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -16,8 +16,8 @@ use crate::windows::{PyWindowSpec, ensure_watermark_before_window};
 fn new_windowed_stream(pipeline: StreamPipeline) -> PyWindowedStream {
     PyWindowedStream {
         pipeline,
-        cached: RefCell::new(None),
-        iter_idx: RefCell::new(0),
+        cached: Mutex::new(None),
+        iter_idx: Mutex::new(0),
     }
 }
 
@@ -188,19 +188,20 @@ impl PyKeyedStream {
 }
 
 /// Windowed, keyed stream — async iterable and aggregations.
-#[pyclass(name = "WindowedStream")]
+#[pyclass(unsendable, name = "WindowedStream")]
 pub struct PyWindowedStream {
     pub(crate) pipeline: StreamPipeline,
-    cached: RefCell<Option<Vec<PyBatch>>>,
-    iter_idx: RefCell<usize>,
+    cached: Mutex<Option<Vec<PyBatch>>>,
+    iter_idx: Mutex<usize>,
 }
 
 impl PyWindowedStream {
     fn ensure_collected(&self) -> PyResult<()> {
-        if self.cached.borrow().is_none() {
+        let mut cached = self.cached.lock().unwrap();
+        if cached.is_none() {
             let batches = execute_pipeline(&self.pipeline)?;
-            *self.cached.borrow_mut() = Some(batches);
-            *self.iter_idx.borrow_mut() = 0;
+            *cached = Some(batches);
+            *self.iter_idx.lock().unwrap() = 0;
         }
         Ok(())
     }
@@ -228,7 +229,7 @@ impl PyWindowedStream {
 
     pub fn collect(&self, _py: Python<'_>) -> PyResult<Vec<PyBatch>> {
         self.ensure_collected()?;
-        Ok(self.cached.borrow().clone().unwrap_or_default())
+        Ok(self.cached.lock().unwrap().clone().unwrap_or_default())
     }
 
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -237,8 +238,8 @@ impl PyWindowedStream {
 
     pub fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
         self.ensure_collected()?;
-        let mut idx = self.iter_idx.borrow_mut();
-        let cached = self.cached.borrow();
+        let cached = self.cached.lock().unwrap();
+        let mut idx = self.iter_idx.lock().unwrap();
         let batches = cached.as_ref().expect("collected");
         if *idx >= batches.len() {
             return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));

@@ -219,6 +219,11 @@ impl InMemoryStateBackend {
         self.store.len()
     }
 
+    /// Return the key group range owned by this backend.
+    pub fn key_group_range(&self) -> std::ops::RangeInclusive<u16> {
+        0..=(crate::key_group::NUM_KEY_GROUPS - 1)
+    }
+
     fn make_key(namespace: &Namespace, key: &[u8]) -> InMemKey {
         (
             namespace.operator_id().to_owned(),

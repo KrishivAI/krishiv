@@ -14,7 +14,8 @@ use crate::dataframe::PyDataFrame;
 use crate::errors::map_krishiv_error;
 use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
-use crate::stream::PyStream;
+use crate::stream::{PyStream, PyWindowedStream};
+use crate::stream_exec::spec_from_pipeline;
 
 fn build_embedded_session() -> PyResult<PySession> {
     krishiv_api::SessionBuilder::new()
@@ -327,8 +328,9 @@ impl PySession {
     pub fn submit_stream_job(
         &self,
         name: String,
-        spec: krishiv_api::LocalWindowExecutionSpec,
+        stream: &PyWindowedStream,
     ) -> PyResult<String> {
+        let spec = spec_from_pipeline(&stream.pipeline)?;
         self.inner
             .submit_stream_job(name, spec)
             .map_err(map_krishiv_error)
