@@ -202,14 +202,16 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
 /// Distributed / remote-cluster runtime (Flight SQL + optional in-process fallback for tests).
 pub struct RemoteExecutionRuntime {
     flight_url: String,
+    session_mode: RuntimeMode,
     /// When set, bounded streaming also uses the in-process cluster (integration tests).
     local_fallback: Option<Arc<InProcessCluster>>,
 }
 
 impl RemoteExecutionRuntime {
-    pub fn new(flight_url: impl Into<String>) -> Self {
+    pub fn new(flight_url: impl Into<String>, session_mode: RuntimeMode) -> Self {
         Self {
             flight_url: flight_url.into(),
+            session_mode,
             local_fallback: None,
         }
     }
@@ -218,14 +220,32 @@ impl RemoteExecutionRuntime {
         self.local_fallback = Some(cluster);
         self
     }
+
+    fn local_accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
+            RuntimeError::unsupported("plan acceptance requires a local cluster fallback")
+        })?;
+        let runtime = match self.session_mode {
+            RuntimeMode::SingleNode => {
+                InProcessExecutionRuntime::single_node(Arc::clone(cluster))
+            }
+            RuntimeMode::Embedded | RuntimeMode::Distributed => {
+                InProcessExecutionRuntime::embedded(Arc::clone(cluster))
+            }
+        };
+        runtime.accept_plan(plan)
+    }
 }
 
 impl ExecutionRuntime for RemoteExecutionRuntime {
     fn mode(&self) -> RuntimeMode {
-        RuntimeMode::Distributed
+        self.session_mode
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        if self.local_fallback.is_some() {
+            return self.local_accept_plan(plan);
+        }
         let mut backend = DistributedBackend::new(self.flight_url.clone());
         backend.execute(plan)
     }
@@ -313,7 +333,8 @@ pub fn build_execution_runtime(
         RuntimeMode::SingleNode => {
             if let Some(url) = coordinator_flight_url {
                 Arc::new(
-                    RemoteExecutionRuntime::new(url).with_local_fallback(Arc::clone(&cluster)),
+                    RemoteExecutionRuntime::new(url, RuntimeMode::SingleNode)
+                        .with_local_fallback(Arc::clone(&cluster)),
                 )
             } else {
                 Arc::new(InProcessExecutionRuntime::single_node(cluster))
@@ -323,7 +344,8 @@ pub fn build_execution_runtime(
             let url = coordinator_flight_url
                 .unwrap_or_else(|| String::from("http://127.0.0.1:50051"));
             Arc::new(
-                RemoteExecutionRuntime::new(url).with_local_fallback(Arc::clone(&cluster)),
+                RemoteExecutionRuntime::new(url, RuntimeMode::Distributed)
+                    .with_local_fallback(Arc::clone(&cluster)),
             )
         }
     }

@@ -15,6 +15,10 @@
 - [x] **Follow-up:** Distributed `Session.sql()` + Flight full result drain
 - [x] **Follow-up:** Continuous streaming drain (`stream:continuous:`, `poll_stream_job`)
 - [x] **Follow-up:** Multi-source watermark in `execute_bounded_window`
+- [x] **Gap closure:** `accept_plan` local fallback; distributed read_parquet/window/memory stream parity
+- [ ] **R2+:** True remote execution (disable local fallback, Flight catalog sync, policy via coordinator)
+
+See [unified-execution-mode-gaps.md](unified-execution-mode-gaps.md) for full mode parity analysis.
 - [x] Tests: sliding/session windows, coordinator reuse, fragment roundtrip
 
 ## Validation

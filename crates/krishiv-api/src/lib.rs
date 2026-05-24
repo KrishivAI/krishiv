@@ -431,7 +431,6 @@ impl Session {
         name: impl Into<String>,
         batches: Vec<RecordBatch>,
     ) -> Result<()> {
-        ensure_local_mode(self.mode)?;
         self.memory_streams
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -595,7 +594,6 @@ impl Session {
         path: impl AsRef<str>,
         version: Option<i64>,
     ) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         let sql_dataframe = self.sql_engine.read_delta(path, version).await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
     }
@@ -607,7 +605,6 @@ impl Session {
         query_type: krishiv_lakehouse::HudiQueryType,
         begin_instant: Option<&str>,
     ) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         let sql_dataframe = self
             .sql_engine
             .read_hudi(path, query_type, begin_instant)
@@ -617,9 +614,10 @@ impl Session {
 
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.
     pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
-        let sql_dataframe = self.sql_engine.read_parquet(path).await?;
-        Ok(self.dataframe_from_sql(sql_dataframe))
+        let path = path.as_ref();
+        let table = parquet_scan_table_name(path);
+        self.register_parquet_async(&table, path).await?;
+        self.sql_async(format!("SELECT * FROM {table}")).await
     }
 
     /// Create a bounded local memory stream.
@@ -627,7 +625,8 @@ impl Session {
         let name = name.into();
         let record_batches: Vec<RecordBatch> =
             batches.iter().map(|b| b.batch().clone()).collect();
-        let _ = self.register_memory_stream(name.clone(), record_batches);
+        self.register_memory_stream(name.clone(), record_batches)
+            .expect("memory stream registration");
         Stream::for_session(
             name,
             StreamMode::Bounded,
@@ -943,19 +942,14 @@ impl Stream {
 
     /// Collect bounded in-memory stream batches.
     pub fn collect_bounded(&self) -> Result<Vec<StreamBatch>> {
-        ensure_local_mode(self.execution_mode)?;
         if !self.is_bounded() {
             return Err(KrishivError::unsupported(
                 "unbounded stream collection requires a streaming runtime",
             ));
         }
 
-        accept_plan_with_backend(
-            self.execution_mode,
-            &self.name,
-            ExecutionKind::Streaming,
-            self.coordinator_url.as_deref(),
-        )?;
+        let plan = PhysicalPlan::new(&self.name, ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan)?;
         Ok(self.batches.clone())
     }
 
@@ -972,13 +966,8 @@ impl Stream {
             ));
         }
 
-        ensure_local_mode(self.execution_mode)?;
-        accept_plan_with_backend(
-            self.execution_mode,
-            &format!("{}:map", self.name),
-            ExecutionKind::Streaming,
-            self.coordinator_url.as_deref(),
-        )?;
+        let plan = PhysicalPlan::new(format!("{}:map", self.name), ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan)?;
 
         Ok(Self::for_session(
             self.name.clone(),
@@ -993,19 +982,14 @@ impl Stream {
 
     /// Filter local stream batches.
     pub fn filter_batches(&self, mut f: impl FnMut(&StreamBatch) -> bool) -> Result<Stream> {
-        ensure_local_mode(self.execution_mode)?;
         if !self.is_bounded() {
             return Err(KrishivError::unsupported(
                 "unbounded stream filtering requires a streaming runtime",
             ));
         }
 
-        accept_plan_with_backend(
-            self.execution_mode,
-            &format!("{}:filter", self.name),
-            ExecutionKind::Streaming,
-            self.coordinator_url.as_deref(),
-        )?;
+        let plan = PhysicalPlan::new(format!("{}:filter", self.name), ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan)?;
 
         Ok(Self::for_session(
             self.name.clone(),
@@ -1449,6 +1433,18 @@ impl KeyedStream {
             session_gap_ms,
         }
     }
+}
+
+fn parquet_scan_table_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("scan");
+    let sanitized: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("_krishiv_parquet_{sanitized}")
 }
 
 fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
@@ -2109,6 +2105,48 @@ mod tests {
         let df = session.sql_async("SELECT 3 AS n").await.unwrap();
         let result = df.collect_async().await.unwrap();
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_window_collect_via_local_cluster() {
+        let session = Session::builder()
+            .with_local_cluster("http://127.0.0.1:50051")
+            .build()
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .tumbling_window(10_000)
+            .collect()
+            .expect("distributed window collect");
+        assert!(!out.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_read_parquet_collects_via_coordinator() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+        let session = Session::builder()
+            .with_coordinator("http://127.0.0.1:50051")
+            .build()
+            .unwrap();
+        let df = session.read_parquet_async(&parquet_path).await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
