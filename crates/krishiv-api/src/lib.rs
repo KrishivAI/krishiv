@@ -24,7 +24,12 @@ use krishiv_sql_policy::PolicyEnforcingSqlEngine;
 pub use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
+pub use krishiv_exec::{AggExpr, AggFunction};
+pub use krishiv_runtime::{
+    LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream, is_streaming_plan,
+};
 pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
+pub use krishiv_state::TtlConfig;
 pub use krishiv_udf::{ScalarUdf, UdfError, UdfRegistry};
 
 /// API result alias.
@@ -182,6 +187,7 @@ pub struct SessionBuilder {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     coordinator_url: Option<String>,
+    state_ttl: Option<StateTtlConfig>,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -191,6 +197,7 @@ impl fmt::Debug for SessionBuilder {
             .field("auth", &self.auth.as_ref().map(|_| "<AuthProvider>"))
             .field("policy", &self.policy.as_ref().map(|_| "<PolicyHook>"))
             .field("coordinator_url", &self.coordinator_url)
+            .field("state_ttl", &self.state_ttl)
             .finish()
     }
 }
@@ -202,6 +209,7 @@ impl Default for SessionBuilder {
             auth: None,
             policy: None,
             coordinator_url: None,
+            state_ttl: None,
         }
     }
 }
@@ -243,6 +251,13 @@ impl SessionBuilder {
         self
     }
 
+    /// Attach streaming operator state TTL (wired to `krishiv-state` backends).
+    #[must_use]
+    pub fn with_state_ttl(mut self, ttl: StateTtlConfig) -> Self {
+        self.state_ttl = Some(ttl);
+        self
+    }
+
     /// Build a session.
     pub fn build(self) -> Result<Session> {
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
@@ -262,6 +277,7 @@ impl SessionBuilder {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
+            state_ttl: self.state_ttl,
             udf_registry,
         })
     }
@@ -276,6 +292,7 @@ pub struct Session {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     coordinator_url: Option<String>,
+    state_ttl: Option<StateTtlConfig>,
     udf_registry: Arc<RwLock<UdfRegistry>>,
 }
 
@@ -304,6 +321,16 @@ impl Session {
     /// Current execution mode.
     pub fn mode(&self) -> ExecutionMode {
         self.mode
+    }
+
+    /// Streaming state TTL configuration, if set.
+    pub fn state_ttl(&self) -> Option<StateTtlConfig> {
+        self.state_ttl
+    }
+
+    /// Convert session TTL config to a `krishiv-state` [`TtlConfig`].
+    pub fn state_ttl_config(&self) -> Option<TtlConfig> {
+        self.state_ttl.map(StateTtlConfig::to_ttl_config)
     }
 
     /// Known local jobs.
@@ -485,12 +512,24 @@ impl Session {
 
     /// Create a bounded local memory stream.
     pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Stream {
-        Stream::for_session(name, StreamMode::Bounded, batches, self.mode)
+        Stream::for_session(
+            name,
+            StreamMode::Bounded,
+            batches,
+            self.mode,
+            self.coordinator_url.clone(),
+        )
     }
 
     /// Create an unbounded local memory stream placeholder.
     pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Stream {
-        Stream::for_session(name, StreamMode::Unbounded, Vec::new(), self.mode)
+        Stream::for_session(
+            name,
+            StreamMode::Unbounded,
+            Vec::new(),
+            self.mode,
+            self.coordinator_url.clone(),
+        )
     }
 }
 
@@ -657,13 +696,21 @@ pub struct Stream {
     name: String,
     mode: StreamMode,
     execution_mode: ExecutionMode,
+    coordinator_url: Option<String>,
     batches: Vec<StreamBatch>,
 }
 
 impl Stream {
-    /// Create a stream.
-    pub fn new(name: impl Into<String>, mode: StreamMode, batches: Vec<StreamBatch>) -> Self {
-        Self::for_session(name, mode, batches, ExecutionMode::Embedded)
+    /// Create a stream with an explicit execution mode.
+    ///
+    /// Prefer [`Session::memory_stream`] so the stream inherits the session mode.
+    pub fn new(
+        name: impl Into<String>,
+        mode: StreamMode,
+        batches: Vec<StreamBatch>,
+        execution_mode: ExecutionMode,
+    ) -> Self {
+        Self::for_session(name, mode, batches, execution_mode, None)
     }
 
     fn for_session(
@@ -671,11 +718,13 @@ impl Stream {
         mode: StreamMode,
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
+        coordinator_url: Option<String>,
     ) -> Self {
         Self {
             name: name.into(),
             mode,
             execution_mode,
+            coordinator_url,
             batches,
         }
     }
@@ -713,9 +762,14 @@ impl Stream {
             self.execution_mode,
             &self.name,
             ExecutionKind::Streaming,
-            None,
+            self.coordinator_url.as_deref(),
         )?;
         Ok(self.batches.clone())
+    }
+
+    /// Execution mode for this stream.
+    pub fn execution_mode(&self) -> ExecutionMode {
+        self.execution_mode
     }
 
     /// Map local stream batches.
@@ -727,12 +781,19 @@ impl Stream {
         }
 
         ensure_local_mode(self.execution_mode)?;
+        accept_plan_with_backend(
+            self.execution_mode,
+            &format!("{}:map", self.name),
+            ExecutionKind::Streaming,
+            self.coordinator_url.as_deref(),
+        )?;
 
         Ok(Self::for_session(
             self.name.clone(),
             self.mode,
             self.batches.iter().map(&mut f).collect(),
             self.execution_mode,
+            self.coordinator_url.clone(),
         ))
     }
 
@@ -745,6 +806,13 @@ impl Stream {
             ));
         }
 
+        accept_plan_with_backend(
+            self.execution_mode,
+            &format!("{}:filter", self.name),
+            ExecutionKind::Streaming,
+            self.coordinator_url.as_deref(),
+        )?;
+
         Ok(Self::for_session(
             self.name.clone(),
             self.mode,
@@ -754,6 +822,7 @@ impl Stream {
                 .cloned()
                 .collect(),
             self.execution_mode,
+            self.coordinator_url.clone(),
         ))
     }
 
@@ -855,8 +924,8 @@ impl KeyedStream {
 
 /// A keyed stream with a tumbling window applied.
 ///
-/// This is a descriptor type — no execution happens until the stream is
-/// submitted to a distributed runtime.
+/// Windowed stream descriptor; call [`WindowedStream::collect`] to execute locally
+/// in embedded or single-node mode.
 #[derive(Debug, Clone)]
 pub struct WindowedStream {
     keyed: KeyedStream,
@@ -888,6 +957,71 @@ impl WindowedStream {
     pub fn keyed_stream(&self) -> &KeyedStream {
         &self.keyed
     }
+
+    /// Execute the tumbling window and collect output batches (embedded / single-node).
+    pub fn collect(&self) -> Result<Vec<StreamBatch>> {
+        self.collect_with_aggs(LocalWindowExecutionSpec::default_count_agg())
+    }
+
+    /// Execute the tumbling window with custom aggregate expressions.
+    pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
+        let spec = build_tumbling_spec(&self.keyed, self.window_size_ms, agg_exprs)?;
+        execute_windowed_inner(&self.keyed.inner, spec)
+    }
+}
+
+fn event_time_column_for_keyed(keyed: &KeyedStream) -> Result<String> {
+    keyed.event_time_column.clone().ok_or_else(|| {
+        KrishivError::unsupported(
+            "windowed stream execution requires with_event_time() before collect",
+        )
+    })
+}
+
+fn build_tumbling_spec(
+    keyed: &KeyedStream,
+    window_size_ms: u64,
+    agg_exprs: Vec<AggExpr>,
+) -> Result<LocalWindowExecutionSpec> {
+    let event_time = event_time_column_for_keyed(keyed)?;
+    let lag = keyed.watermark_spec().map(WatermarkSpec::lag_ms).unwrap_or(0);
+    Ok(LocalWindowExecutionSpec {
+        key_column: keyed.key_column.clone(),
+        event_time_column: event_time,
+        watermark_lag_ms: lag,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms,
+        agg_exprs,
+    })
+}
+
+fn execute_windowed_inner(
+    stream: &Stream,
+    spec: LocalWindowExecutionSpec,
+) -> Result<Vec<StreamBatch>> {
+    ensure_local_mode(stream.execution_mode)?;
+    if !stream.is_bounded() {
+        return Err(KrishivError::unsupported(
+            "unbounded stream window execution requires a streaming runtime",
+        ));
+    }
+    accept_plan_with_backend(
+        stream.execution_mode,
+        &format!("stream:tw:{}", stream.name()),
+        ExecutionKind::Streaming,
+        stream.coordinator_url.as_deref(),
+    )?;
+    let input: Vec<RecordBatch> = stream
+        .batches
+        .iter()
+        .map(|b| b.batch().clone())
+        .collect();
+    let output = execute_windowed_stream(input, &spec).map_err(KrishivError::from)?;
+    Ok(output
+        .into_iter()
+        .enumerate()
+        .map(|(seq, batch)| StreamBatch::new(seq as u64, batch))
+        .collect())
 }
 
 // ── R5.2 Streaming API ────────────────────────────────────────────────────────
@@ -935,6 +1069,11 @@ impl StateTtlConfig {
     /// TTL duration in milliseconds.
     pub fn ttl_ms(&self) -> u64 {
         self.ttl_ms
+    }
+
+    /// Convert to `krishiv-state` [`TtlConfig`] for state backends.
+    pub fn to_ttl_config(self) -> TtlConfig {
+        TtlConfig::new(self.ttl_ms)
     }
 }
 
@@ -998,6 +1137,60 @@ impl SessionWindowedStream {
     pub fn session_gap_ms(&self) -> u64 {
         self.session_gap_ms
     }
+
+    /// Execute the session window and collect output batches.
+    pub fn collect(&self) -> Result<Vec<StreamBatch>> {
+        self.collect_with_aggs(LocalWindowExecutionSpec::default_count_agg())
+    }
+
+    /// Execute with custom aggregates.
+    pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
+        let event_time = event_time_column_for_keyed(&self.keyed)?;
+        let lag = self
+            .keyed
+            .watermark_spec()
+            .map(WatermarkSpec::lag_ms)
+            .unwrap_or(0);
+        let spec = LocalWindowExecutionSpec {
+            key_column: self.keyed.key_column.clone(),
+            event_time_column: event_time,
+            watermark_lag_ms: lag,
+            window_kind: LocalWindowKind::Session {
+                gap_ms: self.session_gap_ms,
+            },
+            window_size_ms: self.session_gap_ms,
+            agg_exprs,
+        };
+        execute_windowed_inner(&self.keyed.inner, spec)
+    }
+}
+
+impl SlidingWindowedStream {
+    /// Execute the sliding window and collect output batches.
+    pub fn collect(&self) -> Result<Vec<StreamBatch>> {
+        self.collect_with_aggs(LocalWindowExecutionSpec::default_count_agg())
+    }
+
+    /// Execute with custom aggregates.
+    pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
+        let event_time = event_time_column_for_keyed(&self.keyed)?;
+        let lag = self
+            .keyed
+            .watermark_spec()
+            .map(WatermarkSpec::lag_ms)
+            .unwrap_or(0);
+        let spec = LocalWindowExecutionSpec {
+            key_column: self.keyed.key_column.clone(),
+            event_time_column: event_time,
+            watermark_lag_ms: lag,
+            window_kind: LocalWindowKind::Sliding {
+                slide_ms: self.slide_ms,
+            },
+            window_size_ms: self.window_size_ms,
+            agg_exprs,
+        };
+        execute_windowed_inner(&self.keyed.inner, spec)
+    }
 }
 
 impl KeyedStream {
@@ -1020,10 +1213,13 @@ impl KeyedStream {
     }
 }
 
-// All execution modes are now supported; this is a no-op retained to keep
-// call sites that guard metadata-only operations readable.
-#[allow(dead_code)]
-fn ensure_local_mode(_mode: ExecutionMode) -> Result<()> {
+fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
+    if mode == ExecutionMode::Distributed {
+        return Err(KrishivError::unsupported(
+            "operation requires embedded or single-node mode; use SessionBuilder without \
+             with_coordinator, or use distributed APIs explicitly",
+        ));
+    }
     Ok(())
 }
 
@@ -1037,7 +1233,7 @@ fn accept_plan_with_backend(
 
     match mode {
         ExecutionMode::Embedded => {
-            let mut backend = EmbeddedBackend;
+            let mut backend = EmbeddedBackend::default();
             backend.execute(&physical_plan)?;
         }
         ExecutionMode::SingleNode => {
@@ -1317,6 +1513,32 @@ mod tests {
         assert_eq!(windowed.event_time_column(), Some("ts"));
         assert_eq!(windowed.watermark_lag_ms(), 1000);
         assert_eq!(windowed.window_size_ms(), 60_000);
+    }
+
+    #[test]
+    fn tumbling_window_collect_executes_in_embedded_mode() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 5_000, 2_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .watermark(WatermarkSpec::fixed_lag_ms(0))
+            .tumbling_window(10_000)
+            .collect()
+            .expect("window collect");
+        assert!(!out.is_empty());
     }
 
     #[test]

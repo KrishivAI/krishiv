@@ -308,6 +308,8 @@ impl SqlEngine {
         }
 
         self.sync_scalar_udfs().await?;
+        self.sync_aggregate_udfs().await?;
+        self.sync_table_udfs().await?;
 
         if query
             .trim_start()

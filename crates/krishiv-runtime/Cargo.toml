@@ -7,8 +7,9 @@ license.workspace = true
 
 [dependencies]
 krishiv-plan = { path = "../krishiv-plan" }
-krishiv-sql = { path = "../krishiv-sql" }
+krishiv-exec = { path = "../krishiv-exec" }
 krishiv-async-util = { path = "../krishiv-async-util" }
+arrow = { workspace = true }
 arrow-flight = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }

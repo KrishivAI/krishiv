@@ -24,6 +24,7 @@ mod session;
 mod sinks;
 mod sources;
 mod stream;
+mod stream_exec;
 mod udf;
 mod windows;
 
@@ -204,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_session_stream_raises_mode_error_via_api() {
+    fn embedded_session_allows_stream_factory() {
         let session = krishiv_api::SessionBuilder::new().build().unwrap();
         assert!(matches!(
             session.mode(),

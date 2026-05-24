@@ -2,6 +2,12 @@
 
 ## Current Phase
 
+**Embedded batch/streaming fixes (2026-05-24).** Branch `cursor/fix-embedded-batch-streaming-cbbd`:
+- Runtime backends accept batch plans without bogus `SqlEngine` re-execution; embedded redirects streaming to single-node.
+- `local_streaming` executes tumbling/sliding/session windows via `krishiv-exec`.
+- API: `WindowedStream::collect`, `ensure_local_mode`, stream `coordinator_url`, `StateTtlConfig` → `TtlConfig`.
+- Python: `WindowedStream` collect/async iteration wired; embedded `stream()` allowed.
+
 **Gap analysis implementation (2026-05-23).** See [`docs/engineering/gap-analysis-2026-05-23.md`](../engineering/gap-analysis-2026-05-23.md).
 
 ### Gap closure (branch `cursor/gap-analysis-impl-7aa2`)

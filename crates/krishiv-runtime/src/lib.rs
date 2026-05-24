@@ -1,40 +1,24 @@
 #![forbid(unsafe_code)]
 
-//! Runtime traits and local backend stubs for Krishiv.
+//! Runtime traits and local backends for Krishiv.
 //!
-//! R1 bootstrap defines the runtime seams without implementing real query
-//! execution. The first real local execution path will be added when
-//! DataFusion integration lands.
+//! Embedded mode runs batch SQL through the session `SqlEngine` (in `krishiv-api`).
+//! Streaming plans are accepted here and executed via [`local_streaming`] on
+//! single-node backends (ADR-12.5).
 
 use std::error::Error;
 use std::fmt;
 
-use krishiv_async_util::block_on;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
-use krishiv_sql::SqlEngine;
 
 mod flight_client;
+pub mod local_streaming;
+mod plan;
 
-fn execute_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-    let sql = flight_client::plan_to_sql(plan);
-    let engine = SqlEngine::new();
-    block_on(async {
-        let df = engine
-            .sql(&sql)
-            .await
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
-        df.collect()
-            .await
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
-        Ok::<(), RuntimeError>(())
-    })?;
-    Ok(ExecutionReport::new(
-        backend,
-        plan.name(),
-        plan.kind(),
-        true,
-    ))
-}
+pub use local_streaming::{
+    LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream,
+};
+pub use plan::is_streaming_plan;
 
 // tracing is used for debug-level plan delegation logging.
 use tracing::debug;
@@ -311,7 +295,8 @@ pub trait ExecutionBackend {
     /// Backend name.
     fn backend_name(&self) -> &str;
 
-    /// Execute a physical plan.
+    /// Accept or execute a physical plan. Batch plans are accepted without
+    /// re-running SQL; execution happens in the session `SqlEngine`.
     fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
 }
 
@@ -321,28 +306,19 @@ pub trait TaskExecutor {
     fn execute_task(&mut self, task: TaskSpec) -> RuntimeResult<TaskReport>;
 }
 
-/// Embedded in-process backend stub.
-#[derive(Debug, Default)]
-pub struct EmbeddedBackend;
-
-impl ExecutionBackend for EmbeddedBackend {
-    fn backend_name(&self) -> &str {
-        "embedded"
+fn accept_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    if plan.name().trim().is_empty() {
+        return Err(RuntimeError::plan_rejected("plan name must not be empty"));
     }
-
-    fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        debug!(
-            backend = "embedded",
-            plan = %plan.name(),
-            kind = %plan.kind(),
-            sql = %flight_client::plan_to_sql(plan),
-            "EmbeddedBackend: executing plan via SqlEngine"
-        );
-        execute_local_plan(self.backend_name(), plan)
-    }
+    Ok(ExecutionReport::new(
+        backend,
+        plan.name(),
+        plan.kind(),
+        true,
+    ))
 }
 
-/// Single-node backend stub.
+/// Single-node in-process backend: accepts batch and streaming plans for local execution.
 #[derive(Debug, Default)]
 pub struct SingleNodeBackend;
 
@@ -356,10 +332,41 @@ impl ExecutionBackend for SingleNodeBackend {
             backend = "single-node",
             plan = %plan.name(),
             kind = %plan.kind(),
-            sql = %flight_client::plan_to_sql(plan),
-            "SingleNodeBackend: executing plan via SqlEngine"
+            streaming = is_streaming_plan(plan),
+            "SingleNodeBackend: accepted plan for in-process execution"
         );
-        execute_local_plan(self.backend_name(), plan)
+        accept_local_plan(self.backend_name(), plan)
+    }
+}
+
+/// Embedded in-process backend: batch via session `SqlEngine`, streaming delegated to
+/// [`SingleNodeBackend`] (ADR-12.5).
+#[derive(Debug, Default)]
+pub struct EmbeddedBackend {
+    single_node: SingleNodeBackend,
+}
+
+impl ExecutionBackend for EmbeddedBackend {
+    fn backend_name(&self) -> &str {
+        "embedded"
+    }
+
+    fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        if is_streaming_plan(plan) {
+            debug!(
+                backend = "embedded",
+                plan = %plan.name(),
+                "EmbeddedBackend: redirecting streaming plan to SingleNodeBackend"
+            );
+            return self.single_node.execute(plan);
+        }
+        debug!(
+            backend = "embedded",
+            plan = %plan.name(),
+            kind = %plan.kind(),
+            "EmbeddedBackend: accepted batch plan (execution via session SqlEngine)"
+        );
+        accept_local_plan(self.backend_name(), plan)
     }
 }
 
@@ -388,6 +395,8 @@ impl ExecutionBackend for DistributedBackend {
     }
 
     fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        use krishiv_async_util::block_on;
+
         debug!(
             backend = "distributed",
             coordinator = %self.flight_url,
@@ -445,20 +454,35 @@ mod distributed_flight_tests {
 mod tests {
     use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
-    use super::{EmbeddedBackend, ExecutionBackend};
+    use super::{EmbeddedBackend, ExecutionBackend, SingleNodeBackend, is_streaming_plan};
 
     #[test]
     fn embedded_backend_accepts_bootstrap_plan() {
         let plan = PhysicalPlan::new("bootstrap", ExecutionKind::Batch);
-        let mut backend = EmbeddedBackend;
+        let mut backend = EmbeddedBackend::default();
 
-        let report = match backend.execute(&plan) {
-            Ok(report) => report,
-            Err(error) => panic!("unexpected runtime error: {error}"),
-        };
+        let report = backend.execute(&plan).expect("execute");
 
         assert_eq!(report.backend(), "embedded");
         assert_eq!(report.plan_name(), "bootstrap");
+        assert!(report.accepted());
+    }
+
+    #[test]
+    fn embedded_redirects_streaming_kind_to_single_node() {
+        let plan = PhysicalPlan::new("events", ExecutionKind::Streaming);
+        assert!(is_streaming_plan(&plan));
+        let mut backend = EmbeddedBackend::default();
+        let report = backend.execute(&plan).expect("execute");
+        assert_eq!(report.backend(), "single-node");
+    }
+
+    #[test]
+    fn single_node_accepts_streaming_plan() {
+        let plan = PhysicalPlan::new("stream:tw:key=u", ExecutionKind::Batch);
+        let mut backend = SingleNodeBackend;
+        let report = backend.execute(&plan).expect("execute");
+        assert_eq!(report.backend(), "single-node");
         assert!(report.accepted());
     }
 }

@@ -1,5 +1,7 @@
 //! `Stream`, `KeyedStream`, and `WindowedStream` transformation chain.
 
+use std::cell::RefCell;
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -8,7 +10,16 @@ use crate::batch::PyBatch;
 use crate::errors::SchemaError;
 use crate::pipeline::{StreamPipeline, WindowKind};
 use crate::session::PySession;
+use crate::stream_exec::execute_pipeline;
 use crate::windows::{PyWindowSpec, ensure_watermark_before_window};
+
+fn new_windowed_stream(pipeline: StreamPipeline) -> PyWindowedStream {
+    PyWindowedStream {
+        pipeline,
+        cached: RefCell::new(None),
+        iter_idx: RefCell::new(0),
+    }
+}
 
 fn stream_repr(pipeline: &StreamPipeline) -> String {
     format!(
@@ -79,7 +90,7 @@ impl PyStream {
                 slide_ms: None,
                 gap_ms: None,
             });
-        Ok(PyWindowedStream { pipeline })
+        Ok(new_windowed_stream(pipeline))
     }
 
     /// Tumbling window duration in seconds (multiplied by 1000 for the engine).
@@ -102,7 +113,7 @@ impl PyStream {
                 slide_ms: None,
                 gap_ms: None,
             });
-        Ok(PyWindowedStream { pipeline })
+        Ok(new_windowed_stream(pipeline))
     }
 
     pub fn __repr__(&self) -> String {
@@ -127,9 +138,9 @@ impl PyKeyedStream {
             &self.pipeline.watermark_column,
             self.pipeline.max_lateness_ms,
         )?;
-        Ok(PyWindowedStream {
-            pipeline: self.pipeline.with_window(spec.into_descriptor()),
-        })
+        Ok(new_windowed_stream(
+            self.pipeline.with_window(spec.into_descriptor()),
+        ))
     }
 
     pub fn tumbling_window(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
@@ -155,6 +166,19 @@ impl PyKeyedStream {
 #[pyclass(name = "WindowedStream")]
 pub struct PyWindowedStream {
     pub(crate) pipeline: StreamPipeline,
+    cached: RefCell<Option<Vec<PyBatch>>>,
+    iter_idx: RefCell<usize>,
+}
+
+impl PyWindowedStream {
+    fn ensure_collected(&self) -> PyResult<()> {
+        if self.cached.borrow().is_none() {
+            let batches = execute_pipeline(&self.pipeline)?;
+            *self.cached.borrow_mut() = Some(batches);
+            *self.iter_idx.borrow_mut() = 0;
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -167,28 +191,36 @@ impl PyWindowedStream {
     }
 
     #[pyo3(signature = (**kwargs))]
-    pub fn agg(&self, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyStream> {
+    pub fn agg(&self, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyWindowedStream> {
         let aggs = descriptors_from_kwargs(kwargs)?;
         if aggs.is_empty() {
             return Err(SchemaError::new_err(
                 "agg() requires at least one named aggregation expression",
             ));
         }
-        Ok(PyStream {
-            pipeline: self.pipeline.with_aggregations(aggs),
-        })
+        Ok(new_windowed_stream(self.pipeline.with_aggregations(aggs)))
     }
 
     pub fn collect(&self, _py: Python<'_>) -> PyResult<Vec<PyBatch>> {
-        Ok(vec![])
+        self.ensure_collected()?;
+        Ok(self.cached.borrow().clone().unwrap_or_default())
     }
 
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    pub fn __anext__(&self, _py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
-        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+    pub fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
+        self.ensure_collected()?;
+        let mut idx = self.iter_idx.borrow_mut();
+        let cached = self.cached.borrow();
+        let batches = cached.as_ref().expect("collected");
+        if *idx >= batches.len() {
+            return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+        }
+        let batch = batches[*idx].clone();
+        *idx += 1;
+        Ok(Some(Py::new(py, batch)?))
     }
 
     pub fn __repr__(&self) -> String {

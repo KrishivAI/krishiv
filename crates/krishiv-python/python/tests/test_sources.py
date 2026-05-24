@@ -5,9 +5,9 @@ import pytest
 import krishiv as ks
 
 
-def test_read_kafka_requires_non_embedded():
+def test_read_kafka_embedded_without_feature_raises():
     session = ks.Session.embedded()
-    with pytest.raises(ks.ModeError):
+    with pytest.raises(ks.ConnectorError):
         ks.read_kafka(session, "topic", "localhost:9092")
 
 
