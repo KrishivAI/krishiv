@@ -40,6 +40,7 @@ Each tracker is intentionally checklist-oriented. R1-R3 are more concrete becaus
 | R20 Enterprise Platform & Ecosystem | [r20-enterprise-platform.md](r20-enterprise-platform.md) |
 | R12–R20 Strategic Roadmap (planning doc) | [../architecture/r12-r20-roadmap.md](../architecture/r12-r20-roadmap.md) |
 | R12 Maturity Gap & Risk Register | [../architecture/r12-maturity-gap-register.md](../architecture/r12-maturity-gap-register.md) |
+| Distributed unified mitigation (plan + tracker) | [distributed-unified-mitigation.md](distributed-unified-mitigation.md) · [plan](../architecture/distributed-unified-mitigation-plan.md) |
 | Architectural Decisions R12–R20 (ADR master) | [../architecture/architectural-decisions-r12-r20.md](../architecture/architectural-decisions-r12-r20.md) |
 
 ## Tracker Template
