@@ -17,7 +17,8 @@ use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
-    DistributedBackend, EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend,
+    build_execution_runtime, DistributedBackend, EmbeddedBackend, ExecutionBackend,
+    ExecutionRuntime, InProcessCluster, JobId, JobState, RuntimeMode, SingleNodeBackend,
 };
 use krishiv_sql::{SqlDataFrame, SqlEngine};
 use krishiv_sql_policy::PolicyEnforcingSqlEngine;
@@ -27,8 +28,8 @@ pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_exec::{AggExpr, AggFunction};
 pub use krishiv_runtime::{
-    InProcessStreamingRuntime, LocalWindowExecutionSpec, LocalWindowKind,
-    execute_windowed_in_process, execute_windowed_stream, is_streaming_plan,
+    ClusterEndpoints, InProcessStreamingRuntime, LocalWindowExecutionSpec, LocalWindowKind,
+    execute_windowed_stream, is_streaming_plan,
 };
 pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
 pub use krishiv_state::TtlConfig;
@@ -189,6 +190,7 @@ pub struct SessionBuilder {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     coordinator_url: Option<String>,
+    local_cluster_grpc: Option<String>,
     state_ttl: Option<StateTtlConfig>,
 }
 
@@ -199,6 +201,7 @@ impl fmt::Debug for SessionBuilder {
             .field("auth", &self.auth.as_ref().map(|_| "<AuthProvider>"))
             .field("policy", &self.policy.as_ref().map(|_| "<PolicyHook>"))
             .field("coordinator_url", &self.coordinator_url)
+            .field("local_cluster_grpc", &self.local_cluster_grpc)
             .field("state_ttl", &self.state_ttl)
             .finish()
     }
@@ -211,8 +214,17 @@ impl Default for SessionBuilder {
             auth: None,
             policy: None,
             coordinator_url: None,
+            local_cluster_grpc: None,
             state_ttl: None,
         }
+    }
+}
+
+fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
+    match mode {
+        ExecutionMode::Embedded => RuntimeMode::Embedded,
+        ExecutionMode::SingleNode => RuntimeMode::SingleNode,
+        ExecutionMode::Distributed => RuntimeMode::Distributed,
     }
 }
 
@@ -253,6 +265,16 @@ impl SessionBuilder {
         self
     }
 
+    /// Connect a [`ExecutionMode::SingleNode`] session to a local cluster without
+    /// switching to distributed mode (Spark-like `local[*]` client).
+    #[must_use]
+    pub fn with_local_cluster(mut self, flight_url: impl Into<String>) -> Self {
+        self.local_cluster_grpc = None;
+        self.coordinator_url = Some(flight_url.into());
+        self.mode = ExecutionMode::SingleNode;
+        self
+    }
+
     /// Attach streaming operator state TTL (wired to `krishiv-state` backends).
     #[must_use]
     pub fn with_state_ttl(mut self, ttl: StateTtlConfig) -> Self {
@@ -272,6 +294,16 @@ impl SessionBuilder {
             )),
             _ => None,
         };
+        let local_cluster = Arc::new(
+            InProcessCluster::new().map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?,
+        );
+        let runtime = build_execution_runtime(
+            execution_mode_to_runtime_mode(self.mode),
+            Arc::clone(&local_cluster),
+            self.coordinator_url.clone(),
+        );
         Ok(Session {
             mode: self.mode,
             sql_engine,
@@ -282,6 +314,8 @@ impl SessionBuilder {
             state_ttl: self.state_ttl,
             memory_streams: Arc::new(RwLock::new(HashMap::new())),
             udf_registry,
+            local_cluster,
+            runtime,
         })
     }
 }
@@ -298,6 +332,8 @@ pub struct Session {
     state_ttl: Option<StateTtlConfig>,
     memory_streams: Arc<RwLock<HashMap<String, Vec<RecordBatch>>>>,
     udf_registry: Arc<RwLock<UdfRegistry>>,
+    local_cluster: Arc<InProcessCluster>,
+    runtime: Arc<dyn ExecutionRuntime>,
 }
 
 impl fmt::Debug for Session {
@@ -335,6 +371,26 @@ impl Session {
     /// Convert session TTL config to a `krishiv-state` [`TtlConfig`].
     pub fn state_ttl_config(&self) -> Option<TtlConfig> {
         self.state_ttl.map(StateTtlConfig::to_ttl_config)
+    }
+
+    /// Session-scoped local coordinator + executor cluster.
+    pub fn local_cluster(&self) -> &InProcessCluster {
+        &self.local_cluster
+    }
+
+    /// Unified execution runtime for this session.
+    pub fn execution_runtime(&self) -> Arc<dyn ExecutionRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
+    /// Submit a continuous streaming job (unbounded sources). Returns a handle id.
+    pub fn submit_stream_job(&self, name: impl Into<String>) -> Result<String> {
+        let name = name.into();
+        let plan = PhysicalPlan::new(format!("stream:job:{name}"), ExecutionKind::Streaming);
+        self.runtime
+            .accept_plan(&plan)
+            .map_err(KrishivError::from)?;
+        Ok(name)
     }
 
     /// Register in-memory stream batches for `memory:<name>` pipeline sources.
@@ -550,6 +606,7 @@ impl Session {
             self.mode,
             self.coordinator_url.clone(),
             self.state_ttl.map(|c| c.ttl_ms()),
+            self.runtime.clone(),
         )
     }
 
@@ -562,6 +619,7 @@ impl Session {
             self.mode,
             self.coordinator_url.clone(),
             self.state_ttl.map(|c| c.ttl_ms()),
+            self.runtime.clone(),
         )
     }
 }
@@ -724,7 +782,7 @@ impl DataFrame {
 }
 
 /// Stream API for R1 local memory streams.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Stream {
     name: String,
     mode: StreamMode,
@@ -732,6 +790,18 @@ pub struct Stream {
     coordinator_url: Option<String>,
     state_ttl_ms: Option<u64>,
     batches: Vec<StreamBatch>,
+    runtime: Arc<dyn ExecutionRuntime>,
+}
+
+impl fmt::Debug for Stream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stream")
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("execution_mode", &self.execution_mode)
+            .field("batch_count", &self.batches.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Stream {
@@ -744,7 +814,21 @@ impl Stream {
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
     ) -> Self {
-        Self::for_session(name, mode, batches, execution_mode, None, None)
+        let cluster = InProcessCluster::new().expect("in-process cluster");
+        let runtime = build_execution_runtime(
+            execution_mode_to_runtime_mode(execution_mode),
+            Arc::new(cluster),
+            None,
+        );
+        Self::for_session(
+            name,
+            mode,
+            batches,
+            execution_mode,
+            None,
+            None,
+            runtime,
+        )
     }
 
     fn for_session(
@@ -754,6 +838,7 @@ impl Stream {
         execution_mode: ExecutionMode,
         coordinator_url: Option<String>,
         state_ttl_ms: Option<u64>,
+        runtime: Arc<dyn ExecutionRuntime>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -762,6 +847,7 @@ impl Stream {
             coordinator_url,
             state_ttl_ms,
             batches,
+            runtime,
         }
     }
 
@@ -831,6 +917,7 @@ impl Stream {
             self.execution_mode,
             self.coordinator_url.clone(),
             self.state_ttl_ms,
+            self.runtime.clone(),
         ))
     }
 
@@ -861,6 +948,7 @@ impl Stream {
             self.execution_mode,
             self.coordinator_url.clone(),
             self.state_ttl_ms,
+            self.runtime.clone(),
         ))
     }
 
@@ -1038,31 +1126,25 @@ fn execute_windowed_inner(
     stream: &Stream,
     spec: LocalWindowExecutionSpec,
 ) -> Result<Vec<StreamBatch>> {
-    ensure_local_mode(stream.execution_mode)?;
     if !stream.is_bounded() {
         return Err(KrishivError::unsupported(
-            "unbounded stream window execution requires a streaming runtime",
+            "unbounded stream window execution requires Session::submit_stream_job",
         ));
     }
-    accept_plan_with_backend(
-        stream.execution_mode,
-        &format!("stream:tw:{}", stream.name()),
-        ExecutionKind::Streaming,
-        stream.coordinator_url.as_deref(),
-    )?;
+    let plan_name = krishiv_runtime::fragment_from_local_spec(&spec);
+    stream
+        .runtime
+        .accept_plan(&PhysicalPlan::new(plan_name, ExecutionKind::Streaming))
+        .map_err(KrishivError::from)?;
     let input: Vec<RecordBatch> = stream
         .batches
         .iter()
         .map(|b| b.batch().clone())
         .collect();
-    let output = match stream.execution_mode {
-        ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-            execute_windowed_in_process(stream.name(), input, &spec).map_err(KrishivError::from)?
-        }
-        ExecutionMode::Distributed => {
-            execute_windowed_stream(input, &spec).map_err(KrishivError::from)?
-        }
-    };
+    let output = stream
+        .runtime
+        .collect_bounded_window(stream.name(), input, &spec)
+        .map_err(KrishivError::from)?;
     Ok(output
         .into_iter()
         .enumerate()
@@ -1587,6 +1669,91 @@ mod tests {
             .collect()
             .expect("window collect");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn sliding_window_collect_via_unified_runtime() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 5_000, 2_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .sliding_window(10_000, 5_000)
+            .collect()
+            .expect("sliding collect");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn session_window_collect_via_unified_runtime() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 8_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .session_window(5_000)
+            .collect()
+            .expect("session collect");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn session_reuses_coordinator_across_window_collects() {
+        let session = Session::builder().build().unwrap();
+        let ptr_before = session
+            .local_cluster()
+            .streaming_runtime()
+            .coordinator_instance_id();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch.clone())]);
+            let _ = stream
+                .key_by("user_id")
+                .with_event_time("ts")
+                .tumbling_window(10_000)
+                .collect()
+                .expect("collect");
+        }
+        let ptr_after = session
+            .local_cluster()
+            .streaming_runtime()
+            .coordinator_instance_id();
+        assert_eq!(ptr_before, ptr_after);
     }
 
     #[test]

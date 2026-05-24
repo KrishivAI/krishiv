@@ -1,9 +1,6 @@
-//! Execute a Python [`StreamPipeline`] through the in-process window runtime.
+//! Execute a Python [`StreamPipeline`] through the unified session execution runtime.
 
-use krishiv_api::{
-    AggExpr, AggFunction, ExecutionMode, LocalWindowExecutionSpec, LocalWindowKind,
-};
-use krishiv_runtime::{execute_windowed_in_process, execute_windowed_stream};
+use krishiv_api::{AggExpr, AggFunction, LocalWindowExecutionSpec, LocalWindowKind};
 use pyo3::prelude::*;
 
 use crate::agg::{AggDescriptor, AggKind};
@@ -102,16 +99,22 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         .source_id
         .strip_prefix("memory:")
         .unwrap_or(pipeline.source_id.as_str());
-    let output = match pipeline.session.execution_mode() {
-        ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-            execute_windowed_in_process(topic, input, &spec).map_err(map_krishiv_error)?
-        }
-        ExecutionMode::Distributed => {
-            execute_windowed_stream(input, &spec).map_err(map_krishiv_error)?
-        }
-    };
+    let plan_name = krishiv_runtime::fragment_from_local_spec(&spec);
+    pipeline
+        .session
+        .execution_runtime()
+        .accept_plan(&krishiv_plan::PhysicalPlan::new(
+            plan_name,
+            krishiv_plan::ExecutionKind::Streaming,
+        ))
+        .map_err(map_krishiv_error)?;
+    let output = pipeline
+        .session
+        .execution_runtime()
+        .collect_bounded_window(topic, input, &spec)
+        .map_err(map_krishiv_error)?;
     Ok(output
         .into_iter()
-        .map(|batch| PyBatch::from_record_batch(batch))
+        .map(PyBatch::from_record_batch)
         .collect())
 }

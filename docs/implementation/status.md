@@ -2,6 +2,13 @@
 
 ## Current Phase
 
+**Unified execution (2026-05-24).** Branch `cursor/unified-execution-phase0-1-7ffe`:
+- **ADR-13.1–13.7:** `ExecutionRuntime`, session-scoped `InProcessCluster`, unified `execute_bounded_window` for all window kinds (tumbling/sliding/session), TTL, full agg support.
+- **Fragments:** `stream:tw|sw|ses` encoding in `krishiv-plan::window`; executor delegates to operator runtime (canonical watermark semantics).
+- **Modes:** Embedded/SingleNode/Distributed window collect through `ExecutionRuntime`; Python unified; `Session::submit_stream_job` for continuous jobs.
+- **Spark-like local:** `krishiv local start|stop|status`; `SessionBuilder::with_local_cluster`; `KRISHIV_COORDINATOR` for single-node SQL.
+- **Docs:** [unified-execution-model.md](../architecture/unified-execution-model.md), [unified-execution-tracker.md](unified-execution-tracker.md).
+
 **ADR-12.4 follow-ups (2026-05-24).** Branch `cursor/adr124-memory-stream-ttl-cbbd` (extends embedded/streaming fixes on `main`):
 - **ADR-12.4:** `InProcessCoordinatorBridge` + `InProcessStreamingRuntime` — coordinator submits jobs, pushes assignments to `ExecutorAssignmentInbox`, executor runs via `ExecutorTaskRunner::run_next_with` (no tonic for `inprocess://` endpoints).
 - **State TTL:** `LocalWindowExecutionSpec.state_ttl_ms` wires `TtlStateBackend` + `StateBackedTumblingWindowOperator` in `local_streaming` and session `StateTtlConfig` on streams.

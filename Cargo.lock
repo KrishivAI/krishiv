@@ -3977,6 +3977,7 @@ dependencies = [
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-exec",
+ "krishiv-plan",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-shuffle",

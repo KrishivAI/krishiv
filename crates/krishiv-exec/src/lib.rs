@@ -59,14 +59,16 @@ pub fn lower_to_physical(logical: &LogicalPlan) -> PhysicalPlan {
     let mut physical = PhysicalPlan::new(logical.name(), logical.kind());
 
     for node in logical.nodes() {
-        physical.add_node(
-            PlanNode::new(
-                format!("physical:{}", node.id()),
-                format!("physical {}", node.label()),
-                node.kind(),
-            )
-            .with_inputs(node.inputs().iter().cloned()),
-        );
+        let mut physical_node = PlanNode::new(
+            format!("physical:{}", node.id()),
+            format!("physical {}", node.label()),
+            node.kind(),
+        )
+        .with_inputs(node.inputs().iter().cloned());
+        if let Some(op) = node.op() {
+            physical_node = physical_node.with_op(op.clone());
+        }
+        physical.add_node(physical_node);
     }
 
     physical
@@ -141,6 +143,7 @@ pub mod side_output;
 pub mod temporal_join;
 #[cfg(test)]
 pub mod watermark_e2e;
+pub mod operator_runtime;
 pub mod window;
 
 pub use chunk::ChunkOperator;
@@ -158,6 +161,9 @@ pub use queue::{
     OperatorQueueSender, operator_queue,
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
+pub use operator_runtime::{
+    execute_bounded_window, local_spec_to_window_execution, LocalWindowKindBridge,
+};
 pub use window::{
     MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
     SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,

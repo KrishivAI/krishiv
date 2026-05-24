@@ -6,14 +6,16 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use krishiv_async_util::block_on;
 use krishiv_executor::{ExecutorAssignmentInbox, ExecutorTaskRunner};
+use krishiv_plan::window::{encode_stream_fragment, WindowExecutionSpec};
 use krishiv_proto::{
-    CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, JobId,
-    JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
+    CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, JobId, JobKind, JobSpec,
+    StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
     Coordinator, InProcessCoordinatorBridge, IN_PROCESS_TASK_ENDPOINT, SubmitOutcome,
 };
 
+use crate::in_process_cluster::plan_spec_to_local;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::stream_kafka::encode_stream_kafka_partition;
 use crate::{RuntimeError, RuntimeResult};
@@ -22,30 +24,8 @@ static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn next_job_id() -> RuntimeResult<JobId> {
     let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    JobId::try_new(format!("in-process-job-{n}")).map_err(|e| RuntimeError::transport(e.to_string()))
-}
-
-fn fragment_from_spec(spec: &LocalWindowExecutionSpec) -> String {
-    let agg = spec
-        .agg_exprs
-        .first()
-        .map(|a| {
-            use krishiv_exec::AggFunction;
-            match a.function {
-                AggFunction::Count => "agg=count".to_string(),
-                AggFunction::Sum => "agg=sum:col=val".to_string(),
-                _ => "agg=count".to_string(),
-            }
-        })
-        .unwrap_or_else(|| "agg=count".to_string());
-    // `stream-kafka:` input partitions normalize to columns `key`, `ts`, `val`.
-    let _ = (&spec.key_column, &spec.event_time_column);
-    format!(
-        "stream:tw:key=key:time=ts:win={}:lag={}:{}",
-        spec.window_size_ms,
-        spec.watermark_lag_ms,
-        agg
-    )
+    JobId::try_new(format!("in-process-job-{n}"))
+        .map_err(|e| RuntimeError::transport(e.to_string()))
 }
 
 /// Shared in-process streaming runtime (coordinator + executor inbox).
@@ -59,7 +39,6 @@ pub struct InProcessStreamingRuntime {
 }
 
 impl InProcessStreamingRuntime {
-    /// Create and register a local in-process executor with the coordinator.
     pub fn new() -> RuntimeResult<Self> {
         let coordinator_id = CoordinatorId::try_new("in-process-coord")
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
@@ -88,17 +67,17 @@ impl InProcessStreamingRuntime {
         })
     }
 
-    /// Execute a windowed stream through the full coordinator → inbox → executor path.
     pub fn execute_windowed(
         &self,
         topic: &str,
         input_batches: Vec<RecordBatch>,
-        spec: &LocalWindowExecutionSpec,
+        spec: &WindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         if input_batches.is_empty() {
             return Ok(Vec::new());
         }
-        let fragment = fragment_from_spec(spec);
+        let fragment = encode_stream_fragment(spec);
+        let local = plan_spec_to_local(spec);
         let job_id = next_job_id()?;
         let task_id =
             TaskId::try_new("task-0").map_err(|e| RuntimeError::transport(e.to_string()))?;
@@ -131,6 +110,7 @@ impl InProcessStreamingRuntime {
             ));
         }
 
+        let value_column = sum_value_column_from_aggs(&local);
         let partitions: Vec<InputPartition> = input_batches
             .iter()
             .enumerate()
@@ -142,6 +122,7 @@ impl InProcessStreamingRuntime {
                     batch,
                     &spec.key_column,
                     &spec.event_time_column,
+                    value_column.as_deref(),
                 )?;
                 Ok(InputPartition::new(format!("stream-kafka-{idx}"), desc))
             })
@@ -165,16 +146,53 @@ impl InProcessStreamingRuntime {
 
         Ok(output_batches)
     }
+
+    /// Execute using the API-local window spec type.
+    /// Stable identity for session-scoped coordinator reuse tests.
+    pub fn coordinator_instance_id(&self) -> usize {
+        Arc::as_ptr(&self.coordinator) as usize
+    }
+
+    pub fn execute_windowed_local(
+        &self,
+        topic: &str,
+        input_batches: Vec<RecordBatch>,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<Vec<RecordBatch>> {
+        use crate::in_process_cluster::local_spec_to_plan_spec;
+        self.execute_windowed(topic, input_batches, &local_spec_to_plan_spec(spec))
+    }
 }
 
-/// Run windowed aggregation via the in-process coordinator when mode is local.
+fn sum_value_column_from_aggs(spec: &LocalWindowExecutionSpec) -> Option<String> {
+    use krishiv_exec::AggFunction;
+    spec.agg_exprs.iter().find_map(|a| {
+        if a.function == AggFunction::Sum && !a.input_column.is_empty() {
+            Some(a.input_column.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Run windowed aggregation via a session-scoped cluster (preferred).
 pub fn execute_windowed_in_process(
+    cluster: &crate::InProcessCluster,
     topic: &str,
     input_batches: Vec<RecordBatch>,
     spec: &LocalWindowExecutionSpec,
 ) -> RuntimeResult<Vec<RecordBatch>> {
-    let runtime = InProcessStreamingRuntime::new()?;
-    runtime.execute_windowed(topic, input_batches, spec)
+    cluster.collect_bounded_window(topic, input_batches, spec)
+}
+
+/// Legacy entry: creates an ephemeral in-process cluster (tests only).
+pub fn execute_windowed_in_process_ephemeral(
+    topic: &str,
+    input_batches: Vec<RecordBatch>,
+    spec: &LocalWindowExecutionSpec,
+) -> RuntimeResult<Vec<RecordBatch>> {
+    let cluster = crate::InProcessCluster::new()?;
+    cluster.collect_bounded_window(topic, input_batches, spec)
 }
 
 #[cfg(test)]
@@ -185,6 +203,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+    use crate::in_process_cluster::InProcessCluster;
     use crate::local_streaming::{LocalWindowExecutionSpec, LocalWindowKind};
 
     #[test]
@@ -210,9 +229,9 @@ mod tests {
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
         };
-        let out = InProcessStreamingRuntime::new()
-            .unwrap()
-            .execute_windowed("events", vec![batch], &spec)
+        let cluster = InProcessCluster::new().unwrap();
+        let out = cluster
+            .collect_bounded_window("events", vec![batch], &spec)
             .unwrap();
         assert!(!out.is_empty());
     }

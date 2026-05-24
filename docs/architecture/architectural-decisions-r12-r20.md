@@ -1463,3 +1463,21 @@ Without a deployment decision, the CI pipeline cannot be extended to include
 the npm build step. This blocks all portal development work in R20's Sprint 2
 onward. If the decision is not made before Sprint 2 begins, the portal will
 be incomplete at the R20 acceptance gate.
+
+---
+
+## ADR-13 Unified Execution (2026-05-24)
+
+The following decisions implement unified batch/streaming execution across
+Embedded, SingleNode, and Distributed modes. See
+[unified-execution-model.md](./unified-execution-model.md).
+
+| ADR | Title | Status |
+|-----|-------|--------|
+| ADR-13.1 | `ExecutionRuntime` trait | DECIDED |
+| ADR-13.2 | Typed `NodeOp` + `krishiv-plan::window` fragments | DECIDED |
+| ADR-13.3 | Session-scoped `InProcessCluster` + `krishiv local` | DECIDED |
+| ADR-13.4 | Control plane (gRPC jobs) vs data plane (Flight results) | DECIDED |
+| ADR-13.5 | Canonical per-batch watermark in `execute_bounded_window` | DECIDED |
+| ADR-13.6 | Bounded collect may reach `Succeeded`; continuous jobs use `submit_stream_job` | DECIDED |
+| ADR-13.7 | State TTL via fragment `:ttl=` and `StateBackedTumblingWindowOperator` | DECIDED |

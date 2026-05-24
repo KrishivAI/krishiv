@@ -10,6 +10,8 @@ use std::fmt;
 
 pub mod r17;
 pub mod streaming;
+pub mod streaming_plan;
+pub mod window;
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
     RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
@@ -133,6 +135,36 @@ pub enum NodeOp {
     RefreshLiveTable { name: String },
     /// Drop a live table.
     DropLiveTable { name: String },
+    /// Key stream by column before windowing.
+    KeyBy { key_column: String },
+    /// Event-time watermark on a keyed stream.
+    Watermark {
+        event_time_column: String,
+        lag_ms: u64,
+    },
+    /// Tumbling event-time window.
+    TumblingWindow {
+        window_size_ms: u64,
+        aggs: Vec<window::WindowAgg>,
+    },
+    /// Sliding event-time window.
+    SlidingWindow {
+        window_size_ms: u64,
+        slide_ms: u64,
+        aggs: Vec<window::WindowAgg>,
+    },
+    /// Session window on inactivity gap.
+    SessionWindow {
+        session_gap_ms: u64,
+        aggs: Vec<window::WindowAgg>,
+    },
+    /// Bounded or unbounded stream source.
+    StreamSource {
+        source_id: String,
+        bounded: bool,
+    },
+    /// Operator state TTL for streaming nodes.
+    StateTtl { ttl_ms: u64 },
     /// Operator not covered by the above variants.
     Other { description: String },
 }
