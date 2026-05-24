@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Per-job coordinator (`krishiv-job-coordinator` / `krishiv job-coordinator`).
+//! Per-job coordinator process (JCP) for bare-metal / shared-metadata deployments.
+//!
+//! Shares a durable metadata store with the cluster control plane and runs
+//! orchestration loops scoped to a single [`krishiv_proto::JobId`].
+//!
+//! Invoked as `krishiv-job-coordinator` or `krishiv job-coordinator`.
 
 use std::env;
 use std::error::Error;
