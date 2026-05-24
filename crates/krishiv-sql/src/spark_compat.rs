@@ -3,7 +3,7 @@
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::logical_expr::registry::FunctionRegistry;
-use datafusion::logical_expr::{create_udf, Volatility};
+use datafusion::logical_expr::{Volatility, create_udf};
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
@@ -17,7 +17,10 @@ const SPARK_ALIASES: &[(&str, &[&str])] = &[
     ("upper", &["upper"]),
     ("lower", &["lower"]),
     ("trim", &["trim", "btrim", "ltrim", "rtrim"]),
-    ("length", &["length", "len", "char_length", "character_length"]),
+    (
+        "length",
+        &["length", "len", "char_length", "character_length"],
+    ),
     ("concat", &["concat"]),
     ("concat_ws", &["concat_ws"]),
     ("replace", &["replace"]),
@@ -113,8 +116,14 @@ const SPARK_ALIASES: &[(&str, &[&str])] = &[
     ("covar_samp", &["covar_samp"]),
     ("skewness", &["skewness"]),
     ("kurtosis", &["kurtosis"]),
-    ("approx_percentile_cont", &["percentile_approx", "approx_percentile"]),
-    ("approx_distinct", &["approx_count_distinct", "hll_cardinality"]),
+    (
+        "approx_percentile_cont",
+        &["percentile_approx", "approx_percentile"],
+    ),
+    (
+        "approx_distinct",
+        &["approx_count_distinct", "hll_cardinality"],
+    ),
     ("bit_and", &["bit_and"]),
     ("bit_or", &["bit_or"]),
     ("bit_xor", &["bit_xor"]),
@@ -140,7 +149,8 @@ const SPARK_ALIASES: &[(&str, &[&str])] = &[
     ("e", &["e"]),
     ("degrees", &["degrees"]),
     ("radians", &["radians"]),
-    ("width_bucket", &["width_bucket"]),];
+    ("width_bucket", &["width_bucket"]),
+];
 
 /// Count of unique Spark alias names registered (for acceptance gates).
 pub fn spark_alias_count() -> usize {
@@ -233,7 +243,8 @@ pub fn spark_function_test_cases() -> Vec<SparkFunctionTestCase> {
         },
         SparkFunctionTestCase {
             name: "row_number_window",
-            sql: "SELECT row_number() OVER (ORDER BY n) AS rn FROM (VALUES (1),(2),(3)) AS t(n)".into(),
+            sql: "SELECT row_number() OVER (ORDER BY n) AS rn FROM (VALUES (1),(2),(3)) AS t(n)"
+                .into(),
             null_handling: NullHandlingClass::Equivalent,
             null_handling_note: "window row_number",
         },
@@ -257,4 +268,3 @@ pub fn spark_function_test_cases() -> Vec<SparkFunctionTestCase> {
         },
     ]
 }
-

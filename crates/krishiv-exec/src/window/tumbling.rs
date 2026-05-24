@@ -5,9 +5,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::{ExecError, ExecResult};
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
+use crate::{ExecError, ExecResult};
 
 // ── TumblingWindowSpec ────────────────────────────────────────────────────────
 
@@ -62,6 +62,79 @@ impl TumblingWindowOperator {
     /// Number of open (not yet flushed) window buckets.
     pub fn open_window_count(&self) -> usize {
         self.accumulators.len()
+    }
+
+    /// Persist open window accumulators to `StateBackend` (GAP-I2).
+    pub fn persist_to_state(
+        &self,
+        backend: &mut dyn krishiv_state::StateBackend,
+        namespace: &krishiv_state::Namespace,
+    ) -> krishiv_state::StateResult<()> {
+        for ((key, win_start), agg) in &self.accumulators {
+            let payload = serde_json::json!({
+                "values": agg.values,
+                "has_value": agg.has_value,
+                "avg_sums": agg.avg_sums,
+                "avg_counts": agg.avg_counts,
+            });
+            let bytes = serde_json::to_vec(&payload).map_err(|e| {
+                krishiv_state::StateError::CorruptEntry {
+                    message: e.to_string(),
+                }
+            })?;
+            let mut state_key = Vec::from(b"tw:");
+            state_key.extend_from_slice(key.as_bytes());
+            state_key.push(0);
+            state_key.extend_from_slice(&win_start.to_le_bytes());
+            backend.put(namespace, state_key, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Restore open window accumulators from `StateBackend` (GAP-I2).
+    pub fn restore_from_state(
+        &mut self,
+        backend: &dyn krishiv_state::StateBackend,
+        namespace: &krishiv_state::Namespace,
+    ) -> krishiv_state::StateResult<()> {
+        for key_bytes in backend.list_keys(namespace)? {
+            let Some(payload) = backend.get(namespace, &key_bytes)? else {
+                continue;
+            };
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
+                krishiv_state::StateError::CorruptEntry {
+                    message: e.to_string(),
+                }
+            })?;
+            let values: Vec<i64> = parsed["values"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            let has_value: Vec<bool> = parsed["has_value"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_bool()).collect())
+                .unwrap_or_default();
+            let avg_sums: Vec<f64> = parsed["avg_sums"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+                .unwrap_or_default();
+            let avg_counts: Vec<u64> = parsed["avg_counts"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+            if let Some((key, win_start)) = parse_tumbling_state_key(&key_bytes) {
+                self.accumulators.insert(
+                    (key, win_start),
+                    AggState {
+                        values,
+                        has_value,
+                        avg_sums,
+                        avg_counts,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Compute the window start for an event time using floor division.
@@ -177,6 +250,18 @@ impl TumblingWindowOperator {
     }
 }
 
+fn parse_tumbling_state_key(bytes: &[u8]) -> Option<(String, i64)> {
+    const PREFIX: &[u8] = b"tw:";
+    if !bytes.starts_with(PREFIX) {
+        return None;
+    }
+    let rest = &bytes[PREFIX.len()..];
+    let sep = rest.iter().position(|b| *b == 0)?;
+    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
+    let win_bytes: [u8; 8] = rest.get(sep + 1..sep + 9)?.try_into().ok()?;
+    Some((key, i64::from_le_bytes(win_bytes)))
+}
+
 // ── Shared window output builder ──────────────────────────────────────────────
 
 /// Build a single-row `RecordBatch` representing one closed window.
@@ -212,4 +297,59 @@ pub(crate) fn build_window_record_batch(
         ])));
     }
     Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use crate::aggregate::AggFunction;
+    use krishiv_state::{InMemoryStateBackend, Namespace, StateBackend};
+
+    #[test]
+    fn tumbling_state_persist_and_restore_roundtrip() {
+        let spec = TumblingWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+        };
+        let mut op = TumblingWindowOperator::new(spec);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![500])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        op.process_batch(&batch, 100).expect("process");
+        assert_eq!(op.open_window_count(), 1);
+
+        let mut backend = InMemoryStateBackend::new();
+        let ns = Namespace::new("op-1", "windows");
+        op.persist_to_state(&mut backend, &ns).expect("persist");
+
+        let mut restored = TumblingWindowOperator::new(TumblingWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+        });
+        restored.restore_from_state(&backend, &ns).expect("restore");
+        assert_eq!(restored.open_window_count(), 1);
+    }
 }

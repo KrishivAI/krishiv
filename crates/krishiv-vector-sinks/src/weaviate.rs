@@ -6,9 +6,7 @@ use serde_json::json;
 
 use crate::batch::EmbeddingBatch;
 use crate::id::point_id_from_doc_epoch;
-use crate::traits::{
-    PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
-};
+use crate::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
 
 /// Weaviate REST vector sink.
 #[derive(Clone)]
@@ -92,7 +90,8 @@ impl VectorSink for WeaviateSink {
                 .send()
                 .await
                 .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
-            if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::NOT_FOUND
             {
                 return Err(VectorSinkError::Upsert(response.status().to_string()));
             }
@@ -107,8 +106,12 @@ impl VectorSink for WeaviateSink {
         _filter: Option<&PayloadFilter>,
     ) -> VectorSinkResult<Vec<ScoredChunk>> {
         let body = json!({
-            "query": format!("NearVector {{ vector {:?} }}", vector),
-            "limit": top_k,
+            "query": format!(
+                "{{ Get {{ {class}(limit: {limit}, nearVector: {{ vector: [{vec}] }}) {{ properties {{ text chunk_index doc_id }} _additional {{ score }} }} }} }}",
+                class = self.class_name,
+                limit = top_k,
+                vec = vector.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+            ),
         });
         let url = format!("{}/v1/graphql", self.base_url);
         let response = self
@@ -125,7 +128,7 @@ impl VectorSink for WeaviateSink {
             .map_err(|e| VectorSinkError::Query(e.to_string()))?;
         let mut out = Vec::new();
         let Some(hits) = payload
-            .pointer(&format!("/data/Get/{}/", self.class_name))
+            .pointer(&format!("/data/Get/{}", self.class_name))
             .and_then(|v| v.as_array())
         else {
             return Ok(out);

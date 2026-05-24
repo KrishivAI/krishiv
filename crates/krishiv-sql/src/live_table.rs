@@ -49,11 +49,12 @@ pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatem
     let upper = trimmed.to_uppercase();
 
     if upper.starts_with("CREATE LIVE TABLE ") {
-        let rest = trimmed
-            .get("CREATE LIVE TABLE ".len()..)
-            .ok_or_else(|| SqlError::Unsupported {
-                feature: "CREATE LIVE TABLE".into(),
-            })?;
+        let rest =
+            trimmed
+                .get("CREATE LIVE TABLE ".len()..)
+                .ok_or_else(|| SqlError::Unsupported {
+                    feature: "CREATE LIVE TABLE".into(),
+                })?;
         let (name, query) = split_name_and_query(rest)?;
         return Ok(Some(LiveTableStatement::Create { name, query }));
     }
@@ -91,11 +92,9 @@ pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatem
 
 fn split_name_and_query(rest: &str) -> SqlResult<(String, String)> {
     let upper = rest.to_uppercase();
-    let as_pos = upper
-        .find(" AS ")
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "CREATE LIVE TABLE requires AS <query>".into(),
-        })?;
+    let as_pos = upper.find(" AS ").ok_or_else(|| SqlError::Unsupported {
+        feature: "CREATE LIVE TABLE requires AS <query>".into(),
+    })?;
     let name = rest[..as_pos].trim().to_string();
     let query = rest[as_pos + 4..].trim().to_string();
     if name.is_empty() {
@@ -110,29 +109,39 @@ fn split_name_and_query(rest: &str) -> SqlResult<(String, String)> {
 /// Build a Krishiv logical plan for a live-table DDL statement.
 pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan {
     match stmt {
-        LiveTableStatement::Create { name, query } => {
-            LogicalPlan::new(format!("create-live-table:{name}"), ExecutionKind::Streaming)
-                .with_node(PlanNode::new(
-                    format!("create-live-{name}"),
-                    format!("CREATE LIVE TABLE {name}"),
-                    ExecutionKind::Streaming,
-                ).with_op(NodeOp::CreateLiveTable { name, query }))
-        }
-        LiveTableStatement::Refresh { name } => {
-            LogicalPlan::new(format!("refresh-live-table:{name}"), ExecutionKind::Streaming)
-                .with_node(PlanNode::new(
-                    format!("refresh-live-{name}"),
-                    format!("REFRESH LIVE TABLE {name}"),
-                    ExecutionKind::Streaming,
-                ).with_op(NodeOp::RefreshLiveTable { name }))
-        }
+        LiveTableStatement::Create { name, query } => LogicalPlan::new(
+            format!("create-live-table:{name}"),
+            ExecutionKind::Streaming,
+        )
+        .with_node(
+            PlanNode::new(
+                format!("create-live-{name}"),
+                format!("CREATE LIVE TABLE {name}"),
+                ExecutionKind::Streaming,
+            )
+            .with_op(NodeOp::CreateLiveTable { name, query }),
+        ),
+        LiveTableStatement::Refresh { name } => LogicalPlan::new(
+            format!("refresh-live-table:{name}"),
+            ExecutionKind::Streaming,
+        )
+        .with_node(
+            PlanNode::new(
+                format!("refresh-live-{name}"),
+                format!("REFRESH LIVE TABLE {name}"),
+                ExecutionKind::Streaming,
+            )
+            .with_op(NodeOp::RefreshLiveTable { name }),
+        ),
         LiveTableStatement::Drop { name } => {
-            LogicalPlan::new(format!("drop-live-table:{name}"), ExecutionKind::Batch)
-                .with_node(PlanNode::new(
+            LogicalPlan::new(format!("drop-live-table:{name}"), ExecutionKind::Batch).with_node(
+                PlanNode::new(
                     format!("drop-live-{name}"),
                     format!("DROP LIVE TABLE {name}"),
                     ExecutionKind::Batch,
-                ).with_op(NodeOp::DropLiveTable { name }))
+                )
+                .with_op(NodeOp::DropLiveTable { name }),
+            )
         }
     }
 }
@@ -187,8 +196,7 @@ mod tests {
 
     #[test]
     fn parse_create_missing_as_errors() {
-        let err = parse_live_table_statement("CREATE LIVE TABLE t SELECT 1")
-            .unwrap_err();
+        let err = parse_live_table_statement("CREATE LIVE TABLE t SELECT 1").unwrap_err();
         assert!(matches!(err, SqlError::Unsupported { .. }));
     }
 

@@ -67,12 +67,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(op
-            .process_batch(b"k1".to_vec(), "a", batch(1), 10)
-            .is_empty());
-        assert_eq!(
-            op.process_batch(b"k1".to_vec(), "b", batch(2), 20).len(),
-            1
+        assert!(
+            op.process_batch(b"k1".to_vec(), "a", batch(1), 10)
+                .is_empty()
         );
+        assert_eq!(op.process_batch(b"k1".to_vec(), "b", batch(2), 20).len(), 1);
     }
 }

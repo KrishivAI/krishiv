@@ -40,7 +40,10 @@ impl InMemoryVectorSink {
         }
     }
 
-    fn matches_filter(payload: &HashMap<String, PayloadValue>, filter: Option<&PayloadFilter>) -> bool {
+    fn matches_filter(
+        payload: &HashMap<String, PayloadValue>,
+        filter: Option<&PayloadFilter>,
+    ) -> bool {
         let Some(filter) = filter else {
             return true;
         };
@@ -135,7 +138,11 @@ impl VectorSink for InMemoryVectorSink {
                 }
             })
             .collect();
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
         Ok(scored)
     }

@@ -665,12 +665,7 @@ mod tests {
         fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
             true
         }
-        fn column_masking_rule(
-            &self,
-            _p: &Principal,
-            _t: &str,
-            _c: &str,
-        ) -> Option<MaskingRule> {
+        fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> {
             Some(MaskingRule::Redact)
         }
     }
@@ -687,7 +682,11 @@ mod tests {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
 
-        let schema = Arc::new(Schema::new(vec![Field::new("amount", DataType::Int64, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            true,
+        )]));
         let col = Arc::new(Int64Array::from(vec![Some(100i64), None, Some(200i64)]));
         let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
 
@@ -715,7 +714,11 @@ mod tests {
         use arrow::array::Float64Array;
         use arrow::datatypes::{DataType, Field, Schema};
 
-        let schema = Arc::new(Schema::new(vec![Field::new("score", DataType::Float64, true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "score",
+            DataType::Float64,
+            true,
+        )]));
         let col = Arc::new(Float64Array::from(vec![Some(1.5f64), Some(2.5f64)]));
         let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
 

@@ -67,7 +67,10 @@ impl SchemaNormalizeOperator {
                 let col = batch.column(idx);
                 Self::cast_column(col, field)?
             } else {
-                Arc::new(arrow::array::new_null_array(field.data_type(), batch.num_rows()))
+                Arc::new(arrow::array::new_null_array(
+                    field.data_type(),
+                    batch.num_rows(),
+                ))
             };
             columns.push(value);
         }

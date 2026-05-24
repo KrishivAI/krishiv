@@ -37,21 +37,20 @@ pub fn compute_memo_key(source: &[u8], schema_json: &str, ipc: &[u8]) -> [u8; 32
     hasher.finalize().into()
 }
 
-pub fn memo_lookup_or_store(
-    key: [u8; 32],
-    batch: RecordBatch,
-) -> Result<RecordBatch, String> {
+pub fn memo_lookup_or_store(key: [u8; 32], batch: RecordBatch) -> Result<RecordBatch, String> {
     if let Some(hit) = MEMO_CACHE.lookup_or_miss(key) {
         return Ok(hit);
     }
-    MEMO_CACHE.store(key, batch.clone()).map_err(|e| e.to_string())?;
+    MEMO_CACHE
+        .store(key, batch.clone())
+        .map_err(|e| e.to_string())?;
     Ok(batch)
 }
 
 #[pyfunction]
 pub fn memo_transform_call(
     source_hash: Vec<u8>,
-_schema_json: String,
+    _schema_json: String,
     ipc_bytes: Vec<u8>,
 ) -> PyResult<Py<PyBytes>> {
     if source_hash.len() != 32 {
@@ -59,8 +58,8 @@ _schema_json: String,
     }
 
     let cursor = std::io::Cursor::new(ipc_bytes.clone());
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut reader =
+        StreamReader::try_new(cursor, None).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let batch = reader
         .next()
         .transpose()

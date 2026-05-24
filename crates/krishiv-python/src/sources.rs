@@ -8,7 +8,7 @@ use pyo3::types::PyType;
 
 use crate::dataframe::PyDataFrame;
 use crate::errors::{ConnectorError, ModeError};
-use crate::schema::{validate_batch_against_schema_class, PySchema};
+use crate::schema::{PySchema, validate_batch_against_schema_class};
 use crate::session::PySession;
 use crate::stream::PyStream;
 
@@ -36,7 +36,9 @@ pub fn read_parquet(
             .sql(format!("SELECT * FROM \"{table_name}\""))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         if let Some(schema_cls) = schema_cls {
-            let result = df.collect().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let result = df
+                .collect()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Python::attach(|py| -> PyResult<()> {
                 let bound = schema_cls.bind(py);
                 for batch in result.batches() {
@@ -121,11 +123,13 @@ fn read_iceberg_impl(
     use std::sync::Arc;
 
     use krishiv_lakehouse::{
-        IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, SchemaField, SchemaVersion,
+        IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, SchemaField,
+        SchemaVersion,
     };
 
-
-    fn schema_version_from_arrow(schema: &std::sync::Arc<arrow::datatypes::Schema>) -> SchemaVersion {
+    fn schema_version_from_arrow(
+        schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    ) -> SchemaVersion {
         let fields = schema
             .fields()
             .iter()
@@ -176,9 +180,10 @@ fn read_iceberg_impl(
         .build()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     rt.block_on(async {
-        table.scan(&_opts).await.map_err(|e| {
-            ConnectorError::new_err(format!("Iceberg catalog error: {e}"))
-        })
+        table
+            .scan(&_opts)
+            .await
+            .map_err(|e| ConnectorError::new_err(format!("Iceberg catalog error: {e}")))
     })?;
     Ok(PyStream::from_pipeline(
         session.inner.clone(),

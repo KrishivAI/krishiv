@@ -1,7 +1,7 @@
 //! Arrow Flight SQL client for [`super::DistributedBackend`] (GAP-RT-01).
 
-use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_flight::Ticket;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 use tonic::transport::{Channel, Endpoint};
@@ -68,7 +68,9 @@ pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> Runti
         .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
 
     let mut stream = client
-        .do_get(Ticket { ticket: ticket.ticket })
+        .do_get(Ticket {
+            ticket: ticket.ticket,
+        })
         .await
         .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
 

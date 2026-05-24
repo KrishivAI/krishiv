@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use krishiv_vector_sinks::{
-    EmbeddingBatch, PayloadValue, VectorSink,
-};
+use krishiv_vector_sinks::{EmbeddingBatch, PayloadValue, VectorSink};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::{Chunk, TextChunker};
 use crate::embed::EmbeddingModel;
-use crate::memo::{memo_key, MemoEntry, MemoStore};
+use crate::memo::{MemoEntry, MemoStore, memo_key};
 
 /// RAG refresh policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +86,7 @@ where
                 );
                 let mut payload = HashMap::new();
                 payload.insert("text".into(), PayloadValue::String(text.clone()));
-                payload.insert(
-                    "chunk_index".into(),
-                    PayloadValue::Int(*chunk_index as i64),
-                );
+                payload.insert("chunk_index".into(), PayloadValue::Int(*chunk_index as i64));
                 payload.insert("doc_id".into(), PayloadValue::String(doc_id.clone()));
                 doc_ids.push(format!("{doc_id}:{chunk_index}"));
                 vectors.push(vector.clone());
@@ -180,7 +175,10 @@ mod tests {
         fn embedding_dim(&self) -> usize {
             self.inner.embedding_dim()
         }
-        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::embed::EmbeddingError> {
+        async fn embed_batch(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, crate::embed::EmbeddingError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.embed_batch(texts).await
         }
@@ -221,6 +219,9 @@ mod tests {
         pipeline.index_documents(&docs).await.unwrap();
         let first_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
         let second = pipeline.index_documents(&docs).await.unwrap();
-        assert!(second.documents_skipped_memo >= 1 || calls.load(std::sync::atomic::Ordering::SeqCst) <= first_calls + 1);
+        assert!(
+            second.documents_skipped_memo >= 1
+                || calls.load(std::sync::atomic::Ordering::SeqCst) <= first_calls + 1
+        );
     }
 }

@@ -432,7 +432,10 @@ impl InMemoryCatalog {
     }
 
     /// Return stored batches for a registered table, if any.
-    pub fn table_batches(&self, name: &str) -> Option<std::sync::Arc<Vec<arrow::record_batch::RecordBatch>>> {
+    pub fn table_batches(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<Vec<arrow::record_batch::RecordBatch>>> {
         self.table_data.get(name).cloned()
     }
 }
@@ -619,11 +622,11 @@ pub mod datafusion_bridge {
                 Ok(table_provider) => {
                     let arrow_schema = Arc::new(table_provider.schema().to_arrow_schema());
                     let batches = catalog.table_batches(name);
-                    let partitions = batches
-                        .map(|b| (*b).clone())
-                        .unwrap_or_default();
+                    let partitions = batches.map(|b| (*b).clone()).unwrap_or_default();
                     let mem = MemTable::try_new(arrow_schema, vec![partitions])?;
-                    Ok(Some(Arc::new(mem) as Arc<dyn datafusion::datasource::TableProvider>))
+                    Ok(Some(
+                        Arc::new(mem) as Arc<dyn datafusion::datasource::TableProvider>
+                    ))
                 }
                 Err(_) => Ok(None),
             }
@@ -635,7 +638,6 @@ pub mod datafusion_bridge {
             catalog.get_table(name).is_ok()
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -796,12 +798,11 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog)),
+            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+                catalog,
+            )),
         );
-        let df = ctx
-            .sql("SELECT * FROM krishiv.public.t")
-            .await
-            .unwrap();
+        let df = ctx.sql("SELECT * FROM krishiv.public.t").await.unwrap();
         let batches = df.collect().await.unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 10);

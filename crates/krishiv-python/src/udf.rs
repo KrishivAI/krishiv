@@ -56,13 +56,11 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                         let mut cells = Vec::with_capacity(arr.len());
                         for v in arr.iter() {
                             cells.push(match v {
-                                Some(x) => Some(
-                                    x.into_pyobject(py).map_err(|e| {
-                                        krishiv_udf::UdfError::Execution {
-                                            message: e.to_string(),
-                                        }
-                                    })?,
-                                ),
+                                Some(x) => Some(x.into_pyobject(py).map_err(|e| {
+                                    krishiv_udf::UdfError::Execution {
+                                        message: e.to_string(),
+                                    }
+                                })?),
                                 None => None,
                             });
                         }
@@ -85,13 +83,11 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                         let mut cells = Vec::with_capacity(arr.len());
                         for v in arr.iter() {
                             cells.push(match v {
-                                Some(x) => Some(
-                                    x.into_pyobject(py).map_err(|e| {
-                                        krishiv_udf::UdfError::Execution {
-                                            message: e.to_string(),
-                                        }
-                                    })?,
-                                ),
+                                Some(x) => Some(x.into_pyobject(py).map_err(|e| {
+                                    krishiv_udf::UdfError::Execution {
+                                        message: e.to_string(),
+                                    }
+                                })?),
                                 None => None,
                             });
                         }
@@ -115,13 +111,11 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
                         let mut cells = Vec::with_capacity(arr.len());
                         for v in arr.iter() {
                             cells.push(match v {
-                                Some(x) => Some(
-                                    x.into_pyobject(py).map_err(|e| {
-                                        krishiv_udf::UdfError::Execution {
-                                            message: e.to_string(),
-                                        }
-                                    })?,
-                                ),
+                                Some(x) => Some(x.into_pyobject(py).map_err(|e| {
+                                    krishiv_udf::UdfError::Execution {
+                                        message: e.to_string(),
+                                    }
+                                })?),
                                 None => None,
                             });
                         }
@@ -319,9 +313,10 @@ pub(crate) fn resolve_register_udf_args(
         let input_types_obj = meta
             .get_item("input_types")?
             .ok_or_else(|| SchemaError::new_err("udf metadata missing 'input_types'"))?;
-        let input_types = input_types_obj.downcast_into::<PyDict>().map_err(|_| {
-            SchemaError::new_err("udf metadata 'input_types' must be a dict")
-        })?.unbind();
+        let input_types = input_types_obj
+            .downcast_into::<PyDict>()
+            .map_err(|_| SchemaError::new_err("udf metadata 'input_types' must be a dict"))?
+            .unbind();
         let output_type: String = meta
             .get_item("output_type")?
             .ok_or_else(|| SchemaError::new_err("udf metadata missing 'output_type'"))?

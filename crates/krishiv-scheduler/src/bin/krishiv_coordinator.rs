@@ -29,12 +29,12 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use krishiv_proto::{CoordinatorId, CoordinatorState};
+#[cfg(feature = "sqlite")]
+use krishiv_scheduler::SqliteMetadataStore;
 use krishiv_scheduler::{
     Coordinator, InMemoryMetadataStore, JsonFileMetadataStore, SharedCoordinator, StabilityMetrics,
     serve_coordinator_executor_grpc_with_listener,
 };
-#[cfg(feature = "sqlite")]
-use krishiv_scheduler::SqliteMetadataStore;
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
@@ -66,14 +66,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "sqlite" => {
                     let store = SqliteMetadataStore::open(path.as_ref())
                         .map_err(|e| format!("sqlite store '{path}': {e}"))?;
-                    coord.recover_from_store(&store)
+                    coord
+                        .recover_from_store(&store)
                         .map_err(|e| format!("coordinator recovery failed: {e}"))?;
                     SharedCoordinator::new(coord.with_store(store))
                 }
                 _ => {
                     let store = JsonFileMetadataStore::open(path.as_ref())
                         .map_err(|e| format!("json store '{path}': {e}"))?;
-                    coord.recover_from_store(&store)
+                    coord
+                        .recover_from_store(&store)
                         .map_err(|e| format!("coordinator recovery failed: {e}"))?;
                     SharedCoordinator::new(coord.with_store(store))
                 }
@@ -86,7 +88,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err("--metadata-backend json requires --metadata-path".into());
         }
         (Some(unknown), _) => {
-            return Err(format!("unknown --metadata-backend '{unknown}'; supported: memory, json, sqlite").into());
+            return Err(format!(
+                "unknown --metadata-backend '{unknown}'; supported: memory, json, sqlite"
+            )
+            .into());
         }
     };
 
@@ -132,11 +137,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let _ = axum::serve(http_listener, router).await;
         });
     }
-
-    // Spark Connect requires krishiv-spark-connect + proto (R15); disabled in R16 coordinator binary.
-
-    // P0-4: drive executor heartbeat timeouts and push assigned tasks to executors.
-    coordinator.spawn_orchestration_loops();
 
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
@@ -212,6 +212,9 @@ krishiv_shuffle_bytes_written_total {shuffle_bytes}
         shuffle_partitions = m.shuffle_partitions_available,
         shuffle_bytes = m.shuffle_bytes_written,
     );
+    let mut body = body;
+    body.push('\n');
+    body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,

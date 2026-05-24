@@ -5,7 +5,5 @@
 mod matcher;
 mod pattern;
 
-pub use matcher::{CepKeyState, PartialMatch, SequentialPatternMatcher};
-pub use pattern::{
-    CepCompileError, CompiledPattern, Pattern, PatternStage, UnsupportedCombinator,
-};
+pub use matcher::{CepKeyState, PartitionedCepMatcher, PartialMatch, SequentialPatternMatcher};
+pub use pattern::{CepCompileError, CompiledPattern, Pattern, PatternStage, UnsupportedCombinator};

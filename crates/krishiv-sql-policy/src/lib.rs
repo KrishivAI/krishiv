@@ -3,15 +3,15 @@
 //! Policy-enforcing SQL engine: wraps [`krishiv_sql::SqlEngine`] with
 //! authentication and column-masking.
 
-use std::sync::Arc;
 use std::fmt;
+use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use krishiv_governance::{
-    audit_log, AuditAction, AuditOutcome, AuthProvider, MaskingRule, PolicyHook, Principal,
+    AuditAction, AuditOutcome, AuthProvider, MaskingRule, PolicyHook, Principal, audit_log,
 };
 use krishiv_sql::{SqlEngine, SqlError, SqlResult, referenced_table_names};
 
@@ -33,11 +33,7 @@ impl fmt::Debug for PolicyEnforcingSqlEngine {
 
 impl PolicyEnforcingSqlEngine {
     /// Create a new `PolicyEnforcingSqlEngine` wrapping `inner`.
-    pub fn new(
-        inner: SqlEngine,
-        auth: Arc<dyn AuthProvider>,
-        policy: Arc<dyn PolicyHook>,
-    ) -> Self {
+    pub fn new(inner: SqlEngine, auth: Arc<dyn AuthProvider>, policy: Arc<dyn PolicyHook>) -> Self {
         Self {
             inner,
             auth,
@@ -86,7 +82,8 @@ impl PolicyEnforcingSqlEngine {
             }
         }
 
-        let effective_sql = apply_row_predicates(query, principal, &table_names, self.policy.as_ref());
+        let effective_sql =
+            apply_row_predicates(query, principal, &table_names, self.policy.as_ref());
         let df = self.inner.sql(&effective_sql).await?;
         let batches = df.collect().await?;
 
@@ -98,9 +95,7 @@ impl PolicyEnforcingSqlEngine {
 
         audit_log(
             principal.subject.as_str(),
-            &AuditAction::QueryExecuted {
-                query_hash,
-            },
+            &AuditAction::QueryExecuted { query_hash },
             AuditOutcome::Allowed,
         );
         Ok(masked)
@@ -121,7 +116,10 @@ fn apply_row_predicates(
         return query.to_string();
     }
     if preds.len() == 1 {
-        return format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {}", preds[0]);
+        return format!(
+            "SELECT * FROM ({query}) AS __krishiv_rls WHERE {}",
+            preds[0]
+        );
     }
     format!(
         "SELECT * FROM ({query}) AS __krishiv_rls WHERE {}",
@@ -196,8 +194,7 @@ fn apply_masking(
         }
     }
 
-    let output_schema =
-        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let output_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
     RecordBatch::try_new(output_schema, columns).map_err(|e| SqlError::DataFusion {
         message: e.to_string(),
     })
@@ -384,14 +381,10 @@ mod policy_tests {
             column: "id".into(),
         }));
         let p = engine.authenticate("key1").unwrap();
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         use arrow::array::Int64Array;
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
         engine
             .inner()
             .register_record_batches("people", vec![batch])

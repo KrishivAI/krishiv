@@ -4,16 +4,14 @@
 //! `{root}/metadata.json`. Supports restart durability: reopen the same path
 //! and scan committed rows.
 
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use serde::{Deserialize, Serialize};
 
-use crate::{
-    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion,
-};
+use crate::{IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FsLayerMeta {
@@ -50,8 +48,7 @@ impl IcebergFsTable {
         schema_version: SchemaVersion,
     ) -> Result<Self, LakehouseError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("data"))
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        fs::create_dir_all(root.join("data")).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let layers = Self::load_layers(&root)?;
         Ok(Self {
             table_ref,
@@ -91,7 +88,8 @@ impl IcebergFsTable {
                 .iter()
                 .map(|l| FsLayerMeta {
                     snapshot_id: l.snapshot_id,
-                    file: l.path
+                    file: l
+                        .path
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("part.parquet")
@@ -131,8 +129,8 @@ impl IcebergFsTable {
         }
         let schema = batches[0].schema();
         let file = File::create(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let mut writer =
-            ArrowWriter::try_new(file, schema, None).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         for batch in batches {
             writer
                 .write(batch)
@@ -241,8 +239,7 @@ mod tests {
         let root = dir.path().to_path_buf();
 
         {
-            let table =
-                IcebergFsTable::new(&root, table_ref.clone(), schema_version()).unwrap();
+            let table = IcebergFsTable::new(&root, table_ref.clone(), schema_version()).unwrap();
             table.append(vec![batch(vec![1, 2, 3])]).await.unwrap();
             table.append(vec![batch(vec![4, 5])]).await.unwrap();
         }

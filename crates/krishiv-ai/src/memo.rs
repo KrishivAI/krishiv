@@ -86,7 +86,9 @@ impl MemoStore {
         let write = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = write.open_table(MEMO_TABLE).map_err(|e| e.to_string())?;
-            table.insert(key, bytes.as_slice()).map_err(|e| e.to_string())?;
+            table
+                .insert(key, bytes.as_slice())
+                .map_err(|e| e.to_string())?;
         }
         write.commit().map_err(|e| e.to_string())?;
         Ok(())

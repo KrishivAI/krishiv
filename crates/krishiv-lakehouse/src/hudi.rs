@@ -77,10 +77,9 @@ impl HudiSnapshotReader {
         match self.query_type {
             HudiQueryType::Snapshot => Ok(all),
             HudiQueryType::Incremental => {
-                let begin = self
-                    .begin_instant
-                    .as_deref()
-                    .ok_or_else(|| LakehouseError::Io("incremental query requires begin_instant".into()))?;
+                let begin = self.begin_instant.as_deref().ok_or_else(|| {
+                    LakehouseError::Io("incremental query requires begin_instant".into())
+                })?;
                 Ok(all.into_iter().filter(|c| c.as_str() > begin).collect())
             }
         }
@@ -94,7 +93,8 @@ impl HudiSnapshotReader {
                 .join(format!("{commit}.commit"))
                 .join("metadata");
             if meta.exists() {
-                let text = fs::read_to_string(&meta).map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let text =
+                    fs::read_to_string(&meta).map_err(|e| LakehouseError::Io(e.to_string()))?;
                 for line in text.lines() {
                     if let Some(path) = line.strip_prefix("file:") {
                         files.insert(self.table_path.join(path));
@@ -151,7 +151,8 @@ pub fn write_hudi_cow_fixture(
     root: &Path,
     commits: &[(&str, &[(i64, &str)])],
 ) -> LakehouseResult<()> {
-    fs::create_dir_all(root.join(".hoodie/timeline")).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    fs::create_dir_all(root.join(".hoodie/timeline"))
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
     for (instant, rows) in commits {
         let commit_dir = root.join(*instant);
         fs::create_dir_all(&commit_dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -169,7 +170,8 @@ pub fn write_hudi_cow_fixture(
         )
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
         fs::write(
-            root.join(".hoodie/timeline").join(format!("{instant}.commit")),
+            root.join(".hoodie/timeline")
+                .join(format!("{instant}.commit")),
             "",
         )
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -196,8 +198,8 @@ fn write_parquet_i64_string(path: &Path, rows: &[(i64, &str)]) -> LakehouseResul
     )
     .map_err(|e| LakehouseError::Io(e.to_string()))?;
     let file = fs::File::create(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    let mut writer = ArrowWriter::try_new(file, schema, None)
-        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let mut writer =
+        ArrowWriter::try_new(file, schema, None).map_err(|e| LakehouseError::Io(e.to_string()))?;
     writer
         .write(&batch)
         .map_err(|e| LakehouseError::Io(e.to_string()))?;

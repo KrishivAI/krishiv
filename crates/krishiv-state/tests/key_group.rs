@@ -1,6 +1,8 @@
 //! Key-group backend tests (R16 S4.1).
 
-use krishiv_state::key_group::{key_group_for_key, key_group_ranges_for_parallelism, NUM_KEY_GROUPS};
+use krishiv_state::key_group::{
+    NUM_KEY_GROUPS, key_group_for_key, key_group_ranges_for_parallelism,
+};
 use krishiv_state::{InMemoryStateBackend, Namespace, StateBackend};
 
 #[test]

@@ -70,8 +70,28 @@ mod tests {
         let mut state = VersionedTableState::new(10_000);
         state.upsert_version(1000, version_batch(1));
         state.upsert_version(2000, version_batch(2));
-        assert_eq!(state.lookup_as_of(2500).unwrap().column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 2);
-        assert_eq!(state.lookup_as_of(1500).unwrap().column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 1);
+        assert_eq!(
+            state
+                .lookup_as_of(2500)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        assert_eq!(
+            state
+                .lookup_as_of(1500)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
         assert!(state.lookup_as_of(500).is_none());
     }
 }

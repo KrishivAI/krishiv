@@ -111,15 +111,12 @@ impl PyBatch {
 
 #[pyfunction]
 pub fn make_example_batch() -> PyBatch {
-    use std::sync::Arc;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
     let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-    )
-    .expect("example batch");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+        .expect("example batch");
     PyBatch::from_record_batch(batch)
 }
 

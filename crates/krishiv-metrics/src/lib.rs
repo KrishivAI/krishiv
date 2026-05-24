@@ -168,8 +168,8 @@ pub fn current_traceparent() -> Option<String> {
 
 // ── Process metrics (Prometheus text) ─────────────────────────────────────────
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// OpenTelemetry-aligned counters/histograms for Krishiv runtime observability.
 #[derive(Debug, Default)]

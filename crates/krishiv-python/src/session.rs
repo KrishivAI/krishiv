@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyType};
 
 use crate::batch::PyBatch;
 use crate::dataframe::PyDataFrame;
-use crate::errors::{map_krishiv_error, ModeError};
+use crate::errors::{ModeError, map_krishiv_error};
 use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
 use crate::stream::PyStream;
@@ -272,7 +272,6 @@ impl PySession {
     pub fn list_udfs(&self) -> Vec<String> {
         self.inner.scalar_udf_names()
     }
-
 
     pub fn live_table(&self, name: String, query: String) -> PyResult<PyLiveTable> {
         crate::live_table::create_live_table(name, query)

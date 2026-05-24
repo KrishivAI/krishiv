@@ -7,11 +7,11 @@ use krishiv_proto::{
     TransportDisposition,
 };
 
-use crate::{ExecutorError, ExecutorResult};
 use crate::runner::{
-    LocalParquetPartition, CONNECTOR_PARQUET_PARTITION_PREFIX, OBJECT_PARQUET_PARTITION_PREFIX,
+    CONNECTOR_PARQUET_PARTITION_PREFIX, LocalParquetPartition, OBJECT_PARQUET_PARTITION_PREFIX,
     OBJECT_PARQUET_SINK_PREFIX,
 };
+use crate::{ExecutorError, ExecutorResult};
 
 pub(crate) fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
     let (_, query) = fragment.split_once("sql:")?;
@@ -292,19 +292,15 @@ pub(crate) async fn read_shuffle_flight_partitions(
                 Some(_) | None => continue,
             };
 
-        let batches = FlightShuffleClient::fetch(
-            &flight_endpoint,
-            &job_id,
-            &upstream_stage_id,
-            partition_id,
-        )
-        .await
-        .map_err(|e| ExecutorError::LocalExecution {
-            message: format!(
-                "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
+        let batches =
+            FlightShuffleClient::fetch(&flight_endpoint, &job_id, &upstream_stage_id, partition_id)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: format!(
+                        "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
                  stage={upstream_stage_id} partition={partition_id}): {e}"
-            ),
-        })?;
+                    ),
+                })?;
         table_batches.entry(table_name).or_default().extend(batches);
     }
 

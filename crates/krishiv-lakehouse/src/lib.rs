@@ -20,20 +20,22 @@ mod local_delta;
 mod partition_spec;
 mod two_phase;
 
-pub use as_of::{AsOfSpec};
-pub use delta::{DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore};
-pub use hudi::{write_hudi_cow_fixture, HudiQueryType, HudiSnapshotReader};
-pub use iceberg_fs::IcebergFsTable;
-pub use partition_spec::{PartitionSpecResolver, PartitionSpecVersion};
-pub use delta_lake::{
-    merge_delta, write_delta, DeltaTableHandle, DeltaWriteMode, MergeDeltaResult,
-};
-pub use two_phase::{
-    IcebergTwoPhaseCommit, MemoryIcebergTwoPhaseCommit, StagedSnapshot, KAFKA_OFFSETS_SUMMARY_KEY,
-    kafka_offsets_json, parse_kafka_offsets_json,
-};
+pub use as_of::AsOfSpec;
 #[cfg(feature = "kafka")]
 pub use delta::RdkafkaDeltaStore;
+pub use delta::{
+    DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore,
+};
+pub use delta_lake::{
+    DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, write_delta,
+};
+pub use hudi::{HudiQueryType, HudiSnapshotReader, write_hudi_cow_fixture};
+pub use iceberg_fs::IcebergFsTable;
+pub use partition_spec::{PartitionSpecResolver, PartitionSpecVersion};
+pub use two_phase::{
+    IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, MemoryIcebergTwoPhaseCommit, StagedSnapshot,
+    kafka_offsets_json, parse_kafka_offsets_json,
+};
 
 // ---------------------------------------------------------------------------
 // LakehouseError

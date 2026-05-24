@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use krishiv_connectors::cdc::{build_batch_from_events, parse_debezium_envelope, CdcEventSource};
+use krishiv_connectors::cdc::{CdcEventSource, build_batch_from_events, parse_debezium_envelope};
 use krishiv_connectors::transactional::InMemoryTransactionalProducer;
 use krishiv_lakehouse::{
     IcebergTableRef, IcebergTwoPhaseCommit, LakehouseTable, MemoryIcebergTwoPhaseCommit,
@@ -49,19 +49,12 @@ fn table() -> Arc<MemoryLakehouseTable> {
 #[tokio::test]
 async fn exactly_once_ten_thousand_rows_after_crash() {
     let events: Vec<String> = (0..10_000)
-        .map(|i| {
-            format!(
-                r#"{{"op":"c","after":{{"id":"{i}"}},"source":{{"table":"orders"}}}}"#
-            )
-        })
+        .map(|i| format!(r#"{{"op":"c","after":{{"id":"{i}"}},"source":{{"table":"orders"}}}}"#))
         .collect();
 
     let lake = table();
     let tpc = MemoryIcebergTwoPhaseCommit::new(lake.clone());
-    let mut source = JsonCdcSource {
-        events,
-        cursor: 0,
-    };
+    let mut source = JsonCdcSource { events, cursor: 0 };
     let mut txn = InMemoryTransactionalProducer::new();
     txn.init_transactions().unwrap();
 
@@ -113,7 +106,10 @@ async fn exactly_once_ten_thousand_rows_after_crash() {
         rows_committed += batch.num_rows();
     }
 
-    let scanned = lake.scan(&krishiv_lakehouse::IcebergScanOptions::default()).await.unwrap();
+    let scanned = lake
+        .scan(&krishiv_lakehouse::IcebergScanOptions::default())
+        .await
+        .unwrap();
     let total: usize = scanned.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 10_000);
     assert_eq!(recovered_offsets.get("orders-0"), Some(&(6000)));

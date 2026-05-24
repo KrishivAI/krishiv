@@ -1,4 +1,6 @@
-use krishiv_proto::{ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration, TaskId};
+use krishiv_proto::{
+    ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration, TaskId,
+};
 
 use crate::{CoordinatorConfig, SchedulerError, SchedulerResult};
 
@@ -209,7 +211,10 @@ impl ExecutorRegistry {
             .collect()
     }
 
-    pub(crate) fn find_executor(&self, executor_id: &ExecutorId) -> SchedulerResult<&ExecutorRecord> {
+    pub(crate) fn find_executor(
+        &self,
+        executor_id: &ExecutorId,
+    ) -> SchedulerResult<&ExecutorRecord> {
         self.executors
             .iter()
             .find(|executor| executor.executor_id() == executor_id)

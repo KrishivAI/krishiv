@@ -69,8 +69,7 @@ mod tests {
 
     #[test]
     fn parses_version_as_of() {
-        let (sql, refs) =
-            preprocess_as_of_sql("SELECT * FROM orders VERSION AS OF 3").unwrap();
+        let (sql, refs) = preprocess_as_of_sql("SELECT * FROM orders VERSION AS OF 3").unwrap();
         assert!(sql.contains("FROM orders"));
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].spec, AsOfSpec::Version(3));

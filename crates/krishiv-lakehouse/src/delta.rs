@@ -52,6 +52,10 @@ pub trait DeltaStore: Send + Sync {
     fn scan(&self) -> Result<Vec<DeltaEntry>, LakehouseError>;
     fn truncate(&self) -> Result<(), LakehouseError>;
     fn len(&self) -> Result<usize, LakehouseError>;
+
+    fn is_empty(&self) -> Result<bool, LakehouseError> {
+        Ok(self.len()? == 0)
+    }
 }
 
 fn encode_entry(op: DeltaOp, batch: &RecordBatch) -> Result<Vec<u8>, LakehouseError> {
@@ -79,8 +83,8 @@ fn decode_entry(bytes: &[u8]) -> Result<DeltaEntry, LakehouseError> {
     let op = DeltaOp::from_str(&payload.op)
         .ok_or_else(|| LakehouseError::Io(format!("unknown delta op: {}", payload.op)))?;
     let cursor = std::io::Cursor::new(payload.ipc);
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let mut reader =
+        StreamReader::try_new(cursor, None).map_err(|e| LakehouseError::Io(e.to_string()))?;
     let batch = reader
         .next()
         .transpose()
@@ -148,13 +152,17 @@ pub struct RedbDeltaStore {
 }
 
 impl RedbDeltaStore {
-    pub fn open(path: impl AsRef<std::path::Path>, namespace: impl AsRef<[u8]>) -> Result<Self, LakehouseError> {
+    pub fn open(
+        path: impl AsRef<std::path::Path>,
+        namespace: impl AsRef<[u8]>,
+    ) -> Result<Self, LakehouseError> {
         let db = Database::create(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let store = Self {
             db,
             namespace: namespace.as_ref().to_vec(),
         };
-        store.db
+        store
+            .db
             .begin_write()
             .map_err(|e| LakehouseError::Io(e.to_string()))?
             .open_table(DELTA_TABLE)
@@ -180,24 +188,35 @@ impl RedbDeltaStore {
         key
     }
 
-
     fn ensure_table(&self) -> Result<(), LakehouseError> {
-        let wtxn = self.db.begin_write().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let wtxn = self
+            .db
+            .begin_write()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         {
-            let _ = wtxn.open_table(DELTA_TABLE).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let _ = wtxn
+                .open_table(DELTA_TABLE)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
-        wtxn.commit().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        wtxn.commit()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(())
     }
 
     fn next_seq(&self) -> Result<u64, LakehouseError> {
-        let read = self.db.begin_read().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let table = read
             .open_table(DELTA_TABLE)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let mut max = 0u64;
         let prefix = self.namespace.as_slice();
-        for item in table.iter().map_err(|e| LakehouseError::Io(e.to_string()))? {
+        for item in table
+            .iter()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?
+        {
             let (k, _) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
             let k = k.value();
             if k.len() >= prefix.len() + 8 && k.starts_with(prefix) {
@@ -213,7 +232,10 @@ impl DeltaStore for RedbDeltaStore {
     fn append(&self, batch: RecordBatch, op: DeltaOp) -> Result<(), LakehouseError> {
         let seq = self.next_seq()?;
         let value = encode_entry(op, &batch)?;
-        let mut write = self.db.begin_write().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         {
             let mut table = write
                 .open_table(DELTA_TABLE)
@@ -222,18 +244,26 @@ impl DeltaStore for RedbDeltaStore {
                 .insert(self.key_for(seq).as_slice(), value.as_slice())
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
-        write.commit().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        write
+            .commit()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(())
     }
 
     fn scan(&self) -> Result<Vec<DeltaEntry>, LakehouseError> {
-        let read = self.db.begin_read().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let table = read
             .open_table(DELTA_TABLE)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let prefix = self.namespace.as_slice();
         let mut out = Vec::new();
-        for item in table.iter().map_err(|e| LakehouseError::Io(e.to_string()))? {
+        for item in table
+            .iter()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?
+        {
             let (k, v) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
             if k.value().starts_with(prefix) {
                 out.push(decode_entry(v.value())?);
@@ -243,7 +273,10 @@ impl DeltaStore for RedbDeltaStore {
     }
 
     fn truncate(&self) -> Result<(), LakehouseError> {
-        let read = self.db.begin_read().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         let table = read
             .open_table(DELTA_TABLE)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -262,7 +295,10 @@ impl DeltaStore for RedbDeltaStore {
                 })
             })
             .collect();
-        let mut write = self.db.begin_write().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         {
             let mut table = write
                 .open_table(DELTA_TABLE)
@@ -271,7 +307,9 @@ impl DeltaStore for RedbDeltaStore {
                 let _ = table.remove(key.as_slice());
             }
         }
-        write.commit().map_err(|e| LakehouseError::Io(e.to_string()))?;
+        write
+            .commit()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -326,7 +364,7 @@ mod kafka_delta {
     use std::sync::Mutex;
 
     use rdkafka::ClientConfig;
-        use rdkafka::producer::{FutureProducer, FutureRecord};
+    use rdkafka::producer::{FutureProducer, FutureRecord};
 
     /// Broker-backed compacted-topic delta store.
     pub struct RdkafkaDeltaStore {
@@ -336,11 +374,17 @@ mod kafka_delta {
     }
 
     impl RdkafkaDeltaStore {
-        pub fn new(bootstrap_servers: &str, topic: impl Into<String>) -> Result<Self, LakehouseError> {
+        pub fn new(
+            bootstrap_servers: &str,
+            topic: impl Into<String>,
+        ) -> Result<Self, LakehouseError> {
             let producer: FutureProducer = ClientConfig::new()
                 .set("bootstrap.servers", bootstrap_servers)
                 .set("enable.idempotence", "true")
-                .set("transactional.id", format!("krishiv-delta-{}", std::process::id()))
+                .set(
+                    "transactional.id",
+                    format!("krishiv-delta-{}", std::process::id()),
+                )
                 .create()
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
             Ok(Self {
@@ -361,9 +405,7 @@ mod kafka_delta {
         fn append(&self, batch: RecordBatch, op: DeltaOp) -> Result<(), LakehouseError> {
             let payload = encode_entry(op, &batch)?;
             let key = self.next_key();
-            let record = FutureRecord::to(&self.topic)
-                .key(&key)
-                .payload(&payload);
+            let record = FutureRecord::to(&self.topic).key(&key).payload(&payload);
             self.producer
                 .send(record, std::time::Duration::from_secs(5))
                 .map_err(|(e, _)| LakehouseError::Io(e.to_string()))?;

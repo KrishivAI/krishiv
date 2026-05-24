@@ -31,7 +31,11 @@ pub fn read_hudi(
         _ => krishiv_lakehouse::HudiQueryType::Snapshot,
     };
     RUNTIME
-        .block_on(session.inner.read_hudi_async(path, qt, begin_instant.as_deref()))
+        .block_on(
+            session
+                .inner
+                .read_hudi_async(path, qt, begin_instant.as_deref()),
+        )
         .map(|df| PyDataFrame { inner: df })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }

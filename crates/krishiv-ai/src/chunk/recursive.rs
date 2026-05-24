@@ -91,7 +91,11 @@ mod tests {
         let chunker = RecursiveTextChunker::new(20, 4);
         let chunks = chunker.chunk("aaaa bbbb cccc dddd eeee ffff");
         assert!(!chunks.is_empty());
-        assert!(chunks.iter().all(|c| c.text.len() <= 20 || c.text.contains(' ')));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.text.len() <= 20 || c.text.contains(' '))
+        );
     }
 
     #[test]

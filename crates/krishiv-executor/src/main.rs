@@ -57,9 +57,9 @@ async fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
     match mode {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
-        ExecutorMode::RegisterOnce => register_once(&mut runtime).await,
+        ExecutorMode::RegisterOnce => register_once(&runtime).await,
         ExecutorMode::Connect => {
-            heartbeat_loop(runtime, heartbeat_interval_secs, task_grpc_addr).await
+            heartbeat_loop(&mut runtime, heartbeat_interval_secs, task_grpc_addr).await
         }
     }
 }
@@ -107,7 +107,7 @@ fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
     Ok(())
 }
 
-async fn register_once(runtime: &mut ExecutorRuntime) -> Result<(), String> {
+async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
     println!("{}", runtime.startup_summary());
     let (registration, heartbeat) = runtime
         .register_and_heartbeat_once()
@@ -133,11 +133,11 @@ async fn register_once(runtime: &mut ExecutorRuntime) -> Result<(), String> {
 }
 
 async fn heartbeat_loop(
-    mut runtime: ExecutorRuntime,
+    runtime: &mut ExecutorRuntime,
     heartbeat_interval_secs: u64,
     task_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), String> {
-    register_once(&mut runtime).await?;
+    register_once(runtime).await?;
 
     // GAP-CP-09: Start the executor task gRPC server so the coordinator can push
     // task assignments without polling.  The inbox is shared between the gRPC
@@ -159,12 +159,13 @@ async fn heartbeat_loop(
     // reporting status to the coordinator endpoint.
     let runner_inbox = inbox.clone();
     let runner_endpoint = runtime.config().coordinator_endpoint().to_owned();
-    let running_attempts = runtime.running_attempts();
     tokio::spawn(async move {
-        let runner =
-            ExecutorTaskRunner::new(runner_inbox).with_running_attempts(running_attempts);
+        let runner = ExecutorTaskRunner::new(runner_inbox);
         loop {
-            let coord = GrpcCoordinatorService::new(runner_endpoint.clone());
+            let coord = GrpcCoordinatorService::new(
+                runner_endpoint.clone(),
+                krishiv_proto::LeaseGeneration::initial(),
+            );
             match runner.run_next_with(&coord).await {
                 Ok(Some(_report)) => {}
                 Ok(None) => {
@@ -187,10 +188,7 @@ async fn heartbeat_loop(
                     .heartbeat_with_grpc_endpoint()
                     .await
                     .map_err(|error| error.to_string())?;
-                runtime.apply_lease_generation(heartbeat.lease_generation());
-                krishiv_executor::transport::ExecutorRuntime::apply_llm_throttles_from_response(
-                    &heartbeat,
-                );
+                // Lease generation is updated inside heartbeat_with_grpc_endpoint (GAP-C4).
                 println!(
                     "heartbeat response version={} lease_generation={} disposition={} message={}",
                     heartbeat.version(),

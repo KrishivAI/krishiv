@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 
 use crate::{ConnectorError, ConnectorResult};
@@ -89,9 +89,10 @@ impl FeatureStoreSink {
     /// Append feature rows (batch backfill or streaming).
     pub fn append(&self, rows: &[FeatureRow]) -> ConnectorResult<()> {
         {
-            let mut guard = self.live.write().map_err(|e| {
-                ConnectorError::Parquet(format!("feature store lock: {e}"))
-            })?;
+            let mut guard = self
+                .live
+                .write()
+                .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
             guard.extend(rows.iter().cloned());
         }
         self.flush_parquet(rows)
@@ -137,9 +138,10 @@ impl FeatureStoreSink {
         .map_err(|e| ConnectorError::Parquet(e.to_string()))?;
 
         let fragment_id = {
-            let mut guard = self.next_fragment_id.write().map_err(|e| {
-                ConnectorError::Parquet(format!("feature store lock: {e}"))
-            })?;
+            let mut guard = self
+                .next_fragment_id
+                .write()
+                .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
             let id = *guard;
             *guard += 1;
             id
@@ -149,10 +151,8 @@ impl FeatureStoreSink {
             .join(format!("batch-{fragment_id}.parquet"));
         let file = std::fs::File::create(&fragment_path).map_err(ConnectorError::Io)?;
         let props = WriterProperties::builder().build();
-        let mut writer =
-            ArrowWriter::try_new(file, schema, Some(props)).map_err(|e| {
-                ConnectorError::Parquet(e.to_string())
-            })?;
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+            .map_err(|e| ConnectorError::Parquet(e.to_string()))?;
         writer
             .write(&batch)
             .map_err(|e| ConnectorError::Parquet(e.to_string()))?;
@@ -170,12 +170,18 @@ impl FeatureStoreSink {
     ) -> ConnectorResult<BTreeMap<String, f64>> {
         let entity_id = entity_key.values().cloned().collect::<Vec<_>>().join("|");
         let now = timestamp_ms;
-        let guard = self.live.read().map_err(|e| {
-            ConnectorError::Parquet(format!("feature store lock: {e}"))
-        })?;
+        let guard = self
+            .live
+            .read()
+            .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
         let mut best: BTreeMap<String, (u64, f64)> = BTreeMap::new();
         for row in guard.iter() {
-            let row_id = row.entity_key.values().cloned().collect::<Vec<_>>().join("|");
+            let row_id = row
+                .entity_key
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("|");
             if row_id != entity_id || row.created_at_ms > timestamp_ms {
                 continue;
             }
@@ -204,12 +210,7 @@ impl FeatureStoreSink {
         Ok(std::fs::read_dir(&dir)
             .map_err(ConnectorError::Io)?
             .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "parquet")
-            })
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
             .count())
     }
 }
@@ -225,18 +226,18 @@ fn read_feature_rows_from_parquet(path: &Path) -> ConnectorResult<Vec<FeatureRow
     for batch in reader {
         let batch = batch.map_err(|e| ConnectorError::Parquet(e.to_string()))?;
         let schema = batch.schema();
-        let entity_idx = schema.index_of("entity_id").map_err(|e| {
-            ConnectorError::Parquet(format!("missing entity_id column: {e}"))
-        })?;
-        let feature_idx = schema.index_of("feature_name").map_err(|e| {
-            ConnectorError::Parquet(format!("missing feature_name column: {e}"))
-        })?;
+        let entity_idx = schema
+            .index_of("entity_id")
+            .map_err(|e| ConnectorError::Parquet(format!("missing entity_id column: {e}")))?;
+        let feature_idx = schema
+            .index_of("feature_name")
+            .map_err(|e| ConnectorError::Parquet(format!("missing feature_name column: {e}")))?;
         let value_idx = schema
             .index_of("value")
             .map_err(|e| ConnectorError::Parquet(format!("missing value column: {e}")))?;
-        let created_idx = schema.index_of("created_at_ms").map_err(|e| {
-            ConnectorError::Parquet(format!("missing created_at_ms column: {e}"))
-        })?;
+        let created_idx = schema
+            .index_of("created_at_ms")
+            .map_err(|e| ConnectorError::Parquet(format!("missing created_at_ms column: {e}")))?;
 
         let entities = batch
             .column(entity_idx)

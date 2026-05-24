@@ -32,14 +32,15 @@ pub fn register_state_migration(
         Arc::new(move |old: &[u8]| {
             Python::attach(|py| {
                 let arg = PyBytes::new(py, old);
-                let result = callable.call1(py, (arg,)).map_err(|e| StateMigrationError {
-                    message: e.to_string(),
-                })?;
-                let bytes: &Bound<'_, PyBytes> = result.cast_bound(py).map_err(|e| {
-                    StateMigrationError {
+                let result = callable
+                    .call1(py, (arg,))
+                    .map_err(|e| StateMigrationError {
+                        message: e.to_string(),
+                    })?;
+                let bytes: &Bound<'_, PyBytes> =
+                    result.cast_bound(py).map_err(|e| StateMigrationError {
                         message: format!("migration must return bytes: {e}"),
-                    }
-                })?;
+                    })?;
                 Ok(bytes.as_bytes().to_vec())
             })
         }),
@@ -56,7 +57,7 @@ pub fn state_migration(
     to_version: u32,
     session: Option<&PySession>,
 ) -> PyResult<Py<PyAny>> {
-        let registry_target = session.map(|s| s.state_migrations.clone());
+    let registry_target = session.map(|s| s.state_migrations.clone());
     let decorator = Py::new(
         py,
         StateMigrationDecorator {
@@ -97,14 +98,15 @@ impl StateMigrationDecorator {
             Arc::new(move |old: &[u8]| {
                 Python::attach(|py| {
                     let arg = PyBytes::new(py, old);
-                    let result = callable.call1(py, (arg,)).map_err(|e| StateMigrationError {
-                        message: e.to_string(),
-                    })?;
-                    let bytes: &Bound<'_, PyBytes> = result.cast_bound(py).map_err(|e| {
-                        StateMigrationError {
+                    let result = callable
+                        .call1(py, (arg,))
+                        .map_err(|e| StateMigrationError {
+                            message: e.to_string(),
+                        })?;
+                    let bytes: &Bound<'_, PyBytes> =
+                        result.cast_bound(py).map_err(|e| StateMigrationError {
                             message: format!("migration must return bytes: {e}"),
-                        }
-                    })?;
+                        })?;
                     Ok(bytes.as_bytes().to_vec())
                 })
             }),

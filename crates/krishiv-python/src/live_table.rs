@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_exec::live_table::{ChangeFeed, CreateLiveTableExec, RefreshLiveTableExec};
 use krishiv_lakehouse::{DeltaOp, MemoryDeltaStore};
-use krishiv_sql::live_table::{execute_live_table_ddl, LiveTableRegistry};
+use krishiv_sql::live_table::{LiveTableRegistry, execute_live_table_ddl};
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 
@@ -88,7 +88,12 @@ impl PyChangeFeedIter {
             DeltaOp::Delete => "delete",
         };
         let batch = PyBatch::from_record_batch(entry.batch);
-        Ok(Some((op.to_string(), batch).into_pyobject(py)?.into_any().unbind()))
+        Ok(Some(
+            (op.to_string(), batch)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind(),
+        ))
     }
 
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -105,7 +110,12 @@ impl PyChangeFeedIter {
             DeltaOp::Delete => "delete",
         };
         let batch = PyBatch::from_record_batch(entry.batch);
-        Ok(Some((op.to_string(), batch).into_pyobject(py)?.into_any().unbind()))
+        Ok(Some(
+            (op.to_string(), batch)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind(),
+        ))
     }
 }
 

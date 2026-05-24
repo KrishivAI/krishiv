@@ -6,8 +6,8 @@
 //! upsert contract from ADR-R17.3 is preserved via the same point-id scheme as other sinks.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use arrow::array::{FixedSizeListArray, Float32Array, Int64Array, StringArray};
@@ -20,9 +20,7 @@ use parquet::file::properties::WriterProperties;
 use crate::batch::EmbeddingBatch;
 use crate::id::point_id_from_doc_epoch;
 use crate::memory::InMemoryVectorSink;
-use crate::traits::{
-    PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
-};
+use crate::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
 
 /// Lance-style local sink: persists Parquet under `uri` and serves queries from an in-memory index.
 #[derive(Debug)]
@@ -36,7 +34,11 @@ pub struct LanceDbSink {
 
 impl LanceDbSink {
     /// Open or create a Lance-compatible table directory.
-    pub async fn open(uri: impl AsRef<Path>, table_name: &str, vector_dim: usize) -> VectorSinkResult<Self> {
+    pub async fn open(
+        uri: impl AsRef<Path>,
+        table_name: &str,
+        vector_dim: usize,
+    ) -> VectorSinkResult<Self> {
         let uri = uri.as_ref().to_path_buf();
         std::fs::create_dir_all(&uri).map_err(|e| VectorSinkError::Connection(e.to_string()))?;
         let mut sink = Self {
@@ -56,17 +58,21 @@ impl LanceDbSink {
         if !table_dir.is_dir() {
             return Ok(());
         }
-        for entry in std::fs::read_dir(&table_dir).map_err(|e| VectorSinkError::Connection(e.to_string()))? {
+        for entry in
+            std::fs::read_dir(&table_dir).map_err(|e| VectorSinkError::Connection(e.to_string()))?
+        {
             let entry = entry.map_err(|e| VectorSinkError::Connection(e.to_string()))?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
                 continue;
             }
-            let file = std::fs::File::open(&path).map_err(|e| VectorSinkError::Query(e.to_string()))?;
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                .map_err(|e| VectorSinkError::Query(e.to_string()))?
-                .build()
-                .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+            let file =
+                std::fs::File::open(&path).map_err(|e| VectorSinkError::Query(e.to_string()))?;
+            let reader =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(|e| VectorSinkError::Query(e.to_string()))?
+                    .build()
+                    .map_err(|e| VectorSinkError::Query(e.to_string()))?;
             for batch in reader {
                 let batch = batch.map_err(|e| VectorSinkError::Query(e.to_string()))?;
                 let restored = Self::arrow_batch_to_embedding(&batch, self.vector_dim)?;
@@ -94,12 +100,11 @@ impl LanceDbSink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
         }
-        let file = std::fs::File::create(&path).map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+        let file =
+            std::fs::File::create(&path).map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
         let props = WriterProperties::builder().build();
-        let mut writer =
-            ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(|e| {
-                VectorSinkError::Upsert(e.to_string())
-            })?;
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
+            .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
         writer
             .write(batch)
             .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
@@ -171,7 +176,10 @@ impl LanceDbSink {
         .map_err(|e| VectorSinkError::Upsert(e.to_string()))
     }
 
-    fn arrow_batch_to_embedding(batch: &RecordBatch, vector_dim: usize) -> VectorSinkResult<EmbeddingBatch> {
+    fn arrow_batch_to_embedding(
+        batch: &RecordBatch,
+        vector_dim: usize,
+    ) -> VectorSinkResult<EmbeddingBatch> {
         use arrow::array::Array;
         let doc_ids = batch
             .column_by_name("doc_id")
@@ -199,7 +207,9 @@ impl LanceDbSink {
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| VectorSinkError::SchemaConflict("vector not float32".into()))?;
             if floats.len() != vector_dim {
-                return Err(VectorSinkError::SchemaConflict("vector dim mismatch".into()));
+                return Err(VectorSinkError::SchemaConflict(
+                    "vector dim mismatch".into(),
+                ));
             }
             out.vectors.push(floats.values().to_vec());
         }

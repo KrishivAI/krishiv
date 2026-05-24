@@ -1079,7 +1079,10 @@ mod tests {
         let result = validate_fencing_token(&meta, 5);
         assert!(matches!(
             result,
-            Err(CheckpointError::StaleFencingToken { stored: 1, current: 5 })
+            Err(CheckpointError::StaleFencingToken {
+                stored: 1,
+                current: 5
+            })
         ));
     }
 

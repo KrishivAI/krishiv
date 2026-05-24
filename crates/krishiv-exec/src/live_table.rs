@@ -5,8 +5,8 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use krishiv_lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
 
-use crate::schema_normalize::SchemaNormalizeOperator;
 use crate::ExecError;
+use crate::schema_normalize::SchemaNormalizeOperator;
 
 /// Physical operator that writes normalized CDC batches into a delta log.
 pub struct CreateLiveTableExec {

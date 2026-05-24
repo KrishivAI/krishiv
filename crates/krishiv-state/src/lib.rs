@@ -19,7 +19,9 @@ pub mod incremental;
 pub mod key_group;
 pub mod migration;
 
-pub use migration::{SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry};
+pub use migration::{
+    SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry,
+};
 
 use krishiv_async_util::unix_now_ms;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -1030,7 +1032,9 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
             key: vec![],
         };
         let pending = self.timers.split_off(&sentinel);
-        let fired = std::mem::replace(&mut self.timers, pending).into_keys().collect::<Vec<_>>();
+        let fired = std::mem::replace(&mut self.timers, pending)
+            .into_keys()
+            .collect::<Vec<_>>();
         for timer in &fired {
             self.identity_index
                 .remove(&(timer.namespace.clone(), timer.key.clone()));
@@ -1201,11 +1205,11 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         let keys = self.inner.list_keys(namespace)?;
         let mut removed = 0usize;
         for key in keys {
-            if let Some(encoded) = self.inner.get(namespace, &key)? {
-                if Self::is_entry_expired(&encoded, now) {
-                    self.inner.delete(namespace, &key)?;
-                    removed += 1;
-                }
+            if let Some(encoded) = self.inner.get(namespace, &key)?
+                && Self::is_entry_expired(&encoded, now)
+            {
+                self.inner.delete(namespace, &key)?;
+                removed += 1;
             }
         }
         Ok(removed)

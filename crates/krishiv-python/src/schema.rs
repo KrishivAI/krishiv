@@ -27,11 +27,9 @@ impl PySchema {
                 for (name, dt_obj) in dict.iter() {
                     let name: String = name.extract()?;
                     let dt_str: String = dt_obj.extract()?;
-                    let dt: DataType = dt_str.parse().map_err(
-                        |_| {
-                            PyRuntimeError::new_err("invalid Arrow type in schema".to_string())
-                        },
-                    )?;
+                    let dt: DataType = dt_str.parse().map_err(|_| {
+                        PyRuntimeError::new_err("invalid Arrow type in schema".to_string())
+                    })?;
                     fields.push((name, dt));
                 }
                 fields.sort_by(|a, b| a.0.cmp(&b.0));

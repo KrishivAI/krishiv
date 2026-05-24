@@ -3,20 +3,17 @@
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use dashmap::DashMap;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-    LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef,
-    TaskStatusRequest,
+    LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskStatusRequest,
     TaskStatusResponse, TransportVersion, wire,
 };
 
-use crate::{ExecutorAssignmentInbox, ExecutorError, ExecutorResult, ExecutorTransportResult};
 use crate::grpc::executor_task_grpc_server;
+use crate::{ExecutorAssignmentInbox, ExecutorError, ExecutorResult, ExecutorTransportResult};
 
 /// Network transport error raised by the executor gRPC client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +128,7 @@ impl ExecutorConfig {
         self.lease_generation
     }
 
-    /// Update lease generation after coordinator registration or heartbeat (P0-8).
+    /// Update lease generation after coordinator registration or heartbeat (GAP-C4).
     pub fn set_lease_generation(&mut self, lease_generation: LeaseGeneration) {
         self.lease_generation = lease_generation;
     }
@@ -143,24 +140,15 @@ impl ExecutorConfig {
 }
 
 /// Minimal executor runtime facade for the R3.1 bootstrap slice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutorRuntime {
     config: ExecutorConfig,
-    running_attempts: Arc<DashMap<String, TaskAttemptRef>>,
 }
 
 impl ExecutorRuntime {
     /// Create an executor runtime.
     pub fn new(config: ExecutorConfig) -> Self {
-        Self {
-            config,
-            running_attempts: Arc::new(DashMap::new()),
-        }
-    }
-
-    /// Shared map of attempts currently executing on this executor (P1-19).
-    pub fn running_attempts(&self) -> Arc<DashMap<String, TaskAttemptRef>> {
-        Arc::clone(&self.running_attempts)
+        Self { config }
     }
 
     /// Runtime configuration.
@@ -168,12 +156,7 @@ impl ExecutorRuntime {
         &self.config
     }
 
-    /// Mutable runtime configuration (lease generation updates).
-    pub fn config_mut(&mut self) -> &mut ExecutorConfig {
-        &mut self.config
-    }
-
-    /// Apply lease generation from a coordinator transport response (P0-8).
+    /// Apply coordinator-issued lease generation from register/heartbeat responses.
     pub fn apply_lease_generation(&mut self, lease_generation: LeaseGeneration) {
         self.config.set_lease_generation(lease_generation);
     }
@@ -222,36 +205,11 @@ impl ExecutorRuntime {
 
     /// Build an empty healthy heartbeat request for this executor.
     pub fn heartbeat_request(&self) -> ExecutorHeartbeatRequest {
-        let running_attempts = self
-            .running_attempts
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
         ExecutorHeartbeatRequest::new(
             self.config.executor_id.clone(),
             self.config.lease_generation,
             ExecutorState::Healthy,
         )
-        .with_running_attempts(running_attempts)
-    }
-
-    /// Build a heartbeat including LLM quota reports (R17).
-    pub fn heartbeat_request_with_llm_quota(
-        &self,
-        reports: Vec<krishiv_proto::LlmQuotaReport>,
-    ) -> ExecutorHeartbeatRequest {
-        self.heartbeat_request().with_llm_quota_reports(reports)
-    }
-
-    /// Apply LLM throttle commands from a heartbeat response (R17).
-    pub fn apply_llm_throttles_from_response(response: &ExecutorHeartbeatResponse) {
-        for cmd in response.llm_throttles() {
-            crate::llm_throttle::apply_llm_throttle(
-                &cmd.model,
-                cmd.max_requests_per_minute,
-                cmd.max_tokens_per_minute,
-            );
-        }
     }
 
     /// Send a heartbeat through a tonic-shaped coordinator service.
@@ -296,7 +254,7 @@ impl ExecutorRuntime {
 
     /// Send one healthy heartbeat through a networked coordinator gRPC endpoint.
     pub async fn heartbeat_with_grpc_endpoint(
-        &self,
+        &mut self,
     ) -> ExecutorTransportResult<ExecutorHeartbeatResponse> {
         let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
             self.config.coordinator_endpoint.clone(),
@@ -304,7 +262,9 @@ impl ExecutorRuntime {
         .await?;
         let request = wire::executor_heartbeat_request_to_wire(self.heartbeat_request());
         let response = client.executor_heartbeat(request).await?.into_inner();
-        Ok(wire::executor_heartbeat_response_from_wire(response)?)
+        let response = wire::executor_heartbeat_response_from_wire(response)?;
+        self.apply_lease_generation(response.lease_generation());
+        Ok(response)
     }
 
     /// Send a checkpoint acknowledgement to the coordinator over gRPC.
@@ -323,7 +283,7 @@ impl ExecutorRuntime {
 
     /// Register once and immediately send one heartbeat over gRPC.
     pub async fn register_and_heartbeat_once(
-        &mut self,
+        &self,
     ) -> ExecutorTransportResult<(RegisterExecutorResponse, ExecutorHeartbeatResponse)> {
         let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
             self.config.coordinator_endpoint.clone(),
@@ -337,7 +297,6 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let registration = wire::register_executor_response_from_wire(registration)?;
-        self.apply_lease_generation(registration.lease_generation());
 
         let heartbeat = client
             .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
@@ -346,7 +305,6 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat)?;
-        self.apply_lease_generation(heartbeat.lease_generation());
 
         Ok((registration, heartbeat))
     }
@@ -363,29 +321,23 @@ impl ExecutorRuntime {
     }
 }
 
-/// gRPC-backed `CoordinatorExecutorService` for the executor task runner loop.
-///
-/// GAP-CP-09: The task runner in `--connect` mode needs a `CoordinatorExecutorService`
-/// to report task status (Running / Succeeded / Failed) after each assignment is
-/// executed.
-#[derive(Debug, Clone)]
+/// gRPC-backed `CoordinatorExecutorService` with pooled client (GAP-C3).
+#[derive(Clone)]
 pub struct GrpcCoordinatorService {
-    endpoint: String,
-    client: std::sync::Arc<
-        tokio::sync::Mutex<
-            Option<wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
-                tonic::transport::Channel,
-            >>,
-        >,
-    >,
+    pool: crate::grpc_client::CoordinatorGrpcPool,
+}
+
+impl fmt::Debug for GrpcCoordinatorService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrpcCoordinatorService")
+            .finish_non_exhaustive()
+    }
 }
 
 impl GrpcCoordinatorService {
-    /// Create a gRPC coordinator service backed by `endpoint`.
-    pub fn new(endpoint: impl Into<String>) -> Self {
+    pub fn new(endpoint: impl Into<String>, lease_generation: LeaseGeneration) -> Self {
         Self {
-            endpoint: endpoint.into(),
-            client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            pool: crate::grpc_client::CoordinatorGrpcPool::new(endpoint, lease_generation),
         }
     }
 
@@ -395,17 +347,10 @@ impl GrpcCoordinatorService {
         wire::v1::coordinator_executor_client::CoordinatorExecutorClient<tonic::transport::Channel>,
         tonic::Status,
     > {
-        let mut guard = self.client.lock().await;
-        if guard.is_none() {
-            *guard = Some(
-                wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-                    self.endpoint.clone(),
-                )
-                .await
-                .map_err(|e| tonic::Status::unavailable(e.to_string()))?,
-            );
-        }
-        Ok(guard.as_ref().expect("client initialized").clone())
+        self.pool
+            .client()
+            .await
+            .map_err(|e| tonic::Status::unavailable(e.to_string()))
     }
 }
 
@@ -417,7 +362,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         let mut client = self.client().await?;
         let response = client
-            .register_executor(wire::register_executor_request_to_wire(request.into_inner()))
+            .register_executor(wire::register_executor_request_to_wire(
+                request.into_inner(),
+            ))
             .await?
             .into_inner();
         Ok(tonic::Response::new(
@@ -449,7 +396,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let mut client = self.client().await?;
         let response = client
-            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(request.into_inner()))
+            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
+                request.into_inner(),
+            ))
             .await?
             .into_inner();
         Ok(tonic::Response::new(

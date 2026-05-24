@@ -17,18 +17,18 @@ use arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
+use krishiv_catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
 
-use krishiv_catalog::{datafusion_bridge::DataFusionCatalogBridge, InMemoryCatalog};
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
 mod lakehouse;
-mod udf;
 pub mod live_table;
 pub mod spark_compat;
 pub mod spark_compat_date;
+mod udf;
 
-pub use lakehouse::{preprocess_as_of_sql, AsOfTableRef, MergeResult, MergeTargetUnsupportedError};
+pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
@@ -159,14 +159,12 @@ impl SqlEngine {
         let Some(registry) = &self.udf_registry else {
             return Ok(());
         };
-        let guard = registry
-            .read()
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?;
+        let guard = registry.read().map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
         udf::sync_scalar_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })
+            message: e.to_string(),
+        })
     }
 
     /// Register aggregate UDFs from the attached registry (P1-21).
@@ -311,7 +309,11 @@ impl SqlEngine {
 
         self.sync_scalar_udfs().await?;
 
-        if query.trim_start().to_ascii_uppercase().starts_with("MERGE INTO") {
+        if query
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("MERGE INTO")
+        {
             let batches = lakehouse::execute_merge_sql(&self.context, query).await?;
             lakehouse::register_scan_batches(&self.context, "_krishiv_merge_result", batches)
                 .await?;
@@ -322,11 +324,8 @@ impl SqlEngine {
             return Ok(SqlDataFrame::new("merge", dataframe));
         }
 
-        let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query).map_err(|e| {
-            SqlError::DataFusion {
-                message: e,
-            }
-        })?;
+        let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query)
+            .map_err(|e| SqlError::DataFusion { message: e })?;
         lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;
         let dataframe = self.context.sql(&rewritten).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe))
@@ -479,9 +478,10 @@ pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan> {
             ExecutionKind::Batch,
         ));
 
+    let optimized = Optimizer::default().optimize(logical_plan);
     Ok(SqlPlan {
         query,
-        logical_plan,
+        logical_plan: optimized.plan,
     })
 }
 
@@ -781,7 +781,6 @@ mod view_cache_tests {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use krishiv_optimizer::{Cost, CostModel, Optimizer};
@@ -794,12 +793,13 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_table_resolved_in_sql() {
-        use std::sync::{Arc, RwLock};
-
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
-        use krishiv_catalog::{CatalogField, FieldType, InMemoryCatalog, TableMetadata, TableSchema};
+        use krishiv_catalog::{
+            CatalogField, FieldType, InMemoryCatalog, TableMetadata, TableSchema,
+        };
+        use std::sync::{Arc, RwLock};
 
         let catalog = Arc::new(RwLock::new(InMemoryCatalog::new()));
         let schema = TableSchema::new(vec![CatalogField::new("id", FieldType::Int64, false)]);
@@ -814,10 +814,7 @@ mod tests {
             .unwrap();
 
         let engine = SqlEngine::with_in_memory_catalog(catalog).unwrap();
-        let df = engine
-            .sql("SELECT * FROM krishiv.public.t")
-            .await
-            .unwrap();
+        let df = engine.sql("SELECT * FROM krishiv.public.t").await.unwrap();
         let batches = df.collect().await.unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 10);
@@ -905,17 +902,15 @@ mod tests {
 
     #[tokio::test]
     async fn collect_with_stats_uses_registered_table() {
-        use std::sync::Arc;
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
+        use std::sync::{Arc, RwLock};
 
         let engine = SqlEngine::new();
 
         // Register a record batch as a table.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let col = Int64Array::from(vec![1i64, 2i64, 3i64]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
         engine
@@ -941,10 +936,9 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod udf_sql_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     use krishiv_udf::MultiplyScalarUdf;
 
@@ -962,11 +956,12 @@ mod udf_sql_tests {
             .register_record_batches(
                 "t",
                 vec![{
-                    use std::sync::Arc;
                     use arrow::array::Int64Array;
                     use arrow::datatypes::{DataType, Field, Schema};
                     use arrow::record_batch::RecordBatch;
-                    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+                    use std::sync::{Arc, RwLock};
+                    let schema =
+                        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
                     RecordBatch::try_new(
                         schema,
                         vec![Arc::new(Int64Array::from(vec![Some(2), Some(4)]))],

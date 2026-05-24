@@ -35,11 +35,19 @@ impl IntervalJoinState {
         }
     }
 
-    pub fn push_left(&mut self, event_time_ms: i64, batch: RecordBatch) -> Vec<(RecordBatch, RecordBatch)> {
+    pub fn push_left(
+        &mut self,
+        event_time_ms: i64,
+        batch: RecordBatch,
+    ) -> Vec<(RecordBatch, RecordBatch)> {
         self.push_side(true, event_time_ms, batch)
     }
 
-    pub fn push_right(&mut self, event_time_ms: i64, batch: RecordBatch) -> Vec<(RecordBatch, RecordBatch)> {
+    pub fn push_right(
+        &mut self,
+        event_time_ms: i64,
+        batch: RecordBatch,
+    ) -> Vec<(RecordBatch, RecordBatch)> {
         self.push_side(false, event_time_ms, batch)
     }
 

@@ -3,11 +3,11 @@ mod imp {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use qdrant_client::qdrant::{
-        PointId, vectors_config::Config, CreateCollection, Distance, PointStruct,
-        UpsertPoints, VectorParams, VectorsConfig,
-    };
     use qdrant_client::Qdrant;
+    use qdrant_client::qdrant::{
+        CreateCollection, Distance, PointId, PointStruct, UpsertPoints, VectorParams,
+        VectorsConfig, vectors_config::Config,
+    };
 
     use crate::batch::EmbeddingBatch;
     use crate::id::point_id_from_doc_epoch;
@@ -15,7 +15,9 @@ mod imp {
         PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
     };
 
-    fn payload_to_qdrant(map: &HashMap<String, PayloadValue>) -> HashMap<String, qdrant_client::qdrant::Value> {
+    fn payload_to_qdrant(
+        map: &HashMap<String, PayloadValue>,
+    ) -> HashMap<String, qdrant_client::qdrant::Value> {
         map.iter()
             .map(|(k, v)| {
                 let value = match v {

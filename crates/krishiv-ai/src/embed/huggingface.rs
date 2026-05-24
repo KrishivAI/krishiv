@@ -31,8 +31,8 @@ mod imp {
             if matches!(device, EmbeddingDevice::Mps) {
                 options = options.with_show_download_progress(false);
             }
-            let inner = TextEmbedding::try_new(options)
-                .map_err(|e| EmbeddingError::Load(e.to_string()))?;
+            let inner =
+                TextEmbedding::try_new(options).map_err(|e| EmbeddingError::Load(e.to_string()))?;
             let dim = inner
                 .embed(vec!["probe"], None)
                 .ok()
@@ -82,8 +82,7 @@ mod imp {
             Ok(Arc::new(HuggingFaceEmbeddingModel::load(
                 "all-MiniLM-L6-v2",
                 EmbeddingDevice::Cpu,
-            )?)
-                as Arc<dyn EmbeddingModel>)
+            )?) as Arc<dyn EmbeddingModel>)
         });
         let b = EmbeddingModelRegistry::get_or_load(key, || {
             Err(EmbeddingError::Load("should not reload".into()))

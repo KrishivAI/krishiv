@@ -125,39 +125,44 @@ pub use krishiv_plan::JoinType;
 
 // ── Sub-modules ───────────────────────────────────────────────────────────────
 
-pub mod join;
-pub mod aggregate;
-pub mod coalesce_partitions;
-pub mod window;
-pub mod queue;
 pub mod adaptive;
-pub mod chunk;
-pub mod schema_normalize;
-pub mod live_table;
-pub mod temporal_join;
-pub mod interval_join;
-pub mod cep;
+pub mod aggregate;
 pub mod barrier_align;
-pub mod side_output;
+pub mod cep;
+pub mod chunk;
+pub mod coalesce_partitions;
+pub mod interval_join;
+pub mod join;
+pub mod live_table;
 pub mod memo;
+pub mod queue;
+pub mod schema_normalize;
+pub mod side_output;
+pub mod temporal_join;
 #[cfg(test)]
 pub mod watermark_e2e;
+pub mod window;
 
 pub use chunk::ChunkOperator;
 
 // ── Re-exports for backwards-compatible crate-level API ───────────────────────
 
-pub use join::{HashJoin, BroadcastJoin, BuiltBroadcastJoin, StreamTableJoin};
-pub use aggregate::{AggFunction, AggExpr, LocalAggregator};
-pub use window::{WatermarkState, MultiSourceWatermarkState,
-    TumblingWindowSpec, TumblingWindowOperator,
-    SlidingWindowSpec, SlidingWindowOperator,
-    SessionWindowSpec, SessionWindowOperator};
-pub use queue::{OperatorMessage, OperatorQueueMetrics, OperatorQueueSender,
-    OperatorQueueReceiver, OperatorQueueError, operator_queue};
-pub use adaptive::{HotKeyReport, HeavyHittersTracker, ThrottleCommand, RateLimiter,
-    SinkLatencyTracker, AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig};
+pub use adaptive::{
+    AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
+    HotKeyReport, RateLimiter, SinkLatencyTracker, ThrottleCommand,
+};
+pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
+pub use join::{BroadcastJoin, BuiltBroadcastJoin, HashJoin, StreamTableJoin};
+pub use queue::{
+    OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
+    OperatorQueueSender, operator_queue,
+};
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
+pub use window::{
+    MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
+    SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,
+    TumblingWindowSpec, WatermarkState,
+};
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

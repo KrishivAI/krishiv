@@ -197,28 +197,27 @@ impl ExecutorAssignmentInbox {
     }
 }
 
-
 // ── Sub-modules ────────────────────────────────────────────────────────────────
-pub mod runner;
 pub mod barrier;
 pub mod barrier_transport;
-pub mod grpc;
-pub mod transport;
-pub mod llm_throttle;
 pub(crate) mod fragment;
+pub mod grpc;
+pub mod grpc_client;
+pub mod llm_throttle;
+pub mod runner;
+pub mod transport;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
-pub use runner::{
-    ExecutorTaskRunReport, ExecutorTaskOutput, ExecutorTaskOutputKind, ShuffleContext,
-    TaskRunner, ExecutorTaskRunner,
-};
 pub use barrier::{BarrierSimulator, BarrierSnapshot};
-pub use grpc::{ExecutorTaskInboxService, ExecutorTaskGrpcService, executor_task_grpc_server};
+pub use grpc::{ExecutorTaskGrpcService, ExecutorTaskInboxService, executor_task_grpc_server};
+pub use runner::{
+    ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport, ExecutorTaskRunner,
+    ShuffleContext, TaskRunner,
+};
 pub use transport::{
-    ExecutorTransportError, ExecutorConfig, ExecutorRuntime, GrpcCoordinatorService,
+    ExecutorConfig, ExecutorRuntime, ExecutorTransportError, GrpcCoordinatorService,
     serve_executor_task_grpc, serve_executor_task_grpc_with_listener,
 };
-
 
 #[cfg(test)]
 mod tests {
@@ -2583,13 +2582,7 @@ mod tests {
         };
 
         let response = runner
-            .initiate_checkpoint_and_deliver_ack(
-                &assignment,
-                req,
-                &backend,
-                &storage,
-                &coordinator,
-            )
+            .initiate_checkpoint_and_deliver_ack(&assignment, req, &backend, &storage, &coordinator)
             .await
             .unwrap();
         assert_eq!(response, CheckpointAckResponse::Accepted);
@@ -2612,13 +2605,14 @@ mod tests {
             TaskId::try_new("task-hb").unwrap(),
             AttemptId::initial(),
         );
-        runtime
-            .running_attempts()
-            .insert(attempt.task_id().as_str().to_string(), attempt.clone());
-
-        let heartbeat = runtime.heartbeat_request();
+        let heartbeat = runtime
+            .heartbeat_request()
+            .with_running_attempts(vec![attempt]);
         assert_eq!(heartbeat.running_attempts().len(), 1);
-        assert_eq!(heartbeat.running_attempts()[0].task_id().as_str(), "task-hb");
+        assert_eq!(
+            heartbeat.running_attempts()[0].task_id().as_str(),
+            "task-hb"
+        );
     }
 
     // ── R4a typed shuffle write / read ────────────────────────────────────────

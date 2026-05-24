@@ -34,7 +34,8 @@ pub struct PartitionFieldSpec {
 #[async_trait]
 pub trait IcebergCatalogClient: Send + Sync {
     async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>>;
-    async fn load_table_metadata(&self, table: &IcebergTableId) -> CatalogResult<serde_json::Value>;
+    async fn load_table_metadata(&self, table: &IcebergTableId)
+    -> CatalogResult<serde_json::Value>;
     async fn add_partition_field(
         &self,
         table: &IcebergTableId,
@@ -81,22 +82,17 @@ impl GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CatalogError::InvalidSchema {
-                message: e.to_string(),
-            })?;
+        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+            message: e.to_string(),
+        })?;
         if !resp.status().is_success() {
             return Err(CatalogError::InvalidSchema {
                 message: resp.text().await.unwrap_or_default(),
             });
         }
-        resp.json()
-            .await
-            .map_err(|e| CatalogError::InvalidSchema {
-                message: e.to_string(),
-            })
+        resp.json().await.map_err(|e| CatalogError::InvalidSchema {
+            message: e.to_string(),
+        })
     }
 }
 
@@ -116,7 +112,10 @@ impl IcebergCatalogClient for GenericRestCatalog {
             .collect())
     }
 
-    async fn load_table_metadata(&self, table: &IcebergTableId) -> CatalogResult<serde_json::Value> {
+    async fn load_table_metadata(
+        &self,
+        table: &IcebergTableId,
+    ) -> CatalogResult<serde_json::Value> {
         let url = self.url(&format!(
             "namespaces/{}/tables/{}",
             table.namespace, table.name
@@ -137,12 +136,9 @@ impl IcebergCatalogClient for GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CatalogError::InvalidSchema {
-                message: e.to_string(),
-            })?;
+        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+            message: e.to_string(),
+        })?;
         if !resp.status().is_success() {
             return Err(CatalogError::InvalidSchema {
                 message: resp.text().await.unwrap_or_default(),
@@ -164,12 +160,9 @@ impl IcebergCatalogClient for GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CatalogError::InvalidSchema {
-                message: e.to_string(),
-            })?;
+        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+            message: e.to_string(),
+        })?;
         if !resp.status().is_success() {
             return Err(CatalogError::InvalidSchema {
                 message: resp.text().await.unwrap_or_default(),
@@ -187,16 +180,16 @@ impl IcebergCatalogClient for GenericRestCatalog {
             "namespaces/{}/tables/{}/partition-specs/replace",
             table.namespace, table.name
         ));
-        let mut req = self.client.put(url).json(&serde_json::json!({ "fields": fields }));
+        let mut req = self
+            .client
+            .put(url)
+            .json(&serde_json::json!({ "fields": fields }));
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CatalogError::InvalidSchema {
-                message: e.to_string(),
-            })?;
+        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+            message: e.to_string(),
+        })?;
         if !resp.status().is_success() {
             return Err(CatalogError::InvalidSchema {
                 message: resp.text().await.unwrap_or_default(),
@@ -215,7 +208,11 @@ pub struct GlueRestCatalog {
 }
 
 impl GlueRestCatalog {
-    pub fn new(region: impl Into<String>, database: impl Into<String>, rest_url: impl Into<String>) -> Self {
+    pub fn new(
+        region: impl Into<String>,
+        database: impl Into<String>,
+        rest_url: impl Into<String>,
+    ) -> Self {
         let region = region.into();
         let database = database.into();
         Self {
@@ -236,7 +233,10 @@ impl IcebergCatalogClient for GlueRestCatalog {
     async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>> {
         self.inner.list_tables(namespace).await
     }
-    async fn load_table_metadata(&self, table: &IcebergTableId) -> CatalogResult<serde_json::Value> {
+    async fn load_table_metadata(
+        &self,
+        table: &IcebergTableId,
+    ) -> CatalogResult<serde_json::Value> {
         self.inner.load_table_metadata(table).await
     }
     async fn add_partition_field(
@@ -288,7 +288,10 @@ impl IcebergCatalogClient for NessieCatalog {
     async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>> {
         self.inner.list_tables(namespace).await
     }
-    async fn load_table_metadata(&self, table: &IcebergTableId) -> CatalogResult<serde_json::Value> {
+    async fn load_table_metadata(
+        &self,
+        table: &IcebergTableId,
+    ) -> CatalogResult<serde_json::Value> {
         self.inner.load_table_metadata(table).await
     }
     async fn add_partition_field(

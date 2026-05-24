@@ -1,7 +1,7 @@
 //! Barrier injection tests (R16 S1.2).
 
-use krishiv_exec::queue::{operator_queue, OperatorMessage};
-use krishiv_executor::barrier_transport::{make_checkpoint_barrier, BarrierInjector};
+use krishiv_exec::queue::{OperatorMessage, operator_queue};
+use krishiv_executor::barrier_transport::{BarrierInjector, make_checkpoint_barrier};
 
 #[test]
 fn source_emits_barrier_after_data_via_queue() {

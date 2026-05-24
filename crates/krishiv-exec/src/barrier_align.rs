@@ -40,9 +40,7 @@ impl BarrierAligner {
             input_count: input_count.max(1),
             barrier_inputs_seen: 0,
             current_epoch: None,
-            buffers: (0..input_count.max(1))
-                .map(|_| VecDeque::new())
-                .collect(),
+            buffers: (0..input_count.max(1)).map(|_| VecDeque::new()).collect(),
             alignment_deadline: None,
             alignment_timeout,
         }
@@ -80,15 +78,14 @@ impl BarrierAligner {
             self.alignment_deadline = None;
             return Ok(true);
         }
-        if let Some(deadline) = self.alignment_deadline {
-            if Instant::now() > deadline {
+        if let Some(deadline) = self.alignment_deadline
+            && Instant::now() > deadline {
                 return Err(CheckpointAlignmentTimeout {
                     epoch,
                     waited_inputs: self.barrier_inputs_seen,
                     expected_inputs: self.input_count,
                 });
             }
-        }
         Ok(false)
     }
 

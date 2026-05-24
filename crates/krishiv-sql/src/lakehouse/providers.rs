@@ -98,9 +98,7 @@ impl TableProvider for DeltaScanProvider {
             .await
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
         let table = MemTable::try_new(schema, vec![batches])?;
-        let plan = table
-            .scan(_state, _projection, _filters, _limit)
-            .await?;
+        let plan = table.scan(_state, _projection, _filters, _limit).await?;
         Ok(plan)
     }
 }

@@ -60,7 +60,10 @@ impl EmbeddingModelRegistry {
     }
 
     /// Get or insert a model singleton.
-    pub fn get_or_load<F>(key: ModelKey, loader: F) -> Result<Arc<dyn EmbeddingModel>, EmbeddingError>
+    pub fn get_or_load<F>(
+        key: ModelKey,
+        loader: F,
+    ) -> Result<Arc<dyn EmbeddingModel>, EmbeddingError>
     where
         F: FnOnce() -> Result<Arc<dyn EmbeddingModel>, EmbeddingError>,
     {

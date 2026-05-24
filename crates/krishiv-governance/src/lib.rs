@@ -278,8 +278,8 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    if let Some(entry) = AUDIT_DEDUP.get(&key) {
-        if now_ms.saturating_sub(*entry) < AUDIT_DEDUP_TTL_MS {
+    if let Some(entry) = AUDIT_DEDUP.get(&key)
+        && now_ms.saturating_sub(*entry) < AUDIT_DEDUP_TTL_MS {
             tracing::warn!(
                 target: "krishiv::audit",
                 principal = principal,
@@ -288,7 +288,6 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
             );
             return;
         }
-    }
     AUDIT_DEDUP.insert(key, now_ms);
 
     let event = AuditEvent {

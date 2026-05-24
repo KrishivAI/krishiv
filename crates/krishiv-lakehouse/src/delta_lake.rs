@@ -111,14 +111,13 @@ pub async fn merge_delta(
     let mut keep_indices = Vec::new();
     let mut updated = 0u64;
     for (i, k) in target_keys.iter().enumerate() {
-        if let Some(k) = k {
-            if source_map.contains_key(k) {
+        if let Some(k) = k
+            && source_map.contains_key(k) {
                 if when_matched_update {
                     updated += 1;
                 }
                 continue;
             }
-        }
         keep_indices.push(i as u32);
     }
 
@@ -132,13 +131,7 @@ pub async fn merge_delta(
         merged_batches.push(source);
     }
     let merged = concat_batches(&merged_batches)?;
-    write_delta(
-        target_path,
-        vec![merged],
-        DeltaWriteMode::Overwrite,
-        false,
-    )
-    .await?;
+    write_delta(target_path, vec![merged], DeltaWriteMode::Overwrite, false).await?;
     Ok(MergeDeltaResult {
         rows_inserted: inserted,
         rows_updated: updated,
@@ -150,7 +143,9 @@ use arrow::array::{Array, Int64Array, StringArray};
 
 fn concat_batches(batches: &[RecordBatch]) -> LakehouseResult<RecordBatch> {
     if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty())));
+        return Ok(RecordBatch::new_empty(Arc::new(
+            arrow::datatypes::Schema::empty(),
+        )));
     }
     let schema = batches[0].schema();
     let mut columns: Vec<Vec<Arc<dyn Array>>> = vec![Vec::new(); schema.fields().len()];

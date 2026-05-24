@@ -48,12 +48,13 @@ pub use windows::PyWindowSpec;
 // Embedded Tokio runtime — shared by session async helpers and UDF bridge
 // ---------------------------------------------------------------------------
 
-pub(crate) static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build embedded Krishiv Tokio runtime")
-});
+pub(crate) static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+    std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build embedded Krishiv Tokio runtime")
+    });
 
 // ---------------------------------------------------------------------------
 // PyModule entry point
@@ -122,8 +123,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use krishiv_udf::ScalarUdf;
 
-    use crate::call_python_udf;
     use crate::RUNTIME;
+    use crate::call_python_udf;
 
     #[test]
     fn py_session_builds_embedded() {

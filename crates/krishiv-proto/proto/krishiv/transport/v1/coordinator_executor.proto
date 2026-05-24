@@ -88,6 +88,12 @@ message ExecutorHeartbeatRequest {
   repeated LlmQuotaReport llm_quota_reports = 12;
 }
 
+message InitiateCheckpointCommand {
+  string job_id = 1;
+  uint64 epoch = 2;
+  uint64 fencing_token = 3;
+}
+
 message ExecutorHeartbeatResponse {
   TransportVersion version = 1;
   uint64 lease_generation = 2;
@@ -95,6 +101,7 @@ message ExecutorHeartbeatResponse {
   string message = 4;
   // R17: coordinator throttle directives for LLM UDF rate limiters.
   repeated LlmThrottleCommand llm_throttles = 5;
+  repeated InitiateCheckpointCommand initiate_checkpoints = 6;
 }
 
 message ExecutorTaskAssignment {
