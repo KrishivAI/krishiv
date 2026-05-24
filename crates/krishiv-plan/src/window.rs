@@ -1,5 +1,7 @@
 //! Streaming window plan configuration and fragment encoding (unified execution).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Window operator kind for streaming execution.
@@ -52,6 +54,13 @@ pub struct WindowExecutionSpec {
     pub session_gap_ms: Option<u64>,
     pub agg_exprs: Vec<WindowAgg>,
     pub state_ttl_ms: Option<u64>,
+    /// Per-source fixed-lag watermark (ms). When non-empty, effective watermark is the
+    /// minimum across all configured sources (R5.2 multi-source reconciliation).
+    #[serde(default)]
+    pub source_watermark_lags: HashMap<String, u64>,
+    /// Column identifying the input source for multi-source watermark propagation.
+    #[serde(default)]
+    pub source_id_column: Option<String>,
 }
 
 impl WindowExecutionSpec {
@@ -74,6 +83,8 @@ impl WindowExecutionSpec {
             session_gap_ms: None,
             agg_exprs: Self::default_count_agg(),
             state_ttl_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         }
     }
 }
@@ -285,6 +296,8 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: vec![WindowAgg::count("count")],
             state_ttl_ms: Some(30_000),
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         };
         let frag = encode_stream_fragment(&spec);
         let parsed = parse_stream_fragment(&frag).expect("parse");

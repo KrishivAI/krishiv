@@ -1,17 +1,18 @@
 //! Unified bounded window execution for batch and streaming (all deployment modes).
 
-use arrow::array::Int64Array;
+use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
 use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
+use crate::window::MultiSourceWatermarkState;
 use crate::{
     AggExpr, AggFunction, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
     SlidingWindowOperator, SlidingWindowSpec, StateBackedTumblingWindowOperator,
     TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
 
-fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
+pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
     let function = match agg.kind {
         WindowAggKind::Count => AggFunction::Count,
         WindowAggKind::Sum => AggFunction::Sum,
@@ -26,7 +27,76 @@ fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
     }
 }
 
-fn max_event_time_ms(batch: &RecordBatch, column: &str) -> ExecResult<i64> {
+fn max_event_time_ms_for_source(
+    batch: &RecordBatch,
+    time_col: &str,
+    source_col: &str,
+    source_id: &str,
+) -> ExecResult<i64> {
+    let time_idx = batch
+        .schema()
+        .index_of(time_col)
+        .map_err(|_| ExecError::ColumnNotFound(time_col.to_string()))?;
+    let source_idx = batch
+        .schema()
+        .index_of(source_col)
+        .map_err(|_| ExecError::ColumnNotFound(source_col.to_string()))?;
+    let times = batch
+        .column(time_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| ExecError::UnsupportedType(format!("{time_col} must be Int64")))?;
+    let sources = batch
+        .column(source_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ExecError::UnsupportedType(format!("{source_col} must be Utf8")))?;
+    let mut max = i64::MIN;
+    for row in 0..batch.num_rows() {
+        if sources.value(row) == source_id {
+            let v = times.value(row);
+            if v > max {
+                max = v;
+            }
+        }
+    }
+    Ok(max)
+}
+
+fn advance_effective_watermark(
+    batch: &RecordBatch,
+    spec: &WindowExecutionSpec,
+    single: &mut WatermarkState,
+    multi: &mut MultiSourceWatermarkState,
+) -> ExecResult<i64> {
+    if spec.source_watermark_lags.is_empty() {
+        let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
+        if max_ts > i64::MIN {
+            single.advance(max_ts);
+        }
+        return Ok(single.current_watermark_ms());
+    }
+    let source_col = spec.source_id_column.as_deref().ok_or_else(|| {
+        ExecError::InvalidWindowConfig(
+            "multi-source watermark requires source_id_column".into(),
+        )
+    })?;
+    for (source_id, lag_ms) in &spec.source_watermark_lags {
+        let max_ts = max_event_time_ms_for_source(
+            batch,
+            &spec.event_time_column,
+            source_col,
+            source_id,
+        )?;
+        if max_ts > i64::MIN {
+            let wm = max_ts.saturating_sub(*lag_ms as i64);
+            multi.update(source_id, wm);
+        }
+    }
+    Ok(multi.effective_watermark_ms())
+}
+
+pub(crate) fn max_event_time_ms(batch: &RecordBatch, column: &str) -> ExecResult<i64> {
     let idx = batch
         .schema()
         .index_of(column)
@@ -64,7 +134,8 @@ pub fn execute_bounded_window(
     }
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
-    let mut watermark = WatermarkState::new(spec.watermark_lag_ms);
+    let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
+    let mut multi_watermark = MultiSourceWatermarkState::new();
     let mut output = Vec::new();
 
     match spec.window_kind {
@@ -87,22 +158,24 @@ pub fn execute_bounded_window(
                 )
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
                 for batch in &input_batches {
-                    let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
-                    if max_ts > i64::MIN {
-                        watermark.advance(max_ts);
-                    }
-                    let wm = watermark.current_watermark_ms();
+                    let wm = advance_effective_watermark(
+                        batch,
+                        spec,
+                        &mut single_watermark,
+                        &mut multi_watermark,
+                    )?;
                     output.extend(op.process_batch(batch, wm)?);
                 }
                 output.extend(op.flush_closed_windows(i64::MAX)?);
             } else {
                 let mut op = TumblingWindowOperator::new(tw_spec);
                 for batch in &input_batches {
-                    let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
-                    if max_ts > i64::MIN {
-                        watermark.advance(max_ts);
-                    }
-                    let wm = watermark.current_watermark_ms();
+                    let wm = advance_effective_watermark(
+                        batch,
+                        spec,
+                        &mut single_watermark,
+                        &mut multi_watermark,
+                    )?;
                     output.extend(op.process_batch(batch, wm)?);
                 }
                 output.extend(op.flush_closed_windows(i64::MAX)?);
@@ -119,11 +192,12 @@ pub fn execute_bounded_window(
             };
             let mut op = SlidingWindowOperator::new(sw_spec)?;
             for batch in &input_batches {
-                let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
-                if max_ts > i64::MIN {
-                    watermark.advance(max_ts);
-                }
-                let wm = watermark.current_watermark_ms();
+                let wm = advance_effective_watermark(
+                    batch,
+                    spec,
+                    &mut single_watermark,
+                    &mut multi_watermark,
+                )?;
                 output.extend(op.process_batch(batch, wm)?);
             }
             output.extend(op.flush_closed_windows(i64::MAX)?);
@@ -138,11 +212,12 @@ pub fn execute_bounded_window(
             };
             let mut op = SessionWindowOperator::new(sess_spec);
             for batch in &input_batches {
-                let max_ts = max_event_time_ms(batch, &spec.event_time_column)?;
-                if max_ts > i64::MIN {
-                    watermark.advance(max_ts);
-                }
-                let wm = watermark.current_watermark_ms();
+                let wm = advance_effective_watermark(
+                    batch,
+                    spec,
+                    &mut single_watermark,
+                    &mut multi_watermark,
+                )?;
                 output.extend(op.process_batch(batch, wm)?);
             }
             output.extend(op.flush_closed_sessions(i64::MAX)?);
@@ -195,6 +270,8 @@ pub fn local_spec_to_window_execution(
             })
             .collect(),
         state_ttl_ms,
+        source_watermark_lags: std::collections::HashMap::new(),
+        source_id_column: None,
     }
 }
 
@@ -231,19 +308,40 @@ mod tests {
     }
 
     #[test]
-    fn sliding_window_produces_output() {
-        let spec = WindowExecutionSpec {
+    fn multi_source_watermark_min_across_sources() {
+        use std::collections::HashMap;
+
+        let mut spec = WindowExecutionSpec {
             key_column: "user_id".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
-            window_kind: WindowKind::Sliding,
+            window_kind: WindowKind::Tumbling,
             window_size_ms: 10_000,
-            slide_ms: Some(5_000),
+            slide_ms: None,
             session_gap_ms: None,
             agg_exprs: WindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            source_watermark_lags: HashMap::from([
+                ("src-a".into(), 0),
+                ("src-b".into(), 0),
+            ]),
+            source_id_column: Some("source_id".into()),
         };
-        let out = execute_bounded_window(vec![events_batch()], &spec).expect("execute");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("source_id", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![5_000])) as _,
+                Arc::new(StringArray::from(vec!["src-a"])) as _,
+            ],
+        )
+        .unwrap();
+        let out = execute_bounded_window(vec![batch], &spec).expect("execute");
         assert!(!out.is_empty());
     }
 }

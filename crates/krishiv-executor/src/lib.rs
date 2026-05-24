@@ -211,8 +211,8 @@ pub mod transport;
 pub use barrier::{BarrierSimulator, BarrierSnapshot};
 pub use grpc::{ExecutorTaskGrpcService, ExecutorTaskInboxService, executor_task_grpc_server};
 pub use runner::{
-    ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport, ExecutorTaskRunner,
-    ShuffleContext, TaskRunner,
+    ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,
+    ExecutorTaskRunner, ShuffleContext, TaskRunner,
 };
 pub use transport::{
     ExecutorConfig, ExecutorRuntime, ExecutorTransportError, GrpcCoordinatorService,

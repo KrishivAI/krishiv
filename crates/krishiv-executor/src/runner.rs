@@ -248,6 +248,11 @@ impl ExecutorTaskOutput {
         self
     }
 
+    pub(crate) fn with_record_batches(mut self, batches: Vec<RecordBatch>) -> Self {
+        self.record_batches = batches;
+        self
+    }
+
     /// Output kind.
     pub fn kind(&self) -> ExecutorTaskOutputKind {
         self.kind
@@ -466,6 +471,12 @@ impl TaskRunner {
     }
 }
 
+/// Drains output from a long-running continuous streaming job (R5.2).
+pub trait ContinuousJobDrainer: Send + Sync {
+    /// Process pending input for `job_id` and return newly emitted batches.
+    fn drain_job(&self, job_id: &str) -> Result<Vec<RecordBatch>, String>;
+}
+
 /// Minimal R3.1 stage-local task runner skeleton.
 #[derive(Clone)]
 pub struct ExecutorTaskRunner {
@@ -478,6 +489,8 @@ pub struct ExecutorTaskRunner {
     pub(crate) checkpoint_runners: Arc<DashMap<TaskId, TaskRunner>>,
     /// Attempts currently executing on this executor (P1-19).
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
+    /// Optional continuous streaming drain hook (in-process cluster).
+    pub(crate) continuous_drainer: Option<Arc<dyn ContinuousJobDrainer>>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -515,7 +528,17 @@ impl ExecutorTaskRunner {
             sql_engine: Arc::new(SqlEngine::new()),
             checkpoint_runners: Arc::new(DashMap::new()),
             running_attempts: None,
+            continuous_drainer: None,
         }
+    }
+
+    /// Wire continuous streaming drain for `stream:continuous:` fragments.
+    pub fn with_continuous_drainer(
+        mut self,
+        drainer: Arc<dyn ContinuousJobDrainer>,
+    ) -> Self {
+        self.continuous_drainer = Some(drainer);
+        self
     }
 
     /// Track running attempts for coordinator heartbeats (P1-19).

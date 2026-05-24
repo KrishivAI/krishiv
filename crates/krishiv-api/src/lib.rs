@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -17,8 +17,9 @@ use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
-    build_execution_runtime, DistributedBackend, EmbeddedBackend, ExecutionBackend,
-    ExecutionRuntime, InProcessCluster, JobId, JobState, RuntimeMode, SingleNodeBackend,
+    build_execution_runtime, BatchTableRegistration, DistributedBackend, EmbeddedBackend,
+    ExecutionBackend, ExecutionRuntime, InProcessCluster, JobId, JobState, RuntimeMode,
+    SingleNodeBackend,
 };
 use krishiv_sql::{SqlDataFrame, SqlEngine};
 use krishiv_sql_policy::PolicyEnforcingSqlEngine;
@@ -316,6 +317,8 @@ impl SessionBuilder {
             udf_registry,
             local_cluster,
             runtime,
+            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
+            stream_jobs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -334,6 +337,8 @@ pub struct Session {
     udf_registry: Arc<RwLock<UdfRegistry>>,
     local_cluster: Arc<InProcessCluster>,
     runtime: Arc<dyn ExecutionRuntime>,
+    registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+    stream_jobs: Arc<RwLock<HashMap<String, LocalWindowExecutionSpec>>>,
 }
 
 impl fmt::Debug for Session {
@@ -384,13 +389,40 @@ impl Session {
     }
 
     /// Submit a continuous streaming job (unbounded sources). Returns a handle id.
-    pub fn submit_stream_job(&self, name: impl Into<String>) -> Result<String> {
+    pub fn submit_stream_job(
+        &self,
+        name: impl Into<String>,
+        spec: LocalWindowExecutionSpec,
+    ) -> Result<String> {
         let name = name.into();
-        let plan = PhysicalPlan::new(format!("stream:job:{name}"), ExecutionKind::Streaming);
+        let plan = PhysicalPlan::new(format!("stream:continuous:{name}"), ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan).map_err(KrishivError::from)?;
         self.runtime
-            .accept_plan(&plan)
+            .register_continuous_stream(&name, &spec)
             .map_err(KrishivError::from)?;
+        self.stream_jobs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.clone(), spec);
         Ok(name)
+    }
+
+    /// Push input batches to a continuous streaming job.
+    pub fn push_stream_job_input(
+        &self,
+        job_id: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        self.runtime
+            .push_continuous_stream_input(job_id, batches)
+            .map_err(KrishivError::from)
+    }
+
+    /// Asynchronously drain newly emitted batches from a continuous streaming job.
+    pub async fn poll_stream_job(&self, job_id: &str) -> Result<Vec<RecordBatch>> {
+        self.runtime
+            .drain_continuous_stream(job_id)
+            .map_err(KrishivError::from)
     }
 
     /// Register in-memory stream batches for `memory:<name>` pipeline sources.
@@ -455,15 +487,19 @@ impl Session {
         table_name: impl AsRef<str>,
         path: impl AsRef<Path>,
     ) -> Result<()> {
-        ensure_local_mode(self.mode)?;
         let table_name = table_name.as_ref().to_owned();
         let path = path.as_ref().to_path_buf();
         block_on(async {
             self.sql_engine
-                .register_parquet(table_name, path)
+                .register_parquet(&table_name, &path)
                 .await
-                .map_err(Into::into)
-        })
+                .map_err(KrishivError::from)
+        })?;
+        self.registered_parquet
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table_name, path);
+        Ok(())
     }
 
     /// Asynchronously register a local Parquet path as a SQL table.
@@ -472,22 +508,40 @@ impl Session {
         table_name: impl AsRef<str>,
         path: impl AsRef<Path>,
     ) -> Result<()> {
-        ensure_local_mode(self.mode)?;
+        let table_name = table_name.as_ref().to_owned();
+        let path = path.as_ref().to_path_buf();
         self.sql_engine
-            .register_parquet(table_name, path)
+            .register_parquet(&table_name, &path)
             .await
-            .map_err(Into::into)
+            .map_err(KrishivError::from)?;
+        self.registered_parquet
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table_name, path);
+        Ok(())
+    }
+
+    fn dataframe_from_sql(&self, sql_dataframe: SqlDataFrame) -> DataFrame {
+        let sql_query = sql_dataframe.query().map(str::to_owned);
+        DataFrame::from_sql_dataframe(
+            self.mode,
+            sql_dataframe,
+            sql_query,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.coordinator_url.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        )
     }
 
     /// Create a DataFrame from a SQL query.
     pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         block_on(self.sql_async(query))
     }
 
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         if self.policy_engine.is_some() {
             return Err(KrishivError::AccessDenied {
                 reason: "session has a policy engine configured; use sql_as() to execute SQL with an authenticated principal".into(),
@@ -495,13 +549,7 @@ impl Session {
         }
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Execute SQL authenticated as the principal identified by `api_key`.
@@ -537,7 +585,6 @@ impl Session {
 
     /// Create a DataFrame by reading a local Parquet path directly.
     pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         let path = path.as_ref().to_path_buf();
         block_on(self.read_parquet_async(path))
     }
@@ -550,13 +597,7 @@ impl Session {
     ) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;
         let sql_dataframe = self.sql_engine.read_delta(path, version).await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Read a Hudi table directory (R18).
@@ -571,26 +612,14 @@ impl Session {
             .sql_engine
             .read_hudi(path, query_type, begin_instant)
             .await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.
     pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
         ensure_local_mode(self.mode)?;
         let sql_dataframe = self.sql_engine.read_parquet(path).await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Create a bounded local memory stream.
@@ -625,10 +654,11 @@ impl Session {
 }
 
 /// DataFrame API backed by DataFusion for R1 local execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DataFrame {
     logical_plan: LogicalPlan,
     sql_dataframe: Option<SqlDataFrame>,
+    sql_query: Option<String>,
     /// Pre-collected batches — set when the DataFrame is constructed from
     /// already-executed results (e.g. [`Session::sql_as`]).
     pre_collected: Option<Vec<RecordBatch>>,
@@ -636,6 +666,19 @@ pub struct DataFrame {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     coordinator_url: Option<String>,
+    runtime: Arc<dyn ExecutionRuntime>,
+    registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+}
+
+impl fmt::Debug for DataFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataFrame")
+            .field("logical_plan", &self.logical_plan)
+            .field("mode", &self.mode)
+            .field("has_sql_query", &self.sql_query.is_some())
+            .field("pre_collected", &self.pre_collected.as_ref().map(|b| b.len()))
+            .finish_non_exhaustive()
+    }
 }
 
 impl DataFrame {
@@ -644,30 +687,43 @@ impl DataFrame {
         Self {
             logical_plan,
             sql_dataframe: None,
+            sql_query: None,
             pre_collected: None,
             mode: ExecutionMode::Embedded,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: None,
+            runtime: build_execution_runtime(
+                RuntimeMode::Embedded,
+                Arc::new(InProcessCluster::new().expect("in-process cluster")),
+                None,
+            ),
+            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     fn from_sql_dataframe(
         mode: ExecutionMode,
         sql_dataframe: SqlDataFrame,
+        sql_query: Option<String>,
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
         coordinator_url: Option<String>,
+        runtime: Arc<dyn ExecutionRuntime>,
+        registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
             logical_plan,
             sql_dataframe: Some(sql_dataframe),
+            sql_query,
             pre_collected: None,
             mode,
             jobs,
             next_job_id,
             coordinator_url,
+            runtime,
+            registered_parquet,
         }
     }
 
@@ -684,15 +740,20 @@ impl DataFrame {
         Self {
             logical_plan,
             sql_dataframe: None,
+            sql_query: None,
             pre_collected: Some(batches),
             mode,
             jobs,
             next_job_id,
             coordinator_url: None,
+            runtime: build_execution_runtime(
+                RuntimeMode::Embedded,
+                Arc::new(InProcessCluster::new().expect("in-process cluster")),
+                None,
+            ),
+            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
         }
     }
-
-    /// Borrow the Krishiv logical plan wrapper.
     pub fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
     }
@@ -726,18 +787,27 @@ impl DataFrame {
 
     /// Asynchronously collect results.
     pub async fn collect_async(&self) -> Result<QueryResult> {
-        ensure_local_mode(self.mode)?;
         let job_id = self.start_job("local-dataframe");
         self.update_job(&job_id, "local-dataframe", JobState::Running);
 
-        // If this DataFrame wraps pre-collected batches (e.g. from sql_as),
-        // return them directly without going through DataFusion again.
         if let Some(batches) = &self.pre_collected {
             self.update_job(&job_id, "local-dataframe", JobState::Succeeded);
             return Ok(QueryResult::new(batches.clone()));
         }
 
-        let result = if let Err(error) = accept_plan_with_backend(
+        let result = if let Some(query) = self.sql_query.as_deref() {
+            let tables = self
+                .registered_parquet
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+                .collect::<Vec<_>>();
+            self.runtime
+                .collect_batch_sql(query, &tables)
+                .map(QueryResult::new)
+                .map_err(KrishivError::from)
+        } else if let Err(error) = accept_plan_with_backend(
             self.mode,
             self.logical_plan.name(),
             self.logical_plan.kind(),
@@ -963,6 +1033,7 @@ impl Stream {
             key_column: column.into(),
             event_time_column: None,
             watermark_spec: None,
+            multi_source_watermark: None,
             inner: self,
         }
     }
@@ -1002,6 +1073,7 @@ pub struct KeyedStream {
     key_column: String,
     event_time_column: Option<String>,
     watermark_spec: Option<WatermarkSpec>,
+    multi_source_watermark: Option<MultiSourceWatermarkSpec>,
 }
 
 impl KeyedStream {
@@ -1017,6 +1089,18 @@ impl KeyedStream {
     pub fn watermark(mut self, spec: WatermarkSpec) -> Self {
         self.watermark_spec = Some(spec);
         self
+    }
+
+    /// Configure multi-source watermark reconciliation (R5.2).
+    #[must_use]
+    pub fn with_multi_source_watermark(mut self, spec: MultiSourceWatermarkSpec) -> Self {
+        self.multi_source_watermark = Some(spec);
+        self
+    }
+
+    /// Multi-source watermark configuration, if set.
+    pub fn multi_source_watermark(&self) -> Option<&MultiSourceWatermarkSpec> {
+        self.multi_source_watermark.as_ref()
     }
 
     /// Create a tumbling event-time window of `window_size_ms` milliseconds.
@@ -1104,6 +1188,20 @@ fn event_time_column_for_keyed(keyed: &KeyedStream) -> Result<String> {
     })
 }
 
+fn apply_multi_source_watermark(
+    keyed: &KeyedStream,
+    spec: &mut LocalWindowExecutionSpec,
+) {
+    if let Some(ms) = keyed.multi_source_watermark() {
+        spec.source_watermark_lags = ms
+            .source_specs()
+            .iter()
+            .map(|(id, ws)| (id.clone(), ws.lag_ms()))
+            .collect();
+        spec.source_id_column = Some(String::from("source_id"));
+    }
+}
+
 fn build_tumbling_spec(
     keyed: &KeyedStream,
     window_size_ms: u64,
@@ -1111,7 +1209,7 @@ fn build_tumbling_spec(
 ) -> Result<LocalWindowExecutionSpec> {
     let event_time = event_time_column_for_keyed(keyed)?;
     let lag = keyed.watermark_spec().map(WatermarkSpec::lag_ms).unwrap_or(0);
-    Ok(LocalWindowExecutionSpec {
+    let mut spec = LocalWindowExecutionSpec {
         key_column: keyed.key_column.clone(),
         event_time_column: event_time,
         watermark_lag_ms: lag,
@@ -1119,7 +1217,11 @@ fn build_tumbling_spec(
         window_size_ms,
         agg_exprs,
         state_ttl_ms: keyed.inner.state_ttl_ms,
-    })
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+    };
+    apply_multi_source_watermark(keyed, &mut spec);
+    Ok(spec)
 }
 
 fn execute_windowed_inner(
@@ -1279,7 +1381,7 @@ impl SessionWindowedStream {
             .watermark_spec()
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
-        let spec = LocalWindowExecutionSpec {
+        let mut spec = LocalWindowExecutionSpec {
             key_column: self.keyed.key_column.clone(),
             event_time_column: event_time,
             watermark_lag_ms: lag,
@@ -1289,7 +1391,10 @@ impl SessionWindowedStream {
             window_size_ms: self.session_gap_ms,
             agg_exprs,
             state_ttl_ms: self.keyed.inner.state_ttl_ms,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         };
+        apply_multi_source_watermark(&self.keyed, &mut spec);
         execute_windowed_inner(&self.keyed.inner, spec)
     }
 }
@@ -1308,7 +1413,7 @@ impl SlidingWindowedStream {
             .watermark_spec()
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
-        let spec = LocalWindowExecutionSpec {
+        let mut spec = LocalWindowExecutionSpec {
             key_column: self.keyed.key_column.clone(),
             event_time_column: event_time,
             watermark_lag_ms: lag,
@@ -1318,7 +1423,10 @@ impl SlidingWindowedStream {
             window_size_ms: self.window_size_ms,
             agg_exprs,
             state_ttl_ms: self.keyed.inner.state_ttl_ms,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         };
+        apply_multi_source_watermark(&self.keyed, &mut spec);
         execute_windowed_inner(&self.keyed.inner, spec)
     }
 }
@@ -1394,9 +1502,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DataType, ExecutionMode, Field, KrishivError, RecordBatch, Schema, Session, SessionBuilder,
-        StreamBatch,
+        DataType, ExecutionMode, Field, KrishivError, LocalWindowKind, RecordBatch, Schema,
+        Session, SessionBuilder, StreamBatch,
     };
+    use std::collections::HashMap;
 
     // ── P0.3 regression: block_on must reuse the current runtime ────────────────
 
@@ -1989,5 +2098,83 @@ mod tests {
             session.coordinator_url.as_deref(),
             Some("http://coord:50051")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_session_sql_collects_via_local_coordinator() {
+        let session = Session::builder()
+            .with_coordinator("http://127.0.0.1:50051")
+            .build()
+            .unwrap();
+        let df = session.sql_async("SELECT 3 AS n").await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continuous_stream_job_poll_drains_via_coordinator() {
+        use krishiv_runtime::LocalWindowExecutionSpec;
+
+        let session = Session::builder().build().unwrap();
+        let spec = LocalWindowExecutionSpec {
+            key_column: "user_id".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: LocalWindowKind::Tumbling,
+            window_size_ms: 10_000,
+            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+        };
+        session.submit_stream_job("events", spec).expect("submit");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        session
+            .push_stream_job_input("events", vec![batch])
+            .expect("push");
+        let _ = session.poll_stream_job("events").await.expect("poll");
+    }
+
+    #[test]
+    fn multi_source_watermark_window_collect_with_source_column() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("source_id", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+                Arc::new(StringArray::from(vec!["src-a"])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .with_multi_source_watermark(
+                MultiSourceWatermarkSpec::new()
+                    .source("src-a", WatermarkSpec::fixed_lag_ms(0))
+                    .source("src-b", WatermarkSpec::fixed_lag_ms(0)),
+            )
+            .tumbling_window(10_000)
+            .collect()
+            .expect("multi-source collect");
+        assert!(!out.is_empty());
     }
 }

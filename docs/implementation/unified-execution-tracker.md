@@ -11,6 +11,10 @@
 - [x] Python `stream_exec` uses `execution_runtime()`
 - [x] `krishiv local start|stop|status`
 - [x] `Session::submit_stream_job` for continuous jobs (plan acceptance)
+- [x] **Follow-up:** Batch SQL via coordinator (`collect_batch_sql` / `sql:` tasks)
+- [x] **Follow-up:** Distributed `Session.sql()` + Flight full result drain
+- [x] **Follow-up:** Continuous streaming drain (`stream:continuous:`, `poll_stream_job`)
+- [x] **Follow-up:** Multi-source watermark in `execute_bounded_window`
 - [x] Tests: sliding/session windows, coordinator reuse, fragment roundtrip
 
 ## Validation

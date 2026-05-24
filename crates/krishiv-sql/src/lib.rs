@@ -323,14 +323,14 @@ impl SqlEngine {
                 .context
                 .sql("SELECT * FROM _krishiv_merge_result")
                 .await?;
-            return Ok(SqlDataFrame::new("merge", dataframe));
+            return Ok(SqlDataFrame::new("merge", dataframe).with_query(query));
         }
 
         let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query)
             .map_err(|e| SqlError::DataFusion { message: e })?;
         lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;
         let dataframe = self.context.sql(&rewritten).await?;
-        Ok(SqlDataFrame::new("sql-query", dataframe))
+        Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten))
     }
 
     /// Execute `query` with materialized view cache lookup.
@@ -382,6 +382,7 @@ fn extract_simple_view_name(query: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct SqlDataFrame {
     name: String,
+    query: Option<String>,
     dataframe: DataFusionDataFrame,
 }
 
@@ -389,8 +390,19 @@ impl SqlDataFrame {
     fn new(name: impl Into<String>, dataframe: DataFusionDataFrame) -> Self {
         Self {
             name: name.into(),
+            query: None,
             dataframe,
         }
+    }
+
+    fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    /// Original SQL query when created from [`SqlEngine::sql`].
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
     }
 
     /// Create a Krishiv logical plan wrapper for this DataFrame.

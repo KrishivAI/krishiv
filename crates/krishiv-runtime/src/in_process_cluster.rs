@@ -23,6 +23,39 @@ impl InProcessCluster {
         })
     }
 
+    /// Execute batch SQL via coordinator → executor (`sql:` task).
+    pub fn collect_batch_sql(
+        &self,
+        query: &str,
+        tables: &[crate::in_process::BatchSqlTable],
+    ) -> RuntimeResult<Vec<RecordBatch>> {
+        self.inner.execute_batch_sql(query, tables)
+    }
+
+    /// Register a continuous streaming job.
+    pub fn register_continuous_job(
+        &self,
+        job_id: &str,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<()> {
+        self.inner
+            .register_continuous_job(job_id, local_spec_to_plan_spec(spec))
+    }
+
+    /// Push input for a continuous job.
+    pub fn push_continuous_input(
+        &self,
+        job_id: &str,
+        batches: Vec<RecordBatch>,
+    ) -> RuntimeResult<()> {
+        self.inner.push_continuous_input(job_id, batches)
+    }
+
+    /// Drain a continuous job through the coordinator.
+    pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        self.inner.drain_continuous_job(job_id)
+    }
+
     /// Execute a bounded windowed stream through coordinator → executor.
     pub fn collect_bounded_window(
         &self,
@@ -82,6 +115,8 @@ pub(crate) fn local_spec_to_plan_spec(spec: &LocalWindowExecutionSpec) -> Window
             })
             .collect(),
         state_ttl_ms: spec.state_ttl_ms,
+        source_watermark_lags: spec.source_watermark_lags.clone(),
+        source_id_column: spec.source_id_column.clone(),
     }
 }
 
@@ -124,10 +159,10 @@ pub(crate) fn plan_spec_to_local(spec: &WindowExecutionSpec) -> LocalWindowExecu
             })
             .collect(),
         state_ttl_ms: spec.state_ttl_ms,
+        source_watermark_lags: spec.source_watermark_lags.clone(),
+        source_id_column: spec.source_id_column.clone(),
     }
 }
-
-/// Encode fragment for coordinator submission from a local window spec.
 pub fn fragment_from_local_spec(spec: &LocalWindowExecutionSpec) -> String {
     encode_stream_fragment(&local_spec_to_plan_spec(spec))
 }
@@ -173,6 +208,8 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
         };
         let cluster = InProcessCluster::new().expect("cluster");
         let out = cluster

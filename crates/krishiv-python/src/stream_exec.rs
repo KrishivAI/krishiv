@@ -93,6 +93,8 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         window_size_ms: window.size_ms,
         agg_exprs,
         state_ttl_ms,
+        source_watermark_lags: std::collections::HashMap::new(),
+        source_id_column: None,
     };
     let input = resolve_input_batches(pipeline).map_err(map_krishiv_error)?;
     let topic = pipeline

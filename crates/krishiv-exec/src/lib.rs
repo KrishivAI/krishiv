@@ -144,6 +144,7 @@ pub mod temporal_join;
 #[cfg(test)]
 pub mod watermark_e2e;
 pub mod operator_runtime;
+pub mod continuous;
 pub mod window;
 
 pub use chunk::ChunkOperator;
@@ -164,6 +165,7 @@ pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
 pub use operator_runtime::{
     execute_bounded_window, local_spec_to_window_execution, LocalWindowKindBridge,
 };
+pub use continuous::ContinuousWindowExecutor;
 pub use window::{
     MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
     SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,

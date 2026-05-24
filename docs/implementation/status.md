@@ -36,6 +36,17 @@
 - **GAP-CI1/CI2:** GitHub Actions CI workflow and PR template.
 - **GAP-B1:** `rust-version = "1.92"` in workspace `Cargo.toml`.
 
+### Follow-up slice (same PR, 2026-05-24)
+
+- **Batch through coordinator:** `DataFrame.collect_async()` routes SQL via `ExecutionRuntime::collect_batch_sql` → `sql:` executor tasks; batches returned in `ExecutorTaskOutput`.
+- **Distributed `Session.sql()`:** Removed `ensure_local_mode` from SQL/register paths; distributed collect uses in-process coordinator fallback + Flight SQL full drain (`execute_remote_sql`).
+- **Continuous streaming:** `stream:continuous:{job_id}` executor fragment + `ContinuousStreamRegistry`; `submit_stream_job(name, spec)`, `push_stream_job_input`, `poll_stream_job`.
+- **Multi-source watermark:** `MultiSourceWatermarkSpec` → `WindowExecutionSpec.source_watermark_lags` wired in `execute_bounded_window`.
+
+```bash
+cargo +stable test -p krishiv-plan -p krishiv-exec -p krishiv-runtime -p krishiv-executor -p krishiv-api --lib
+```
+
 ### Validation (2026-05-24, ADR-12.4 branch)
 
 ```bash

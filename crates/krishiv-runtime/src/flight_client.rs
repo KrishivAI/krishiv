@@ -52,12 +52,20 @@ async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlService
 
 /// Submit `plan` to the remote Flight SQL endpoint and drain the result stream to confirm acceptance.
 pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> RuntimeResult<()> {
+    let _ = execute_remote_sql(flight_url, &plan_to_sql(plan)).await?;
+    Ok(())
+}
+
+/// Execute SQL remotely via Flight and return all result batches.
+pub async fn execute_remote_sql(
+    flight_url: &str,
+    sql: &str,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     let endpoint = normalize_flight_endpoint(flight_url)?;
     let mut client = connect_flight_client(&endpoint).await?;
-    let sql = plan_to_sql(plan);
 
     let flight_info = client
-        .execute(sql, None)
+        .execute(sql.to_string(), None)
         .await
         .map_err(|e| RuntimeError::transport(format!("flight execute failed: {e}")))?;
 
@@ -74,14 +82,15 @@ pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> Runti
         .await
         .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
 
-    // Drain at least one FlightData chunk so we know the remote executed the statement.
-    if stream.try_next().await.is_err() {
-        return Err(RuntimeError::transport(
-            "flight result stream ended before first batch",
-        ));
+    let mut batches = Vec::new();
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
+    {
+        batches.push(batch);
     }
-
-    Ok(())
+    Ok(batches)
 }
 
 #[cfg(test)]

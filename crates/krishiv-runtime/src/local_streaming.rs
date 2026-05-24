@@ -25,6 +25,10 @@ pub struct LocalWindowExecutionSpec {
     pub window_size_ms: u64,
     pub agg_exprs: Vec<AggExpr>,
     pub state_ttl_ms: Option<u64>,
+    /// Per-source watermark lags (R5.2). Effective watermark is the minimum across sources.
+    pub source_watermark_lags: std::collections::HashMap<String, u64>,
+    /// Source id column required when `source_watermark_lags` is non-empty.
+    pub source_id_column: Option<String>,
 }
 
 impl LocalWindowExecutionSpec {
@@ -85,6 +89,8 @@ mod tests {
             window_size_ms: 10_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
         };
         let out =
             execute_windowed_stream(vec![events_batch()], &spec).expect("execute_windowed_stream");
@@ -101,6 +107,8 @@ mod tests {
             window_size_ms: 5_000,
             agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
         };
         let out = execute_windowed_stream(vec![events_batch()], &spec).expect("session");
         assert!(!out.is_empty());

@@ -1,10 +1,12 @@
 //! Unified execution runtime across Embedded, SingleNode, and Distributed modes.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
+use crate::in_process::BatchSqlTable;
 use crate::in_process_cluster::InProcessCluster;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{
@@ -38,6 +40,22 @@ pub enum RuntimeMode {
     Distributed,
 }
 
+/// Parquet table forwarded to executor SQL tasks during batch collect.
+#[derive(Debug, Clone)]
+pub struct BatchTableRegistration {
+    pub table_name: String,
+    pub path: PathBuf,
+}
+
+impl BatchTableRegistration {
+    pub fn new(table_name: impl Into<String>, path: PathBuf) -> Self {
+        Self {
+            table_name: table_name.into(),
+            path,
+        }
+    }
+}
+
 /// Unified runtime API for batch plan acceptance and bounded streaming collect.
 pub trait ExecutionRuntime: Send + Sync {
     /// Execution mode label for telemetry.
@@ -54,10 +72,44 @@ pub trait ExecutionRuntime: Send + Sync {
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>>;
 
+    /// Execute batch SQL through coordinator/Flight and return all result batches.
+    fn collect_batch_sql(
+        &self,
+        query: &str,
+        tables: &[BatchTableRegistration],
+    ) -> RuntimeResult<Vec<RecordBatch>>;
+
+    /// Register a continuous streaming job (long-running operator).
+    fn register_continuous_stream(
+        &self,
+        job_id: &str,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<()>;
+
+    /// Push input batches to a continuous streaming job.
+    fn push_continuous_stream_input(
+        &self,
+        job_id: &str,
+        batches: Vec<RecordBatch>,
+    ) -> RuntimeResult<()>;
+
+    /// Drain newly emitted batches from a continuous streaming job.
+    fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>>;
+
     /// Optional remote Flight URL (distributed / single-node daemon).
     fn flight_url(&self) -> Option<&str> {
         None
     }
+}
+
+fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {
+    tables
+        .iter()
+        .map(|t| BatchSqlTable {
+            table_name: t.table_name.clone(),
+            path: t.path.clone(),
+        })
+        .collect()
 }
 
 /// In-process cluster runtime for Embedded and auto-start SingleNode.
@@ -116,6 +168,35 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
         self.cluster
             .collect_bounded_window(topic, input_batches, spec)
     }
+
+    fn collect_batch_sql(
+        &self,
+        query: &str,
+        tables: &[BatchTableRegistration],
+    ) -> RuntimeResult<Vec<RecordBatch>> {
+        self.cluster
+            .collect_batch_sql(query, &tables_to_batch_sql(tables))
+    }
+
+    fn register_continuous_stream(
+        &self,
+        job_id: &str,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<()> {
+        self.cluster.register_continuous_job(job_id, spec)
+    }
+
+    fn push_continuous_stream_input(
+        &self,
+        job_id: &str,
+        batches: Vec<RecordBatch>,
+    ) -> RuntimeResult<()> {
+        self.cluster.push_continuous_input(job_id, batches)
+    }
+
+    fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        self.cluster.drain_continuous_job(job_id)
+    }
 }
 
 /// Distributed / remote-cluster runtime (Flight SQL + optional in-process fallback for tests).
@@ -158,11 +239,60 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         if let Some(cluster) = &self.local_fallback {
             return cluster.collect_bounded_window(topic, input_batches, spec);
         }
-        // Direct operator execution when no remote streaming job API is configured.
         use krishiv_exec::execute_bounded_window;
         use crate::in_process_cluster::local_spec_to_plan_spec;
         execute_bounded_window(input_batches, &local_spec_to_plan_spec(spec))
             .map_err(|e| RuntimeError::transport(e.to_string()))
+    }
+
+    fn collect_batch_sql(
+        &self,
+        query: &str,
+        tables: &[BatchTableRegistration],
+    ) -> RuntimeResult<Vec<RecordBatch>> {
+        if let Some(cluster) = &self.local_fallback {
+            return cluster.collect_batch_sql(query, &tables_to_batch_sql(tables));
+        }
+        use krishiv_async_util::block_on;
+        block_on(crate::flight_client::execute_remote_sql(
+            &self.flight_url,
+            query,
+        ))
+    }
+
+    fn register_continuous_stream(
+        &self,
+        job_id: &str,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<()> {
+        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
+            RuntimeError::unsupported(
+                "continuous streaming requires a local cluster fallback in distributed mode",
+            )
+        })?;
+        cluster.register_continuous_job(job_id, spec)
+    }
+
+    fn push_continuous_stream_input(
+        &self,
+        job_id: &str,
+        batches: Vec<RecordBatch>,
+    ) -> RuntimeResult<()> {
+        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
+            RuntimeError::unsupported(
+                "continuous streaming requires a local cluster fallback in distributed mode",
+            )
+        })?;
+        cluster.push_continuous_input(job_id, batches)
+    }
+
+    fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
+            RuntimeError::unsupported(
+                "continuous streaming requires a local cluster fallback in distributed mode",
+            )
+        })?;
+        cluster.drain_continuous_job(job_id)
     }
 
     fn flight_url(&self) -> Option<&str> {

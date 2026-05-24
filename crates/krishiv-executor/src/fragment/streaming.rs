@@ -7,6 +7,7 @@ use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
+const STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
 
 fn parsed_to_plan_spec(parsed: krishiv_plan::window::ParsedStreamFragment) -> WindowExecutionSpec {
     let (slide_ms, session_gap_ms) = match parsed.window_kind {
@@ -24,6 +25,8 @@ fn parsed_to_plan_spec(parsed: krishiv_plan::window::ParsedStreamFragment) -> Wi
         session_gap_ms,
         agg_exprs: vec![parsed.agg],
         state_ttl_ms: parsed.ttl_ms,
+        source_watermark_lags: std::collections::HashMap::new(),
+        source_id_column: None,
     }
 }
 
@@ -146,10 +149,39 @@ fn parse_stream_kafka_partitions(
 
 /// Execute a bounded streaming window fragment (tumbling, sliding, or session).
 pub(crate) async fn execute_streaming_fragment(
-    _runner: &ExecutorTaskRunner,
+    runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment = assignment.plan_fragment().description().trim();
+
+    if let Some(job_id) = fragment.strip_prefix(STREAM_CONTINUOUS_PREFIX) {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return Err(ExecutorError::InvalidAssignment {
+                message: String::from("stream:continuous fragment requires a job id"),
+            });
+        }
+        let drainer = runner.continuous_drainer.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidAssignment {
+                message: String::from(
+                    "stream:continuous fragment requires a continuous drainer on the executor runner",
+                ),
+            }
+        })?;
+        let collected_batches = drainer
+            .drain_job(job_id)
+            .map_err(|message| ExecutorError::LocalExecution { message })?;
+        let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
+        let total_batches = collected_batches.len();
+        let column_count = collected_batches.first().map(|b| b.num_columns()).unwrap_or(0);
+        return Ok(ExecutorTaskOutput::streaming_window(
+            total_rows,
+            total_batches,
+            column_count,
+            collected_batches,
+        ));
+    }
+
     let parsed = parse_stream_fragment(fragment).map_err(|e| ExecutorError::InvalidAssignment {
         message: e,
     })?;
