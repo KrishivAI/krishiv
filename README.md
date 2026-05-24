@@ -1,3 +1,5 @@
+![Krishiv logo](docs/assets/krishiv-logo.svg)
+
 # Krishiv
 
 Krishiv is a Rust-native hybrid compute framework for **batch SQL**, **stateful streaming**, and **lakehouse pipelines**.
