@@ -271,6 +271,24 @@ impl PySession {
         crate::live_table::create_live_table(name, query)
     }
 
+    /// Create a [`PyStream`] backed by in-memory batches (supports windowed `collect()` / `async for`).
+    #[pyo3(signature = (name, batches, watermark_column, max_lateness_ms))]
+    pub fn memory_stream(
+        &self,
+        name: String,
+        batches: Vec<PyBatch>,
+        watermark_column: String,
+        max_lateness_ms: u64,
+    ) -> PyResult<PyStream> {
+        PyStream::from_memory(
+            self.inner.clone(),
+            name,
+            watermark_column,
+            max_lateness_ms,
+            batches,
+        )
+    }
+
     pub fn memory_stream_collect(
         &self,
         py: Python<'_>,

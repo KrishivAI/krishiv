@@ -105,7 +105,7 @@ pub(crate) fn compare_key_parts(ai: &str, bi: &str) -> std::cmp::Ordering {
 
 /// Serialize a single row value from the given column to a `String` for use as
 /// a hash-map key.  Supported types: `Int32`, `Int64`, `Utf8`.
-pub(crate) fn format_key_value(
+pub fn format_key_value(
     batch: &RecordBatch,
     col_idx: usize,
     row: usize,

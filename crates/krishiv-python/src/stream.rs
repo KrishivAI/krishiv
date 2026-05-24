@@ -49,6 +49,31 @@ impl PyStream {
     pub fn from_pipeline_struct(pipeline: StreamPipeline) -> Self {
         Self { pipeline }
     }
+
+    /// Build a stream from session-registered memory batches (`memory:<name>` source).
+    pub fn from_memory(
+        session: std::sync::Arc<krishiv_api::Session>,
+        name: String,
+        watermark_column: String,
+        max_lateness_ms: u64,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<Self> {
+        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
+            .iter()
+            .map(|b| b.record_batch().clone())
+            .collect();
+        session
+            .register_memory_stream(&name, record_batches)
+            .map_err(crate::errors::map_krishiv_error)?;
+        Ok(Self {
+            pipeline: StreamPipeline::new(
+                session,
+                format!("memory:{name}"),
+                watermark_column,
+                max_lateness_ms,
+            ),
+        })
+    }
 }
 
 #[pymethods]

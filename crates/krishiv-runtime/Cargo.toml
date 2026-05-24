@@ -8,11 +8,16 @@ license.workspace = true
 [dependencies]
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-exec = { path = "../krishiv-exec" }
+krishiv-executor = { path = "../krishiv-executor" }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-state = { path = "../krishiv-state" }
+krishiv-proto = { path = "../krishiv-proto" }
 krishiv-async-util = { path = "../krishiv-async-util" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

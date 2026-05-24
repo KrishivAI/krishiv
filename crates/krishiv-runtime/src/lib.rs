@@ -12,9 +12,12 @@ use std::fmt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
 mod flight_client;
+pub mod in_process;
 pub mod local_streaming;
 mod plan;
+pub mod stream_kafka;
 
+pub use in_process::{InProcessStreamingRuntime, execute_windowed_in_process};
 pub use local_streaming::{
     LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream,
 };
