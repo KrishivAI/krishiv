@@ -11,8 +11,9 @@ pub struct LlmRateLimiter {
     last_refill_ms: Option<u64>,
 }
 
-static GLOBAL_LIMITERS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<LlmRateLimiter>>>>> =
-    OnceLock::new();
+static GLOBAL_LIMITERS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<LlmRateLimiter>>>>,
+> = OnceLock::new();
 
 impl LlmRateLimiter {
     /// Create a new limiter from config.
@@ -27,7 +28,8 @@ impl LlmRateLimiter {
 
     /// Process-wide singleton per model name.
     pub fn for_model(model: &str, config: RateLimitConfig) -> Arc<tokio::sync::Mutex<Self>> {
-        let map = GLOBAL_LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let map =
+            GLOBAL_LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut guard = map.lock().unwrap_or_else(|e| {
             tracing::error!("LLM rate limiter map lock poisoned: {e}");
             e.into_inner()
@@ -50,10 +52,10 @@ impl LlmRateLimiter {
             let elapsed = now.saturating_sub(last);
             let req_rate = self.config.requests_per_minute as f64 / 60_000.0;
             let tok_rate = self.config.tokens_per_minute as f64 / 60_000.0;
-            self.request_tokens =
-                (self.request_tokens + elapsed as f64 * req_rate).min(self.config.requests_per_minute as f64);
-            self.token_tokens =
-                (self.token_tokens + elapsed as f64 * tok_rate).min(self.config.tokens_per_minute as f64);
+            self.request_tokens = (self.request_tokens + elapsed as f64 * req_rate)
+                .min(self.config.requests_per_minute as f64);
+            self.token_tokens = (self.token_tokens + elapsed as f64 * tok_rate)
+                .min(self.config.tokens_per_minute as f64);
         }
         self.last_refill_ms = Some(now);
     }

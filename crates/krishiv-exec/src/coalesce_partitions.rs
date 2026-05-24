@@ -1,6 +1,5 @@
 //! Coalesce N input partition batches into fewer output batches (P2-4).
 
-use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -26,8 +25,8 @@ pub fn coalesce_partition_batches(
         if chunk.len() == 1 {
             outputs.push(chunk[0].clone());
         } else {
-            let merged = concat_batches(&schema, chunk)
-                .map_err(|e| ExecError::Arrow(e.to_string()))?;
+            let merged =
+                concat_batches(&schema, chunk).map_err(|e| ExecError::Arrow(e.to_string()))?;
             outputs.push(merged);
         }
     }

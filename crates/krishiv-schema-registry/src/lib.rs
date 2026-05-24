@@ -3,11 +3,11 @@
 
 use std::sync::Arc;
 
-use apache_avro::types::Value;
 use apache_avro::Reader;
+use apache_avro::types::Value;
 use arrow::array::{Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -85,7 +85,9 @@ impl SchemaRegistryClient {
             .await
             .map_err(|e| SchemaRegistryError::Http(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(SchemaRegistryError::Http(resp.text().await.unwrap_or_default()));
+            return Err(SchemaRegistryError::Http(
+                resp.text().await.unwrap_or_default(),
+            ));
         }
         #[derive(serde::Deserialize)]
         struct Body {
@@ -144,8 +146,8 @@ pub struct JsonSchemaDeserializer;
 #[async_trait]
 impl KafkaDeserializer for JsonSchemaDeserializer {
     async fn decode(&self, payload: &[u8]) -> SchemaRegistryResult<RecordBatch> {
-        let text = std::str::from_utf8(payload)
-            .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
+        let text =
+            std::str::from_utf8(payload).map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
         json_payload_batch(text)
     }
 
@@ -188,7 +190,8 @@ fn avro_value_to_batch(value: &Value) -> SchemaRegistryResult<RecordBatch> {
             let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
             for (name, v) in fields {
                 names.push(Field::new(name, DataType::Utf8, true));
-                arrays.push(Arc::new(StringArray::from(vec![format!("{v:?}")])) as Arc<dyn arrow::array::Array>);
+                arrays.push(Arc::new(StringArray::from(vec![format!("{v:?}")]))
+                    as Arc<dyn arrow::array::Array>);
             }
             let schema = Arc::new(Schema::new(names));
             RecordBatch::try_new(schema, arrays)

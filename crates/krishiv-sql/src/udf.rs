@@ -5,9 +5,9 @@ use std::sync::Arc;
 use arrow::array::RecordBatchOptions;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion::logical_expr::ColumnarValue;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{create_udf, Volatility};
+use datafusion::logical_expr::ColumnarValue;
+use datafusion::logical_expr::{Volatility, create_udf};
 
 /// Register every scalar UDF in `registry` with the DataFusion session context.
 pub fn sync_scalar_udfs(
@@ -84,12 +84,14 @@ fn columnar_values_to_record_batch(
     values: &[ColumnarValue],
 ) -> Result<RecordBatch, DataFusionError> {
     if values.len() != schema.fields().len() {
-        return Err(DataFusionError::External(format!(
-            "expected {} arguments, got {}",
-            schema.fields().len(),
-            values.len()
-        )
-        .into()));
+        return Err(DataFusionError::External(
+            format!(
+                "expected {} arguments, got {}",
+                schema.fields().len(),
+                values.len()
+            )
+            .into(),
+        ));
     }
 
     let num_rows = values
@@ -106,13 +108,15 @@ fn columnar_values_to_record_batch(
         let array = match value {
             ColumnarValue::Array(a) => {
                 if a.len() != num_rows {
-                    return Err(DataFusionError::External(format!(
-                        "column '{}' length {} does not match batch length {}",
-                        field.name(),
-                        a.len(),
-                        num_rows
-                    )
-                    .into()));
+                    return Err(DataFusionError::External(
+                        format!(
+                            "column '{}' length {} does not match batch length {}",
+                            field.name(),
+                            a.len(),
+                            num_rows
+                        )
+                        .into(),
+                    ));
                 }
                 Arc::clone(a)
             }

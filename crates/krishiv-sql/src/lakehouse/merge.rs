@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use regex::Regex;
@@ -115,7 +115,7 @@ async fn merge_iceberg_memory(
     ctx: &SessionContext,
     target: &str,
     mut source_batches: Vec<RecordBatch>,
-    merge_key: &str,
+    _merge_key: &str,
 ) -> SqlResult<MergeResult> {
     let table = target.trim_start_matches("iceberg:");
     let existing = ctx
@@ -140,7 +140,11 @@ async fn merge_iceberg_memory(
 }
 
 fn merge_result_batch(result: krishiv_lakehouse::MergeDeltaResult) -> RecordBatch {
-    merge_metrics_batch(result.rows_inserted, result.rows_updated, result.rows_deleted)
+    merge_metrics_batch(
+        result.rows_inserted,
+        result.rows_updated,
+        result.rows_deleted,
+    )
 }
 
 fn merge_metrics_batch(inserted: u64, updated: u64, deleted: u64) -> RecordBatch {

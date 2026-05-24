@@ -14,10 +14,20 @@ pub struct DataSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
 pub enum ChunkerConfig {
-    RecursiveText { chunk_size: usize, overlap: usize },
-    Sentence { max_sentences: usize },
-    TokenAware { max_tokens: usize, tokenizer: String },
-    MarkdownSection { min_level: u8 },
+    RecursiveText {
+        chunk_size: usize,
+        overlap: usize,
+    },
+    Sentence {
+        max_sentences: usize,
+    },
+    TokenAware {
+        max_tokens: usize,
+        tokenizer: String,
+    },
+    MarkdownSection {
+        min_level: u8,
+    },
 }
 
 /// Embedder configuration.

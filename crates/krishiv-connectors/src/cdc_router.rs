@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use krishiv_lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
 
-use crate::cdc::{CdcEvent, CdcEventSource, CdcOp};
 use crate::ConnectorError;
+use crate::cdc::{CdcEvent, CdcEventSource, CdcOp};
 
 /// Routes CDC events from one source to per-table delta stores.
 pub struct CdcRouter {
@@ -43,10 +43,9 @@ impl CdcRouter {
     }
 
     pub fn route_event(&self, event: &CdcEvent) -> Result<(), ConnectorError> {
-        let route = self
-            .routes
-            .get(&event.table)
-            .ok_or_else(|| ConnectorError::Cdc(format!("no live table route for {}", event.table)))?;
+        let route = self.routes.get(&event.table).ok_or_else(|| {
+            ConnectorError::Cdc(format!("no live table route for {}", event.table))
+        })?;
         let mut guard = route
             .lock()
             .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?;
@@ -128,11 +127,8 @@ mod tests {
 
     fn event(table: &str, id: &str, op: CdcOp) -> CdcEvent {
         let s = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
-        let batch = RecordBatch::try_new(
-            s,
-            vec![Arc::new(StringArray::from(vec![Some(id)]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(s, vec![Arc::new(StringArray::from(vec![Some(id)]))]).unwrap();
         CdcEvent {
             op,
             before: None,
@@ -151,9 +147,15 @@ mod tests {
         for table in ["orders", "products", "customers"] {
             router.register_table(table, schema(), None);
         }
-        router.route_event(&event("orders", "1", CdcOp::Insert)).unwrap();
-        router.route_event(&event("products", "2", CdcOp::Insert)).unwrap();
-        router.route_event(&event("customers", "3", CdcOp::Insert)).unwrap();
+        router
+            .route_event(&event("orders", "1", CdcOp::Insert))
+            .unwrap();
+        router
+            .route_event(&event("products", "2", CdcOp::Insert))
+            .unwrap();
+        router
+            .route_event(&event("customers", "3", CdcOp::Insert))
+            .unwrap();
         assert_eq!(router.table_count(), 3);
     }
 

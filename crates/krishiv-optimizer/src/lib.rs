@@ -320,8 +320,7 @@ impl CoalesceRule {
             return 1;
         }
         // ceiling division
-        total_bytes.div_ceil(self.target_partition_bytes)
-            .max(1) as usize
+        total_bytes.div_ceil(self.target_partition_bytes).max(1) as usize
     }
 }
 

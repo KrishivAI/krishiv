@@ -1,11 +1,11 @@
 //! Exactly-once certification matrix tests (R16 S5).
 
 use arrow::array::{Int32Array, RecordBatch};
-use krishiv_connectors::Offset;
 use arrow::datatypes::{DataType, Field, Schema};
+use krishiv_connectors::Offset;
 use krishiv_connectors::{
-    transactional_kafka::TransactionalKafkaSink, two_phase_parquet_s3::TwoPhaseParquetSink,
-    TwoPhaseCommitSink,
+    TwoPhaseCommitSink, transactional_kafka::TransactionalKafkaSink,
+    two_phase_parquet_s3::TwoPhaseParquetSink,
 };
 use std::sync::Arc;
 use tempfile::tempdir;

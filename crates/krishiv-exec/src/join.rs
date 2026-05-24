@@ -23,7 +23,7 @@ pub(crate) enum AggKey {
 
 impl AggKey {
     pub(crate) fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
+        
         match (self, other) {
             (Self::Int32(a), Self::Int32(b)) => a.cmp(b),
             (Self::Int64(a), Self::Int64(b)) => a.cmp(b),
@@ -95,6 +95,7 @@ pub(crate) fn extract_agg_key(
 /// lexicographic tiebreaker (`ai.cmp(bi)`) ensures that distinct
 /// representations of the same integer (e.g. `"1"` vs `"01"`) still produce a
 /// stable, deterministic sort order across runs.
+#[allow(dead_code)]
 pub(crate) fn compare_key_parts(ai: &str, bi: &str) -> std::cmp::Ordering {
     match (ai.parse::<i64>(), bi.parse::<i64>()) {
         (Ok(an), Ok(bn)) => an.cmp(&bn).then_with(|| ai.cmp(bi)),

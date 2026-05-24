@@ -20,14 +20,7 @@ fn make_bid_batch(n: usize) -> RecordBatch {
     ]));
     let auction: UInt64Array = (0..n as u64).map(|i| i % 10_000).collect();
     let price: UInt64Array = (0..n as u64).map(|i| 100 + (i % 900)).collect();
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(auction) as _,
-            Arc::new(price) as _,
-        ],
-    )
-    .unwrap()
+    RecordBatch::try_new(schema, vec![Arc::new(auction) as _, Arc::new(price) as _]).unwrap()
 }
 
 fn make_auction_batch(n: usize) -> RecordBatch {
@@ -37,11 +30,7 @@ fn make_auction_batch(n: usize) -> RecordBatch {
     ]));
     let id: UInt64Array = (0..n as u64).collect();
     let category: UInt64Array = (0..n as u64).map(|i| i % 100).collect();
-    RecordBatch::try_new(
-        schema,
-        vec![Arc::new(id) as _, Arc::new(category) as _],
-    )
-    .unwrap()
+    RecordBatch::try_new(schema, vec![Arc::new(id) as _, Arc::new(category) as _]).unwrap()
 }
 
 fn make_person_batch(n: usize) -> RecordBatch {
@@ -51,11 +40,7 @@ fn make_person_batch(n: usize) -> RecordBatch {
     ]));
     let id: UInt64Array = (0..n as u64).collect();
     let region: Int64Array = (0..n as i64).map(|i| i % 10).collect();
-    RecordBatch::try_new(
-        schema,
-        vec![Arc::new(id) as _, Arc::new(region) as _],
-    )
-    .unwrap()
+    RecordBatch::try_new(schema, vec![Arc::new(id) as _, Arc::new(region) as _]).unwrap()
 }
 
 async fn register_nexmark_tables(engine: &SqlEngine, n: usize) {

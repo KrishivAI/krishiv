@@ -69,12 +69,16 @@ impl IcebergTwoPhaseCommit for MemoryIcebergTwoPhaseCommit {
     ) -> Result<i64, LakehouseError> {
         self.table.append(staged.batches).await?;
         *self.committed_offsets.lock().await = kafka_offsets;
-        self.staged.lock().await.retain(|s| s.snapshot_id != staged.snapshot_id);
-        self.table.current_snapshot_id().await?.ok_or_else(|| {
-            LakehouseError::Concurrency {
+        self.staged
+            .lock()
+            .await
+            .retain(|s| s.snapshot_id != staged.snapshot_id);
+        self.table
+            .current_snapshot_id()
+            .await?
+            .ok_or_else(|| LakehouseError::Concurrency {
                 message: "snapshot missing after commit".to_string(),
-            }
-        })
+            })
     }
 
     async fn abort(&self, staged: StagedSnapshot) -> Result<(), LakehouseError> {

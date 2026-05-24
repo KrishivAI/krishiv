@@ -92,6 +92,7 @@ impl SequentialPatternMatcher {
     }
 }
 
+#[allow(dead_code)] // compiled with workspace; integration lands in streaming exec path
 /// Partitioned wrapper routing events to per-key [`SequentialPatternMatcher`] instances (P3-27).
 #[derive(Debug, Clone)]
 pub struct PartitionedCepMatcher<K>
@@ -126,7 +127,9 @@ where
                 CepKeyState::default(),
             )
         });
-        entry.0.process_event(&mut entry.1, stage_name, batch, event_time_ms)
+        entry
+            .0
+            .process_event(&mut entry.1, stage_name, batch, event_time_ms)
     }
 }
 
@@ -156,7 +159,11 @@ mod tests {
             .unwrap();
         let matcher = SequentialPatternMatcher::new(pattern);
         let mut state = CepKeyState::default();
-        assert!(matcher.process_event(&mut state, "a", batch(1), 100).is_empty());
+        assert!(
+            matcher
+                .process_event(&mut state, "a", batch(1), 100)
+                .is_empty()
+        );
         let done = matcher.process_event(&mut state, "b", batch(2), 200);
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].len(), 2);
@@ -172,6 +179,10 @@ mod tests {
         let matcher = SequentialPatternMatcher::new(pattern);
         let mut state = CepKeyState::default();
         matcher.process_event(&mut state, "a", batch(1), 0);
-        assert!(matcher.process_event(&mut state, "b", batch(2), 100).is_empty());
+        assert!(
+            matcher
+                .process_event(&mut state, "b", batch(2), 100)
+                .is_empty()
+        );
     }
 }

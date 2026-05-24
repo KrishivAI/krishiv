@@ -4,11 +4,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::agg::descriptors_from_kwargs;
+use crate::batch::PyBatch;
 use crate::errors::SchemaError;
 use crate::pipeline::{StreamPipeline, WindowKind};
 use crate::session::PySession;
-use crate::windows::{ensure_watermark_before_window, PyWindowSpec};
-use crate::batch::PyBatch;
+use crate::windows::{PyWindowSpec, ensure_watermark_before_window};
 
 fn stream_repr(pipeline: &StreamPipeline) -> String {
     format!(
@@ -56,7 +56,9 @@ impl PyStream {
     #[pyo3(signature = (*columns))]
     pub fn key_by(&self, columns: Vec<String>) -> PyResult<PyKeyedStream> {
         if columns.is_empty() {
-            return Err(SchemaError::new_err("key_by() requires at least one column"));
+            return Err(SchemaError::new_err(
+                "key_by() requires at least one column",
+            ));
         }
         Ok(PyKeyedStream {
             pipeline: self.pipeline.with_keys(columns),
@@ -69,12 +71,14 @@ impl PyStream {
             &self.pipeline.watermark_column,
             self.pipeline.max_lateness_ms,
         )?;
-        let pipeline = self.pipeline.with_window(crate::pipeline::WindowDescriptor {
-            kind: WindowKind::Tumbling,
-            size_ms: window_ms,
-            slide_ms: None,
-            gap_ms: None,
-        });
+        let pipeline = self
+            .pipeline
+            .with_window(crate::pipeline::WindowDescriptor {
+                kind: WindowKind::Tumbling,
+                size_ms: window_ms,
+                slide_ms: None,
+                gap_ms: None,
+            });
         Ok(PyWindowedStream { pipeline })
     }
 
@@ -90,12 +94,14 @@ impl PyStream {
             self.pipeline.max_lateness_ms,
         )?;
         let window_ms = window_secs.saturating_mul(1000);
-        let pipeline = self.pipeline.with_window(crate::pipeline::WindowDescriptor {
-            kind: WindowKind::Tumbling,
-            size_ms: window_ms,
-            slide_ms: None,
-            gap_ms: None,
-        });
+        let pipeline = self
+            .pipeline
+            .with_window(crate::pipeline::WindowDescriptor {
+                kind: WindowKind::Tumbling,
+                size_ms: window_ms,
+                slide_ms: None,
+                gap_ms: None,
+            });
         Ok(PyWindowedStream { pipeline })
     }
 

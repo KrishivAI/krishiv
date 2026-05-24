@@ -61,12 +61,12 @@ impl WatermarkE2ePipeline {
 
 #[cfg(test)]
 mod tests {
-    use crate::barrier_align::BarrierAligner;
-    use std::time::Duration;
     use super::*;
+    use crate::barrier_align::BarrierAligner;
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn batch(v: i32) -> RecordBatch {
         RecordBatch::try_new(

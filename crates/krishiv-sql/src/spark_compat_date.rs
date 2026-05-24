@@ -2,7 +2,7 @@
 
 use datafusion::arrow::array::{ArrayRef, Date32Array, Int32Array};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::logical_expr::{create_udf, ColumnarValue, Volatility};
+use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
@@ -23,12 +23,7 @@ fn civil_from_days(z: i32) -> (i32, i32, i32) {
 pub fn register_spark_date_udfs(
     ctx: &SessionContext,
 ) -> Result<(), datafusion::error::DataFusionError> {
-    for (name, part) in [
-        ("year", 0i32),
-        ("month", 1),
-        ("day", 2),
-        ("quarter", 1),
-    ] {
+    for (name, part) in [("year", 0i32), ("month", 1), ("day", 2), ("quarter", 1)] {
         let part_idx = part;
         let udf = create_udf(
             name,
@@ -41,9 +36,9 @@ pub fn register_spark_date_udfs(
                     ColumnarValue::Scalar(s) => s.to_array()?,
                 };
                 let dates = arr.as_any().downcast_ref::<Date32Array>().ok_or_else(|| {
-                    datafusion::error::DataFusionError::Execution(
-                        format!("{name}: expected Date32 array"),
-                    )
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "{name}: expected Date32 array"
+                    ))
                 })?;
                 let out: Int32Array = dates
                     .iter()

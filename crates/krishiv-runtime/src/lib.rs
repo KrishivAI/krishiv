@@ -11,8 +11,30 @@ use std::fmt;
 
 use krishiv_async_util::block_on;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
+use krishiv_sql::SqlEngine;
 
 mod flight_client;
+
+fn execute_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    let sql = flight_client::plan_to_sql(plan);
+    let engine = SqlEngine::new();
+    block_on(async {
+        let df = engine
+            .sql(&sql)
+            .await
+            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+        df.collect()
+            .await
+            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+        Ok::<(), RuntimeError>(())
+    })?;
+    Ok(ExecutionReport::new(
+        backend,
+        plan.name(),
+        plan.kind(),
+        true,
+    ))
+}
 
 // tracing is used for debug-level plan delegation logging.
 use tracing::debug;
@@ -309,21 +331,14 @@ impl ExecutionBackend for EmbeddedBackend {
     }
 
     fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        // Delegates to DataFusion via SqlEngine in the api/sql crate layer.
-        // Physical execution is driven by SqlEngine; this backend records
-        // acceptance and emits a debug log with the plan description.
         debug!(
             backend = "embedded",
             plan = %plan.name(),
             kind = %plan.kind(),
-            "EmbeddedBackend: delegating plan to DataFusion via SqlEngine"
+            sql = %flight_client::plan_to_sql(plan),
+            "EmbeddedBackend: executing plan via SqlEngine"
         );
-        Ok(ExecutionReport::new(
-            self.backend_name(),
-            plan.name(),
-            plan.kind(),
-            true,
-        ))
+        execute_local_plan(self.backend_name(), plan)
     }
 }
 
@@ -337,21 +352,14 @@ impl ExecutionBackend for SingleNodeBackend {
     }
 
     fn execute(&mut self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        // Delegates to DataFusion via SqlEngine in the api/sql crate layer.
-        // Physical execution is driven by SqlEngine; this backend records
-        // acceptance and emits a debug log with the plan description.
         debug!(
             backend = "single-node",
             plan = %plan.name(),
             kind = %plan.kind(),
-            "SingleNodeBackend: delegating plan to DataFusion via SqlEngine"
+            sql = %flight_client::plan_to_sql(plan),
+            "SingleNodeBackend: executing plan via SqlEngine"
         );
-        Ok(ExecutionReport::new(
-            self.backend_name(),
-            plan.name(),
-            plan.kind(),
-            true,
-        ))
+        execute_local_plan(self.backend_name(), plan)
     }
 }
 

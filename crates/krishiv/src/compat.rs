@@ -108,7 +108,10 @@ fn classify_api(api: &str) -> CompatVerdict {
         ("read.jdbc", "JDBC connector not in R15 scope"),
         ("ml.", "MLlib not in R15 scope"),
     ];
-    if SUPPORTED.iter().any(|s| api == *s || api.ends_with(s) || api.contains(s)) {
+    if SUPPORTED
+        .iter()
+        .any(|s| api == *s || api.ends_with(s) || api.contains(s))
+    {
         return CompatVerdict::Supported;
     }
     if api.starts_with("SparkSession")
@@ -168,17 +171,14 @@ pub fn analyze_file(path: &Path) -> Result<CompatReport, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let raw: Vec<BTreeMap<String, serde_json::Value>> =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("invalid analyzer json: {e}"))?;
+    let raw: Vec<BTreeMap<String, serde_json::Value>> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("invalid analyzer json: {e}"))?;
     let mut call_sites = Vec::new();
     let mut supported = 0usize;
     let mut partially_supported = 0usize;
     let mut unsupported = 0usize;
     for entry in raw {
-        let line = entry
-            .get("line")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let api = entry
             .get("api")
             .and_then(|v| v.as_str())
@@ -214,7 +214,10 @@ pub fn format_report_text(report: &CompatReport) -> String {
         report.confidence_score * 100.0
     ));
     for site in &report.call_sites {
-        out.push_str(&format!("  L{} {} {:?}\n", site.line, site.api, site.verdict));
+        out.push_str(&format!(
+            "  L{} {} {:?}\n",
+            site.line, site.api, site.verdict
+        ));
     }
     out
 }
@@ -247,9 +250,14 @@ mod tpch_analyzer_tests {
 
     #[test]
     fn analyze_tpch_reference_script() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/reference/tpch_pyspark.py");
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/reference/tpch_pyspark.py");
         let report = analyze_file(&path).expect("analyze");
-        assert!(report.unsupported == 0, "unsupported: {:?}", report.call_sites);
+        assert!(
+            report.unsupported == 0,
+            "unsupported: {:?}",
+            report.call_sites
+        );
         assert!(report.supported >= 5);
         assert!(report.confidence_score >= 0.9);
     }

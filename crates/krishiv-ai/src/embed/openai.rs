@@ -92,7 +92,9 @@ impl OpenAiEmbeddingModel {
                 continue;
             }
             if !response.status().is_success() {
-                return Err(EmbeddingError::Http(response.text().await.unwrap_or_default()));
+                return Err(EmbeddingError::Http(
+                    response.text().await.unwrap_or_default(),
+                ));
             }
             #[derive(Deserialize)]
             struct EmbeddingData {
@@ -124,11 +126,7 @@ impl EmbeddingModel for OpenAiEmbeddingModel {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let mut out = Vec::new();
         for chunk in texts.chunks(100) {
-            self.rate_limiter
-                .lock()
-                .await
-                .acquire()
-                .await;
+            self.rate_limiter.lock().await.acquire().await;
             out.extend(self.call_api(chunk).await?);
         }
         Ok(out)

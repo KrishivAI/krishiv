@@ -35,7 +35,10 @@ impl PyRecursiveTextChunker {
     }
 
     fn chunk(&self, text: &str) -> Vec<String> {
-        krishiv_ai::TextChunker::chunk(&self.inner, text).into_iter().map(|c| c.text).collect()
+        krishiv_ai::TextChunker::chunk(&self.inner, text)
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
     }
 }
 
@@ -55,7 +58,10 @@ impl PySentenceChunker {
     }
 
     fn chunk(&self, text: &str) -> Vec<String> {
-        krishiv_ai::TextChunker::chunk(&self.inner, text).into_iter().map(|c| c.text).collect()
+        krishiv_ai::TextChunker::chunk(&self.inner, text)
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
     }
 }
 
@@ -75,7 +81,10 @@ impl PyTokenAwareChunker {
     }
 
     fn chunk(&self, text: &str) -> Vec<String> {
-        krishiv_ai::TextChunker::chunk(&self.inner, text).into_iter().map(|c| c.text).collect()
+        krishiv_ai::TextChunker::chunk(&self.inner, text)
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
     }
 }
 
@@ -95,7 +104,10 @@ impl PyMarkdownSectionChunker {
     }
 
     fn chunk(&self, text: &str) -> Vec<String> {
-        krishiv_ai::TextChunker::chunk(&self.inner, text).into_iter().map(|c| c.text).collect()
+        krishiv_ai::TextChunker::chunk(&self.inner, text)
+            .into_iter()
+            .map(|c| c.text)
+            .collect()
     }
 }
 
@@ -142,7 +154,8 @@ fn rag_index(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
         .insert(rag_model_key(model), sink.clone());
     let dir = std::env::temp_dir().join(format!("krishiv-rag-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let memo = krishiv_ai::MemoStore::open(dir.join("memo.redb"))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
     let pipeline = krishiv_ai::RagIndexPipeline {
@@ -189,10 +202,7 @@ fn rag_query(query_text: &str, model: &str, top_k: usize) -> PyResult<Vec<(Strin
     let chunks = RUNTIME
         .block_on(query.query(query_text, top_k))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-    Ok(chunks
-        .into_iter()
-        .map(|c| (c.text, c.score))
-        .collect())
+    Ok(chunks.into_iter().map(|c| (c.text, c.score)).collect())
 }
 
 #[cfg(test)]
@@ -207,10 +217,7 @@ mod tests {
             .unwrap()
             .insert(rag_model_key("test-model"), sink);
         assert!(
-            RAG_VECTOR_SINKS
-                .read()
-                .unwrap()
-                .contains_key("test-model"),
+            RAG_VECTOR_SINKS.read().unwrap().contains_key("test-model"),
             "rag_index must register the shared sink for rag_query"
         );
     }

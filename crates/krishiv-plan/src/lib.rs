@@ -313,8 +313,7 @@ impl PlanNode {
 }
 
 /// Shared core fields for logical and physical plans.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlanCore {
     pub(crate) name: String,
     pub(crate) kind: ExecutionKind,

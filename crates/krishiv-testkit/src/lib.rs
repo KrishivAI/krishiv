@@ -15,7 +15,11 @@ pub fn make_batch(schema: SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch {
 
 /// Build a single-column Int32 batch named `value`.
 pub fn make_i32_batch(values: &[i32]) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
     make_batch(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
 }
 

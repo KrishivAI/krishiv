@@ -17,21 +17,34 @@
 - **GAP-CI1/CI2:** GitHub Actions CI workflow and PR template.
 - **GAP-B1:** `rust-version = "1.92"` in workspace `Cargo.toml`.
 
-### Validation (2026-05-23)
+### Validation (2026-05-24)
 
 ```bash
-cargo check -p krishiv-proto -p krishiv-scheduler -p krishiv-executor -p krishiv-checkpoint -p krishiv-state -p krishiv-catalog -p krishiv-sql
+cargo check -p krishiv-exec -p krishiv-sql -p krishiv-runtime -p krishiv-metrics -p krishiv-vector-sinks -p krishiv-scheduler -p krishiv-cep
+cargo test -p krishiv-exec --lib tumbling_state_persist_and_restore_roundtrip
+cargo test -p krishiv-vector-sinks --lib weaviate_query_returns_results
 cargo test -p krishiv-scheduler --lib
-cargo test -p krishiv-scheduler --test coordinator_executor_integration
-cargo test -p krishiv-sql --lib catalog_table_resolved_in_sql
+cargo test -p krishiv-metrics --lib krishiv_metrics_prometheus_contains_tasks_total
+cargo fmt --check
+cargo clippy -p krishiv-exec -p krishiv-sql -p krishiv-runtime -p krishiv-metrics -p krishiv-scheduler -p krishiv-state -p krishiv-vector-sinks -p krishiv-cep -- -D warnings
 ```
 
-### Remaining (follow-up PRs)
+### Follow-up closure (same PR, 2026-05-24)
 
-- **GAP-C2:** Operator K8s lease election loop (partial wiring may exist; verify active/standby coordinator transition).
-- **GAP-I1/I2/I4/I6:** Runtime backend execution, streaming `StateBackend`, UDAF/UDTF bridge, OTel metrics.
-- **GAP-B4/B5:** Workspace-wide `cargo fmt` / `cargo clippy -D warnings`.
-- **GAP-B2/B3/T1:** `krishiv-cep` workspace membership, Python/native link jobs, vector-sinks weaviate test.
+- **GAP-I1:** `EmbeddedBackend` / `SingleNodeBackend` execute plans via `SqlEngine`; `DistributedBackend` uses Flight SQL (`flight_client`).
+- **GAP-I2:** `TumblingWindowOperator::persist_to_state` / `restore_from_state` + `StateBackedTumblingWindowOperator`.
+- **GAP-I4:** `sync_aggregate_udfs` / `sync_table_udfs` in `krishiv-sql` (`udf.rs` from `main`).
+- **GAP-I6:** `KrishivMetrics` + `global_metrics().render_prometheus()` on coordinator `/metrics`; `inc_tasks_submitted` on job submit.
+- **GAP-B2:** `krishiv-cep` and `krishiv-vector-sinks` added to workspace members.
+- **GAP-B3:** [`CONTRIBUTING.md`](../../CONTRIBUTING.md) documents native link prerequisites.
+- **GAP-B4:** `cargo fmt --all` applied.
+- **GAP-B5:** `cargo clippy` clean on follow-up crates (excludes `krishiv-python` / `krishiv-chaos` when native deps absent).
+- **GAP-T1:** `weaviate_query_returns_results` passes.
+
+### Remaining
+
+- **GAP-C2:** Operator K8s lease election loop (verify active/standby coordinator transition).
+- Full-workspace `cargo clippy --workspace` may still fail on bins/crates needing native link (`krishiv-executor`, `krishiv-operator`) — see CONTRIBUTING.md.
 
 ---
 

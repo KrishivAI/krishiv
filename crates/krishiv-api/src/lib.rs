@@ -1058,7 +1058,6 @@ fn accept_plan_with_backend(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -1536,7 +1535,9 @@ mod tests {
 
         let registry = session.udf_registry();
         let guard = registry.read().unwrap();
-        let loaded = guard.get_scalar("double").expect("udf should be registered");
+        let loaded = guard
+            .get_scalar("double")
+            .expect("udf should be registered");
         assert_eq!(loaded.name(), "double");
     }
 

@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
 
-use crate::{ExecError, ExecResult};
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
 use crate::window::tumbling::build_window_record_batch;
+use crate::{ExecError, ExecResult};
 
 /// Configuration for a sliding event-time window operator (R5.2).
 ///

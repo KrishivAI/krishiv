@@ -3,8 +3,8 @@ mod imp {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
+    use sqlx::postgres::PgPoolOptions;
 
     use crate::batch::EmbeddingBatch;
     use crate::id::point_id_from_doc_epoch;
@@ -151,9 +151,7 @@ mod imp {
     }
 
     fn payload_to_json(map: &HashMap<String, PayloadValue>) -> HashMap<String, serde_json::Value> {
-        map.iter()
-            .map(|(k, v)| (k.clone(), v.to_json()))
-            .collect()
+        map.iter().map(|(k, v)| (k.clone(), v.to_json())).collect()
     }
 
     fn json_to_chunk(payload: &serde_json::Value, score: f32) -> ScoredChunk {

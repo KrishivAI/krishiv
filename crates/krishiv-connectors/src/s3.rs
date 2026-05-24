@@ -45,9 +45,12 @@ impl S3Source {
         let get_result = store.get(&path).await.map_err(|e| ConnectorError::IoStr {
             message: format!("failed to get object '{}': {e}", path),
         })?;
-        let raw: Bytes = get_result.bytes().await.map_err(|e| ConnectorError::IoStr {
-            message: format!("failed to read bytes from '{}': {e}", path),
-        })?;
+        let raw: Bytes = get_result
+            .bytes()
+            .await
+            .map_err(|e| ConnectorError::IoStr {
+                message: format!("failed to read bytes from '{}': {e}", path),
+            })?;
 
         // Parse as Parquet.
         let builder =
@@ -174,10 +177,11 @@ impl Sink for S3Sink {
         // Serialise all pending batches to a Parquet byte buffer.
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut writer =
-                ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| ConnectorError::IoStr {
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, None).map_err(|e| {
+                ConnectorError::IoStr {
                     message: format!("failed to create Parquet writer: {e}"),
-                })?;
+                }
+            })?;
             for batch in &self.pending {
                 writer.write(batch).map_err(|e| ConnectorError::IoStr {
                     message: format!("failed to write Parquet batch: {e}"),

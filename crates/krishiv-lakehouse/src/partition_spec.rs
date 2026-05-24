@@ -46,13 +46,13 @@ impl PartitionSpecResolver {
 
     /// Add a partition field to the current default spec (evolution).
     pub fn add_field(&mut self, field: PartitionField) {
-        let entry = self
-            .specs
-            .entry(self.default_spec_id)
-            .or_insert_with(|| PartitionSpecVersion {
-                spec_id: self.default_spec_id,
-                fields: Vec::new(),
-            });
+        let entry =
+            self.specs
+                .entry(self.default_spec_id)
+                .or_insert_with(|| PartitionSpecVersion {
+                    spec_id: self.default_spec_id,
+                    fields: Vec::new(),
+                });
         entry.fields.push(field);
     }
 

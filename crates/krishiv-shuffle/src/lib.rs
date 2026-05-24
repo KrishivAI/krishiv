@@ -319,9 +319,7 @@ fn parquet_writer_properties(
     let codec = match compression {
         ShuffleCompression::None => Compression::UNCOMPRESSED,
         ShuffleCompression::Lz4 => Compression::LZ4,
-        ShuffleCompression::Zstd => {
-            Compression::ZSTD(ZstdLevel::try_new(3).unwrap_or_default())
-        }
+        ShuffleCompression::Zstd => Compression::ZSTD(ZstdLevel::try_new(3).unwrap_or_default()),
     };
     WriterProperties::builder().set_compression(codec).build()
 }
@@ -883,9 +881,7 @@ impl InMemoryShuffleStore {
                 *used = used.saturating_sub(spill_size);
             }
 
-            spill
-                .write_partition(spill_partition, spill_token)
-                .await?;
+            spill.write_partition(spill_partition, spill_token).await?;
             shuffle_write_lock(&self.spilled)?.insert(key_to_spill);
         }
     }
@@ -959,10 +955,10 @@ impl ShuffleStore for InMemoryShuffleStore {
 
     async fn read_partition(&self, id: &PartitionId) -> StoreResult<Option<ShufflePartition>> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-        if shuffle_read_lock(&self.spilled)?.contains(&key) {
-            if let Some(spill) = &self.spill_store {
-                return spill.read_partition(id).await;
-            }
+        if shuffle_read_lock(&self.spilled)?.contains(&key)
+            && let Some(spill) = &self.spill_store
+        {
+            return spill.read_partition(id).await;
         }
         let guard = shuffle_read_lock(&self.partitions)?;
         Ok(guard.get(&key).cloned())
@@ -1238,11 +1234,7 @@ impl ObjectStoreShuffleStore {
 }
 
 impl ShuffleStore for ObjectStoreShuffleStore {
-    async fn register_partition_lease(
-        &self,
-        id: PartitionId,
-        lease_token: u64,
-    ) -> StoreResult<()> {
+    async fn register_partition_lease(&self, id: PartitionId, lease_token: u64) -> StoreResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
         if let Some(expected) = self.lease_tokens.get(&key).map(|entry| *entry)
             && lease_token != expected
@@ -1335,8 +1327,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
     async fn delete_job_partitions(&self, job_id: &str) -> StoreResult<()> {
         use futures::TryStreamExt;
 
-        self.lease_tokens
-            .retain(|(jid, _, _), _| jid != job_id);
+        self.lease_tokens.retain(|(jid, _, _), _| jid != job_id);
 
         // P2.9: collect all object paths, then issue a single batch-delete stream
         // rather than O(N) serial round-trips.
@@ -1589,7 +1580,10 @@ mod tests {
         let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
         store.write_partition(&path, &data).await.unwrap();
         let read_back = store.read_partition(&path).await.unwrap();
-        assert_eq!(read_back, data, "LZ4 write/read round-trip must be byte-exact");
+        assert_eq!(
+            read_back, data,
+            "LZ4 write/read round-trip must be byte-exact"
+        );
     }
 
     #[tokio::test]
@@ -1600,7 +1594,10 @@ mod tests {
         let data: Vec<u8> = (0u8..=255).cycle().take(512).collect();
         store.write_partition(&path, &data).await.unwrap();
         let read_back = store.read_partition(&path).await.unwrap();
-        assert_eq!(read_back, data, "Zstd write/read round-trip must be byte-exact");
+        assert_eq!(
+            read_back, data,
+            "Zstd write/read round-trip must be byte-exact"
+        );
     }
 
     /// GAP-SH-02: Verify that the header codec byte governs decompression even
@@ -1613,7 +1610,8 @@ mod tests {
     #[tokio::test]
     async fn shuffle_codec_header_mismatch_detected() {
         let dir = tempfile::tempdir().unwrap();
-        let write_store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::None);
+        let write_store =
+            LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::None);
         let read_store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
 
         let path = ShufflePath::new("job-mismatch", "stage-0", 0);
@@ -1840,9 +1838,7 @@ mod tests {
 
     // ── ShuffleStore tests ────────────────────────────────────────────────
 
-    use super::{
-        PartitionId, ShufflePartition, ShuffleStore, StoreError,
-    };
+    use super::{PartitionId, ShufflePartition, ShuffleStore, StoreError};
 
     fn make_store_partition(job_id: &str, stage_id: &str, partition: u32) -> ShufflePartition {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -2188,11 +2184,7 @@ mod tests {
         assert!(store.read_partition(&id0).await.unwrap().is_some());
         assert!(store.read_partition(&id1).await.unwrap().is_some());
 
-        let spilled_path = dir
-            .path()
-            .join("job-spill")
-            .join("s0")
-            .join("0.parquet");
+        let spilled_path = dir.path().join("job-spill").join("s0").join("0.parquet");
         assert!(
             spilled_path.exists(),
             "oldest partition should spill to LocalDiskShuffleStore"
@@ -2248,7 +2240,10 @@ mod tests {
         let id = partition.id.clone();
 
         store.register_partition_lease(id.clone(), 9).await.unwrap();
-        let err = store.write_partition(partition.clone(), 8).await.unwrap_err();
+        let err = store
+            .write_partition(partition.clone(), 8)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,

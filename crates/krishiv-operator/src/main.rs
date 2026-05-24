@@ -7,9 +7,9 @@ use krishiv_operator::{
     BootstrapExecutor, K8sLeaseElection, KubernetesControllerConfig, KubernetesControllerRuntime,
     run_kubernetes_controller_runtime_with_client,
 };
-use krishiv_scheduler::{LeaderElection, SharedCoordinator};
 use krishiv_proto::CoordinatorId;
 use krishiv_scheduler::serve_coordinator_executor_grpc_with_listener;
+use krishiv_scheduler::{LeaderElection, SharedCoordinator};
 use krishiv_ui::{UiState, serve};
 use kube::Client;
 

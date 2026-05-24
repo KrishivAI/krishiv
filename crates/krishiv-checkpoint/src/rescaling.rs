@@ -1,6 +1,6 @@
 //! Key-group rescaling for checkpoint restore (R16 S4.2).
 
-use krishiv_state::key_group::{key_group_ranges_for_parallelism, KeyGroupRange, NUM_KEY_GROUPS};
+use krishiv_state::key_group::{KeyGroupRange, NUM_KEY_GROUPS, key_group_ranges_for_parallelism};
 
 /// Computes key-group → task slot mapping when restoring with new parallelism.
 #[derive(Debug, Clone, PartialEq, Eq)]

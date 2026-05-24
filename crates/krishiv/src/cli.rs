@@ -54,7 +54,9 @@ impl CoordinatorMode {
             }
         }
         // Explicit flag beats env var.
-        if url.is_none() && let Some(env_url) = env_value.filter(|u| !u.is_empty()) {
+        if url.is_none()
+            && let Some(env_url) = env_value.filter(|u| !u.is_empty())
+        {
             url = Some(env_url.to_owned());
         }
         let mode = match url {
@@ -75,10 +77,18 @@ pub struct CliResponse {
 
 impl CliResponse {
     fn ok(stdout: impl Into<String>) -> Self {
-        Self { stdout: stdout.into(), stderr: String::new(), exit_code: 0 }
+        Self {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: 0,
+        }
     }
     fn err(stderr: impl Into<String>, exit_code: i32) -> Self {
-        Self { stdout: String::new(), stderr: stderr.into(), exit_code }
+        Self {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            exit_code,
+        }
     }
 }
 
@@ -166,7 +176,6 @@ pub fn main_help() -> String {
     )
 }
 
-
 pub fn compat_help() -> String {
     String::from(
         "PySpark migration compatibility analyzer.\n\
@@ -184,10 +193,21 @@ fn run_compat_analyze(args: &[&str]) -> CliResponse {
     let mut i = 0;
     while i < args.len() {
         match args[i] {
-            "--format" if i + 1 < args.len() => { format = args[i + 1]; i += 2; }
-            "--output" | "-o" if i + 1 < args.len() => { output = Some(PathBuf::from(args[i + 1])); i += 2; }
-            flag if flag.starts_with('-') => return CliResponse::err(format!("unknown flag: {flag}"), 2),
-            file => { path = Some(PathBuf::from(file)); i += 1; }
+            "--format" if i + 1 < args.len() => {
+                format = args[i + 1];
+                i += 2;
+            }
+            "--output" | "-o" if i + 1 < args.len() => {
+                output = Some(PathBuf::from(args[i + 1]));
+                i += 2;
+            }
+            flag if flag.starts_with('-') => {
+                return CliResponse::err(format!("unknown flag: {flag}"), 2);
+            }
+            file => {
+                path = Some(PathBuf::from(file));
+                i += 1;
+            }
         }
     }
     let Some(path) = path else {
@@ -326,7 +346,10 @@ fn run_jobs(args: &[&str]) -> CliResponse {
         return CliResponse::ok(render_distributed_jobs(&coordinator.job_snapshots()));
     }
     if !args.is_empty() {
-        return CliResponse::err(format!("unexpected arguments for jobs\n\n{}", jobs_help()), 2);
+        return CliResponse::err(
+            format!("unexpected arguments for jobs\n\n{}", jobs_help()),
+            2,
+        );
     }
     let session = match Session::builder().build() {
         Ok(session) => session,
@@ -379,10 +402,24 @@ fn run_state_inspect(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut i = 0;
     while i < args.len() {
         match args[i] {
-            "--job" if i + 1 < args.len() => { job_id = Some(args[i + 1]); i += 2; }
-            "--operator" if i + 1 < args.len() => { operator_id = Some(args[i + 1]); i += 2; }
-            "--storage-path" if i + 1 < args.len() => { storage_path = Some(args[i + 1]); i += 2; }
-            other => return CliResponse::err(format!("unexpected argument '{other}'\n\n{}", state_help()), 2),
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--operator" if i + 1 < args.len() => {
+                operator_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--storage-path" if i + 1 < args.len() => {
+                storage_path = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", state_help()),
+                    2,
+                );
+            }
         }
     }
     let Some(job_id) = job_id else {
@@ -411,7 +448,6 @@ fn run_state_inspect(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
             Err(e) => CliResponse::err(format!("remote coordinator error: {e}\n"), 1),
         };
     }
-
 
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
@@ -463,7 +499,11 @@ fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> 
         ExecutorId::try_new(command.executor_id.clone()).map_err(|e| e.to_string())?;
     let slots = command.tasks.max(1);
     coordinator
-        .register_executor(ExecutorDescriptor::new(executor_id.clone(), "local-r2-executor", slots))
+        .register_executor(ExecutorDescriptor::new(
+            executor_id.clone(),
+            "local-r2-executor",
+            slots,
+        ))
         .map_err(|e| e.to_string())?;
     coordinator
         .executor_heartbeat(ExecutorHeartbeat::new(executor_id, ExecutorState::Healthy))
@@ -472,10 +512,18 @@ fn submit_to_local_scheduler(command: &SubmitCommand) -> Result<String, String> 
     let job_id = job.job_id().clone();
     coordinator.submit_job(job).map_err(|e| e.to_string())?;
     if command.launch {
-        coordinator.launch_assigned_tasks(&job_id).map_err(|e| e.to_string())?;
+        coordinator
+            .launch_assigned_tasks(&job_id)
+            .map_err(|e| e.to_string())?;
     }
-    let detail = coordinator.job_detail_snapshot(&job_id).map_err(|e| e.to_string())?;
-    Ok(render_submit_result(command.kind, &detail, &coordinator.executor_snapshots()))
+    let detail = coordinator
+        .job_detail_snapshot(&job_id)
+        .map_err(|e| e.to_string())?;
+    Ok(render_submit_result(
+        command.kind,
+        &detail,
+        &coordinator.executor_snapshots(),
+    ))
 }
 
 fn active_local_coordinator() -> Result<Coordinator, String> {
@@ -507,16 +555,25 @@ fn render_submit_result(
     for stage in detail.stages() {
         output.push_str(&format!(
             "{}\t{}\t{}\n",
-            stage.stage_id(), stage.state(), stage.task_count()
+            stage.stage_id(),
+            stage.state(),
+            stage.task_count()
         ));
     }
     output.push_str("\nTASK\tSTAGE\tSTATE\tEXECUTOR\tATTEMPT\n");
     for stage in detail.stages() {
         for task in stage.tasks() {
-            let executor = task.assigned_executor().map(ToString::to_string).unwrap_or_else(|| String::from("-"));
+            let executor = task
+                .assigned_executor()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| String::from("-"));
             output.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\n",
-                task.task_id(), stage.stage_id(), task.state(), executor, task.attempt()
+                task.task_id(),
+                stage.stage_id(),
+                task.state(),
+                executor,
+                task.attempt()
             ));
         }
     }
@@ -524,8 +581,10 @@ fn render_submit_result(
     for executor in executors {
         output.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
-            executor.executor_id(), executor.state(),
-            executor.descriptor().slots(), executor.descriptor().host()
+            executor.executor_id(),
+            executor.state(),
+            executor.descriptor().slots(),
+            executor.descriptor().host()
         ));
     }
     output
@@ -535,13 +594,19 @@ fn render_distributed_jobs(jobs: &[JobSnapshot]) -> String {
     if jobs.is_empty() {
         return String::from("No distributed jobs in this process.\n");
     }
-    let mut output = String::from("JOB\tSTATE\tSTAGES\tTASKS\tASSIGNED\tRUNNING\tSUCCEEDED\tFAILED\n");
+    let mut output =
+        String::from("JOB\tSTATE\tSTAGES\tTASKS\tASSIGNED\tRUNNING\tSUCCEEDED\tFAILED\n");
     for job in jobs {
         output.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            job.job_id(), job.state(), job.stage_count(), job.task_count(),
-            job.assigned_task_count(), job.running_task_count(),
-            job.succeeded_task_count(), job.failed_task_count()
+            job.job_id(),
+            job.state(),
+            job.stage_count(),
+            job.task_count(),
+            job.assigned_task_count(),
+            job.running_task_count(),
+            job.succeeded_task_count(),
+            job.failed_task_count()
         ));
     }
     output
@@ -554,9 +619,14 @@ fn build_session(command: &QueryCommand) -> Result<Session, String> {
         .map_err(|e| e.to_string())?;
     for (table, path) in &command.parquet_tables {
         if !path.exists() {
-            return Err(format!("DataFusion error: parquet file not found: {}", path.display()));
+            return Err(format!(
+                "DataFusion error: parquet file not found: {}",
+                path.display()
+            ));
         }
-        session.register_parquet(table, path).map_err(|e| e.to_string())?;
+        session
+            .register_parquet(table, path)
+            .map_err(|e| e.to_string())?;
     }
     Ok(session)
 }
@@ -570,17 +640,23 @@ fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
         match args[idx] {
             "--query" | "-q" => {
                 idx += 1;
-                let value = args.get(idx).ok_or_else(|| String::from("missing value for --query"))?;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --query"))?;
                 query = Some((*value).to_owned());
             }
             "--mode" => {
                 idx += 1;
-                let value = args.get(idx).ok_or_else(|| String::from("missing value for --mode"))?;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --mode"))?;
                 mode = parse_mode(value)?;
             }
             "--parquet" => {
                 idx += 1;
-                let value = args.get(idx).ok_or_else(|| String::from("missing value for --parquet"))?;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --parquet"))?;
                 parquet_tables.push(parse_parquet_spec(value)?);
             }
             "--help" | "-h" => return Err(String::from("help requested")),
@@ -592,7 +668,11 @@ fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     if query.trim().is_empty() {
         return Err(String::from("query cannot be empty"));
     }
-    Ok(QueryCommand { query, mode, parquet_tables })
+    Ok(QueryCommand {
+        query,
+        mode,
+        parquet_tables,
+    })
 }
 
 fn parse_submit_command(args: &[&str]) -> Result<SubmitCommand, String> {
@@ -605,21 +685,67 @@ fn parse_submit_command(args: &[&str]) -> Result<SubmitCommand, String> {
     let mut idx = 0;
     while idx < args.len() {
         match args[idx] {
-            "--job-id" => { idx += 1; job_id = args.get(idx).ok_or_else(|| String::from("missing value for --job-id"))?.to_string(); }
-            "--name" => { idx += 1; name = args.get(idx).ok_or_else(|| String::from("missing value for --name"))?.to_string(); }
-            "--kind" => { idx += 1; kind = parse_job_kind(args.get(idx).ok_or_else(|| String::from("missing value for --kind"))?)?; }
-            "--tasks" => { idx += 1; tasks = parse_positive_usize(args.get(idx).ok_or_else(|| String::from("missing value for --tasks"))?, "--tasks")?; }
-            "--executor" => { idx += 1; executor_id = args.get(idx).ok_or_else(|| String::from("missing value for --executor"))?.to_string(); }
-            "--launch" => { launch = true; }
+            "--job-id" => {
+                idx += 1;
+                job_id = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --job-id"))?
+                    .to_string();
+            }
+            "--name" => {
+                idx += 1;
+                name = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --name"))?
+                    .to_string();
+            }
+            "--kind" => {
+                idx += 1;
+                kind = parse_job_kind(
+                    args.get(idx)
+                        .ok_or_else(|| String::from("missing value for --kind"))?,
+                )?;
+            }
+            "--tasks" => {
+                idx += 1;
+                tasks = parse_positive_usize(
+                    args.get(idx)
+                        .ok_or_else(|| String::from("missing value for --tasks"))?,
+                    "--tasks",
+                )?;
+            }
+            "--executor" => {
+                idx += 1;
+                executor_id = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --executor"))?
+                    .to_string();
+            }
+            "--launch" => {
+                launch = true;
+            }
             "--help" | "-h" => return Err(String::from("help requested")),
             unknown => return Err(format!("unknown option: {unknown}")),
         }
         idx += 1;
     }
-    if job_id.trim().is_empty() { return Err(String::from("job id cannot be empty")); }
-    if name.trim().is_empty() { return Err(String::from("job name cannot be empty")); }
-    if executor_id.trim().is_empty() { return Err(String::from("executor id cannot be empty")); }
-    Ok(SubmitCommand { job_id, name, kind, tasks, executor_id, launch })
+    if job_id.trim().is_empty() {
+        return Err(String::from("job id cannot be empty"));
+    }
+    if name.trim().is_empty() {
+        return Err(String::from("job name cannot be empty"));
+    }
+    if executor_id.trim().is_empty() {
+        return Err(String::from("executor id cannot be empty"));
+    }
+    Ok(SubmitCommand {
+        job_id,
+        name,
+        kind,
+        tasks,
+        executor_id,
+        launch,
+    })
 }
 
 fn parse_job_kind(value: &str) -> Result<JobKind, String> {
@@ -631,8 +757,12 @@ fn parse_job_kind(value: &str) -> Result<JobKind, String> {
 }
 
 fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
-    let parsed = value.parse::<usize>().map_err(|_| format!("{flag} must be a positive integer"))?;
-    if parsed == 0 { return Err(format!("{flag} must be greater than zero")); }
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
     Ok(parsed)
 }
 
@@ -646,9 +776,15 @@ fn parse_mode(value: &str) -> Result<ExecutionMode, String> {
 }
 
 fn parse_parquet_spec(value: &str) -> Result<(String, PathBuf), String> {
-    let (table, path) = value.split_once('=').ok_or_else(|| String::from("--parquet must use table=path"))?;
-    if table.trim().is_empty() { return Err(String::from("parquet table name cannot be empty")); }
-    if path.trim().is_empty() { return Err(String::from("parquet path cannot be empty")); }
+    let (table, path) = value
+        .split_once('=')
+        .ok_or_else(|| String::from("--parquet must use table=path"))?;
+    if table.trim().is_empty() {
+        return Err(String::from("parquet table name cannot be empty"));
+    }
+    if path.trim().is_empty() {
+        return Err(String::from("parquet path cannot be empty"));
+    }
     Ok((table.to_owned(), PathBuf::from(path)))
 }
 
@@ -674,9 +810,20 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut i = 0;
     while i < args.len() {
         match args[i] {
-            "--job" if i + 1 < args.len() => { job_id = Some(args[i + 1]); i += 2; }
-            "--label" if i + 1 < args.len() => { label = Some(args[i + 1]); i += 2; }
-            other => return CliResponse::err(format!("unexpected argument '{other}'\n\n{}", savepoint_help()), 2),
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--label" if i + 1 < args.len() => {
+                label = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", savepoint_help()),
+                    2,
+                );
+            }
         }
     }
     let Some(job_id_str) = job_id else {
@@ -753,10 +900,24 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut i = 0;
     while i < args.len() {
         match args[i] {
-            "--job" if i + 1 < args.len() => { job_id = Some(args[i + 1]); i += 2; }
-            "--epoch" if i + 1 < args.len() => { epoch = Some(args[i + 1]); i += 2; }
-            "--storage-path" if i + 1 < args.len() => { storage_path = Some(args[i + 1]); i += 2; }
-            other => return CliResponse::err(format!("unexpected argument '{other}'\n\n{}", restore_help()), 2),
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--epoch" if i + 1 < args.len() => {
+                epoch = Some(args[i + 1]);
+                i += 2;
+            }
+            "--storage-path" if i + 1 < args.len() => {
+                storage_path = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", restore_help()),
+                    2,
+                );
+            }
         }
     }
     let Some(job_id) = job_id else {
@@ -767,9 +928,15 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     };
     let epoch_num: u64 = match epoch.parse() {
         Ok(n) => n,
-        Err(_) => return CliResponse::err(
-            format!("--epoch must be a non-negative integer; got '{epoch}'\n\n{}", restore_help()), 2,
-        ),
+        Err(_) => {
+            return CliResponse::err(
+                format!(
+                    "--epoch must be a non-negative integer; got '{epoch}'\n\n{}",
+                    restore_help()
+                ),
+                2,
+            );
+        }
     };
 
     // Remote coordinator path.
@@ -783,7 +950,6 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
             Err(e) => CliResponse::err(format!("remote coordinator error: {e}\n"), 1),
         };
     }
-
 
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
@@ -802,8 +968,16 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     };
     let snapshot_count = meta.operator_snapshots.len();
     let source_count = meta.source_offsets.len();
-    let kind = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
-    let label = meta.savepoint_label.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
+    let kind = if meta.is_savepoint {
+        "savepoint"
+    } else {
+        "checkpoint"
+    };
+    let label = meta
+        .savepoint_label
+        .as_deref()
+        .map(|l| format!(" ({l})"))
+        .unwrap_or_default();
     CliResponse::ok(format!(
         "Restore plan\n\
          Job:              {job_id}\n\
@@ -853,9 +1027,20 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut i = 0;
     while i < args.len() {
         match args[i] {
-            "--job" if i + 1 < args.len() => { job_id = Some(args[i + 1]); i += 2; }
-            "--storage-path" if i + 1 < args.len() => { storage_path = Some(args[i + 1]); i += 2; }
-            other => return CliResponse::err(format!("unexpected argument '{other}'\n\n{}", checkpoints_help()), 2),
+            "--job" if i + 1 < args.len() => {
+                job_id = Some(args[i + 1]);
+                i += 2;
+            }
+            "--storage-path" if i + 1 < args.len() => {
+                storage_path = Some(args[i + 1]);
+                i += 2;
+            }
+            other => {
+                return CliResponse::err(
+                    format!("unexpected argument '{other}'\n\n{}", checkpoints_help()),
+                    2,
+                );
+            }
         }
     }
     let Some(job_id) = job_id else {
@@ -882,7 +1067,6 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
         };
     }
 
-
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
         Ok(s) => s,
@@ -899,7 +1083,11 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     for &epoch in &epochs {
         let (kind, label) = match read_epoch_metadata(&storage, job_id, epoch) {
             Ok(Some(meta)) => {
-                let k = if meta.is_savepoint { "savepoint" } else { "checkpoint" };
+                let k = if meta.is_savepoint {
+                    "savepoint"
+                } else {
+                    "checkpoint"
+                };
                 let l = meta.savepoint_label.unwrap_or_default();
                 (k, l)
             }
@@ -959,7 +1147,9 @@ mod tests {
 
     #[test]
     fn submit_command_uses_r2_scheduler_status_shape() {
-        let response = dispatch(&["submit", "--job-id", "job-demo", "--name", "demo", "--tasks", "2", "--launch"]);
+        let response = dispatch(&[
+            "submit", "--job-id", "job-demo", "--name", "demo", "--tasks", "2", "--launch",
+        ]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);
         assert!(response.stdout.contains("Submitted distributed batch job"));
         assert!(response.stdout.contains("JOB\tSTATE\tSTAGES\tTASKS"));
@@ -970,7 +1160,11 @@ mod tests {
     fn submit_command_rejects_zero_tasks() {
         let response = dispatch(&["submit", "--tasks", "0"]);
         assert_eq!(response.exit_code, 2);
-        assert!(response.stderr.contains("--tasks must be greater than zero"));
+        assert!(
+            response
+                .stderr
+                .contains("--tasks must be greater than zero")
+        );
     }
 
     #[test]

@@ -24,19 +24,15 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-    use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::PyRuntimeError;
 
 pub fn map_krishiv_error(error: krishiv_api::KrishivError) -> PyErr {
     match error {
-        krishiv_api::KrishivError::AccessDenied { reason } => {
-            AuthorizationError::new_err(reason)
-        }
+        krishiv_api::KrishivError::AccessDenied { reason } => AuthorizationError::new_err(reason),
         krishiv_api::KrishivError::Unsupported { feature } => {
             QueryError::new_err(format!("unsupported feature: {feature}"))
         }
-        krishiv_api::KrishivError::InvalidConfig { message } => {
-            KrishivError::new_err(message)
-        }
+        krishiv_api::KrishivError::InvalidConfig { message } => KrishivError::new_err(message),
         krishiv_api::KrishivError::Runtime { message } => PyRuntimeError::new_err(message),
     }
 }

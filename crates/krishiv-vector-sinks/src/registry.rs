@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-
 use crate::config::VectorSinkConfig;
 use crate::memory::InMemoryVectorSink;
 use crate::pinecone::PineconeSink;
@@ -75,7 +74,7 @@ impl VectorSinkRegistry {
                 table,
                 vector_dim,
             } => Ok(Arc::new(LanceDbSink::open(uri, table, *vector_dim).await?)),
-            
+
             VectorSinkConfig::Weaviate {
                 base_url,
                 class_name,
@@ -89,7 +88,11 @@ impl VectorSinkRegistry {
                 host,
                 api_key,
                 namespace,
-            } => Ok(Arc::new(PineconeSink::new(host, api_key, namespace.clone()))),
+            } => Ok(Arc::new(PineconeSink::new(
+                host,
+                api_key,
+                namespace.clone(),
+            ))),
         }
     }
 }

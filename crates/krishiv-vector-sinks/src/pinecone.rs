@@ -6,9 +6,7 @@ use serde_json::json;
 
 use crate::batch::EmbeddingBatch;
 use crate::id::point_id_from_doc_epoch;
-use crate::traits::{
-    PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
-};
+use crate::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
 
 /// Pinecone REST upsert sink.
 #[derive(Clone)]
@@ -21,7 +19,11 @@ pub struct PineconeSink {
 
 impl PineconeSink {
     /// Create a Pinecone sink. `host` is the index host (e.g. `index-abc.svc.pinecone.io`).
-    pub fn new(host: impl Into<String>, api_key: impl Into<String>, namespace: Option<String>) -> Self {
+    pub fn new(
+        host: impl Into<String>,
+        api_key: impl Into<String>,
+        namespace: Option<String>,
+    ) -> Self {
         Self {
             client: Client::new(),
             host: host.into(),

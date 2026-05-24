@@ -12,8 +12,8 @@ use krishiv_proto::{
     TaskStatusResponse, TransportVersion, wire,
 };
 
-use crate::{ExecutorAssignmentInbox, ExecutorError, ExecutorResult, ExecutorTransportResult};
 use crate::grpc::executor_task_grpc_server;
+use crate::{ExecutorAssignmentInbox, ExecutorError, ExecutorResult, ExecutorTransportResult};
 
 /// Network transport error raised by the executor gRPC client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,7 +329,8 @@ pub struct GrpcCoordinatorService {
 
 impl fmt::Debug for GrpcCoordinatorService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GrpcCoordinatorService").finish_non_exhaustive()
+        f.debug_struct("GrpcCoordinatorService")
+            .finish_non_exhaustive()
     }
 }
 
@@ -361,7 +362,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         let mut client = self.client().await?;
         let response = client
-            .register_executor(wire::register_executor_request_to_wire(request.into_inner()))
+            .register_executor(wire::register_executor_request_to_wire(
+                request.into_inner(),
+            ))
             .await?
             .into_inner();
         Ok(tonic::Response::new(
@@ -393,7 +396,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let mut client = self.client().await?;
         let response = client
-            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(request.into_inner()))
+            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
+                request.into_inner(),
+            ))
             .await?
             .into_inner();
         Ok(tonic::Response::new(

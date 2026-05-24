@@ -21,9 +21,9 @@ pub mod s3;
 pub mod transactional_kafka;
 pub mod two_phase_parquet_s3;
 
-pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
 #[cfg(feature = "state")]
 pub use cdc::CdcOffsetTracker;
+pub use feature_store::{FeatureRow, FeatureStoreSink, InMemoryFeatureStream};
 
 // ---------------------------------------------------------------------------
 // Error and Result
@@ -40,7 +40,10 @@ pub enum ConnectorError {
     /// Parquet read/write error.
     Parquet(String),
     /// Object-store (S3/GCS/Azure) error with optional HTTP status code.
-    ObjectStore { message: String, status: Option<u16> },
+    ObjectStore {
+        message: String,
+        status: Option<u16>,
+    },
     /// CDC (change-data-capture) pipeline error.
     Cdc(String),
     /// Typed I/O error from the operating system.
@@ -843,12 +846,14 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
         match std::fs::hard_link(&handle.staging_path, &handle.final_path) {
-            Ok(()) => std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::IoStr {
-                message: format!(
-                    "parquet 2pc commit: remove staging {:?}: {e}",
-                    handle.staging_path
-                ),
-            }),
+            Ok(()) => {
+                std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::IoStr {
+                    message: format!(
+                        "parquet 2pc commit: remove staging {:?}: {e}",
+                        handle.staging_path
+                    ),
+                })
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let _ = std::fs::remove_file(&handle.staging_path);
                 Ok(())

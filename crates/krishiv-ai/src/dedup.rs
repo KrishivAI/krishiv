@@ -49,7 +49,7 @@ impl SemanticDedup {
 
     fn lsh_candidates(embeddings: &[Vec<f32>]) -> Vec<(usize, usize)> {
         let bands = 10usize;
-        let width = 8usize.max(1);
+        let width = 8usize;
         let mut buckets: std::collections::HashMap<u64, Vec<usize>> =
             std::collections::HashMap::new();
         for (idx, emb) in embeddings.iter().enumerate() {
@@ -92,7 +92,9 @@ impl SemanticDedup {
         } else {
             Self::lsh_candidates(embeddings)
                 .into_iter()
-                .filter(|(i, j)| Self::cosine(&embeddings[*i], &embeddings[*j]) >= self.config.threshold)
+                .filter(|(i, j)| {
+                    Self::cosine(&embeddings[*i], &embeddings[*j]) >= self.config.threshold
+                })
                 .collect()
         };
         let mut drop: HashSet<usize> = HashSet::new();

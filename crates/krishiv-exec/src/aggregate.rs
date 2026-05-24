@@ -2,14 +2,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-};
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::join::{AggKey, extract_agg_key};
 use crate::{ExecError, ExecResult};
-use crate::join::{extract_agg_key, AggKey};
 
 // ── LocalAggregator ───────────────────────────────────────────────────────────
 
@@ -65,14 +63,8 @@ impl AggState {
             })
             .collect();
         let has_value = agg_exprs.iter().map(|_| false).collect();
-        let avg_sums = agg_exprs
-            .iter()
-            .map(|expr| if expr.function == AggFunction::Avg { 0.0 } else { 0.0 })
-            .collect();
-        let avg_counts = agg_exprs
-            .iter()
-            .map(|expr| if expr.function == AggFunction::Avg { 0 } else { 0 })
-            .collect();
+        let avg_sums = agg_exprs.iter().map(|_| 0.0).collect();
+        let avg_counts = agg_exprs.iter().map(|_| 0u64).collect();
         Self {
             values,
             has_value,
@@ -81,11 +73,7 @@ impl AggState {
         }
     }
 
-    fn numeric_value(
-        col: &ArrayRef,
-        row: usize,
-        input_column: &str,
-    ) -> ExecResult<f64> {
+    fn numeric_value(col: &ArrayRef, row: usize, input_column: &str) -> ExecResult<f64> {
         match col.data_type() {
             DataType::Int32 => {
                 let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {

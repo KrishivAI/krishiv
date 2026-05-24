@@ -426,7 +426,10 @@ impl RdkafkaKafkaSource {
     /// of already-delivered messages on restart.
     pub fn commit_watermark(&self) {
         use rdkafka::consumer::Consumer;
-        if let Err(e) = self.consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
+        if let Err(e) = self
+            .consumer
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+        {
             tracing::warn!(
                 topic = %self.topic,
                 error = %e,
@@ -457,7 +460,9 @@ impl RdkafkaKafkaSource {
         use std::sync::Arc;
 
         // Try to parse as a JSON object.
-        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload) {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(payload)
+        {
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
             keys.sort_unstable();
 
@@ -788,8 +793,7 @@ mod tests {
     async fn rdkafka_kafka_source_constructor_fails_gracefully_without_broker() {
         // Connecting to an unreachable broker should fail with a descriptive
         // error rather than panicking.
-        let result =
-            super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic");
+        let result = super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic");
         // rdkafka validates config synchronously; creation may succeed or fail
         // depending on platform.  Both are acceptable — we only assert no panic.
         let _ = result;

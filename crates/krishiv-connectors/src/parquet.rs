@@ -288,7 +288,10 @@ mod tests {
         // Reset and read again — should return the same batch.
         source.reset().unwrap();
         let after_reset = source.read_batch().await.unwrap();
-        assert!(after_reset.is_some(), "read after reset should return a batch");
+        assert!(
+            after_reset.is_some(),
+            "read after reset should return a batch"
+        );
         let reset_batch = after_reset.unwrap();
         assert_eq!(
             reset_batch.num_rows(),
@@ -308,7 +311,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(orig_ids.values(), reset_ids.values(), "data must match after reset");
+        assert_eq!(
+            orig_ids.values(),
+            reset_ids.values(),
+            "data must match after reset"
+        );
     }
 
     #[tokio::test]

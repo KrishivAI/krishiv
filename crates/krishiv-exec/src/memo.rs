@@ -126,7 +126,14 @@ mod tests {
         assert!(cache.lookup_or_miss(key).is_none());
         cache.store(key, batch(1)).unwrap();
         let hit = cache.lookup_or_miss(key).unwrap();
-        assert_eq!(hit.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 1);
+        assert_eq!(
+            hit.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
         let (hits, misses, size) = cache.cache_info();
         assert!(hits >= 1);
         assert!(misses >= 1);

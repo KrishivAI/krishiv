@@ -68,12 +68,9 @@ impl CheckpointStorage for ObjectStoreCheckpointStorage {
                     message: format!("object store get: {e}"),
                 }),
                 Ok(Ok(meta)) => {
-                    let bytes = meta
-                        .bytes()
-                        .await
-                        .map_err(|e| CheckpointError::Storage {
-                            message: format!("object store read body: {e}"),
-                        })?;
+                    let bytes = meta.bytes().await.map_err(|e| CheckpointError::Storage {
+                        message: format!("object store read body: {e}"),
+                    })?;
                     Ok(Some(bytes.to_vec()))
                 }
             }
@@ -86,12 +83,16 @@ impl CheckpointStorage for ObjectStoreCheckpointStorage {
         futures::executor::block_on(async move {
             let mut names = Vec::new();
             let mut stream = store.list(Some(&path));
-            while let Some(entry) = stream.next().await.transpose().map_err(|e| {
-                CheckpointError::Storage {
-                    message: format!("object store list: {e}"),
-                }
-            })? {
-                if let Some(name) = entry.location.parts().last() {
+            while let Some(entry) =
+                stream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| CheckpointError::Storage {
+                        message: format!("object store list: {e}"),
+                    })?
+            {
+                if let Some(name) = entry.location.parts().next_back() {
                     names.push(name.as_ref().to_string());
                 }
             }
@@ -104,14 +105,21 @@ impl CheckpointStorage for ObjectStoreCheckpointStorage {
         let path = self.object_path(prefix);
         futures::executor::block_on(async move {
             let mut stream = store.list(Some(&path));
-            while let Some(entry) = stream.next().await.transpose().map_err(|e| {
-                CheckpointError::Storage {
-                    message: format!("object store list for delete: {e}"),
-                }
-            })? {
-                store.delete(&entry.location).await.map_err(|e| CheckpointError::Storage {
-                    message: format!("object store delete: {e}"),
-                })?;
+            while let Some(entry) =
+                stream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| CheckpointError::Storage {
+                        message: format!("object store list for delete: {e}"),
+                    })?
+            {
+                store
+                    .delete(&entry.location)
+                    .await
+                    .map_err(|e| CheckpointError::Storage {
+                        message: format!("object store delete: {e}"),
+                    })?;
             }
             Ok(())
         })

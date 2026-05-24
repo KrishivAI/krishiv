@@ -67,11 +67,7 @@ impl TransactionalKafkaSink {
 impl TwoPhaseCommitSink for TransactionalKafkaSink {
     type Handle = KafkaTxnHandle;
 
-    fn prepare(
-        &mut self,
-        epoch: u64,
-        batch: &RecordBatch,
-    ) -> ConnectorResult<Self::Handle> {
+    fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         if epoch != self.epoch {
             return Err(ConnectorError::IoStr {
                 message: format!("epoch mismatch: expected {}", self.epoch),
@@ -145,15 +141,11 @@ mod tests {
     fn kafka_recovery_fences_zombie_epoch() {
         let reg = TransactionalKafkaRegistry::default();
         let mut old = TransactionalKafkaSink::new("job", 0, 1);
-        let h = old
-            .prepare(1, &single_binary_batch(b"v"))
-            .unwrap();
+        let h = old.prepare(1, &single_binary_batch(b"v")).unwrap();
         reg.register(old);
         reg.fence_previous_epoch("job", 0, 1);
         let mut new = TransactionalKafkaSink::new("job", 0, 2);
-        let h2 = new
-            .prepare(2, &single_binary_batch(b"v2"))
-            .unwrap();
+        let h2 = new.prepare(2, &single_binary_batch(b"v2")).unwrap();
         new.commit(h2).unwrap();
         assert_eq!(new.committed_batches().len(), 1);
         let _ = h; // staged in old sink was fenced
