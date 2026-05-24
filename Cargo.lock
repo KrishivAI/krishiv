@@ -3849,6 +3849,7 @@ dependencies = [
  "arrow",
  "krishiv-async-util",
  "krishiv-exec",
+ "krishiv-flight-sql",
  "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-plan",
@@ -3860,6 +3861,7 @@ dependencies = [
  "parquet 58.3.0",
  "tempfile",
  "tokio",
+ "tonic 0.14.6",
 ]
 
 [[package]]
@@ -3977,6 +3979,7 @@ dependencies = [
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-exec",
+ "krishiv-plan",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-shuffle",
@@ -4010,6 +4013,8 @@ dependencies = [
  "futures",
  "krishiv-api",
  "krishiv-governance",
+ "krishiv-plan",
+ "krishiv-runtime",
  "krishiv-sql",
  "krishiv-sql-policy",
  "prost 0.14.3",
@@ -4141,6 +4146,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "base64 0.22.1",
  "futures",
  "krishiv-async-util",
  "krishiv-exec",
@@ -4149,7 +4155,9 @@ dependencies = [
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-scheduler",
+ "krishiv-sql",
  "krishiv-state",
+ "serde_json",
  "tokio",
  "tonic 0.14.6",
  "tracing",

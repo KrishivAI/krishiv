@@ -100,6 +100,9 @@ pub mod compat;
 #[doc(hidden)]
 pub mod remote_client;
 
+#[doc(hidden)]
+pub mod local_cluster;
+
 /// Convenient glob import for the most common Krishiv types.
 ///
 /// ```rust

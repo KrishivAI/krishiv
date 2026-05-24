@@ -9,15 +9,16 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use krishiv_async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
-    DistributedBackend, EmbeddedBackend, ExecutionBackend, JobId, JobState, SingleNodeBackend,
+    build_execution_runtime, BatchTableRegistration, ExecutionRuntime, InProcessCluster, JobId,
+    JobState, RuntimeMode,
 };
 use krishiv_sql::{SqlDataFrame, SqlEngine};
 use krishiv_sql_policy::PolicyEnforcingSqlEngine;
@@ -27,8 +28,8 @@ pub use arrow::record_batch::RecordBatch;
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_exec::{AggExpr, AggFunction};
 pub use krishiv_runtime::{
-    InProcessStreamingRuntime, LocalWindowExecutionSpec, LocalWindowKind,
-    execute_windowed_in_process, execute_windowed_stream, is_streaming_plan,
+    ClusterEndpoints, InProcessStreamingRuntime, LocalWindowExecutionSpec, LocalWindowKind,
+    execute_windowed_stream, is_streaming_plan,
 };
 pub use krishiv_runtime::{JobStatus, LocalJobRegistry};
 pub use krishiv_state::TtlConfig;
@@ -189,7 +190,10 @@ pub struct SessionBuilder {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     coordinator_url: Option<String>,
+    local_cluster_grpc: Option<String>,
     state_ttl: Option<StateTtlConfig>,
+    /// When true, route data-plane work to the remote Flight endpoint (no local fallback).
+    remote_execution: bool,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -199,7 +203,9 @@ impl fmt::Debug for SessionBuilder {
             .field("auth", &self.auth.as_ref().map(|_| "<AuthProvider>"))
             .field("policy", &self.policy.as_ref().map(|_| "<PolicyHook>"))
             .field("coordinator_url", &self.coordinator_url)
+            .field("local_cluster_grpc", &self.local_cluster_grpc)
             .field("state_ttl", &self.state_ttl)
+            .field("remote_execution", &self.remote_execution)
             .finish()
     }
 }
@@ -211,8 +217,41 @@ impl Default for SessionBuilder {
             auth: None,
             policy: None,
             coordinator_url: None,
+            local_cluster_grpc: None,
             state_ttl: None,
+            remote_execution: remote_execution_from_env(),
         }
+    }
+}
+
+fn remote_execution_from_env() -> bool {
+    std::env::var("KRISHIV_REMOTE_EXEC")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
+    static RUNTIME: OnceLock<Arc<dyn ExecutionRuntime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let cluster = Arc::new(
+                InProcessCluster::new().expect("shared embedded in-process cluster"),
+            );
+            build_execution_runtime(RuntimeMode::Embedded, cluster, None, false)
+        })
+        .clone()
+}
+
+fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
+    match mode {
+        ExecutionMode::Embedded => RuntimeMode::Embedded,
+        ExecutionMode::SingleNode => RuntimeMode::SingleNode,
+        ExecutionMode::Distributed => RuntimeMode::Distributed,
     }
 }
 
@@ -253,6 +292,24 @@ impl SessionBuilder {
         self
     }
 
+    /// Connect a [`ExecutionMode::SingleNode`] session to a local cluster without
+    /// switching to distributed mode (Spark-like `local[*]` client).
+    #[must_use]
+    pub fn with_local_cluster(mut self, flight_url: impl Into<String>) -> Self {
+        self.local_cluster_grpc = None;
+        self.coordinator_url = Some(flight_url.into());
+        self.mode = ExecutionMode::SingleNode;
+        self
+    }
+
+    /// When true, batch and streaming data-plane work is routed to the remote Flight
+    /// endpoint instead of the session-embedded in-process cluster.
+    #[must_use]
+    pub fn with_remote_execution(mut self, enabled: bool) -> Self {
+        self.remote_execution = enabled;
+        self
+    }
+
     /// Attach streaming operator state TTL (wired to `krishiv-state` backends).
     #[must_use]
     pub fn with_state_ttl(mut self, ttl: StateTtlConfig) -> Self {
@@ -272,6 +329,17 @@ impl SessionBuilder {
             )),
             _ => None,
         };
+        let local_cluster = Arc::new(
+            InProcessCluster::new().map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?,
+        );
+        let runtime = build_execution_runtime(
+            execution_mode_to_runtime_mode(self.mode),
+            Arc::clone(&local_cluster),
+            self.coordinator_url.clone(),
+            self.remote_execution,
+        );
         Ok(Session {
             mode: self.mode,
             sql_engine,
@@ -282,6 +350,10 @@ impl SessionBuilder {
             state_ttl: self.state_ttl,
             memory_streams: Arc::new(RwLock::new(HashMap::new())),
             udf_registry,
+            local_cluster,
+            runtime,
+            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
+            stream_jobs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -298,6 +370,10 @@ pub struct Session {
     state_ttl: Option<StateTtlConfig>,
     memory_streams: Arc<RwLock<HashMap<String, Vec<RecordBatch>>>>,
     udf_registry: Arc<RwLock<UdfRegistry>>,
+    local_cluster: Arc<InProcessCluster>,
+    runtime: Arc<dyn ExecutionRuntime>,
+    registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+    stream_jobs: Arc<RwLock<HashMap<String, LocalWindowExecutionSpec>>>,
 }
 
 impl fmt::Debug for Session {
@@ -337,13 +413,59 @@ impl Session {
         self.state_ttl.map(StateTtlConfig::to_ttl_config)
     }
 
+    /// Session-scoped local coordinator + executor cluster.
+    pub fn local_cluster(&self) -> &InProcessCluster {
+        &self.local_cluster
+    }
+
+    /// Unified execution runtime for this session.
+    pub fn execution_runtime(&self) -> Arc<dyn ExecutionRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
+    /// Submit a continuous streaming job (unbounded sources). Returns a handle id.
+    pub fn submit_stream_job(
+        &self,
+        name: impl Into<String>,
+        spec: LocalWindowExecutionSpec,
+    ) -> Result<String> {
+        let name = name.into();
+        let plan = PhysicalPlan::new(format!("stream:continuous:{name}"), ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan).map_err(KrishivError::from)?;
+        self.runtime
+            .register_continuous_stream(&name, &spec)
+            .map_err(KrishivError::from)?;
+        self.stream_jobs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.clone(), spec);
+        Ok(name)
+    }
+
+    /// Push input batches to a continuous streaming job.
+    pub fn push_stream_job_input(
+        &self,
+        job_id: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        self.runtime
+            .push_continuous_stream_input(job_id, batches)
+            .map_err(KrishivError::from)
+    }
+
+    /// Asynchronously drain newly emitted batches from a continuous streaming job.
+    pub async fn poll_stream_job(&self, job_id: &str) -> Result<Vec<RecordBatch>> {
+        self.runtime
+            .drain_continuous_stream(job_id)
+            .map_err(KrishivError::from)
+    }
+
     /// Register in-memory stream batches for `memory:<name>` pipeline sources.
     pub fn register_memory_stream(
         &self,
         name: impl Into<String>,
         batches: Vec<RecordBatch>,
     ) -> Result<()> {
-        ensure_local_mode(self.mode)?;
         self.memory_streams
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -399,15 +521,19 @@ impl Session {
         table_name: impl AsRef<str>,
         path: impl AsRef<Path>,
     ) -> Result<()> {
-        ensure_local_mode(self.mode)?;
         let table_name = table_name.as_ref().to_owned();
         let path = path.as_ref().to_path_buf();
         block_on(async {
             self.sql_engine
-                .register_parquet(table_name, path)
+                .register_parquet(&table_name, &path)
                 .await
-                .map_err(Into::into)
-        })
+                .map_err(KrishivError::from)
+        })?;
+        self.registered_parquet
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table_name, path);
+        Ok(())
     }
 
     /// Asynchronously register a local Parquet path as a SQL table.
@@ -416,22 +542,40 @@ impl Session {
         table_name: impl AsRef<str>,
         path: impl AsRef<Path>,
     ) -> Result<()> {
-        ensure_local_mode(self.mode)?;
+        let table_name = table_name.as_ref().to_owned();
+        let path = path.as_ref().to_path_buf();
         self.sql_engine
-            .register_parquet(table_name, path)
+            .register_parquet(&table_name, &path)
             .await
-            .map_err(Into::into)
+            .map_err(KrishivError::from)?;
+        self.registered_parquet
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table_name, path);
+        Ok(())
+    }
+
+    fn dataframe_from_sql(&self, sql_dataframe: SqlDataFrame) -> DataFrame {
+        let sql_query = sql_dataframe.query().map(str::to_owned);
+        DataFrame::from_sql_dataframe(
+            self.mode,
+            sql_dataframe,
+            sql_query,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.coordinator_url.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        )
     }
 
     /// Create a DataFrame from a SQL query.
     pub fn sql(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         block_on(self.sql_async(query))
     }
 
     /// Asynchronously create a DataFrame from a SQL query.
     pub async fn sql_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         if self.policy_engine.is_some() {
             return Err(KrishivError::AccessDenied {
                 reason: "session has a policy engine configured; use sql_as() to execute SQL with an authenticated principal".into(),
@@ -439,13 +583,7 @@ impl Session {
         }
         let query = query.as_ref().to_owned();
         let sql_dataframe = self.sql_engine.sql(&query).await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Execute SQL authenticated as the principal identified by `api_key`.
@@ -467,21 +605,37 @@ impl Session {
                 reason: e.to_string(),
             })?;
         let query_str = query.as_ref();
-        let batches = engine
-            .execute_as(&principal, query_str)
-            .await
+        let effective_sql = engine
+            .prepare_authorized_query(&principal, query_str)
+            .map_err(KrishivError::from)?;
+        let tables = self
+            .registered_parquet
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+            .collect::<Vec<_>>();
+        let batches = runtime_collect_batch_sql(
+            Arc::clone(&self.runtime),
+            &effective_sql,
+            &tables,
+        )
+        .await?;
+        let masked = engine
+            .mask_result_batches(&principal, query_str, batches)
             .map_err(KrishivError::from)?;
         Ok(DataFrame::from_batches(
             self.mode,
-            batches,
+            masked,
             self.jobs.clone(),
             self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
         ))
     }
 
     /// Create a DataFrame by reading a local Parquet path directly.
     pub fn read_parquet(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         let path = path.as_ref().to_path_buf();
         block_on(self.read_parquet_async(path))
     }
@@ -492,15 +646,8 @@ impl Session {
         path: impl AsRef<str>,
         version: Option<i64>,
     ) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         let sql_dataframe = self.sql_engine.read_delta(path, version).await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Read a Hudi table directory (R18).
@@ -510,31 +657,19 @@ impl Session {
         query_type: krishiv_lakehouse::HudiQueryType,
         begin_instant: Option<&str>,
     ) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
         let sql_dataframe = self
             .sql_engine
             .read_hudi(path, query_type, begin_instant)
             .await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.
     pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame> {
-        ensure_local_mode(self.mode)?;
-        let sql_dataframe = self.sql_engine.read_parquet(path).await?;
-        Ok(DataFrame::from_sql_dataframe(
-            self.mode,
-            sql_dataframe,
-            self.jobs.clone(),
-            self.next_job_id.clone(),
-            self.coordinator_url.clone(),
-        ))
+        let path = path.as_ref();
+        let table = parquet_scan_table_name(path);
+        self.register_parquet_async(&table, path).await?;
+        self.sql_async(format!("SELECT * FROM {table}")).await
     }
 
     /// Create a bounded local memory stream.
@@ -542,7 +677,8 @@ impl Session {
         let name = name.into();
         let record_batches: Vec<RecordBatch> =
             batches.iter().map(|b| b.batch().clone()).collect();
-        let _ = self.register_memory_stream(name.clone(), record_batches);
+        self.register_memory_stream(name.clone(), record_batches)
+            .expect("memory stream registration");
         Stream::for_session(
             name,
             StreamMode::Bounded,
@@ -550,6 +686,7 @@ impl Session {
             self.mode,
             self.coordinator_url.clone(),
             self.state_ttl.map(|c| c.ttl_ms()),
+            self.runtime.clone(),
         )
     }
 
@@ -562,15 +699,17 @@ impl Session {
             self.mode,
             self.coordinator_url.clone(),
             self.state_ttl.map(|c| c.ttl_ms()),
+            self.runtime.clone(),
         )
     }
 }
 
 /// DataFrame API backed by DataFusion for R1 local execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DataFrame {
     logical_plan: LogicalPlan,
     sql_dataframe: Option<SqlDataFrame>,
+    sql_query: Option<String>,
     /// Pre-collected batches — set when the DataFrame is constructed from
     /// already-executed results (e.g. [`Session::sql_as`]).
     pre_collected: Option<Vec<RecordBatch>>,
@@ -578,6 +717,19 @@ pub struct DataFrame {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     coordinator_url: Option<String>,
+    runtime: Arc<dyn ExecutionRuntime>,
+    registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+}
+
+impl fmt::Debug for DataFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataFrame")
+            .field("logical_plan", &self.logical_plan)
+            .field("mode", &self.mode)
+            .field("has_sql_query", &self.sql_query.is_some())
+            .field("pre_collected", &self.pre_collected.as_ref().map(|b| b.len()))
+            .finish_non_exhaustive()
+    }
 }
 
 impl DataFrame {
@@ -586,30 +738,39 @@ impl DataFrame {
         Self {
             logical_plan,
             sql_dataframe: None,
+            sql_query: None,
             pre_collected: None,
             mode: ExecutionMode::Embedded,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: None,
+            runtime: shared_embedded_runtime(),
+            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     fn from_sql_dataframe(
         mode: ExecutionMode,
         sql_dataframe: SqlDataFrame,
+        sql_query: Option<String>,
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
         coordinator_url: Option<String>,
+        runtime: Arc<dyn ExecutionRuntime>,
+        registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
             logical_plan,
             sql_dataframe: Some(sql_dataframe),
+            sql_query,
             pre_collected: None,
             mode,
             jobs,
             next_job_id,
             coordinator_url,
+            runtime,
+            registered_parquet,
         }
     }
 
@@ -621,20 +782,23 @@ impl DataFrame {
         batches: Vec<RecordBatch>,
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
+        runtime: Arc<dyn ExecutionRuntime>,
+        registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
     ) -> Self {
         let logical_plan = LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
         Self {
             logical_plan,
             sql_dataframe: None,
+            sql_query: None,
             pre_collected: Some(batches),
             mode,
             jobs,
             next_job_id,
             coordinator_url: None,
+            runtime,
+            registered_parquet,
         }
     }
-
-    /// Borrow the Krishiv logical plan wrapper.
     pub fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
     }
@@ -646,7 +810,9 @@ impl DataFrame {
 
     /// Asynchronously explain the current plan.
     pub async fn explain_async(&self) -> Result<String> {
-        ensure_local_mode(self.mode)?;
+        if let Some(query) = self.sql_query.as_deref() {
+            return self.runtime.explain_sql(query).map_err(KrishivError::from);
+        }
         match &self.sql_dataframe {
             Some(dataframe) => dataframe.explain().await.map_err(Into::into),
             None => Ok(self.logical_plan.describe()),
@@ -668,25 +834,32 @@ impl DataFrame {
 
     /// Asynchronously collect results.
     pub async fn collect_async(&self) -> Result<QueryResult> {
-        ensure_local_mode(self.mode)?;
         let job_id = self.start_job("local-dataframe");
         self.update_job(&job_id, "local-dataframe", JobState::Running);
 
-        // If this DataFrame wraps pre-collected batches (e.g. from sql_as),
-        // return them directly without going through DataFusion again.
         if let Some(batches) = &self.pre_collected {
             self.update_job(&job_id, "local-dataframe", JobState::Succeeded);
             return Ok(QueryResult::new(batches.clone()));
         }
 
-        let result = if let Err(error) = accept_plan_with_backend(
-            self.mode,
-            self.logical_plan.name(),
-            self.logical_plan.kind(),
-            self.coordinator_url.as_deref(),
-        ) {
-            Err(error)
+        let result = if let Some(query) = self.sql_query.as_deref() {
+            let tables = self
+                .registered_parquet
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+                .collect::<Vec<_>>();
+            runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables)
+                .await
+                .map(QueryResult::new)
         } else {
+            self.runtime
+                .accept_plan(&PhysicalPlan::new(
+                    self.logical_plan.name(),
+                    self.logical_plan.kind(),
+                ))
+                .map_err(KrishivError::from)?;
             match &self.sql_dataframe {
                 Some(dataframe) => dataframe
                     .collect()
@@ -724,7 +897,7 @@ impl DataFrame {
 }
 
 /// Stream API for R1 local memory streams.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Stream {
     name: String,
     mode: StreamMode,
@@ -732,6 +905,18 @@ pub struct Stream {
     coordinator_url: Option<String>,
     state_ttl_ms: Option<u64>,
     batches: Vec<StreamBatch>,
+    runtime: Arc<dyn ExecutionRuntime>,
+}
+
+impl fmt::Debug for Stream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stream")
+            .field("name", &self.name)
+            .field("mode", &self.mode)
+            .field("execution_mode", &self.execution_mode)
+            .field("batch_count", &self.batches.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Stream {
@@ -744,7 +929,15 @@ impl Stream {
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
     ) -> Self {
-        Self::for_session(name, mode, batches, execution_mode, None, None)
+        Self::for_session(
+            name,
+            mode,
+            batches,
+            execution_mode,
+            None,
+            None,
+            shared_embedded_runtime(),
+        )
     }
 
     fn for_session(
@@ -754,6 +947,7 @@ impl Stream {
         execution_mode: ExecutionMode,
         coordinator_url: Option<String>,
         state_ttl_ms: Option<u64>,
+        runtime: Arc<dyn ExecutionRuntime>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -762,6 +956,7 @@ impl Stream {
             coordinator_url,
             state_ttl_ms,
             batches,
+            runtime,
         }
     }
 
@@ -787,19 +982,14 @@ impl Stream {
 
     /// Collect bounded in-memory stream batches.
     pub fn collect_bounded(&self) -> Result<Vec<StreamBatch>> {
-        ensure_local_mode(self.execution_mode)?;
         if !self.is_bounded() {
             return Err(KrishivError::unsupported(
                 "unbounded stream collection requires a streaming runtime",
             ));
         }
 
-        accept_plan_with_backend(
-            self.execution_mode,
-            &self.name,
-            ExecutionKind::Streaming,
-            self.coordinator_url.as_deref(),
-        )?;
+        let plan = PhysicalPlan::new(&self.name, ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan)?;
         Ok(self.batches.clone())
     }
 
@@ -816,13 +1006,8 @@ impl Stream {
             ));
         }
 
-        ensure_local_mode(self.execution_mode)?;
-        accept_plan_with_backend(
-            self.execution_mode,
-            &format!("{}:map", self.name),
-            ExecutionKind::Streaming,
-            self.coordinator_url.as_deref(),
-        )?;
+        let plan = PhysicalPlan::new(format!("{}:map", self.name), ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan)?;
 
         Ok(Self::for_session(
             self.name.clone(),
@@ -831,24 +1016,20 @@ impl Stream {
             self.execution_mode,
             self.coordinator_url.clone(),
             self.state_ttl_ms,
+            self.runtime.clone(),
         ))
     }
 
     /// Filter local stream batches.
     pub fn filter_batches(&self, mut f: impl FnMut(&StreamBatch) -> bool) -> Result<Stream> {
-        ensure_local_mode(self.execution_mode)?;
         if !self.is_bounded() {
             return Err(KrishivError::unsupported(
                 "unbounded stream filtering requires a streaming runtime",
             ));
         }
 
-        accept_plan_with_backend(
-            self.execution_mode,
-            &format!("{}:filter", self.name),
-            ExecutionKind::Streaming,
-            self.coordinator_url.as_deref(),
-        )?;
+        let plan = PhysicalPlan::new(format!("{}:filter", self.name), ExecutionKind::Streaming);
+        self.runtime.accept_plan(&plan)?;
 
         Ok(Self::for_session(
             self.name.clone(),
@@ -861,6 +1042,7 @@ impl Stream {
             self.execution_mode,
             self.coordinator_url.clone(),
             self.state_ttl_ms,
+            self.runtime.clone(),
         ))
     }
 
@@ -875,6 +1057,7 @@ impl Stream {
             key_column: column.into(),
             event_time_column: None,
             watermark_spec: None,
+            multi_source_watermark: None,
             inner: self,
         }
     }
@@ -914,6 +1097,7 @@ pub struct KeyedStream {
     key_column: String,
     event_time_column: Option<String>,
     watermark_spec: Option<WatermarkSpec>,
+    multi_source_watermark: Option<MultiSourceWatermarkSpec>,
 }
 
 impl KeyedStream {
@@ -929,6 +1113,18 @@ impl KeyedStream {
     pub fn watermark(mut self, spec: WatermarkSpec) -> Self {
         self.watermark_spec = Some(spec);
         self
+    }
+
+    /// Configure multi-source watermark reconciliation (R5.2).
+    #[must_use]
+    pub fn with_multi_source_watermark(mut self, spec: MultiSourceWatermarkSpec) -> Self {
+        self.multi_source_watermark = Some(spec);
+        self
+    }
+
+    /// Multi-source watermark configuration, if set.
+    pub fn multi_source_watermark(&self) -> Option<&MultiSourceWatermarkSpec> {
+        self.multi_source_watermark.as_ref()
     }
 
     /// Create a tumbling event-time window of `window_size_ms` milliseconds.
@@ -1016,6 +1212,20 @@ fn event_time_column_for_keyed(keyed: &KeyedStream) -> Result<String> {
     })
 }
 
+fn apply_multi_source_watermark(
+    keyed: &KeyedStream,
+    spec: &mut LocalWindowExecutionSpec,
+) {
+    if let Some(ms) = keyed.multi_source_watermark() {
+        spec.source_watermark_lags = ms
+            .source_specs()
+            .iter()
+            .map(|(id, ws)| (id.clone(), ws.lag_ms()))
+            .collect();
+        spec.source_id_column = Some(String::from("source_id"));
+    }
+}
+
 fn build_tumbling_spec(
     keyed: &KeyedStream,
     window_size_ms: u64,
@@ -1023,7 +1233,7 @@ fn build_tumbling_spec(
 ) -> Result<LocalWindowExecutionSpec> {
     let event_time = event_time_column_for_keyed(keyed)?;
     let lag = keyed.watermark_spec().map(WatermarkSpec::lag_ms).unwrap_or(0);
-    Ok(LocalWindowExecutionSpec {
+    let mut spec = LocalWindowExecutionSpec {
         key_column: keyed.key_column.clone(),
         event_time_column: event_time,
         watermark_lag_ms: lag,
@@ -1031,38 +1241,36 @@ fn build_tumbling_spec(
         window_size_ms,
         agg_exprs,
         state_ttl_ms: keyed.inner.state_ttl_ms,
-    })
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+    };
+    apply_multi_source_watermark(keyed, &mut spec);
+    Ok(spec)
 }
 
 fn execute_windowed_inner(
     stream: &Stream,
     spec: LocalWindowExecutionSpec,
 ) -> Result<Vec<StreamBatch>> {
-    ensure_local_mode(stream.execution_mode)?;
     if !stream.is_bounded() {
         return Err(KrishivError::unsupported(
-            "unbounded stream window execution requires a streaming runtime",
+            "unbounded stream window execution requires Session::submit_stream_job",
         ));
     }
-    accept_plan_with_backend(
-        stream.execution_mode,
-        &format!("stream:tw:{}", stream.name()),
-        ExecutionKind::Streaming,
-        stream.coordinator_url.as_deref(),
-    )?;
+    let plan_name = krishiv_runtime::fragment_from_local_spec(&spec);
+    stream
+        .runtime
+        .accept_plan(&PhysicalPlan::new(plan_name, ExecutionKind::Streaming))
+        .map_err(KrishivError::from)?;
     let input: Vec<RecordBatch> = stream
         .batches
         .iter()
         .map(|b| b.batch().clone())
         .collect();
-    let output = match stream.execution_mode {
-        ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-            execute_windowed_in_process(stream.name(), input, &spec).map_err(KrishivError::from)?
-        }
-        ExecutionMode::Distributed => {
-            execute_windowed_stream(input, &spec).map_err(KrishivError::from)?
-        }
-    };
+    let output = stream
+        .runtime
+        .collect_bounded_window(stream.name(), input, &spec)
+        .map_err(KrishivError::from)?;
     Ok(output
         .into_iter()
         .enumerate()
@@ -1197,7 +1405,7 @@ impl SessionWindowedStream {
             .watermark_spec()
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
-        let spec = LocalWindowExecutionSpec {
+        let mut spec = LocalWindowExecutionSpec {
             key_column: self.keyed.key_column.clone(),
             event_time_column: event_time,
             watermark_lag_ms: lag,
@@ -1207,7 +1415,10 @@ impl SessionWindowedStream {
             window_size_ms: self.session_gap_ms,
             agg_exprs,
             state_ttl_ms: self.keyed.inner.state_ttl_ms,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         };
+        apply_multi_source_watermark(&self.keyed, &mut spec);
         execute_windowed_inner(&self.keyed.inner, spec)
     }
 }
@@ -1226,7 +1437,7 @@ impl SlidingWindowedStream {
             .watermark_spec()
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
-        let spec = LocalWindowExecutionSpec {
+        let mut spec = LocalWindowExecutionSpec {
             key_column: self.keyed.key_column.clone(),
             event_time_column: event_time,
             watermark_lag_ms: lag,
@@ -1236,7 +1447,10 @@ impl SlidingWindowedStream {
             window_size_ms: self.window_size_ms,
             agg_exprs,
             state_ttl_ms: self.keyed.inner.state_ttl_ms,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
         };
+        apply_multi_source_watermark(&self.keyed, &mut spec);
         execute_windowed_inner(&self.keyed.inner, spec)
     }
 }
@@ -1261,45 +1475,31 @@ impl KeyedStream {
     }
 }
 
-fn ensure_local_mode(mode: ExecutionMode) -> Result<()> {
-    if mode == ExecutionMode::Distributed {
-        return Err(KrishivError::unsupported(
-            "operation requires embedded or single-node mode; use SessionBuilder without \
-             with_coordinator, or use distributed APIs explicitly",
-        ));
-    }
-    Ok(())
+fn parquet_scan_table_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("scan");
+    let sanitized: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("_krishiv_parquet_{sanitized}")
 }
 
-fn accept_plan_with_backend(
-    mode: ExecutionMode,
-    plan_name: &str,
-    kind: ExecutionKind,
-    coordinator_url: Option<&str>,
-) -> Result<()> {
-    let physical_plan = PhysicalPlan::new(plan_name, kind);
-
-    match mode {
-        ExecutionMode::Embedded => {
-            let mut backend = EmbeddedBackend::default();
-            backend.execute(&physical_plan)?;
-        }
-        ExecutionMode::SingleNode => {
-            let mut backend = SingleNodeBackend;
-            backend.execute(&physical_plan)?;
-        }
-        ExecutionMode::Distributed => {
-            let url = coordinator_url.ok_or_else(|| {
-                KrishivError::unsupported(
-                    "distributed mode requires a coordinator URL; use SessionBuilder::with_coordinator",
-                )
-            })?;
-            let mut backend = DistributedBackend::new(url);
-            backend.execute(&physical_plan)?;
-        }
-    }
-
-    Ok(())
+async fn runtime_collect_batch_sql(
+    runtime: Arc<dyn ExecutionRuntime>,
+    query: &str,
+    tables: &[BatchTableRegistration],
+) -> Result<Vec<RecordBatch>> {
+    let query = query.to_owned();
+    let tables = tables.to_vec();
+    tokio::task::spawn_blocking(move || runtime.collect_batch_sql(&query, &tables))
+        .await
+        .map_err(|e| KrishivError::Runtime {
+            message: format!("runtime collect task failed: {e}"),
+        })?
+        .map_err(KrishivError::from)
 }
 
 #[cfg(test)]
@@ -1312,9 +1512,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DataType, ExecutionMode, Field, KrishivError, RecordBatch, Schema, Session, SessionBuilder,
-        StreamBatch,
+        DataType, ExecutionMode, Field, KrishivError, LocalWindowKind, RecordBatch, Schema,
+        Session, SessionBuilder, StreamBatch,
     };
+    use std::collections::HashMap;
 
     // ── P0.3 regression: block_on must reuse the current runtime ────────────────
 
@@ -1590,6 +1791,91 @@ mod tests {
     }
 
     #[test]
+    fn sliding_window_collect_via_unified_runtime() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 5_000, 2_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .sliding_window(10_000, 5_000)
+            .collect()
+            .expect("sliding collect");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn session_window_collect_via_unified_runtime() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 8_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .session_window(5_000)
+            .collect()
+            .expect("session collect");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn session_reuses_coordinator_across_window_collects() {
+        let session = Session::builder().build().unwrap();
+        let ptr_before = session
+            .local_cluster()
+            .streaming_runtime()
+            .coordinator_instance_id();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch.clone())]);
+            let _ = stream
+                .key_by("user_id")
+                .with_event_time("ts")
+                .tumbling_window(10_000)
+                .collect()
+                .expect("collect");
+        }
+        let ptr_after = session
+            .local_cluster()
+            .streaming_runtime()
+            .coordinator_instance_id();
+        assert_eq!(ptr_before, ptr_after);
+    }
+
+    #[test]
     fn watermark_spec_lag_ms_roundtrip() {
         let spec = WatermarkSpec::fixed_lag_ms(30_000);
         assert_eq!(spec.lag_ms(), 30_000);
@@ -1822,5 +2108,158 @@ mod tests {
             session.coordinator_url.as_deref(),
             Some("http://coord:50051")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_session_sql_collects_via_local_coordinator() {
+        let session = Session::builder()
+            .with_coordinator("http://127.0.0.1:50051")
+            .build()
+            .unwrap();
+        let df = session.sql_async("SELECT 3 AS n").await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_window_collect_via_local_cluster() {
+        let session = Session::builder()
+            .with_local_cluster("http://127.0.0.1:50051")
+            .build()
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .tumbling_window(10_000)
+            .collect()
+            .expect("distributed window collect");
+        assert!(!out.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_read_parquet_collects_via_coordinator() {
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+        let session = Session::builder()
+            .with_coordinator("http://127.0.0.1:50051")
+            .build()
+            .unwrap();
+        let df = session.read_parquet_async(&parquet_path).await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continuous_stream_job_poll_drains_via_coordinator() {
+        use krishiv_runtime::LocalWindowExecutionSpec;
+
+        let session = Session::builder().build().unwrap();
+        let spec = LocalWindowExecutionSpec {
+            key_column: "user_id".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: LocalWindowKind::Tumbling,
+            window_size_ms: 10_000,
+            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+        };
+        session.submit_stream_job("events", spec).expect("submit");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        session
+            .push_stream_job_input("events", vec![batch])
+            .expect("push");
+        let _ = session.poll_stream_job("events").await.expect("poll");
+    }
+
+    #[test]
+    fn multi_source_watermark_window_collect_with_source_column() {
+        let session = Session::builder().build().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("source_id", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+                Arc::new(StringArray::from(vec!["src-a"])) as _,
+            ],
+        )
+        .unwrap();
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+        let out = stream
+            .key_by("user_id")
+            .with_event_time("ts")
+            .with_multi_source_watermark(
+                MultiSourceWatermarkSpec::new()
+                    .source("src-a", WatermarkSpec::fixed_lag_ms(0))
+                    .source("src-b", WatermarkSpec::fixed_lag_ms(0)),
+            )
+            .tumbling_window(10_000)
+            .collect()
+            .expect("multi-source collect");
+        assert!(!out.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_execution_without_fallback_uses_flight_server() {
+        use std::net::SocketAddr;
+
+        use krishiv_flight_sql::make_flight_sql_server;
+        use tonic::transport::Server;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(make_flight_sql_server())
+                .serve_with_incoming(incoming)
+                .await
+                .expect("serve");
+        });
+
+        let url = format!("http://{addr}");
+        let session = Session::builder()
+            .with_coordinator(&url)
+            .with_remote_execution(true)
+            .build()
+            .unwrap();
+        assert!(session.execution_runtime().uses_remote_execution());
+        let df = session.sql_async("SELECT 99 AS n").await.unwrap();
+        let result = df.collect_async().await.unwrap();
+        assert_eq!(result.row_count(), 1);
+        server.abort();
     }
 }

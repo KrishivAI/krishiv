@@ -164,6 +164,7 @@ pub(crate) async fn execute_batch_fragment(
         };
         return Ok(
             ExecutorTaskOutput::sql(row_count, batches.len(), column_count)
+                .with_record_batches(batches)
                 .with_runtime_stats(runtime_stats),
         );
     }

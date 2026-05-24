@@ -13,12 +13,15 @@ krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-async-util = { path = "../krishiv-async-util" }
+krishiv-sql = { path = "../krishiv-sql" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }

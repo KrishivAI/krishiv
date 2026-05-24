@@ -1,9 +1,6 @@
-//! Execute a Python [`StreamPipeline`] through the in-process window runtime.
+//! Execute a Python [`StreamPipeline`] through the unified session execution runtime.
 
-use krishiv_api::{
-    AggExpr, AggFunction, ExecutionMode, LocalWindowExecutionSpec, LocalWindowKind,
-};
-use krishiv_runtime::{execute_windowed_in_process, execute_windowed_stream};
+use krishiv_api::{AggExpr, AggFunction, LocalWindowExecutionSpec, LocalWindowKind};
 use pyo3::prelude::*;
 
 use crate::agg::{AggDescriptor, AggKind};
@@ -39,8 +36,8 @@ fn resolve_input_batches(
     }
     let upper = pipeline.source_id.to_ascii_uppercase();
     if upper.contains("SELECT") || upper.contains("FROM") {
-        let df = block_on_async(pipeline.session.sql(&pipeline.source_id))?;
-        let result = df.collect()?;
+        let df = block_on_async(pipeline.session.sql_async(&pipeline.source_id))?;
+        let result = block_on_async(df.collect_async())?;
         return Ok(result.batches().to_vec());
     }
     Err(krishiv_api::KrishivError::unsupported(
@@ -96,22 +93,30 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
         window_size_ms: window.size_ms,
         agg_exprs,
         state_ttl_ms,
+        source_watermark_lags: std::collections::HashMap::new(),
+        source_id_column: None,
     };
     let input = resolve_input_batches(pipeline).map_err(map_krishiv_error)?;
     let topic = pipeline
         .source_id
         .strip_prefix("memory:")
         .unwrap_or(pipeline.source_id.as_str());
-    let output = match pipeline.session.execution_mode() {
-        ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-            execute_windowed_in_process(topic, input, &spec).map_err(map_krishiv_error)?
-        }
-        ExecutionMode::Distributed => {
-            execute_windowed_stream(input, &spec).map_err(map_krishiv_error)?
-        }
-    };
+    let plan_name = krishiv_runtime::fragment_from_local_spec(&spec);
+    pipeline
+        .session
+        .execution_runtime()
+        .accept_plan(&krishiv_plan::PhysicalPlan::new(
+            plan_name,
+            krishiv_plan::ExecutionKind::Streaming,
+        ))
+        .map_err(map_krishiv_error)?;
+    let output = pipeline
+        .session
+        .execution_runtime()
+        .collect_bounded_window(topic, input, &spec)
+        .map_err(map_krishiv_error)?;
     Ok(output
         .into_iter()
-        .map(|batch| PyBatch::from_record_batch(batch))
+        .map(PyBatch::from_record_batch)
         .collect())
 }

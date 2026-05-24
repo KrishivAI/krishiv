@@ -2,6 +2,28 @@
 
 ## Current Phase
 
+**Unified execution mode parity (2026-05-24).** Branch `cursor/unified-execution-phase0-1-7ffe` (PR #43):
+- **C2:** `SessionBuilder::with_remote_execution(true)` + `KRISHIV_REMOTE_EXEC=1` disables local fallback; data plane routes to Flight.
+- **C3:** Flight comment protocol for catalog sync (`krishiv-register-parquet`) + shared `FlightExecutionHost` on server.
+- **C4:** `sql_as` authorizes client-side, executes via `collect_batch_sql`, masks results.
+- **Remote streaming:** bounded window + continuous register/push/drain over Flight protocol.
+- **explain_async:** `ExecutionRuntime::explain_sql` (local + remote).
+- **Python:** `submit_stream_job`, `push_stream_job_input`, `poll_stream_job`; `stream_exec` single async collect path.
+- **Local cluster:** `krishiv local start` spawns `krishiv-flight-server` on `:50051`.
+- **Cleanup:** removed `accept_plan_with_backend`; shared embedded runtime for orphan `DataFrame`/`Stream::new`.
+- **Test:** `remote_execution_without_fallback_uses_flight_server`.
+
+```bash
+cargo +stable test -p krishiv-plan -p krishiv-exec -p krishiv-runtime -p krishiv-executor -p krishiv-api -p krishiv-flight-sql -p krishiv-sql-policy --lib
+```
+
+**Unified execution (2026-05-24).** Branch `cursor/unified-execution-phase0-1-7ffe`:
+- **ADR-13.1–13.7:** `ExecutionRuntime`, session-scoped `InProcessCluster`, unified `execute_bounded_window` for all window kinds (tumbling/sliding/session), TTL, full agg support.
+- **Fragments:** `stream:tw|sw|ses` encoding in `krishiv-plan::window`; executor delegates to operator runtime (canonical watermark semantics).
+- **Modes:** Embedded/SingleNode/Distributed window collect through `ExecutionRuntime`; Python unified; `Session::submit_stream_job` for continuous jobs.
+- **Spark-like local:** `krishiv local start|stop|status`; `SessionBuilder::with_local_cluster`; `KRISHIV_COORDINATOR` for single-node SQL.
+- **Docs:** [unified-execution-model.md](../architecture/unified-execution-model.md), [unified-execution-tracker.md](unified-execution-tracker.md).
+
 **ADR-12.4 follow-ups (2026-05-24).** Branch `cursor/adr124-memory-stream-ttl-cbbd` (extends embedded/streaming fixes on `main`):
 - **ADR-12.4:** `InProcessCoordinatorBridge` + `InProcessStreamingRuntime` — coordinator submits jobs, pushes assignments to `ExecutorAssignmentInbox`, executor runs via `ExecutorTaskRunner::run_next_with` (no tonic for `inprocess://` endpoints).
 - **State TTL:** `LocalWindowExecutionSpec.state_ttl_ms` wires `TtlStateBackend` + `StateBackedTumblingWindowOperator` in `local_streaming` and session `StateTtlConfig` on streams.
@@ -28,6 +50,17 @@
 - **GAP-T2:** `coordinator_executor_integration` test in `krishiv-scheduler`.
 - **GAP-CI1/CI2:** GitHub Actions CI workflow and PR template.
 - **GAP-B1:** `rust-version = "1.92"` in workspace `Cargo.toml`.
+
+### Follow-up slice (same PR, 2026-05-24)
+
+- **Batch through coordinator:** `DataFrame.collect_async()` routes SQL via `ExecutionRuntime::collect_batch_sql` → `sql:` executor tasks; batches returned in `ExecutorTaskOutput`.
+- **Distributed `Session.sql()`:** Removed `ensure_local_mode` from SQL/register paths; distributed collect uses in-process coordinator fallback + Flight SQL full drain (`execute_remote_sql`).
+- **Continuous streaming:** `stream:continuous:{job_id}` executor fragment + `ContinuousStreamRegistry`; `submit_stream_job(name, spec)`, `push_stream_job_input`, `poll_stream_job`.
+- **Multi-source watermark:** `MultiSourceWatermarkSpec` → `WindowExecutionSpec.source_watermark_lags` wired in `execute_bounded_window`.
+
+```bash
+cargo +stable test -p krishiv-plan -p krishiv-exec -p krishiv-runtime -p krishiv-executor -p krishiv-api --lib
+```
 
 ### Validation (2026-05-24, ADR-12.4 branch)
 

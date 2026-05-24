@@ -12,12 +12,22 @@ use std::fmt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
 mod flight_client;
+pub mod flight_protocol;
+pub mod continuous_stream;
+pub mod execution_runtime;
 pub mod in_process;
+pub mod in_process_cluster;
 pub mod local_streaming;
 mod plan;
 pub mod stream_kafka;
 
-pub use in_process::{InProcessStreamingRuntime, execute_windowed_in_process};
+pub use execution_runtime::{
+    build_execution_runtime, BatchTableRegistration, ClusterEndpoints, ExecutionRuntime,
+    RemoteExecutionRuntime, RuntimeMode, InProcessExecutionRuntime,
+};
+pub use in_process::{BatchSqlTable, InProcessStreamingRuntime, execute_windowed_in_process};
+pub use continuous_stream::ContinuousStreamRegistry;
+pub use in_process_cluster::{fragment_from_local_spec, plan_spec_to_local, InProcessCluster};
 pub use local_streaming::{
     LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream,
 };

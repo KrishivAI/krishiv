@@ -21,8 +21,11 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 krishiv-udf = { path = "../krishiv-udf" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql" }
 parquet = { workspace = true }
 tempfile = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

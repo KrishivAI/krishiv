@@ -14,6 +14,7 @@ pub fn encode_stream_kafka_partition(
     batch: &RecordBatch,
     key_column: &str,
     time_column: &str,
+    value_column: Option<&str>,
 ) -> Result<String, RuntimeError> {
     let key_idx = batch
         .schema()
@@ -23,10 +24,19 @@ pub fn encode_stream_kafka_partition(
         .schema()
         .index_of(time_column)
         .map_err(|_| RuntimeError::transport(format!("time column '{time_column}' not found")))?;
+    let value_idx = value_column
+        .map(|col| {
+            batch
+                .schema()
+                .index_of(col)
+                .map_err(|_| RuntimeError::transport(format!("value column '{col}' not found")))
+        })
+        .transpose()?;
 
     let mut records = Vec::new();
     for row in 0..batch.num_rows() {
-        let key = format_key_value(batch, key_idx, row).map_err(|e| RuntimeError::transport(e.to_string()))?;
+        let key = format_key_value(batch, key_idx, row)
+            .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let time_arr = batch
             .column(time_idx)
             .as_any()
@@ -35,7 +45,15 @@ pub fn encode_stream_kafka_partition(
                 RuntimeError::transport(format!("time column '{time_column}' must be Int64"))
             })?;
         let ts = time_arr.value(row);
-        records.push(format!("key={key},ts={ts},val=0"));
+        let val = if let Some(vidx) = value_idx {
+            format_key_value(batch, vidx, row)
+                .map_err(|e| RuntimeError::transport(e.to_string()))?
+                .parse::<i64>()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        records.push(format!("key={key},ts={ts},val={val}"));
     }
     if records.is_empty() {
         return Err(RuntimeError::transport(

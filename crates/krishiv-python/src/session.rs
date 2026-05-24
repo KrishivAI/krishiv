@@ -66,8 +66,11 @@ impl PySession {
 
     #[classmethod]
     pub fn connect(_cls: &Bound<'_, PyType>, url: String) -> PyResult<Self> {
-        krishiv_api::SessionBuilder::new()
-            .with_coordinator(url)
+        let mut builder = krishiv_api::SessionBuilder::new().with_coordinator(url);
+        if remote_execution_from_env() {
+            builder = builder.with_remote_execution(true);
+        }
+        builder
             .build()
             .map(|s| Self {
                 inner: Arc::new(s),
@@ -96,6 +99,11 @@ impl PySession {
                 }
             }
             _ => builder,
+        };
+        let builder = if remote_execution_from_env() {
+            builder.with_remote_execution(true)
+        } else {
+            builder
         };
         builder
             .build()
@@ -314,6 +322,54 @@ impl PySession {
                 .map_err(map_krishiv_error)
         })
     }
+
+    /// Submit a continuous streaming job. Returns the job id handle.
+    pub fn submit_stream_job(
+        &self,
+        name: String,
+        spec: krishiv_api::LocalWindowExecutionSpec,
+    ) -> PyResult<String> {
+        self.inner
+            .submit_stream_job(name, spec)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Push input batches to a continuous streaming job.
+    pub fn push_stream_job_input(&self, job_id: String, batches: Vec<PyBatch>) -> PyResult<()> {
+        let record_batches: Vec<arrow::record_batch::RecordBatch> =
+            batches.into_iter().map(|b| b.record_batch().clone()).collect();
+        self.inner
+            .push_stream_job_input(&job_id, record_batches)
+            .map_err(map_krishiv_error)
+    }
+
+    /// Drain newly emitted batches from a continuous streaming job.
+    pub fn poll_stream_job(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<PyBatch>> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            block_on_async(async move {
+                inner.poll_stream_job(&job_id).await
+            })
+            .map(|batches| {
+                batches
+                    .into_iter()
+                    .map(PyBatch::from_record_batch)
+                    .collect()
+            })
+            .map_err(map_krishiv_error)
+        })
+    }
+}
+
+fn remote_execution_from_env() -> bool {
+    std::env::var("KRISHIV_REMOTE_EXEC")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn parse_role(role: &str) -> PyResult<Role> {

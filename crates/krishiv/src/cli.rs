@@ -76,14 +76,14 @@ pub struct CliResponse {
 }
 
 impl CliResponse {
-    fn ok(stdout: impl Into<String>) -> Self {
+    pub(crate) fn ok(stdout: impl Into<String>) -> Self {
         Self {
             stdout: stdout.into(),
             stderr: String::new(),
             exit_code: 0,
         }
     }
-    fn err(stderr: impl Into<String>, exit_code: i32) -> Self {
+    pub(crate) fn err(stderr: impl Into<String>, exit_code: i32) -> Self {
         Self {
             stdout: String::new(),
             stderr: stderr.into(),
@@ -126,7 +126,9 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["restore", "--help"] | ["restore", "-h"] => CliResponse::ok(restore_help()),
         ["checkpoints", "--help"] | ["checkpoints", "-h"] => CliResponse::ok(checkpoints_help()),
         ["compat", "--help"] | ["compat", "-h"] => CliResponse::ok(compat_help()),
-        ["compat", "--help"] | ["compat", "-h"] => CliResponse::ok(compat_help()),
+        ["local"] | ["local", "--help"] | ["local", "-h"] => {
+            CliResponse::ok(crate::local_cluster::local_help())
+        }
         ["help", "sql"] => CliResponse::ok(sql_help()),
         ["help", "explain"] => CliResponse::ok(explain_help()),
         ["help", "submit"] => CliResponse::ok(submit_help()),
@@ -136,6 +138,8 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["help", "restore"] => CliResponse::ok(restore_help()),
         ["help", "checkpoints"] => CliResponse::ok(checkpoints_help()),
         ["help", "compat"] => CliResponse::ok(compat_help()),
+        ["help", "local"] => CliResponse::ok(crate::local_cluster::local_help()),
+        ["local", rest @ ..] => crate::local_cluster::run_local(rest),
         ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
@@ -168,6 +172,7 @@ pub fn main_help() -> String {
            restore      Restore a streaming job from a checkpoint or savepoint (R6)\n\
            checkpoints  List checkpoints for a streaming job (R6)\n\
            compat       PySpark migration compatibility tools (R15)\n\
+           local        Start/stop/status a Spark-like local cluster\n\
            help         Show help for a command\n\
          \n\
          Options:\n\
@@ -613,10 +618,22 @@ fn render_distributed_jobs(jobs: &[JobSnapshot]) -> String {
 }
 
 fn build_session(command: &QueryCommand) -> Result<Session, String> {
-    let session = Session::builder()
-        .with_execution_mode(command.mode)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let mut builder = Session::builder().with_execution_mode(command.mode);
+    if command.mode == ExecutionMode::SingleNode {
+        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR") {
+            if !url.trim().is_empty() {
+                builder = builder.with_local_cluster(url);
+            }
+        }
+    }
+    if command.mode == ExecutionMode::Distributed {
+        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR") {
+            if !url.trim().is_empty() {
+                builder = builder.with_coordinator(url);
+            }
+        }
+    }
+    let session = builder.build().map_err(|e| e.to_string())?;
     for (table, path) in &command.parquet_tables {
         if !path.exists() {
             return Err(format!(
