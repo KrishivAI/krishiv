@@ -1,7 +1,7 @@
 # Distributed Unified Mitigation — Implementation Tracker
 
 **Architecture plan:** [distributed-unified-mitigation-plan.md](../architecture/distributed-unified-mitigation-plan.md)  
-**Status:** WS-4–WS-11 implementation landed 2026-05-24 on branch `cursor/implement-distributed-unified-854c`.
+**Status:** WS-0–WS-11 landed on branch `cursor/implement-distributed-unified-854c` (2026-05-24). L5 acceptance gates partially open (see below).
 
 ## Goal
 
@@ -28,7 +28,7 @@ Deliver production-grade unified batch + streaming on Kubernetes and bare metal 
 - [ ] `cargo clippy --workspace -- -D warnings` — clean
 - [x] `cargo test -p krishiv-scheduler --test distributed_e2e` — batch + streaming lowering
 - [ ] CI `kind-e2e` — KrishivJob → JCP pod → tasks succeeded
-- [ ] CI `bare-metal-e2e` — clusterd + executors
+- [ ] CI `bare-metal-e2e` — clusterd + executors (workflow added; required green on main)
 - [ ] `scripts/audit-fencing.sh` — all write paths validated
 - [ ] `tests/certification` — streaming checkpoint + connector rows aligned
 - [ ] No `todo!()` / `unimplemented!()` in distributed hot paths (scheduler, executor, operator, runtime, api)
@@ -36,6 +36,6 @@ Deliver production-grade unified batch + streaming on Kubernetes and bare metal 
 ## Next command
 
 ```bash
-# After WS-0 lands:
-cargo test -p krishiv-scheduler --test coordinator_executor_integration
+cargo +stable test -p krishiv-scheduler -p krishiv-operator -p krishiv-executor -p krishiv-federation --lib
+cargo +stable test -p krishiv-scheduler --test distributed_e2e
 ```
