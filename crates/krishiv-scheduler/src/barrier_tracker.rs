@@ -71,8 +71,12 @@ mod tests {
 
     #[test]
     fn tracker_completes_when_all_acks_received() {
-        let mut tracker =
-            CheckpointBarrierTracker::new("job-1", 3, ["t0".to_string(), "t1".to_string()], Duration::from_secs(30));
+        let mut tracker = CheckpointBarrierTracker::new(
+            "job-1",
+            3,
+            ["t0".to_string(), "t1".to_string()],
+            Duration::from_secs(30),
+        );
         assert!(!tracker.is_complete());
         tracker.record_ack(&BarrierAck {
             epoch: 3,

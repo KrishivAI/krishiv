@@ -1,6 +1,6 @@
 //! Coordinator-side checkpoint barrier dispatch over gRPC (WS-4 / ADR-R16.1).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
@@ -183,9 +183,11 @@ pub async fn drive_barrier_dispatches(
     timeout: Duration,
 ) -> SchedulerResult<()> {
     let plans = {
-        let coord = shared.read().map_err(|_| crate::SchedulerError::Transport {
-            message: "coordinator lock poisoned".to_string(),
-        })?;
+        let coord = shared
+            .read()
+            .map_err(|_| crate::SchedulerError::Transport {
+                message: "coordinator lock poisoned".to_string(),
+            })?;
         coord.pending_barrier_dispatch_plans()
     };
     for plan in plans {
@@ -194,9 +196,11 @@ pub async fn drive_barrier_dispatches(
         let fencing = plan.fencing_token;
         match dispatch_barrier_plan(&plan, timeout).await {
             Ok(acks) => {
-                let mut coord = shared.write().map_err(|_| crate::SchedulerError::Transport {
-                    message: "coordinator lock poisoned".to_string(),
-                })?;
+                let mut coord = shared
+                    .write()
+                    .map_err(|_| crate::SchedulerError::Transport {
+                        message: "coordinator lock poisoned".to_string(),
+                    })?;
                 coord.mark_barrier_dispatched(&job_id, epoch);
                 coord.apply_barrier_acks(&job_id, epoch, fencing, &acks);
             }
@@ -220,8 +224,7 @@ mod tests {
 
     #[test]
     fn pending_plan_skips_executor_without_barrier_endpoint() {
-        let mut coord =
-            Coordinator::active(CoordinatorId::try_new("barrier-plan").unwrap());
+        let mut coord = Coordinator::active(CoordinatorId::try_new("barrier-plan").unwrap());
         let exec_id = krishiv_proto::ExecutorId::try_new("exec-1").unwrap();
         coord
             .register_executor(ExecutorDescriptor::new(exec_id.clone(), "host", 2))

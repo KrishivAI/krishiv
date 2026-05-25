@@ -11,12 +11,15 @@ use crate::process_util::{spawn_krishiv_daemon, spawn_krishiv_daemon_with_env};
 
 const DEFAULT_DATA_DIR: &str = ".krishiv/local";
 const CONFIG_FILE: &str = "cluster.json";
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:18080";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalClusterConfig {
     pub coordinator_grpc: String,
     pub coordinator_http: String,
     pub coordinator_flight: String,
+    #[serde(default = "default_ui_url")]
+    pub ui_url: String,
     pub executor_id: String,
     pub data_dir: PathBuf,
     #[serde(default)]
@@ -25,6 +28,23 @@ pub struct LocalClusterConfig {
     pub executor_pid: Option<u32>,
     #[serde(default)]
     pub flight_pid: Option<u32>,
+    #[serde(default)]
+    pub ui_pid: Option<u32>,
+}
+
+fn default_ui_url() -> String {
+    ui_url_from_http_addr(DEFAULT_HTTP_ADDR)
+}
+
+fn ui_url_from_http_addr(addr: &str) -> String {
+    format!("http://{addr}/ui")
+}
+
+fn select_local_http_addr(preferred: Option<&str>) -> Result<String, String> {
+    if let Some(addr) = preferred {
+        return Ok(addr.to_string());
+    }
+    Ok(DEFAULT_HTTP_ADDR.to_string())
 }
 
 impl LocalClusterConfig {
@@ -52,13 +72,16 @@ pub fn local_help() -> String {
         "Manage a Spark-like local Krishiv cluster (coordinator + executor).\n\
          \n\
          Usage:\n\
-           krishiv local start [--data-dir <DIR>]\n\
+           krishiv local start [--data-dir <DIR>] [--http-addr <HOST:PORT>]\n\
            krishiv local stop [--data-dir <DIR>]\n\
            krishiv local status [--data-dir <DIR>]\n\
          \n\
          After start, use:\n\
            export KRISHIV_COORDINATOR=http://127.0.0.1:50051\n\
-           krishiv sql --mode single-node --query 'SELECT 1'\n",
+          krishiv sql --mode single-node --query 'SELECT 1'\n\
+         \n\
+         Web UI:\n\
+           http://127.0.0.1:18080/ui by default, or use --http-addr <HOST:PORT>.\n",
     )
 }
 
@@ -89,6 +112,12 @@ fn parse_data_dir(args: &[&str]) -> Result<PathBuf, String> {
                         .ok_or_else(|| String::from("missing value for --data-dir"))?,
                 );
             }
+            "--http-addr" => {
+                idx += 1;
+                let _ = args
+                    .get(idx)
+                    .ok_or_else(|| String::from("missing value for --http-addr"))?;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
         idx += 1;
@@ -96,16 +125,45 @@ fn parse_data_dir(args: &[&str]) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
+    let mut addr = std::env::var("KRISHIV_LOCAL_HTTP_ADDR").ok();
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == "--http-addr" {
+            idx += 1;
+            addr = Some(
+                args.get(idx)
+                    .ok_or_else(|| String::from("missing value for --http-addr"))?
+                    .to_string(),
+            );
+        }
+        idx += 1;
+    }
+    Ok(addr)
+}
+
 fn run_local_start(args: &[&str]) -> CliResponse {
     let data_dir = match parse_data_dir(args) {
         Ok(d) => d,
         Err(e) => return CliResponse::err(format!("{e}\n"), 2),
     };
-    if LocalClusterConfig::load(&data_dir).is_ok() {
+    let requested_http_addr = match parse_http_addr(args) {
+        Ok(addr) => addr,
+        Err(e) => return CliResponse::err(format!("{e}\n"), 2),
+    };
+    if let Ok(mut existing) = LocalClusterConfig::load(&data_dir) {
+        if existing.ui_url != default_ui_url() || existing.ui_pid.is_some() {
+            existing.ui_url = default_ui_url();
+            existing.ui_pid = None;
+            if let Err(e) = existing.save() {
+                return CliResponse::err(format!("{e}\n"), 1);
+            }
+        }
         return CliResponse::err(
             format!(
-                "local cluster already running (config at {})\n",
-                LocalClusterConfig::path(&data_dir).display()
+                "local cluster already running (config at {})\nUI: {}\n",
+                LocalClusterConfig::path(&data_dir).display(),
+                existing.ui_url
             ),
             1,
         );
@@ -115,7 +173,10 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     let meta_path = data_dir.join("coordinator-meta.json");
     let grpc_addr = "127.0.0.1:9090";
-    let http_addr = "127.0.0.1:8080";
+    let http_addr = match select_local_http_addr(requested_http_addr.as_deref()) {
+        Ok(addr) => addr,
+        Err(e) => return CliResponse::err(format!("{e}\n"), 1),
+    };
 
     let meta = meta_path.to_str().unwrap_or("coordinator-meta.json");
     let coordinator_pid = match spawn_krishiv_daemon(
@@ -124,7 +185,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
             "--grpc-addr",
             grpc_addr,
             "--http-addr",
-            http_addr,
+            &http_addr,
             "--metadata-backend",
             "json",
             "--metadata-path",
@@ -152,7 +213,9 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     ) {
         Ok(pid) => pid,
         Err(e) => {
-            let _ = Command::new("kill").arg(coordinator_pid.to_string()).status();
+            let _ = Command::new("kill")
+                .arg(coordinator_pid.to_string())
+                .status();
             return CliResponse::err(
                 format!(
                     "failed to spawn krishiv flight-server: {e}\n\
@@ -177,7 +240,9 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     ) {
         Ok(pid) => pid,
         Err(err) => {
-            let _ = Command::new("kill").arg(coordinator_pid.to_string()).status();
+            let _ = Command::new("kill")
+                .arg(coordinator_pid.to_string())
+                .status();
             let _ = Command::new("kill").arg(flight_pid.to_string()).status();
             return CliResponse::err(
                 format!(
@@ -191,13 +256,15 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     let config = LocalClusterConfig {
         coordinator_grpc: format!("http://{grpc_addr}"),
-        coordinator_http: format!("http://{http_addr}"),
+        coordinator_http: format!("http://{}", http_addr),
         coordinator_flight: String::from("http://127.0.0.1:50051"),
+        ui_url: ui_url_from_http_addr(&http_addr),
         executor_id: String::from("local-exec-1"),
         data_dir: data_dir.clone(),
         coordinator_pid: Some(coordinator_pid),
         executor_pid: Some(executor_pid),
         flight_pid: Some(flight_pid),
+        ui_pid: None,
     };
 
     match config.save() {
@@ -206,12 +273,14 @@ fn run_local_start(args: &[&str]) -> CliResponse {
              gRPC:    {}\n\
              HTTP:    {}\n\
              Flight:  {}\n\
+             UI:      {}\n\
              data:    {}\n\
              \n\
              export KRISHIV_COORDINATOR={}\n",
             config.coordinator_grpc,
             config.coordinator_http,
             config.coordinator_flight,
+            config.ui_url,
             config.data_dir.display(),
             config.coordinator_flight,
         )),
@@ -229,6 +298,9 @@ fn run_local_stop(args: &[&str]) -> CliResponse {
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
     if let Some(pid) = config.flight_pid {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    if let Some(pid) = config.ui_pid {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
     if let Some(pid) = config.executor_pid {
@@ -252,10 +324,19 @@ fn run_local_status(args: &[&str]) -> CliResponse {
              gRPC:    {}\n\
              HTTP:    {}\n\
              Flight:  {}\n\
+             UI:      {}\n\
              coordinator pid: {:?}\n\
              executor pid: {:?}\n\
-             flight pid: {:?}\n",
-            c.coordinator_grpc, c.coordinator_http, c.coordinator_flight, c.coordinator_pid, c.executor_pid, c.flight_pid
+             flight pid: {:?}\n\
+             ui pid: {:?}\n",
+            c.coordinator_grpc,
+            c.coordinator_http,
+            c.coordinator_flight,
+            c.ui_url,
+            c.coordinator_pid,
+            c.executor_pid,
+            c.flight_pid,
+            c.ui_pid
         )),
         Err(e) => CliResponse::err(format!("{e}\n"), 1),
     }

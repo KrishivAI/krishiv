@@ -22,7 +22,7 @@ pub enum AggKind {
 }
 
 /// One aggregation expression passed to `WindowedStream.agg(**exprs)`.
-#[pyclass(name = "AggExpr")]
+#[pyclass(from_py_object, name = "AggExpr")]
 #[derive(Clone)]
 pub struct PyAggExpr {
     #[pyo3(get)]

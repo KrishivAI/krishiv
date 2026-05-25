@@ -44,7 +44,7 @@ pub fn register_state_migration(
                 Ok(bytes.as_bytes().to_vec())
             })
         }),
-    );
+    ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     Ok(())
 }
 
@@ -110,7 +110,7 @@ impl StateMigrationDecorator {
                     Ok(bytes.as_bytes().to_vec())
                 })
             }),
-        );
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(migration_fn)
     }
 }

@@ -2,6 +2,36 @@
 
 ## Current Phase
 
+**CDC State Persistence & Integration Test Hardening (2026-05-25).**
+- **CdcOffsetTracker State Persistence**: Implemented `CdcOffsetTracker` under the `state` feature flag to persist committed CDC partition offsets directly into the `RedbStateBackend` under a dedicated `"cdc_offsets"` namespace, preventing restart-replay gaps.
+- **Transactional Module Exposure**: Declared `pub mod transactional;` in `crates/krishiv-connectors/src/lib.rs` to expose exactly-once transactional helper utilities to other crates.
+- **Tokio Test Runtime Context**: Fixed `kafka_source_reports_unbounded_and_rewindable` in `krishiv-connectors` to use a `#[tokio::test]` runtime, preventing a Tokio context panic on `rdkafka` client initialization.
+- **Clean Warnings**: Cleaned up remaining unused imports and assignments in tests, ensuring the entire workspace compiles warning-free and all tests pass with zero failures.
+
+Validation:
+```bash
+cargo check --workspace --all-targets --all-features
+cargo test --workspace --all-features
+```
+
+**Local/cluster UI lifecycle (2026-05-25).**
+- Coordinator HTTP now serves a live status UI at `http://127.0.0.1:18080/ui` by default plus JSON endpoints `/api/v1/jobs` and `/api/v1/executors`.
+- The UI reads the running coordinator `SharedCoordinator` snapshots directly; it is no longer the standalone `krishiv-ui --demo` / empty-state process.
+- `krishiv local start|status` and `krishiv cluster start|status` now point users at the live coordinator UI. Bare-metal `cluster start` enables coordinator HTTP on `127.0.0.1:18080`.
+- `--http-addr <HOST:PORT>` and `KRISHIV_LOCAL_HTTP_ADDR` / `KRISHIV_CLUSTER_HTTP_ADDR` can override the UI/HTTP address when needed.
+- Older local configs are normalized by `krishiv local start` to the live coordinator UI URL and clear the obsolete standalone `ui_pid`.
+
+Validation:
+```bash
+cargo check -p krishiv-scheduler -p krishiv
+cargo check -p krishiv
+cargo build -p krishiv --bin krishiv
+cargo test -p krishiv local --lib
+cargo test -p krishiv-scheduler coordinator_http --lib
+./target/debug/krishiv local start
+./target/debug/krishiv local status
+```
+
 **Distributed unified mitigation (2026-05-24).** Branch `cursor/implement-distributed-unified-854c`:
 - **CCP/JCP:** `ClusterControlPlane`, `JobCoordinator`, `coordinator_daemon` shared startup.
 - **Lowering:** `krishiv-plan::lowering` encodes `NodeOp` → executor fragments (batch SQL + `stream:tw|sw|ses`).

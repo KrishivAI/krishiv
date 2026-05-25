@@ -6,7 +6,7 @@ use crate::errors::SchemaError;
 use crate::pipeline::{WindowDescriptor, WindowKind};
 
 /// Window configuration for `KeyedStream.window(spec)`.
-#[pyclass(name = "WindowSpec")]
+#[pyclass(from_py_object, name = "WindowSpec")]
 #[derive(Clone)]
 pub struct PyWindowSpec {
     kind: WindowKind,

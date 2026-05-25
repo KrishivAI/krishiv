@@ -3,9 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{BinaryArray, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
-use std::sync::Arc as ArrowArc;
+use arrow::array::RecordBatch;
 
 use crate::{ConnectorError, ConnectorResult, TwoPhaseCommitSink};
 
@@ -110,23 +108,26 @@ impl TransactionalKafkaRegistry {
         }
     }
 }
-
-fn single_binary_batch(payload: &[u8]) -> RecordBatch {
-    let schema = ArrowArc::new(Schema::new(vec![Field::new(
-        "payload",
-        DataType::Binary,
-        false,
-    )]));
-    RecordBatch::try_new(
-        schema,
-        vec![ArrowArc::new(BinaryArray::from(vec![payload])) as _],
-    )
-    .expect("batch")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn single_binary_batch(payload: &[u8]) -> RecordBatch {
+        use arrow::array::BinaryArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc as ArrowArc;
+
+        let schema = ArrowArc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![ArrowArc::new(BinaryArray::from(vec![payload])) as _],
+        )
+        .expect("batch")
+    }
 
     #[test]
     fn kafka_exactly_once_prepare_commit() {

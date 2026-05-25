@@ -95,7 +95,9 @@ fn run_executor(args: &[String]) -> i32 {
         print!("{}", krishiv_executor::cli::executor_cli_help());
         return 0;
     }
-    match block_on(krishiv_executor::cli::run_executor_cli(args.iter().cloned())) {
+    match block_on(krishiv_executor::cli::run_executor_cli(
+        args.iter().cloned(),
+    )) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");

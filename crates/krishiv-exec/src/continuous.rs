@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, WindowKind};
+use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
 use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::operator_runtime::{max_event_time_ms, window_agg_to_expr};

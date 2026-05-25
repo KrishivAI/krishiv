@@ -63,6 +63,7 @@ pub fn schema_registry_confluent(
 
 #[pyclass(name = "SchemaRegistryConfig")]
 pub struct PySchemaRegistryConfig {
+    #[allow(dead_code)]
     pub(crate) inner: krishiv_schema_registry::SchemaRegistryConfig,
 }
 

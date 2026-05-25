@@ -9,8 +9,8 @@ use std::sync::Arc;
 use krishiv_proto::{CoordinatorId, JobId, JobSpec};
 
 use crate::{
-    Coordinator, JobCoordinator, LeaderElection, SchedulerError, SchedulerResult, SharedCoordinator,
-    SingleNodeElection, SubmitOutcome,
+    Coordinator, JobCoordinator, LeaderElection, SchedulerError, SchedulerResult,
+    SharedCoordinator, SingleNodeElection, SubmitOutcome,
 };
 
 /// Cluster-level coordinator runtime (one active CCP per cell).
@@ -195,6 +195,9 @@ mod tests {
         let spec = JobSpec::new(job_id.clone(), "demo", JobKind::Batch).with_stage(stage);
         ccp.submit_job(spec).unwrap();
         let jcp = ccp.job_coordinator(job_id);
-        assert_eq!(jcp.job_snapshot().unwrap().job_id(), &JobId::try_new("job-1").unwrap());
+        assert_eq!(
+            jcp.job_snapshot().unwrap().job_id(),
+            &JobId::try_new("job-1").unwrap()
+        );
     }
 }

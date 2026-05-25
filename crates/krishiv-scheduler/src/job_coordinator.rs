@@ -127,14 +127,15 @@ impl JobCoordinator {
                 for jid in job_ids {
                     let targets = match cluster.write() {
                         Ok(mut coord) => match coord.launch_assigned_task_assignments(&jid) {
-                            Ok(assignments) => match coord.resolve_assignment_targets(assignments)
-                            {
-                                Ok(targets) => targets,
-                                Err(error) => {
-                                    tracing::warn!(%jid, %error, "resolve assignment targets failed");
-                                    continue;
+                            Ok(assignments) => {
+                                match coord.resolve_assignment_targets(assignments) {
+                                    Ok(targets) => targets,
+                                    Err(error) => {
+                                        tracing::warn!(%jid, %error, "resolve assignment targets failed");
+                                        continue;
+                                    }
                                 }
-                            },
+                            }
                             Err(error) => {
                                 tracing::warn!(%jid, %error, "launch assignments failed");
                                 continue;
@@ -160,7 +161,9 @@ impl JobCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_proto::{CoordinatorId, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+    use krishiv_proto::{
+        CoordinatorId, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
+    };
 
     use super::*;
     use crate::{Coordinator, ExecutorDescriptor, ExecutorId};

@@ -143,7 +143,10 @@ fn parse_table_read(args: &[&str]) -> Result<TableReadCommand, String> {
         idx += 1;
     }
     let path = path.ok_or_else(|| String::from("missing required --path"))?;
-    let format = match format.ok_or_else(|| String::from("missing required --format"))?.as_str() {
+    let format = match format
+        .ok_or_else(|| String::from("missing required --format"))?
+        .as_str()
+    {
         "parquet" => TableFormat::Parquet,
         "delta" => TableFormat::Delta,
         "hudi" => TableFormat::Hudi,

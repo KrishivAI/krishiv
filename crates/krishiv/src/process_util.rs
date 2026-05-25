@@ -19,10 +19,7 @@ pub fn krishiv_daemon_command(subcommand: &str, args: &[&str]) -> Command {
 }
 
 /// Spawn a background daemon; returns child PID when successful.
-pub fn spawn_krishiv_daemon(
-    subcommand: &str,
-    args: &[&str],
-) -> Result<u32, String> {
+pub fn spawn_krishiv_daemon(subcommand: &str, args: &[&str]) -> Result<u32, String> {
     spawn_krishiv_daemon_with_env(subcommand, args, &[])
 }
 
@@ -48,8 +45,7 @@ pub fn spawn_krishiv_daemon_with_env(
 pub fn cluster_data_dir(default: &str, override_path: Option<&Path>) -> PathBuf {
     override_path.map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from(
-            std::env::var("KRISHIV_CLUSTER_DATA_DIR")
-                .unwrap_or_else(|_| default.to_string()),
+            std::env::var("KRISHIV_CLUSTER_DATA_DIR").unwrap_or_else(|_| default.to_string()),
         )
     })
 }

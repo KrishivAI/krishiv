@@ -314,8 +314,9 @@ pub(crate) fn resolve_register_udf_args(
             .get_item("input_types")?
             .ok_or_else(|| SchemaError::new_err("udf metadata missing 'input_types'"))?;
         let input_types = input_types_obj
-            .downcast_into::<PyDict>()
+            .cast::<PyDict>()
             .map_err(|_| SchemaError::new_err("udf metadata 'input_types' must be a dict"))?
+            .clone()
             .unbind();
         let output_type: String = meta
             .get_item("output_type")?

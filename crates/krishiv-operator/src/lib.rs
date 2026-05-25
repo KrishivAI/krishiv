@@ -1798,6 +1798,7 @@ impl LeaderElection for K8sLeaseElection {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,

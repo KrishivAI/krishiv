@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::record_batch::RecordBatch;
+
 use krishiv_lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
 
 use crate::ConnectorError;
@@ -46,7 +46,7 @@ impl CdcRouter {
         let route = self.routes.get(&event.table).ok_or_else(|| {
             ConnectorError::Cdc(format!("no live table route for {}", event.table))
         })?;
-        let mut guard = route
+        let guard = route
             .lock()
             .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?;
         let batch = event
@@ -114,6 +114,7 @@ impl Default for CdcRouter {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use arrow::record_batch::RecordBatch;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};

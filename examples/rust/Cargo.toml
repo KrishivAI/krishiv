@@ -1,0 +1,15 @@
+[package]
+name = "krishiv-rust-examples"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+arrow = "58.3.0"
+krishiv = { path = "../../crates/krishiv" }
+parquet = "58.3.0"
+tempfile = "3"

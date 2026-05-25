@@ -6,23 +6,23 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use krishiv_proto::{CoordinatorId, CoordinatorState};
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
-use crate::{
-    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore,
-    JobCoordinator, SharedCoordinator, StabilityMetrics,
-    serve_coordinator_executor_grpc_with_listener,
-};
 #[cfg(feature = "sqlite")]
 use crate::SqliteMetadataStore;
+use crate::{
+    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JobCoordinator, JsonFileMetadataStore,
+    SharedCoordinator, StabilityMetrics, serve_coordinator_executor_grpc_with_listener,
+};
 use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
 /// CLI configuration for coordinator-family binaries.
@@ -98,7 +98,8 @@ pub async fn run_cluster_control_plane(
         ccp_loop.run_leader_loop().await;
     });
     let _ = leader;
-    serve_coordinator_executor_grpc_with_listener(listener, ccp.shared_coordinator().clone()).await?;
+    serve_coordinator_executor_grpc_with_listener(listener, ccp.shared_coordinator().clone())
+        .await?;
     Ok(())
 }
 
@@ -174,13 +175,167 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/federation/v1/jobs", post(federation_submit_job))
-        .route("/federation/v1/jobs/:job_id", get(federation_job_status))
         .route(
-            "/federation/v1/jobs/:job_id/cancel",
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/ui") }),
+        )
+        .route("/ui", get(live_ui))
+        .route("/api/v1/jobs", get(api_jobs))
+        .route("/api/v1/executors", get(api_executors))
+        .route("/federation/v1/jobs", post(federation_submit_job))
+        .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
+        .route(
+            "/federation/v1/jobs/{job_id}/cancel",
             post(federation_cancel_job),
         )
         .with_state(coordinator)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LiveJobsResponse {
+    jobs: Vec<LiveJobView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LiveJobView {
+    job_id: String,
+    kind: String,
+    state: String,
+    stage_count: usize,
+    task_count: usize,
+    assigned_task_count: usize,
+    running_task_count: usize,
+    succeeded_task_count: usize,
+    failed_task_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LiveExecutorsResponse {
+    executors: Vec<LiveExecutorView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LiveExecutorView {
+    executor_id: String,
+    host: String,
+    slots: usize,
+    state: String,
+    lease_generation: u64,
+    running_task_count: usize,
+    last_heartbeat_tick: u64,
+}
+
+async fn api_jobs(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
+    let jobs = coordinator
+        .read()
+        .map(|coord| {
+            coord
+                .job_snapshots()
+                .into_iter()
+                .map(|job| LiveJobView {
+                    job_id: job.job_id().to_string(),
+                    kind: format!("{:?}", job.kind()),
+                    state: format!("{:?}", job.state()),
+                    stage_count: job.stage_count(),
+                    task_count: job.task_count(),
+                    assigned_task_count: job.assigned_task_count(),
+                    running_task_count: job.running_task_count(),
+                    succeeded_task_count: job.succeeded_task_count(),
+                    failed_task_count: job.failed_task_count(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Json(LiveJobsResponse { jobs })
+}
+
+async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
+    let executors = coordinator
+        .read()
+        .map(|coord| {
+            coord
+                .executor_snapshots()
+                .into_iter()
+                .map(|record| {
+                    let descriptor = record.descriptor();
+                    LiveExecutorView {
+                        executor_id: record.executor_id().to_string(),
+                        host: descriptor.host().to_string(),
+                        slots: descriptor.slots(),
+                        state: format!("{:?}", record.state()),
+                        lease_generation: record.lease_generation().as_u64(),
+                        running_task_count: record.running_tasks().len(),
+                        last_heartbeat_tick: record.last_heartbeat_tick(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Json(LiveExecutorsResponse { executors })
+}
+
+async fn live_ui(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
+    let (state, jobs, executors) = match coordinator.read() {
+        Ok(coord) => (
+            format!("{:?}", coord.state()),
+            coord.job_snapshots(),
+            coord.executor_snapshots(),
+        ),
+        Err(_) => (String::from("Unavailable"), Vec::new(), Vec::new()),
+    };
+
+    let mut body = String::from(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Krishiv Cluster</title>\
+         <style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;color:#17202a}\
+         table{border-collapse:collapse;width:100%;margin:16px 0 28px}th,td{border-bottom:1px solid #d8dee4;padding:8px;text-align:left}\
+         th{background:#f6f8fa}.meta{color:#57606a}.ok{color:#116329;font-weight:600}</style></head><body>",
+    );
+    body.push_str("<h1>Krishiv Cluster</h1>");
+    body.push_str(&format!(
+        "<p class=\"meta\">Coordinator state: <span class=\"ok\">{state}</span></p>"
+    ));
+    body.push_str("<h2>Executors</h2><table><thead><tr><th>Executor</th><th>Host</th><th>Slots</th><th>State</th><th>Running Tasks</th><th>Lease</th><th>Last Heartbeat Tick</th></tr></thead><tbody>");
+    if executors.is_empty() {
+        body.push_str("<tr><td colspan=\"7\">No executors registered.</td></tr>");
+    } else {
+        for record in executors {
+            let descriptor = record.descriptor();
+            body.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                record.executor_id(),
+                descriptor.host(),
+                descriptor.slots(),
+                record.state(),
+                record.running_tasks().len(),
+                record.lease_generation().as_u64(),
+                record.last_heartbeat_tick(),
+            ));
+        }
+    }
+    body.push_str("</tbody></table>");
+    body.push_str("<h2>Jobs</h2><table><thead><tr><th>Job</th><th>Kind</th><th>State</th><th>Stages</th><th>Tasks</th><th>Assigned</th><th>Running</th><th>Succeeded</th><th>Failed</th></tr></thead><tbody>");
+    if jobs.is_empty() {
+        body.push_str("<tr><td colspan=\"9\">No jobs submitted yet.</td></tr>");
+    } else {
+        for job in jobs {
+            body.push_str(&format!(
+                "<tr><td>{}</td><td>{:?}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                job.job_id(),
+                job.kind(),
+                job.state(),
+                job.stage_count(),
+                job.task_count(),
+                job.assigned_task_count(),
+                job.running_task_count(),
+                job.succeeded_task_count(),
+                job.failed_task_count(),
+            ));
+        }
+    }
+    body.push_str("</tbody></table><p class=\"meta\">JSON: <a href=\"/api/v1/jobs\">jobs</a> · <a href=\"/api/v1/executors\">executors</a> · <a href=\"/metrics\">metrics</a></p></body></html>");
+    Html(body)
 }
 
 async fn readyz(
@@ -272,9 +427,11 @@ pub fn parse_coordinator_daemon_config(
             }
             "--http-addr" => {
                 let value = next_daemon_arg(&mut args, "--http-addr")?;
-                config.http_addr = Some(value.parse().map_err(|_| {
-                    format!("invalid socket address for --http-addr: {value}")
-                })?);
+                config.http_addr = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid socket address for --http-addr: {value}"))?,
+                );
             }
             "--shuffle-dir" => {
                 config.shuffle_dir =
@@ -284,12 +441,16 @@ pub fn parse_coordinator_daemon_config(
                 config.metadata_backend = Some(next_daemon_arg(&mut args, "--metadata-backend")?);
             }
             "--metadata-path" => {
-                config.metadata_path =
-                    Some(PathBuf::from(next_daemon_arg(&mut args, "--metadata-path")?));
+                config.metadata_path = Some(PathBuf::from(next_daemon_arg(
+                    &mut args,
+                    "--metadata-path",
+                )?));
             }
             "--help" | "-h" => config.help = true,
             unknown => {
-                return Err(format!("unknown option: {unknown}\n\n{}", coordinator_daemon_help()).into());
+                return Err(
+                    format!("unknown option: {unknown}\n\n{}", coordinator_daemon_help()).into(),
+                );
             }
         }
     }
@@ -347,7 +508,10 @@ pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), 
     let shared = build_shared_coordinator(&config)?;
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
-    let ccp = Arc::new(ClusterControlPlane::from_shared(coordinator_id, shared.clone()));
+    let ccp = Arc::new(ClusterControlPlane::from_shared(
+        coordinator_id,
+        shared.clone(),
+    ));
     spawn_coordinator_sidecars(&shared, &config).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
@@ -380,11 +544,16 @@ pub fn parse_job_coordinator_daemon_config(
         match arg.as_str() {
             "--job-id" => config.job_id = next_daemon_arg(&mut args, "--job-id")?,
             "--metadata-path" => {
-                config.metadata_path = PathBuf::from(next_daemon_arg(&mut args, "--metadata-path")?);
+                config.metadata_path =
+                    PathBuf::from(next_daemon_arg(&mut args, "--metadata-path")?);
             }
             "--help" | "-h" => config.help = true,
             unknown => {
-                return Err(format!("unknown option: {unknown}\n\n{}", job_coordinator_daemon_help()).into());
+                return Err(format!(
+                    "unknown option: {unknown}\n\n{}",
+                    job_coordinator_daemon_help()
+                )
+                .into());
             }
         }
     }
@@ -448,8 +617,8 @@ fn submit_job_from_env_spec(
         mode: String,
         tasks: usize,
     }
-    let env_spec: JobSpecEnv = serde_json::from_str(spec_json)
-        .map_err(|e| format!("KRISHIV_JOB_SPEC_JSON: {e}"))?;
+    let env_spec: JobSpecEnv =
+        serde_json::from_str(spec_json).map_err(|e| format!("KRISHIV_JOB_SPEC_JSON: {e}"))?;
     let kind = match env_spec.mode.as_str() {
         "streaming" => JobKind::Streaming,
         _ => JobKind::Batch,

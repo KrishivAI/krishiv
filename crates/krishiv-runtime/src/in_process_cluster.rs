@@ -7,7 +7,7 @@ use krishiv_plan::window::{encode_stream_fragment, WindowExecutionSpec, WindowKi
 
 use crate::in_process::InProcessStreamingRuntime;
 use crate::local_streaming::LocalWindowExecutionSpec;
-use crate::{RuntimeError, RuntimeResult};
+use crate::RuntimeResult;
 
 /// Shared local cluster: one coordinator + executor per session.
 #[derive(Clone)]

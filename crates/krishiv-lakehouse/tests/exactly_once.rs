@@ -3,9 +3,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::Int64Array;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use krishiv_connectors::cdc::{CdcEventSource, build_batch_from_events, parse_debezium_envelope};
 use krishiv_connectors::transactional::InMemoryTransactionalProducer;
 use krishiv_lakehouse::{
@@ -113,4 +110,5 @@ async fn exactly_once_ten_thousand_rows_after_crash() {
     let total: usize = scanned.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 10_000);
     assert_eq!(recovered_offsets.get("orders-0"), Some(&(6000)));
+    let _ = rows_committed;
 }

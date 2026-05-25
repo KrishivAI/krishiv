@@ -167,7 +167,7 @@ fn apply_row_predicates(
     table_names: &[String],
     policy: &dyn PolicyHook,
 ) -> String {
-    let mut preds: Vec<String> = table_names
+    let preds: Vec<String> = table_names
         .iter()
         .filter_map(|t| policy.row_predicate(principal, t))
         .collect();

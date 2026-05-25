@@ -1,7 +1,7 @@
 //! Physical plan lowering: typed [`NodeOp`] → executor task fragments (ADR-DIST-04).
 
 use crate::window::{encode_stream_fragment, WindowAgg, WindowExecutionSpec, WindowKind};
-use crate::{ExecutionKind, NodeOp, PlanNode};
+use crate::{NodeOp, PlanNode};
 
 const PLAN_OP_PREFIX: &str = "planop:";
 
@@ -113,6 +113,7 @@ mod tests {
 
     #[test]
     fn tumbling_node_op_lowers_to_stream_fragment() {
+        use crate::ExecutionKind;
         let node = PlanNode::new("w1", "window", ExecutionKind::Streaming).with_op(
             NodeOp::TumblingWindow {
                 window_size_ms: 5_000,

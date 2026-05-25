@@ -1,8 +1,6 @@
 //! CLI dispatch for the `krishiv` binary.
 
-use std::path::PathBuf;
-
-use krishiv_api::{ExecutionMode, Session};
+use krishiv_api::Session;
 use krishiv_async_util::block_on;
 use krishiv_checkpoint::{LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata};
 use krishiv_proto::{
@@ -147,8 +145,12 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["help", "daemons"] | ["help", "daemon"] => crate::daemon_cmd::help_daemons(),
         ["local", rest @ ..] => crate::local_cluster::run_local(rest),
         ["cluster", rest @ ..] => crate::cluster_cmd::run_cluster(rest),
-        ["coordinator", ..] | ["clusterd", ..] | ["executor", ..] | ["job-coordinator", ..]
-        | ["flight-server", ..] | ["shuffle-svc", ..] => CliResponse::err(
+        ["coordinator", ..]
+        | ["clusterd", ..]
+        | ["executor", ..]
+        | ["job-coordinator", ..]
+        | ["flight-server", ..]
+        | ["shuffle-svc", ..] => CliResponse::err(
             format!(
                 "daemon commands must run via the krishiv binary entrypoint\n\n{}",
                 crate::daemon_cmd::daemons_help()
@@ -298,7 +300,7 @@ fn run_sql(args: &[&str]) -> CliResponse {
     let command = match crate::query_cli::parse_query_command(args) {
         Ok(command) => command,
         Err(message) => {
-            return CliResponse::err(format!("{message}\n\n{}", crate::query_cli::sql_help()), 2)
+            return CliResponse::err(format!("{message}\n\n{}", crate::query_cli::sql_help()), 2);
         }
     };
     crate::query_cli::run_sql(&command)
@@ -311,7 +313,7 @@ fn run_explain(args: &[&str]) -> CliResponse {
             return CliResponse::err(
                 format!("{message}\n\n{}", crate::query_cli::explain_help()),
                 2,
-            )
+            );
         }
     };
     crate::query_cli::run_explain(&command)
@@ -1063,8 +1065,7 @@ mod tests {
         let response = dispatch(&["explain", "--query", "select 1 as value"]);
         assert_eq!(response.exit_code, 0, "{}", response.stderr);
         assert!(
-            response.stdout.contains("logical plan:")
-                || response.stdout.contains("logical_plan"),
+            response.stdout.contains("logical plan:") || response.stdout.contains("logical_plan"),
             "{}",
             response.stdout
         );

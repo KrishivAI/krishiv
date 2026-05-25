@@ -1,0 +1,12 @@
+{
+  "coordinator_grpc": "http://127.0.0.1:9090",
+  "coordinator_http": "http://127.0.0.1:18080",
+  "coordinator_flight": "http://127.0.0.1:50051",
+  "ui_url": "http://127.0.0.1:18080/ui",
+  "executor_id": "local-exec-1",
+  "data_dir": ".krishiv/local",
+  "coordinator_pid": 708212,
+  "executor_pid": 708238,
+  "flight_pid": 708225,
+  "ui_pid": null
+}

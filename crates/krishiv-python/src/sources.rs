@@ -1,14 +1,12 @@
 //! Module-level sources: `read_parquet`, `read_kafka`, `read_iceberg`.
 
-use std::sync::Arc;
-
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
 use crate::dataframe::PyDataFrame;
 use crate::errors::ConnectorError;
-use crate::schema::{PySchema, validate_batch_against_schema_class};
+use crate::schema::validate_batch_against_schema_class;
 use crate::session::PySession;
 use crate::stream::PyStream;
 
@@ -63,7 +61,7 @@ pub fn read_kafka(
     let _ = (schema, group_id);
     #[cfg(not(feature = "kafka"))]
     {
-        let _ = (&topic, &bootstrap_servers);
+        let _ = (session, &topic, &bootstrap_servers);
         return Err(ConnectorError::new_err(
             "Kafka support requires building with the `kafka` feature (pip install krishiv[kafka])",
         ));
@@ -90,7 +88,7 @@ pub fn read_iceberg(
     let _ = schema;
     #[cfg(not(feature = "iceberg"))]
     {
-        let _ = (&catalog_uri, &table_name);
+        let _ = (session, &catalog_uri, &table_name);
         return Err(ConnectorError::new_err(
             "Iceberg support requires the `iceberg` feature (pip install krishiv[iceberg])",
         ));
@@ -109,6 +107,7 @@ fn read_iceberg_impl(
     schema: Option<&Bound<'_, PyType>>,
 ) -> PyResult<PyStream> {
     use std::sync::Arc;
+    use crate::schema::PySchema;
 
     use krishiv_lakehouse::{
         IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, SchemaField,

@@ -13,9 +13,10 @@ use crate::errors::SchemaError;
 const FIELDS_ATTR: &str = "_krishiv_fields";
 
 /// Declarative schema base class. Subclasses declare columns via PEP 484 annotations.
-#[pyclass(name = "Schema", subclass)]
+#[pyclass(from_py_object, name = "Schema", subclass)]
 #[derive(Clone)]
 pub struct PySchema {
+    #[allow(dead_code)]
     fields: Vec<(String, DataType)>,
 }
 

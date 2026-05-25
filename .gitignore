@@ -1,4 +1,6 @@
+# Rust build artifacts
 /target/
+**/target/
 **/.fastembed_cache/
 /.DS_Store
 /.claude/worktrees/

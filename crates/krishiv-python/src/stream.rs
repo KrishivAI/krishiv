@@ -9,7 +9,6 @@ use crate::agg::descriptors_from_kwargs;
 use crate::batch::PyBatch;
 use crate::errors::SchemaError;
 use crate::pipeline::{StreamPipeline, WindowKind};
-use crate::session::PySession;
 use crate::stream_exec::execute_pipeline;
 use crate::windows::{PyWindowSpec, ensure_watermark_before_window};
 

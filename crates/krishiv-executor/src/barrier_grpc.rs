@@ -1,6 +1,5 @@
 //! Executor-side `BarrierService` gRPC server (R16 S1.2–S1.4).
 
-use std::pin::Pin;
 use std::time::Duration;
 
 use krishiv_proto::wire::v1::{

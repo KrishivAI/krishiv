@@ -210,7 +210,10 @@ pub fn run_explain(command: &QueryCommand) -> CliResponse {
     }
 }
 
-async fn query_dataframe(session: &Session, command: &QueryCommand) -> Result<DataFrame, KrishivError> {
+async fn query_dataframe(
+    session: &Session,
+    command: &QueryCommand,
+) -> Result<DataFrame, KrishivError> {
     if let Some(key) = &command.api_key {
         return session.sql_as(key, &command.query).await;
     }
@@ -236,9 +239,9 @@ fn auth_from_env() -> Result<Arc<dyn AuthProvider>, String> {
         let (key, rest) = part
             .split_once('=')
             .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry: {part}"))?;
-        let (subject, role_name) = rest
-            .split_once(':')
-            .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}"))?;
+        let (subject, role_name) = rest.split_once(':').ok_or_else(|| {
+            format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}")
+        })?;
         let role = parse_role(role_name.trim())?;
         entries.push((key.trim().to_string(), subject.trim().to_string(), role));
     }

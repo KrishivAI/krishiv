@@ -194,7 +194,10 @@ fn parse_stream_submit(args: &[&str]) -> Result<StreamSubmitSpec, String> {
     }
     let job_id = job_id.ok_or_else(|| String::from("missing required --job-id"))?;
     let (window_kind, window_label) = match window.as_str() {
-        "tumbling" => (LocalWindowKind::Tumbling, format!("tumbling/{window_size_ms}ms")),
+        "tumbling" => (
+            LocalWindowKind::Tumbling,
+            format!("tumbling/{window_size_ms}ms"),
+        ),
         "sliding" => (
             LocalWindowKind::Sliding { slide_ms },
             format!("sliding/{window_size_ms}ms slide {slide_ms}ms"),
@@ -240,10 +243,10 @@ fn parse_job_and_parquet(args: &[&str]) -> Result<(String, PathBuf), String> {
             }
             "--parquet" => {
                 idx += 1;
-                path = Some(PathBuf::from(
-                    args.get(idx)
-                        .ok_or_else(|| String::from("missing value for --parquet"))?,
-                ));
+                path =
+                    Some(PathBuf::from(args.get(idx).ok_or_else(|| {
+                        String::from("missing value for --parquet")
+                    })?));
             }
             unknown => return Err(format!("unknown option: {unknown}")),
         }
@@ -284,9 +287,7 @@ fn parse_u64_arg(value: Option<&str>, flag: &str) -> Result<u64, String> {
 fn shared_stream_cluster() -> Arc<InProcessCluster> {
     static CLUSTER: OnceLock<Arc<InProcessCluster>> = OnceLock::new();
     Arc::clone(CLUSTER.get_or_init(|| {
-        Arc::new(
-            InProcessCluster::new().expect("in-process cluster for krishiv stream CLI"),
-        )
+        Arc::new(InProcessCluster::new().expect("in-process cluster for krishiv stream CLI"))
     }))
 }
 
@@ -297,8 +298,8 @@ fn stream_session() -> Result<Session, krishiv_api::KrishivError> {
 }
 
 fn read_parquet_batches(path: &PathBuf) -> Result<Vec<krishiv_api::RecordBatch>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| format!("parquet read error: {e}"))?
         .build()

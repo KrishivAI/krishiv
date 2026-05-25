@@ -119,6 +119,12 @@ pub mod table_cmd;
 /// Most applications use [`Session`] only; operators and custom tooling can use these
 /// types to run coordinators and executors in-process or compose custom deployments.
 pub mod distributed {
+    pub use krishiv_executor::{
+        ExecutorConfig, ExecutorRuntime, ExecutorTaskRunner, GrpcCoordinatorService,
+    };
+    pub use krishiv_proto::{
+        CoordinatorId, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec,
+    };
     pub use krishiv_scheduler::{
         ClusterControlPlane, Coordinator, CoordinatorDaemonConfig, JobCoordinator,
         JobCoordinatorDaemonConfig, SharedCoordinator, build_shared_coordinator,
@@ -126,12 +132,6 @@ pub mod distributed {
         parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
         run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
         run_standalone_coordinator, spawn_coordinator_sidecars,
-    };
-    pub use krishiv_executor::{
-        ExecutorConfig, ExecutorRuntime, ExecutorTaskRunner, GrpcCoordinatorService,
-    };
-    pub use krishiv_proto::{
-        CoordinatorId, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec,
     };
 }
 

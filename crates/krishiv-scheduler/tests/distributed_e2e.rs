@@ -37,10 +37,11 @@ fn in_process_batch_job_submits_with_plan_op_lowering() {
 #[test]
 fn in_process_streaming_window_lowers_to_stream_fragment() {
     use krishiv_plan::window::WindowAgg;
-    let node = PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
-        window_size_ms: 1_000,
-        aggs: vec![WindowAgg::count("count")],
-    });
+    let node =
+        PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
+            window_size_ms: 1_000,
+            aggs: vec![WindowAgg::count("count")],
+        });
     let frag = krishiv_plan::encode_task_fragment(&node);
     assert!(frag.starts_with("stream:tw:"));
     let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming).with_node(node);

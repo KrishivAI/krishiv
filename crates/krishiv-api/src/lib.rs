@@ -797,6 +797,7 @@ pub struct DataFrame {
     mode: ExecutionMode,
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
+    #[allow(dead_code)]
     coordinator_url: Option<String>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
@@ -889,8 +890,12 @@ impl DataFrame {
         block_on(self.explain_async())
     }
 
-    /// Asynchronously explain the current plan.
     pub async fn explain_async(&self) -> Result<String> {
+        if !self.runtime.uses_remote_execution() {
+            if let Some(dataframe) = &self.sql_dataframe {
+                return dataframe.explain().await.map_err(Into::into);
+            }
+        }
         if let Some(query) = self.sql_query.as_deref() {
             return self.runtime.explain_sql(query).map_err(KrishivError::from);
         }

@@ -621,8 +621,8 @@ mod tests {
     // KafkaSource capabilities
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn kafka_source_reports_unbounded_and_rewindable() {
+    #[tokio::test]
+    async fn kafka_source_reports_unbounded_and_rewindable() {
         let config = KafkaConfig {
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),

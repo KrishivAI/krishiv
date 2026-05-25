@@ -18,6 +18,7 @@ pub mod feature_store;
 pub mod kafka;
 pub mod parquet;
 pub mod s3;
+pub mod transactional;
 pub mod transactional_kafka;
 pub mod two_phase_parquet_s3;
 

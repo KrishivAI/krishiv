@@ -20,23 +20,18 @@ use krishiv_checkpoint::{
 };
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
-    AttemptId, CheckpointAckRequest, CheckpointAckResponse,
-    CheckpointEpochInfo, CoordinatorExecutorService, CoordinatorId, CoordinatorState,
-    CoordinatorManagementService,
-    DeregisterExecutorRequest,
-    DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat, ExecutorHeartbeatRequest,
-    ExecutorHeartbeatResponse, ExecutorId, ExecutorTaskAssignment,
+    AttemptId, CheckpointAckRequest, CheckpointAckResponse, CheckpointEpochInfo,
+    CoordinatorExecutorService, CoordinatorId, CoordinatorManagementService, CoordinatorState,
+    DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat,
+    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, HeartbeatThrottleCommand, InitiateCheckpointCommand,
-    InitiateCheckpointRequest,
-    LlmThrottleCommand,
-    InspectStateRequest, InspectStateResponse, ListCheckpointsRequest, ListCheckpointsResponse,
-    JobId, JobKind, JobSpec, LeaseGeneration,
-    RegisterExecutorRequest, RegisterExecutorResponse,
-    RestoreJobRequest, RestoreJobResponse,
+    InitiateCheckpointRequest, InspectStateRequest, InspectStateResponse, JobId, JobKind, JobSpec,
+    LeaseGeneration, ListCheckpointsRequest, ListCheckpointsResponse, LlmThrottleCommand,
+    RegisterExecutorRequest, RegisterExecutorResponse, RestoreJobRequest, RestoreJobResponse,
     StageId, StateSnapshotInfo, StreamingTaskState, TaskAssignment, TaskAttemptRef,
-    TaskCancellationRequest, TaskId, TaskState, TaskStatusRequest,
-    TaskStatusResponse, TaskStatusUpdate, TransportDisposition, TransportVersion,
-    TriggerSavepointRequest, TriggerSavepointResponse, wire,
+    TaskCancellationRequest, TaskId, TaskState, TaskStatusRequest, TaskStatusResponse,
+    TaskStatusUpdate, TransportDisposition, TransportVersion, TriggerSavepointRequest,
+    TriggerSavepointResponse, wire,
 };
 
 // ── GAP-OB-01: Scheduler hot-path metrics counters ──────────────────────────
@@ -45,16 +40,13 @@ use krishiv_proto::{
 // Prometheus / OTLP export can scrape these via the metrics HTTP endpoint.
 
 /// Total number of jobs accepted by `submit_job` since process start.
-pub static JOBS_SUBMITTED_TOTAL: LazyLock<AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(0));
+pub static JOBS_SUBMITTED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 /// Total number of checkpoint epochs initiated since process start.
-pub static CHECKPOINT_EPOCHS_TOTAL: LazyLock<AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(0));
+pub static CHECKPOINT_EPOCHS_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 /// Total number of task assignments launched since process start.
-pub static TASKS_ASSIGNED_TOTAL: LazyLock<AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(0));
+pub static TASKS_ASSIGNED_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 /// Snapshot of scheduler-level metrics counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +106,7 @@ pub use coordinator_daemon::{
     run_standalone_coordinator, spawn_coordinator_sidecars,
 };
 pub use in_process::{
-    InProcessCoordinatorBridge, IN_PROCESS_TASK_ENDPOINT, is_in_process_task_endpoint,
+    IN_PROCESS_TASK_ENDPOINT, InProcessCoordinatorBridge, is_in_process_task_endpoint,
 };
 pub use job_coordinator::JobCoordinator;
 pub use transport::CoordinatorExecutorTransport;
@@ -122,26 +114,22 @@ pub(crate) mod store;
 
 // ── Re-exports for backwards-compatible crate-level API ────────────────────────
 pub use admission::{
-    QueueManager, InMemoryQueueManager, QuotaPolicy, QuotaQueueManager, ConfigFileQueueManager,
+    ConfigFileQueueManager, InMemoryQueueManager, QueueManager, QuotaPolicy, QuotaQueueManager,
 };
-pub use checkpoint::{CheckpointCoordinatorState, CheckpointCoordinator};
+pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use heartbeat::{
-    ExecutorHealthSnapshot, ExecutorRegistry, ExecutorRecord, ExecutorHeartbeatAge,
-};
-pub use job::{
-    SubmitOutcome, ResourceUsage, NamespaceQuotaSnapshot,
-    JobRecord, StageRecord, TaskRecord,
-    JobSnapshot, JobDetailSnapshot, StageSnapshot, TaskSnapshot,
-    StabilityMetrics,
-    job_spec_from_logical_plan, job_spec_from_physical_plan,
-    SlotAwareScheduler, StaticScheduler,
+    ExecutorHealthSnapshot, ExecutorHeartbeatAge, ExecutorRecord, ExecutorRegistry,
 };
 pub(crate) use job::validate_job;
-pub use store::{
-    EventLogEvent, MetadataStore, InMemoryMetadataStore, JsonFileMetadataStore,
+pub use job::{
+    JobDetailSnapshot, JobRecord, JobSnapshot, NamespaceQuotaSnapshot, ResourceUsage,
+    SlotAwareScheduler, StabilityMetrics, StageRecord, StageSnapshot, StaticScheduler,
+    SubmitOutcome, TaskRecord, TaskSnapshot, job_spec_from_logical_plan,
+    job_spec_from_physical_plan,
 };
 #[cfg(feature = "sqlite")]
 pub use store::SqliteMetadataStore;
+pub use store::{EventLogEvent, InMemoryMetadataStore, JsonFileMetadataStore, MetadataStore};
 
 /// Job submission interface supporting both gRPC (process mode) and Kubernetes
 /// CRD (operator mode) submission paths.
@@ -151,8 +139,6 @@ pub use store::SqliteMetadataStore;
 pub trait JobSubmitter: Send + Sync {
     fn submit(&self, spec: &JobSpec) -> SchedulerResult<()>;
 }
-
-
 
 /// Coordinator behavior knobs for deterministic R2 scheduler tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,7 +392,6 @@ impl fmt::Display for SchedulerError {
 
 impl Error for SchedulerError {}
 
-
 /// R2 coordinator skeleton.
 #[derive(Clone)]
 pub struct Coordinator {
@@ -559,11 +544,8 @@ impl SharedCoordinator {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                if let Err(error) = drive_barrier_dispatches(
-                    &barriers,
-                    std::time::Duration::from_secs(30),
-                )
-                .await
+                if let Err(error) =
+                    drive_barrier_dispatches(&barriers, std::time::Duration::from_secs(30)).await
                 {
                     eprintln!("coordinator barrier dispatch failed: {error}");
                 }
@@ -840,8 +822,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 .map(|mut c| c.handle_checkpoint_ack(ack))
         })
         .await
-        .map_err(|e| tonic::Status::internal(format!("checkpoint_ack task panicked: {e}")))?
-        ?;
+        .map_err(|e| tonic::Status::internal(format!("checkpoint_ack task panicked: {e}")))??;
         Ok(tonic::Response::new(response))
     }
 }
@@ -854,16 +835,20 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<TriggerSavepointRequest>,
     ) -> Result<tonic::Response<TriggerSavepointResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
-            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
-        })?;
-        let label = if req.label.is_empty() { None } else { Some(req.label) };
-        let mut coordinator = self.coordinator.write().map_err(|_| {
-            tonic::Status::internal("coordinator lock poisoned")
-        })?;
-        let epoch = coordinator.savepoint_job(&job_id, label).map_err(|e| {
-            tonic::Status::internal(e.to_string())
-        })?;
+        let job_id = JobId::try_new(&req.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
+        let label = if req.label.is_empty() {
+            None
+        } else {
+            Some(req.label)
+        };
+        let mut coordinator = self
+            .coordinator
+            .write()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let epoch = coordinator
+            .savepoint_job(&job_id, label)
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
         Ok(tonic::Response::new(TriggerSavepointResponse { epoch }))
     }
 
@@ -872,16 +857,19 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<RestoreJobRequest>,
     ) -> Result<tonic::Response<RestoreJobResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
-            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
-        })?;
-        let coordinator = self.coordinator.read().map_err(|_| {
-            tonic::Status::internal("coordinator lock poisoned")
-        })?;
+        let job_id = JobId::try_new(&req.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
+        let coordinator = self
+            .coordinator
+            .read()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
         match coordinator.restore_job_from_checkpoint(&job_id, req.epoch, &req.storage_path) {
             Ok(_meta) => Ok(tonic::Response::new(RestoreJobResponse {
                 accepted: true,
-                message: format!("restore plan loaded for job {} epoch {}", req.job_id, req.epoch),
+                message: format!(
+                    "restore plan loaded for job {} epoch {}",
+                    req.job_id, req.epoch
+                ),
             })),
             Err(e) => Ok(tonic::Response::new(RestoreJobResponse {
                 accepted: false,
@@ -895,15 +883,15 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<ListCheckpointsRequest>,
     ) -> Result<tonic::Response<ListCheckpointsResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
-            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
-        })?;
-        let coordinator = self.coordinator.read().map_err(|_| {
-            tonic::Status::internal("coordinator lock poisoned")
-        })?;
-        let epoch_nums = coordinator.list_job_checkpoints(&job_id).map_err(|e| {
-            tonic::Status::internal(e.to_string())
-        })?;
+        let job_id = JobId::try_new(&req.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
+        let coordinator = self
+            .coordinator
+            .read()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let epoch_nums = coordinator
+            .list_job_checkpoints(&job_id)
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
         // Enrich each epoch with savepoint metadata if available.
         let epochs = epoch_nums
             .into_iter()
@@ -922,7 +910,11 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 CheckpointEpochInfo {
                     epoch,
                     is_savepoint,
-                    savepoint_label: if savepoint_label.is_empty() { None } else { Some(savepoint_label) },
+                    savepoint_label: if savepoint_label.is_empty() {
+                        None
+                    } else {
+                        Some(savepoint_label)
+                    },
                 }
             })
             .collect();
@@ -934,12 +926,12 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<InspectStateRequest>,
     ) -> Result<tonic::Response<InspectStateResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id).map_err(|e| {
-            tonic::Status::invalid_argument(format!("invalid job_id: {e}"))
-        })?;
-        let coordinator = self.coordinator.read().map_err(|_| {
-            tonic::Status::internal("coordinator lock poisoned")
-        })?;
+        let job_id = JobId::try_new(&req.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
+        let coordinator = self
+            .coordinator
+            .read()
+            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
         // Collect snapshot paths for the requested operator from the checkpoint coordinator.
         let snapshots = coordinator
             .checkpoint_coordinator(&job_id)
@@ -1090,7 +1082,10 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         request: tonic::Request<wire::v1::TriggerSavepointRequest>,
     ) -> Result<tonic::Response<wire::v1::TriggerSavepointResponse>, tonic::Status> {
         let w = request.into_inner();
-        let domain = TriggerSavepointRequest { job_id: w.job_id, label: w.label };
+        let domain = TriggerSavepointRequest {
+            job_id: w.job_id,
+            label: w.label,
+        };
         let resp = CoordinatorManagementService::trigger_savepoint(
             &self.inner,
             tonic::Request::new(domain),
@@ -1113,12 +1108,10 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
             epoch: w.epoch,
             storage_path: w.storage_path,
         };
-        let resp = CoordinatorManagementService::restore_job(
-            &self.inner,
-            tonic::Request::new(domain),
-        )
-        .await?
-        .into_inner();
+        let resp =
+            CoordinatorManagementService::restore_job(&self.inner, tonic::Request::new(domain))
+                .await?
+                .into_inner();
         Ok(tonic::Response::new(wire::v1::RestoreJobResponse {
             accepted: resp.accepted,
             message: resp.message,
@@ -1160,12 +1153,10 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
             job_id: w.job_id,
             operator_id: w.operator_id,
         };
-        let resp = CoordinatorManagementService::inspect_state(
-            &self.inner,
-            tonic::Request::new(domain),
-        )
-        .await?
-        .into_inner();
+        let resp =
+            CoordinatorManagementService::inspect_state(&self.inner, tonic::Request::new(domain))
+                .await?
+                .into_inner();
         let snapshots = resp
             .snapshots
             .into_iter()
@@ -1203,9 +1194,7 @@ pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
                 Err(tonic::Status::unauthenticated("invalid API key"))
             }
         }
-        AuthContext::Anonymous => Err(tonic::Status::unauthenticated(
-            "missing Bearer token",
-        )),
+        AuthContext::Anonymous => Err(tonic::Status::unauthenticated("missing Bearer token")),
     }
 }
 
@@ -1294,7 +1283,9 @@ pub async fn serve_coordinator_executor_grpc(
     let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
         .add_service(coordinator_executor_grpc_server(coordinator))
-        .add_service(coordinator_management_grpc_server(coordinator_for_management))
+        .add_service(coordinator_management_grpc_server(
+            coordinator_for_management,
+        ))
         .serve(addr)
         .await
 }
@@ -1307,7 +1298,9 @@ pub async fn serve_coordinator_executor_grpc_with_listener(
     let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
         .add_service(coordinator_executor_grpc_server(coordinator))
-        .add_service(coordinator_management_grpc_server(coordinator_for_management))
+        .add_service(coordinator_management_grpc_server(
+            coordinator_for_management,
+        ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
 }
@@ -1409,10 +1402,9 @@ impl Coordinator {
     fn generate_id() -> SchedulerResult<CoordinatorId> {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        CoordinatorId::try_new(format!("coordinator-{n}"))
-            .map_err(|e| SchedulerError::InvalidJob {
-                message: format!("generated coordinator id invalid: {e}"),
-            })
+        CoordinatorId::try_new(format!("coordinator-{n}")).map_err(|e| SchedulerError::InvalidJob {
+            message: format!("generated coordinator id invalid: {e}"),
+        })
     }
 
     /// Create a new active coordinator, returning an error if id generation fails.
@@ -1552,8 +1544,7 @@ impl Coordinator {
             self.llm_quota_aggregator.ingest(&llm_reports);
         }
         let llm_throttles = self.llm_quota_aggregator.evaluate_and_reset();
-        let checkpoint_commands =
-            self.pending_initiate_checkpoints_for_executor(&executor_id);
+        let checkpoint_commands = self.pending_initiate_checkpoints_for_executor(&executor_id);
         let lease_generation = self
             .executors
             .find_executor(&executor_id)
@@ -1715,12 +1706,7 @@ impl Coordinator {
             job.stages
                 .iter()
                 .flat_map(|stage| stage.tasks())
-                .filter(|task| {
-                    matches!(
-                        task.state(),
-                        TaskState::Running | TaskState::Assigned
-                    )
-                })
+                .filter(|task| matches!(task.state(), TaskState::Running | TaskState::Assigned))
                 .count()
         })
     }
@@ -1765,11 +1751,7 @@ impl Coordinator {
             .retain(|(jid, _, e)| jid != job_id || *e != epoch);
     }
 
-    fn executor_has_running_task_in_job(
-        &self,
-        executor_id: &ExecutorId,
-        job_id: &JobId,
-    ) -> bool {
+    fn executor_has_running_task_in_job(&self, executor_id: &ExecutorId, job_id: &JobId) -> bool {
         self.jobs.get(job_id).is_some_and(|job| {
             job.stages.iter().any(|stage| {
                 stage.tasks().iter().any(|task| {
@@ -1808,20 +1790,17 @@ impl Coordinator {
     /// Used by per-job coordinator processes that share a durable metadata file
     /// with the cluster control plane (ADR-DIST-01).
     pub fn sync_job_from_metadata_store(&mut self, job_id: &JobId) -> SchedulerResult<()> {
-        let store = self.store.as_ref().ok_or_else(|| SchedulerError::Transport {
-            message: "coordinator has no metadata store".to_string(),
-        })?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| SchedulerError::Transport {
+                message: "coordinator has no metadata store".to_string(),
+            })?;
         let record = {
-            let guard = store
-                .lock()
-                .map_err(|_| SchedulerError::Transport {
-                    message: "metadata store lock poisoned".to_string(),
-                })?;
-            guard
-                .jobs()
-                .iter()
-                .find(|j| j.job_id() == job_id)
-                .cloned()
+            let guard = store.lock().map_err(|_| SchedulerError::Transport {
+                message: "metadata store lock poisoned".to_string(),
+            })?;
+            guard.jobs().iter().find(|j| j.job_id() == job_id).cloned()
         };
         if let Some(record) = record {
             let streaming = record.spec.kind() == JobKind::Streaming;
@@ -1972,12 +1951,8 @@ impl Coordinator {
             )
         {
             let storage = Self::open_checkpoint_storage(storage_path)?;
-            let ckpt_coord = CheckpointCoordinator::new(
-                spec.job_id().clone(),
-                storage,
-                interval_ms,
-                0,
-            );
+            let ckpt_coord =
+                CheckpointCoordinator::new(spec.job_id().clone(), storage, interval_ms, 0);
             self.checkpoint_coordinators
                 .insert(spec.job_id().clone(), ckpt_coord);
         }
@@ -1993,7 +1968,10 @@ impl Coordinator {
             // be durably recorded must not be accepted, to prevent phantom jobs
             // surviving coordinator restart.
             s.save_job(&record).map_err(|e| SchedulerError::Transport {
-                message: format!("failed to persist job {} to metadata store: {e}", record.job_id()),
+                message: format!(
+                    "failed to persist job {} to metadata store: {e}",
+                    record.job_id()
+                ),
             })?;
             if let Err(e) = s.append_event(EventLogEvent::JobSubmitted {
                 job_id: job_id.clone(),
@@ -2253,7 +2231,8 @@ impl Coordinator {
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         self.ensure_active()?;
         let executor_leases = self.executors.assignment_leases();
-        let assignments = self.find_job_mut(job_id)?
+        let assignments = self
+            .find_job_mut(job_id)?
             .launch_assigned_task_assignments(&executor_leases)?;
         // GAP-OB-01: Increment tasks_assigned counter.
         TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
@@ -2548,6 +2527,7 @@ impl Coordinator {
     ///
     /// On a cache hit, clones the existing `Channel` (pointer-only cost).
     /// On a miss, establishes a new TCP+TLS connection and stores it for reuse.
+    #[allow(dead_code)]
     async fn get_or_connect_channel(
         &self,
         endpoint: &str,
@@ -2704,7 +2684,6 @@ impl TlsConfig {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -2723,6 +2702,8 @@ mod tests {
         TaskStatusResponse, TaskStatusUpdate, TransportDisposition, wire,
     };
 
+    #[cfg(feature = "sqlite")]
+    use super::SqliteMetadataStore;
     use super::{
         AdaptiveDecisionKind, AdaptiveOverrideConfig, CheckpointCoordinator,
         CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator, CoordinatorConfig,
@@ -2732,8 +2713,6 @@ mod tests {
         SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
         job_spec_from_logical_plan, serve_coordinator_executor_grpc_with_listener,
     };
-    #[cfg(feature = "sqlite")]
-    use super::SqliteMetadataStore;
 
     #[derive(Debug, Clone, Default)]
     struct RecordingExecutorTaskService {
@@ -5684,7 +5663,11 @@ mod tests {
 
         // Accumulate 4 000 ms — below the 5 000 ms interval.
         assert_eq!(coord.try_tick(4_000), None, "not yet due");
-        assert_eq!(coord.try_tick(2_000), None, "zero running tasks skips initiate");
+        assert_eq!(
+            coord.try_tick(2_000),
+            None,
+            "zero running tasks skips initiate"
+        );
         coord.set_expected_task_count(1);
         assert_eq!(coord.try_tick(5_000), Some(1), "epoch 1 initiated");
         // Epoch 1 is now in AwaitingAcks. Abort it to return to Idle.
@@ -6361,14 +6344,15 @@ mod tests {
     #[cfg(feature = "sqlite")]
     fn sqlite_coordinator_with_job(job_id: &JobId, name: &str) -> Coordinator {
         let task = TaskSpec::new(TaskId::try_new("task-1").unwrap(), "test-task");
-        let stage = StageSpec::new(StageId::try_new("stage-1").unwrap(), "test-stage")
-            .with_task(task);
+        let stage =
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "test-stage").with_task(task);
         let spec = JobSpec::new(job_id.clone(), name, JobKind::Batch).with_stage(stage);
         let exec_id = ExecutorId::try_new("exec-sqlite-1").unwrap();
-        let mut coord = Coordinator::active(
-            CoordinatorId::try_new(&format!("coord-{name}")).unwrap(),
-        );
-        coord.register_executor(ExecutorDescriptor::new(exec_id, "sqlite-node", 4)).unwrap();
+        let mut coord =
+            Coordinator::active(CoordinatorId::try_new(&format!("coord-{name}")).unwrap());
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id, "sqlite-node", 4))
+            .unwrap();
         coord.submit_job(spec).unwrap();
         coord
     }
@@ -6407,7 +6391,11 @@ mod tests {
         coordinator.persist_jobs_to_store(&mut store).unwrap();
         coordinator.persist_jobs_to_store(&mut store).unwrap();
 
-        assert_eq!(store.jobs().len(), 1, "upsert must not create duplicate rows");
+        assert_eq!(
+            store.jobs().len(),
+            1,
+            "upsert must not create duplicate rows"
+        );
         assert_eq!(store.jobs()[0].job_id(), &job_id);
     }
 
