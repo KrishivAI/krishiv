@@ -79,13 +79,14 @@ impl BarrierAligner {
             return Ok(true);
         }
         if let Some(deadline) = self.alignment_deadline
-            && Instant::now() > deadline {
-                return Err(CheckpointAlignmentTimeout {
-                    epoch,
-                    waited_inputs: self.barrier_inputs_seen,
-                    expected_inputs: self.input_count,
-                });
-            }
+            && Instant::now() > deadline
+        {
+            return Err(CheckpointAlignmentTimeout {
+                epoch,
+                waited_inputs: self.barrier_inputs_seen,
+                expected_inputs: self.input_count,
+            });
+        }
         Ok(false)
     }
 

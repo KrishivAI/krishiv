@@ -10,9 +10,9 @@ use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBacke
 use crate::operator_runtime::{max_event_time_ms, window_agg_to_expr};
 use crate::window::MultiSourceWatermarkState;
 use crate::{
-    AggExpr, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
-    SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,
-    TumblingWindowSpec, WatermarkState,
+    AggExpr, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
+    SlidingWindowOperator, SlidingWindowSpec, StateBackedTumblingWindowOperator,
+    TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
 
 enum WindowOperatorState {
@@ -56,8 +56,12 @@ impl WatermarkTracker {
             )
         })?;
         for (source_id, lag_ms) in &self.source_lags {
-            let max_ts =
-                max_event_time_ms_for_source(batch, &self.event_time_column, source_col, source_id)?;
+            let max_ts = max_event_time_ms_for_source(
+                batch,
+                &self.event_time_column,
+                source_col,
+                source_id,
+            )?;
             if max_ts > i64::MIN {
                 let wm = max_ts.saturating_sub(*lag_ms as i64);
                 self.multi.update(source_id, wm);
@@ -103,7 +107,10 @@ fn max_event_time_ms_for_source(
     Ok(max)
 }
 
-fn build_operator(spec: &WindowExecutionSpec, agg_exprs: &[AggExpr]) -> ExecResult<WindowOperatorState> {
+fn build_operator(
+    spec: &WindowExecutionSpec,
+    agg_exprs: &[AggExpr],
+) -> ExecResult<WindowOperatorState> {
     match spec.window_kind {
         WindowKind::Tumbling => {
             let tw_spec = TumblingWindowSpec {
@@ -261,10 +268,8 @@ mod tests {
     fn multi_source_watermark_configured() {
         let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
         spec.source_id_column = Some("source_id".into());
-        spec.source_watermark_lags = HashMap::from([
-            ("src-a".into(), 1_000),
-            ("src-b".into(), 2_000),
-        ]);
+        spec.source_watermark_lags =
+            HashMap::from([("src-a".into(), 1_000), ("src-b".into(), 2_000)]);
         let exec = ContinuousWindowExecutor::new(spec).expect("create");
         assert!(exec.uses_multi_source_watermark());
     }

@@ -1,6 +1,5 @@
 //! Coalesce N input partition batches into fewer output batches (P2-4).
 
-
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 

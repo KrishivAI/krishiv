@@ -27,9 +27,10 @@ fn next_version(root: &Path) -> LakehouseResult<u64> {
         let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(stem) = name.strip_suffix(".json")
-            && let Ok(v) = stem.parse::<u64>() {
-                max = max.max(v);
-            }
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            max = max.max(v);
+        }
     }
     Ok(max + 1)
 }
@@ -45,9 +46,10 @@ fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec
         let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(stem) = name.strip_suffix(".json")
-            && let Ok(v) = stem.parse::<u64>() {
-                versions.push(v);
-            }
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            versions.push(v);
+        }
     }
     versions.sort_unstable();
     let limit = max_version.unwrap_or_else(|| versions.last().copied().unwrap_or(0));
@@ -61,9 +63,10 @@ fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec
             let value: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
             if let Some(add) = value.get("add").and_then(|a| a.get("path"))
-                && let Some(rel) = add.as_str() {
-                    files.push(root.join(rel));
-                }
+                && let Some(rel) = add.as_str()
+            {
+                files.push(root.join(rel));
+            }
         }
     }
     Ok(files)
@@ -92,16 +95,15 @@ pub fn read_table(path: &str, version: Option<u64>) -> LakehouseResult<Vec<Recor
 pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> LakehouseResult<()> {
     let root = Path::new(path);
     fs::create_dir_all(root).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    if overwrite
-        && root.exists() {
-            for entry in fs::read_dir(root).map_err(|e| LakehouseError::Io(e.to_string()))? {
-                let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
-                let p = entry.path();
-                if p.extension().is_some_and(|e| e == "parquet") {
-                    fs::remove_file(p).ok();
-                }
+    if overwrite && root.exists() {
+        for entry in fs::read_dir(root).map_err(|e| LakehouseError::Io(e.to_string()))? {
+            let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "parquet") {
+                fs::remove_file(p).ok();
             }
         }
+    }
     let version = next_version(root)?;
     let file_name = format!("part-{version:05}.parquet");
     let file_path = root.join(&file_name);

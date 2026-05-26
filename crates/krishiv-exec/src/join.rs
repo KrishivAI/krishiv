@@ -23,7 +23,6 @@ pub(crate) enum AggKey {
 
 impl AggKey {
     pub(crate) fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        
         match (self, other) {
             (Self::Int32(a), Self::Int32(b)) => a.cmp(b),
             (Self::Int64(a), Self::Int64(b)) => a.cmp(b),
@@ -105,11 +104,7 @@ pub(crate) fn compare_key_parts(ai: &str, bi: &str) -> std::cmp::Ordering {
 
 /// Serialize a single row value from the given column to a `String` for use as
 /// a hash-map key.  Supported types: `Int32`, `Int64`, `Utf8`.
-pub fn format_key_value(
-    batch: &RecordBatch,
-    col_idx: usize,
-    row: usize,
-) -> ExecResult<String> {
+pub fn format_key_value(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecResult<String> {
     let col = batch.column(col_idx);
     match col.data_type() {
         DataType::Int32 => {

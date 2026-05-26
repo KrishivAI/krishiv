@@ -105,10 +105,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
 
     let extra = match spec.window_kind {
         WindowKind::Tumbling => String::new(),
-        WindowKind::Sliding => format!(
-            ":slide={}",
-            spec.slide_ms.unwrap_or(spec.window_size_ms)
-        ),
+        WindowKind::Sliding => format!(":slide={}", spec.slide_ms.unwrap_or(spec.window_size_ms)),
         WindowKind::Session => format!(
             ":gap={}",
             spec.session_gap_ms.unwrap_or(spec.window_size_ms)
@@ -122,8 +119,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
 
     format!(
         "{prefix}:key=key:time=ts:win={}:lag={}:{agg}{extra}{ttl}",
-        spec.window_size_ms,
-        spec.watermark_lag_ms,
+        spec.window_size_ms, spec.watermark_lag_ms,
     )
 }
 
@@ -234,10 +230,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Str
             input_column: agg_col.clone().ok_or_else(|| {
                 String::from("stream fragment with agg=sum requires col=<column>")
             })?,
-            output_column: format!(
-                "sum_{}",
-                agg_col.as_deref().unwrap_or("val")
-            ),
+            output_column: format!("sum_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("min") => WindowAgg {
             kind: WindowAggKind::Min,

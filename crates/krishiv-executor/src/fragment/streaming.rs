@@ -1,10 +1,10 @@
 //! Streaming fragment execution: unified bounded window path (all window kinds).
 
-use krishiv_exec::execute_bounded_window;
-use krishiv_plan::window::{parse_stream_fragment, WindowAggKind, WindowExecutionSpec, WindowKind};
-use krishiv_proto::ExecutorTaskAssignment;
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
+use krishiv_exec::execute_bounded_window;
+use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, WindowKind, parse_stream_fragment};
+use krishiv_proto::ExecutorTaskAssignment;
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
 const STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
@@ -173,7 +173,10 @@ pub(crate) async fn execute_streaming_fragment(
             .map_err(|message| ExecutorError::LocalExecution { message })?;
         let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
         let total_batches = collected_batches.len();
-        let column_count = collected_batches.first().map(|b| b.num_columns()).unwrap_or(0);
+        let column_count = collected_batches
+            .first()
+            .map(|b| b.num_columns())
+            .unwrap_or(0);
         return Ok(ExecutorTaskOutput::streaming_window(
             total_rows,
             total_batches,
@@ -182,30 +185,34 @@ pub(crate) async fn execute_streaming_fragment(
         ));
     }
 
-    let parsed = parse_stream_fragment(fragment).map_err(|e| ExecutorError::InvalidAssignment {
-        message: e,
-    })?;
+    let parsed = parse_stream_fragment(fragment)
+        .map_err(|e| ExecutorError::InvalidAssignment { message: e })?;
     let mut plan_spec = parsed_to_plan_spec(parsed);
 
     // stream-kafka batches use normalized column names key/ts/val
     plan_spec.key_column = String::from("key");
     plan_spec.event_time_column = String::from("ts");
-    if plan_spec.agg_exprs.first().is_some_and(|a| a.kind == WindowAggKind::Sum) {
-        if plan_spec.agg_exprs[0].input_column.is_empty() {
-            plan_spec.agg_exprs[0].input_column = String::from("val");
-        }
+    if plan_spec
+        .agg_exprs
+        .first()
+        .is_some_and(|a| a.kind == WindowAggKind::Sum)
+        && plan_spec.agg_exprs[0].input_column.is_empty()
+    {
+        plan_spec.agg_exprs[0].input_column = String::from("val");
     }
 
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
-    let collected_batches = execute_bounded_window(batches, &plan_spec).map_err(|e| {
-        ExecutorError::LocalExecution {
+    let collected_batches =
+        execute_bounded_window(batches, &plan_spec).map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),
-        }
-    })?;
+        })?;
 
     let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected_batches.len();
-    let column_count = collected_batches.first().map(|b| b.num_columns()).unwrap_or(0);
+    let column_count = collected_batches
+        .first()
+        .map(|b| b.num_columns())
+        .unwrap_or(0);
 
     Ok(ExecutorTaskOutput::streaming_window(
         total_rows,

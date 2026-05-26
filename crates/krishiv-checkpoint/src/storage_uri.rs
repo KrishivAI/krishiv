@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use object_store::ObjectStore;
 
-use crate::{CheckpointError, CheckpointResult, CheckpointStorage, LocalFsCheckpointStorage};
 use crate::ObjectStoreCheckpointStorage;
+use crate::{CheckpointError, CheckpointResult, CheckpointStorage, LocalFsCheckpointStorage};
 
 /// Open checkpoint storage for a configured path or URI.
 ///
@@ -21,7 +21,10 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
     }
     if trimmed == "memory://" || trimmed.starts_with("memory://") {
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let prefix = trimmed.strip_prefix("memory://").unwrap_or("").trim_matches('/');
+        let prefix = trimmed
+            .strip_prefix("memory://")
+            .unwrap_or("")
+            .trim_matches('/');
         return Ok(Arc::new(ObjectStoreCheckpointStorage::new(store, prefix)));
     }
     if let Some(rest) = trimmed.strip_prefix("s3://") {
@@ -46,9 +49,9 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
         )));
     }
     let path = trimmed.strip_prefix("file://").unwrap_or(trimmed);
-    Ok(Arc::new(
-        LocalFsCheckpointStorage::new(path).map_err(|e| CheckpointError::Storage {
+    Ok(Arc::new(LocalFsCheckpointStorage::new(path).map_err(
+        |e| CheckpointError::Storage {
             message: format!("local checkpoint storage at {path}: {e}"),
-        })?,
-    ))
+        },
+    )?))
 }

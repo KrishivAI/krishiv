@@ -1,0 +1,69 @@
+//! Adaptive governance types.
+
+use std::fmt;
+
+use krishiv_proto::{InitiateCheckpointCommand, JobId, LeaseGeneration, LlmThrottleCommand};
+
+// ── R7.2 Adaptive governance types ───────────────────────────────────────────
+
+/// The kind of adaptive decision taken or suppressed by the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaptiveDecisionKind {
+    HotKeySplit,
+    Repartition,
+    SourceThrottle,
+    SlowSinkDetected,
+}
+
+impl fmt::Display for AdaptiveDecisionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HotKeySplit => f.write_str("hot-key-split"),
+            Self::Repartition => f.write_str("repartition"),
+            Self::SourceThrottle => f.write_str("source-throttle"),
+            Self::SlowSinkDetected => f.write_str("slow-sink"),
+        }
+    }
+}
+
+/// One recorded adaptive decision (applied or suppressed by manual override).
+#[derive(Debug, Clone)]
+pub struct AdaptiveDecisionLog {
+    pub timestamp_ms: u64,
+    pub kind: AdaptiveDecisionKind,
+    pub affected_job_id: JobId,
+    pub details: String,
+    /// `true` if the decision was actually applied; `false` if suppressed.
+    pub applied: bool,
+}
+
+/// Manual override configuration for adaptive behaviors in the coordinator.
+#[derive(Debug, Clone, Default)]
+pub struct AdaptiveOverrideConfig {
+    pub disable_hot_key_splitting: bool,
+    pub disable_adaptive_repartition: bool,
+    pub disable_source_throttling: bool,
+}
+
+/// A throttle command the coordinator sends back to an executor in the
+/// heartbeat response (R7.2 Group C).
+///
+/// The executor forwards this to its source operators to apply rate limiting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrottleDecision {
+    /// Source operator id on the executor.
+    pub source_id: String,
+    /// Maximum rows per second (`None` clears the throttle).
+    pub rows_per_second: Option<u64>,
+}
+
+/// Side effects returned from a successful executor heartbeat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutorHeartbeatEffects {
+    /// Source-operator throttle directives (R7.2).
+    pub source_throttles: Vec<ThrottleDecision>,
+    /// LLM UDF throttle directives (R17).
+    pub llm_throttles: Vec<LlmThrottleCommand>,
+    pub checkpoint_commands: Vec<InitiateCheckpointCommand>,
+    pub lease_generation: LeaseGeneration,
+}

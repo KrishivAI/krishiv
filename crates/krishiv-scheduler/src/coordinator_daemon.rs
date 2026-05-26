@@ -157,7 +157,8 @@ pub async fn spawn_coordinator_sidecars(
         loop {
             ticker.tick().await;
             if let Ok(mut coord) = tick_coordinator.write() {
-                if let Err(e) = coord.coordinator_tick() {
+                let tick_res = coord.coordinator_tick();
+                if let Err(e) = tick_res {
                     tracing::warn!(error = %e, "coordinator tick failed");
                 }
             }

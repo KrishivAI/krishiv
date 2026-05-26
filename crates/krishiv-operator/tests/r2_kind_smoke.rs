@@ -81,7 +81,8 @@ impl KindSmokeConfig {
             self.run("kind", &["create", "cluster", "--name", &self.cluster]);
         }
         if let Some(image) = &self.image {
-            if self.load_image {
+            let load = self.load_image;
+            if load {
                 self.run(
                     "kind",
                     &["load", "docker-image", image, "--name", &self.cluster],

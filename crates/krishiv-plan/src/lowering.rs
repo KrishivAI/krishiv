@@ -1,6 +1,6 @@
 //! Physical plan lowering: typed [`NodeOp`] → executor task fragments (ADR-DIST-04).
 
-use crate::window::{encode_stream_fragment, WindowAgg, WindowExecutionSpec, WindowKind};
+use crate::window::{WindowAgg, WindowExecutionSpec, WindowKind, encode_stream_fragment};
 use crate::{NodeOp, PlanNode};
 
 const PLAN_OP_PREFIX: &str = "planop:";

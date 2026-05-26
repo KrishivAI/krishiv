@@ -4,12 +4,12 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::{LocalDiskShuffleStore, PartitionId, ShuffleCompression, ShuffleStore};
 use axum::Router;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use crate::{LocalDiskShuffleStore, PartitionId, ShuffleCompression, ShuffleStore};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -33,8 +33,7 @@ pub async fn run_shuffle_svc(
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let store = Arc::new(
-        LocalDiskShuffleStore::new(base_dir.as_ref())?
-            .with_compression(ShuffleCompression::Lz4),
+        LocalDiskShuffleStore::new(base_dir.as_ref())?.with_compression(ShuffleCompression::Lz4),
     );
     let state = ShuffleSvcState { store };
     let app = Router::new()

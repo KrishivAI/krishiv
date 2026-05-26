@@ -406,7 +406,9 @@ mod kafka_delta {
             let payload = encode_entry(op, &batch)?;
             let key = self.next_key();
             let record = FutureRecord::to(&self.topic).key(&key).payload(&payload);
-            let fut = self.producer.send(record, std::time::Duration::from_secs(5));
+            let fut = self
+                .producer
+                .send(record, std::time::Duration::from_secs(5));
             krishiv_async_util::block_on(fut)
                 .map_err(|(e, _)| LakehouseError::Io(e.to_string()))?;
             Ok(())

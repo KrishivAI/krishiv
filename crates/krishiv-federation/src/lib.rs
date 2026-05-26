@@ -157,7 +157,10 @@ impl FederationClient for RemoteFederationClient {
             .await
             .map_err(|e| FederationError(format!("job_status HTTP: {e}")))?;
         if !resp.status().is_success() {
-            return Err(FederationError(format!("job_status HTTP {}", resp.status())));
+            return Err(FederationError(format!(
+                "job_status HTTP {}",
+                resp.status()
+            )));
         }
         let body: JobStatusBody = resp
             .json()
@@ -180,7 +183,10 @@ impl FederationClient for RemoteFederationClient {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(FederationError(format!("cancel_job HTTP {}", resp.status())))
+            Err(FederationError(format!(
+                "cancel_job HTTP {}",
+                resp.status()
+            )))
         }
     }
 }
@@ -373,10 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_client_requires_live_coordinator() {
-        let client = RemoteFederationClient::new(
-            RegionId::new("us-west-2"),
-            "http://127.0.0.1:1",
-        );
+        let client = RemoteFederationClient::new(RegionId::new("us-west-2"), "http://127.0.0.1:1");
         assert!(client.submit_job("job-1", "{}").await.is_err());
     }
 

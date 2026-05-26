@@ -533,10 +533,7 @@ impl ExecutorTaskRunner {
     }
 
     /// Wire continuous streaming drain for `stream:continuous:` fragments.
-    pub fn with_continuous_drainer(
-        mut self,
-        drainer: Arc<dyn ContinuousJobDrainer>,
-    ) -> Self {
+    pub fn with_continuous_drainer(mut self, drainer: Arc<dyn ContinuousJobDrainer>) -> Self {
         self.continuous_drainer = Some(drainer);
         self
     }
@@ -849,9 +846,8 @@ impl ExecutorTaskRunner {
             );
             let assignment = ExecutorTaskAssignment::new(
                 ids,
-                ExecutorId::try_new("exec-checkpoint").unwrap_or_else(|_| {
-                    ExecutorId::try_new("exec").expect("exec id")
-                }),
+                ExecutorId::try_new("exec-checkpoint")
+                    .unwrap_or_else(|_| ExecutorId::try_new("exec").expect("exec id")),
                 LeaseGeneration::initial(),
                 PlanFragment::new("checkpoint"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),

@@ -26,25 +26,27 @@ pub fn register_state_migration(
         .map(|s| s.state_migrations.clone())
         .unwrap_or_else(|| GLOBAL_MIGRATIONS.clone());
     let callable = migration_fn.clone_ref(py);
-    registry.register(
-        from_version,
-        to_version,
-        Arc::new(move |old: &[u8]| {
-            Python::attach(|py| {
-                let arg = PyBytes::new(py, old);
-                let result = callable
-                    .call1(py, (arg,))
-                    .map_err(|e| StateMigrationError {
-                        message: e.to_string(),
-                    })?;
-                let bytes: &Bound<'_, PyBytes> =
-                    result.cast_bound(py).map_err(|e| StateMigrationError {
-                        message: format!("migration must return bytes: {e}"),
-                    })?;
-                Ok(bytes.as_bytes().to_vec())
-            })
-        }),
-    ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    registry
+        .register(
+            from_version,
+            to_version,
+            Arc::new(move |old: &[u8]| {
+                Python::attach(|py| {
+                    let arg = PyBytes::new(py, old);
+                    let result = callable
+                        .call1(py, (arg,))
+                        .map_err(|e| StateMigrationError {
+                            message: e.to_string(),
+                        })?;
+                    let bytes: &Bound<'_, PyBytes> =
+                        result.cast_bound(py).map_err(|e| StateMigrationError {
+                            message: format!("migration must return bytes: {e}"),
+                        })?;
+                    Ok(bytes.as_bytes().to_vec())
+                })
+            }),
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     Ok(())
 }
 
@@ -92,25 +94,28 @@ impl StateMigrationDecorator {
         let from = self.from_version;
         let to = self.to_version;
         let callable = migration_fn.clone_ref(py);
-        registry.register(
-            from,
-            to,
-            Arc::new(move |old: &[u8]| {
-                Python::attach(|py| {
-                    let arg = PyBytes::new(py, old);
-                    let result = callable
-                        .call1(py, (arg,))
-                        .map_err(|e| StateMigrationError {
-                            message: e.to_string(),
-                        })?;
-                    let bytes: &Bound<'_, PyBytes> =
-                        result.cast_bound(py).map_err(|e| StateMigrationError {
-                            message: format!("migration must return bytes: {e}"),
-                        })?;
-                    Ok(bytes.as_bytes().to_vec())
-                })
-            }),
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        registry
+            .register(
+                from,
+                to,
+                Arc::new(move |old: &[u8]| {
+                    Python::attach(|py| {
+                        let arg = PyBytes::new(py, old);
+                        let result =
+                            callable
+                                .call1(py, (arg,))
+                                .map_err(|e| StateMigrationError {
+                                    message: e.to_string(),
+                                })?;
+                        let bytes: &Bound<'_, PyBytes> =
+                            result.cast_bound(py).map_err(|e| StateMigrationError {
+                                message: format!("migration must return bytes: {e}"),
+                            })?;
+                        Ok(bytes.as_bytes().to_vec())
+                    })
+                }),
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(migration_fn)
     }
 }

@@ -593,7 +593,10 @@ impl RdkafkaCdcEventSource {
     /// providing at-least-once semantics).
     fn commit_offsets(&self) {
         use rdkafka::consumer::Consumer;
-        if let Err(e) = self.consumer.commit_consumer_state(rdkafka::consumer::CommitMode::Sync) {
+        if let Err(e) = self
+            .consumer
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+        {
             tracing::warn!(error = %e, "rdkafka offset commit failed (at-least-once: will reprocess on restart)");
         }
     }
@@ -680,15 +683,21 @@ impl CdcOffsetTracker {
                 if k.len() == 4 {
                     let partition = u32::from_le_bytes(k.as_slice().try_into().unwrap());
                     if let Ok(Some(val_bytes)) = backend.get(&ns, &k) {
-                        if val_bytes.len() == 8 {
-                            let offset = i64::from_le_bytes(val_bytes.as_slice().try_into().unwrap());
+                        let len = val_bytes.len();
+                        if len == 8 {
+                            let offset =
+                                i64::from_le_bytes(val_bytes.as_slice().try_into().unwrap());
                             offsets.insert(partition, offset);
                         }
                     }
                 }
             }
         }
-        Self { backend, ns, offsets }
+        Self {
+            backend,
+            ns,
+            offsets,
+        }
     }
 
     pub fn commit_offset(&mut self, partition: u32, offset: i64) -> Result<(), String> {

@@ -25,10 +25,21 @@ const EXPLAIN: &str = "krishiv-explain";
 /// Parsed Krishiv Flight SQL directive.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlightDirective {
-    RegisterParquet { table: String, path: PathBuf },
-    ContinuousRegister { job_id: String, spec: WindowExecutionSpec },
-    ContinuousPush { job_id: String, batches: Vec<RecordBatch> },
-    ContinuousDrain { job_id: String },
+    RegisterParquet {
+        table: String,
+        path: PathBuf,
+    },
+    ContinuousRegister {
+        job_id: String,
+        spec: WindowExecutionSpec,
+    },
+    ContinuousPush {
+        job_id: String,
+        batches: Vec<RecordBatch>,
+    },
+    ContinuousDrain {
+        job_id: String,
+    },
     BoundedWindow {
         topic: String,
         spec: WindowExecutionSpec,

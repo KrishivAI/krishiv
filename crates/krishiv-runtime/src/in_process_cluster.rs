@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::window::{encode_stream_fragment, WindowExecutionSpec, WindowKind};
+use krishiv_plan::window::{WindowExecutionSpec, WindowKind, encode_stream_fragment};
 
+use crate::RuntimeResult;
 use crate::in_process::InProcessStreamingRuntime;
 use crate::local_streaming::LocalWindowExecutionSpec;
-use crate::RuntimeResult;
 
 /// Shared local cluster: one coordinator + executor per session.
 #[derive(Clone)]

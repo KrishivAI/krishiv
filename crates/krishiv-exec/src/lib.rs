@@ -133,18 +133,18 @@ pub mod barrier_align;
 pub mod cep;
 pub mod chunk;
 pub mod coalesce_partitions;
+pub mod continuous;
 pub mod interval_join;
 pub mod join;
 pub mod live_table;
 pub mod memo;
+pub mod operator_runtime;
 pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
 pub mod temporal_join;
 #[cfg(test)]
 pub mod watermark_e2e;
-pub mod operator_runtime;
-pub mod continuous;
 pub mod window;
 
 pub use chunk::ChunkOperator;
@@ -156,16 +156,16 @@ pub use adaptive::{
     HotKeyReport, RateLimiter, SinkLatencyTracker, ThrottleCommand,
 };
 pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
+pub use continuous::ContinuousWindowExecutor;
 pub use join::{BroadcastJoin, BuiltBroadcastJoin, HashJoin, StreamTableJoin};
+pub use operator_runtime::{
+    LocalWindowKindBridge, execute_bounded_window, local_spec_to_window_execution,
+};
 pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,
     OperatorQueueSender, operator_queue,
 };
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
-pub use operator_runtime::{
-    execute_bounded_window, local_spec_to_window_execution, LocalWindowKindBridge,
-};
-pub use continuous::ContinuousWindowExecutor;
 pub use window::{
     MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
     SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,

@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use krishiv_async_util::block_on;
 use krishiv_executor::{ContinuousJobDrainer, ExecutorAssignmentInbox, ExecutorTaskRunner};
-use krishiv_plan::window::{encode_stream_fragment, WindowExecutionSpec};
+use krishiv_plan::window::{WindowExecutionSpec, encode_stream_fragment};
 use krishiv_proto::{
-    CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, InputPartitionDescriptor,
-    JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
+    CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, InputPartitionDescriptor, JobId,
+    JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
-    Coordinator, InProcessCoordinatorBridge, IN_PROCESS_TASK_ENDPOINT, SubmitOutcome,
+    Coordinator, IN_PROCESS_TASK_ENDPOINT, InProcessCoordinatorBridge, SubmitOutcome,
 };
 
 use crate::continuous_stream::{ContinuousStreamRegistry, SharedContinuousStreamRegistry};
@@ -61,7 +61,9 @@ impl InProcessStreamingRuntime {
         Self::with_continuous_registry(Arc::new(ContinuousStreamRegistry::new()))
     }
 
-    pub fn with_continuous_registry(registry: SharedContinuousStreamRegistry) -> RuntimeResult<Self> {
+    pub fn with_continuous_registry(
+        registry: SharedContinuousStreamRegistry,
+    ) -> RuntimeResult<Self> {
         let coordinator_id = CoordinatorId::try_new("in-process-coord")
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let coordinator = Arc::new(Mutex::new(Coordinator::active(coordinator_id)));
@@ -79,9 +81,8 @@ impl InProcessStreamingRuntime {
         }
         let inbox = ExecutorAssignmentInbox::new();
         let drainer = Arc::new(RegistryDrainer(Arc::clone(&registry)));
-        let runner = Arc::new(
-            ExecutorTaskRunner::new(inbox.clone()).with_continuous_drainer(drainer),
-        );
+        let runner =
+            Arc::new(ExecutorTaskRunner::new(inbox.clone()).with_continuous_drainer(drainer));
         let bridge = InProcessCoordinatorBridge::new(Arc::clone(&coordinator));
         Ok(Self {
             coordinator,
@@ -144,10 +145,8 @@ impl InProcessStreamingRuntime {
         let stage_id =
             StageId::try_new("stage-0").map_err(|e| RuntimeError::transport(e.to_string()))?;
         let job_spec = JobSpec::new(job_id.clone(), fragment.to_string(), kind).with_stage(
-            StageSpec::new(stage_id, "stage-0").with_task(TaskSpec::new(
-                task_id.clone(),
-                fragment.to_string(),
-            )),
+            StageSpec::new(stage_id, "stage-0")
+                .with_task(TaskSpec::new(task_id.clone(), fragment.to_string())),
         );
 
         let mut assignments = {
@@ -174,14 +173,12 @@ impl InProcessStreamingRuntime {
             .iter()
             .enumerate()
             .map(|(idx, table)| {
-                InputPartition::new(
-                    format!("local-parquet-{idx}"),
-                    String::new(),
+                InputPartition::new(format!("local-parquet-{idx}"), String::new()).with_descriptor(
+                    InputPartitionDescriptor::LocalParquet {
+                        table_name: table.table_name.clone(),
+                        path: table.path.to_string_lossy().into_owned(),
+                    },
                 )
-                .with_descriptor(InputPartitionDescriptor::LocalParquet {
-                    table_name: table.table_name.clone(),
-                    path: table.path.to_string_lossy().into_owned(),
-                })
             })
             .collect();
         partitions.extend(stream_partitions);
@@ -195,9 +192,11 @@ impl InProcessStreamingRuntime {
         let runner = Arc::clone(&self.runner);
         let mut output_batches = Vec::new();
         block_on(async {
-            while let Some(report) = runner.run_next_with(&bridge).await.map_err(|e| {
-                RuntimeError::transport(e.message())
-            })? {
+            while let Some(report) = runner
+                .run_next_with(&bridge)
+                .await
+                .map_err(|e| RuntimeError::transport(e.message()))?
+            {
                 output_batches.extend(report.output().record_batches().to_vec());
             }
             Ok::<(), RuntimeError>(())

@@ -13,11 +13,15 @@ pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSp
         ExecutionKind::Streaming,
     ));
     plan.add_node(
-        PlanNode::new("keyby", format!("key-by:{}", spec.key_column), ExecutionKind::Streaming)
-            .with_op(crate::NodeOp::KeyBy {
-                key_column: spec.key_column.clone(),
-            })
-            .with_inputs(["source".to_string()]),
+        PlanNode::new(
+            "keyby",
+            format!("key-by:{}", spec.key_column),
+            ExecutionKind::Streaming,
+        )
+        .with_op(crate::NodeOp::KeyBy {
+            key_column: spec.key_column.clone(),
+        })
+        .with_inputs(["source".to_string()]),
     );
     let window_op = match spec.window_kind {
         crate::window::WindowKind::Tumbling => crate::NodeOp::TumblingWindow {
@@ -41,16 +45,23 @@ pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSp
     );
     if let Some(ttl_ms) = spec.state_ttl_ms {
         plan.add_node(
-            PlanNode::new("state-ttl", format!("ttl:{ttl_ms}"), ExecutionKind::Streaming)
-                .with_op(crate::NodeOp::StateTtl { ttl_ms })
-                .with_inputs(["window".to_string()]),
+            PlanNode::new(
+                "state-ttl",
+                format!("ttl:{ttl_ms}"),
+                ExecutionKind::Streaming,
+            )
+            .with_op(crate::NodeOp::StateTtl { ttl_ms })
+            .with_inputs(["window".to_string()]),
         );
     }
     plan
 }
 
 /// Lower a window spec to a physical plan (copies logical nodes with ops).
-pub fn physical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSpec) -> PhysicalPlan {
+pub fn physical_plan_for_window(
+    name: impl Into<String>,
+    spec: &WindowExecutionSpec,
+) -> PhysicalPlan {
     let logical = logical_plan_for_window(name, spec);
     let mut physical = PhysicalPlan::new(logical.name(), logical.kind());
     for node in logical.nodes() {

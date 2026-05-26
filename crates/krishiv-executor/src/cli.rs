@@ -4,21 +4,21 @@ use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::Router;
-use axum::http::header::CONTENT_TYPE;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use krishiv_checkpoint::LocalFsCheckpointStorage;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
     ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector,
     executor_barrier_grpc_server, serve_executor_task_grpc_with_listener,
 };
+use axum::Router;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use krishiv_checkpoint::LocalFsCheckpointStorage;
 use krishiv_proto::{InitiateCheckpointRequest, JobId};
 use krishiv_state::RedbStateBackend;
-use tonic::transport::Server;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tonic::transport::Server;
 
 /// Run the executor CLI (blocking async runtime).
 pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {

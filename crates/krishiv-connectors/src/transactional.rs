@@ -14,7 +14,8 @@ pub struct TransactionalBatchMetadata {
 
 impl TransactionalBatchMetadata {
     pub fn record(&mut self, topic_partition: impl Into<String>, offset: i64) {
-        self.committed_offsets.insert(topic_partition.into(), offset);
+        self.committed_offsets
+            .insert(topic_partition.into(), offset);
     }
 }
 
@@ -75,9 +76,9 @@ impl InMemoryTransactionalProducer {
 #[cfg(feature = "kafka")]
 pub mod rdkafka_txn {
     use super::*;
+    use rdkafka::ClientConfig;
     use rdkafka::producer::{FutureProducer, Producer};
     use rdkafka::util::Timeout;
-    use rdkafka::ClientConfig;
 
     /// rdkafka transactional producer wrapper.
     pub struct RdkafkaTransactionalProducer {
@@ -86,7 +87,10 @@ pub mod rdkafka_txn {
     }
 
     impl RdkafkaTransactionalProducer {
-        pub fn new(bootstrap_servers: &str, transactional_id: impl Into<String>) -> Result<Self, ConnectorError> {
+        pub fn new(
+            bootstrap_servers: &str,
+            transactional_id: impl Into<String>,
+        ) -> Result<Self, ConnectorError> {
             let transactional_id = transactional_id.into();
             let producer: FutureProducer = ClientConfig::new()
                 .set("bootstrap.servers", bootstrap_servers)

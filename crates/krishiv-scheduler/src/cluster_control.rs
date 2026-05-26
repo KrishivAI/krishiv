@@ -28,6 +28,12 @@ pub struct SingleNodeLeader {
     fencing_token: std::sync::atomic::AtomicU64,
 }
 
+impl Default for SingleNodeLeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SingleNodeLeader {
     pub fn new() -> Self {
         Self {

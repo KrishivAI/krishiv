@@ -161,10 +161,7 @@ pub enum NodeOp {
         aggs: Vec<window::WindowAgg>,
     },
     /// Bounded or unbounded stream source.
-    StreamSource {
-        source_id: String,
-        bounded: bool,
-    },
+    StreamSource { source_id: String, bounded: bool },
     /// Operator state TTL for streaming nodes.
     StateTtl { ttl_ms: u64 },
     /// Operator not covered by the above variants.

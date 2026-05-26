@@ -112,12 +112,13 @@ pub async fn merge_delta(
     let mut updated = 0u64;
     for (i, k) in target_keys.iter().enumerate() {
         if let Some(k) = k
-            && source_map.contains_key(k) {
-                if when_matched_update {
-                    updated += 1;
-                }
-                continue;
+            && source_map.contains_key(k)
+        {
+            if when_matched_update {
+                updated += 1;
             }
+            continue;
+        }
         keep_indices.push(i as u32);
     }
 

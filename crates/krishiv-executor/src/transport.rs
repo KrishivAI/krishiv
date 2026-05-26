@@ -157,7 +157,8 @@ impl ExecutorConfig {
 
     /// Build an executor descriptor for registration.
     pub fn descriptor(&self) -> ExecutorDescriptor {
-        let mut d = ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots);
+        let mut d =
+            ExecutorDescriptor::new(self.executor_id.clone(), self.host.clone(), self.slots);
         if let Some(ep) = &self.task_endpoint {
             d = d.with_task_endpoint(ep);
         }
