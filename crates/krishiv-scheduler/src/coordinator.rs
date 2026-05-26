@@ -27,6 +27,7 @@ use crate::checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 use crate::config::CoordinatorConfig;
 use crate::error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
 use crate::heartbeat::{ExecutorRecord, ExecutorRegistry};
+use crate::in_process::is_in_process_task_endpoint;
 use crate::job::{
     JobDetailSnapshot, JobRecord, JobSnapshot, NamespaceQuotaSnapshot, ResourceUsage,
     SlotAwareScheduler, StabilityMetrics, SubmitOutcome, job_spec_from_logical_plan,
@@ -37,7 +38,12 @@ use crate::metrics::{CHECKPOINT_EPOCHS_TOTAL, JOBS_SUBMITTED_TOTAL, TASKS_ASSIGN
 use crate::store::{EventLogEvent, MetadataStore};
 
 /// R2 coordinator skeleton.
-#[derive(Clone)]
+///
+/// Intentionally does *not* derive `Clone`.  Cloning the coordinator would
+/// only deep-copy `HashMap` fields while aliasing the `Arc` fields
+/// (`store`, `executor_channels`, …), producing two `Coordinator`s with
+/// divergent job state but shared channel caches — a foot-gun that has bitten
+/// before (F3 in the audit).  The shared handle is [`SharedCoordinator`].
 pub struct Coordinator {
     pub(crate) coordinator_id: CoordinatorId,
     pub(crate) state: CoordinatorState,
@@ -419,14 +425,10 @@ impl Coordinator {
     /// `AdaptiveDecisionLog` entry. If `disable_hot_key_splitting` is set,
     /// the decision is logged with `applied: false`.
     fn process_hot_key_reports(&mut self, reports: &[HeartbeatHotKeyReport]) {
-        use std::time::{SystemTime, UNIX_EPOCH};
         if reports.is_empty() {
             return;
         }
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = u64::try_from(krishiv_async_util::unix_now_ms()).unwrap_or(0);
 
         for report in reports {
             if report.job_id.is_empty() {
@@ -1188,24 +1190,46 @@ impl Coordinator {
         channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
         targets: Vec<(String, ExecutorTaskAssignment)>,
     ) -> SchedulerResult<Vec<TaskStatusResponse>> {
-        let mut responses = Vec::with_capacity(targets.len());
-        for (endpoint, assignment) in targets {
-            let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
-            let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
-            let response = client
-                .assign_task(wire::executor_task_assignment_to_wire(assignment))
-                .await
-                .map_err(|error| SchedulerError::Transport {
-                    message: error.to_string(),
-                })?
-                .into_inner();
-            responses.push(
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // Inbox-backed in-process targets do not have a gRPC endpoint: they are
+        // delivered directly via `InProcessCoordinatorBridge` (see F4 / the
+        // `inprocess://` sentinel).  Logging would create noise; the in-process
+        // path pushes to the inbox before reaching this function.
+        let (in_process, remote): (Vec<_>, Vec<_>) = targets
+            .into_iter()
+            .partition(|(endpoint, _)| is_in_process_task_endpoint(endpoint));
+        if !in_process.is_empty() {
+            tracing::debug!(
+                count = in_process.len(),
+                "skipping gRPC dispatch for in-process task endpoints"
+            );
+        }
+
+        let mut futures = FuturesUnordered::new();
+        for (endpoint, assignment) in remote {
+            let channels = Arc::clone(&channels);
+            futures.push(async move {
+                let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
+                let response = client
+                    .assign_task(wire::executor_task_assignment_to_wire(assignment))
+                    .await
+                    .map_err(|error| SchedulerError::Transport {
+                        message: format!("assign_task to {endpoint}: {error}"),
+                    })?
+                    .into_inner();
                 wire::task_status_response_from_wire(response).map_err(|error| {
                     SchedulerError::Transport {
-                        message: error.to_string(),
+                        message: format!("wire decode from {endpoint}: {error}"),
                     }
-                })?,
-            );
+                })
+            });
+        }
+
+        let mut responses = Vec::new();
+        while let Some(result) = futures.next().await {
+            responses.push(result?);
         }
         Ok(responses)
     }
@@ -1257,21 +1281,36 @@ impl Coordinator {
         // Cancel the job in scheduler state first.
         self.cancel_job(job_id)?;
 
-        // Push cancel RPCs — partial failures are non-fatal.
+        // Push cancel RPCs — partial failures are non-fatal.  Re-use the
+        // executor channel cache so we do not pay a TCP+TLS handshake per
+        // cancel target (F2).  Drive them concurrently.
+        let channels = self.executor_channels.clone();
+        let mut futures = futures::stream::FuturesUnordered::new();
         for (endpoint, req) in targets {
-            match wire::v1::executor_task_client::ExecutorTaskClient::connect(endpoint.clone())
-                .await
-            {
-                Ok(mut client) => {
-                    let _ = client
-                        .cancel_task(wire::task_cancellation_request_to_wire(req))
-                        .await;
-                }
-                Err(err) => {
-                    eprintln!("push_cancel_job: failed to connect to {endpoint}: {err}");
-                }
+            if is_in_process_task_endpoint(&endpoint) {
+                tracing::debug!(endpoint = %endpoint, "skipping cancel for in-process executor");
+                continue;
             }
+            let channels = channels.clone();
+            futures.push(async move {
+                let channel = match Self::get_or_connect_channel_on_map(&channels, &endpoint).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: connect failed");
+                        return;
+                    }
+                };
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
+                if let Err(err) = client
+                    .cancel_task(wire::task_cancellation_request_to_wire(req))
+                    .await
+                {
+                    tracing::warn!(endpoint = %endpoint, error = %err, "push_cancel_job: cancel_task rpc failed");
+                }
+            });
         }
+        use futures::stream::StreamExt;
+        while futures.next().await.is_some() {}
         Ok(())
     }
 
@@ -1394,22 +1433,44 @@ impl Coordinator {
         channels: &Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
         endpoint: &str,
     ) -> SchedulerResult<tonic::transport::Channel> {
-        let mut map = channels.lock().await;
-        if let Some(ch) = map.get(endpoint) {
-            return Ok(ch.clone());
+        // Fast path: check the cache and drop the lock before doing any I/O.
+        {
+            let map = channels.lock().await;
+            if let Some(ch) = map.get(endpoint) {
+                return Ok(ch.clone());
+            }
         }
-        let ch = tonic::transport::Endpoint::from_shared(endpoint.to_string())
-            .map_err(|e| SchedulerError::InvalidJob {
+
+        // Slow path: connect outside the lock so a single slow handshake
+        // cannot block lookups for other endpoints (A6).
+        let parsed = tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(
+            |e| SchedulerError::InvalidJob {
                 message: e.to_string(),
-            })?
+            },
+        )?;
+        let ch = parsed
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .keep_alive_while_idle(true)
             .connect()
             .await
             .map_err(|e| SchedulerError::ExecutorUnavailable {
                 endpoint: endpoint.to_string(),
                 reason: e.to_string(),
             })?;
-        map.insert(endpoint.to_owned(), ch.clone());
-        Ok(ch)
+
+        // Re-acquire briefly to install the cached channel.  If another task
+        // raced us and installed a different channel, prefer the existing one.
+        let mut map = channels.lock().await;
+        match map.entry(endpoint.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(existing) => Ok(existing.get().clone()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(ch.clone());
+                Ok(ch)
+            }
+        }
     }
 
     fn ensure_active(&self) -> SchedulerResult<()> {

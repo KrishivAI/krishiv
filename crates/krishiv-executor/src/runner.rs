@@ -23,6 +23,31 @@ use crate::{
     fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
 
+/// Maximum bytes used in the failure message sent to the coordinator.  Larger
+/// messages are truncated with `…` so they cannot blow past gRPC payload limits.
+pub(crate) const TASK_FAILURE_MESSAGE_MAX_BYTES: usize = 4096;
+
+/// Format an executor-side failure into a coordinator-visible message that
+/// includes the fragment description and the underlying error text.  Truncates
+/// at [`TASK_FAILURE_MESSAGE_MAX_BYTES`] so we cannot ship arbitrarily large
+/// strings through `task_status` RPCs.
+pub(crate) fn format_failure_message(fragment: &str, error: &str) -> String {
+    let mut buf = String::with_capacity(fragment.len() + error.len() + 32);
+    buf.push_str("executor failed fragment '");
+    buf.push_str(fragment.trim());
+    buf.push_str("': ");
+    buf.push_str(error.trim());
+    if buf.len() > TASK_FAILURE_MESSAGE_MAX_BYTES {
+        let mut end = TASK_FAILURE_MESSAGE_MAX_BYTES.saturating_sub(1);
+        while !buf.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        buf.truncate(end);
+        buf.push('…');
+    }
+    buf
+}
+
 pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
 pub(crate) const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
 pub(crate) const OBJECT_PARQUET_PARTITION_PREFIX: &str = "object-parquet:";
@@ -690,11 +715,16 @@ impl ExecutorTaskRunner {
             Ok(output) => output,
             Err(error) => {
                 self.clear_running_attempt(&assignment);
+                let error_text = error.to_string();
+                let message = format_failure_message(
+                    assignment.plan_fragment().description(),
+                    &error_text,
+                );
                 let failed = self
                     .send_task_status(
                         &assignment,
                         TaskState::Failed,
-                        "executor failed assignment before DataFusion execution",
+                        message,
                         coordinator,
                         None,
                     )
@@ -703,7 +733,7 @@ impl ExecutorTaskRunner {
                     failed.disposition(),
                     TaskState::Failed,
                 )?;
-                return Err(tonic::Status::internal(error.to_string()));
+                return Err(tonic::Status::internal(error_text));
             }
         };
 
@@ -756,7 +786,7 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
         state: TaskState,
-        message: &'static str,
+        message: impl Into<String>,
         coordinator: &S,
         output_metadata: Option<TaskOutputMetadata>,
     ) -> Result<TaskStatusResponse, tonic::Status>
@@ -769,6 +799,7 @@ impl ExecutorTaskRunner {
             assignment.task_id().clone(),
             assignment.attempt_id(),
         );
+        let message = message.into();
         let mut request = TaskStatusRequest::new(
             ids,
             assignment.executor_id().clone(),

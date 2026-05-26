@@ -4190,7 +4190,10 @@ name = "krishiv-scheduler"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "axum 0.8.9",
+ "futures",
+ "krishiv-async-util",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-governance",
@@ -4204,6 +4207,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.14.6",
  "tracing",
 ]
@@ -7652,6 +7656,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "slab",
  "tokio",
