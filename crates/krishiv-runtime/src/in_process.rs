@@ -197,7 +197,7 @@ impl InProcessStreamingRuntime {
                     },
                 )
             })
-            .chain(stream_partitions.into_iter())
+            .chain(stream_partitions)
             .collect();
 
         let bridge = self.bridge.clone();

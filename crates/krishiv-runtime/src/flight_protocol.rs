@@ -392,7 +392,11 @@ mod tests {
         let evil = "evil*/SELECT 1; DROP TABLE users; /*";
         let comment = format!("/* {CONTINUOUS_DRAIN}:{evil} */");
         let (directives, _query) = parse_sql(&comment);
-        assert_eq!(directives.len(), 1, "directive must be parsed: {directives:?}");
+        assert_eq!(
+            directives.len(),
+            1,
+            "directive must be parsed: {directives:?}"
+        );
         assert!(matches!(
             &directives[0],
             FlightDirective::ContinuousDrain { job_id } if job_id == "evil"
@@ -408,8 +412,7 @@ mod tests {
         // Spaces / shell metacharacters in identifiers cause the directive
         // to be silently dropped (parsed as None), so the caller does NOT
         // mistake a malformed comment for a valid control plane request.
-        let comment =
-            "/* krishiv-continuous-drain:foo bar; rm -rf / */ SELECT 1".to_string();
+        let comment = "/* krishiv-continuous-drain:foo bar; rm -rf / */ SELECT 1".to_string();
         let (directives, _query) = parse_sql(&comment);
         assert!(directives.is_empty(), "unsafe identifier must be rejected");
     }
@@ -418,9 +421,7 @@ mod tests {
     fn comment_parser_rejects_unsafe_base64_field() {
         // Insert a `*` character into what looks like base64 (the standard
         // alphabet doesn't contain `*`): rejected.
-        let comment = format!(
-            "/* {BOUNDED_WINDOW}:events:abc*defgh:ipc */ SELECT 1"
-        );
+        let comment = format!("/* {BOUNDED_WINDOW}:events:abc*defgh:ipc */ SELECT 1");
         let (directives, _query) = parse_sql(&comment);
         assert!(directives.is_empty(), "unsafe base64 must be rejected");
     }

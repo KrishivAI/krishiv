@@ -43,11 +43,7 @@ impl ObjectStoreCheckpointStorage {
     }
 
     /// Async write — preferred for callers in a Tokio context (D4).
-    pub async fn write_bytes_async_inner(
-        &self,
-        path: &str,
-        data: &[u8],
-    ) -> CheckpointResult<()> {
+    pub async fn write_bytes_async_inner(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
         let object_path = self.object_path(path);
         let payload = bytes::Bytes::copy_from_slice(data);
         tokio::time::timeout(WRITE_TIMEOUT, self.store.put(&object_path, payload.into()))
@@ -86,13 +82,14 @@ impl ObjectStoreCheckpointStorage {
         let path = self.object_path(prefix);
         let mut names = Vec::new();
         let mut stream = self.store.list(Some(&path));
-        while let Some(entry) = stream
-            .next()
-            .await
-            .transpose()
-            .map_err(|e| CheckpointError::Storage {
-                message: format!("object store list: {e}"),
-            })?
+        while let Some(entry) =
+            stream
+                .next()
+                .await
+                .transpose()
+                .map_err(|e| CheckpointError::Storage {
+                    message: format!("object store list: {e}"),
+                })?
         {
             if let Some(name) = entry.location.parts().next_back() {
                 names.push(name.as_ref().to_string());
@@ -105,13 +102,14 @@ impl ObjectStoreCheckpointStorage {
     pub async fn delete_prefix_async_inner(&self, prefix: &str) -> CheckpointResult<()> {
         let path = self.object_path(prefix);
         let mut stream = self.store.list(Some(&path));
-        while let Some(entry) = stream
-            .next()
-            .await
-            .transpose()
-            .map_err(|e| CheckpointError::Storage {
-                message: format!("object store list for delete: {e}"),
-            })?
+        while let Some(entry) =
+            stream
+                .next()
+                .await
+                .transpose()
+                .map_err(|e| CheckpointError::Storage {
+                    message: format!("object store list for delete: {e}"),
+                })?
         {
             self.store
                 .delete(&entry.location)

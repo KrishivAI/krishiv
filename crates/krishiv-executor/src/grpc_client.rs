@@ -85,8 +85,7 @@ impl CoordinatorGrpcPool {
         if let Some(client) = guard.as_ref() {
             return Ok(client.clone());
         }
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .map_err(tonic::transport::Error::from)?
+        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
             .http2_keep_alive_interval(std::time::Duration::from_secs(15))

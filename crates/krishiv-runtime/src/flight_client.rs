@@ -263,8 +263,7 @@ pub(crate) async fn do_action(
         .connect()
         .await
         .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;
-    let mut client =
-        arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+    let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
     let body = action.to_action_body()?;
     let req = arrow_flight::Action {
         r#type: action.action_type(),
@@ -278,8 +277,7 @@ pub(crate) async fn do_action(
 
     let mut buf = Vec::new();
     while let Some(item) = stream.next().await {
-        let part =
-            item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
+        let part = item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
         buf.extend_from_slice(&part.body);
     }
     Ok(buf)

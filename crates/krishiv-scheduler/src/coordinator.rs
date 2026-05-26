@@ -1517,11 +1517,12 @@ impl Coordinator {
 
         // Slow path: connect outside the lock so a single slow handshake
         // cannot block lookups for other endpoints (A6).
-        let parsed = tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(
-            |e| SchedulerError::InvalidJob {
-                message: e.to_string(),
-            },
-        )?;
+        let parsed =
+            tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(|e| {
+                SchedulerError::InvalidJob {
+                    message: e.to_string(),
+                }
+            })?;
         let ch = parsed
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(30)))

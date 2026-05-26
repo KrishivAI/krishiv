@@ -491,7 +491,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
         let mut client = self.client().await?;
-        let req = request.into_inner().with_lease_generation(self.live_lease());
+        let req = request
+            .into_inner()
+            .with_lease_generation(self.live_lease());
         let response = client
             .task_status(wire::task_status_request_to_wire(req))
             .await?

@@ -221,13 +221,12 @@ impl SessionBuilder {
         // B2: Distributed sessions default to true remote execution.  An
         // explicit `with_remote_execution(false)` (or `KRISHIV_REMOTE_EXEC=0`)
         // still keeps the local fallback for integration tests.
-        let remote_execution = if self.remote_execution_explicit
-            || remote_execution_from_env_opt().is_some()
-        {
-            self.remote_execution
-        } else {
-            matches!(self.mode, ExecutionMode::Distributed)
-        };
+        let remote_execution =
+            if self.remote_execution_explicit || remote_execution_from_env_opt().is_some() {
+                self.remote_execution
+            } else {
+                matches!(self.mode, ExecutionMode::Distributed)
+            };
 
         if matches!(self.mode, ExecutionMode::Distributed) && self.coordinator_url.is_none() {
             return Err(KrishivError::unsupported(

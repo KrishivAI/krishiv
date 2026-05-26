@@ -371,13 +371,13 @@ impl FlightSqlService for KrishivFlightSqlService {
         let parsed = KrishivFlightAction::from_action_body(&action.body)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        let response_body =
-            self.handle_krishiv_action(parsed)
-                .await
-                .map_err(|e| match e {
-                    KrishivActionError::Status(status) => status,
-                    KrishivActionError::Other(msg) => Status::internal(msg),
-                })?;
+        let response_body = self
+            .handle_krishiv_action(parsed)
+            .await
+            .map_err(|e| match e {
+                KrishivActionError::Status(status) => status,
+                KrishivActionError::Other(msg) => Status::internal(msg),
+            })?;
         let result = arrow_flight::Result {
             body: bytes::Bytes::from(response_body),
         };
@@ -446,7 +446,7 @@ impl KrishivFlightSqlService {
                     .host
                     .execute_sql(&sql)
                     .await
-                    .map_err(|s| KrishivActionError::Status(s))?;
+                    .map_err(KrishivActionError::Status)?;
                 Ok(Vec::new())
             }
             A::ContinuousRegister(body) => {
@@ -484,12 +484,11 @@ impl KrishivFlightSqlService {
             A::ContinuousDrain(body) => {
                 let cluster = self.host.cluster();
                 let job_id = body.job_id.clone();
-                let batches = tokio::task::spawn_blocking(move || {
-                    cluster.drain_continuous_job(&job_id)
-                })
-                .await
-                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
-                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                let batches =
+                    tokio::task::spawn_blocking(move || cluster.drain_continuous_job(&job_id))
+                        .await
+                        .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
+                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 encode_batches_ipc_bytes(&batches)
             }
             A::BoundedWindow(body) => {
@@ -515,9 +514,7 @@ impl KrishivFlightSqlService {
     }
 }
 
-fn encode_batches_ipc_bytes(
-    batches: &[RecordBatch],
-) -> Result<Vec<u8>, KrishivActionError> {
+fn encode_batches_ipc_bytes(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {
     if batches.is_empty() {
         return Ok(Vec::new());
     }
@@ -680,7 +677,7 @@ mod tests {
         assert!(!first.body.is_empty());
         let text = std::str::from_utf8(&first.body).unwrap();
         // explain text comes from DataFusion; should at least include 'Projection' or similar.
-        assert!(text.len() > 0);
+        assert!(!text.is_empty());
     }
 
     #[tokio::test]

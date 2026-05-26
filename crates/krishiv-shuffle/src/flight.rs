@@ -238,8 +238,7 @@ impl FlightShuffleClient {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
-        let mut client =
-            arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
         let ticket_text = format!("{job_id}/{stage_id}/{partition_id}");
         let ticket = Ticket {
             ticket: ticket_text.into_bytes().into(),
@@ -257,7 +256,7 @@ impl FlightShuffleClient {
                         ),
                     )
                 } else {
-                    io::Error::new(io::ErrorKind::Other, e.to_string())
+                    io::Error::other(e.to_string())
                 }
             })?
             .into_inner();

@@ -2,6 +2,86 @@
 
 ## Current Phase
 
+**Audit Resolution Sweep — distributed/embedded/streaming fixes (2026-05-26).**
+
+Branch `cursor/implement-all-audit-resolutions-ac65` lands every resolution
+from the unified-runtime audit (PR #49):
+
+| Item | Crate | Summary |
+|------|-------|---------|
+| A1   | krishiv-scheduler, krishiv-operator | `ClusterControlPlane::from_shared_with_leader` accepts an injected `Arc<dyn LeaderElection>`; operator passes `K8sLeaseElection` |
+| A2/E3 | krishiv-scheduler, krishiv-operator | Coordinator starts Standby; orchestration loops spawn only after promotion and are aborted on demotion via returned `AbortHandle`s |
+| A3   | krishiv-scheduler | Standalone `krishiv-job-coordinator` rewritten as a federation-HTTP client of the CCP — no more orphan SharedCoordinator |
+| A4   | krishiv-scheduler | `JobCoordinator::spawn_job_orchestration_loops` no longer ticks the heartbeat clock (CCP owns it) |
+| A5   | krishiv-scheduler | `spawn_orchestration_loops_with_handles` returns `AbortHandle`s |
+| A6   | krishiv-scheduler | Dispatch fan-out via `FuturesUnordered`; channel cache drops the lock before `connect().await` |
+| A7   | krishiv-scheduler | `submit_job` installs the `CheckpointCoordinator` only AFTER `save_job` succeeds |
+| A8   | krishiv-scheduler | `restore_job_from_checkpoint_with_fencing(..., leader_token)` always validates |
+| A9   | krishiv-scheduler | `process_hot_key_reports` uses `krishiv_async_util::unix_now_ms` |
+| B2   | krishiv-api | Distributed mode defaults `remote_execution=true`; `Session::check_routing()` guards |
+| B3/D2 | krishiv-runtime, krishiv-flight-sql | Typed `KrishivFlightAction` over Flight `DoAction` replaces SQL-comment encoding for new clients; comment parser hardened against `*/` injection |
+| B4   | krishiv-shuffle | Hand-rolled TCP framing replaced with Arrow Flight (`DoGet`) |
+| B5   | krishiv-executor | Executor binary wires `LocalDiskShuffleStore` + `InMemoryShuffleStore` and starts the shuffle Flight server |
+| B6   | krishiv-executor | `slots`-many concurrent runner tasks share one inbox |
+| B7   | krishiv-executor, krishiv-proto | Shared `SharedLeaseGeneration` atomic stamped on every outbound RPC by `GrpcCoordinatorService` |
+| B8   | krishiv-executor | Task/barrier endpoints populated BEFORE first register — no more lease-bump race |
+| B9   | krishiv-executor | Failure status carries the real error text (truncated to 4 KiB) |
+| B10  | krishiv-executor | Checkpoint fanout uses real `running_attempts` instead of synthetic `exec-checkpoint` ids |
+| C1   | krishiv-runtime | Per-cluster coordinator/executor ids + per-cluster job counter |
+| C2/C3 | krishiv-runtime | SingleNode is distinct; `InProcessExecutionRuntime` drops the `Mutex<EmbeddedBackend>` |
+| C5   | krishiv-runtime | `run_terminal_task` loops until the job terminates → multi-stage in-process execution |
+| D3   | krishiv-scheduler | Checkpoint barrier quorum counts only `Running` tasks |
+| D4   | krishiv-checkpoint | `ObjectStoreCheckpointStorage` uses `run_blocking_on_tokio` (`block_in_place`) instead of `futures::executor::block_on`; async API exposed |
+| E1   | krishiv-operator | `ensure_dedicated_job_loop` documented as in-process-only; standalone JCP is client-only |
+| F1   | krishiv-executor | Self-heal on `StaleLease` / `UnknownExecutor` heartbeat dispositions — re-register and invalidate cached channel |
+| F2   | krishiv-scheduler | `push_cancel_job` reuses cached channel pool + concurrent dispatch |
+| F3   | krishiv-scheduler | `Coordinator` no longer derives `Clone` |
+| F4   | krishiv-scheduler | `inprocess://` task endpoints short-circuited from gRPC dispatch |
+
+Validation (per-crate, completed in-session):
+
+```bash
+cargo check --workspace --lib --bins --tests \
+  --exclude krishiv-ai --exclude krishiv-lakehouse --exclude krishiv-vector-sinks \
+  --exclude krishiv-federation --exclude krishiv-chaos --exclude krishiv-python \
+  --exclude krishiv-spark-connect --exclude krishiv-bench --exclude krishiv-upgrade-tests \
+  --exclude krishiv-schema-registry
+# OK
+
+cargo test --workspace --lib (same exclusions)
+# 701 passed, 0 failed across 21 suites — including:
+#   krishiv-scheduler: 109 passed
+#   krishiv-executor:  55 passed
+#   krishiv-checkpoint:36 passed (+ async path coverage)
+#   krishiv-runtime:   28 passed (incl. flight_action round-trip)
+#   krishiv-flight-sql:30 passed (incl. do_action_explain_round_trip)
+#   krishiv-shuffle:   54 passed (Arrow Flight DoGet)
+#   krishiv-api:       36 passed
+#   krishiv-operator:  38 passed
+#   krishiv-state:     66 passed
+#   krishiv-proto:     38 passed
+
+cargo clippy -p krishiv-runtime -p krishiv-scheduler -p krishiv-executor \
+  -p krishiv-api -p krishiv-flight-sql -p krishiv-operator -p krishiv-shuffle \
+  -p krishiv-checkpoint --lib --tests --no-deps -- -D warnings
+# 0 errors, 0 warnings on touched crates.
+
+cargo fmt --all -- --check    # OK
+```
+
+Excluded crates (`krishiv-ai`, `krishiv-lakehouse`, `krishiv-vector-sinks`,
+`krishiv-federation`, …) depend transitively on `native-tls`/`libssl-dev` which
+is not available in the local environment; they are unchanged.
+
+**Blocker:** none.
+
+**Next:** wire `krishiv-flight-sql` to also use `DoPut` / `DoExchange` for
+streaming push/drain payloads (currently they ride inside `DoAction` bodies
+as base64-IPC) — the typed action API is stable enough for that follow-up to
+be additive without breaking compat.
+
+---
+
 **Large-Crate Root Refactor — eight crates complete (2026-05-26).**
 
 Split monolithic `lib.rs` roots into cohesive modules with crate-root `pub use` facades. No public API renames; behavior-preserving module moves only.

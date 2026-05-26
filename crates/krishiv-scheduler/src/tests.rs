@@ -3023,11 +3023,7 @@ mod scheduler_tests {
 
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
         coordinator
-            .register_executor(ExecutorDescriptor::new(
-                executor_id.clone(),
-                "host-1",
-                2,
-            ))
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 2))
             .unwrap();
 
         // Submit a streaming job with a 3-second checkpoint interval.
@@ -3047,7 +3043,9 @@ mod scheduler_tests {
             .find_executor(&executor_id)
             .unwrap()
             .lease_generation();
-        let assignments = coordinator.launch_assigned_task_assignments(&job_id).unwrap();
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
         let attempt = assignments
             .first()
             .map(|a| a.attempt_id().as_u32())
@@ -3071,7 +3069,10 @@ mod scheduler_tests {
             .flat_map(|s| s.tasks().iter())
             .filter(|t| matches!(t.state(), TaskState::Running))
             .count();
-        assert_eq!(running_count, 1, "task should be Running after status update");
+        assert_eq!(
+            running_count, 1,
+            "task should be Running after status update"
+        );
 
         // 2 ticks × 1 000 ms = 2 000 ms < 3 000 ms — no checkpoint yet.
         coordinator.advance_heartbeat_clock(2).unwrap();

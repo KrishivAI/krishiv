@@ -645,7 +645,10 @@ pub async fn run_job_coordinator_daemon(
         return Err("--coordinator-http is required".into());
     }
     let job_id = jcp_config.job_id.clone();
-    let base = jcp_config.coordinator_http.trim_end_matches('/').to_string();
+    let base = jcp_config
+        .coordinator_http
+        .trim_end_matches('/')
+        .to_string();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -687,10 +690,8 @@ pub async fn run_job_coordinator_daemon(
                 match resp.json::<JcpJobStatusResponse>().await {
                     Ok(status) => {
                         println!("Krishiv JCP: job {job_id} state={}", status.state);
-                        let terminal = matches!(
-                            status.state.as_str(),
-                            "Succeeded" | "Failed" | "Cancelled"
-                        );
+                        let terminal =
+                            matches!(status.state.as_str(), "Succeeded" | "Failed" | "Cancelled");
                         if terminal {
                             return match status.state.as_str() {
                                 "Succeeded" => Ok(()),

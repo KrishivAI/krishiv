@@ -221,9 +221,8 @@ async fn heartbeat_loop(
     let checkpoint_storage: Arc<dyn CheckpointStorage> =
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
-    let state_backend = Arc::new(
-        RedbStateBackend::ephemeral().map_err(|e| format!("state backend: {e}"))?,
-    );
+    let state_backend =
+        Arc::new(RedbStateBackend::ephemeral().map_err(|e| format!("state backend: {e}"))?);
 
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
     // operators that exchange partitions between executors (B5).  When no
@@ -240,10 +239,9 @@ async fn heartbeat_loop(
         let bind: SocketAddr = "0.0.0.0:0"
             .parse()
             .expect("0.0.0.0:0 is a valid socket address");
-        let (local_addr, _server_handle) =
-            krishiv_shuffle::flight::serve(bind, Arc::clone(&disk))
-                .await
-                .map_err(|e| format!("shuffle flight server: {e}"))?;
+        let (local_addr, _server_handle) = krishiv_shuffle::flight::serve(bind, Arc::clone(&disk))
+            .await
+            .map_err(|e| format!("shuffle flight server: {e}"))?;
         let endpoint = local_addr.to_string();
         println!("Krishiv executor shuffle flight listening on {endpoint}");
         runner_builder = runner_builder.with_shuffle(ShuffleContext {

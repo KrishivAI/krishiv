@@ -727,18 +727,10 @@ impl ExecutorTaskRunner {
             Err(error) => {
                 self.clear_running_attempt(&assignment);
                 let error_text = error.to_string();
-                let message = format_failure_message(
-                    assignment.plan_fragment().description(),
-                    &error_text,
-                );
+                let message =
+                    format_failure_message(assignment.plan_fragment().description(), &error_text);
                 let failed = self
-                    .send_task_status(
-                        &assignment,
-                        TaskState::Failed,
-                        message,
-                        coordinator,
-                        None,
-                    )
+                    .send_task_status(&assignment, TaskState::Failed, message, coordinator, None)
                     .await?;
                 crate::fragment::common::ensure_status_accepted_or_duplicate(
                     failed.disposition(),
@@ -903,14 +895,9 @@ impl ExecutorTaskRunner {
                     (stage, krishiv_proto::AttemptId::initial(), None)
                 });
             let _ = executor_id_opt; // (kept for symmetry; coordinator looks up by task_id)
-            let executor_id = krishiv_proto::ExecutorId::try_new("exec")
-                .expect("'exec' is a valid executor id");
-            let ids = TaskAttemptRef::new(
-                req.job_id.clone(),
-                stage_id,
-                task_id,
-                attempt_id,
-            );
+            let executor_id =
+                krishiv_proto::ExecutorId::try_new("exec").expect("'exec' is a valid executor id");
+            let ids = TaskAttemptRef::new(req.job_id.clone(), stage_id, task_id, attempt_id);
             let assignment = ExecutorTaskAssignment::new(
                 ids,
                 executor_id,
