@@ -7,13 +7,14 @@ license.workspace = true
 
 [dependencies]
 krishiv-state = { path = "../krishiv-state" }
+bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true, features = ["aws", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

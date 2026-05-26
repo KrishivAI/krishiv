@@ -3938,6 +3938,7 @@ dependencies = [
 name = "krishiv-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "krishiv-state",
  "object_store",
