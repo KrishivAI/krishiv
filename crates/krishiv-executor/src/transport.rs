@@ -327,7 +327,7 @@ impl ExecutorRuntime {
 
     /// Register once and immediately send one heartbeat over gRPC.
     pub async fn register_and_heartbeat_once(
-        &self,
+        &mut self,
     ) -> ExecutorTransportResult<(RegisterExecutorResponse, ExecutorHeartbeatResponse)> {
         let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
             self.config.coordinator_endpoint.clone(),
@@ -341,6 +341,7 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let registration = wire::register_executor_response_from_wire(registration)?;
+        self.apply_lease_generation(registration.lease_generation());
 
         let heartbeat = client
             .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
@@ -349,6 +350,7 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat)?;
+        self.apply_lease_generation(heartbeat.lease_generation());
 
         Ok((registration, heartbeat))
     }

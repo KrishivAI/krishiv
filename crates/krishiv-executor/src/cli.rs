@@ -52,7 +52,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<
 
     match mode {
         ExecutorMode::DryRun => print_contract_summary(&runtime),
-        ExecutorMode::RegisterOnce => register_once(&runtime).await,
+        ExecutorMode::RegisterOnce => register_once(&mut runtime).await,
         ExecutorMode::Connect => {
             heartbeat_loop(
                 &mut runtime,
@@ -108,12 +108,13 @@ fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
     Ok(())
 }
 
-async fn register_once(runtime: &ExecutorRuntime) -> Result<(), String> {
+async fn register_once(runtime: &mut ExecutorRuntime) -> Result<(), String> {
     println!("{}", runtime.startup_summary());
     let (registration, heartbeat) = runtime
         .register_and_heartbeat_once()
         .await
         .map_err(|error| error.to_string())?;
+    runtime.apply_lease_generation(registration.lease_generation());
 
     println!(
         "registration response version={} executor={} lease_generation={} disposition={} message={}",
@@ -157,6 +158,8 @@ async fn heartbeat_loop(
         tokio::spawn(async move {
             let _ = serve_executor_task_grpc_with_listener(task_listener, server_inbox).await;
         });
+        // Re-register so the coordinator learns the task endpoint too.
+        let _ = runtime.register_with_grpc_endpoint().await;
     }
 
     if let Some(addr) = barrier_grpc_addr {
@@ -178,7 +181,7 @@ async fn heartbeat_loop(
                 ))
                 .await;
         });
-        // Re-register so coordinator learns barrier endpoint.
+        // Re-register so the coordinator learns barrier endpoint too.
         let _ = runtime.register_with_grpc_endpoint().await;
     }
 

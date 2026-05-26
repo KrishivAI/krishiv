@@ -215,6 +215,16 @@ impl SqlEngine {
         }
 
         let path = path.as_ref().to_string_lossy().into_owned();
+        if self
+            .context
+            .table_exist(table_name)
+            .map_err(SqlError::from)?
+        {
+            let _ = self
+                .context
+                .deregister_table(table_name)
+                .map_err(SqlError::from)?;
+        }
         self.context
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await?;
@@ -261,6 +271,16 @@ impl SqlEngine {
                     message: e.to_string(),
                 }
             })?;
+        if self
+            .context
+            .table_exist(table_name)
+            .map_err(SqlError::from)?
+        {
+            let _ = self
+                .context
+                .deregister_table(table_name)
+                .map_err(SqlError::from)?;
+        }
         self.context
             .register_table(table_name, Arc::new(mem_table))
             .map_err(|e| SqlError::DataFusion {
@@ -792,6 +812,40 @@ mod view_cache_tests {
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_record_batches_overwrites_existing_table() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from(vec![3, 4, 5]))],
+        )
+        .unwrap();
+
+        let engine = SqlEngine::new();
+        engine
+            .register_record_batches("inventory", vec![first])
+            .await
+            .unwrap();
+        engine
+            .register_record_batches("inventory", vec![second])
+            .await
+            .unwrap();
+
+        let dataframe = engine.sql("SELECT count(*) AS n FROM inventory").await.unwrap();
+        let collected = dataframe.collect().await.unwrap();
+        let rows: usize = collected.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 1);
     }
 }
 

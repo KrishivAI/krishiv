@@ -37,6 +37,8 @@ pub enum ShuffleError {
     LockPoisoned,
     /// Arrow column type does not match the expected downcast target.
     TypeMismatch { expected: String },
+    /// The requested partition count was zero.
+    InvalidPartitionCount { buckets: u32 },
 }
 
 impl std::fmt::Display for ShuffleError {
@@ -63,6 +65,9 @@ impl std::fmt::Display for ShuffleError {
             Self::LockPoisoned => f.write_str("shuffle lock poisoned"),
             Self::TypeMismatch { expected } => {
                 write!(f, "shuffle type mismatch: expected {expected}")
+            }
+            Self::InvalidPartitionCount { buckets } => {
+                write!(f, "invalid shuffle partition count: {buckets}")
             }
         }
     }

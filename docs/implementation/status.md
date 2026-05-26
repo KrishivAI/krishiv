@@ -26,6 +26,16 @@ cargo check --workspace --all-targets --all-features   # OK
 cargo test -p krishiv-{proto,executor,state,shuffle,connectors,api,scheduler,operator} --all-features --lib
 ```
 
+**Session update (2026-05-26):**
+- Fixed `krishiv-proto` build-script tempdir creation, executor lease-generation propagation/re-registration, and shuffle zero-partition handling.
+- Validated the touched crates with `cargo test -p krishiv-executor -p krishiv-shuffle --lib`; all 109 tests passed.
+- Continued the crate-by-crate review across `krishiv-scheduler`, `krishiv-operator`, `krishiv-catalog`, and `krishiv-lakehouse`; no new concrete runtime defect was confirmed in that slice.
+
+**Session update (2026-05-26, follow-up):**
+- Fixed duplicate SQL table registration in `krishiv-sql` by making `register_parquet` and `register_record_batches` replace existing registrations before re-adding them.
+- Added a regression test for repeated in-memory table registration.
+- Verified the failing example now runs successfully: `cargo run --manifest-path examples/rust/Cargo.toml --bin single_node_inventory_replenishment`.
+
 **Blocker:** full `cargo test --workspace --all-features` and `cargo clippy --workspace …` did not finish in this environment (`Disk quota exceeded` on `/tmp` and `target/` during link/protoc/sqlite builds). Free disk space, then run:
 ```bash
 cargo test --workspace --all-features

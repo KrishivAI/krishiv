@@ -3106,6 +3106,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "iceberg",
+ "krishiv-async-util",
  "parquet 58.3.0",
  "redb",
  "serde",

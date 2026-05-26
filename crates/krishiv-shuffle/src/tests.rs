@@ -112,6 +112,19 @@ mod shuffle_tests {
         meta.mark_pending(&p).unwrap();
     }
 
+    #[test]
+    fn hash_partitioner_rejects_zero_buckets() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+        let partitioner = HashPartitioner::new("key", 0);
+        let err = partitioner.partition(&batch).unwrap_err();
+        assert!(matches!(
+            err,
+            ShuffleError::InvalidPartitionCount { buckets: 0 }
+        ));
+    }
+
     // ── LocalShuffleStore ─────────────────────────────────────────────────
 
     #[tokio::test]

@@ -1,4 +1,12 @@
+use std::fs;
+use std::path::PathBuf;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        let path = PathBuf::from(tmpdir);
+        fs::create_dir_all(&path)?;
+    }
+
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     let mut prost_config = prost_build::Config::new();
     prost_config.protoc_executable(protoc);

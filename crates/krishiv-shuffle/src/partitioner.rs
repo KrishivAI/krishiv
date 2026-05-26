@@ -32,6 +32,11 @@ impl HashPartitioner {
     /// buckets are represented as zero-row `RecordBatch` values with the same
     /// schema as the input.
     pub fn partition(&self, batch: &RecordBatch) -> ShuffleResult<Vec<RecordBatch>> {
+        if self.buckets == 0 {
+            return Err(ShuffleError::InvalidPartitionCount {
+                buckets: self.buckets,
+            });
+        }
         let schema = batch.schema();
         let col_idx = schema
             .index_of(&self.key_column)
@@ -152,12 +157,14 @@ impl HashPartitioner {
 }
 
 pub fn hash_i64(value: i64, buckets: u32) -> u32 {
+    debug_assert!(buckets > 0);
     let mut hasher = twox_hash::XxHash64::with_seed(0);
     hasher.write(&value.to_le_bytes());
     (hasher.finish() % buckets as u64) as u32
 }
 
 pub fn hash_str(value: &str, buckets: u32) -> u32 {
+    debug_assert!(buckets > 0);
     let mut hasher = twox_hash::XxHash64::with_seed(0);
     hasher.write(value.as_bytes());
     (hasher.finish() % buckets as u64) as u32
