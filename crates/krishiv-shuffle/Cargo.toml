@@ -16,9 +16,11 @@ arrow-flight = { workspace = true }
 bytes = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
-tokio = { workspace = true, features = ["fs", "net"] }
+tokio = { workspace = true, features = ["fs", "net", "sync"] }
+tokio-stream = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }
+tracing = { workspace = true }
 lz4_flex = { workspace = true }
 twox-hash = { workspace = true }
 zstd = { workspace = true }

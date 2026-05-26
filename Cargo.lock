@@ -4246,7 +4246,9 @@ dependencies = [
  "parquet 58.3.0",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic 0.14.6",
+ "tracing",
  "twox-hash",
  "zstd",
 ]
