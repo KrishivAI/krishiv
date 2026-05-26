@@ -4,7 +4,6 @@
 //!
 //! High-level client API for constructing local, batch SQL, and streaming pipelines.
 
-pub mod collect;
 pub mod dataframe;
 pub mod error;
 pub mod session;
@@ -32,8 +31,9 @@ pub use arrow::record_batch::RecordBatch;
 pub use krishiv_exec::{AggExpr, AggFunction};
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_runtime::{
-    ClusterEndpoints, InProcessCluster, InProcessStreamingRuntime, JobStatus, LocalJobRegistry,
-    LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream, is_streaming_plan,
+    ClusterEndpoints, InProcessCluster, InProcessStreamingRuntime, LocalWindowExecutionSpec,
+    LocalWindowKind, execute_windowed_stream, is_streaming_plan,
+    JobStatus, LocalJobRegistry,
 };
 pub use krishiv_state::TtlConfig;
 pub use krishiv_udf::{ScalarUdf, UdfError, UdfRegistry};
