@@ -75,6 +75,9 @@ impl JobCoordinator {
         Ok(self.job_snapshot()?.kind())
     }
 
+    /// Single-shot scoped tick: launch any newly assigned tasks for this
+    /// job's id only.  Does NOT advance the heartbeat clock — that is the
+    /// CCP's responsibility, doing it here would double-count ticks (A4).
     pub fn coordinator_tick(&self) -> SchedulerResult<()> {
         let mut coord = self
             .cluster
@@ -85,38 +88,24 @@ impl JobCoordinator {
         if self.job_snapshot().is_err() {
             return Ok(());
         }
-        coord.advance_heartbeat_clock(1)?;
         coord.launch_assigned_task_assignments(&self.job_id)?;
         Ok(())
     }
 
-    pub fn spawn_job_orchestration_loops(self) {
-        let job_id = self.job_id.clone();
-        let cluster = self.cluster.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                let tick = (|| {
-                    let mut coord = cluster.write().map_err(|_| SchedulerError::Transport {
-                        message: "coordinator lock poisoned".to_string(),
-                    })?;
-                    if coord.job_snapshot(&job_id).is_err() {
-                        return Ok(());
-                    }
-                    coord.advance_heartbeat_clock(1)?;
-                    coord.launch_assigned_task_assignments(&job_id)?;
-                    Ok::<(), SchedulerError>(())
-                })();
-                if let Err(error) = tick {
-                    tracing::warn!(%job_id, %error, "job coordinator heartbeat tick failed");
-                }
-            }
-        });
+    /// Spawn job-scoped task launch and dispatch loops.  Returns abort
+    /// handles so the caller can stop the loops on demotion / job
+    /// completion.
+    ///
+    /// The heartbeat clock is NOT advanced here — see [`Self::coordinator_tick`].
+    /// CCP's `spawn_orchestration_loops` already ticks the global clock.
+    #[must_use]
+    pub fn spawn_job_orchestration_loops_with_handles(self) -> Vec<tokio::task::AbortHandle> {
+        let mut handles = Vec::with_capacity(1);
         let job_id = self.job_id;
         let cluster = self.cluster;
-        tokio::spawn(async move {
+        let launch_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let job_ids = match cluster.read() {
@@ -137,7 +126,10 @@ impl JobCoordinator {
                                 }
                             }
                             Err(error) => {
-                                tracing::warn!(%jid, %error, "launch assignments failed");
+                                let text = error.to_string();
+                                if !text.contains("InactiveCoordinator") {
+                                    tracing::warn!(%jid, error = %text, "launch assignments failed");
+                                }
                                 continue;
                             }
                         },
@@ -156,6 +148,14 @@ impl JobCoordinator {
                 }
             }
         });
+        handles.push(launch_task.abort_handle());
+        handles
+    }
+
+    /// Same as [`Self::spawn_job_orchestration_loops_with_handles`] but
+    /// discards the abort handles — kept for source compatibility.
+    pub fn spawn_job_orchestration_loops(self) {
+        let _ = self.spawn_job_orchestration_loops_with_handles();
     }
 }
 

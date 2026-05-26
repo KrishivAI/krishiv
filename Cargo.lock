@@ -4204,6 +4204,7 @@ dependencies = [
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
+ "reqwest 0.13.3",
  "rusqlite",
  "serde",
  "serde_json",

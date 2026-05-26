@@ -20,11 +20,10 @@ use tokio::time::{Duration, interval};
 #[cfg(feature = "sqlite")]
 use crate::SqliteMetadataStore;
 use crate::{
-    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JobCoordinator, JsonFileMetadataStore,
+    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore,
     SharedCoordinator, StabilityMetrics, scheduler_metrics,
     serve_coordinator_executor_grpc_with_listener,
 };
-use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,10 +546,30 @@ pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), 
 }
 
 /// Per-job coordinator process configuration.
+///
+/// The standalone JCP daemon is an HTTP **client** of the cluster control
+/// plane.  It does NOT run independent orchestration loops or own a separate
+/// `Coordinator` — A3 in the audit demonstrated that pattern produced a stuck
+/// process because executors register with the CCP, not the JCP, so the JCP's
+/// view of the world was always empty.
+///
+/// Instead, the JCP:
+///   1. Submits the job to the CCP (if not already present) via the federation
+///      HTTP endpoint.
+///   2. Polls job status until it reaches a terminal state.
+///   3. Exits with code 0 (Succeeded) / 1 (Failed) / 2 (Cancelled).
+///
+/// For Kubernetes `dedicatedCoordinator: true` deployments the per-job loops
+/// continue to run inside the operator process via
+/// [`crate::JobCoordinator::spawn_job_orchestration_loops`] which DOES share
+/// the operator's `SharedCoordinator`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCoordinatorDaemonConfig {
     pub job_id: String,
-    pub metadata_path: PathBuf,
+    /// Cluster control-plane HTTP base URL, e.g. `http://krishiv-clusterd:18080`.
+    pub coordinator_http: String,
+    /// How often to poll the CCP for job status.
+    pub poll_interval: std::time::Duration,
     pub help: bool,
 }
 
@@ -559,17 +578,28 @@ pub fn parse_job_coordinator_daemon_config(
     args: impl IntoIterator<Item = String>,
 ) -> Result<JobCoordinatorDaemonConfig, Box<dyn Error>> {
     let mut config = JobCoordinatorDaemonConfig {
-        job_id: String::new(),
-        metadata_path: PathBuf::new(),
+        job_id: env::var("KRISHIV_JOB_ID").unwrap_or_default(),
+        coordinator_http: env::var("KRISHIV_COORDINATOR_HTTP")
+            .unwrap_or_else(|_| String::from("http://127.0.0.1:18080")),
+        poll_interval: std::time::Duration::from_secs(
+            env::var("KRISHIV_JCP_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+        ),
         help: false,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--job-id" => config.job_id = next_daemon_arg(&mut args, "--job-id")?,
-            "--metadata-path" => {
-                config.metadata_path =
-                    PathBuf::from(next_daemon_arg(&mut args, "--metadata-path")?);
+            "--coordinator-http" => {
+                config.coordinator_http = next_daemon_arg(&mut args, "--coordinator-http")?;
+            }
+            "--poll-interval-secs" => {
+                let v = next_daemon_arg(&mut args, "--poll-interval-secs")?;
+                let secs: u64 = v.parse().map_err(|_| "--poll-interval-secs must be u64")?;
+                config.poll_interval = std::time::Duration::from_secs(secs.max(1));
             }
             "--help" | "-h" => config.help = true,
             unknown => {
@@ -585,85 +615,104 @@ pub fn parse_job_coordinator_daemon_config(
 }
 
 pub fn job_coordinator_daemon_help() -> &'static str {
-    "Run a per-job coordinator (JCP) sharing durable metadata with the cluster control plane.\n\
+    "Run a per-job coordinator (JCP) as a CCP client process.\n\
      \n\
      Usage:\n\
-       krishiv job-coordinator --job-id <ID> --metadata-path <PATH>\n\
+       krishiv job-coordinator --job-id <ID> [--coordinator-http <URL>]\n\
      \n\
-     Optional env KRISHIV_JOB_SPEC_JSON for first-time job submit.\n"
+     Options:\n\
+       --job-id <ID>              Job id to watch (also KRISHIV_JOB_ID)\n\
+       --coordinator-http <URL>   CCP federation HTTP endpoint (also KRISHIV_COORDINATOR_HTTP, default http://127.0.0.1:18080)\n\
+       --poll-interval-secs <N>   Status poll interval (also KRISHIV_JCP_POLL_INTERVAL_SECS, default 2)\n\
+     \n\
+     Optional env KRISHIV_JOB_SPEC_JSON to submit the job on first connect.\n"
 }
 
-/// Run the per-job coordinator loop.
+#[derive(serde::Deserialize)]
+struct JcpJobStatusResponse {
+    #[serde(default)]
+    pub state: String,
+}
+
+/// Run the per-job coordinator loop as a CCP client (A3).
 pub async fn run_job_coordinator_daemon(
     jcp_config: JobCoordinatorDaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
     if jcp_config.job_id.is_empty() {
         return Err("--job-id is required".into());
     }
-    if jcp_config.metadata_path.as_os_str().is_empty() {
-        return Err("--metadata-path is required".into());
+    if jcp_config.coordinator_http.is_empty() {
+        return Err("--coordinator-http is required".into());
     }
-    let job_id_str = jcp_config.job_id.clone();
-    let job_id = JobId::try_new(&job_id_str).map_err(|e| format!("invalid job id: {e}"))?;
-    let config = CoordinatorDaemonConfig {
-        coordinator_id: format!("jcp-{job_id_str}"),
-        grpc_addr: "127.0.0.1:0".parse().unwrap(),
-        http_addr: None,
-        shuffle_dir: None,
-        metadata_backend: Some(String::from("json")),
-        metadata_path: Some(jcp_config.metadata_path),
-        help: false,
-    };
-    let shared = build_shared_coordinator(&config)?;
-    if let Ok(spec_json) = env::var("KRISHIV_JOB_SPEC_JSON") {
-        submit_job_from_env_spec(&shared, &job_id, &spec_json)?;
-    }
-    let jcp = JobCoordinator::new(job_id.clone(), shared.clone());
-    jcp.spawn_job_orchestration_loops();
-    println!("Krishiv job coordinator running for job {job_id}");
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        if let Ok(mut coord) = shared.write() {
-            let _ = coord.sync_job_from_metadata_store(&job_id);
-        }
-    }
-}
+    let job_id = jcp_config.job_id.clone();
+    let base = jcp_config.coordinator_http.trim_end_matches('/').to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
 
-fn submit_job_from_env_spec(
-    shared: &SharedCoordinator,
-    job_id: &JobId,
-    spec_json: &str,
-) -> Result<(), Box<dyn Error>> {
-    #[derive(serde::Deserialize)]
-    struct JobSpecEnv {
-        job_id: String,
-        name: String,
-        mode: String,
-        tasks: usize,
-    }
-    let env_spec: JobSpecEnv =
-        serde_json::from_str(spec_json).map_err(|e| format!("KRISHIV_JOB_SPEC_JSON: {e}"))?;
-    let kind = match env_spec.mode.as_str() {
-        "streaming" => JobKind::Streaming,
-        _ => JobKind::Batch,
-    };
-    let submit_id =
-        JobId::try_new(&env_spec.job_id).map_err(|e| format!("job spec job_id: {e}"))?;
-    if submit_id != *job_id {
-        return Err("KRISHIV_JOB_SPEC_JSON job_id must match --job-id".into());
-    }
-    let mut coord = shared.write().map_err(|_| "lock poisoned")?;
-    if coord.job_snapshot(job_id).is_err() {
-        let stage_id = StageId::try_new("stage-1").map_err(|e| e.to_string())?;
-        let mut stage = StageSpec::new(stage_id, format!("{}-stage", env_spec.name));
-        for i in 1..=env_spec.tasks.max(1) {
-            let task_id = TaskId::try_new(format!("task-{i}")).map_err(|e| e.to_string())?;
-            stage = stage.with_task(TaskSpec::new(task_id, format!("task-{i}")));
+    // First-time submit: if KRISHIV_JOB_SPEC_JSON is provided, submit through
+    // the federation endpoint.  If the CCP already knows the job, the endpoint
+    // returns BAD_REQUEST (DuplicateJob) which is fine.
+    if let Ok(spec_json) = env::var("KRISHIV_JOB_SPEC_JSON") {
+        let body = serde_json::json!({
+            "job_id": job_id,
+            "spec_json": spec_json,
+        });
+        let url = format!("{base}/federation/v1/jobs");
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                println!("Krishiv JCP: submitted job {job_id} to {base}");
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    status = %resp.status(),
+                    "JCP submit returned non-success (already-submitted is typical)"
+                );
+            }
+            Err(e) => {
+                return Err(format!("submit job to {url}: {e}").into());
+            }
         }
-        let spec = JobSpec::new(job_id.clone(), env_spec.name, kind).with_stage(stage);
-        coord.submit_job(spec).map_err(|e| e.to_string())?;
     }
-    Ok(())
+
+    println!(
+        "Krishiv JCP watching job {job_id} on {base} (poll every {:?})",
+        jcp_config.poll_interval
+    );
+
+    let status_url = format!("{base}/federation/v1/jobs/{job_id}");
+    loop {
+        match client.get(&status_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<JcpJobStatusResponse>().await {
+                    Ok(status) => {
+                        println!("Krishiv JCP: job {job_id} state={}", status.state);
+                        let terminal = matches!(
+                            status.state.as_str(),
+                            "Succeeded" | "Failed" | "Cancelled"
+                        );
+                        if terminal {
+                            return match status.state.as_str() {
+                                "Succeeded" => Ok(()),
+                                "Cancelled" => Err("job cancelled".into()),
+                                _ => Err("job failed".into()),
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "JCP failed to decode status payload");
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!(status = %resp.status(), "JCP status RPC returned non-success");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "JCP status RPC failed; will retry");
+            }
+        }
+        tokio::time::sleep(jcp_config.poll_interval).await;
+    }
 }
 
 #[cfg(test)]
