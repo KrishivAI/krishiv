@@ -1,7 +1,7 @@
 //! Unified execution runtime across Embedded, SingleNode, and Distributed modes.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
@@ -126,10 +126,13 @@ fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> 
 }
 
 /// In-process cluster runtime for Embedded and auto-start SingleNode.
+///
+/// Neither backend carries per-call state, so a `Mutex<...>` is unnecessary —
+/// removing it eliminates the serialization point that previously blocked
+/// concurrent SQL submissions from the same session (C3).
 pub struct InProcessExecutionRuntime {
     mode: RuntimeMode,
     cluster: Arc<InProcessCluster>,
-    backend: Mutex<EmbeddedBackend>,
 }
 
 impl InProcessExecutionRuntime {
@@ -137,7 +140,6 @@ impl InProcessExecutionRuntime {
         Self {
             mode: RuntimeMode::Embedded,
             cluster,
-            backend: Mutex::new(EmbeddedBackend::default()),
         }
     }
 
@@ -145,7 +147,6 @@ impl InProcessExecutionRuntime {
         Self {
             mode: RuntimeMode::SingleNode,
             cluster,
-            backend: Mutex::new(EmbeddedBackend::default()),
         }
     }
 }
@@ -157,11 +158,10 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         match self.mode {
-            RuntimeMode::Embedded => self
-                .backend
-                .lock()
-                .map_err(|_| RuntimeError::transport("runtime backend lock poisoned"))?
-                .execute(plan),
+            RuntimeMode::Embedded => {
+                let mut backend = EmbeddedBackend::default();
+                backend.execute(plan)
+            }
             RuntimeMode::SingleNode => {
                 let mut sn = SingleNodeBackend;
                 sn.execute(plan)

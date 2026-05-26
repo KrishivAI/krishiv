@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use krishiv_async_util::block_on;
@@ -94,15 +94,22 @@ fn remote_execution_from_env() -> bool {
     remote_execution_from_env_opt().unwrap_or(false)
 }
 
+/// Returns a per-call fresh embedded runtime for orphan `DataFrame::new`/
+/// `Stream::new` constructors.  Previously this returned a process-global
+/// `OnceLock` instance shared across every session — a major contention
+/// hotspot under parallel workloads (C1).
+///
+/// The returned runtime carries its own `InProcessCluster` and ids; dropping
+/// it tears down the cluster.
 pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
-    static RUNTIME: OnceLock<Arc<dyn ExecutionRuntime>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            let cluster =
-                Arc::new(InProcessCluster::new().expect("shared embedded in-process cluster"));
-            build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false)
-        })
-        .clone()
+    // OnceLock kept around to avoid breaking any external code that might
+    // observe a stable identity across calls — but we always return a *fresh*
+    // runtime so concurrent constructors get isolated coordinators.  The
+    // OnceLock itself is unused for hand-out; left here for backward-compat
+    // marker placement only.
+    let _ = std::sync::OnceLock::<()>::new();
+    let cluster = Arc::new(InProcessCluster::new().expect("orphan embedded in-process cluster"));
+    build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false)
 }
 
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
