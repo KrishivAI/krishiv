@@ -4182,6 +4182,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-sql",
  "krishiv-state",
+ "serde",
  "serde_json",
  "tokio",
  "tonic 0.14.6",
