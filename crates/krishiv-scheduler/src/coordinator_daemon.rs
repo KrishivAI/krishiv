@@ -21,7 +21,8 @@ use tokio::time::{Duration, interval};
 use crate::SqliteMetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, InMemoryMetadataStore, JobCoordinator, JsonFileMetadataStore,
-    SharedCoordinator, StabilityMetrics, serve_coordinator_executor_grpc_with_listener,
+    SharedCoordinator, StabilityMetrics, scheduler_metrics,
+    serve_coordinator_executor_grpc_with_listener,
 };
 use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 
@@ -356,6 +357,13 @@ async fn readyz(
 }
 
 async fn metrics(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        render_metrics_body(&coordinator),
+    )
+}
+
+fn render_metrics_body(coordinator: &SharedCoordinator) -> String {
     let m = coordinator
         .read()
         .map(|c| c.stability_metrics())
@@ -388,11 +396,26 @@ krishiv_max_executor_heartbeat_age_ticks {hb_age}
     );
     let mut body = body;
     body.push('\n');
+    let scheduler = scheduler_metrics();
+    let scheduler_body = format!(
+        "\
+# HELP krishiv_scheduler_jobs_submitted_total Total jobs submitted to the coordinator
+# TYPE krishiv_scheduler_jobs_submitted_total counter
+krishiv_scheduler_jobs_submitted_total {jobs}
+# HELP krishiv_scheduler_checkpoint_epochs_total Total checkpoint epochs initiated
+# TYPE krishiv_scheduler_checkpoint_epochs_total counter
+krishiv_scheduler_checkpoint_epochs_total {epochs}
+# HELP krishiv_scheduler_tasks_assigned_total Total task assignments launched
+# TYPE krishiv_scheduler_tasks_assigned_total counter
+krishiv_scheduler_tasks_assigned_total {tasks}
+",
+        jobs = scheduler.jobs_submitted_total,
+        epochs = scheduler.checkpoint_epochs_total,
+        tasks = scheduler.tasks_assigned_total,
+    );
+    body.push_str(&scheduler_body);
     body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        body,
-    )
+    body
 }
 
 /// Parse coordinator-family daemon flags (`krishiv-coordinator`, `krishiv-clusterd`, `krishiv clusterd`, …).
@@ -645,7 +668,9 @@ fn submit_job_from_env_spec(
 
 #[cfg(test)]
 mod parse_tests {
-    use super::parse_coordinator_daemon_config;
+    use super::{parse_coordinator_daemon_config, render_metrics_body};
+    use crate::{Coordinator, SharedCoordinator};
+    use krishiv_proto::CoordinatorId;
 
     #[test]
     fn parses_defaults() {
@@ -659,5 +684,16 @@ mod parse_tests {
     fn parses_help_flag() {
         let config = parse_coordinator_daemon_config([String::from("--help")]).unwrap();
         assert!(config.help);
+    }
+
+    #[test]
+    fn metrics_body_includes_scheduler_counters() {
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-metrics").unwrap(),
+        ));
+        let body = render_metrics_body(&coordinator);
+        assert!(body.contains("krishiv_scheduler_jobs_submitted_total"));
+        assert!(body.contains("krishiv_scheduler_checkpoint_epochs_total"));
+        assert!(body.contains("krishiv_scheduler_tasks_assigned_total"));
     }
 }

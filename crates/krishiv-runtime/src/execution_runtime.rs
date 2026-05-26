@@ -108,6 +108,11 @@ pub trait ExecutionRuntime: Send + Sync {
     fn flight_url(&self) -> Option<&str> {
         None
     }
+
+    /// Optional coordinator gRPC URL used by CLI/operator control-plane integrations.
+    fn coordinator_grpc_url(&self) -> Option<&str> {
+        None
+    }
 }
 
 fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {
@@ -214,15 +219,21 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
 /// Distributed / remote-cluster runtime (Flight SQL + optional in-process fallback for tests).
 pub struct RemoteExecutionRuntime {
     flight_url: String,
+    coordinator_grpc_url: Option<String>,
     session_mode: RuntimeMode,
     /// When set, bounded streaming also uses the in-process cluster (integration tests).
     local_fallback: Option<Arc<InProcessCluster>>,
 }
 
 impl RemoteExecutionRuntime {
-    pub fn new(flight_url: impl Into<String>, session_mode: RuntimeMode) -> Self {
+    pub fn new(
+        flight_url: impl Into<String>,
+        session_mode: RuntimeMode,
+        coordinator_grpc_url: Option<String>,
+    ) -> Self {
         Self {
             flight_url: flight_url.into(),
+            coordinator_grpc_url,
             session_mode,
             local_fallback: None,
         }
@@ -238,9 +249,9 @@ impl RemoteExecutionRuntime {
             RuntimeError::unsupported("plan acceptance requires a local cluster fallback")
         })?;
         let runtime = match self.session_mode {
-            RuntimeMode::SingleNode => InProcessExecutionRuntime::single_node(Arc::clone(cluster)),
-            RuntimeMode::Embedded | RuntimeMode::Distributed => {
-                InProcessExecutionRuntime::embedded(Arc::clone(cluster))
+            RuntimeMode::Embedded => InProcessExecutionRuntime::embedded(Arc::clone(cluster)),
+            RuntimeMode::SingleNode | RuntimeMode::Distributed => {
+                InProcessExecutionRuntime::single_node(Arc::clone(cluster))
             }
         };
         runtime.accept_plan(plan)
@@ -356,6 +367,10 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
     fn flight_url(&self) -> Option<&str> {
         Some(&self.flight_url)
     }
+
+    fn coordinator_grpc_url(&self) -> Option<&str> {
+        self.coordinator_grpc_url.as_deref()
+    }
 }
 
 /// Build the appropriate runtime for a session configuration.
@@ -363,6 +378,7 @@ pub fn build_execution_runtime(
     mode: RuntimeMode,
     cluster: Arc<InProcessCluster>,
     coordinator_flight_url: Option<String>,
+    coordinator_grpc_url: Option<String>,
     remote_execution: bool,
 ) -> Arc<dyn ExecutionRuntime> {
     match mode {
@@ -371,7 +387,8 @@ pub fn build_execution_runtime(
         }
         RuntimeMode::SingleNode => {
             if let Some(url) = coordinator_flight_url {
-                let mut remote = RemoteExecutionRuntime::new(url, RuntimeMode::SingleNode);
+                let mut remote =
+                    RemoteExecutionRuntime::new(url, RuntimeMode::SingleNode, coordinator_grpc_url);
                 if !remote_execution {
                     remote = remote.with_local_fallback(Arc::clone(&cluster));
                 }
@@ -383,7 +400,8 @@ pub fn build_execution_runtime(
         RuntimeMode::Distributed => {
             let url =
                 coordinator_flight_url.unwrap_or_else(|| String::from("http://127.0.0.1:50051"));
-            let mut remote = RemoteExecutionRuntime::new(url, RuntimeMode::Distributed);
+            let mut remote =
+                RemoteExecutionRuntime::new(url, RuntimeMode::Distributed, coordinator_grpc_url);
             if !remote_execution {
                 remote = remote.with_local_fallback(Arc::clone(&cluster));
             }
@@ -395,4 +413,35 @@ pub fn build_execution_runtime(
 /// Classify a plan for routing without executing it.
 pub fn plan_execution_kind(plan: &PhysicalPlan) -> ExecutionKind {
     plan.kind()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{RuntimeMode, build_execution_runtime};
+    use crate::InProcessCluster;
+
+    #[test]
+    fn distributed_runtime_preserves_flight_and_grpc_urls() {
+        let cluster = Arc::new(InProcessCluster::new().expect("cluster"));
+        let runtime = build_execution_runtime(
+            RuntimeMode::Distributed,
+            cluster,
+            Some(String::from("http://127.0.0.1:50051")),
+            Some(String::from("http://127.0.0.1:9090")),
+            false,
+        );
+
+        assert_eq!(
+            runtime.flight_url(),
+            Some("http://127.0.0.1:50051"),
+            "flight URL should be preserved for distributed sessions"
+        );
+        assert_eq!(
+            runtime.coordinator_grpc_url(),
+            Some("http://127.0.0.1:9090"),
+            "gRPC coordinator URL should be preserved for distributed sessions"
+        );
+    }
 }

@@ -816,11 +816,9 @@ mod view_cache_tests {
 
     #[tokio::test]
     async fn register_record_batches_overwrites_existing_table() {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "id",
-            arrow::datatypes::DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
         let first = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2]))],
@@ -842,7 +840,10 @@ mod view_cache_tests {
             .await
             .unwrap();
 
-        let dataframe = engine.sql("SELECT count(*) AS n FROM inventory").await.unwrap();
+        let dataframe = engine
+            .sql("SELECT count(*) AS n FROM inventory")
+            .await
+            .unwrap();
         let collected = dataframe.collect().await.unwrap();
         let rows: usize = collected.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(rows, 1);

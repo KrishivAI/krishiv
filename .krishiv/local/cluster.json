@@ -5,8 +5,8 @@
   "ui_url": "http://127.0.0.1:18080/ui",
   "executor_id": "local-exec-1",
   "data_dir": ".krishiv/local",
-  "coordinator_pid": 708212,
-  "executor_pid": 708238,
-  "flight_pid": 708225,
+  "coordinator_pid": 317583,
+  "executor_pid": 317605,
+  "flight_pid": 317590,
   "ui_pid": null
 }

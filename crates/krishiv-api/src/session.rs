@@ -90,7 +90,7 @@ pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
         .get_or_init(|| {
             let cluster =
                 Arc::new(InProcessCluster::new().expect("shared embedded in-process cluster"));
-            build_execution_runtime(RuntimeMode::Embedded, cluster, None, false)
+            build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false)
         })
         .clone()
 }
@@ -201,6 +201,7 @@ impl SessionBuilder {
             execution_mode_to_runtime_mode(self.mode),
             Arc::clone(&local_cluster),
             self.coordinator_url.clone(),
+            self.local_cluster_grpc.clone(),
             self.remote_execution,
         );
         Ok(Session {
@@ -210,6 +211,7 @@ impl SessionBuilder {
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: self.coordinator_url,
+            coordinator_grpc_url: self.local_cluster_grpc,
             state_ttl: self.state_ttl,
             memory_streams: Arc::new(RwLock::new(HashMap::new())),
             udf_registry,
@@ -230,6 +232,7 @@ pub struct Session {
     jobs: Arc<Mutex<LocalJobRegistry>>,
     next_job_id: Arc<AtomicU64>,
     pub(crate) coordinator_url: Option<String>,
+    coordinator_grpc_url: Option<String>,
     state_ttl: Option<StateTtlConfig>,
     memory_streams: Arc<RwLock<HashMap<String, Vec<RecordBatch>>>>,
     udf_registry: Arc<RwLock<UdfRegistry>>,
@@ -352,6 +355,11 @@ impl Session {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .snapshot()
+    }
+
+    /// Optional control-plane gRPC endpoint associated with this session.
+    pub fn coordinator_grpc_url(&self) -> Option<&str> {
+        self.coordinator_grpc_url.as_deref()
     }
 
     /// Shared UDF registry for this session.

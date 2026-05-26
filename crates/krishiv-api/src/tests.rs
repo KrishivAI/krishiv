@@ -88,6 +88,19 @@ fn session_builder_accepts_single_node() {
 }
 
 #[test]
+fn session_builder_preserves_coordinator_grpc_url() {
+    let session = Session::builder()
+        .with_coordinator_grpc("http://127.0.0.1:9090")
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        session.coordinator_grpc_url(),
+        Some("http://127.0.0.1:9090")
+    );
+}
+
+#[test]
 fn sql_collects_literal_query() {
     let session = match Session::builder().build() {
         Ok(session) => session,
