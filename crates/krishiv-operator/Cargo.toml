@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }

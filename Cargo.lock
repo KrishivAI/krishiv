@@ -4097,6 +4097,7 @@ dependencies = [
 name = "krishiv-operator"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "k8s-openapi",
  "krishiv-checkpoint",

@@ -30,8 +30,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let client = Client::try_default().await?;
-    // P0-4: embedded coordinator must tick heartbeats and launch assigned tasks.
-    runtime.coordinator().spawn_orchestration_loops();
+    // A2/E3: do NOT eagerly start orchestration loops while still Standby.
+    // Demote first so the lease loop can promote us atomically once acquired.
+    if let Ok(mut coord) = runtime.coordinator().write() {
+        coord.demote_to_standby();
+    }
     spawn_coordinator_leader_election(
         runtime.coordinator(),
         client.clone(),
@@ -137,21 +140,57 @@ fn spawn_coordinator_leader_election(
     coordinator_id: String,
 ) {
     let ns = namespace.unwrap_or_else(|| "krishiv-system".to_string());
-    let election = std::sync::Arc::new(
+    let election: std::sync::Arc<dyn LeaderElection + Send + Sync> = std::sync::Arc::new(
         K8sLeaseElection::new(&coordinator_id, &ns, &coordinator_id).with_kube_client(client),
     );
+
+    // E3: orchestration loops are tied to leadership.  We hold the abort
+    // handles in this task so we can stop them on demotion.
+    let mut orchestration_abort: Option<Vec<tokio::task::AbortHandle>> = None;
+
     tokio::spawn(async move {
+        // Try to acquire synchronously before starting the periodic loop so
+        // there is no window where two pods both think they are Active (A2).
+        if election.try_acquire().await
+            && let Ok(mut c) = coordinator.write()
+        {
+            c.promote_to_active();
+            orchestration_abort = Some(coordinator.spawn_orchestration_loops_with_handles());
+        }
+
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if election.try_acquire().await {
+            let was_leader = election.is_leader();
+            let acquired = election.try_acquire().await;
+            if acquired {
                 if let Ok(mut c) = coordinator.write() {
                     c.promote_to_active();
                 }
-            } else if election.is_leader() {
-                let _ = election.renew().await;
+                if orchestration_abort.is_none() {
+                    orchestration_abort =
+                        Some(coordinator.spawn_orchestration_loops_with_handles());
+                }
+            } else if was_leader {
+                let renewed = election.renew().await;
+                if !renewed {
+                    if let Ok(mut c) = coordinator.write() {
+                        c.demote_to_standby();
+                    }
+                    if let Some(handles) = orchestration_abort.take() {
+                        for h in handles {
+                            h.abort();
+                        }
+                    }
+                }
             } else if let Ok(mut c) = coordinator.write() {
                 c.demote_to_standby();
+                if let Some(handles) = orchestration_abort.take() {
+                    for h in handles {
+                        h.abort();
+                    }
+                }
             }
         }
     });

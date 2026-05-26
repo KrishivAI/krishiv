@@ -288,6 +288,7 @@ async fn heartbeat_loop(
             _ = tokio::time::sleep(Duration::from_secs(heartbeat_interval_secs)) => {
                 match runtime.heartbeat_with_grpc_endpoint().await {
                     Ok(heartbeat) => {
+                        use krishiv_proto::TransportDisposition;
                         // Propagate to the shared atomic so runner RPCs see the new lease.
                         shared_lease.set(heartbeat.lease_generation());
                         println!(
@@ -297,6 +298,31 @@ async fn heartbeat_loop(
                             heartbeat.disposition(),
                             heartbeat.message().unwrap_or("")
                         );
+                        // F1: if the coordinator reports our lease is stale (or we are
+                        // unknown to it), re-register.  This is the steady-state
+                        // recovery path that allows an executor to survive a
+                        // coordinator restart or a transient lease bump.
+                        if matches!(
+                            heartbeat.disposition(),
+                            TransportDisposition::StaleLease
+                                | TransportDisposition::UnknownExecutor
+                        ) {
+                            tracing::warn!(
+                                disposition = %heartbeat.disposition(),
+                                "heartbeat reported lease problem; re-registering"
+                            );
+                            match runtime.register_with_grpc_endpoint().await {
+                                Ok(response) => {
+                                    runtime.apply_lease_generation(response.lease_generation());
+                                    shared_lease.set(response.lease_generation());
+                                    coord_service.invalidate_channel().await;
+                                }
+                                Err(error) => {
+                                    tracing::error!(error = %error, "re-register failed");
+                                }
+                            }
+                            continue;
+                        }
                         for cmd in heartbeat.checkpoint_commands() {
                             if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
                                 let req = InitiateCheckpointRequest {
@@ -317,18 +343,9 @@ async fn heartbeat_loop(
                     }
                     Err(error) => {
                         let text = error.to_string();
-                        if text.contains("StaleExecutorLease") || text.contains("stale lease") {
-                            // F1: server bumped the lease while we were quiet; re-register.
-                            tracing::warn!(error = %text, "heartbeat reported stale lease; re-registering");
-                            if let Ok(response) = runtime.register_with_grpc_endpoint().await {
-                                runtime.apply_lease_generation(response.lease_generation());
-                                shared_lease.set(response.lease_generation());
-                            } else {
-                                tracing::error!("re-register after stale lease failed");
-                            }
-                        } else {
-                            return Err(text);
-                        }
+                        tracing::warn!(error = %text, "heartbeat rpc failed; will retry");
+                        // Drop the cached channel so the next iteration reconnects.
+                        coord_service.invalidate_channel().await;
                     }
                 }
             }

@@ -4,17 +4,12 @@
 
 /// `SingleNodeElection` is the embedded/single-node implementation.
 /// `K8sLeaseElection` in `krishiv-operator` implements this for Kubernetes HA.
-/// Bare-metal HA backed by external etcd is deferred post-R9.
+/// Bare-metal HA backed by external etcd is selected through the same trait.
 ///
-/// # ADR-R12-02 (Option B — AFIT)
-/// The three mutating methods use `async fn` (AFIT, stable since Rust 1.75).
-/// This eliminates the `block_on` anti-pattern in `K8sLeaseElection`, which
-/// panics when called from inside an async Tokio runtime context.
-///
-/// `dyn LeaderElection` is not used anywhere in this codebase, so auto-trait
-/// bounds on the returned futures (the lint `async_fn_in_trait` warns about)
-/// are not a concern.
-#[allow(async_fn_in_trait)]
+/// The trait is `#[async_trait]` so `Arc<dyn LeaderElection>` works for
+/// runtime injection (A1).  The boxed-future overhead is negligible at the
+/// rate of one election tick per few seconds.
+#[async_trait::async_trait]
 pub trait LeaderElection: Send + Sync {
     /// Whether this node currently holds the leader lease.
     fn is_leader(&self) -> bool;
