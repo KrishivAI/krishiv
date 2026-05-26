@@ -587,8 +587,12 @@ fn with_coordinator_stores_url_accessible_via_sql() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn distributed_session_sql_collects_via_local_coordinator() {
+    // B2: Distributed mode now defaults to real remote execution.  This test
+    // explicitly opts into the local-fallback path that was the historical
+    // default, since no flight server is running on 127.0.0.1:50051.
     let session = Session::builder()
         .with_coordinator("http://127.0.0.1:50051")
+        .with_remote_execution(false)
         .build()
         .unwrap();
     let df = session.sql_async("SELECT 3 AS n").await.unwrap();
@@ -631,6 +635,7 @@ async fn distributed_read_parquet_collects_via_coordinator() {
     write_people_parquet(&parquet_path);
     let session = Session::builder()
         .with_coordinator("http://127.0.0.1:50051")
+        .with_remote_execution(false)
         .build()
         .unwrap();
     let df = session.read_parquet_async(&parquet_path).await.unwrap();
