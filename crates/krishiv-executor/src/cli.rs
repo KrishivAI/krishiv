@@ -2,19 +2,22 @@
 
 use std::env;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
-    ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector,
+    ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector, ShuffleContext,
     executor_barrier_grpc_server, serve_executor_task_grpc_with_listener,
 };
 use axum::Router;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use krishiv_checkpoint::LocalFsCheckpointStorage;
+use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_proto::{InitiateCheckpointRequest, JobId};
+use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
 use krishiv_state::RedbStateBackend;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -33,6 +36,9 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<
     let http_addr = config.http_addr;
     let task_grpc_addr = config.task_grpc_addr;
     let barrier_grpc_addr = config.barrier_grpc_addr;
+    let shuffle_dir = config.shuffle_dir.clone();
+    let checkpoint_uri = config.checkpoint_uri.clone();
+    let slots = config.slots;
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
 
     // Start optional HTTP health server (/healthz, /readyz, /metrics).
@@ -59,6 +65,9 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<
                 heartbeat_interval_secs,
                 task_grpc_addr,
                 barrier_grpc_addr,
+                shuffle_dir,
+                checkpoint_uri,
+                slots,
             )
             .await
         }
@@ -134,124 +143,192 @@ async fn register_once(runtime: &mut ExecutorRuntime) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_loop(
     runtime: &mut ExecutorRuntime,
     heartbeat_interval_secs: u64,
     task_grpc_addr: Option<SocketAddr>,
     barrier_grpc_addr: Option<SocketAddr>,
+    shuffle_dir: Option<std::path::PathBuf>,
+    checkpoint_uri: String,
+    slots: usize,
 ) -> Result<(), String> {
-    register_once(runtime).await?;
-
-    // GAP-CP-09: Start the executor task gRPC server so the coordinator can push
-    // task assignments without polling.  The inbox is shared between the gRPC
-    // service and the task runner loop below.
+    // Bind task/barrier listeners FIRST so the *first* register advertises real
+    // endpoints — avoids the double-register race that previously bumped the
+    // lease before the loop could observe it (B8).
     let inbox = ExecutorAssignmentInbox::new();
-    if let Some(addr) = task_grpc_addr {
-        let task_listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("failed to bind task gRPC addr {addr}: {e}"))?;
-        let bound_addr = task_listener.local_addr().unwrap();
+    let task_listener = if let Some(addr) = task_grpc_addr {
+        Some(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| format!("failed to bind task gRPC addr {addr}: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(listener) = &task_listener {
+        let bound_addr = listener.local_addr().unwrap();
         let endpoint = format!("http://{bound_addr}");
         runtime.set_advertised_endpoints(Some(endpoint.clone()), None);
         println!("Krishiv executor task gRPC listening on {bound_addr}");
-        let server_inbox = inbox.clone();
-        tokio::spawn(async move {
-            let _ = serve_executor_task_grpc_with_listener(task_listener, server_inbox).await;
-        });
-        // Re-register so the coordinator learns the task endpoint too.
-        let _ = runtime.register_with_grpc_endpoint().await;
     }
-
-    if let Some(addr) = barrier_grpc_addr {
-        let barrier_listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("failed to bind barrier gRPC addr {addr}: {e}"))?;
-        let bound_addr = barrier_listener.local_addr().unwrap();
+    let barrier_listener = if let Some(addr) = barrier_grpc_addr {
+        Some(
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| format!("failed to bind barrier gRPC addr {addr}: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(listener) = &barrier_listener {
+        let bound_addr = listener.local_addr().unwrap();
         let endpoint = format!("http://{bound_addr}");
         runtime.set_advertised_endpoints(None, Some(endpoint.clone()));
         println!("Krishiv executor barrier gRPC listening on {bound_addr}");
+    }
+
+    // First register (now with task/barrier endpoints already populated).
+    register_once(runtime).await?;
+    let initial_lease = runtime.config().lease_generation();
+    let shared_lease = SharedLeaseGeneration::new(initial_lease);
+    let coordinator_endpoint = runtime.config().coordinator_endpoint().to_owned();
+    let coord_service = Arc::new(GrpcCoordinatorService::with_shared_lease(
+        coordinator_endpoint.clone(),
+        shared_lease.clone(),
+    ));
+
+    // Now spawn the task and barrier servers.  No more re-registers required.
+    if let Some(listener) = task_listener {
+        let server_inbox = inbox.clone();
+        tokio::spawn(async move {
+            let _ = serve_executor_task_grpc_with_listener(listener, server_inbox).await;
+        });
+    }
+    if let Some(listener) = barrier_listener {
         let injector: SharedBarrierInjector = Default::default();
         let barrier_service =
             ExecutorBarrierService::new(injector, runtime.config().executor_id().as_str());
         tokio::spawn(async move {
             let _ = Server::builder()
                 .add_service(executor_barrier_grpc_server(barrier_service))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
-                    barrier_listener,
-                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
         });
-        // Re-register so the coordinator learns barrier endpoint too.
-        let _ = runtime.register_with_grpc_endpoint().await;
     }
 
-    let checkpoint_dir = env::var("KRISHIV_CHECKPOINT_STORAGE")
-        .unwrap_or_else(|_| String::from("/tmp/krishiv-checkpoints"));
-    let checkpoint_storage = LocalFsCheckpointStorage::new(&checkpoint_dir)
-        .map_err(|e| format!("checkpoint storage at {checkpoint_dir}: {e}"))?;
-    let state_backend = RedbStateBackend::ephemeral().map_err(|e| e.to_string())?;
+    // Checkpoint storage and state backend.  Both honor explicit URIs from the CLI/env.
+    let checkpoint_storage: Arc<dyn CheckpointStorage> =
+        open_checkpoint_storage_from_uri(&checkpoint_uri)
+            .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
+    let state_backend = Arc::new(
+        RedbStateBackend::ephemeral().map_err(|e| format!("state backend: {e}"))?,
+    );
 
-    // Spawn the task runner loop: pop assignments from the inbox and run them,
-    // reporting status to the coordinator endpoint.
-    let runner_inbox = inbox.clone();
-    let runner_endpoint = runtime.config().coordinator_endpoint().to_owned();
-    let runner = std::sync::Arc::new(ExecutorTaskRunner::new(runner_inbox));
-    let runner_loop = runner.clone();
-    tokio::spawn(async move {
-        loop {
-            let coord = GrpcCoordinatorService::new(
-                runner_endpoint.clone(),
-                krishiv_proto::LeaseGeneration::initial(),
-            );
-            match runner_loop.run_next_with(&coord).await {
-                Ok(Some(_report)) => {}
-                Ok(None) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => {
-                    eprintln!("task runner error: {e}");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Shuffle store: required for `shuffle-write:` fragments and for streaming
+    // operators that exchange partitions between executors (B5).  When no
+    // `--shuffle-dir` is provided we still create an in-memory shuffle store so
+    // R4a typed shuffle write/read tasks succeed for tests.
+    let mut runner_builder =
+        ExecutorTaskRunner::new(inbox.clone()).with_live_lease(shared_lease.clone());
+    if let Some(dir) = &shuffle_dir {
+        let disk = Arc::new(
+            LocalDiskShuffleStore::new(dir)
+                .map_err(|e| format!("local shuffle store at {}: {e}", dir.display()))?,
+        );
+        // Start the shuffle Flight server on a kernel-chosen port and advertise it.
+        let bind: SocketAddr = "0.0.0.0:0"
+            .parse()
+            .expect("0.0.0.0:0 is a valid socket address");
+        let (local_addr, _server_handle) =
+            krishiv_shuffle::flight::serve(bind, Arc::clone(&disk))
+                .await
+                .map_err(|e| format!("shuffle flight server: {e}"))?;
+        let endpoint = local_addr.to_string();
+        println!("Krishiv executor shuffle flight listening on {endpoint}");
+        runner_builder = runner_builder.with_shuffle(ShuffleContext {
+            store: disk,
+            flight_endpoint: endpoint,
+        });
+    }
+    let inmem_shuffle = Arc::new(InMemoryShuffleStore::new());
+    runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
+
+    let runner = Arc::new(runner_builder);
+
+    // Spawn `slots` concurrent runner tasks all reading from the same inbox
+    // (B6): without this the executor processes one task at a time regardless
+    // of the advertised slot count.
+    let effective_slots = slots.max(1);
+    for slot_idx in 0..effective_slots {
+        let runner_loop = Arc::clone(&runner);
+        let coord = Arc::clone(&coord_service);
+        tokio::spawn(async move {
+            loop {
+                match runner_loop.run_next_with(coord.as_ref()).await {
+                    Ok(Some(_report)) => {}
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(slot = slot_idx, error = %e, "task runner error");
+                        // Invalidate the channel so the next iteration reconnects.
+                        coord.invalidate_channel().await;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(heartbeat_interval_secs)) => {
-                let heartbeat = runtime
-                    .heartbeat_with_grpc_endpoint()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // Lease generation is updated inside heartbeat_with_grpc_endpoint (GAP-C4).
-                println!(
-                    "heartbeat response version={} lease_generation={} disposition={} message={}",
-                    heartbeat.version(),
-                    heartbeat.lease_generation(),
-                    heartbeat.disposition(),
-                    heartbeat.message().unwrap_or("")
-                );
-                for cmd in heartbeat.checkpoint_commands() {
-                    if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
-                        let req = InitiateCheckpointRequest {
-                            job_id,
-                            epoch: cmd.epoch,
-                            fencing_token: cmd.fencing_token,
-                        };
-                        let coord = GrpcCoordinatorService::new(
-                            runtime.config().coordinator_endpoint().to_owned(),
-                            runtime.config().lease_generation(),
+                match runtime.heartbeat_with_grpc_endpoint().await {
+                    Ok(heartbeat) => {
+                        // Propagate to the shared atomic so runner RPCs see the new lease.
+                        shared_lease.set(heartbeat.lease_generation());
+                        println!(
+                            "heartbeat response version={} lease_generation={} disposition={} message={}",
+                            heartbeat.version(),
+                            heartbeat.lease_generation(),
+                            heartbeat.disposition(),
+                            heartbeat.message().unwrap_or("")
                         );
-                        let _ = runner
-                            .initiate_checkpoint_for_job(
-                                &req,
-                                &state_backend,
-                                &checkpoint_storage,
-                                &coord,
-                            )
-                            .await;
+                        for cmd in heartbeat.checkpoint_commands() {
+                            if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
+                                let req = InitiateCheckpointRequest {
+                                    job_id,
+                                    epoch: cmd.epoch,
+                                    fencing_token: cmd.fencing_token,
+                                };
+                                let _ = runner
+                                    .initiate_checkpoint_for_job(
+                                        &req,
+                                        state_backend.as_ref(),
+                                        checkpoint_storage.as_ref(),
+                                        coord_service.as_ref(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let text = error.to_string();
+                        if text.contains("StaleExecutorLease") || text.contains("stale lease") {
+                            // F1: server bumped the lease while we were quiet; re-register.
+                            tracing::warn!(error = %text, "heartbeat reported stale lease; re-registering");
+                            if let Ok(response) = runtime.register_with_grpc_endpoint().await {
+                                runtime.apply_lease_generation(response.lease_generation());
+                                shared_lease.set(response.lease_generation());
+                            } else {
+                                tracing::error!("re-register after stale lease failed");
+                            }
+                        } else {
+                            return Err(text);
+                        }
                     }
                 }
             }
@@ -263,6 +340,8 @@ async fn heartbeat_loop(
         }
     }
 }
+
+// (LeaseGeneration is referenced via the heartbeat callback above.)
 
 /// Executor CLI help text.
 pub fn executor_cli_help() -> &'static str {
@@ -282,6 +361,12 @@ struct ExecutorCliConfig {
     task_grpc_addr: Option<SocketAddr>,
     /// BarrierService gRPC listen address (WS-4).
     barrier_grpc_addr: Option<SocketAddr>,
+    /// Local on-disk shuffle store directory; if set, the shuffle Flight
+    /// server is started and the runner is wired for `shuffle-write:` fragments (B5).
+    shuffle_dir: Option<std::path::PathBuf>,
+    /// Checkpoint storage URI (filesystem path or `s3://`, `memory://`, …).
+    /// Defaults to `KRISHIV_CHECKPOINT_STORAGE` then `file:///tmp/krishiv-checkpoints`.
+    checkpoint_uri: String,
     help: bool,
 }
 
@@ -320,6 +405,11 @@ impl ExecutorCliConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .or_else(|| "0.0.0.0:50056".parse().ok()),
+            shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
+            checkpoint_uri: env::var("KRISHIV_CHECKPOINT_STORAGE")
+                .unwrap_or_else(|_| String::from("file:///tmp/krishiv-checkpoints")),
             help: false,
         };
         let mut args = args.into_iter();
@@ -381,6 +471,17 @@ impl ExecutorCliConfig {
                         ));
                     }
                 }
+                "--shuffle-dir" => {
+                    let value = next_arg(&mut args, "--shuffle-dir")?;
+                    config.shuffle_dir = if value.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(value))
+                    };
+                }
+                "--checkpoint-uri" => {
+                    config.checkpoint_uri = next_arg(&mut args, "--checkpoint-uri")?;
+                }
                 "--help" | "-h" => config.help = true,
                 unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
             }
@@ -390,13 +491,24 @@ impl ExecutorCliConfig {
     }
 
     fn into_executor_config(self) -> Result<ExecutorConfig, String> {
-        ExecutorConfig::new(
+        // Pre-populate task and barrier endpoints so that the FIRST register
+        // call advertises real endpoints; the binary will rewrite them after
+        // binding listeners (which use kernel-chosen ports if 0).  This avoids
+        // the lease-bumping double-register race documented in B8.
+        let mut cfg = ExecutorConfig::new(
             self.executor_id,
             self.host,
             self.slots,
             self.coordinator_endpoint,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        if let Some(addr) = self.task_grpc_addr {
+            cfg = cfg.with_task_endpoint(format!("http://{addr}"));
+        }
+        if let Some(addr) = self.barrier_grpc_addr {
+            cfg = cfg.with_barrier_endpoint(format!("http://{addr}"));
+        }
+        Ok(cfg)
     }
 
     fn set_mode(&mut self, mode: ExecutorMode) -> Result<(), String> {
@@ -424,6 +536,9 @@ impl ExecutorCliConfig {
            --connect                    Register with the coordinator and continue heartbeating\n\
            --heartbeat-interval-secs <N> Heartbeat interval for --connect, defaults to KRISHIV_HEARTBEAT_INTERVAL_SECS or 10\n\
            --task-grpc-addr <ADDR>      Task gRPC server address (default: KRISHIV_TASK_GRPC_ADDR or 0.0.0.0:50055; use 'off' to disable)\n\
+           --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:50056; use 'off' to disable)\n\
+           --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
+           --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE or file:///tmp/krishiv-checkpoints)\n\
            -h, --help                   Show help\n"
     }
 }

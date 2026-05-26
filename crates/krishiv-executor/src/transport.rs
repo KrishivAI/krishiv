@@ -367,7 +367,12 @@ impl ExecutorRuntime {
     }
 }
 
-/// gRPC-backed `CoordinatorExecutorService` with pooled client (GAP-C3).
+/// gRPC-backed `CoordinatorExecutorService` with pooled client (GAP-C3, B7).
+///
+/// Stamps the live executor lease generation onto every outbound request so
+/// that retries after a lease bump cannot ship a stale lease.  The lease is
+/// shared via [`SharedLeaseGeneration`] with the executor heartbeat loop and
+/// with re-registration paths.
 #[derive(Clone)]
 pub struct GrpcCoordinatorService {
     pool: crate::grpc_client::CoordinatorGrpcPool,
@@ -376,6 +381,7 @@ pub struct GrpcCoordinatorService {
 impl fmt::Debug for GrpcCoordinatorService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GrpcCoordinatorService")
+            .field("endpoint", &self.pool.endpoint())
             .finish_non_exhaustive()
     }
 }
@@ -385,6 +391,30 @@ impl GrpcCoordinatorService {
         Self {
             pool: crate::grpc_client::CoordinatorGrpcPool::new(endpoint, lease_generation),
         }
+    }
+
+    /// Build a service that shares its lease atomic with the caller (executor binary).
+    pub fn with_shared_lease(
+        endpoint: impl Into<String>,
+        lease: crate::grpc_client::SharedLeaseGeneration,
+    ) -> Self {
+        Self {
+            pool: crate::grpc_client::CoordinatorGrpcPool::with_shared_lease(endpoint, lease),
+        }
+    }
+
+    /// Handle for the shared lease atomic.
+    pub fn lease_handle(&self) -> crate::grpc_client::SharedLeaseGeneration {
+        self.pool.lease_handle()
+    }
+
+    /// Invalidate the cached gRPC channel (e.g. after a stale-lease error).
+    pub async fn invalidate_channel(&self) {
+        self.pool.invalidate().await;
+    }
+
+    fn live_lease(&self) -> LeaseGeneration {
+        self.pool.lease_generation()
     }
 
     async fn client(
@@ -441,16 +471,19 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let mut client = self.client().await?;
+        // Stamp the live lease before forwarding so retries after a lease bump
+        // do not ship a stale generation (B7).
+        let mut hb = request.into_inner();
+        hb = hb.with_lease_generation(self.live_lease());
         let response = client
-            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(
-                request.into_inner(),
-            ))
+            .executor_heartbeat(wire::executor_heartbeat_request_to_wire(hb))
             .await?
             .into_inner();
-        Ok(tonic::Response::new(
-            wire::executor_heartbeat_response_from_wire(response)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
-        ))
+        let decoded = wire::executor_heartbeat_response_from_wire(response)
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        // Coordinator's authoritative lease — propagate immediately.
+        self.pool.set_lease_generation(decoded.lease_generation());
+        Ok(tonic::Response::new(decoded))
     }
 
     async fn task_status(
@@ -458,8 +491,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
         let mut client = self.client().await?;
+        let req = request.into_inner().with_lease_generation(self.live_lease());
         let response = client
-            .task_status(wire::task_status_request_to_wire(request.into_inner()))
+            .task_status(wire::task_status_request_to_wire(req))
             .await?
             .into_inner();
         Ok(tonic::Response::new(
@@ -473,8 +507,9 @@ impl CoordinatorExecutorService for GrpcCoordinatorService {
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
         let mut client = self.client().await?;
+        let req = request.into_inner();
         let response = client
-            .checkpoint_ack(wire::checkpoint_ack_request_to_wire(request.into_inner()))
+            .checkpoint_ack(wire::checkpoint_ack_request_to_wire(req))
             .await?
             .into_inner();
         Ok(tonic::Response::new(

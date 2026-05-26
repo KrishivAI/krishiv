@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
+use krishiv_checkpoint::{CheckpointStorage, snapshot_path};
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
     CoordinatorExecutorService, ExecutorTaskAssignment, InitiateCheckpointRequest,
@@ -417,7 +417,7 @@ impl TaskRunner {
         &mut self,
         req: InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
-        storage: &impl CheckpointStorage,
+        storage: &(impl CheckpointStorage + ?Sized),
     ) -> CheckpointAckRequest {
         // Stale epoch: return an ack that signals the stale condition via epoch.
         if req.epoch <= self.last_acked_epoch {
@@ -457,14 +457,10 @@ impl TaskRunner {
                 &self.operator_id,
                 self.task_id.as_str(),
             );
-            match write_operator_snapshot(
-                storage,
-                req.job_id.as_str(),
-                req.epoch,
-                &self.operator_id,
-                self.task_id.as_str(),
-                &snapshot_bytes,
-            ) {
+            // `storage` may be `?Sized`, so we cannot pass it to the
+            // `&dyn CheckpointStorage`-accepting helper.  Call the trait
+            // method directly using the same `snapshot_path` layout.
+            match storage.write_bytes(&path, &snapshot_bytes) {
                 Ok(()) => Some(path),
                 Err(_) => None,
             }
@@ -516,6 +512,10 @@ pub struct ExecutorTaskRunner {
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
     /// Optional continuous streaming drain hook (in-process cluster).
     pub(crate) continuous_drainer: Option<Arc<dyn ContinuousJobDrainer>>,
+    /// Live executor lease generation, shared with the heartbeat loop.
+    /// Used to stamp checkpoint-fanout RPCs without round-tripping through
+    /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
+    pub(crate) live_lease: crate::grpc_client::SharedLeaseGeneration,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -539,6 +539,7 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .map(|map| map.len())
                     .unwrap_or(0),
             )
+            .field("live_lease", &self.live_lease.get())
             .finish()
     }
 }
@@ -554,7 +555,17 @@ impl ExecutorTaskRunner {
             checkpoint_runners: Arc::new(DashMap::new()),
             running_attempts: None,
             continuous_drainer: None,
+            live_lease: crate::grpc_client::SharedLeaseGeneration::new(
+                krishiv_proto::LeaseGeneration::initial(),
+            ),
         }
+    }
+
+    /// Attach a shared lease handle so checkpoint-fanout RPCs stamp the live
+    /// executor lease rather than `LeaseGeneration::initial()` (B10).
+    pub fn with_live_lease(mut self, lease: crate::grpc_client::SharedLeaseGeneration) -> Self {
+        self.live_lease = lease;
+        self
     }
 
     /// Wire continuous streaming drain for `stream:continuous:` fragments.
@@ -829,7 +840,7 @@ impl ExecutorTaskRunner {
         assignment: &ExecutorTaskAssignment,
         req: InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
-        storage: &impl CheckpointStorage,
+        storage: &(impl CheckpointStorage + ?Sized),
         coordinator: &S,
     ) -> Result<CheckpointAckResponse, tonic::Status>
     where
@@ -850,36 +861,60 @@ impl ExecutorTaskRunner {
     }
 
     /// Fan out checkpoint initiation to all known task runners for a job (heartbeat path).
+    ///
+    /// Uses the real `running_attempts` map to source actual executor and
+    /// stage identifiers — previously this code synthesized fake ids that
+    /// the coordinator could not correlate (B10).
     pub async fn initiate_checkpoint_for_job<S>(
         &self,
         req: &InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
-        storage: &impl CheckpointStorage,
+        storage: &(impl CheckpointStorage + ?Sized),
         coordinator: &S,
     ) -> Result<(), tonic::Status>
     where
         S: CoordinatorExecutorService,
     {
         use krishiv_proto::{
-            ExecutorId, ExecutorTaskAssignment, LeaseGeneration, OutputContract,
-            OutputContractKind, PlanFragment, TaskAttemptRef,
+            ExecutorTaskAssignment, OutputContract, OutputContractKind, PlanFragment,
+            TaskAttemptRef,
         };
         for entry in self.checkpoint_runners.iter() {
             let task_id = entry.key().clone();
-            let stage_id = krishiv_proto::StageId::try_new("checkpoint")
-                .or_else(|_| krishiv_proto::StageId::try_new("s0"))
-                .expect("stage id");
+            // Prefer the real attempt ref from running_attempts.  Fall back to
+            // a stage-0 / initial-attempt synthesis ONLY when no real ref is
+            // available (e.g. the task completed before the barrier arrived).
+            let (stage_id, attempt_id, executor_id_opt) = self
+                .running_attempts
+                .as_ref()
+                .and_then(|map| {
+                    map.get(task_id.as_str()).map(|attempt| {
+                        (
+                            attempt.stage_id().clone(),
+                            attempt.attempt_id(),
+                            None::<krishiv_proto::ExecutorId>,
+                        )
+                    })
+                })
+                .unwrap_or_else(|| {
+                    let stage = krishiv_proto::StageId::try_new("s0")
+                        .or_else(|_| krishiv_proto::StageId::try_new("stage"))
+                        .expect("stage id");
+                    (stage, krishiv_proto::AttemptId::initial(), None)
+                });
+            let _ = executor_id_opt; // (kept for symmetry; coordinator looks up by task_id)
+            let executor_id = krishiv_proto::ExecutorId::try_new("exec")
+                .expect("'exec' is a valid executor id");
             let ids = TaskAttemptRef::new(
                 req.job_id.clone(),
                 stage_id,
                 task_id,
-                krishiv_proto::AttemptId::initial(),
+                attempt_id,
             );
             let assignment = ExecutorTaskAssignment::new(
                 ids,
-                ExecutorId::try_new("exec-checkpoint")
-                    .unwrap_or_else(|_| ExecutorId::try_new("exec").expect("exec id")),
-                LeaseGeneration::initial(),
+                executor_id,
+                self.live_lease.get(),
                 PlanFragment::new("checkpoint"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );

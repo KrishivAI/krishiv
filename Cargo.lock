@@ -4008,6 +4008,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.14.6",
+ "tracing",
 ]
 
 [[package]]
