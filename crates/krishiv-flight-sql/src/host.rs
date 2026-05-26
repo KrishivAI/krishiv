@@ -13,7 +13,7 @@ use krishiv_runtime::flight_protocol::{
     parse_sql,
 };
 use krishiv_runtime::in_process::BatchSqlTable;
-use krishiv_runtime::in_process_cluster::{plan_spec_to_local, InProcessCluster};
+use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
 use krishiv_sql::explain_sql;
 use tonic::Status;
 
@@ -48,9 +48,7 @@ impl FlightExecutionHost {
         self.apply_catalog_directives(&directives)?;
 
         if has_control_directive(&directives) {
-            return self
-                .handle_control_directives(directives, &sql)
-                .await;
+            return self.handle_control_directives(directives, &sql).await;
         }
 
         let cluster = Arc::clone(&self.cluster);
@@ -69,10 +67,7 @@ impl FlightExecutionHost {
     }
 
     fn catalog_tables(&self) -> Vec<BatchSqlTable> {
-        let catalog = self
-            .catalog
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
         catalog_to_batch_tables(&catalog)
     }
 
@@ -155,7 +150,11 @@ fn explain_batch(text: &str) -> Result<RecordBatch, Status> {
 }
 
 fn status_batch(label: &str) -> Result<RecordBatch, Status> {
-    let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "status",
+        DataType::Utf8,
+        false,
+    )]));
     let col = Arc::new(StringArray::from(vec![label])) as ArrayRef;
     RecordBatch::try_new(schema, vec![col]).map_err(|e| Status::internal(e.to_string()))
 }

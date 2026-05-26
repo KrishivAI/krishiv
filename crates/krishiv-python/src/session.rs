@@ -325,11 +325,7 @@ impl PySession {
     }
 
     /// Submit a continuous streaming job. Returns the job id handle.
-    pub fn submit_stream_job(
-        &self,
-        name: String,
-        stream: &PyWindowedStream,
-    ) -> PyResult<String> {
+    pub fn submit_stream_job(&self, name: String, stream: &PyWindowedStream) -> PyResult<String> {
         let spec = spec_from_pipeline(&stream.pipeline)?;
         self.inner
             .submit_stream_job(name, spec)
@@ -338,8 +334,10 @@ impl PySession {
 
     /// Push input batches to a continuous streaming job.
     pub fn push_stream_job_input(&self, job_id: String, batches: Vec<PyBatch>) -> PyResult<()> {
-        let record_batches: Vec<arrow::record_batch::RecordBatch> =
-            batches.into_iter().map(|b| b.record_batch().clone()).collect();
+        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
+            .into_iter()
+            .map(|b| b.record_batch().clone())
+            .collect();
         self.inner
             .push_stream_job_input(&job_id, record_batches)
             .map_err(map_krishiv_error)
@@ -349,16 +347,14 @@ impl PySession {
     pub fn poll_stream_job(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<PyBatch>> {
         let inner = self.inner.clone();
         py.detach(move || {
-            block_on_async(async move {
-                inner.poll_stream_job(&job_id).await
-            })
-            .map(|batches| {
-                batches
-                    .into_iter()
-                    .map(PyBatch::from_record_batch)
-                    .collect()
-            })
-            .map_err(map_krishiv_error)
+            block_on_async(async move { inner.poll_stream_job(&job_id).await })
+                .map(|batches| {
+                    batches
+                        .into_iter()
+                        .map(PyBatch::from_record_batch)
+                        .collect()
+                })
+                .map_err(map_krishiv_error)
         })
     }
 }

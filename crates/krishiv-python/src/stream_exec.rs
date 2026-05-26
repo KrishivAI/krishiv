@@ -79,11 +79,16 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             gap_ms: window.gap_ms.unwrap_or(window.size_ms),
         },
     };
-    let key_column = pipeline.key_columns.first().cloned().ok_or_else(|| {
-        krishiv_api::KrishivError::unsupported(
-            "streaming execution requires key_by() before window collect",
-        )
-    }).map_err(map_krishiv_error)?;
+    let key_column = pipeline
+        .key_columns
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            krishiv_api::KrishivError::unsupported(
+                "streaming execution requires key_by() before window collect",
+            )
+        })
+        .map_err(map_krishiv_error)?;
     let state_ttl_ms = pipeline.session.state_ttl().map(|c| c.ttl_ms());
     Ok(LocalWindowExecutionSpec {
         key_column,

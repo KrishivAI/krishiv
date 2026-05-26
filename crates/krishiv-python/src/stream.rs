@@ -57,10 +57,8 @@ impl PyStream {
         max_lateness_ms: u64,
         batches: Vec<crate::batch::PyBatch>,
     ) -> PyResult<Self> {
-        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
-            .iter()
-            .map(|b| b.record_batch().clone())
-            .collect();
+        let record_batches: Vec<arrow::record_batch::RecordBatch> =
+            batches.iter().map(|b| b.record_batch().clone()).collect();
         session
             .register_memory_stream(&name, record_batches)
             .map_err(crate::errors::map_krishiv_error)?;

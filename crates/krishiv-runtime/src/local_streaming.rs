@@ -1,11 +1,11 @@
 //! Bounded window execution (delegates to unified `krishiv-exec` operator runtime).
 
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::{execute_bounded_window, AggExpr, AggFunction};
+use krishiv_exec::{AggExpr, AggFunction, execute_bounded_window};
 use krishiv_plan::window::WindowExecutionSpec;
 
-use crate::in_process_cluster::local_spec_to_plan_spec;
 use crate::RuntimeError;
+use crate::in_process_cluster::local_spec_to_plan_spec;
 
 /// Window operator kind for local execution.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -77,17 +77,11 @@ fn advance_effective_watermark(
         return Ok(single.current_watermark_ms());
     }
     let source_col = spec.source_id_column.as_deref().ok_or_else(|| {
-        ExecError::InvalidWindowConfig(
-            "multi-source watermark requires source_id_column".into(),
-        )
+        ExecError::InvalidWindowConfig("multi-source watermark requires source_id_column".into())
     })?;
     for (source_id, lag_ms) in &spec.source_watermark_lags {
-        let max_ts = max_event_time_ms_for_source(
-            batch,
-            &spec.event_time_column,
-            source_col,
-            source_id,
-        )?;
+        let max_ts =
+            max_event_time_ms_for_source(batch, &spec.event_time_column, source_col, source_id)?;
         if max_ts > i64::MIN {
             let wm = max_ts.saturating_sub(*lag_ms as i64);
             multi.update(source_id, wm);
@@ -135,7 +129,8 @@ pub fn execute_bounded_window(
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
     let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
-    let mut multi_watermark = MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
+    let mut multi_watermark =
+        MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
     let mut output = Vec::new();
 
     match spec.window_kind {
@@ -153,13 +148,9 @@ pub fn execute_bounded_window(
             } else {
                 Box::new(redb)
             };
-            let mut op = StateBackedTumblingWindowOperator::new(
-                tw_spec,
-                state,
-                "window-exec",
-                "tumbling",
-            )
-            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let mut op =
+                StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             for batch in &input_batches {
                 multi_watermark.apply_idle_source_policy();
                 let wm = advance_effective_watermark(
@@ -231,9 +222,7 @@ pub fn local_spec_to_window_execution(
     let (kind, slide_ms, session_gap_ms) = match window_kind {
         LocalWindowKindBridge::Tumbling => (WindowKind::Tumbling, None, None),
         LocalWindowKindBridge::Sliding { slide_ms } => (WindowKind::Sliding, Some(slide_ms), None),
-        LocalWindowKindBridge::Session { gap_ms } => {
-            (WindowKind::Session, None, Some(gap_ms))
-        }
+        LocalWindowKindBridge::Session { gap_ms } => (WindowKind::Session, None, Some(gap_ms)),
     };
     WindowExecutionSpec {
         key_column,
@@ -312,10 +301,7 @@ mod tests {
             session_gap_ms: None,
             agg_exprs: WindowExecutionSpec::default_count_agg(),
             state_ttl_ms: None,
-            source_watermark_lags: HashMap::from([
-                ("src-a".into(), 0),
-                ("src-b".into(), 0),
-            ]),
+            source_watermark_lags: HashMap::from([("src-a".into(), 0), ("src-b".into(), 0)]),
             source_id_column: Some("source_id".into()),
         };
         let schema = Arc::new(Schema::new(vec![

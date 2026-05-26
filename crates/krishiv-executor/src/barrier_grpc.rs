@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use krishiv_proto::wire::v1::{
-    barrier_service_server::{BarrierService, BarrierServiceServer},
     BarrierAck, CheckpointBarrier, StateHandle,
+    barrier_service_server::{BarrierService, BarrierServiceServer},
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -93,25 +93,19 @@ pub async fn send_barrier_and_wait_ack(
     barrier: CheckpointBarrier,
     timeout: Duration,
 ) -> Result<BarrierAck, tonic::Status> {
-    
     let (tx, rx) = mpsc::channel(4);
-    tx.send(barrier).await.map_err(|e| tonic::Status::internal(e.to_string()))?;
+    tx.send(barrier)
+        .await
+        .map_err(|e| tonic::Status::internal(e.to_string()))?;
     drop(tx);
     let mut stream = client
         .barrier_stream(ReceiverStream::new(rx))
         .await?
         .into_inner();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(tonic::Status::deadline_exceeded("barrier ack timeout"));
-        }
-        match tokio::time::timeout(remaining, tokio_stream::StreamExt::next(&mut stream)).await {
-            Ok(Some(Ok(ack))) => return Ok(ack),
-            Ok(Some(Err(status))) => return Err(status),
-            Ok(None) => return Err(tonic::Status::internal("barrier stream closed")),
-            Err(_) => return Err(tonic::Status::deadline_exceeded("barrier ack timeout")),
-        }
+    match tokio::time::timeout(timeout, tokio_stream::StreamExt::next(&mut stream)).await {
+        Ok(Some(Ok(ack))) => Ok(ack),
+        Ok(Some(Err(status))) => Err(status),
+        Ok(None) => Err(tonic::Status::internal("barrier stream closed")),
+        Err(_) => Err(tonic::Status::deadline_exceeded("barrier ack timeout")),
     }
 }

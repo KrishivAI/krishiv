@@ -30,7 +30,11 @@ impl ContinuousStreamRegistry {
     }
 
     /// Register a continuous job with its window spec.
-    pub fn register_job(&self, job_id: impl Into<String>, spec: WindowExecutionSpec) -> RuntimeResult<()> {
+    pub fn register_job(
+        &self,
+        job_id: impl Into<String>,
+        spec: WindowExecutionSpec,
+    ) -> RuntimeResult<()> {
         let executor = ContinuousWindowExecutor::new(spec.clone())
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let mut jobs = self
@@ -50,18 +54,16 @@ impl ContinuousStreamRegistry {
     }
 
     /// Enqueue input batches for a continuous job.
-    pub fn push_input(
-        &self,
-        job_id: &str,
-        batches: Vec<RecordBatch>,
-    ) -> RuntimeResult<()> {
+    pub fn push_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> RuntimeResult<()> {
         let mut jobs = self
             .jobs
             .lock()
             .map_err(|_| RuntimeError::transport("continuous registry lock poisoned"))?;
-        let entry = jobs.get_mut(job_id).ok_or_else(|| RuntimeError::InvalidState {
-            message: format!("unknown continuous stream job '{job_id}'"),
-        })?;
+        let entry = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| RuntimeError::InvalidState {
+                message: format!("unknown continuous stream job '{job_id}'"),
+            })?;
         entry.pending_input.extend(batches);
         Ok(())
     }
@@ -72,9 +74,11 @@ impl ContinuousStreamRegistry {
             .jobs
             .lock()
             .map_err(|_| RuntimeError::transport("continuous registry lock poisoned"))?;
-        let entry = jobs.get_mut(job_id).ok_or_else(|| RuntimeError::InvalidState {
-            message: format!("unknown continuous stream job '{job_id}'"),
-        })?;
+        let entry = jobs
+            .get_mut(job_id)
+            .ok_or_else(|| RuntimeError::InvalidState {
+                message: format!("unknown continuous stream job '{job_id}'"),
+            })?;
         let input: Vec<RecordBatch> = entry.pending_input.drain(..).collect();
         if input.is_empty() {
             let output: Vec<RecordBatch> = entry.pending_output.drain(..).collect();
@@ -135,7 +139,10 @@ mod tests {
     fn continuous_registry_drains_input() {
         let registry = ContinuousStreamRegistry::new();
         registry
-            .register_job("job-1", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job(
+                "job-1",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
             .expect("register");
         registry
             .push_input("job-1", vec![batch(1_000)])

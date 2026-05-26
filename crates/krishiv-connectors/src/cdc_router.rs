@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-
 use krishiv_lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
 
 use crate::ConnectorError;
@@ -113,8 +112,8 @@ impl Default for CdcRouter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};

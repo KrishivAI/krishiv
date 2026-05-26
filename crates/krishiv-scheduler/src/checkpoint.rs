@@ -353,7 +353,7 @@ impl CheckpointCoordinator {
 mod tests {
     use std::sync::Arc;
 
-    use krishiv_checkpoint::{CheckpointError, LocalFsCheckpointStorage, write_operator_snapshot};
+    use krishiv_checkpoint::{LocalFsCheckpointStorage, write_operator_snapshot};
     use krishiv_proto::{
         CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, TaskId,
     };

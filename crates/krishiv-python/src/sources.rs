@@ -106,8 +106,8 @@ fn read_iceberg_impl(
     table_name: String,
     schema: Option<&Bound<'_, PyType>>,
 ) -> PyResult<PyStream> {
-    use std::sync::Arc;
     use crate::schema::PySchema;
+    use std::sync::Arc;
 
     use krishiv_lakehouse::{
         IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, SchemaField,

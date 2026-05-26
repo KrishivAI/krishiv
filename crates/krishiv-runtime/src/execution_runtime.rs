@@ -238,9 +238,7 @@ impl RemoteExecutionRuntime {
             RuntimeError::unsupported("plan acceptance requires a local cluster fallback")
         })?;
         let runtime = match self.session_mode {
-            RuntimeMode::SingleNode => {
-                InProcessExecutionRuntime::single_node(Arc::clone(cluster))
-            }
+            RuntimeMode::SingleNode => InProcessExecutionRuntime::single_node(Arc::clone(cluster)),
             RuntimeMode::Embedded | RuntimeMode::Distributed => {
                 InProcessExecutionRuntime::embedded(Arc::clone(cluster))
             }
@@ -302,7 +300,8 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
         if self.local_fallback.is_some() {
-            return krishiv_sql::explain_sql(query).map_err(|e| RuntimeError::transport(e.to_string()));
+            return krishiv_sql::explain_sql(query)
+                .map_err(|e| RuntimeError::transport(e.to_string()));
         }
         use krishiv_async_util::block_on;
         block_on(crate::flight_client::execute_remote_explain(
@@ -382,8 +381,8 @@ pub fn build_execution_runtime(
             }
         }
         RuntimeMode::Distributed => {
-            let url = coordinator_flight_url
-                .unwrap_or_else(|| String::from("http://127.0.0.1:50051"));
+            let url =
+                coordinator_flight_url.unwrap_or_else(|| String::from("http://127.0.0.1:50051"));
             let mut remote = RemoteExecutionRuntime::new(url, RuntimeMode::Distributed);
             if !remote_execution {
                 remote = remote.with_local_fallback(Arc::clone(&cluster));

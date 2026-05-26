@@ -46,10 +46,7 @@ impl StateBackedTumblingWindowOperator {
     }
 
     /// Flush closed windows and persist updated state.
-    pub fn flush_closed_windows(
-        &mut self,
-        watermark_ms: i64,
-    ) -> ExecResult<Vec<RecordBatch>> {
+    pub fn flush_closed_windows(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
         let out = self.inner.flush_closed_windows(watermark_ms)?;
         self.inner
             .persist_to_state(self.state.as_mut(), &self.namespace)
