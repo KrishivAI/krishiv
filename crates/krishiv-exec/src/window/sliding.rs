@@ -79,10 +79,8 @@ impl SlidingWindowOperator {
                 "avg_sums": agg.avg_sums,
                 "avg_counts": agg.avg_counts,
             });
-            let bytes = serde_json::to_vec(&payload).map_err(|e| {
-                StateError::CorruptEntry {
-                    message: e.to_string(),
-                }
+            let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
+                message: e.to_string(),
             })?;
             let mut state_key = Vec::from(b"sw:");
             state_key.extend_from_slice(key.as_bytes());
@@ -113,11 +111,10 @@ impl SlidingWindowOperator {
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
                 continue;
             };
-            let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
-                StateError::CorruptEntry {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             let values: Vec<i64> = parsed["values"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())

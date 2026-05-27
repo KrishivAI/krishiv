@@ -603,11 +603,8 @@ impl OptimizerRule for PredicatePushdownRule {
 
     fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
         let nodes = plan.nodes().to_vec();
-        let id_to_idx: std::collections::HashMap<&str, usize> = nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.id(), i))
-            .collect();
+        let id_to_idx: std::collections::HashMap<&str, usize> =
+            nodes.iter().enumerate().map(|(i, n)| (n.id(), i)).collect();
 
         // Collect pushdown candidates: filter nodes whose input is a scan.
         struct Pushdown {
@@ -659,7 +656,9 @@ impl OptimizerRule for PredicatePushdownRule {
             for conjunct in &conjuncts {
                 let cols = extract_column_refs(conjunct);
                 let can_push = !cols.is_empty()
-                    && cols.iter().all(|c| column_belongs_to_scan(c, &scan_columns));
+                    && cols
+                        .iter()
+                        .all(|c| column_belongs_to_scan(c, &scan_columns));
 
                 if can_push {
                     pushable.push(conjunct.to_string());
@@ -690,20 +689,17 @@ impl OptimizerRule for PredicatePushdownRule {
             if let Some(NodeOp::Scan { table, filters }) = new_nodes[pd.scan_idx].op() {
                 let mut new_filters = filters.clone();
                 new_filters.extend(pd.pushable.iter().cloned());
-                new_nodes[pd.scan_idx] = new_nodes[pd.scan_idx]
-                    .clone()
-                    .with_op(NodeOp::Scan {
-                        table: table.clone(),
-                        filters: new_filters,
-                    });
+                new_nodes[pd.scan_idx] = new_nodes[pd.scan_idx].clone().with_op(NodeOp::Scan {
+                    table: table.clone(),
+                    filters: new_filters,
+                });
             }
 
             if pd.remaining.is_empty() {
                 to_remove.push(pd.filter_idx);
             } else {
-                new_nodes[pd.filter_idx] = new_nodes[pd.filter_idx]
-                    .clone()
-                    .with_op(NodeOp::Filter {
+                new_nodes[pd.filter_idx] =
+                    new_nodes[pd.filter_idx].clone().with_op(NodeOp::Filter {
                         predicate: pd.remaining.join(" AND "),
                     });
             }
@@ -747,10 +743,10 @@ impl OptimizerRule for PredicatePushdownRule {
 /// that contain at least one ASCII letter and are not SQL reserved words.
 fn extract_column_refs(predicate: &str) -> Vec<String> {
     const SQL_KEYWORDS: &[&str] = &[
-        "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "WHERE", "SELECT", "FROM",
-        "AS", "ON", "BETWEEN", "LIKE", "EXISTS", "HAVING", "GROUP", "ORDER", "BY", "ASC",
-        "DESC", "LIMIT", "OFFSET", "DISTINCT", "ALL", "ANY", "SOME", "CASE", "WHEN", "THEN",
-        "ELSE", "END", "CAST",
+        "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "WHERE", "SELECT", "FROM", "AS",
+        "ON", "BETWEEN", "LIKE", "EXISTS", "HAVING", "GROUP", "ORDER", "BY", "ASC", "DESC",
+        "LIMIT", "OFFSET", "DISTINCT", "ALL", "ANY", "SOME", "CASE", "WHEN", "THEN", "ELSE", "END",
+        "CAST",
     ];
 
     let mut refs: Vec<String> = predicate
@@ -1382,7 +1378,11 @@ mod tests {
     #[test]
     fn projection_pruning_preserves_order() {
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema("s", "t", &[("a", FieldType::Int32), ("b", FieldType::Utf8)]))
+            .with_node(scan_with_schema(
+                "s",
+                "t",
+                &[("a", FieldType::Int32), ("b", FieldType::Utf8)],
+            ))
             .with_node(project_node("p", &["s"], &["b", "a", "b", "a"]));
 
         let result = ProjectionPruningRule.apply(&plan).unwrap();
@@ -1399,7 +1399,11 @@ mod tests {
     #[test]
     fn projection_pruning_noop_when_no_duplicates() {
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema("s", "t", &[("a", FieldType::Int32), ("b", FieldType::Utf8)]))
+            .with_node(scan_with_schema(
+                "s",
+                "t",
+                &[("a", FieldType::Int32), ("b", FieldType::Utf8)],
+            ))
             .with_node(project_node("p", &["s"], &["a", "b"]));
 
         let result = ProjectionPruningRule.apply(&plan);
@@ -1468,11 +1472,7 @@ mod tests {
     #[test]
     fn predicate_pushdown_noop_when_predicate_not_scan_columns() {
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema(
-                "s",
-                "orders",
-                &[("id", FieldType::Int64)],
-            ))
+            .with_node(scan_with_schema("s", "orders", &[("id", FieldType::Int64)]))
             .with_node(filter_node("f", &["s"], "status = 'active'"));
 
         let result = PredicatePushdownRule.apply(&plan);

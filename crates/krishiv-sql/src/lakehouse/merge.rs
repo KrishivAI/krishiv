@@ -15,9 +15,8 @@ use crate::SqlError;
 use crate::SqlResult;
 
 /// Match the ON-clause equality pattern and extract the column name.
-static KEY_COL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:(?:\w+|`[^`]+`)\.)?(\w+)\s*=").unwrap()
-});
+static KEY_COL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:(?:\w+|`[^`]+`)\.)?(\w+)\s*=").unwrap());
 
 static MERGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -62,17 +61,24 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
     let target = caps[1].trim_matches('`').to_string();
     let source_table = caps[2].trim_matches('`').to_string();
     let on_clause = caps[3].trim();
-    let has_matched = caps.get(4).and_then(|m| {
-        let s = m.as_str().trim();
-        if s.is_empty() { None } else { Some(s) }
-    }).is_some();
-    let has_not_matched = caps.get(5).and_then(|m| {
-        let s = m.as_str().trim();
-        if s.is_empty() { None } else { Some(s) }
-    }).is_some();
+    let has_matched = caps
+        .get(4)
+        .and_then(|m| {
+            let s = m.as_str().trim();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .is_some();
+    let has_not_matched = caps
+        .get(5)
+        .and_then(|m| {
+            let s = m.as_str().trim();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .is_some();
     if !has_matched && !has_not_matched {
         return Err(SqlError::Unsupported {
-            feature: "MERGE INTO requires at least one WHEN MATCHED or WHEN NOT MATCHED clause".into(),
+            feature: "MERGE INTO requires at least one WHEN MATCHED or WHEN NOT MATCHED clause"
+                .into(),
         });
     }
 
@@ -81,7 +87,9 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().trim_matches('`'))
         .ok_or_else(|| SqlError::Unsupported {
-            feature: "MERGE ON clause must contain a column equality (e.g. target.col = source.col)".into(),
+            feature:
+                "MERGE ON clause must contain a column equality (e.g. target.col = source.col)"
+                    .into(),
         })?;
 
     let source_df = ctx
@@ -189,18 +197,18 @@ async fn merge_iceberg_memory(
             0
         } else {
             let existing_schema = existing[0].schema();
-            let tb = concat_batches(&existing_schema, &existing)
-                .map_err(|e| SqlError::DataFusion {
+            let tb =
+                concat_batches(&existing_schema, &existing).map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
                 })?;
-            let target_key_idx = tb
-                .schema()
-                .index_of(merge_key)
-                .map_err(|_| SqlError::Unsupported {
-                    feature: format!(
-                        "merge key column '{merge_key}' not found in target schema"
-                    ),
-                })?;
+            let target_key_idx =
+                tb.schema()
+                    .index_of(merge_key)
+                    .map_err(|_| SqlError::Unsupported {
+                        feature: format!(
+                            "merge key column '{merge_key}' not found in target schema"
+                        ),
+                    })?;
             let target_keys: Vec<String> = {
                 let f =
                     ArrayFormatter::try_new(tb.column(target_key_idx), &fmt_opts).map_err(|e| {
@@ -208,9 +216,7 @@ async fn merge_iceberg_memory(
                             message: e.to_string(),
                         }
                     })?;
-                (0..tb.num_rows())
-                    .map(|i| f.value(i).to_string())
-                    .collect()
+                (0..tb.num_rows()).map(|i| f.value(i).to_string()).collect()
             };
             target_keys
                 .iter()

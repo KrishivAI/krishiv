@@ -17,7 +17,8 @@ pub struct AsOfTableRef {
 /// Strip `AS OF` clauses and return rewritten SQL plus qualifiers.
 pub fn preprocess_as_of_sql(sql: &str) -> Result<(String, Vec<AsOfTableRef>), String> {
     let dialect = DatabricksDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql).map_err(|e| format!("SQL parse error: {e}"))?;
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| format!("SQL parse error: {e}"))?;
     if stmts.len() != 1 {
         return Err("expected a single SQL statement".into());
     }
@@ -162,10 +163,9 @@ mod tests {
 
     #[test]
     fn handles_subquery_as_of() {
-        let (sql, refs) = preprocess_as_of_sql(
-            "SELECT * FROM (SELECT * FROM inner_tbl VERSION AS OF 42) AS sub",
-        )
-        .unwrap();
+        let (sql, refs) =
+            preprocess_as_of_sql("SELECT * FROM (SELECT * FROM inner_tbl VERSION AS OF 42) AS sub")
+                .unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].spec, AsOfSpec::Version(42));
         assert!(!sql.contains("VERSION AS OF"));
@@ -184,10 +184,8 @@ mod tests {
 
     #[test]
     fn ignores_string_literals() {
-        let (sql, refs) = preprocess_as_of_sql(
-            "SELECT * FROM t WHERE name = 'VERSION AS OF 123'",
-        )
-        .unwrap();
+        let (sql, refs) =
+            preprocess_as_of_sql("SELECT * FROM t WHERE name = 'VERSION AS OF 123'").unwrap();
         assert_eq!(refs.len(), 0);
         assert!(sql.contains("VERSION AS OF 123"));
     }

@@ -3,11 +3,9 @@
 
 use std::sync::Arc;
 
-use apache_avro::types::Value;
 use apache_avro::Reader;
-use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
-};
+use apache_avro::types::Value;
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -255,8 +253,9 @@ fn avro_records_to_batches(
         ));
     }
 
-    let mut columns: Vec<Vec<&Value>> =
-        (0..num_fields).map(|_| Vec::with_capacity(records.len())).collect();
+    let mut columns: Vec<Vec<&Value>> = (0..num_fields)
+        .map(|_| Vec::with_capacity(records.len()))
+        .collect();
 
     let name_to_idx: std::collections::HashMap<&str, usize> = arrow_schema
         .fields()

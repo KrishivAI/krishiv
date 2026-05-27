@@ -75,10 +75,8 @@ impl SessionWindowOperator {
                 "avg_sums": session.agg.avg_sums,
                 "avg_counts": session.agg.avg_counts,
             });
-            let bytes = serde_json::to_vec(&payload).map_err(|e| {
-                StateError::CorruptEntry {
-                    message: e.to_string(),
-                }
+            let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
+                message: e.to_string(),
             })?;
             let mut state_key = Vec::from(b"ses:");
             state_key.extend_from_slice(key.as_bytes());
@@ -111,11 +109,10 @@ impl SessionWindowOperator {
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
                 continue;
             };
-            let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
-                StateError::CorruptEntry {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             let session_start_ms = parsed["session_start_ms"].as_i64().unwrap_or(0);
             let last_event_time_ms = parsed["last_event_time_ms"].as_i64().unwrap_or(0);
             let values: Vec<i64> = parsed["values"]

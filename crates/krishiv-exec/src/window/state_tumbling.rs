@@ -71,10 +71,11 @@ impl StateBackedSlidingWindowOperator {
         state_name: impl Into<String>,
     ) -> StateResult<Self> {
         let namespace = Namespace::new(operator_id, state_name);
-        let mut inner = SlidingWindowOperator::new(spec)
-            .map_err(|e| krishiv_state::StateError::CorruptEntry {
+        let mut inner = SlidingWindowOperator::new(spec).map_err(|e| {
+            krishiv_state::StateError::CorruptEntry {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
         inner.restore_from_state(state.as_ref(), &namespace)?;
         Ok(Self {
             inner,

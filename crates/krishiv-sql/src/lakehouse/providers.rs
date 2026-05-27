@@ -105,8 +105,7 @@ impl TableProvider for DeltaScanProvider {
             batches = batches
                 .into_iter()
                 .map(|batch| {
-                    let columns: Vec<_> =
-                        proj.iter().map(|&i| batch.column(i).clone()).collect();
+                    let columns: Vec<_> = proj.iter().map(|&i| batch.column(i).clone()).collect();
                     RecordBatch::try_new(out.clone(), columns)
                         .map_err(|e| DataFusionError::External(e.to_string().into()))
                 })
@@ -187,8 +186,7 @@ impl TableProvider for HudiScanProvider {
             batches = batches
                 .into_iter()
                 .map(|batch| {
-                    let columns: Vec<_> =
-                        proj.iter().map(|&i| batch.column(i).clone()).collect();
+                    let columns: Vec<_> = proj.iter().map(|&i| batch.column(i).clone()).collect();
                     RecordBatch::try_new(out.clone(), columns)
                         .map_err(|e| DataFusionError::External(e.to_string().into()))
                 })
