@@ -31,29 +31,41 @@ impl StateBackedTumblingWindowOperator {
         })
     }
 
+    /// Process one batch.
+    ///
+    /// State is NOT persisted after every batch — use `flush_closed_windows` or
+    /// `checkpoint` to persist at checkpoint boundaries.  Persisting on every
+    /// batch was O(batches × windows) backend writes and caused I/O saturation
+    /// on high-throughput pipelines.
     pub fn process_batch(
         &mut self,
         batch: &RecordBatch,
         new_watermark_ms: i64,
     ) -> ExecResult<Vec<RecordBatch>> {
-        let out = self.inner.process_batch(batch, new_watermark_ms)?;
-        self.inner
-            .persist_to_state(self.state.as_mut(), &self.namespace)
-            .map_err(|e| crate::ExecError::Arrow(e.to_string()))?;
-        Ok(out)
+        self.inner.process_batch(batch, new_watermark_ms)
     }
 
     pub fn open_window_count(&self) -> usize {
         self.inner.open_window_count()
     }
 
-    /// Flush closed windows and persist updated state.
+    /// Flush closed windows and persist the updated accumulator state.
     pub fn flush_closed_windows(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
         let out = self.inner.flush_closed_windows(watermark_ms)?;
         self.inner
             .persist_to_state(self.state.as_mut(), &self.namespace)
             .map_err(|e| ExecError::Arrow(e.to_string()))?;
         Ok(out)
+    }
+
+    /// Persist the current accumulator state to the backing store.
+    ///
+    /// Call this at checkpoint boundaries (e.g. when a barrier is received)
+    /// rather than after every batch.
+    pub fn checkpoint(&mut self) -> ExecResult<()> {
+        self.inner
+            .persist_to_state(self.state.as_mut(), &self.namespace)
+            .map_err(|e| ExecError::Arrow(e.to_string()))
     }
 }
 
@@ -84,16 +96,14 @@ impl StateBackedSlidingWindowOperator {
         })
     }
 
+    /// Process one batch.  State is persisted only in `flush_closed_windows`
+    /// or `checkpoint`, not after every batch.
     pub fn process_batch(
         &mut self,
         batch: &RecordBatch,
         new_watermark_ms: i64,
     ) -> ExecResult<Vec<RecordBatch>> {
-        let out = self.inner.process_batch(batch, new_watermark_ms)?;
-        self.inner
-            .persist_to_state(self.state.as_mut(), &self.namespace)
-            .map_err(|e| ExecError::Arrow(e.to_string()))?;
-        Ok(out)
+        self.inner.process_batch(batch, new_watermark_ms)
     }
 
     pub fn open_window_count(&self) -> usize {
@@ -106,6 +116,13 @@ impl StateBackedSlidingWindowOperator {
             .persist_to_state(self.state.as_mut(), &self.namespace)
             .map_err(|e| ExecError::Arrow(e.to_string()))?;
         Ok(out)
+    }
+
+    /// Persist the current accumulator state at a checkpoint boundary.
+    pub fn checkpoint(&mut self) -> ExecResult<()> {
+        self.inner
+            .persist_to_state(self.state.as_mut(), &self.namespace)
+            .map_err(|e| ExecError::Arrow(e.to_string()))
     }
 }
 
@@ -132,16 +149,14 @@ impl StateBackedSessionWindowOperator {
         })
     }
 
+    /// Process one batch.  State is persisted only in `flush_closed_sessions`
+    /// or `checkpoint`, not after every batch.
     pub fn process_batch(
         &mut self,
         batch: &RecordBatch,
         new_watermark_ms: i64,
     ) -> ExecResult<Vec<RecordBatch>> {
-        let out = self.inner.process_batch(batch, new_watermark_ms)?;
-        self.inner
-            .persist_to_state(self.state.as_mut(), &self.namespace)
-            .map_err(|e| ExecError::Arrow(e.to_string()))?;
-        Ok(out)
+        self.inner.process_batch(batch, new_watermark_ms)
     }
 
     pub fn open_session_count(&self) -> usize {
@@ -154,5 +169,12 @@ impl StateBackedSessionWindowOperator {
             .persist_to_state(self.state.as_mut(), &self.namespace)
             .map_err(|e| ExecError::Arrow(e.to_string()))?;
         Ok(out)
+    }
+
+    /// Persist the current session state at a checkpoint boundary.
+    pub fn checkpoint(&mut self) -> ExecResult<()> {
+        self.inner
+            .persist_to_state(self.state.as_mut(), &self.namespace)
+            .map_err(|e| ExecError::Arrow(e.to_string()))
     }
 }

@@ -57,11 +57,22 @@ impl SessionWindowOperator {
     }
 
     /// Persist open sessions to `StateBackend`.
+    ///
+    /// Clears the namespace first so that stale entries for already-closed
+    /// sessions are removed and cannot be re-opened on checkpoint restore.
     pub fn persist_to_state(
         &self,
         backend: &mut dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
+        // Remove all previously persisted entries so closed sessions don't
+        // survive into the next checkpoint snapshot.
+        backend.clear_namespace(namespace)?;
+
+        if self.sessions.is_empty() {
+            return Ok(());
+        }
+
         let op_id = namespace.operator_id();
         let name = namespace.state_name();
         let mut state_keys = Vec::with_capacity(self.sessions.len());
@@ -87,14 +98,12 @@ impl SessionWindowOperator {
             state_keys.push(state_key);
             values.push(bytes);
         }
-        if !state_keys.is_empty() {
-            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
-                .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
-                .collect();
-            backend.put_batch(&batch_entries)?;
-        }
+        let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+            .collect();
+        backend.put_batch(&batch_entries)?;
         Ok(())
     }
 
@@ -220,10 +229,18 @@ impl SessionWindowOperator {
     /// Flush sessions whose inactivity gap has passed the watermark.
     pub fn flush_closed_sessions(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
         let gap = self.spec.session_gap_ms as i64;
+        // Use saturating_add to prevent i64 overflow when last_event_time_ms is
+        // near i64::MAX (e.g. from a malformed event).  An overflow would wrap
+        // to a negative value, making every session appear closed spuriously.
         let closed: Vec<String> = self
             .sessions
             .keys()
-            .filter(|k| self.sessions[*k].last_event_time_ms + gap <= watermark_ms)
+            .filter(|k| {
+                self.sessions[*k]
+                    .last_event_time_ms
+                    .saturating_add(gap)
+                    <= watermark_ms
+            })
             .cloned()
             .collect();
         if closed.is_empty() {

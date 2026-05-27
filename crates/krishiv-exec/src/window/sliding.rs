@@ -63,11 +63,22 @@ impl SlidingWindowOperator {
     }
 
     /// Persist open sliding window accumulators to `StateBackend`.
+    ///
+    /// Clears the namespace first so that stale entries for already-flushed
+    /// windows are removed and cannot be re-opened on checkpoint restore.
     pub fn persist_to_state(
         &self,
         backend: &mut dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
+        // Remove all previously persisted entries so closed windows don't
+        // survive into the next checkpoint snapshot.
+        backend.clear_namespace(namespace)?;
+
+        if self.accumulators.is_empty() {
+            return Ok(());
+        }
+
         let op_id = namespace.operator_id();
         let name = namespace.state_name();
         let mut state_keys = Vec::with_capacity(self.accumulators.len());
@@ -89,14 +100,12 @@ impl SlidingWindowOperator {
             state_keys.push(state_key);
             values.push(bytes);
         }
-        if !state_keys.is_empty() {
-            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
-                .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
-                .collect();
-            backend.put_batch(&batch_entries)?;
-        }
+        let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+            .collect();
+        backend.put_batch(&batch_entries)?;
         Ok(())
     }
 

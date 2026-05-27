@@ -189,19 +189,23 @@ pub(crate) async fn execute_streaming_fragment(
         .map_err(|e| ExecutorError::InvalidAssignment { message: e })?;
     let mut plan_spec = parsed_to_plan_spec(parsed);
 
-    // stream-kafka batches use normalized column names key/ts/val
-    plan_spec.key_column = String::from("key");
-    plan_spec.event_time_column = String::from("ts");
-    if plan_spec
-        .agg_exprs
-        .first()
-        .is_some_and(|a| a.kind == WindowAggKind::Sum)
-        && plan_spec.agg_exprs[0].input_column.is_empty()
-    {
-        plan_spec.agg_exprs[0].input_column = String::from("val");
-    }
-
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
+
+    // Only override column names for stream-kafka partitions.  Overriding
+    // unconditionally would clobber user-specified column names for non-kafka
+    // streaming fragments (e.g. in-process or file-backed streams).
+    if !batches.is_empty() {
+        plan_spec.key_column = String::from("key");
+        plan_spec.event_time_column = String::from("ts");
+        if plan_spec
+            .agg_exprs
+            .first()
+            .is_some_and(|a| a.kind == WindowAggKind::Sum)
+            && plan_spec.agg_exprs[0].input_column.is_empty()
+        {
+            plan_spec.agg_exprs[0].input_column = String::from("val");
+        }
+    }
     let collected_batches =
         execute_bounded_window(batches, &plan_spec).map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),

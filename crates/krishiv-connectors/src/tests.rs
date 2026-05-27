@@ -665,7 +665,9 @@ mod quality_tests {
             DataQualityRule::NotNull { column: "v".into() },
             QualityAction::Reject,
         );
-        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path()).with_quality_config(config);
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path())
+            .with_quality_config(config)
+            .unwrap();
 
         let handle = sink.prepare(1, &batch).unwrap();
         sink.commit(handle).unwrap();
@@ -705,7 +707,9 @@ mod quality_tests {
             DataQualityRule::NotNull { column: "v".into() },
             QualityAction::Fail,
         );
-        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path()).with_quality_config(config);
+        let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path())
+            .with_quality_config(config)
+            .unwrap();
 
         let result = sink.prepare(1, &batch);
         assert!(result.is_err(), "Fail action must abort prepare");

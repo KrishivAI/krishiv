@@ -1,7 +1,7 @@
 //! Two-phase commit.
 
 use crate::error::{ConnectorError, ConnectorResult};
-use crate::quality::{DataQualityConfig, check_batch};
+use crate::quality::{CompiledDataQualityConfig, DataQualityConfig, check_batch_compiled};
 
 // ---------------------------------------------------------------------------
 // TwoPhaseCommitSink
@@ -144,7 +144,9 @@ pub struct ParquetCommitHandle {
 pub struct LocalParquetTwoPhaseCommitSink {
     output_dir: std::path::PathBuf,
     next_handle: u64,
-    quality_config: Option<DataQualityConfig>,
+    /// Pre-compiled quality config so regex compilation happens once at
+    /// construction, not once per `prepare()` call.
+    quality_config: Option<CompiledDataQualityConfig>,
 }
 
 impl LocalParquetTwoPhaseCommitSink {
@@ -161,10 +163,12 @@ impl LocalParquetTwoPhaseCommitSink {
     /// Attach a data quality configuration. Quality checks run during `prepare()`.
     /// Rows failing a `Reject` rule are excluded from the written output.
     /// A `Fail` rule aborts the entire prepare with an error.
-    #[must_use]
-    pub fn with_quality_config(mut self, config: DataQualityConfig) -> Self {
-        self.quality_config = Some(config);
-        self
+    ///
+    /// The config is compiled immediately (regex patterns pre-compiled) so
+    /// repeated `prepare()` calls do not pay regex-compilation overhead.
+    pub fn with_quality_config(mut self, config: DataQualityConfig) -> ConnectorResult<Self> {
+        self.quality_config = Some(config.compile()?);
+        Ok(self)
     }
 }
 
@@ -180,7 +184,7 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         let filtered: arrow::record_batch::RecordBatch;
         let batch = if let Some(ref qc) = self.quality_config {
             use arrow::array::BooleanArray;
-            let result = check_batch(batch, qc)?;
+            let result = check_batch_compiled(batch, qc)?;
             if result.failed {
                 return Err(ConnectorError::IoStr {
                     message: format!("data quality Fail action triggered at epoch {}", epoch),
@@ -247,25 +251,29 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        match std::fs::hard_link(&handle.staging_path, &handle.final_path) {
-            Ok(()) => {
-                std::fs::remove_file(&handle.staging_path).map_err(|e| ConnectorError::IoStr {
-                    message: format!(
-                        "parquet 2pc commit: remove staging {:?}: {e}",
-                        handle.staging_path
-                    ),
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(&handle.staging_path);
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && handle.final_path.exists() => {
-                Ok(())
+        // `rename` is atomic on POSIX: the final path becomes visible only when
+        // the rename succeeds.  If the staging file is missing and the final path
+        // already exists, the commit was completed by a prior attempt (idempotent).
+        use std::io::ErrorKind;
+        match std::fs::rename(&handle.staging_path, &handle.final_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // Staging file is gone — either already committed (final exists)
+                // or an unexpected race.  Accept if the final target exists.
+                if handle.final_path.exists() {
+                    Ok(())
+                } else {
+                    Err(ConnectorError::IoStr {
+                        message: format!(
+                            "parquet 2pc commit: rename {:?} to {:?}: staging missing and final absent: {e}",
+                            handle.staging_path, handle.final_path
+                        ),
+                    })
+                }
             }
             Err(e) => Err(ConnectorError::IoStr {
                 message: format!(
-                    "parquet 2pc commit: link {:?} to {:?}: {e}",
+                    "parquet 2pc commit: rename {:?} to {:?}: {e}",
                     handle.staging_path, handle.final_path
                 ),
             }),

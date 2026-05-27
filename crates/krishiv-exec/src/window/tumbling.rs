@@ -65,11 +65,25 @@ impl TumblingWindowOperator {
     }
 
     /// Persist open window accumulators to `StateBackend` (GAP-I2).
+    ///
+    /// Clears the namespace first so that stale entries for windows that have
+    /// already been flushed (closed) are removed.  Without this, closed windows
+    /// would accumulate in the backend across checkpoint cycles and be
+    /// incorrectly re-opened on restore, causing double-emission.
     pub fn persist_to_state(
         &self,
         backend: &mut dyn krishiv_state::StateBackend,
         namespace: &krishiv_state::Namespace,
     ) -> krishiv_state::StateResult<()> {
+        // Remove all previously persisted entries for this operator so that
+        // windows closed since the last persist do not survive into the next
+        // checkpoint snapshot.
+        backend.clear_namespace(namespace)?;
+
+        if self.accumulators.is_empty() {
+            return Ok(());
+        }
+
         let op_id = namespace.operator_id();
         let name = namespace.state_name();
         let mut state_keys = Vec::with_capacity(self.accumulators.len());
@@ -93,14 +107,12 @@ impl TumblingWindowOperator {
             state_keys.push(state_key);
             values.push(bytes);
         }
-        if !state_keys.is_empty() {
-            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
-                .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
-                .collect();
-            backend.put_batch(&batch_entries)?;
-        }
+        let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+            .collect();
+        backend.put_batch(&batch_entries)?;
         Ok(())
     }
 

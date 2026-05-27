@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -550,6 +551,12 @@ pub struct ExecutorTaskRunner {
     /// enqueued here are drained by the runner loop and trigger checkpoint
     /// initiation.
     pub(crate) barrier_injector: Option<SharedBarrierInjector>,
+
+    /// Most-recently observed coordinator fencing token, cached from real gRPC
+    /// `InitiateCheckpointRequest` messages.  `drain_pending_barriers` stamps
+    /// locally-injected barriers with this token so the coordinator does not
+    /// reject acks from stale-token barriers after a leadership election.
+    pub(crate) cached_coordinator_fencing_token: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -574,6 +581,12 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .unwrap_or(0),
             )
             .field("live_lease", &self.live_lease.get())
+            .field(
+                "cached_coordinator_fencing_token",
+                &self
+                    .cached_coordinator_fencing_token
+                    .load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -593,6 +606,9 @@ impl ExecutorTaskRunner {
                 krishiv_proto::LeaseGeneration::initial(),
             ),
             barrier_injector: None,
+            cached_coordinator_fencing_token: Arc::new(AtomicU64::new(
+                FencingToken::initial().as_u64(),
+            )),
         }
     }
 
@@ -942,6 +958,11 @@ impl ExecutorTaskRunner {
             ExecutorTaskAssignment, OutputContract, OutputContractKind, PlanFragment,
             TaskAttemptRef,
         };
+        // Cache the live coordinator fencing token so that `drain_pending_barriers`
+        // (which cannot receive the token from the barrier proto itself) uses the
+        // most-recently seen token instead of always stamping FencingToken::initial().
+        self.cached_coordinator_fencing_token
+            .store(req.fencing_token.as_u64(), Ordering::SeqCst);
         for entry in self.checkpoint_runners.iter() {
             let task_id = entry.key().clone();
             // Prefer the real attempt ref from running_attempts.  Fall back to
@@ -1009,10 +1030,19 @@ impl ExecutorTaskRunner {
             let Ok(job_id) = JobId::try_new(&barrier.job_id) else {
                 continue;
             };
+            // Use the most-recently observed coordinator fencing token so the
+            // ack is not rejected after a leadership election.  Falls back to
+            // FencingToken::initial() only before any real checkpoint request
+            // has been received (which is safe: no prior leader exists yet).
+            let raw_token = self
+                .cached_coordinator_fencing_token
+                .load(Ordering::SeqCst);
+            let fencing_token = FencingToken::try_new(raw_token.max(1))
+                .unwrap_or_else(|_| FencingToken::initial());
             let req = InitiateCheckpointRequest {
                 job_id,
                 epoch: barrier.epoch,
-                fencing_token: FencingToken::initial(),
+                fencing_token,
             };
             if let Err(e) = self
                 .initiate_checkpoint_for_job(&req, state_backend, storage, coordinator)

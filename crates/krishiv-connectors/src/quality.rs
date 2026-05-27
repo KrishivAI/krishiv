@@ -90,7 +90,10 @@ pub fn check_batch_compiled(
     config: &CompiledDataQualityConfig,
 ) -> ConnectorResult<DataQualityCheckResult> {
     let nrows = batch.num_rows();
-    let mut rejected_rows: Vec<usize> = Vec::new();
+    // HashSet gives O(1) membership tests so the per-rule violation loop is
+    // O(violations) rather than O(violations × already_rejected).  The final
+    // accepted_indices scan is O(N) instead of O(N × rejected).
+    let mut rejected_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut rejected_meta: Vec<RejectedRow> = Vec::new();
     let mut failed = false;
 
@@ -110,7 +113,7 @@ pub fn check_batch_compiled(
                     failed = true;
                 }
                 QualityAction::Reject => {
-                    rejected_rows.push(row_idx);
+                    rejected_rows.insert(row_idx);
                     rejected_meta.push(RejectedRow {
                         batch_row_index: row_idx,
                         rule_violated: compiled_rule_violation_label(rule),
@@ -307,7 +310,10 @@ pub fn check_batch(
     config: &DataQualityConfig,
 ) -> ConnectorResult<DataQualityCheckResult> {
     let nrows = batch.num_rows();
-    let mut rejected_rows: Vec<usize> = Vec::new();
+    // HashSet gives O(1) membership tests so the per-rule violation loop is
+    // O(violations) rather than O(violations × already_rejected).  The final
+    // accepted_indices scan is O(N) instead of O(N × rejected).
+    let mut rejected_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut rejected_meta: Vec<RejectedRow> = Vec::new();
     let mut failed = false;
 
@@ -327,7 +333,7 @@ pub fn check_batch(
                     failed = true;
                 }
                 QualityAction::Reject => {
-                    rejected_rows.push(row_idx);
+                    rejected_rows.insert(row_idx);
                     rejected_meta.push(RejectedRow {
                         batch_row_index: row_idx,
                         rule_violated: format!("{:?}", rule),

@@ -1,6 +1,6 @@
 //! Multi-input checkpoint barrier alignment (R16 S1.3).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Error when barrier alignment times out.
@@ -27,7 +27,10 @@ impl std::error::Error for CheckpointAlignmentTimeout {}
 #[derive(Debug)]
 pub struct BarrierAligner {
     input_count: usize,
-    barrier_inputs_seen: usize,
+    /// Set of input indices that have already reported a barrier for the current epoch.
+    /// Using a HashSet prevents the same input from being counted more than once,
+    /// which would cause premature alignment (fix for double-counting bug).
+    barrier_inputs_seen: HashSet<usize>,
     current_epoch: Option<u64>,
     buffers: Vec<VecDeque<arrow::record_batch::RecordBatch>>,
     alignment_deadline: Option<Instant>,
@@ -38,7 +41,7 @@ impl BarrierAligner {
     pub fn new(input_count: usize, alignment_timeout: Duration) -> Self {
         Self {
             input_count: input_count.max(1),
-            barrier_inputs_seen: 0,
+            barrier_inputs_seen: HashSet::new(),
             current_epoch: None,
             buffers: (0..input_count.max(1)).map(|_| VecDeque::new()).collect(),
             alignment_deadline: None,
@@ -56,6 +59,9 @@ impl BarrierAligner {
     /// Notify that `input_index` received barrier for `epoch`.
     ///
     /// Returns `Ok(true)` when all inputs have aligned and buffered data may be released.
+    ///
+    /// Each `input_index` is counted at most once per epoch — duplicate calls from
+    /// the same input are idempotent and do not advance the alignment counter.
     pub fn on_barrier(
         &mut self,
         input_index: usize,
@@ -63,17 +69,20 @@ impl BarrierAligner {
     ) -> Result<bool, CheckpointAlignmentTimeout> {
         if self.current_epoch.is_none() {
             self.current_epoch = Some(epoch);
-            self.barrier_inputs_seen = 0;
+            self.barrier_inputs_seen.clear();
             self.alignment_deadline = Some(Instant::now() + self.alignment_timeout);
         }
         if self.current_epoch != Some(epoch) {
             return Ok(false);
         }
+        // Insert returns false when the input_index was already present —
+        // duplicates are silently ignored so one fast input cannot trigger
+        // premature alignment by reporting multiple times.
         if input_index < self.input_count {
-            self.barrier_inputs_seen += 1;
+            self.barrier_inputs_seen.insert(input_index);
         }
-        if self.barrier_inputs_seen >= self.input_count {
-            self.barrier_inputs_seen = 0;
+        if self.barrier_inputs_seen.len() >= self.input_count {
+            self.barrier_inputs_seen.clear();
             self.current_epoch = None;
             self.alignment_deadline = None;
             return Ok(true);
@@ -83,7 +92,7 @@ impl BarrierAligner {
         {
             return Err(CheckpointAlignmentTimeout {
                 epoch,
-                waited_inputs: self.barrier_inputs_seen,
+                waited_inputs: self.barrier_inputs_seen.len(),
                 expected_inputs: self.input_count,
             });
         }

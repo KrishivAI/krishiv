@@ -367,13 +367,20 @@ pub fn write_epoch_metadata(
     epoch: u64,
     metadata: &CheckpointMetadata,
 ) -> CheckpointResult<()> {
-    if let Ok(latest) = latest_valid_epoch(storage, job_id)
-        && epoch <= latest
-    {
-        return Err(CheckpointError::StaleEpoch {
-            attempted: epoch,
-            latest,
-        });
+    // Propagate real storage errors; only `NoValidEpoch` (first checkpoint)
+    // is benign and should be treated as "no prior epoch, proceed".
+    // Using `if let Ok(...)` would silently swallow non-`NoValidEpoch` errors
+    // and bypass the monotonicity guard, so we use an explicit `match`.
+    match latest_valid_epoch(storage, job_id) {
+        Ok(latest) if epoch <= latest => {
+            return Err(CheckpointError::StaleEpoch {
+                attempted: epoch,
+                latest,
+            });
+        }
+        Ok(_) => {} // newer epoch — proceed
+        Err(CheckpointError::NoValidEpoch) => {} // no prior epoch — proceed
+        Err(e) => return Err(e), // real storage error — propagate
     }
     let json = serde_json::to_vec_pretty(metadata).map_err(|e| CheckpointError::Storage {
         message: format!("metadata serialize: {e}"),
