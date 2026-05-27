@@ -3014,23 +3014,65 @@ mod scheduler_tests {
         let storage_path = dir.path().to_str().unwrap().to_owned();
         let job_id = JobId::try_new("job-clock").unwrap();
 
-        let config = CoordinatorConfig::new(1, 3).with_tick_period_ms(1_000);
+        // heartbeat_timeout_ticks is large enough that advance_heartbeat_clock(2)
+        // does not mark the executor Lost (which would reset the Running task
+        // back to Assigned and zero out the checkpoint quorum, D3).
+        let config = CoordinatorConfig::new(1, 100).with_tick_period_ms(1_000);
         let coordinator_id = CoordinatorId::try_new("coord-clock").unwrap();
         let mut coordinator = Coordinator::active_with_config(coordinator_id, config);
 
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
         coordinator
-            .register_executor(ExecutorDescriptor::new(executor_id, "host-1", 2))
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "host-1", 2))
             .unwrap();
 
         // Submit a streaming job with a 3-second checkpoint interval.
         let task_id = TaskId::try_new("t1").unwrap();
-        let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage-1")
-            .with_task(TaskSpec::new(task_id, "task-1"));
+        let stage_id = StageId::try_new("s1").unwrap();
+        let stage = StageSpec::new(stage_id.clone(), "stage-1")
+            .with_task(TaskSpec::new(task_id.clone(), "task-1"));
         let spec = JobSpec::new(job_id.clone(), "clock-test", JobKind::Streaming)
             .with_stage(stage)
             .with_checkpoint(3_000, storage_path);
         coordinator.submit_job(spec).unwrap();
+
+        // D3: checkpoint epochs require Running tasks (not just Assigned),
+        // so transition the task to Running before ticking.
+        let lease = coordinator
+            .executors
+            .find_executor(&executor_id)
+            .unwrap()
+            .lease_generation();
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        let attempt = assignments
+            .first()
+            .map(|a| a.attempt_id().as_u32())
+            .unwrap_or(1);
+        let update = TaskStatusUpdate::new(
+            job_id.clone(),
+            stage_id,
+            task_id,
+            executor_id,
+            TaskState::Running,
+            attempt,
+        )
+        .with_lease_generation(lease);
+        coordinator.apply_task_update(update).unwrap();
+
+        // Sanity: one Running task means the checkpoint quorum should be 1.
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let running_count = detail
+            .stages()
+            .iter()
+            .flat_map(|s| s.tasks().iter())
+            .filter(|t| matches!(t.state(), TaskState::Running))
+            .count();
+        assert_eq!(
+            running_count, 1,
+            "task should be Running after status update"
+        );
 
         // 2 ticks × 1 000 ms = 2 000 ms < 3 000 ms — no checkpoint yet.
         coordinator.advance_heartbeat_clock(2).unwrap();

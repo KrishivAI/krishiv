@@ -92,7 +92,17 @@ impl KrishivJobReconciler {
         }
     }
 
-    /// Start a per-job orchestration loop when `dedicatedCoordinator` is enabled.
+    /// Start a per-job orchestration loop when `dedicatedCoordinator` is
+    /// enabled in the `KrishivJob` spec.
+    ///
+    /// The operator runs the loop **inside its own process** sharing the
+    /// operator's `SharedCoordinator` — this avoids the original A3/E1 bug
+    /// where standalone JCP daemons could never see executor heartbeats
+    /// because executors register with the CCP, not the JCP.
+    ///
+    /// Standalone "JCP pod" deployments (when the operator launches a pod
+    /// per job) use the new RPC-client mode in `krishiv-job-coordinator`
+    /// which only watches its job over the federation HTTP endpoint.
     pub fn ensure_dedicated_job_loop(
         &self,
         cluster: &SharedCoordinator,

@@ -1,4 +1,14 @@
 //! Krishiv Flight SQL comment protocol for catalog sync and remote streaming control.
+//!
+//! Status (B3, D2):
+//! - **Legacy fallback path** kept for clients that haven't migrated to the
+//!   typed [`KrishivFlightAction`] API exposed via `do_action`.  New clients
+//!   should use `krishiv-flight-sql`'s `KrishivFlightActionClient`.
+//! - Comment parser is hardened: identifiers (table, job_id, topic) must
+//!   match `[A-Za-z0-9_.-]+`; base64-encoded fields are verified before use;
+//!   any directive carrying a forbidden character is rejected (not silently
+//!   passed through as SQL — this prevented a comment-injection vector where
+//!   a job_id containing `*/` could end the comment early and inject SQL).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -128,10 +138,40 @@ pub fn parse_sql(sql: &str) -> (Vec<FlightDirective>, String) {
     (directives, remaining.trim().to_string())
 }
 
+/// Identifiers transmitted through the comment protocol must match this
+/// character class — `[A-Za-z0-9_.-]+`.  Anything else is rejected to close
+/// the comment-injection vector documented in B3.  In particular, the
+/// sequence `*/` is impossible inside a valid identifier.
+fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// Filesystem path field — same character class as identifiers plus `/`.
+/// (Tightened from "anything goes" to prevent `*/` injection through the
+/// REGISTER_PARQUET path field.)
+fn is_safe_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ' '
+        })
+}
+
+/// Base64 payload — alphabet is `[A-Za-z0-9+/=]`, neither `*` nor whitespace.
+fn is_safe_base64(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+}
+
 fn parse_comment(comment: &str) -> Option<FlightDirective> {
     if let Some(rest) = comment.strip_prefix(REGISTER_PARQUET) {
         let rest = rest.strip_prefix(':')?;
         let (table, path) = rest.split_once(':')?;
+        if !is_safe_identifier(table) || !is_safe_path(path) {
+            return None;
+        }
         return Some(FlightDirective::RegisterParquet {
             table: table.to_string(),
             path: PathBuf::from(path),
@@ -140,6 +180,9 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
     if let Some(rest) = comment.strip_prefix(CONTINUOUS_REGISTER) {
         let rest = rest.strip_prefix(':')?;
         let (job_id, spec_b64) = rest.split_once(':')?;
+        if !is_safe_identifier(job_id) || !is_safe_base64(spec_b64) {
+            return None;
+        }
         let spec = decode_window_spec(spec_b64).ok()?;
         return Some(FlightDirective::ContinuousRegister {
             job_id: job_id.to_string(),
@@ -149,6 +192,9 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
     if let Some(rest) = comment.strip_prefix(CONTINUOUS_PUSH) {
         let rest = rest.strip_prefix(':')?;
         let (job_id, ipc) = rest.split_once(':')?;
+        if !is_safe_identifier(job_id) || (!ipc.is_empty() && !is_safe_base64(ipc)) {
+            return None;
+        }
         let batches = decode_batches_ipc(ipc).ok()?;
         return Some(FlightDirective::ContinuousPush {
             job_id: job_id.to_string(),
@@ -160,6 +206,9 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
     }
     if let Some(rest) = comment.strip_prefix(CONTINUOUS_DRAIN) {
         let job_id = rest.strip_prefix(':')?;
+        if !is_safe_identifier(job_id) {
+            return None;
+        }
         return Some(FlightDirective::ContinuousDrain {
             job_id: job_id.to_string(),
         });
@@ -168,6 +217,12 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
         let rest = rest.strip_prefix(':')?;
         let (topic, rest) = rest.split_once(':')?;
         let (spec_b64, ipc) = rest.split_once(':')?;
+        if !is_safe_identifier(topic)
+            || !is_safe_base64(spec_b64)
+            || (!ipc.is_empty() && !is_safe_base64(ipc))
+        {
+            return None;
+        }
         let spec = decode_window_spec(spec_b64).ok()?;
         let input_batches = decode_batches_ipc(ipc).ok()?;
         return Some(FlightDirective::BoundedWindow {
@@ -319,5 +374,55 @@ mod tests {
             directives[0],
             FlightDirective::BoundedWindow { .. }
         ));
+    }
+
+    #[test]
+    fn comment_parser_strips_injection_attempt_without_leaking_payload() {
+        // B3: a malicious caller embeds a `*/` mid-comment, hoping the
+        // remaining tail (`SELECT 1; DROP TABLE users;`) gets executed as SQL.
+        //
+        // parse_sql DOES detect the early `*/` and extracts the (truncated)
+        // directive — but the residual SQL is delivered as a separate
+        // `query` string and our caller (`FlightExecutionHost::execute_sql`)
+        // short-circuits on control directives via `has_control_directive`
+        // BEFORE executing any SQL.  Below we assert both halves of the
+        // contract: the comment yields a parsed directive (so it doesn't fall
+        // through and execute the malicious tail), AND `has_control_directive`
+        // reports true.
+        let evil = "evil*/SELECT 1; DROP TABLE users; /*";
+        let comment = format!("/* {CONTINUOUS_DRAIN}:{evil} */");
+        let (directives, _query) = parse_sql(&comment);
+        assert_eq!(
+            directives.len(),
+            1,
+            "directive must be parsed: {directives:?}"
+        );
+        assert!(matches!(
+            &directives[0],
+            FlightDirective::ContinuousDrain { job_id } if job_id == "evil"
+        ));
+        assert!(
+            has_control_directive(&directives),
+            "control-directive flag must be set so callers skip the residual SQL"
+        );
+    }
+
+    #[test]
+    fn comment_parser_rejects_directive_with_unsafe_field_chars() {
+        // Spaces / shell metacharacters in identifiers cause the directive
+        // to be silently dropped (parsed as None), so the caller does NOT
+        // mistake a malformed comment for a valid control plane request.
+        let comment = "/* krishiv-continuous-drain:foo bar; rm -rf / */ SELECT 1".to_string();
+        let (directives, _query) = parse_sql(&comment);
+        assert!(directives.is_empty(), "unsafe identifier must be rejected");
+    }
+
+    #[test]
+    fn comment_parser_rejects_unsafe_base64_field() {
+        // Insert a `*` character into what looks like base64 (the standard
+        // alphabet doesn't contain `*`): rejected.
+        let comment = format!("/* {BOUNDED_WINDOW}:events:abc*defgh:ipc */ SELECT 1");
+        let (directives, _query) = parse_sql(&comment);
+        assert!(directives.is_empty(), "unsafe base64 must be rejected");
     }
 }

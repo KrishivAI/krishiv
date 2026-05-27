@@ -391,6 +391,7 @@ impl K8sLeaseElection {
     }
 }
 
+#[async_trait::async_trait]
 impl LeaderElection for K8sLeaseElection {
     fn is_leader(&self) -> bool {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());

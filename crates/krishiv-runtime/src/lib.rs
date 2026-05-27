@@ -13,6 +13,7 @@ use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
 pub mod continuous_stream;
 pub mod execution_runtime;
+pub mod flight_action;
 mod flight_client;
 pub mod flight_protocol;
 pub mod in_process;
@@ -25,6 +26,11 @@ pub use continuous_stream::ContinuousStreamRegistry;
 pub use execution_runtime::{
     BatchTableRegistration, ClusterEndpoints, ExecutionRuntime, InProcessExecutionRuntime,
     RemoteExecutionRuntime, RuntimeMode, build_execution_runtime,
+};
+pub use flight_action::{
+    BoundedWindowBody, ContinuousDrainBody, ContinuousPushBody, ContinuousRegisterBody,
+    ExplainBody, KrishivFlightAction, RegisterParquetBody, action_type, decode_batches,
+    encode_batches, strip_action_type, tags as action_tags,
 };
 pub use in_process::{BatchSqlTable, InProcessStreamingRuntime, execute_windowed_in_process};
 pub use in_process_cluster::{InProcessCluster, fragment_from_local_spec, plan_spec_to_local};

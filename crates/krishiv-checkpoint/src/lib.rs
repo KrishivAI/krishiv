@@ -272,12 +272,13 @@ pub fn manifest_path(job_id: &str, epoch: u64) -> String {
 
 /// Storage backend for checkpoint data.
 ///
-/// All methods are synchronous; callers in async contexts must use
-/// `spawn_blocking` (same contract as [`krishiv_state::RocksDbStateBackend`]).
-///
-/// [`LocalFsCheckpointStorage`] implements this trait using `std::fs` for
-/// unit tests.  A production object-store backend wraps `object_store::ObjectStore`
-/// behind this trait in a later release.
+/// The trait is synchronous because most call sites (CheckpointCoordinator,
+/// executor checkpoint fanout) already drive it from blocking-friendly
+/// contexts.  Object-store backends that internally need a Tokio runtime
+/// (S3 / GCS clients use `reqwest`) MUST use [`run_blocking_on_tokio`] in
+/// their `write_bytes` / `read_bytes` / `list_dir` / `delete_prefix` impls,
+/// which uses `block_in_place` to avoid the worker-thread deadlock that
+/// `futures::executor::block_on` produces (D4).
 pub trait CheckpointStorage: Send + Sync {
     /// Write `data` to `path`.  Overwrites if it already exists.
     ///
@@ -297,6 +298,54 @@ pub trait CheckpointStorage: Send + Sync {
     /// Recursively delete everything under `prefix`.  No-op if `prefix` does
     /// not exist.
     fn delete_prefix(&self, prefix: &str) -> CheckpointResult<()>;
+}
+
+/// Run an async block from a synchronous `CheckpointStorage` impl without
+/// deadlocking the Tokio runtime.
+///
+/// The previous object-store backend used `futures::executor::block_on`, which
+/// parks the current thread without yielding to Tokio.  If the inner future
+/// awaits a Tokio resource (timer / TCP socket — both used by `reqwest`),
+/// the worker thread deadlocks (D4).
+///
+/// This helper uses `block_in_place` when called from inside a multi-thread
+/// Tokio runtime, falls back to a short-lived runtime when no runtime is
+/// active, and returns a clear `Storage` error when called from a
+/// `current_thread` runtime (where neither approach is safe).
+pub fn run_blocking_on_tokio<F, T>(label: &'static str, fut: F) -> CheckpointResult<T>
+where
+    F: std::future::Future<Output = CheckpointResult<T>> + Send,
+    T: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            // We are inside a Tokio runtime.  block_in_place is only legal on
+            // multi-thread runtimes; current_thread will panic.  Detect that
+            // and return a clear error instead.
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(fut))
+                }
+                _ => Err(CheckpointError::Storage {
+                    message: format!(
+                        "{label}: cannot block on a current_thread Tokio runtime; \
+                         call from a multi-thread runtime (#[tokio::main(flavor = \"multi_thread\")]) \
+                         or use the async API directly"
+                    ),
+                }),
+            }
+        }
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .map_err(|e| CheckpointError::Storage {
+                    message: format!("{label}: failed to build temporary Tokio runtime: {e}"),
+                })?;
+            rt.block_on(fut)
+        }
+    }
 }
 
 fn uuid_simple() -> u64 {

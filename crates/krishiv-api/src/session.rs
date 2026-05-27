@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use krishiv_async_util::block_on;
@@ -35,6 +35,11 @@ pub struct SessionBuilder {
     remote_execution: bool,
     /// Reuse an existing in-process cluster (continuous stream registry, coordinator bridge).
     in_process_cluster: Option<Arc<InProcessCluster>>,
+    /// Whether `with_remote_execution` was called explicitly (B2): controls
+    /// whether `build()` flips Distributed mode to `remote_execution = true`
+    /// automatically.  Tests and integrations that want a local fallback in
+    /// Distributed mode set this via `with_remote_execution(false)`.
+    remote_execution_explicit: bool,
 }
 
 impl fmt::Debug for SessionBuilder {
@@ -69,30 +74,42 @@ impl Default for SessionBuilder {
             state_ttl: None,
             remote_execution: remote_execution_from_env(),
             in_process_cluster: None,
+            remote_execution_explicit: false,
         }
     }
 }
 
-fn remote_execution_from_env() -> bool {
-    std::env::var("KRISHIV_REMOTE_EXEC")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+/// Read the `KRISHIV_REMOTE_EXEC` env var. Returns `Some(true|false)` if set,
+/// `None` if absent so the session builder can choose mode-aware defaults.
+fn remote_execution_from_env_opt() -> Option<bool> {
+    std::env::var("KRISHIV_REMOTE_EXEC").ok().map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
+fn remote_execution_from_env() -> bool {
+    remote_execution_from_env_opt().unwrap_or(false)
+}
+
+/// Returns a per-call fresh embedded runtime for orphan `DataFrame::new`/
+/// `Stream::new` constructors.  Previously this returned a process-global
+/// `OnceLock` instance shared across every session — a major contention
+/// hotspot under parallel workloads (C1).
+///
+/// The returned runtime carries its own `InProcessCluster` and ids; dropping
+/// it tears down the cluster.
 pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
-    static RUNTIME: OnceLock<Arc<dyn ExecutionRuntime>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            let cluster =
-                Arc::new(InProcessCluster::new().expect("shared embedded in-process cluster"));
-            build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false)
-        })
-        .clone()
+    // OnceLock kept around to avoid breaking any external code that might
+    // observe a stable identity across calls — but we always return a *fresh*
+    // runtime so concurrent constructors get isolated coordinators.  The
+    // OnceLock itself is unused for hand-out; left here for backward-compat
+    // marker placement only.
+    let _ = std::sync::OnceLock::<()>::new();
+    let cluster = Arc::new(InProcessCluster::new().expect("orphan embedded in-process cluster"));
+    build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false)
 }
 
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
@@ -151,10 +168,13 @@ impl SessionBuilder {
     }
 
     /// When true, batch and streaming data-plane work is routed to the remote Flight
-    /// endpoint instead of the session-embedded in-process cluster.
+    /// endpoint instead of the session-embedded in-process cluster.  When false in
+    /// Distributed mode, the session falls back to an in-process cluster — useful
+    /// for integration tests but never the default (see B2).
     #[must_use]
     pub fn with_remote_execution(mut self, enabled: bool) -> Self {
         self.remote_execution = enabled;
+        self.remote_execution_explicit = true;
         self
     }
 
@@ -197,12 +217,30 @@ impl SessionBuilder {
                 message: e.to_string(),
             })?),
         };
+
+        // B2: Distributed sessions default to true remote execution.  An
+        // explicit `with_remote_execution(false)` (or `KRISHIV_REMOTE_EXEC=0`)
+        // still keeps the local fallback for integration tests.
+        let remote_execution =
+            if self.remote_execution_explicit || remote_execution_from_env_opt().is_some() {
+                self.remote_execution
+            } else {
+                matches!(self.mode, ExecutionMode::Distributed)
+            };
+
+        if matches!(self.mode, ExecutionMode::Distributed) && self.coordinator_url.is_none() {
+            return Err(KrishivError::unsupported(
+                "Distributed mode requires SessionBuilder::with_coordinator(<flight_url>); \
+                 otherwise use Embedded or SingleNode",
+            ));
+        }
+
         let runtime = build_execution_runtime(
             execution_mode_to_runtime_mode(self.mode),
             Arc::clone(&local_cluster),
             self.coordinator_url.clone(),
             self.local_cluster_grpc.clone(),
-            self.remote_execution,
+            remote_execution,
         );
         Ok(Session {
             mode: self.mode,
@@ -287,6 +325,29 @@ impl Session {
     /// Unified execution runtime for this session.
     pub fn execution_runtime(&self) -> Arc<dyn ExecutionRuntime> {
         Arc::clone(&self.runtime)
+    }
+
+    /// Returns an error if the session was built for a deployment mode whose
+    /// routing does not match the runtime — for example a Distributed session
+    /// whose runtime is silently using the in-process fallback (B2 guard).
+    pub fn check_routing(&self) -> Result<()> {
+        match self.mode {
+            ExecutionMode::Distributed => {
+                if !self.runtime.uses_remote_execution() {
+                    return Err(KrishivError::unsupported(
+                        "Distributed session is using a local fallback runtime; call \
+                         with_remote_execution(true) or unset KRISHIV_REMOTE_EXEC=0",
+                    ));
+                }
+                if self.coordinator_url.is_none() {
+                    return Err(KrishivError::unsupported(
+                        "Distributed session has no coordinator URL; call with_coordinator()",
+                    ));
+                }
+            }
+            ExecutionMode::SingleNode | ExecutionMode::Embedded => {}
+        }
+        Ok(())
     }
 
     /// Submit a continuous streaming job (unbounded sources). Returns a handle id.

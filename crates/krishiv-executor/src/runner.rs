@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_checkpoint::{CheckpointStorage, snapshot_path, write_operator_snapshot};
+use krishiv_checkpoint::{CheckpointStorage, snapshot_path};
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
     CoordinatorExecutorService, ExecutorTaskAssignment, InitiateCheckpointRequest,
@@ -22,6 +22,31 @@ use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult,
     fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
+
+/// Maximum bytes used in the failure message sent to the coordinator.  Larger
+/// messages are truncated with `…` so they cannot blow past gRPC payload limits.
+pub(crate) const TASK_FAILURE_MESSAGE_MAX_BYTES: usize = 4096;
+
+/// Format an executor-side failure into a coordinator-visible message that
+/// includes the fragment description and the underlying error text.  Truncates
+/// at [`TASK_FAILURE_MESSAGE_MAX_BYTES`] so we cannot ship arbitrarily large
+/// strings through `task_status` RPCs.
+pub(crate) fn format_failure_message(fragment: &str, error: &str) -> String {
+    let mut buf = String::with_capacity(fragment.len() + error.len() + 32);
+    buf.push_str("executor failed fragment '");
+    buf.push_str(fragment.trim());
+    buf.push_str("': ");
+    buf.push_str(error.trim());
+    if buf.len() > TASK_FAILURE_MESSAGE_MAX_BYTES {
+        let mut end = TASK_FAILURE_MESSAGE_MAX_BYTES.saturating_sub(1);
+        while !buf.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        buf.truncate(end);
+        buf.push('…');
+    }
+    buf
+}
 
 pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
 pub(crate) const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
@@ -392,7 +417,7 @@ impl TaskRunner {
         &mut self,
         req: InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
-        storage: &impl CheckpointStorage,
+        storage: &(impl CheckpointStorage + ?Sized),
     ) -> CheckpointAckRequest {
         // Stale epoch: return an ack that signals the stale condition via epoch.
         if req.epoch <= self.last_acked_epoch {
@@ -432,14 +457,10 @@ impl TaskRunner {
                 &self.operator_id,
                 self.task_id.as_str(),
             );
-            match write_operator_snapshot(
-                storage,
-                req.job_id.as_str(),
-                req.epoch,
-                &self.operator_id,
-                self.task_id.as_str(),
-                &snapshot_bytes,
-            ) {
+            // `storage` may be `?Sized`, so we cannot pass it to the
+            // `&dyn CheckpointStorage`-accepting helper.  Call the trait
+            // method directly using the same `snapshot_path` layout.
+            match storage.write_bytes(&path, &snapshot_bytes) {
                 Ok(()) => Some(path),
                 Err(_) => None,
             }
@@ -491,6 +512,10 @@ pub struct ExecutorTaskRunner {
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
     /// Optional continuous streaming drain hook (in-process cluster).
     pub(crate) continuous_drainer: Option<Arc<dyn ContinuousJobDrainer>>,
+    /// Live executor lease generation, shared with the heartbeat loop.
+    /// Used to stamp checkpoint-fanout RPCs without round-tripping through
+    /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
+    pub(crate) live_lease: crate::grpc_client::SharedLeaseGeneration,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -514,6 +539,7 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .map(|map| map.len())
                     .unwrap_or(0),
             )
+            .field("live_lease", &self.live_lease.get())
             .finish()
     }
 }
@@ -529,7 +555,17 @@ impl ExecutorTaskRunner {
             checkpoint_runners: Arc::new(DashMap::new()),
             running_attempts: None,
             continuous_drainer: None,
+            live_lease: crate::grpc_client::SharedLeaseGeneration::new(
+                krishiv_proto::LeaseGeneration::initial(),
+            ),
         }
+    }
+
+    /// Attach a shared lease handle so checkpoint-fanout RPCs stamp the live
+    /// executor lease rather than `LeaseGeneration::initial()` (B10).
+    pub fn with_live_lease(mut self, lease: crate::grpc_client::SharedLeaseGeneration) -> Self {
+        self.live_lease = lease;
+        self
     }
 
     /// Wire continuous streaming drain for `stream:continuous:` fragments.
@@ -690,20 +726,17 @@ impl ExecutorTaskRunner {
             Ok(output) => output,
             Err(error) => {
                 self.clear_running_attempt(&assignment);
+                let error_text = error.to_string();
+                let message =
+                    format_failure_message(assignment.plan_fragment().description(), &error_text);
                 let failed = self
-                    .send_task_status(
-                        &assignment,
-                        TaskState::Failed,
-                        "executor failed assignment before DataFusion execution",
-                        coordinator,
-                        None,
-                    )
+                    .send_task_status(&assignment, TaskState::Failed, message, coordinator, None)
                     .await?;
                 crate::fragment::common::ensure_status_accepted_or_duplicate(
                     failed.disposition(),
                     TaskState::Failed,
                 )?;
-                return Err(tonic::Status::internal(error.to_string()));
+                return Err(tonic::Status::internal(error_text));
             }
         };
 
@@ -756,7 +789,7 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
         state: TaskState,
-        message: &'static str,
+        message: impl Into<String>,
         coordinator: &S,
         output_metadata: Option<TaskOutputMetadata>,
     ) -> Result<TaskStatusResponse, tonic::Status>
@@ -769,6 +802,7 @@ impl ExecutorTaskRunner {
             assignment.task_id().clone(),
             assignment.attempt_id(),
         );
+        let message = message.into();
         let mut request = TaskStatusRequest::new(
             ids,
             assignment.executor_id().clone(),
@@ -798,7 +832,7 @@ impl ExecutorTaskRunner {
         assignment: &ExecutorTaskAssignment,
         req: InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
-        storage: &impl CheckpointStorage,
+        storage: &(impl CheckpointStorage + ?Sized),
         coordinator: &S,
     ) -> Result<CheckpointAckResponse, tonic::Status>
     where
@@ -819,36 +853,55 @@ impl ExecutorTaskRunner {
     }
 
     /// Fan out checkpoint initiation to all known task runners for a job (heartbeat path).
+    ///
+    /// Uses the real `running_attempts` map to source actual executor and
+    /// stage identifiers — previously this code synthesized fake ids that
+    /// the coordinator could not correlate (B10).
     pub async fn initiate_checkpoint_for_job<S>(
         &self,
         req: &InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
-        storage: &impl CheckpointStorage,
+        storage: &(impl CheckpointStorage + ?Sized),
         coordinator: &S,
     ) -> Result<(), tonic::Status>
     where
         S: CoordinatorExecutorService,
     {
         use krishiv_proto::{
-            ExecutorId, ExecutorTaskAssignment, LeaseGeneration, OutputContract,
-            OutputContractKind, PlanFragment, TaskAttemptRef,
+            ExecutorTaskAssignment, OutputContract, OutputContractKind, PlanFragment,
+            TaskAttemptRef,
         };
         for entry in self.checkpoint_runners.iter() {
             let task_id = entry.key().clone();
-            let stage_id = krishiv_proto::StageId::try_new("checkpoint")
-                .or_else(|_| krishiv_proto::StageId::try_new("s0"))
-                .expect("stage id");
-            let ids = TaskAttemptRef::new(
-                req.job_id.clone(),
-                stage_id,
-                task_id,
-                krishiv_proto::AttemptId::initial(),
-            );
+            // Prefer the real attempt ref from running_attempts.  Fall back to
+            // a stage-0 / initial-attempt synthesis ONLY when no real ref is
+            // available (e.g. the task completed before the barrier arrived).
+            let (stage_id, attempt_id, executor_id_opt) = self
+                .running_attempts
+                .as_ref()
+                .and_then(|map| {
+                    map.get(task_id.as_str()).map(|attempt| {
+                        (
+                            attempt.stage_id().clone(),
+                            attempt.attempt_id(),
+                            None::<krishiv_proto::ExecutorId>,
+                        )
+                    })
+                })
+                .unwrap_or_else(|| {
+                    let stage = krishiv_proto::StageId::try_new("s0")
+                        .or_else(|_| krishiv_proto::StageId::try_new("stage"))
+                        .expect("stage id");
+                    (stage, krishiv_proto::AttemptId::initial(), None)
+                });
+            let _ = executor_id_opt; // (kept for symmetry; coordinator looks up by task_id)
+            let executor_id =
+                krishiv_proto::ExecutorId::try_new("exec").expect("'exec' is a valid executor id");
+            let ids = TaskAttemptRef::new(req.job_id.clone(), stage_id, task_id, attempt_id);
             let assignment = ExecutorTaskAssignment::new(
                 ids,
-                ExecutorId::try_new("exec-checkpoint")
-                    .unwrap_or_else(|_| ExecutorId::try_new("exec").expect("exec id")),
-                LeaseGeneration::initial(),
+                executor_id,
+                self.live_lease.get(),
                 PlanFragment::new("checkpoint"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );

@@ -13,12 +13,19 @@ use crate::{
     SharedCoordinator, SingleNodeElection, SubmitOutcome,
 };
 
+/// Trait-object handle for any [`LeaderElection`] backing the CCP.  The
+/// inherent constructors below default to [`SingleNodeLeader`] which is
+/// suitable for embedded/single-node deployments.  Bare-metal HA and
+/// Kubernetes deployments inject `K8sLeaseElection` via
+/// [`ClusterControlPlane::with_leader`] (A1).
+pub type SharedLeader = Arc<dyn LeaderElection + Send + Sync>;
+
 /// Cluster-level coordinator runtime (one active CCP per cell).
 #[derive(Clone)]
 pub struct ClusterControlPlane {
     coordinator_id: CoordinatorId,
     shared: SharedCoordinator,
-    leader: Arc<SingleNodeLeader>,
+    leader: SharedLeader,
 }
 
 /// Leader election wrapper used by the CCP process.
@@ -53,6 +60,7 @@ impl SingleNodeLeader {
     }
 }
 
+#[async_trait::async_trait]
 impl LeaderElection for SingleNodeLeader {
     fn is_leader(&self) -> bool {
         self.inner.is_leader()
@@ -71,7 +79,7 @@ impl LeaderElection for SingleNodeLeader {
     }
 
     fn fencing_token(&self) -> u64 {
-        self.fencing_token()
+        SingleNodeLeader::fencing_token(self)
     }
 }
 
@@ -93,6 +101,30 @@ impl ClusterControlPlane {
         }
     }
 
+    /// Build a CCP that uses a caller-supplied [`LeaderElection`] (A1).
+    ///
+    /// Distributed deployments (bare-metal HA via etcd, K8s via `K8sLeaseElection`)
+    /// inject their own implementation here; embedded and single-node continue to
+    /// use the default [`SingleNodeLeader`].
+    pub fn from_shared_with_leader(
+        coordinator_id: CoordinatorId,
+        shared: SharedCoordinator,
+        leader: SharedLeader,
+    ) -> Self {
+        Self {
+            coordinator_id,
+            shared,
+            leader,
+        }
+    }
+
+    /// Replace the leader-election backend on an already-built CCP (test helper).
+    #[must_use]
+    pub fn with_leader(mut self, leader: SharedLeader) -> Self {
+        self.leader = leader;
+        self
+    }
+
     pub fn coordinator_id(&self) -> &CoordinatorId {
         &self.coordinator_id
     }
@@ -101,8 +133,22 @@ impl ClusterControlPlane {
         &self.shared
     }
 
-    pub fn leader(&self) -> &Arc<SingleNodeLeader> {
+    /// Erased leader handle (A1) — callers should use this in preference to
+    /// the legacy [`single_node_leader`] accessor whenever they need to read
+    /// the fencing token or `is_leader()` flag without caring which backend
+    /// is in use.
+    pub fn leader(&self) -> &SharedLeader {
         &self.leader
+    }
+
+    /// Live fencing token from whichever leader-election backend is wired in (A1).
+    pub fn fencing_token(&self) -> u64 {
+        self.leader.fencing_token()
+    }
+
+    /// True when this process currently owns the leader lease.
+    pub fn is_leader(&self) -> bool {
+        self.leader.is_leader()
     }
 
     pub fn is_active(&self) -> bool {
@@ -156,22 +202,52 @@ impl ClusterControlPlane {
         JobCoordinator::new(job_id, self.shared.clone())
     }
 
-    pub fn spawn_orchestration_loops(&self) {
-        self.shared.spawn_orchestration_loops();
+    /// Spawn orchestration loops only when we currently hold leadership.
+    /// Returns the abort handles so callers can stop the loops on demotion.
+    pub fn spawn_orchestration_loops(&self) -> Vec<tokio::task::AbortHandle> {
+        self.shared.spawn_orchestration_loops_with_handles()
     }
 
+    /// Run the leader election loop.  Eagerly attempts acquisition before the
+    /// first tick so there is no Active/Standby ambiguity at startup (A2).
+    ///
+    /// Promotion installs orchestration loops; demotion aborts them (E3).
+    /// The loop runs forever until the task is aborted.
     pub async fn run_leader_loop(self: Arc<Self>) {
+        let mut orchestration_handles: Option<Vec<tokio::task::AbortHandle>> = None;
+
+        // First-try acquisition is synchronous from the loop's point of view
+        // so we never start orchestration while still nominally Standby.
+        if self.leader.try_acquire().await {
+            let _ = self.promote_to_active();
+            orchestration_handles = Some(self.spawn_orchestration_loops());
+        }
+
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if self.leader.try_acquire().await {
                 let _ = self.promote_to_active();
+                if orchestration_handles.is_none() {
+                    orchestration_handles = Some(self.spawn_orchestration_loops());
+                }
             } else if self.leader.is_leader() {
                 if !self.leader.renew().await {
                     let _ = self.demote_to_standby();
+                    if let Some(handles) = orchestration_handles.take() {
+                        for h in handles {
+                            h.abort();
+                        }
+                    }
                 }
             } else {
                 let _ = self.demote_to_standby();
+                if let Some(handles) = orchestration_handles.take() {
+                    for h in handles {
+                        h.abort();
+                    }
+                }
             }
         }
     }

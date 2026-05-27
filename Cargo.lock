@@ -3938,6 +3938,7 @@ dependencies = [
 name = "krishiv-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "krishiv-state",
  "object_store",
@@ -4008,6 +4009,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.14.6",
+ "tracing",
 ]
 
 [[package]]
@@ -4096,6 +4098,7 @@ dependencies = [
 name = "krishiv-operator"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "k8s-openapi",
  "krishiv-checkpoint",
@@ -4179,6 +4182,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-sql",
  "krishiv-state",
+ "serde",
  "serde_json",
  "tokio",
  "tonic 0.14.6",
@@ -4190,7 +4194,10 @@ name = "krishiv-scheduler"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "axum 0.8.9",
+ "futures",
+ "krishiv-async-util",
  "krishiv-checkpoint",
  "krishiv-connectors",
  "krishiv-governance",
@@ -4198,12 +4205,14 @@ dependencies = [
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
+ "reqwest 0.13.3",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.14.6",
  "tracing",
 ]
@@ -4238,7 +4247,9 @@ dependencies = [
  "parquet 58.3.0",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic 0.14.6",
+ "tracing",
  "twox-hash",
  "zstd",
 ]
@@ -7652,6 +7663,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "slab",
  "tokio",

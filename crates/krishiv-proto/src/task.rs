@@ -397,6 +397,17 @@ impl ExecutorHeartbeatRequest {
         self
     }
 
+    /// Override the executor lease generation stamped on this heartbeat.
+    ///
+    /// Used by the gRPC client adapter to stamp the live atomic lease before
+    /// transmission (B7) so that heartbeats sent after a lease bump cannot
+    /// ship a stale generation.
+    #[must_use]
+    pub fn with_lease_generation(mut self, lease_generation: LeaseGeneration) -> Self {
+        self.lease_generation = lease_generation;
+        self
+    }
+
     /// Attach a W3C trace context for distributed tracing (R8 wiring).
     #[must_use]
     pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
@@ -1170,6 +1181,17 @@ impl TaskStatusRequest {
     #[must_use]
     pub fn with_output_metadata(mut self, output_metadata: TaskOutputMetadata) -> Self {
         self.output_metadata = Some(output_metadata);
+        self
+    }
+
+    /// Override the executor lease generation stamped on this request.
+    ///
+    /// Used by the gRPC client adapter to stamp the live atomic lease before
+    /// transmission (B7) so that retries after a lease bump cannot ship a
+    /// stale generation.
+    #[must_use]
+    pub fn with_lease_generation(mut self, lease_generation: LeaseGeneration) -> Self {
+        self.lease_generation = lease_generation;
         self
     }
 

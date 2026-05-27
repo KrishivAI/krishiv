@@ -22,12 +22,13 @@ use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::stream_kafka::encode_stream_kafka_partition;
 use crate::{RuntimeError, RuntimeResult};
 
-static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Process-global counter used to give every [`InProcessStreamingRuntime`]
+/// a unique numeric suffix.  This avoids two concurrent embedded sessions
+/// colliding on coordinator id (C1, C2).
+static CLUSTER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-fn next_job_id() -> RuntimeResult<JobId> {
-    let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    JobId::try_new(format!("in-process-job-{n}"))
-        .map_err(|e| RuntimeError::transport(e.to_string()))
+fn next_cluster_suffix() -> u64 {
+    CLUSTER_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Parquet table registration forwarded to executor SQL tasks.
@@ -54,6 +55,11 @@ pub struct InProcessStreamingRuntime {
     runner: Arc<ExecutorTaskRunner>,
     continuous_registry: SharedContinuousStreamRegistry,
     _executor_id: ExecutorId,
+    /// Per-cluster job counter so each `InProcessStreamingRuntime` has its
+    /// own job id namespace (C1).
+    job_counter: Arc<AtomicU64>,
+    /// Per-cluster suffix used in coordinator/executor ids.
+    suffix: u64,
 }
 
 impl InProcessStreamingRuntime {
@@ -64,10 +70,14 @@ impl InProcessStreamingRuntime {
     pub fn with_continuous_registry(
         registry: SharedContinuousStreamRegistry,
     ) -> RuntimeResult<Self> {
-        let coordinator_id = CoordinatorId::try_new("in-process-coord")
+        let suffix = next_cluster_suffix();
+        // Each in-process cluster gets a process-unique coordinator and
+        // executor id so multiple sessions sharing the same process do not
+        // collide in metadata stores or audit logs (C1).
+        let coordinator_id = CoordinatorId::try_new(format!("in-process-coord-{suffix}"))
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let coordinator = Arc::new(Mutex::new(Coordinator::active(coordinator_id)));
-        let executor_id = ExecutorId::try_new("in-process-exec")
+        let executor_id = ExecutorId::try_new(format!("in-process-exec-{suffix}"))
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let descriptor = ExecutorDescriptor::new(executor_id.clone(), "localhost", 8)
             .with_task_endpoint(IN_PROCESS_TASK_ENDPOINT);
@@ -91,7 +101,16 @@ impl InProcessStreamingRuntime {
             runner,
             continuous_registry: registry,
             _executor_id: executor_id,
+            job_counter: Arc::new(AtomicU64::new(1)),
+            suffix,
         })
+    }
+
+    /// Per-cluster job id generator (C1) — replaces the legacy process-global counter.
+    fn next_job_id(&self) -> RuntimeResult<JobId> {
+        let n = self.job_counter.fetch_add(1, Ordering::Relaxed);
+        JobId::try_new(format!("in-process-{}-job-{n}", self.suffix))
+            .map_err(|e| RuntimeError::transport(e.to_string()))
     }
 
     pub fn continuous_registry(&self) -> &ContinuousStreamRegistry {
@@ -139,7 +158,7 @@ impl InProcessStreamingRuntime {
         tables: &[BatchSqlTable],
         stream_partitions: Vec<InputPartition>,
     ) -> RuntimeResult<Vec<RecordBatch>> {
-        let job_id = next_job_id()?;
+        let job_id = self.next_job_id()?;
         let task_id =
             TaskId::try_new("task-0").map_err(|e| RuntimeError::transport(e.to_string()))?;
         let stage_id =
@@ -149,7 +168,7 @@ impl InProcessStreamingRuntime {
                 .with_task(TaskSpec::new(task_id.clone(), fragment.to_string())),
         );
 
-        let mut assignments = {
+        {
             let mut coord = self
                 .coordinator
                 .lock()
@@ -158,18 +177,16 @@ impl InProcessStreamingRuntime {
                 Ok(SubmitOutcome::Accepted) | Ok(SubmitOutcome::Queued { .. }) => {}
                 Err(e) => return Err(RuntimeError::transport(e.to_string())),
             }
-            coord
-                .launch_assigned_task_assignments(&job_id)
-                .map_err(|e| RuntimeError::transport(e.to_string()))?
-        };
-
-        if assignments.is_empty() {
-            return Err(RuntimeError::transport(
-                "in-process coordinator produced no task assignments",
-            ));
         }
 
-        let mut partitions: Vec<InputPartition> = tables
+        // C5: Multi-stage in-process execution.  Repeatedly:
+        //  1. Ask the coordinator for currently-assigned tasks for this job.
+        //  2. For the first stage's first task, attach the input partitions
+        //     supplied by the caller (parquet tables / stream partitions).
+        //  3. Push every assignment into the inbox.
+        //  4. Drain the inbox via the runner.
+        //  5. Loop until no new assignments are launched (terminal stages all done).
+        let initial_partitions: Vec<InputPartition> = tables
             .iter()
             .enumerate()
             .map(|(idx, table)| {
@@ -180,26 +197,78 @@ impl InProcessStreamingRuntime {
                     },
                 )
             })
+            .chain(stream_partitions)
             .collect();
-        partitions.extend(stream_partitions);
-
-        let assignment = assignments.remove(0).with_input_partitions(partitions);
-        self.inbox
-            .push(assignment)
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
 
         let bridge = self.bridge.clone();
         let runner = Arc::clone(&self.runner);
         let mut output_batches = Vec::new();
+        let mut iter_count = 0usize;
+        let mut first_iteration_partitions = Some(initial_partitions);
+        const MAX_STAGE_ITERATIONS: usize = 1024;
+
         block_on(async {
-            while let Some(report) = runner
-                .run_next_with(&bridge)
-                .await
-                .map_err(|e| RuntimeError::transport(e.message()))?
-            {
-                output_batches.extend(report.output().record_batches().to_vec());
+            loop {
+                if iter_count > MAX_STAGE_ITERATIONS {
+                    return Err(RuntimeError::transport(format!(
+                        "in-process runtime exceeded {MAX_STAGE_ITERATIONS} stage iterations for job {job_id}"
+                    )));
+                }
+                iter_count += 1;
+
+                let mut assignments = {
+                    let mut coord = self
+                        .coordinator
+                        .lock()
+                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                    coord
+                        .launch_assigned_task_assignments(&job_id)
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?
+                };
+
+                if assignments.is_empty() {
+                    // Job either finished or has no more assignable work this turn.
+                    let terminal = {
+                        let coord = self
+                            .coordinator
+                            .lock()
+                            .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                        coord
+                            .job_snapshot(&job_id)
+                            .map(|snap| snap.state().is_terminal())
+                            .unwrap_or(false)
+                    };
+                    if terminal || iter_count > 1 {
+                        return Ok(());
+                    }
+                    return Err(RuntimeError::transport(
+                        "in-process coordinator produced no task assignments",
+                    ));
+                }
+
+                // Attach caller-supplied input partitions to the FIRST assignment
+                // emitted by the FIRST iteration only.  Subsequent stages source
+                // their input from shuffle outputs.
+                if let Some(partitions) = first_iteration_partitions.take() {
+                    let first = assignments.remove(0).with_input_partitions(partitions);
+                    self.inbox
+                        .push(first)
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                }
+                for assignment in assignments {
+                    self.inbox
+                        .push(assignment)
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                }
+
+                while let Some(report) = runner
+                    .run_next_with(&bridge)
+                    .await
+                    .map_err(|e| RuntimeError::transport(e.message()))?
+                {
+                    output_batches.extend(report.output().record_batches().to_vec());
+                }
             }
-            Ok::<(), RuntimeError>(())
         })?;
 
         Ok(output_batches)

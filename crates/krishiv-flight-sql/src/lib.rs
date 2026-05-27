@@ -347,6 +347,192 @@ impl FlightSqlService for KrishivFlightSqlService {
 
     // Required method — no-op for R8.1 beta (server doesn't serve SqlInfo)
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+    /// Typed Krishiv `DoAction` handler (B3, D2).
+    ///
+    /// The legacy comment-encoded streaming control plane is still served by
+    /// `do_get_statement`; new clients ship structured payloads through
+    /// `do_action` using the [`krishiv_runtime::KrishivFlightAction`] envelope.
+    async fn do_action_fallback(
+        &self,
+        request: Request<arrow_flight::Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        use krishiv_runtime::KrishivFlightAction;
+        use krishiv_runtime::flight_action::strip_action_type;
+
+        let action = request.into_inner();
+        let action_type = action.r#type.clone();
+        let Some(_tag) = strip_action_type(&action_type) else {
+            return Err(Status::invalid_argument(format!(
+                "unrecognized action type {action_type}"
+            )));
+        };
+
+        let parsed = KrishivFlightAction::from_action_body(&action.body)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let response_body = self
+            .handle_krishiv_action(parsed)
+            .await
+            .map_err(|e| match e {
+                KrishivActionError::Status(status) => status,
+                KrishivActionError::Other(msg) => Status::internal(msg),
+            })?;
+        let result = arrow_flight::Result {
+            body: bytes::Bytes::from(response_body),
+        };
+        let stream: <Self as FlightService>::DoActionStream =
+            Box::pin(stream::iter(vec![Ok(result)]));
+        Ok(Response::new(stream))
+    }
+
+    async fn list_custom_actions(&self) -> Option<Vec<Result<arrow_flight::ActionType, Status>>> {
+        use krishiv_runtime::flight_action::{action_type as at, tags};
+        Some(
+            [
+                tags::REGISTER_PARQUET,
+                tags::CONTINUOUS_REGISTER,
+                tags::CONTINUOUS_PUSH,
+                tags::CONTINUOUS_DRAIN,
+                tags::BOUNDED_WINDOW,
+                tags::EXPLAIN,
+            ]
+            .iter()
+            .map(|tag| {
+                Ok(arrow_flight::ActionType {
+                    r#type: at(tag),
+                    description: format!("Krishiv {tag} action"),
+                })
+            })
+            .collect(),
+        )
+    }
+}
+
+/// Error type for Krishiv DoAction handlers.
+enum KrishivActionError {
+    Status(Status),
+    Other(String),
+}
+
+impl From<Status> for KrishivActionError {
+    fn from(s: Status) -> Self {
+        Self::Status(s)
+    }
+}
+
+impl KrishivFlightSqlService {
+    /// Dispatch a typed Krishiv DoAction into the execution host (B3, D2).
+    async fn handle_krishiv_action(
+        &self,
+        action: krishiv_runtime::KrishivFlightAction,
+    ) -> Result<Vec<u8>, KrishivActionError> {
+        use krishiv_runtime::KrishivFlightAction as A;
+
+        // Per-action dispatch.  Empty body on success unless the action
+        // produces record batches, in which case we return Arrow IPC bytes.
+        match action {
+            A::RegisterParquet(body) => {
+                // Stash the registration in the host's catalog.  We reuse the
+                // existing legacy path by handing it a synthetic comment.
+                let sql = krishiv_runtime::flight_protocol::encode_batch_sql(
+                    "SELECT 1 AS registered",
+                    &[krishiv_runtime::in_process::BatchSqlTable {
+                        table_name: body.table,
+                        path: body.path,
+                    }],
+                );
+                let _ = self
+                    .host
+                    .execute_sql(&sql)
+                    .await
+                    .map_err(KrishivActionError::Status)?;
+                Ok(Vec::new())
+            }
+            A::ContinuousRegister(body) => {
+                let cluster = self.host.cluster();
+                let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
+                let registry = self.host.continuous_registry();
+                let job_id = body.job_id.clone();
+                let job_id_for_blocking = job_id.clone();
+                let spec_copy = body.spec.clone();
+                tokio::task::spawn_blocking(move || {
+                    cluster.register_continuous_job(&job_id_for_blocking, &local)?;
+                    registry.register_job(job_id_for_blocking, spec_copy)
+                })
+                .await
+                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
+                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                Ok(Vec::new())
+            }
+            A::ContinuousPush(body) => {
+                let batches = krishiv_runtime::decode_batches(&body.batches_b64)
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                let cluster = self.host.cluster();
+                let registry = self.host.continuous_registry();
+                let job_id = body.job_id.clone();
+                let batches_for_cluster = batches.clone();
+                tokio::task::spawn_blocking(move || {
+                    cluster.push_continuous_input(&job_id, batches_for_cluster)?;
+                    registry.push_input(&job_id, batches)
+                })
+                .await
+                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
+                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                Ok(Vec::new())
+            }
+            A::ContinuousDrain(body) => {
+                let cluster = self.host.cluster();
+                let job_id = body.job_id.clone();
+                let batches =
+                    tokio::task::spawn_blocking(move || cluster.drain_continuous_job(&job_id))
+                        .await
+                        .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
+                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                encode_batches_ipc_bytes(&batches)
+            }
+            A::BoundedWindow(body) => {
+                let input_batches = krishiv_runtime::decode_batches(&body.batches_b64)
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                let cluster = self.host.cluster();
+                let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
+                let topic = body.topic.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    cluster.collect_bounded_window(&topic, input_batches, &local)
+                })
+                .await
+                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
+                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                encode_batches_ipc_bytes(&result)
+            }
+            A::Explain(body) => {
+                let text = krishiv_sql::explain_sql(&body.sql)
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                Ok(text.into_bytes())
+            }
+        }
+    }
+}
+
+fn encode_batches_ipc_bytes(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = batches[0].schema();
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
+            .map_err(|e| KrishivActionError::Other(format!("ipc encode: {e}")))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| KrishivActionError::Other(format!("ipc write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| KrishivActionError::Other(format!("ipc finish: {e}")))?;
+    }
+    Ok(buf)
 }
 
 /// Build a gRPC `FlightServiceServer` wrapping `KrishivFlightSqlService`.
@@ -464,6 +650,57 @@ mod tests {
         // At minimum a schema FlightData item is returned
         assert!(!items.is_empty());
         assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn do_action_explain_round_trip() {
+        // B3/D2: the typed DoAction path returns the explain text as raw
+        // bytes inside arrow_flight::Result.body — no SQL involved on the
+        // wire, no comment-injection surface.
+        use krishiv_runtime::{ExplainBody, KrishivFlightAction};
+
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let action = KrishivFlightAction::Explain(ExplainBody {
+            sql: "SELECT 1 AS n".into(),
+        });
+        let req = arrow_flight::Action {
+            r#type: action.action_type(),
+            body: action.to_action_body().unwrap().into(),
+        };
+        let resp = svc
+            .do_action_fallback(Request::new(req))
+            .await
+            .expect("do_action_fallback");
+        let parts: Vec<_> = resp.into_inner().collect().await;
+        assert!(!parts.is_empty());
+        let first = parts.into_iter().next().unwrap().unwrap();
+        assert!(!first.body.is_empty());
+        let text = std::str::from_utf8(&first.body).unwrap();
+        // explain text comes from DataFusion; should at least include 'Projection' or similar.
+        assert!(!text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn do_action_rejects_unknown_type() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let req = arrow_flight::Action {
+            r#type: "unknown.action".to_string(),
+            body: bytes::Bytes::new(),
+        };
+        let result = svc.do_action_fallback(Request::new(req)).await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_custom_actions_lists_krishiv_types() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let listed = svc.list_custom_actions().await.expect("listed");
+        assert!(listed.iter().any(|r| {
+            r.as_ref()
+                .map(|a| a.r#type == "krishiv.v1.explain")
+                .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]
