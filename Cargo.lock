@@ -4198,6 +4198,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-sql",
  "krishiv-state",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "tokio",

@@ -12,6 +12,7 @@ use std::fmt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
 pub mod continuous_stream;
+mod coordinator_http_client;
 pub mod execution_runtime;
 pub mod flight_action;
 mod flight_client;
@@ -23,6 +24,7 @@ mod plan;
 pub mod stream_kafka;
 
 pub use continuous_stream::ContinuousStreamRegistry;
+pub use coordinator_http_client::execute_coordinator_batch_sql;
 pub use execution_runtime::{
     BatchTableRegistration, ClusterEndpoints, ExecutionRuntime, InProcessExecutionRuntime,
     RemoteExecutionRuntime, RuntimeMode, build_execution_runtime,

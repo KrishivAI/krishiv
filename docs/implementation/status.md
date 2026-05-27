@@ -2,6 +2,31 @@
 
 ## Current Phase
 
+**Unified sprint sweep — Flight→CCP proxy, typed fragments, multi-stage jobs (2026-05-27).**
+
+Branch `cursor/full-unified-sprints-5e3d`:
+
+| Sprint | Summary |
+|--------|---------|
+| A0.1 | `POST /api/v1/batch-sql` on coordinator HTTP; `FlightExecutionHost` routes SQL through `KRISHIV_COORDINATOR_HTTP` when set; `krishiv local start` exports HTTP to flight-server |
+| A0.2/A0.3 | Inline Arrow IPC on `TaskOutputMetadata`; coordinator `job_inline_results`; executor encodes SQL batches to IPC; SingleNode + coordinator URL defaults `remote_execution=true` |
+| B | `EtcdMetadataStore` (`--metadata-backend etcd`, snapshot key `/krishiv/metadata/snapshot`) |
+| C | `TypedTaskFragment` + `encode_typed_task_fragment`; multi-stage `job_spec_from_physical_plan` at `NodeOp::Exchange` boundaries; `ExecutionModel` uses typed kind; streaming tasks report `Running` until bounded/continuous terminal |
+| Runtime | `execute_coordinator_batch_sql` HTTP client in `krishiv-runtime` |
+
+Validation:
+
+```bash
+export TMPDIR=/workspace/.tmp PROTOC=/usr/bin/protoc
+cargo test -p krishiv-scheduler -p krishiv-executor -p krishiv-runtime \
+  -p krishiv-flight-sql -p krishiv-plan --lib --features etcd
+# scheduler: 116 passed; executor/runtime/flight/plan: all passed
+```
+
+**Next:** Session `submit_job`/`JobHandle` over management gRPC; federation `spec_json` → real `JobSpec` deserialize; Flight `DoPut`/`DoExchange` for streaming payloads; distributed e2e with live clusterd+executor.
+
+---
+
 **Bare-metal CCP HA — etcd lease election (2026-05-27).**
 
 - `EtcdLeaseElection` (`krishiv-scheduler`, feature `etcd`) implements `LeaderElection` via etcd v3 lease + `/krishiv/ccp/leader` key.

@@ -226,6 +226,8 @@ impl SessionBuilder {
                 self.remote_execution
             } else {
                 matches!(self.mode, ExecutionMode::Distributed)
+                    || (matches!(self.mode, ExecutionMode::SingleNode)
+                        && self.coordinator_url.is_some())
             };
 
         if matches!(self.mode, ExecutionMode::Distributed) && self.coordinator_url.is_none() {

@@ -3774,4 +3774,31 @@ mod scheduler_tests {
 
         assert!(coordinator2.job_detail_snapshot(&job_id).is_ok());
     }
+
+    #[test]
+    fn batch_sql_decode_inline_ipc_roundtrip() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        use crate::batch_sql::decode_inline_record_batches;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![7_i64])) as _],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let decoded = decode_inline_record_batches(&[buf]).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].num_rows(), 1);
+    }
 }

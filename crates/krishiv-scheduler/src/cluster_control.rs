@@ -103,9 +103,9 @@ impl ClusterControlPlane {
 
     /// Build a CCP that uses a caller-supplied [`LeaderElection`] (A1).
     ///
-/// Distributed deployments inject their own implementation here: `EtcdLeaseElection`
-/// on bare metal (`--leader-backend etcd`) and `K8sLeaseElection` in Kubernetes.
-/// Embedded and single-node continue to use the default [`SingleNodeLeader`].
+    /// Distributed deployments inject their own implementation here: `EtcdLeaseElection`
+    /// on bare metal (`--leader-backend etcd`) and `K8sLeaseElection` in Kubernetes.
+    /// Embedded and single-node continue to use the default [`SingleNodeLeader`].
     pub fn from_shared_with_leader(
         coordinator_id: CoordinatorId,
         shared: SharedCoordinator,

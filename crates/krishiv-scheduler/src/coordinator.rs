@@ -84,6 +84,10 @@ pub struct Coordinator {
     pub(crate) barrier_dispatch_sent: HashSet<(JobId, u64)>,
     /// Aggregates LLM quota reports across executors (R17).
     pub(crate) llm_quota_aggregator: llm_quota::LlmQuotaAggregator,
+    /// Inline Arrow IPC result batches keyed by job id (terminal SQL/window collect).
+    pub(crate) job_inline_results: HashMap<JobId, Vec<Vec<u8>>>,
+    /// Parquet tables registered for coordinated `batch-sql` jobs.
+    pub(crate) batch_sql_job_tables: HashMap<JobId, Vec<crate::batch_sql::BatchSqlTable>>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -96,6 +100,7 @@ impl fmt::Debug for Coordinator {
             .field("jobs", &self.jobs)
             .field("store", &self.store.as_ref().map(|_| "<store>"))
             .field("streaming_task_index_len", &self.streaming_task_index.len())
+            .field("job_inline_results_len", &self.job_inline_results.len())
             .finish()
     }
 }
@@ -271,7 +276,14 @@ impl Coordinator {
                 config.llm_quota_requests_per_minute(),
                 config.llm_quota_tokens_per_minute(),
             ),
+            job_inline_results: HashMap::new(),
+            batch_sql_job_tables: HashMap::new(),
         }
+    }
+
+    /// Take inline Arrow IPC result batches for a completed job.
+    pub fn take_job_inline_results(&mut self, job_id: &JobId) -> Option<Vec<Vec<u8>>> {
+        self.job_inline_results.remove(job_id)
     }
 
     /// Create a new active coordinator with a process-unique identifier.
@@ -1156,15 +1168,24 @@ impl Coordinator {
     }
 
     /// Launch all assigned tasks for a job and return executor transport assignments.
+    pub fn register_batch_sql_tables(
+        &mut self,
+        job_id: JobId,
+        tables: Vec<crate::batch_sql::BatchSqlTable>,
+    ) {
+        self.batch_sql_job_tables.insert(job_id, tables);
+    }
+
     pub fn launch_assigned_task_assignments(
         &mut self,
         job_id: &JobId,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         self.ensure_active()?;
         let executor_leases = self.executors.assignment_leases();
+        let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();
         let assignments = self
             .find_job_mut(job_id)?
-            .launch_assigned_task_assignments(&executor_leases)?;
+            .launch_assigned_task_assignments(&executor_leases, batch_tables.as_deref())?;
         // GAP-OB-01: Increment tasks_assigned counter.
         TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
         Ok(assignments)
@@ -1397,7 +1418,18 @@ impl Coordinator {
         self.executors
             .validate_lease(update.executor_id(), update.lease_generation())?;
         let job_id = update.job_id().clone();
+        let inline_ipc = update
+            .output_metadata()
+            .map(|meta| meta.inline_record_batch_ipc().to_vec())
+            .unwrap_or_default();
+        let terminal_state = update.state();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
+        if terminal_state == TaskState::Succeeded && !inline_ipc.is_empty() {
+            self.job_inline_results
+                .entry(job_id.clone())
+                .or_default()
+                .extend(inline_ipc);
+        }
 
         // Snapshot the job's current state and resource usage after the update.
         let (is_terminal, usage) = self
@@ -1548,7 +1580,7 @@ impl Coordinator {
         }
     }
 
-    fn ensure_active(&self) -> SchedulerResult<()> {
+    pub(crate) fn ensure_active(&self) -> SchedulerResult<()> {
         if self.state == CoordinatorState::Active {
             Ok(())
         } else {

@@ -164,6 +164,28 @@ impl ExecutorTaskRunReport {
     }
 }
 
+/// Encode record batches as Arrow IPC stream bytes for coordinator inline results.
+fn encode_record_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>, String> {
+    use arrow::ipc::writer::StreamWriter;
+
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = batches[0].schema();
+    let mut buf = Vec::new();
+    {
+        let mut writer =
+            StreamWriter::try_new(&mut buf, &schema).map_err(|e| format!("ipc writer: {e}"))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| format!("ipc write batch: {e}"))?;
+        }
+        writer.finish().map_err(|e| format!("ipc finish: {e}"))?;
+    }
+    Ok(vec![buf])
+}
+
 /// Local executor output metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorTaskOutput {
@@ -311,6 +333,11 @@ impl ExecutorTaskOutput {
         }
         if let Some(stats) = &self.runtime_stats {
             meta = meta.with_runtime_stats(stats.clone());
+        }
+        if !self.record_batches.is_empty() {
+            if let Ok(ipc) = encode_record_batches_ipc(&self.record_batches) {
+                meta = meta.with_inline_record_batch_ipc(ipc);
+            }
         }
         meta
     }
@@ -740,21 +767,39 @@ impl ExecutorTaskRunner {
             }
         };
 
+        let fragment = assignment.plan_fragment().description().trim();
+        let terminal_streaming_task = model == crate::ExecutionModel::Streaming
+            && (fragment.starts_with("stream:continuous:")
+                || krishiv_plan::window::parse_stream_fragment(fragment).is_ok());
+        let terminal_state =
+            if model == crate::ExecutionModel::Streaming && !terminal_streaming_task {
+                TaskState::Running
+            } else {
+                TaskState::Succeeded
+            };
+        let terminal_message = if terminal_state == TaskState::Running {
+            "streaming operator active"
+        } else {
+            "executor completed stage-local fragment"
+        };
+
         let terminal = self
             .send_task_status(
                 &assignment,
-                TaskState::Succeeded,
-                "executor completed stage-local fragment",
+                terminal_state,
+                terminal_message,
                 coordinator,
                 Some(output.to_task_output_metadata()),
             )
             .await?;
         crate::fragment::common::ensure_status_accepted_or_duplicate(
             terminal.disposition(),
-            TaskState::Succeeded,
+            terminal_state,
         )?;
 
-        self.clear_running_attempt(&assignment);
+        if terminal_state == TaskState::Succeeded {
+            self.clear_running_attempt(&assignment);
+        }
 
         Ok(ExecutorTaskRunReport::new(
             assignment,

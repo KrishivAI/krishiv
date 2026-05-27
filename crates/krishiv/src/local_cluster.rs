@@ -78,6 +78,7 @@ pub fn local_help() -> String {
          \n\
          After start, use:\n\
            export KRISHIV_COORDINATOR=http://127.0.0.1:50051\n\
+           (flight-server uses KRISHIV_COORDINATOR_HTTP=http://127.0.0.1:18080 for executor-backed SQL)\n\
           krishiv sql --mode single-node --query 'SELECT 1'\n\
          \n\
          Web UI:\n\
@@ -206,10 +207,14 @@ fn run_local_start(args: &[&str]) -> CliResponse {
 
     std::thread::sleep(std::time::Duration::from_millis(500));
 
+    let coordinator_http = format!("http://{http_addr}");
     let flight_pid = match spawn_krishiv_daemon_with_env(
         "flight-server",
         &[],
-        &[("KRISHIV_FLIGHT_ADDR", "127.0.0.1:50051")],
+        &[
+            ("KRISHIV_FLIGHT_ADDR", "127.0.0.1:50051"),
+            ("KRISHIV_COORDINATOR_HTTP", coordinator_http.as_str()),
+        ],
     ) {
         Ok(pid) => pid,
         Err(e) => {

@@ -20,13 +20,13 @@ use tokio::time::{Duration, interval};
 #[cfg(feature = "sqlite")]
 use crate::SqliteMetadataStore;
 use crate::{
-    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore,
+    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore, LeaderElection,
     SharedCoordinator, SingleNodeLeader, StabilityMetrics, scheduler_metrics,
-    serve_coordinator_executor_grpc_with_listener, LeaderElection,
+    serve_coordinator_executor_grpc_with_listener,
 };
 
 #[cfg(feature = "etcd")]
-use crate::EtcdLeaseElection;
+use crate::{EtcdLeaseElection, EtcdMetadataStore};
 
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,10 +55,9 @@ pub async fn build_leader_election(
     match config.leader_backend.as_str() {
         "single" => Ok(Arc::new(SingleNodeLeader::new())),
         "etcd" => build_etcd_leader_election(config).await,
-        other => Err(format!(
-            "unknown --leader-backend '{other}' (supported: single, etcd)"
-        )
-        .into()),
+        other => {
+            Err(format!("unknown --leader-backend '{other}' (supported: single, etcd)").into())
+        }
     }
 }
 
@@ -84,14 +83,19 @@ async fn build_etcd_leader_election(
     #[cfg(not(feature = "etcd"))]
     {
         let _ = config;
-        Err(
-            "etcd leader election requires building krishiv-scheduler with feature `etcd`".into(),
-        )
+        Err("etcd leader election requires building krishiv-scheduler with feature `etcd`".into())
     }
 }
 
 /// Build a shared coordinator from daemon configuration.
 pub fn build_shared_coordinator(
+    config: &CoordinatorDaemonConfig,
+) -> Result<SharedCoordinator, Box<dyn Error>> {
+    build_shared_coordinator_sync(config)
+}
+
+/// Synchronous entry used by binaries; etcd metadata uses a blocking connect.
+pub fn build_shared_coordinator_sync(
     config: &CoordinatorDaemonConfig,
 ) -> Result<SharedCoordinator, Box<dyn Error>> {
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
@@ -100,6 +104,29 @@ pub fn build_shared_coordinator(
     let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {
         (Some("memory"), _) | (None, None) => {
             SharedCoordinator::new(coord.with_store(InMemoryMetadataStore::default()))
+        }
+        #[cfg(feature = "etcd")]
+        (Some("etcd"), _) => {
+            if config.etcd_endpoints.is_empty() {
+                return Err(
+                    "--metadata-backend etcd requires --etcd-endpoints (or KRISHIV_ETCD_ENDPOINTS)"
+                        .into(),
+                );
+            }
+            let store = futures::executor::block_on(EtcdMetadataStore::connect(
+                config.etcd_endpoints.clone(),
+            ))
+            .map_err(|e| format!("etcd metadata store: {e}"))?;
+            coord
+                .recover_from_store(&store)
+                .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+            SharedCoordinator::new(coord.with_store(store))
+        }
+        #[cfg(not(feature = "etcd"))]
+        (Some("etcd"), _) => {
+            return Err(
+                "etcd metadata requires building krishiv-scheduler with feature `etcd`".into(),
+            );
         }
         (backend, Some(path)) => {
             let path = path.to_string_lossy();
@@ -131,7 +158,7 @@ pub fn build_shared_coordinator(
         }
         (Some(unknown), _) => {
             return Err(format!(
-                "unknown --metadata-backend '{unknown}'; supported: memory, json, sqlite"
+                "unknown --metadata-backend '{unknown}'; supported: memory, json, sqlite, etcd"
             )
             .into());
         }
@@ -222,6 +249,7 @@ pub async fn spawn_coordinator_sidecars(
 }
 
 pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
+    use crate::batch_sql_http::api_batch_sql;
     use crate::federation_http::{
         federation_cancel_job, federation_job_status, federation_submit_job,
     };
@@ -236,6 +264,7 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route("/ui", get(live_ui))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
+        .route("/api/v1/batch-sql", post(api_batch_sql))
         .route("/federation/v1/jobs", post(federation_submit_job))
         .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
         .route(
@@ -606,7 +635,7 @@ pub fn coordinator_daemon_help() -> &'static str {
        --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:9090)\n\
        --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
-       --metadata-backend <TYPE>   memory | json | sqlite\n\
+       --metadata-backend <TYPE>   memory | json | sqlite | etcd\n\
        --metadata-path <PATH>      Durable metadata path (required for json/sqlite)\n\
        --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
        --etcd-endpoints <HOSTS>    Comma-separated etcd URLs (KRISHIV_ETCD_ENDPOINTS)\n\

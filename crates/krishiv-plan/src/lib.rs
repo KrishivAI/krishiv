@@ -12,11 +12,15 @@ pub mod lowering;
 pub mod r17;
 pub mod streaming;
 pub mod streaming_plan;
+pub mod task_fragment;
 pub mod window;
 pub use lowering::{decode_task_fragment, encode_task_fragment};
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
     RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
+};
+pub use task_fragment::{
+    TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
 };
 
 /// Data type for a plan schema field.

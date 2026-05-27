@@ -12,15 +12,19 @@ pub mod auth;
 pub mod config;
 pub mod coordinator;
 pub mod error;
-pub mod grpc;
-pub mod leadership;
 #[cfg(feature = "etcd")]
 pub mod etcd_lease;
+#[cfg(feature = "etcd")]
+pub mod etcd_metadata;
+pub mod grpc;
+pub mod leadership;
 pub mod metrics;
 
 pub mod barrier_client;
 pub mod barrier_dispatch;
 pub mod barrier_tracker;
+pub mod batch_sql;
+pub mod batch_sql_http;
 pub mod checkpoint;
 pub mod cluster_control;
 pub mod coordinator_daemon;
@@ -44,18 +48,25 @@ pub use admission::{
 pub use auth::{AuthContext, extract_auth_context, set_grpc_auth_provider, validate_grpc_auth};
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
+pub use batch_sql::{
+    BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches, execute_batch_sql_coordinated,
+};
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
 pub use coordinator::{Coordinator, SharedCoordinator};
 pub use coordinator_daemon::{
-    CoordinatorDaemonConfig, JobCoordinatorDaemonConfig, build_shared_coordinator,
-    coordinator_daemon_help, coordinator_http_router, job_coordinator_daemon_help,
-    build_leader_election, parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
-    run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
-    run_standalone_coordinator, spawn_coordinator_sidecars,
+    CoordinatorDaemonConfig, JobCoordinatorDaemonConfig, build_leader_election,
+    build_shared_coordinator, coordinator_daemon_help, coordinator_http_router,
+    job_coordinator_daemon_help, parse_coordinator_daemon_config,
+    parse_job_coordinator_daemon_config, run_cluster_control_plane, run_clusterd_daemon,
+    run_job_coordinator_daemon, run_standalone_coordinator, spawn_coordinator_sidecars,
 };
 pub use error::{SchedulerError, SchedulerResult, TaskUpdateOutcome};
+#[cfg(feature = "etcd")]
+pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
+#[cfg(feature = "etcd")]
+pub use etcd_metadata::EtcdMetadataStore;
 pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,
     CoordinatorManagementGrpcService, coordinator_executor_grpc_server,
@@ -75,8 +86,6 @@ pub use job::{
 };
 pub use job_coordinator::JobCoordinator;
 pub use leadership::{LeaderElection, SingleNodeElection};
-#[cfg(feature = "etcd")]
-pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
 #[cfg(feature = "sqlite")]
 pub use store::SqliteMetadataStore;

@@ -511,6 +511,7 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
         output_rows: value.runtime_stats().map_or(0, |s| s.output_rows),
         cpu_nanos: value.runtime_stats().map_or(0, |s| s.cpu_nanos),
         spill_bytes: value.runtime_stats().map_or(0, |s| s.spill_bytes),
+        inline_record_batch_ipc: value.inline_record_batch_ipc().to_vec(),
     }
 }
 
@@ -533,6 +534,9 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
     );
     if !shuffle_partitions.is_empty() {
         meta = meta.with_shuffle_partitions(shuffle_partitions);
+    }
+    if !value.inline_record_batch_ipc.is_empty() {
+        meta = meta.with_inline_record_batch_ipc(value.inline_record_batch_ipc);
     }
     let has_stats = value.input_rows > 0
         || value.output_rows > 0
