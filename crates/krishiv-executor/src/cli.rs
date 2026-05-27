@@ -3,6 +3,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::grpc_client::SharedLeaseGeneration;
@@ -50,8 +51,10 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<
             "Krishiv executor HTTP listening on {}",
             listener.local_addr().unwrap()
         );
+        let http_executor_id = runtime.config().executor_id().to_owned();
+        let http_slots = slots;
         tokio::spawn(async move {
-            let router = executor_http_router();
+            let router = executor_http_router(http_executor_id, http_slots);
             let _ = axum::serve(listener, router).await;
         });
     }
@@ -74,20 +77,27 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<
     }
 }
 
-fn executor_http_router() -> Router {
+fn executor_http_router(executor_id: String, slots: usize) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(|| async { "ready\n" }))
-        .route("/metrics", get(executor_metrics))
+        .route(
+            "/metrics",
+            get(move || executor_metrics(executor_id.clone(), slots)),
+        )
 }
 
-async fn executor_metrics() -> impl IntoResponse {
-    let body = "\
+async fn executor_metrics(executor_id: String, slots: usize) -> impl IntoResponse {
+    let body = format!(
+        "\
 # HELP krishiv_executor_up Executor process is running
 # TYPE krishiv_executor_up gauge
-krishiv_executor_up 1
+krishiv_executor_up{{executor_id=\"{executor_id}\"}} 1
+# HELP krishiv_executor_slots_total Total task slots configured
+# TYPE krishiv_executor_slots_total gauge
+krishiv_executor_slots_total{{executor_id=\"{executor_id}\"}} {slots}
 "
-    .to_owned();
+    );
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
@@ -205,10 +215,12 @@ async fn heartbeat_loop(
             let _ = serve_executor_task_grpc_with_listener(listener, server_inbox).await;
         });
     }
+    let barrier_injector: SharedBarrierInjector = Default::default();
     if let Some(listener) = barrier_listener {
-        let injector: SharedBarrierInjector = Default::default();
-        let barrier_service =
-            ExecutorBarrierService::new(injector, runtime.config().executor_id().as_str());
+        let barrier_service = ExecutorBarrierService::new(
+            barrier_injector.clone(),
+            runtime.config().executor_id().as_str(),
+        );
         tokio::spawn(async move {
             let _ = Server::builder()
                 .add_service(executor_barrier_grpc_server(barrier_service))
@@ -228,8 +240,9 @@ async fn heartbeat_loop(
     // operators that exchange partitions between executors (B5).  When no
     // `--shuffle-dir` is provided we still create an in-memory shuffle store so
     // R4a typed shuffle write/read tasks succeed for tests.
-    let mut runner_builder =
-        ExecutorTaskRunner::new(inbox.clone()).with_live_lease(shared_lease.clone());
+    let mut runner_builder = ExecutorTaskRunner::new(inbox.clone())
+        .with_live_lease(shared_lease.clone())
+        .with_barrier_injector(barrier_injector);
     if let Some(dir) = &shuffle_dir {
         let disk = Arc::new(
             LocalDiskShuffleStore::new(dir)
@@ -257,12 +270,29 @@ async fn heartbeat_loop(
     // Spawn `slots` concurrent runner tasks all reading from the same inbox
     // (B6): without this the executor processes one task at a time regardless
     // of the advertised slot count.
+    let shutdown = Arc::new(AtomicBool::new(false));
     let effective_slots = slots.max(1);
+    let storage_for_tasks = Arc::clone(&checkpoint_storage);
+    let backend_for_tasks = Arc::clone(&state_backend);
     for slot_idx in 0..effective_slots {
         let runner_loop = Arc::clone(&runner);
         let coord = Arc::clone(&coord_service);
+        let storage = Arc::clone(&storage_for_tasks);
+        let backend = Arc::clone(&backend_for_tasks);
+        let shutdown_flag = Arc::clone(&shutdown);
         tokio::spawn(async move {
             loop {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    tracing::info!(slot = slot_idx, "runner shutting down");
+                    break;
+                }
+
+                // Drain any pending barriers from the gRPC injector before
+                // picking up the next task assignment.
+                runner_loop
+                    .drain_pending_barriers(backend.as_ref(), storage.as_ref(), coord.as_ref())
+                    .await;
+
                 match runner_loop.run_next_with(coord.as_ref()).await {
                     Ok(Some(_report)) => {}
                     Ok(None) => {
@@ -349,6 +379,10 @@ async fn heartbeat_loop(
             }
             _ = sigterm.recv() => {
                 println!("SIGTERM received — deregistering and shutting down");
+                shutdown.store(true, Ordering::Relaxed);
+                // Give in-flight tasks a brief window to observe the shutdown
+                // flag before we tear down the gRPC channel.
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 let _ = runtime.deregister_with_grpc_endpoint().await;
                 return Ok(());
             }

@@ -12,14 +12,14 @@ use krishiv_checkpoint::{CheckpointStorage, snapshot_path};
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
     CoordinatorExecutorService, ExecutorTaskAssignment, InitiateCheckpointRequest,
-    InputPartitionDescriptor, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats,
+    InputPartitionDescriptor, JobId, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats,
     TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
 use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
 
 use crate::{
-    ExecutorAssignmentInbox, ExecutorError, ExecutorResult,
+    ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierInjector,
     fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
 
@@ -545,6 +545,11 @@ pub struct ExecutorTaskRunner {
     /// Used to stamp checkpoint-fanout RPCs without round-tripping through
     /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
     pub(crate) live_lease: crate::grpc_client::SharedLeaseGeneration,
+
+    /// Shared barrier injector fed by the gRPC `BarrierService`.  Barriers
+    /// enqueued here are drained by the runner loop and trigger checkpoint
+    /// initiation.
+    pub(crate) barrier_injector: Option<SharedBarrierInjector>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -587,6 +592,7 @@ impl ExecutorTaskRunner {
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),
             ),
+            barrier_injector: None,
         }
     }
 
@@ -594,6 +600,13 @@ impl ExecutorTaskRunner {
     /// executor lease rather than `LeaseGeneration::initial()` (B10).
     pub fn with_live_lease(mut self, lease: crate::grpc_client::SharedLeaseGeneration) -> Self {
         self.live_lease = lease;
+        self
+    }
+
+    /// Attach a shared barrier injector so barriers received via gRPC are
+    /// consumed by the runner loop and trigger checkpoint initiation.
+    pub fn with_barrier_injector(mut self, injector: SharedBarrierInjector) -> Self {
+        self.barrier_injector = Some(injector);
         self
     }
 
@@ -977,6 +990,37 @@ impl ExecutorTaskRunner {
             }
         }
         Ok(())
+    }
+
+    /// Drain all pending barriers from the shared injector and initiate
+    /// checkpoints for each one.  Called from the runner loop in `cli.rs`.
+    pub async fn drain_pending_barriers<S>(
+        &self,
+        state_backend: &dyn StateBackend,
+        storage: &(impl CheckpointStorage + ?Sized),
+        coordinator: &S,
+    ) where
+        S: CoordinatorExecutorService,
+    {
+        let Some(ref injector) = self.barrier_injector else {
+            return;
+        };
+        while let Some(barrier) = injector.next_barrier() {
+            let Ok(job_id) = JobId::try_new(&barrier.job_id) else {
+                continue;
+            };
+            let req = InitiateCheckpointRequest {
+                job_id,
+                epoch: barrier.epoch,
+                fencing_token: 0,
+            };
+            if let Err(e) = self
+                .initiate_checkpoint_for_job(&req, state_backend, storage, coordinator)
+                .await
+            {
+                tracing::warn!(error = %e, "barrier checkpoint failed");
+            }
+        }
     }
 }
 
