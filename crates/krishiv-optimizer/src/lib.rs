@@ -550,7 +550,7 @@ impl Default for AqeOptimizer {
 
 // ── Production optimizer rules (P2-3) ───────────────────────────────────────────
 
-/// Remove duplicate column names from `Project` nodes.
+/// Remove duplicate column names from `Project` nodes while preserving original order.
 pub struct ProjectionPruningRule;
 
 impl OptimizerRule for ProjectionPruningRule {
@@ -563,10 +563,11 @@ impl OptimizerRule for ProjectionPruningRule {
         let mut changed = false;
         for node in &mut nodes {
             if let Some(NodeOp::Project { columns }) = node.op() {
+                let original_len = columns.len();
+                let mut seen = std::collections::HashSet::new();
                 let mut pruned = columns.clone();
-                pruned.sort();
-                pruned.dedup();
-                if pruned.len() != columns.len() {
+                pruned.retain(|c| seen.insert(c.clone()));
+                if pruned.len() != original_len {
                     changed = true;
                     *node = node.clone().with_op(NodeOp::Project { columns: pruned });
                 }
@@ -582,7 +583,17 @@ impl OptimizerRule for ProjectionPruningRule {
     }
 }
 
-/// Move `Filter` nodes before `Join` when the filter only depends on the scan side.
+/// Push `Filter` predicates down into `TableScan` nodes.
+///
+/// Walks the logical plan looking for `Filter` nodes whose direct input is a
+/// `Scan` node. The filter's predicate is decomposed into AND-conjuncts, and
+/// any conjuncts that reference only columns present in the scan's output
+/// schema are pushed into the scan node's `filters` list. If all conjuncts
+/// are pushed, the `Filter` node is removed from the plan; remaining conjuncts
+/// stay in place.
+///
+/// Pushdown through join nodes is not yet implemented — only the
+/// Filter-above-Scan pattern is handled.
 pub struct PredicatePushdownRule;
 
 impl OptimizerRule for PredicatePushdownRule {
@@ -590,13 +601,181 @@ impl OptimizerRule for PredicatePushdownRule {
         "predicate-pushdown"
     }
 
-    /// No-op: predicate pushdown requires expression-column-provenance analysis
-    /// to avoid incorrect results. The flat-list reordering below is commented out
-    /// because it moves any filter below any join without checking whether the
-    /// filter's predicate references columns from only one side of the join.
-    fn apply(&self, _plan: &LogicalPlan) -> Option<LogicalPlan> {
-        None
+    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let nodes = plan.nodes().to_vec();
+        let id_to_idx: std::collections::HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id(), i))
+            .collect();
+
+        // Collect pushdown candidates: filter nodes whose input is a scan.
+        struct Pushdown {
+            filter_idx: usize,
+            scan_idx: usize,
+            pushable: Vec<String>,
+            remaining: Vec<String>,
+        }
+
+        let mut pushdowns: Vec<Pushdown> = Vec::new();
+
+        for (i, node) in nodes.iter().enumerate() {
+            let predicate = match node.op() {
+                Some(NodeOp::Filter { predicate }) => predicate.clone(),
+                _ => continue,
+            };
+
+            let scan_info = node
+                .inputs()
+                .iter()
+                .filter_map(|input_id| id_to_idx.get(input_id.as_str()).copied())
+                .find(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Scan { .. })));
+
+            let Some(scan_idx) = scan_info else {
+                continue;
+            };
+            let scan_node = &nodes[scan_idx];
+
+            let conjuncts: Vec<&str> = predicate
+                .split(" AND ")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if conjuncts.is_empty() {
+                continue;
+            }
+
+            let scan_columns: Vec<&str> = scan_node
+                .output_schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect();
+
+            let mut pushable: Vec<String> = Vec::new();
+            let mut remaining: Vec<String> = Vec::new();
+
+            for conjunct in &conjuncts {
+                let cols = extract_column_refs(conjunct);
+                let can_push = !cols.is_empty()
+                    && cols.iter().all(|c| column_belongs_to_scan(c, &scan_columns));
+
+                if can_push {
+                    pushable.push(conjunct.to_string());
+                } else {
+                    remaining.push(conjunct.to_string());
+                }
+            }
+
+            if !pushable.is_empty() {
+                pushdowns.push(Pushdown {
+                    filter_idx: i,
+                    scan_idx,
+                    pushable,
+                    remaining,
+                });
+            }
+        }
+
+        if pushdowns.is_empty() {
+            return None;
+        }
+
+        let mut new_nodes = nodes.clone();
+        let mut to_remove: Vec<usize> = Vec::new();
+
+        for pd in &pushdowns {
+            // Push conjuncts into the scan node's filters list.
+            if let Some(NodeOp::Scan { table, filters }) = new_nodes[pd.scan_idx].op() {
+                let mut new_filters = filters.clone();
+                new_filters.extend(pd.pushable.iter().cloned());
+                new_nodes[pd.scan_idx] = new_nodes[pd.scan_idx]
+                    .clone()
+                    .with_op(NodeOp::Scan {
+                        table: table.clone(),
+                        filters: new_filters,
+                    });
+            }
+
+            if pd.remaining.is_empty() {
+                to_remove.push(pd.filter_idx);
+            } else {
+                new_nodes[pd.filter_idx] = new_nodes[pd.filter_idx]
+                    .clone()
+                    .with_op(NodeOp::Filter {
+                        predicate: pd.remaining.join(" AND "),
+                    });
+            }
+        }
+
+        // Remove filter nodes and rewire downstream node inputs.
+        for &idx in to_remove.iter().rev() {
+            let filter_id = new_nodes[idx].id().to_string();
+            let filter_inputs: Vec<String> = new_nodes[idx].inputs().to_vec();
+            new_nodes.remove(idx);
+
+            for node in &mut new_nodes {
+                let inputs: Vec<String> = node.inputs().to_vec();
+                if inputs.contains(&filter_id) {
+                    let new_inputs: Vec<String> = inputs
+                        .iter()
+                        .flat_map(|input| {
+                            if input == &filter_id {
+                                filter_inputs.clone()
+                            } else {
+                                vec![input.clone()]
+                            }
+                        })
+                        .collect();
+                    *node = node.clone().with_inputs(new_inputs);
+                }
+            }
+        }
+
+        let mut out = LogicalPlan::new(plan.name(), plan.kind());
+        for node in new_nodes {
+            out.add_node(node);
+        }
+        Some(out)
     }
+}
+
+/// Extract likely column-name identifiers from a predicate expression string.
+///
+/// Splits on non-alphanumeric characters (except `_` and `.`) and keeps tokens
+/// that contain at least one ASCII letter and are not SQL reserved words.
+fn extract_column_refs(predicate: &str) -> Vec<String> {
+    const SQL_KEYWORDS: &[&str] = &[
+        "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "WHERE", "SELECT", "FROM",
+        "AS", "ON", "BETWEEN", "LIKE", "EXISTS", "HAVING", "GROUP", "ORDER", "BY", "ASC",
+        "DESC", "LIMIT", "OFFSET", "DISTINCT", "ALL", "ANY", "SOME", "CASE", "WHEN", "THEN",
+        "ELSE", "END", "CAST",
+    ];
+
+    let mut refs: Vec<String> = predicate
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .filter(|w| !w.is_empty())
+        .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
+        .filter(|w| !SQL_KEYWORDS.contains(&w.to_uppercase().as_str()))
+        .map(|w| w.to_string())
+        .collect();
+
+    refs.dedup();
+    refs
+}
+
+/// Check whether `col` (possibly qualified like `"t.id"`) matches any of the
+/// scan's column names, either by full match or by unqualified suffix.
+fn column_belongs_to_scan(col: &str, scan_columns: &[&str]) -> bool {
+    if scan_columns.contains(&col) {
+        return true;
+    }
+    if let Some(dot_pos) = col.rfind('.') {
+        let unqualified = &col[dot_pos + 1..];
+        return scan_columns.contains(&unqualified);
+    }
+    false
 }
 
 /// Drop no-op `Project` nodes that select zero columns.
@@ -640,7 +819,7 @@ pub fn default_logical_optimizer() -> Optimizer {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
+    use krishiv_plan::{ExecutionKind, FieldType, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
 
     use super::{
         AqeOptimizer, AqeRule, CoalesceRule, Optimizer, OptimizerRule, RuntimeStats,
@@ -1158,6 +1337,217 @@ mod tests {
         assert_eq!(
             rewritten, plan_clone,
             "plan must be unchanged when no partitions are small"
+        );
+    }
+
+    // ── ProjectionPruningRule ─────────────────────────────────────────────
+
+    use super::ProjectionPruningRule;
+
+    fn scan_with_schema(
+        id: &str,
+        table: &str,
+        schema_fields: &[(&str, krishiv_plan::FieldType)],
+    ) -> PlanNode {
+        let schema = krishiv_plan::PlanSchema::new(
+            schema_fields
+                .iter()
+                .map(|(name, ft)| krishiv_plan::SchemaField::new(*name, ft.clone()))
+                .collect(),
+        );
+        PlanNode::new(id, format!("scan {table}"), ExecutionKind::Batch)
+            .with_op(NodeOp::Scan {
+                table: table.to_string(),
+                filters: vec![],
+            })
+            .with_output_schema(schema)
+    }
+
+    fn filter_node(id: &str, inputs: &[&str], predicate: &str) -> PlanNode {
+        PlanNode::new(id, format!("filter: {predicate}"), ExecutionKind::Batch)
+            .with_inputs(inputs.iter().map(|s| s.to_string()))
+            .with_op(NodeOp::Filter {
+                predicate: predicate.to_string(),
+            })
+    }
+
+    fn project_node(id: &str, inputs: &[&str], columns: &[&str]) -> PlanNode {
+        PlanNode::new(id, "project", ExecutionKind::Batch)
+            .with_inputs(inputs.iter().map(|s| s.to_string()))
+            .with_op(NodeOp::Project {
+                columns: columns.iter().map(|s| s.to_string()).collect(),
+            })
+    }
+
+    #[test]
+    fn projection_pruning_preserves_order() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema("s", "t", &[("a", FieldType::Int32), ("b", FieldType::Utf8)]))
+            .with_node(project_node("p", &["s"], &["b", "a", "b", "a"]));
+
+        let result = ProjectionPruningRule.apply(&plan).unwrap();
+
+        let project_node = result.nodes().iter().find(|n| n.id() == "p").unwrap();
+        if let Some(NodeOp::Project { columns }) = project_node.op() {
+            // Should be ["b", "a"] — first occurrence order preserved, not sorted to ["a", "b"]
+            assert_eq!(columns, &["b", "a"]);
+        } else {
+            panic!("expected Project node");
+        }
+    }
+
+    #[test]
+    fn projection_pruning_noop_when_no_duplicates() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema("s", "t", &[("a", FieldType::Int32), ("b", FieldType::Utf8)]))
+            .with_node(project_node("p", &["s"], &["a", "b"]));
+
+        let result = ProjectionPruningRule.apply(&plan);
+        assert!(result.is_none(), "no duplicates → no change");
+    }
+
+    // ── PredicatePushdownRule ──────────────────────────────────────────────
+
+    use super::PredicatePushdownRule;
+
+    #[test]
+    fn predicate_pushdown_simple_filter_on_scan() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "s",
+                "orders",
+                &[("id", FieldType::Int64), ("amount", FieldType::Float64)],
+            ))
+            .with_node(filter_node("f", &["s"], "amount > 100"));
+
+        let result = PredicatePushdownRule.apply(&plan).unwrap();
+
+        // Filter should be removed, scan should have pushed filter
+        assert!(
+            !result.nodes().iter().any(|n| n.id() == "f"),
+            "filter node should be removed"
+        );
+        let scan = result.nodes().iter().find(|n| n.id() == "s").unwrap();
+        if let Some(NodeOp::Scan { filters, .. }) = scan.op() {
+            assert_eq!(filters, &["amount > 100"]);
+        } else {
+            panic!("expected Scan node");
+        }
+    }
+
+    #[test]
+    fn predicate_pushdown_partial_pushdown() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "s",
+                "orders",
+                &[("id", FieldType::Int64), ("amount", FieldType::Float64)],
+            ))
+            // id is a scan column, status is not in scan's schema
+            .with_node(filter_node("f", &["s"], "id > 0 AND status = 'active'"));
+
+        let result = PredicatePushdownRule.apply(&plan).unwrap();
+
+        // Filter should remain with only the non-pushable conjunct
+        let filter = result.nodes().iter().find(|n| n.id() == "f").unwrap();
+        if let Some(NodeOp::Filter { predicate }) = filter.op() {
+            assert_eq!(predicate, "status = 'active'");
+        } else {
+            panic!("expected Filter node");
+        }
+
+        // Scan should have the pushable conjunct
+        let scan = result.nodes().iter().find(|n| n.id() == "s").unwrap();
+        if let Some(NodeOp::Scan { filters, .. }) = scan.op() {
+            assert_eq!(filters, &["id > 0"]);
+        } else {
+            panic!("expected Scan node");
+        }
+    }
+
+    #[test]
+    fn predicate_pushdown_noop_when_predicate_not_scan_columns() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "s",
+                "orders",
+                &[("id", FieldType::Int64)],
+            ))
+            .with_node(filter_node("f", &["s"], "status = 'active'"));
+
+        let result = PredicatePushdownRule.apply(&plan);
+        assert!(result.is_none(), "no columns match → no change");
+    }
+
+    #[test]
+    fn predicate_pushdown_noop_when_filter_not_over_scan() {
+        // Filter above a project (not directly above a scan) should not change
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema("s", "t", &[("x", FieldType::Int32)]))
+            .with_node(project_node("p", &["s"], &["x"]))
+            .with_node(filter_node("f", &["p"], "x > 0"));
+
+        let result = PredicatePushdownRule.apply(&plan);
+        assert!(result.is_none(), "filter above project → no pushdown");
+    }
+
+    #[test]
+    fn predicate_pushdown_empty_predicate_noop() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema("s", "t", &[("x", FieldType::Int32)]))
+            .with_node(filter_node("f", &["s"], ""));
+
+        let result = PredicatePushdownRule.apply(&plan);
+        assert!(result.is_none(), "empty predicate → no change");
+    }
+
+    #[test]
+    fn predicate_pushdown_qualified_column_match() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "s",
+                "orders",
+                &[("id", FieldType::Int64), ("amount", FieldType::Float64)],
+            ))
+            // Qualified column "o.id" should match scan column "id" via unqualified suffix
+            .with_node(filter_node("f", &["s"], "o.id = 5 AND o.amount > 100"));
+
+        let result = PredicatePushdownRule.apply(&plan).unwrap();
+
+        assert!(
+            !result.nodes().iter().any(|n| n.id() == "f"),
+            "filter should be fully pushed"
+        );
+        let scan = result.nodes().iter().find(|n| n.id() == "s").unwrap();
+        if let Some(NodeOp::Scan { filters, .. }) = scan.op() {
+            assert_eq!(filters.len(), 2);
+            assert!(filters.contains(&"o.id = 5".to_string()));
+            assert!(filters.contains(&"o.amount > 100".to_string()));
+        } else {
+            panic!("expected Scan node");
+        }
+    }
+
+    #[test]
+    fn predicate_pushdown_rewires_downstream_inputs() {
+        // scan → filter → project: after pushdown, project should reference scan
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema("s", "t", &[("x", FieldType::Int32)]))
+            .with_node(filter_node("f", &["s"], "x > 0"))
+            .with_node(project_node("p", &["f"], &["x"]));
+
+        let result = PredicatePushdownRule.apply(&plan).unwrap();
+
+        // Filter should be gone
+        assert!(
+            !result.nodes().iter().any(|n| n.id() == "f"),
+            "filter should be removed"
+        );
+        // Project should now reference scan directly
+        let project = result.nodes().iter().find(|n| n.id() == "p").unwrap();
+        assert!(
+            project.inputs().contains(&"s".to_string()),
+            "project should now reference the scan node directly"
         );
     }
 }

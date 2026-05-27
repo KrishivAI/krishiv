@@ -113,10 +113,10 @@ pub enum JoinType {
 /// Typed operator classification for a plan node.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NodeOp {
-    /// Table or file scan.
-    Scan { table: String },
-    /// Row filter.
-    Filter,
+    /// Table or file scan, with optional pushed-down filter predicates.
+    Scan { table: String, filters: Vec<String> },
+    /// Row filter with a predicate expression string.
+    Filter { predicate: String },
     /// Column projection.
     Project { columns: Vec<String> },
     /// Aggregation with optional group keys.
@@ -727,8 +727,9 @@ mod tests {
         let node =
             PlanNode::new("scan", "scan parquet", ExecutionKind::Batch).with_op(NodeOp::Scan {
                 table: String::from("orders"),
+                filters: vec![],
             });
-        assert!(matches!(node.op(), Some(NodeOp::Scan { table }) if table == "orders"));
+        assert!(matches!(node.op(), Some(NodeOp::Scan { table, .. }) if table == "orders"));
     }
 
     #[test]
@@ -763,8 +764,11 @@ mod tests {
         let ops: Vec<NodeOp> = vec![
             NodeOp::Scan {
                 table: String::from("t1"),
+                filters: vec![],
             },
-            NodeOp::Filter,
+            NodeOp::Filter {
+                predicate: String::new(),
+            },
             NodeOp::Project {
                 columns: vec![String::from("a")],
             },

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
+use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
@@ -59,6 +60,94 @@ impl SlidingWindowOperator {
     /// Number of open (not yet flushed) window buckets.
     pub fn open_window_count(&self) -> usize {
         self.accumulators.len()
+    }
+
+    /// Persist open sliding window accumulators to `StateBackend`.
+    pub fn persist_to_state(
+        &self,
+        backend: &mut dyn StateBackend,
+        namespace: &Namespace,
+    ) -> StateResult<()> {
+        let op_id = namespace.operator_id();
+        let name = namespace.state_name();
+        let mut state_keys = Vec::with_capacity(self.accumulators.len());
+        let mut values = Vec::with_capacity(self.accumulators.len());
+        for ((key, win_start), agg) in &self.accumulators {
+            let payload = serde_json::json!({
+                "values": agg.values,
+                "has_value": agg.has_value,
+                "avg_sums": agg.avg_sums,
+                "avg_counts": agg.avg_counts,
+            });
+            let bytes = serde_json::to_vec(&payload).map_err(|e| {
+                StateError::CorruptEntry {
+                    message: e.to_string(),
+                }
+            })?;
+            let mut state_key = Vec::from(b"sw:");
+            state_key.extend_from_slice(key.as_bytes());
+            state_key.push(0);
+            state_key.extend_from_slice(&win_start.to_le_bytes());
+            state_keys.push(state_key);
+            values.push(bytes);
+        }
+        if !state_keys.is_empty() {
+            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+                .iter()
+                .zip(values.iter())
+                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+                .collect();
+            backend.put_batch(&batch_entries)?;
+        }
+        Ok(())
+    }
+
+    /// Restore open sliding window accumulators from `StateBackend`.
+    pub fn restore_from_state(
+        &mut self,
+        backend: &dyn StateBackend,
+        namespace: &Namespace,
+    ) -> StateResult<()> {
+        let mut restored = HashMap::new();
+        for key_bytes in backend.list_keys(namespace)? {
+            let Some(payload) = backend.get(namespace, &key_bytes)? else {
+                continue;
+            };
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
+                StateError::CorruptEntry {
+                    message: e.to_string(),
+                }
+            })?;
+            let values: Vec<i64> = parsed["values"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            let has_value: Vec<bool> = parsed["has_value"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_bool()).collect())
+                .unwrap_or_default();
+            let avg_sums: Vec<f64> = parsed["avg_sums"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+                .unwrap_or_default();
+            let avg_counts: Vec<u64> = parsed["avg_counts"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+            if let Some((key, win_start)) = parse_sliding_state_key(&key_bytes) {
+                restored.insert(
+                    (key, win_start),
+                    AggState {
+                        values,
+                        has_value,
+                        avg_sums,
+                        avg_counts,
+                    },
+                );
+            }
+        }
+        self.accumulators = restored;
+        Ok(())
     }
 
     /// All window starts (multiples of `slide`) that contain `event_time_ms`.
@@ -165,5 +254,94 @@ impl SlidingWindowOperator {
             &self.spec.agg_exprs,
             state,
         )
+    }
+}
+
+fn parse_sliding_state_key(bytes: &[u8]) -> Option<(String, i64)> {
+    const PREFIX: &[u8] = b"sw:";
+    if !bytes.starts_with(PREFIX) {
+        return None;
+    }
+    let rest = &bytes[PREFIX.len()..];
+    let sep = rest.iter().position(|b| *b == 0)?;
+    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
+    let win_bytes: [u8; 8] = rest.get(sep + 1..sep + 9)?.try_into().ok()?;
+    Some((key, i64::from_le_bytes(win_bytes)))
+}
+
+#[cfg(test)]
+mod sliding_state_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::aggregate::AggFunction;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use krishiv_state::{InMemoryStateBackend, Namespace};
+
+    #[test]
+    fn sliding_state_persist_and_restore_roundtrip() {
+        let spec = SlidingWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 2000,
+            slide_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+        };
+        let mut op = SlidingWindowOperator::new(spec).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![500])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        op.process_batch(&batch, 100).expect("process");
+        assert!(op.open_window_count() > 0);
+
+        let mut backend = InMemoryStateBackend::new();
+        let ns = Namespace::new("op-sliding", "windows");
+        op.persist_to_state(&mut backend, &ns).expect("persist");
+
+        let mut restored = SlidingWindowOperator::new(SlidingWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 2000,
+            slide_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+        })
+        .unwrap();
+        restored.restore_from_state(&backend, &ns).expect("restore");
+        assert!(restored.open_window_count() > 0);
+    }
+
+    #[test]
+    fn sliding_state_parse_key() {
+        let mut key = Vec::from(b"sw:mykey");
+        key.push(0);
+        key.extend_from_slice(&42i64.to_le_bytes());
+        let (k, w) = parse_sliding_state_key(&key).unwrap();
+        assert_eq!(k, "mykey");
+        assert_eq!(w, 42);
+    }
+
+    #[test]
+    fn sliding_state_parse_key_bad_prefix_returns_none() {
+        let key = b"tw:other";
+        assert!(parse_sliding_state_key(key).is_none());
     }
 }

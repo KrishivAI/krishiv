@@ -23,6 +23,7 @@ fn in_process_batch_job_submits_with_plan_op_lowering() {
     let job_id = JobId::try_new("e2e-batch").unwrap();
     let node = PlanNode::new("scan", "parquet", ExecutionKind::Batch).with_op(NodeOp::Scan {
         table: String::from("t"),
+        filters: vec![],
     });
     let fragment = krishiv_plan::encode_task_fragment(&node);
     assert!(fragment.starts_with("sql:"));

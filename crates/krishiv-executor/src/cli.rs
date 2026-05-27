@@ -51,7 +51,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<
             "Krishiv executor HTTP listening on {}",
             listener.local_addr().unwrap()
         );
-        let http_executor_id = runtime.config().executor_id().to_owned();
+        let http_executor_id = runtime.config().executor_id().as_str().to_owned();
         let http_slots = slots;
         tokio::spawn(async move {
             let router = executor_http_router(http_executor_id, http_slots);

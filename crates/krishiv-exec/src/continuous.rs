@@ -11,15 +11,18 @@ use crate::operator_runtime::{max_event_time_ms, window_agg_to_expr};
 use crate::window::MultiSourceWatermarkState;
 use crate::{
     AggExpr, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
-    SlidingWindowOperator, SlidingWindowSpec, StateBackedTumblingWindowOperator,
-    TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
+    SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,
+    StateBackedSlidingWindowOperator, StateBackedTumblingWindowOperator, TumblingWindowOperator,
+    TumblingWindowSpec, WatermarkState,
 };
 
 enum WindowOperatorState {
     Tumbling(TumblingWindowOperator),
     TumblingState(Box<StateBackedTumblingWindowOperator>),
     Sliding(SlidingWindowOperator),
+    SlidingState(Box<StateBackedSlidingWindowOperator>),
     Session(SessionWindowOperator),
+    SessionState(Box<StateBackedSessionWindowOperator>),
 }
 
 /// Tracks single- or multi-source watermark state for continuous execution.
@@ -139,26 +142,56 @@ fn build_operator(
         }
         WindowKind::Sliding => {
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
-            Ok(WindowOperatorState::Sliding(SlidingWindowOperator::new(
-                SlidingWindowSpec {
-                    key_column: spec.key_column.clone(),
-                    event_time_column: spec.event_time_column.clone(),
-                    window_size_ms: spec.window_size_ms,
-                    slide_ms,
-                    agg_exprs: agg_exprs.to_vec(),
-                },
-            )?))
+            let sw_spec = SlidingWindowSpec {
+                key_column: spec.key_column.clone(),
+                event_time_column: spec.event_time_column.clone(),
+                window_size_ms: spec.window_size_ms,
+                slide_ms,
+                agg_exprs: agg_exprs.to_vec(),
+            };
+            if let Some(ttl_ms) = spec.state_ttl_ms {
+                let inner = InMemoryStateBackend::new();
+                let state: Box<dyn StateBackend> =
+                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
+                let op = StateBackedSlidingWindowOperator::new(
+                    sw_spec,
+                    state,
+                    "continuous-window",
+                    "sliding",
+                )
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+                Ok(WindowOperatorState::SlidingState(Box::new(op)))
+            } else {
+                Ok(WindowOperatorState::Sliding(SlidingWindowOperator::new(
+                    sw_spec,
+                )?))
+            }
         }
         WindowKind::Session => {
             let gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
-            Ok(WindowOperatorState::Session(SessionWindowOperator::new(
-                SessionWindowSpec {
-                    key_column: spec.key_column.clone(),
-                    event_time_column: spec.event_time_column.clone(),
-                    session_gap_ms: gap_ms,
-                    agg_exprs: agg_exprs.to_vec(),
-                },
-            )))
+            let sess_spec = SessionWindowSpec {
+                key_column: spec.key_column.clone(),
+                event_time_column: spec.event_time_column.clone(),
+                session_gap_ms: gap_ms,
+                agg_exprs: agg_exprs.to_vec(),
+            };
+            if let Some(ttl_ms) = spec.state_ttl_ms {
+                let inner = InMemoryStateBackend::new();
+                let state: Box<dyn StateBackend> =
+                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
+                let op = StateBackedSessionWindowOperator::new(
+                    sess_spec,
+                    state,
+                    "continuous-window",
+                    "session",
+                )
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+                Ok(WindowOperatorState::SessionState(Box::new(op)))
+            } else {
+                Ok(WindowOperatorState::Session(SessionWindowOperator::new(
+                    sess_spec,
+                )))
+            }
         }
     }
 }
@@ -173,7 +206,9 @@ impl WindowOperatorState {
             Self::Tumbling(op) => op.process_batch(batch, watermark_ms),
             Self::TumblingState(op) => op.process_batch(batch, watermark_ms),
             Self::Sliding(op) => op.process_batch(batch, watermark_ms),
+            Self::SlidingState(op) => op.process_batch(batch, watermark_ms),
             Self::Session(op) => op.process_batch(batch, watermark_ms),
+            Self::SessionState(op) => op.process_batch(batch, watermark_ms),
         }
     }
 }

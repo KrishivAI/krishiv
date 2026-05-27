@@ -5,7 +5,10 @@ pub mod tumbling;
 
 pub use session::{SessionWindowOperator, SessionWindowSpec};
 pub use sliding::{SlidingWindowOperator, SlidingWindowSpec};
-pub use state_tumbling::StateBackedTumblingWindowOperator;
+pub use state_tumbling::{
+    StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
+    StateBackedTumblingWindowOperator,
+};
 pub use tumbling::{TumblingWindowOperator, TumblingWindowSpec};
 
 use std::collections::HashMap;

@@ -142,7 +142,8 @@ pub async fn merge_delta(
     })
 }
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::Array;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 fn concat_batches(batches: &[RecordBatch]) -> LakehouseResult<RecordBatch> {
     if batches.is_empty() {
@@ -202,34 +203,64 @@ fn target_keys_indices(
 }
 
 /// Format a single cell as a type-prefixed string key for hash-join.
-/// The prefix prevents cross-type collisions (Int64 1 vs String "1").
+/// The prefix prevents cross-type collisions (e.g. Int32 1 vs String "1").
 fn typed_key(array: &dyn Array, row: usize) -> Option<String> {
-    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
-        if a.is_null(row) {
-            None
-        } else {
-            Some(format!("utf8:{}", a.value(row)))
-        }
-    } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-        if a.is_null(row) {
-            None
-        } else {
-            Some(format!("i64:{}", a.value(row)))
-        }
-    } else {
-        // Unsupported type — warn and treat as non-matching.
-        eprintln!(
-            "warn: unsupported merge-key column type: {}",
-            array.data_type()
-        );
-        None
+    use arrow::datatypes::DataType;
+    if array.is_null(row) {
+        return None;
     }
+    let prefix = match array.data_type() {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "I",
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "U",
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "F",
+        DataType::Utf8 | DataType::LargeUtf8 => "S",
+        DataType::Boolean => "B",
+        DataType::Date32 | DataType::Date64 => "D",
+        dt => return Some(format!("O:{}:{}", dt, format_value_as_string(array, row))),
+    };
+    Some(format!("{}:{}", prefix, format_value_as_string(array, row)))
+}
+
+fn format_value_as_string(array: &dyn Array, row: usize) -> String {
+    let formatter = ArrayFormatter::try_new(array, &FormatOptions::default())
+        .expect("ArrayFormatter creation should succeed for valid arrays");
+    formatter.value(row).to_string()
+}
+
+/// Remove a column by name from a RecordBatch.
+pub fn remove_merge_key_column(
+    batch: &RecordBatch,
+    key_field: &str,
+) -> LakehouseResult<RecordBatch> {
+    use arrow::datatypes::Schema;
+    let pos = batch
+        .schema()
+        .index_of(key_field)
+        .map_err(|e| LakehouseError::Io(format!("column '{key_field}' not found: {e}")))?;
+    let new_schema = Arc::new(Schema::new(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != pos)
+            .map(|(_, f)| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+    ));
+    let new_columns: Vec<Arc<dyn Array>> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != pos)
+        .map(|(_, c)| c.clone())
+        .collect();
+    RecordBatch::try_new(new_schema, new_columns).map_err(|e| LakehouseError::Io(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use tempfile::tempdir;
 
@@ -260,5 +291,147 @@ mod tests {
         let read = handle.scan_batches().await.unwrap();
         let rows: usize = read.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // typed_key type expansion tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn typed_key_int32() {
+        let arr = Int32Array::from(vec![42, -1]);
+        assert_eq!(typed_key(&arr, 0), Some("I:42".into()));
+        assert_eq!(typed_key(&arr, 1), Some("I:-1".into()));
+    }
+
+    #[test]
+    fn typed_key_float64() {
+        let arr = Float64Array::from(vec![3.14, -2.5]);
+        assert_eq!(typed_key(&arr, 0), Some("F:3.14".into()));
+        assert_eq!(typed_key(&arr, 1), Some("F:-2.5".into()));
+    }
+
+    #[test]
+    fn typed_key_bool() {
+        let arr = BooleanArray::from(vec![true, false]);
+        assert_eq!(typed_key(&arr, 0), Some("B:true".into()));
+        assert_eq!(typed_key(&arr, 1), Some("B:false".into()));
+    }
+
+    #[test]
+    fn typed_key_date32() {
+        use arrow::array::Date32Array;
+        let arr = Date32Array::from(vec![0, 1]); // epoch, 1970-01-02
+        assert_eq!(typed_key(&arr, 0), Some("D:1970-01-01".into()));
+        assert_eq!(typed_key(&arr, 1), Some("D:1970-01-02".into()));
+    }
+
+    #[test]
+    fn typed_key_utf8() {
+        let arr = StringArray::from(vec!["hello", "world"]);
+        assert_eq!(typed_key(&arr, 0), Some("S:hello".into()));
+        assert_eq!(typed_key(&arr, 1), Some("S:world".into()));
+    }
+
+    #[test]
+    fn typed_key_int64() {
+        let arr = Int64Array::from(vec![1, 2]);
+        assert_eq!(typed_key(&arr, 0), Some("I:1".into()));
+        assert_eq!(typed_key(&arr, 1), Some("I:2".into()));
+    }
+
+    #[test]
+    fn typed_key_null() {
+        let arr = Int64Array::from(vec![Some(1), None]);
+        assert_eq!(typed_key(&arr, 0), Some("I:1".into()));
+        assert!(typed_key(&arr, 1).is_none());
+    }
+
+    /// Cross-type collision test: same numeric value in different types must
+    /// produce distinct typed keys.
+    #[test]
+    fn typed_key_cross_type_no_collision() {
+        let i32_arr = Int32Array::from(vec![1]);
+        let i64_arr = Int64Array::from(vec![1]);
+        let f64_arr = Float64Array::from(vec![1.0]);
+        let s_arr = StringArray::from(vec!["1"]);
+
+        let i32_key = typed_key(&i32_arr, 0).unwrap();
+        let i64_key = typed_key(&i64_arr, 0).unwrap();
+        let f64_key = typed_key(&f64_arr, 0).unwrap();
+        let s_key = typed_key(&s_arr, 0).unwrap();
+
+        assert_eq!(i32_key, i64_key, "I:1 == I:1"); // same prefix family
+        assert_ne!(i32_key, f64_key, "I:1 != F:1");
+        assert_ne!(i32_key, s_key, "I:1 != S:1");
+        assert_ne!(f64_key, s_key, "F:1 != S:1");
+    }
+
+    #[test]
+    fn typed_key_unsigned() {
+        use arrow::array::UInt32Array;
+        let arr = UInt32Array::from(vec![100u32, 200u32]);
+        assert_eq!(typed_key(&arr, 0), Some("U:100".into()));
+        assert_eq!(typed_key(&arr, 1), Some("U:200".into()));
+    }
+
+    // ------------------------------------------------------------------
+    // remove_merge_key_column tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn remove_key_column_by_name() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let stripped = remove_merge_key_column(&batch, "id").unwrap();
+        assert_eq!(stripped.num_columns(), 1);
+        assert_eq!(stripped.schema().field(0).name(), "name");
+        assert_eq!(stripped.num_rows(), 2);
+    }
+
+    #[test]
+    fn remove_key_column_not_found_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let err = remove_merge_key_column(&batch, "nonexistent").unwrap_err();
+        assert!(
+            matches!(err, LakehouseError::Io(_)),
+            "expected Io error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn remove_key_column_keeps_remaining_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("c", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["x"])),
+                Arc::new(Float64Array::from(vec![3.5])),
+            ],
+        )
+        .unwrap();
+
+        let stripped = remove_merge_key_column(&batch, "b").unwrap();
+        assert_eq!(stripped.num_columns(), 2);
+        assert_eq!(stripped.schema().field(0).name(), "a");
+        assert_eq!(stripped.schema().field(1).name(), "c");
     }
 }

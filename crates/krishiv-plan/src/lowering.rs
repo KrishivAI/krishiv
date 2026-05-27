@@ -64,8 +64,8 @@ fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
             Some(*session_gap_ms),
             aggs,
         ))),
-        NodeOp::Scan { table } => Some(format!("sql:SELECT * FROM {table}")),
-        NodeOp::Filter | NodeOp::Project { .. } | NodeOp::Aggregate { .. } => {
+        NodeOp::Scan { table, .. } => Some(format!("sql:SELECT * FROM {table}")),
+        NodeOp::Filter { .. } | NodeOp::Project { .. } | NodeOp::Aggregate { .. } => {
             serde_json::to_string(op)
                 .ok()
                 .map(|json| format!("{PLAN_OP_PREFIX}{json}"))
@@ -142,7 +142,9 @@ mod tests {
 
     #[test]
     fn planop_roundtrip_for_filter() {
-        let op = NodeOp::Filter;
+        let op = NodeOp::Filter {
+            predicate: String::new(),
+        };
         let frag = format!("{PLAN_OP_PREFIX}{}", serde_json::to_string(&op).unwrap());
         assert_eq!(decode_task_fragment(&frag), Some(op));
     }

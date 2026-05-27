@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, snapshot_path};
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset,
-    CoordinatorExecutorService, ExecutorTaskAssignment, InitiateCheckpointRequest,
+    CoordinatorExecutorService, ExecutorTaskAssignment, FencingToken, InitiateCheckpointRequest,
     InputPartitionDescriptor, JobId, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskRuntimeStats,
     TaskState, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
@@ -1012,7 +1012,7 @@ impl ExecutorTaskRunner {
             let req = InitiateCheckpointRequest {
                 job_id,
                 epoch: barrier.epoch,
-                fencing_token: 0,
+                fencing_token: FencingToken::initial(),
             };
             if let Err(e) = self
                 .initiate_checkpoint_for_job(&req, state_backend, storage, coordinator)

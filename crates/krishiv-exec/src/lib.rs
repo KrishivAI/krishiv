@@ -168,8 +168,8 @@ pub use queue::{
 pub use schema_normalize::{ColumnRenameMap, SchemaNormalizeOperator};
 pub use window::{
     MultiSourceWatermarkState, SessionWindowOperator, SessionWindowSpec, SlidingWindowOperator,
-    SlidingWindowSpec, StateBackedTumblingWindowOperator, TumblingWindowOperator,
-    TumblingWindowSpec, WatermarkState,
+    SlidingWindowSpec, StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
+    StateBackedTumblingWindowOperator, TumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

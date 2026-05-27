@@ -261,6 +261,8 @@ pub(crate) async fn do_action(
     let endpoint = normalize_flight_endpoint(flight_url)?;
     let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
         .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .connect()
         .await
         .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;

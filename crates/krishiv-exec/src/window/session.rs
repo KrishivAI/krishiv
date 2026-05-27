@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
@@ -53,6 +54,104 @@ impl SessionWindowOperator {
     /// Number of open sessions.
     pub fn open_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Persist open sessions to `StateBackend`.
+    pub fn persist_to_state(
+        &self,
+        backend: &mut dyn StateBackend,
+        namespace: &Namespace,
+    ) -> StateResult<()> {
+        let op_id = namespace.operator_id();
+        let name = namespace.state_name();
+        let mut state_keys = Vec::with_capacity(self.sessions.len());
+        let mut values = Vec::with_capacity(self.sessions.len());
+        for (key, session) in &self.sessions {
+            let payload = serde_json::json!({
+                "session_start_ms": session.session_start_ms,
+                "last_event_time_ms": session.last_event_time_ms,
+                "values": session.agg.values,
+                "has_value": session.agg.has_value,
+                "avg_sums": session.agg.avg_sums,
+                "avg_counts": session.agg.avg_counts,
+            });
+            let bytes = serde_json::to_vec(&payload).map_err(|e| {
+                StateError::CorruptEntry {
+                    message: e.to_string(),
+                }
+            })?;
+            let mut state_key = Vec::from(b"ses:");
+            state_key.extend_from_slice(key.as_bytes());
+            state_key.push(0);
+            state_key.extend_from_slice(&session.session_start_ms.to_le_bytes());
+            state_key.push(0);
+            state_key.extend_from_slice(&session.last_event_time_ms.to_le_bytes());
+            state_keys.push(state_key);
+            values.push(bytes);
+        }
+        if !state_keys.is_empty() {
+            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+                .iter()
+                .zip(values.iter())
+                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+                .collect();
+            backend.put_batch(&batch_entries)?;
+        }
+        Ok(())
+    }
+
+    /// Restore open sessions from `StateBackend`.
+    pub fn restore_from_state(
+        &mut self,
+        backend: &dyn StateBackend,
+        namespace: &Namespace,
+    ) -> StateResult<()> {
+        let mut restored = HashMap::new();
+        for key_bytes in backend.list_keys(namespace)? {
+            let Some(payload) = backend.get(namespace, &key_bytes)? else {
+                continue;
+            };
+            let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
+                StateError::CorruptEntry {
+                    message: e.to_string(),
+                }
+            })?;
+            let session_start_ms = parsed["session_start_ms"].as_i64().unwrap_or(0);
+            let last_event_time_ms = parsed["last_event_time_ms"].as_i64().unwrap_or(0);
+            let values: Vec<i64> = parsed["values"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            let has_value: Vec<bool> = parsed["has_value"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_bool()).collect())
+                .unwrap_or_default();
+            let avg_sums: Vec<f64> = parsed["avg_sums"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+                .unwrap_or_default();
+            let avg_counts: Vec<u64> = parsed["avg_counts"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+            if let Some(key) = parse_session_state_key(&key_bytes) {
+                restored.insert(
+                    key,
+                    SessionState {
+                        session_start_ms,
+                        last_event_time_ms,
+                        agg: AggState {
+                            values,
+                            has_value,
+                            avg_sums,
+                            avg_counts,
+                        },
+                    },
+                );
+            }
+        }
+        self.sessions = restored;
+        Ok(())
     }
 
     /// Process one `RecordBatch`, returning closed session outputs.
@@ -174,5 +273,89 @@ impl SessionWindowOperator {
             ])));
         }
         Ok(RecordBatch::try_new(schema, columns)?)
+    }
+}
+
+fn parse_session_state_key(bytes: &[u8]) -> Option<String> {
+    const PREFIX: &[u8] = b"ses:";
+    if !bytes.starts_with(PREFIX) {
+        return None;
+    }
+    let rest = &bytes[PREFIX.len()..];
+    let sep = rest.iter().position(|b| *b == 0)?;
+    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
+    Some(key)
+}
+
+#[cfg(test)]
+mod session_state_tests {
+    use super::*;
+    use crate::aggregate::AggFunction;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use krishiv_state::{InMemoryStateBackend, Namespace};
+
+    #[test]
+    fn session_state_persist_and_restore_roundtrip() {
+        let spec = SessionWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            session_gap_ms: 500,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "cnt".into(),
+                function: AggFunction::Count,
+            }],
+        };
+        let mut op = SessionWindowOperator::new(spec);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        op.process_batch(&batch, 300).expect("process");
+        assert_eq!(op.open_session_count(), 1);
+
+        let mut backend = InMemoryStateBackend::new();
+        let ns = Namespace::new("op-session", "windows");
+        op.persist_to_state(&mut backend, &ns).expect("persist");
+
+        let mut restored = SessionWindowOperator::new(SessionWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            session_gap_ms: 500,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "cnt".into(),
+                function: AggFunction::Count,
+            }],
+        });
+        restored.restore_from_state(&backend, &ns).expect("restore");
+        assert_eq!(restored.open_session_count(), 1);
+    }
+
+    #[test]
+    fn session_state_parse_key() {
+        let mut key = Vec::from(b"ses:mykey");
+        key.push(0);
+        key.extend_from_slice(&100i64.to_le_bytes());
+        key.push(0);
+        key.extend_from_slice(&200i64.to_le_bytes());
+        let k = parse_session_state_key(&key).unwrap();
+        assert_eq!(k, "mykey");
+    }
+
+    #[test]
+    fn session_state_parse_key_bad_prefix_returns_none() {
+        let key = b"tw:other";
+        assert!(parse_session_state_key(key).is_none());
     }
 }

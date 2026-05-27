@@ -1288,6 +1288,7 @@ mod exchange_stage_tests {
     fn physical_plan_with_exchange_produces_multi_stage_job() {
         let scan = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
             table: String::from("t"),
+            filters: vec![],
         });
         let exchange = PlanNode::new("ex", "exchange", ExecutionKind::Batch)
             .with_inputs(["scan"])

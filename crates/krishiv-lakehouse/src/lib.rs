@@ -27,7 +27,8 @@ pub use delta::{
     DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore,
 };
 pub use delta_lake::{
-    DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, write_delta,
+    DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, remove_merge_key_column,
+    write_delta,
 };
 pub use hudi::{HudiQueryType, HudiSnapshotReader, write_hudi_cow_fixture};
 pub use iceberg_fs::IcebergFsTable;

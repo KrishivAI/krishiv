@@ -14,9 +14,14 @@ use datafusion::prelude::SessionContext;
 use crate::SqlError;
 use crate::SqlResult;
 
+/// Match the ON-clause equality pattern and extract the column name.
+static KEY_COL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:(?:\w+|`[^`]+`)\.)?(\w+)\s*=").unwrap()
+});
+
 static MERGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?is)^\s*MERGE\s+INTO\s+([`\w.:/-]+)\s+USING\s+([`\w.]+)\s+ON\s+(.+?)\s+WHEN\s+MATCHED\s+THEN\s+UPDATE\s+.*WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT",
+        r"(?is)^\s*MERGE\s+INTO\s+([`\w.:/-]+)\s+USING\s+([`\w.]+)\s+ON\s+(.+?)(?:\s+WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+.+?)?(?:\s+WHEN\s+NOT\s+MATCHED\s+THEN\s+INSERT\s*(?:\([^)]*\))?\s*(?:VALUES\s*\([^)]*\)|\*)?)?\s*$",
     )
     .unwrap()
 });
@@ -57,14 +62,26 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
     let target = caps[1].trim_matches('`').to_string();
     let source_table = caps[2].trim_matches('`').to_string();
     let on_clause = caps[3].trim();
-    let merge_key = on_clause
-        .split('=')
-        .next()
-        .and_then(|s| s.split('.').next_back())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let has_matched = caps.get(4).and_then(|m| {
+        let s = m.as_str().trim();
+        if s.is_empty() { None } else { Some(s) }
+    }).is_some();
+    let has_not_matched = caps.get(5).and_then(|m| {
+        let s = m.as_str().trim();
+        if s.is_empty() { None } else { Some(s) }
+    }).is_some();
+    if !has_matched && !has_not_matched {
+        return Err(SqlError::Unsupported {
+            feature: "MERGE INTO requires at least one WHEN MATCHED or WHEN NOT MATCHED clause".into(),
+        });
+    }
+
+    let merge_key = KEY_COL_RE
+        .captures(on_clause)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().trim_matches('`'))
         .ok_or_else(|| SqlError::Unsupported {
-            feature: "MERGE ON clause must be equality on a single column".into(),
+            feature: "MERGE ON clause must contain a column equality (e.g. target.col = source.col)".into(),
         })?;
 
     let source_df = ctx
@@ -121,55 +138,19 @@ async fn merge_iceberg_memory(
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     use std::collections::HashSet;
 
-    let table = target.trim_start_matches("iceberg:");
-    let existing = ctx
-        .table(table)
-        .await
-        .map_err(|e| SqlError::DataFusion {
-            message: e.to_string(),
-        })?
-        .collect()
-        .await
-        .map_err(|e| SqlError::DataFusion {
-            message: e.to_string(),
-        })?;
-
     if source_batches.is_empty() {
-        return Ok(MergeResult {
-            rows_inserted: 0,
-            rows_updated: 0,
-            rows_deleted: 0,
-        });
+        return Ok(MergeResult::default());
     }
 
     let source_schema = source_batches[0].schema();
-    let existing_schema = existing
-        .first()
-        .map(|b| b.schema())
-        .unwrap_or_else(|| source_schema.clone());
-
-    // Coalesce existing rows into one batch for key matching.
-    let target_batch: Option<RecordBatch> = if existing.is_empty() {
-        None
-    } else {
-        Some(
-            concat_batches(&existing_schema, &existing).map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?,
-        )
-    };
-
-    // Coalesce source into one batch for key extraction.
     let source_batch =
         concat_batches(&source_schema, &source_batches).map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
         })?;
 
+    let inserted: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
     let fmt_opts = FormatOptions::default();
 
-    let inserted: u64 = source_batches.iter().map(|b| b.num_rows() as u64).sum();
-
-    // ---- Scope for !Send formatters (must not cross .await) ----
     // Extract source key values into a hash set.
     let key_idx = source_schema
         .index_of(merge_key)
@@ -187,59 +168,58 @@ async fn merge_iceberg_memory(
             .collect()
     };
 
-    // Count how many target rows match a source key, and build the keep set.
-    let (updated, merged_batches) = if let Some(ref tb) = target_batch {
-        let target_key_idx =
-            existing_schema
+    // Only load the target table when we have source keys to match against.
+    let updated = if source_keys.is_empty() {
+        0
+    } else {
+        let table = target.trim_start_matches("iceberg:");
+        let existing = ctx
+            .table(table)
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?
+            .collect()
+            .await
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+
+        if existing.is_empty() {
+            0
+        } else {
+            let existing_schema = existing[0].schema();
+            let tb = concat_batches(&existing_schema, &existing)
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let target_key_idx = tb
+                .schema()
                 .index_of(merge_key)
                 .map_err(|_| SqlError::Unsupported {
-                    feature: format!("merge key column '{merge_key}' not found in target schema"),
+                    feature: format!(
+                        "merge key column '{merge_key}' not found in target schema"
+                    ),
                 })?;
-        let target_keys: Vec<String> = {
-            let f = ArrayFormatter::try_new(tb.column(target_key_idx), &fmt_opts).map_err(|e| {
-                SqlError::DataFusion {
-                    message: e.to_string(),
-                }
-            })?;
-            (0..tb.num_rows()).map(|i| f.value(i).to_string()).collect()
-        };
-
-        let mut up: u64 = 0;
-        let mut keep_indices: Vec<u32> = Vec::new();
-        for (i, key) in target_keys.iter().enumerate() {
-            if source_keys.contains(key) {
-                up += 1;
-            } else {
-                keep_indices.push(i as u32);
-            }
-        }
-
-        let mut result: Vec<RecordBatch> = Vec::new();
-        if !keep_indices.is_empty() {
-            let indices_arr = arrow::array::UInt32Array::from(keep_indices);
-            let columns: Vec<arrow::array::ArrayRef> = tb
-                .columns()
+            let target_keys: Vec<String> = {
+                let f =
+                    ArrayFormatter::try_new(tb.column(target_key_idx), &fmt_opts).map_err(|e| {
+                        SqlError::DataFusion {
+                            message: e.to_string(),
+                        }
+                    })?;
+                (0..tb.num_rows())
+                    .map(|i| f.value(i).to_string())
+                    .collect()
+            };
+            target_keys
                 .iter()
-                .map(|c| {
-                    arrow::compute::take(c, &indices_arr, None).map_err(|e| SqlError::DataFusion {
-                        message: e.to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let kept =
-                RecordBatch::try_new(tb.schema(), columns).map_err(|e| SqlError::DataFusion {
-                    message: e.to_string(),
-                })?;
-            result.push(kept);
+                .filter(|k| source_keys.contains(*k))
+                .count() as u64
         }
-        result.extend(source_batches);
-        (up, result)
-    } else {
-        (0, source_batches)
     };
     // ---- end !Send scope ----
 
-    super::providers::register_scan_batches(ctx, table, merged_batches).await?;
     Ok(MergeResult {
         rows_inserted: inserted.saturating_sub(updated),
         rows_updated: updated,
@@ -285,6 +265,34 @@ mod tests {
         let sql = "MERGE INTO delta.`/tmp/t` USING staging ON target.id = source.id \
                    WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *";
         assert!(MERGE_RE.is_match(sql));
+    }
+
+    #[test]
+    fn merge_regex_matches_matched_only() {
+        let sql = "MERGE INTO delta.`/tmp/t` USING staging ON target.id = source.id \
+                   WHEN MATCHED THEN UPDATE SET *";
+        assert!(MERGE_RE.is_match(sql));
+    }
+
+    #[test]
+    fn merge_regex_matches_not_matched_only() {
+        let sql = "MERGE INTO delta.`/tmp/t` USING staging ON target.id = source.id \
+                   WHEN NOT MATCHED THEN INSERT *";
+        assert!(MERGE_RE.is_match(sql));
+    }
+
+    #[test]
+    fn merge_key_column_extraction() {
+        let on = "target.id = source.id";
+        let caps = KEY_COL_RE.captures(on).unwrap();
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("id"));
+    }
+
+    #[test]
+    fn merge_key_extracts_first_column_from_compound() {
+        let on = "target.id = source.id AND target.date = source.date";
+        let caps = KEY_COL_RE.captures(on).unwrap();
+        assert_eq!(caps.get(1).map(|m| m.as_str()), Some("id"));
     }
 
     /// C9 regression: iceberg in-memory merge must return correct metrics

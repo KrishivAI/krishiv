@@ -7,9 +7,9 @@ use krishiv_state::{RedbStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::window::MultiSourceWatermarkState;
 use crate::{
-    AggExpr, AggFunction, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
-    SlidingWindowOperator, SlidingWindowSpec, StateBackedTumblingWindowOperator,
-    TumblingWindowSpec, WatermarkState,
+    AggExpr, AggFunction, ExecError, ExecResult, SessionWindowSpec, SlidingWindowSpec,
+    StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
+    StateBackedTumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
 
 pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
@@ -172,8 +172,18 @@ pub fn execute_bounded_window(
                 slide_ms,
                 agg_exprs,
             };
-            let mut op = SlidingWindowOperator::new(sw_spec)?;
+            let redb = RedbStateBackend::ephemeral()
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
+            } else {
+                Box::new(redb)
+            };
+            let mut op =
+                StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             for batch in &input_batches {
+                multi_watermark.apply_idle_source_policy();
                 let wm = advance_effective_watermark(
                     batch,
                     spec,
@@ -192,8 +202,18 @@ pub fn execute_bounded_window(
                 session_gap_ms: gap_ms,
                 agg_exprs,
             };
-            let mut op = SessionWindowOperator::new(sess_spec);
+            let redb = RedbStateBackend::ephemeral()
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
+            } else {
+                Box::new(redb)
+            };
+            let mut op =
+                StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             for batch in &input_batches {
+                multi_watermark.apply_idle_source_policy();
                 let wm = advance_effective_watermark(
                     batch,
                     spec,

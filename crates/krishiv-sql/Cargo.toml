@@ -16,6 +16,7 @@ krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-udf = { path = "../krishiv-udf" }
 regex = "1"
+sqlparser = "0.61"
 
 [features]
 default = ["delta"]
