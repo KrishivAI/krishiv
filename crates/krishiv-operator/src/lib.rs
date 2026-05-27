@@ -43,5 +43,6 @@ pub use reconciler::{
 };
 pub use status::{
     ConditionStatus, JobCondition, KrishivJobPhase, KrishivJobStatus, TaskStatusCounters,
-    patch_krishivjob_finalizer, patch_krishivjob_status, status_patch,
 };
+#[cfg(feature = "k8s")]
+pub use status::{patch_krishivjob_finalizer, patch_krishivjob_status, status_patch};

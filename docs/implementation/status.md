@@ -27,6 +27,12 @@
   async call sites to `.await`, adding `blocking_read` / `blocking_write`
   accessors for synchronous code and tests, and removing a broken duplicate
   block in the UI metrics handler.
+- Feature-gate seam reduction in `krishiv-operator`:
+  `k8s-openapi` and `kube` are now optional dependencies behind the real
+  `k8s` feature, K8s-only modules/exports (`controller`, `dynamic`, `lease`,
+  dynamic status patch helpers) are `#[cfg(feature = "k8s")]`, and the
+  operator binary now prints a clear rebuild-with-`k8s` message when compiled
+  without Kubernetes support.
 - Validation for the removal pass: `cargo metadata --no-deps --format-version 1`
   succeeds after the workspace change; crate directories and workspace member
   entries were removed; active docs were updated to treat the removed crates as
@@ -38,6 +44,13 @@
 - Validation for the compile-fix pass:
   `cargo check` and `cargo check --workspace` both succeed from the workspace
   root after the scheduler/operator/UI repairs.
+- Validation for the operator gate pass:
+  `cargo metadata --no-deps --format-version 1` shows `krishiv-operator`
+  `k8s = ["dep:k8s-openapi", "dep:kube"]` and marks both dependencies
+  optional. `cargo check -p krishiv-operator` passed before the K8s seam split;
+  the post-split no-default-features verification is being run in an isolated
+  target dir (`/tmp/krishiv-operator-no-k8s`) because another workspace
+  `cargo test` process was holding the shared target lock.
 - Blockers for this pass:
   none for `cargo check`; only residual warnings remain in
   `krishiv-scheduler/src/store.rs` for unused metadata snapshot helpers.

@@ -158,7 +158,7 @@ async fn run_controller_with_servers(
     Ok(())
 }
 
-#[cfg(feature = "ui")]
+#[cfg(all(feature = "k8s", feature = "ui"))]
 async fn serve_status(
     listener: tokio::net::TcpListener,
     coordinator: SharedCoordinator,
@@ -167,7 +167,7 @@ async fn serve_status(
     krishiv_ui::serve(listener, state).await
 }
 
-#[cfg(not(feature = "ui"))]
+#[cfg(all(feature = "k8s", not(feature = "ui")))]
 async fn serve_status(
     _listener: tokio::net::TcpListener,
     _coordinator: SharedCoordinator,
