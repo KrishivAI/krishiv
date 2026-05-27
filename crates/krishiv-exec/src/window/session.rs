@@ -89,11 +89,14 @@ impl SessionWindowOperator {
             let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
                 message: e.to_string(),
             })?;
-            let mut state_key = Vec::from(b"ses:");
-            state_key.extend_from_slice(key.as_bytes());
-            state_key.push(0);
+            // GAP-18: length-prefix encoding.
+            // Format: b"ses:" | key_len_le_u32 | key_bytes | session_start_le_i64 | last_event_le_i64
+            let key_bytes_slice = key.as_bytes();
+            let mut state_key = Vec::with_capacity(4 + 4 + key_bytes_slice.len() + 16);
+            state_key.extend_from_slice(b"ses:");
+            state_key.extend_from_slice(&(key_bytes_slice.len() as u32).to_le_bytes());
+            state_key.extend_from_slice(key_bytes_slice);
             state_key.extend_from_slice(&session.session_start_ms.to_le_bytes());
-            state_key.push(0);
             state_key.extend_from_slice(&session.last_event_time_ms.to_le_bytes());
             state_keys.push(state_key);
             values.push(bytes);
@@ -291,13 +294,15 @@ impl SessionWindowOperator {
 }
 
 fn parse_session_state_key(bytes: &[u8]) -> Option<String> {
+    // GAP-18: length-prefix format.
+    // Format: b"ses:" | key_len_le_u32 | key_bytes | session_start_le_i64 | last_event_le_i64
     const PREFIX: &[u8] = b"ses:";
     if !bytes.starts_with(PREFIX) {
         return None;
     }
     let rest = &bytes[PREFIX.len()..];
-    let sep = rest.iter().position(|b| *b == 0)?;
-    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
+    let key_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let key = std::str::from_utf8(rest.get(4..4 + key_len)?).ok()?.to_string();
     Some(key)
 }
 
@@ -358,13 +363,30 @@ mod session_state_tests {
 
     #[test]
     fn session_state_parse_key() {
-        let mut key = Vec::from(b"ses:mykey");
-        key.push(0);
+        // GAP-18: use length-prefix encoding
+        let key_str = "mykey";
+        let key_bytes = key_str.as_bytes();
+        let mut key = Vec::from(b"ses:");
+        key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(key_bytes);
         key.extend_from_slice(&100i64.to_le_bytes());
-        key.push(0);
         key.extend_from_slice(&200i64.to_le_bytes());
         let k = parse_session_state_key(&key).unwrap();
         assert_eq!(k, "mykey");
+    }
+
+    #[test]
+    fn session_state_parse_key_with_embedded_null() {
+        // GAP-18: keys with null bytes must parse correctly.
+        let key_str = "user\x00id";
+        let key_bytes = key_str.as_bytes();
+        let mut key = Vec::from(b"ses:");
+        key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(key_bytes);
+        key.extend_from_slice(&100i64.to_le_bytes());
+        key.extend_from_slice(&200i64.to_le_bytes());
+        let k = parse_session_state_key(&key).unwrap();
+        assert_eq!(k, "user\x00id");
     }
 
     #[test]

@@ -87,7 +87,21 @@ impl ShuffleStore for LocalDiskShuffleStore {
             partition.id.partition,
         );
 
-        // Validate/update the lease token.
+        // BUG-4: Two-phase token validation with temp-file + rename atomicity.
+        //
+        // The previous single-phase approach acquired the write lock, validated
+        // the token, advanced it, released the lock, and then wrote the file.
+        // Two concurrent writers with tokens T1 < T2 could both pass validation
+        // (sequentially), then race to write the file — with T1's stale data
+        // potentially overwriting T2's newer data if T1's spawn_blocking started
+        // later.
+        //
+        // Fix: Write to a temp file WITHOUT holding the lock (phase 1), then
+        // re-acquire the lock and atomically rename the temp file to the final
+        // path only if the token in the map still matches (phase 2).  If a newer
+        // writer has meanwhile advanced the token past ours, we discard the temp.
+        //
+        // Phase 1: validate initial token and advance it.
         {
             let mut tokens = shuffle_write_lock(&self.lease_tokens)?;
             if let Some(&expected) = tokens.get(&key) {
@@ -101,47 +115,84 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 }
                 // Advance the stored token so a zombie with the previous token
                 // cannot win a race by writing before the replacement arrives.
-                tokens.insert(key, lease_token);
+                tokens.insert(key.clone(), lease_token);
             } else {
                 // Compatibility path for direct single-attempt writes: the first
                 // writer establishes the expected token for this partition.
-                tokens.insert(key, lease_token);
+                tokens.insert(key.clone(), lease_token);
             }
         }
 
-        let path = self.partition_path(&partition.id);
+        let final_path = self.partition_path(&partition.id);
         let writer_props = parquet_writer_properties(self.compression);
+        let lease_tokens = Arc::clone(&self.lease_tokens);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
         tokio::task::spawn_blocking(move || {
             use parquet::arrow::ArrowWriter;
+            use std::sync::atomic::{AtomicU64, Ordering};
 
-            if let Some(parent) = path.parent() {
+            // Use a process-local counter for unique temp file names.
+            static TMP_CTR: AtomicU64 = AtomicU64::new(1);
+            let tmp_suffix = TMP_CTR.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(parent) = final_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     ShuffleError::Io(format!("failed to create partition dir: {e}"))
                 })?;
             }
 
-            let file = std::fs::File::create(&path).map_err(|e| {
-                ShuffleError::Io(format!(
-                    "failed to create partition file '{}': {e}",
-                    path.display()
-                ))
-            })?;
-
-            let schema = partition.schema.clone();
-            let mut writer = ArrowWriter::try_new(file, schema, Some(writer_props))
-                .map_err(|e| ShuffleError::Io(format!("failed to create Parquet writer: {e}")))?;
-
-            for batch in &partition.batches {
-                writer
-                    .write(batch)
-                    .map_err(|e| ShuffleError::Io(format!("failed to write Parquet batch: {e}")))?;
+            // Phase 1 (continued): Write to a temp file alongside the final path.
+            let tmp_path = final_path.with_extension(format!("tmp.{tmp_suffix}"));
+            {
+                let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| {
+                    ShuffleError::Io(format!(
+                        "failed to create temp partition file '{}': {e}",
+                        tmp_path.display()
+                    ))
+                })?;
+                let schema = partition.schema.clone();
+                let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(writer_props))
+                    .map_err(|e| {
+                        ShuffleError::Io(format!("failed to create Parquet writer: {e}"))
+                    })?;
+                for batch in &partition.batches {
+                    writer.write(batch).map_err(|e| {
+                        ShuffleError::Io(format!("failed to write Parquet batch: {e}"))
+                    })?;
+                }
+                writer.close().map_err(|e| {
+                    ShuffleError::Io(format!("failed to close Parquet writer: {e}"))
+                })?;
             }
-            writer
-                .close()
-                .map_err(|e| ShuffleError::Io(format!("failed to close Parquet writer: {e}")))?;
+
+            // Phase 2: Re-acquire the lock and commit via rename only if our token
+            // is still the current winner.  If a newer writer advanced the token
+            // past ours since phase 1, discard the temp file.
+            let commit = {
+                let tokens = lease_tokens
+                    .read()
+                    .map_err(|_| ShuffleError::Io("lease token lock poisoned".to_owned()))?;
+                tokens.get(&key).copied().map_or(false, |t| t == lease_token)
+            };
+
+            if commit {
+                std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+                    ShuffleError::Io(format!(
+                        "failed to rename temp partition '{}' → '{}': {e}",
+                        tmp_path.display(),
+                        final_path.display()
+                    ))
+                })?;
+            } else {
+                // Newer writer won — silently discard this temp file.
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected: lease_token.saturating_add(1),
+                    actual: lease_token,
+                });
+            }
             Ok(())
         })
         .await

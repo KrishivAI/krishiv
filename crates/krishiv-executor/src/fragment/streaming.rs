@@ -206,6 +206,11 @@ pub(crate) async fn execute_streaming_fragment(
             plan_spec.agg_exprs[0].input_column = String::from("val");
         }
     }
+    // GAP-2: compute the observed event-time watermark from input batches BEFORE
+    // executing the window so we can attach it to the output and let the coordinator
+    // track global low-watermark across all executor tasks.
+    let observed_watermark_ms = compute_input_watermark(&batches, &plan_spec);
+
     let collected_batches =
         execute_bounded_window(batches, &plan_spec).map_err(|e| ExecutorError::LocalExecution {
             message: e.to_string(),
@@ -218,10 +223,47 @@ pub(crate) async fn execute_streaming_fragment(
         .map(|b| b.num_columns())
         .unwrap_or(0);
 
-    Ok(ExecutorTaskOutput::streaming_window(
+    let mut output = ExecutorTaskOutput::streaming_window(
         total_rows,
         total_batches,
         column_count,
         collected_batches,
-    ))
+    );
+    if let Some(wm) = observed_watermark_ms {
+        output = output.with_watermark_ms(wm);
+    }
+    Ok(output)
+}
+
+/// Compute the event-time watermark from input batches.
+///
+/// Watermark = max(event_time_column) − watermark_lag_ms.
+/// Returns `None` if the event-time column is not found or the batches are empty.
+fn compute_input_watermark(
+    batches: &[arrow::record_batch::RecordBatch],
+    spec: &WindowExecutionSpec,
+) -> Option<i64> {
+    use arrow::array::{Array, Int64Array};
+
+    let mut max_ts: Option<i64> = None;
+    for batch in batches {
+        let col_idx = batch
+            .schema()
+            .index_of(&spec.event_time_column)
+            .ok()?;
+        let col = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()?;
+        for i in 0..col.len() {
+            if !col.is_null(i) {
+                let ts = col.value(i);
+                max_ts = Some(match max_ts {
+                    Some(prev) => prev.max(ts),
+                    None => ts,
+                });
+            }
+        }
+    }
+    max_ts.map(|ts| ts.saturating_sub(spec.watermark_lag_ms as i64))
 }

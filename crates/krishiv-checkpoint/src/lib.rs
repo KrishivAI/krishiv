@@ -361,6 +361,12 @@ fn uuid_simple() -> u64 {
 // ── High-level helpers ────────────────────────────────────────────────────────
 
 /// Write serialized `metadata` to `{epoch_dir}/metadata.json`.
+///
+/// **Does not update the epoch hint file.** Callers must call [`write_epoch_hint`]
+/// *after* [`write_manifest`] so the hint only ever points to a fully sealed epoch.
+/// Updating the hint before the manifest is written can cause `latest_valid_epoch`
+/// to return an epoch whose manifest has not yet been written — resulting in an
+/// apparent "no valid epoch" on the next restart even though a newer epoch exists.
 pub fn write_epoch_metadata(
     storage: &dyn CheckpointStorage,
     job_id: &str,
@@ -385,7 +391,26 @@ pub fn write_epoch_metadata(
     let json = serde_json::to_vec_pretty(metadata).map_err(|e| CheckpointError::Storage {
         message: format!("metadata serialize: {e}"),
     })?;
-    storage.write_bytes(&metadata_path(job_id, epoch), &json)?;
+    storage.write_bytes(&metadata_path(job_id, epoch), &json)
+    // NOTE: epoch hint is NOT written here — callers must call write_epoch_hint()
+    // after write_manifest() succeeds to guarantee the hint only points to sealed epochs.
+}
+
+/// Update the fast-path epoch hint to `epoch`.
+///
+/// This must be called **last** — after both [`write_epoch_metadata`] and
+/// [`write_manifest`] have succeeded.  Writing the hint before the manifest is
+/// present can cause `latest_valid_epoch` to return an epoch that fails
+/// `validate_epoch` on the next restart, forcing a full directory scan.
+///
+/// In the worst case (crash between writing the manifest and writing the hint)
+/// `latest_valid_epoch` simply falls back to scanning `list_valid_epochs`, so
+/// the epoch is not lost — the hint is purely a read-path optimisation.
+pub fn write_epoch_hint(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+) -> CheckpointResult<()> {
     storage.write_bytes(
         &latest_epoch_hint_path(job_id),
         epoch.to_string().as_bytes(),

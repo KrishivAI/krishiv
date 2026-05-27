@@ -1344,13 +1344,33 @@ impl Coordinator {
     }
 
     /// Launch assigned tasks and push them to executor-owned task endpoints.
+    ///
+    /// # Lock safety (GAP-4)
+    ///
+    /// This method takes `&mut self` for the sync prepare phase
+    /// (`launch_assigned_task_assignments` + `resolve_assignment_targets`), then
+    /// clones the channel map and calls the **static** `deliver_assignment_targets_with_channels`
+    /// so `self` is NOT borrowed during the async network I/O.
+    ///
+    /// **Important**: If you call this through a `SharedCoordinator.write()` guard the write
+    /// lock is still held for the duration of the await, because the borrow lives for the
+    /// entire async function body.  For the production dispatch path use
+    /// `JobCoordinator::spawn_job_orchestration_loops`, which explicitly drops the write guard
+    /// before awaiting.  This method is intended for tests and CLI tools where no shared lock
+    /// is involved.
     pub async fn push_assigned_task_assignments(
         &mut self,
         job_id: &JobId,
     ) -> SchedulerResult<Vec<TaskStatusResponse>> {
         let assignments = self.launch_assigned_task_assignments(job_id)?;
         let targets = self.resolve_assignment_targets(assignments)?;
-        let responses = match self.deliver_assignment_targets(targets).await {
+        // GAP-4: Clone the channel map BEFORE the await point. Because
+        // `deliver_assignment_targets_with_channels` is a static method that owns
+        // `channels`, `self` is not borrowed across the network I/O yield points.
+        // Callers that hold a `SharedCoordinator.write()` guard should prefer the
+        // `JobCoordinator` pattern (acquire lock → collect targets → drop lock → deliver).
+        let channels = self.executor_channels.clone();
+        let responses = match Self::deliver_assignment_targets_with_channels(channels, targets).await {
             Ok(responses) => responses,
             Err(error) => {
                 self.clear_launch_in_flight_for_job(job_id);

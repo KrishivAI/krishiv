@@ -100,9 +100,15 @@ impl TumblingWindowOperator {
                     message: e.to_string(),
                 }
             })?;
-            let mut state_key = Vec::from(b"tw:");
-            state_key.extend_from_slice(key.as_bytes());
-            state_key.push(0);
+            // GAP-18: Use length-prefix encoding instead of null-byte separator.
+            // Null-byte separators are ambiguous when key strings can contain null
+            // bytes (e.g. arbitrary group-by key column values from user data).
+            // Format: b"tw:" | key_len_le_u32 (4 bytes) | key_bytes | win_start_le_i64 (8 bytes)
+            let key_bytes = key.as_bytes();
+            let mut state_key = Vec::with_capacity(3 + 4 + key_bytes.len() + 8);
+            state_key.extend_from_slice(b"tw:");
+            state_key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            state_key.extend_from_slice(key_bytes);
             state_key.extend_from_slice(&win_start.to_le_bytes());
             state_keys.push(state_key);
             values.push(bytes);
@@ -278,14 +284,20 @@ impl TumblingWindowOperator {
 }
 
 fn parse_tumbling_state_key(bytes: &[u8]) -> Option<(String, i64)> {
+    // GAP-18: length-prefix format: b"tw:" | key_len_le_u32 | key_bytes | win_start_le_i64
     const PREFIX: &[u8] = b"tw:";
     if !bytes.starts_with(PREFIX) {
         return None;
     }
     let rest = &bytes[PREFIX.len()..];
-    let sep = rest.iter().position(|b| *b == 0)?;
-    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
-    let win_bytes: [u8; 8] = rest.get(sep + 1..sep + 9)?.try_into().ok()?;
+    // Read 4-byte little-endian key length.
+    let key_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let key = std::str::from_utf8(rest.get(4..4 + key_len)?).ok()?.to_string();
+    let win_start_offset = 4 + key_len;
+    let win_bytes: [u8; 8] = rest
+        .get(win_start_offset..win_start_offset + 8)?
+        .try_into()
+        .ok()?;
     Some((key, i64::from_le_bytes(win_bytes)))
 }
 

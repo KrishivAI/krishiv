@@ -133,6 +133,12 @@ pub struct TaskOutputMetadata {
     runtime_stats: Option<TaskRuntimeStats>,
     /// Arrow IPC stream bytes per result batch for inline SQL/window collect.
     inline_record_batch_ipc: Vec<Vec<u8>>,
+    /// GAP-2: Maximum event-time watermark (milliseconds since epoch) emitted by
+    /// this streaming window task.  `None` for batch and non-window tasks.
+    ///
+    /// Transmitted back to the coordinator in the `TaskStatusRequest` so the
+    /// coordinator can track the global low-watermark across all executor tasks.
+    watermark_ms: Option<i64>,
 }
 
 impl TaskOutputMetadata {
@@ -151,6 +157,7 @@ impl TaskOutputMetadata {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             inline_record_batch_ipc: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -208,6 +215,18 @@ impl TaskOutputMetadata {
     pub fn with_inline_record_batch_ipc(mut self, batches: Vec<Vec<u8>>) -> Self {
         self.inline_record_batch_ipc = batches;
         self
+    }
+
+    /// Attach the maximum event-time watermark for a streaming window task.
+    #[must_use]
+    pub fn with_watermark_ms(mut self, watermark_ms: i64) -> Self {
+        self.watermark_ms = Some(watermark_ms);
+        self
+    }
+
+    /// Maximum event-time watermark (ms) emitted by this streaming window task.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.watermark_ms
     }
 }
 

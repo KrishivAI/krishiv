@@ -198,6 +198,13 @@ pub struct ExecutorTaskOutput {
     pub(crate) runtime_stats: Option<TaskRuntimeStats>,
     /// Record batches produced by streaming window operators (in-process / local path).
     pub(crate) record_batches: Vec<RecordBatch>,
+    /// GAP-2: Maximum event-time watermark (in milliseconds) reached by this
+    /// streaming window task.  `None` for batch and non-window tasks.
+    ///
+    /// The coordinator propagates this to downstream stage scheduling so that
+    /// a pipeline fan-out knows the global low watermark across all executor
+    /// tasks and can safely emit late-data decisions.
+    pub(crate) watermark_ms: Option<i64>,
 }
 
 impl ExecutorTaskOutput {
@@ -210,6 +217,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -226,6 +234,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -238,6 +247,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -250,6 +260,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -265,6 +276,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: partitions,
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -283,6 +295,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches,
+            watermark_ms: None,
         }
     }
 
@@ -299,6 +312,20 @@ impl ExecutorTaskOutput {
     pub(crate) fn with_record_batches(mut self, batches: Vec<RecordBatch>) -> Self {
         self.record_batches = batches;
         self
+    }
+
+    /// Attach the maximum event-time watermark reached by this streaming task.
+    ///
+    /// Must be set for `StreamingWindow` outputs so that the coordinator can
+    /// track global low-watermark across all tasks and propagate it downstream.
+    pub(crate) fn with_watermark_ms(mut self, watermark_ms: i64) -> Self {
+        self.watermark_ms = Some(watermark_ms);
+        self
+    }
+
+    /// Maximum event-time watermark reached by this streaming window task, if any.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.watermark_ms
     }
 
     /// Output kind.
@@ -339,6 +366,11 @@ impl ExecutorTaskOutput {
             && let Ok(ipc) = encode_record_batches_ipc(&self.record_batches)
         {
             meta = meta.with_inline_record_batch_ipc(ipc);
+        }
+        // GAP-2: Propagate watermark so the coordinator can track global low-watermark
+        // across all executor tasks for downstream stage scheduling.
+        if let Some(wm) = self.watermark_ms {
+            meta = meta.with_watermark_ms(wm);
         }
         meta
     }
