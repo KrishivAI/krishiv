@@ -4,7 +4,7 @@
 
 /// `SingleNodeElection` is the embedded/single-node implementation.
 /// `K8sLeaseElection` in `krishiv-operator` implements this for Kubernetes HA.
-/// Bare-metal HA backed by external etcd is selected through the same trait.
+/// `EtcdLeaseElection` in this crate (`feature = "etcd"`) implements bare-metal CCP HA.
 ///
 /// The trait is `#[async_trait]` so `Arc<dyn LeaderElection>` works for
 /// runtime injection (A1).  The boxed-future overhead is negligible at the

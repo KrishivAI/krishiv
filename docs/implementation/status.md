@@ -2,6 +2,12 @@
 
 ## Current Phase
 
+**Bare-metal CCP HA — etcd lease election (2026-05-27).**
+
+- `EtcdLeaseElection` (`krishiv-scheduler`, feature `etcd`) implements `LeaderElection` via etcd v3 lease + `/krishiv/ccp/leader` key.
+- `krishiv-clusterd` accepts `--leader-backend etcd --etcd-endpoints <URLs>` (env: `KRISHIV_LEADER_BACKEND`, `KRISHIV_ETCD_ENDPOINTS`).
+- Default remains `single` (always-leader `SingleNodeLeader`).
+
 **Audit Resolution Sweep — distributed/embedded/streaming fixes (2026-05-26).**
 
 Branch `cursor/implement-all-audit-resolutions-ac65` lands every resolution
