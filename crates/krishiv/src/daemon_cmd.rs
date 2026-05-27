@@ -111,6 +111,12 @@ fn run_flight_server(args: &[String]) -> i32 {
         print!("{}", flight_server_help());
         return 0;
     }
+    #[cfg(not(feature = "flight-sql"))]
+    {
+        eprintln!("flight-server support requires building krishiv with feature `flight-sql`");
+        return 2;
+    }
+    #[cfg(feature = "flight-sql")]
     match block_on(krishiv_flight_sql::run_flight_server_from_env()) {
         Ok(()) => 0,
         Err(e) => {
@@ -125,6 +131,12 @@ fn run_shuffle_svc(args: &[String]) -> i32 {
         print!("{}", shuffle_svc_help());
         return 0;
     }
+    #[cfg(not(feature = "shuffle"))]
+    {
+        eprintln!("shuffle-svc support requires building krishiv with feature `shuffle`");
+        return 2;
+    }
+    #[cfg(feature = "shuffle")]
     match block_on(krishiv_shuffle::shuffle_svc::run_shuffle_svc_from_env()) {
         Ok(()) => 0,
         Err(e) => {
@@ -135,19 +147,34 @@ fn run_shuffle_svc(args: &[String]) -> i32 {
 }
 
 pub fn daemons_help() -> String {
-    format!(
+    let mut help = String::from(
         "Krishiv daemon processes (also available as legacy binary names).\n\
          \n\
          Usage:\n\
            krishiv coordinator [OPTIONS]     Active coordinator (was krishiv-coordinator)\n\
            krishiv clusterd [OPTIONS]        Cluster control plane (was krishiv-clusterd)\n\
            krishiv job-coordinator [OPTS]    Per-job coordinator (was krishiv-job-coordinator)\n\
-           krishiv executor [OPTIONS]        Data-plane worker (was krishiv-executor)\n\
-           krishiv flight-server             Arrow Flight SQL (was krishiv-flight-server)\n\
-           krishiv shuffle-svc               Optional shuffle HTTP service\n\
-         \n\
-         Legacy binaries remain install aliases; prefer `krishiv <subcommand>`.\n"
-    )
+           krishiv executor [OPTIONS]        Data-plane worker (was krishiv-executor)\n",
+    );
+    #[cfg(feature = "flight-sql")]
+    help.push_str(
+        "           krishiv flight-server             Arrow Flight SQL (was krishiv-flight-server)\n",
+    );
+    #[cfg(not(feature = "flight-sql"))]
+    help.push_str(
+        "           krishiv flight-server             Arrow Flight SQL [disabled; build with feature `flight-sql`]\n",
+    );
+    #[cfg(feature = "shuffle")]
+    help.push_str("           krishiv shuffle-svc               Optional shuffle HTTP service\n");
+    #[cfg(not(feature = "shuffle"))]
+    help.push_str(
+        "           krishiv shuffle-svc               Optional shuffle HTTP service [disabled; build with feature `shuffle`]\n",
+    );
+    help.push_str(
+        "\n\
+         Legacy binaries remain install aliases; prefer `krishiv <subcommand>`.\n",
+    );
+    help
 }
 
 fn flight_server_help() -> &'static str {
@@ -165,13 +192,26 @@ fn shuffle_svc_help() -> &'static str {
 }
 
 /// CLI help snippet for main help (daemon section).
-pub fn daemon_help_section() -> &'static str {
-    "  coordinator       Run active coordinator (distributed control plane)\n\
-     clusterd          Run cluster control plane daemon (CCP)\n\
-     job-coordinator   Run per-job coordinator (JCP)\n\
-     executor          Run data-plane executor worker\n\
-     flight-server     Run Arrow Flight SQL endpoint\n\
-     shuffle-svc       Run optional shuffle HTTP service\n"
+pub fn daemon_help_section() -> String {
+    let mut help = String::from(
+        "  coordinator       Run active coordinator (distributed control plane)\n\
+         clusterd          Run cluster control plane daemon (CCP)\n\
+         job-coordinator   Run per-job coordinator (JCP)\n\
+         executor          Run data-plane executor worker\n",
+    );
+    #[cfg(feature = "flight-sql")]
+    help.push_str("  flight-server     Run Arrow Flight SQL endpoint\n");
+    #[cfg(not(feature = "flight-sql"))]
+    help.push_str(
+        "  flight-server     Arrow Flight SQL endpoint [disabled; build with feature `flight-sql`]\n",
+    );
+    #[cfg(feature = "shuffle")]
+    help.push_str("  shuffle-svc       Run optional shuffle HTTP service\n");
+    #[cfg(not(feature = "shuffle"))]
+    help.push_str(
+        "  shuffle-svc       Optional shuffle HTTP service [disabled; build with feature `shuffle`]\n",
+    );
+    help
 }
 
 /// Dispatch `help daemons` output.

@@ -65,7 +65,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = shuffle_write_lock(&self.lease_tokens)?;
         if let Some(&expected) = leases.get(&key)
-            && lease_token != expected
+            && lease_token < expected
         {
             return Err(ShuffleError::StaleLeaseToken {
                 expected,
@@ -99,6 +99,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         actual: lease_token,
                     });
                 }
+                // Advance the stored token so a zombie with the previous token
+                // cannot win a race by writing before the replacement arrives.
+                tokens.insert(key, lease_token);
             } else {
                 // Compatibility path for direct single-attempt writes: the first
                 // writer establishes the expected token for this partition.

@@ -25,15 +25,21 @@ pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSp
     );
     let window_op = match spec.window_kind {
         crate::window::WindowKind::Tumbling => crate::NodeOp::TumblingWindow {
+            key_column: spec.key_column.clone(),
+            event_time_column: spec.event_time_column.clone(),
             window_size_ms: spec.window_size_ms,
             aggs: spec.agg_exprs.clone(),
         },
         crate::window::WindowKind::Sliding => crate::NodeOp::SlidingWindow {
+            key_column: spec.key_column.clone(),
+            event_time_column: spec.event_time_column.clone(),
             window_size_ms: spec.window_size_ms,
             slide_ms: spec.slide_ms.unwrap_or(spec.window_size_ms),
             aggs: spec.agg_exprs.clone(),
         },
         crate::window::WindowKind::Session => crate::NodeOp::SessionWindow {
+            key_column: spec.key_column.clone(),
+            event_time_column: spec.event_time_column.clone(),
             session_gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
             aggs: spec.agg_exprs.clone(),
         },
@@ -65,12 +71,18 @@ pub fn physical_plan_for_window(
     let logical = logical_plan_for_window(name, spec);
     let mut physical = PhysicalPlan::new(logical.name(), logical.kind());
     for node in logical.nodes() {
+        let physical_id = format!("physical:{}", node.id());
         let mut physical_node = PlanNode::new(
-            format!("physical:{}", node.id()),
+            physical_id,
             format!("physical {}", node.label()),
             node.kind(),
         )
-        .with_inputs(node.inputs().iter().cloned());
+        .with_inputs(
+            node.inputs()
+                .iter()
+                .map(|id| format!("physical:{id}"))
+                .collect::<Vec<_>>(),
+        );
         if let Some(op) = node.op() {
             physical_node = physical_node.with_op(op.clone());
         }

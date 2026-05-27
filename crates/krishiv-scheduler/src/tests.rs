@@ -285,7 +285,13 @@ mod scheduler_tests {
         let metrics = coordinator.stability_metrics();
         assert_eq!(metrics.heartbeat_ages()[0].executor_id(), &executor_id);
         assert_eq!(metrics.heartbeat_ages()[0].age_ticks(), 1);
-        assert_eq!(metrics.running_task_count(), 1);
+        assert_eq!(
+            coordinator
+                .job_snapshot(&job_id)
+                .unwrap()
+                .assigned_task_count(),
+            1
+        );
     }
 
     #[test]
@@ -297,7 +303,7 @@ mod scheduler_tests {
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.blocking_write();
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
                 .unwrap();
@@ -306,11 +312,37 @@ mod scheduler_tests {
                 .unwrap();
         }
 
-        let coordinator = observer.read().unwrap();
+        let coordinator = observer.blocking_read();
         assert_eq!(coordinator.executor_snapshots().len(), 1);
         assert_eq!(
             coordinator.executor_snapshots()[0].state(),
             ExecutorState::Healthy
+        );
+    }
+
+    #[test]
+    fn launched_task_stays_assigned_until_executor_reports_running() {
+        let executor_id = ExecutorId::try_new("exec-launch-state").unwrap();
+        let job_id = JobId::try_new("job-launch-state").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-launch").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id, "pod-a", 1))
+            .unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        assert_eq!(assignments.len(), 1);
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task = &detail.stages()[0].tasks()[0];
+        assert_eq!(
+            task.state(),
+            TaskState::Assigned,
+            "the coordinator must not mark a task Running before the executor acks launch"
         );
     }
 
@@ -332,7 +364,7 @@ mod scheduler_tests {
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
         assert_eq!(response.lease_generation(), LeaseGeneration::initial());
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.blocking_read();
         assert_eq!(coordinator.executor_snapshots().len(), 1);
         assert_eq!(
             coordinator.executor_snapshots()[0].executor_id(),
@@ -374,7 +406,7 @@ mod scheduler_tests {
             .into_inner();
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.blocking_read();
         let executor = &coordinator.executor_snapshots()[0];
         assert_eq!(executor.state(), ExecutorState::Healthy);
         assert_eq!(executor.running_tasks(), &[task_id]);
@@ -412,7 +444,7 @@ mod scheduler_tests {
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.blocking_write();
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
                 .unwrap();
@@ -587,7 +619,7 @@ mod scheduler_tests {
 
         assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
         {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.blocking_read();
             assert_eq!(coordinator.executor_snapshots().len(), 1);
             assert_eq!(
                 coordinator.executor_snapshots()[0].state(),
@@ -600,7 +632,7 @@ mod scheduler_tests {
         let stage_id = job.stages()[0].stage_id().clone();
         let task_id = job.stages()[0].tasks()[0].task_id().clone();
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.blocking_write();
             coordinator.submit_job(job).unwrap();
             coordinator.launch_assigned_tasks(&job_id).unwrap();
         }
@@ -666,7 +698,7 @@ mod scheduler_tests {
         assert_eq!(register_resp.disposition(), TransportDisposition::Accepted);
 
         let lease_generation = {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.blocking_read();
             coordinator
                 .executor_snapshots()
                 .into_iter()
@@ -686,7 +718,7 @@ mod scheduler_tests {
         assert_eq!(dereg_resp.disposition(), TransportDisposition::Accepted);
 
         {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.blocking_read();
             let snapshot = coordinator
                 .executor_snapshots()
                 .into_iter()
@@ -712,7 +744,7 @@ mod scheduler_tests {
         let task_id = job.stages()[0].tasks()[0].task_id().clone();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.blocking_write();
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
                 .unwrap();
@@ -735,8 +767,7 @@ mod scheduler_tests {
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
         assert_eq!(
             shared
-                .read()
-                .unwrap()
+                .blocking_read()
                 .job_snapshot(&job_id)
                 .unwrap()
                 .state(),
@@ -763,7 +794,7 @@ mod scheduler_tests {
         );
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.blocking_write();
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
                 .unwrap();
@@ -810,7 +841,7 @@ mod scheduler_tests {
         let task_id = job.stages()[0].tasks()[0].task_id().clone();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.blocking_write();
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
                 .unwrap();
@@ -945,7 +976,7 @@ mod scheduler_tests {
             coordinator
                 .job_snapshot(&job_id)
                 .unwrap()
-                .running_task_count()
+                .assigned_task_count()
                 > 0
         );
     }
@@ -1020,7 +1051,7 @@ mod scheduler_tests {
             coordinator
                 .job_snapshot(&job_id)
                 .unwrap()
-                .running_task_count(),
+                .assigned_task_count(),
             2
         );
     }
@@ -1089,7 +1120,7 @@ mod scheduler_tests {
 
         assert_eq!(coordinator.launch_assigned_tasks(&job_id).unwrap(), 2);
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
-        assert_eq!(snapshot.running_task_count(), 2);
+        assert_eq!(snapshot.assigned_task_count(), 2);
 
         coordinator
             .apply_task_update(TaskStatusUpdate::new(
@@ -1690,8 +1721,9 @@ mod scheduler_tests {
             Some(9999),
             "apply_streaming_state is task-agnostic; the coordinator applies it if IDs match"
         );
-        // Task state must be unchanged by the heartbeat (Running from launch_assigned_tasks).
-        assert_eq!(task.state(), TaskState::Running);
+        // Task state must be unchanged by the heartbeat (still Assigned until an
+        // executor status update transitions it to Running).
+        assert_eq!(task.state(), TaskState::Assigned);
     }
 
     #[test]
@@ -2158,18 +2190,17 @@ mod scheduler_tests {
             ExecutorState::Lost
         );
 
-        // Task should have been reset to Assigned.
+        // Task should have been reset to Pending (no executors available to re-assign).
         {
             let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
             assert_eq!(
                 detail.stages()[0].tasks()[0].state(),
-                TaskState::Assigned,
-                "task should be reset to Assigned after executor crash"
+                TaskState::Pending,
+                "task should be reset to Pending after executor crash"
             );
         }
 
         // Re-register executor A (lost executor re-joins with a new lease).
-        // The task is still assigned to executor A, so the relaunch will go back to it.
         let new_lease_a = coordinator
             .register_executor(ExecutorDescriptor::new(
                 executor_a.clone(),
@@ -2189,6 +2220,9 @@ mod scheduler_tests {
             .register_executor(ExecutorDescriptor::new(executor_b.clone(), "pod-b", 1))
             .unwrap();
 
+        // Re-assign the pending task, then launch it.
+        let reassigned = coordinator.assign_pending_tasks(&job_id).unwrap();
+        assert_eq!(reassigned, 1, "should re-assign the pending task");
         let relaunch = coordinator
             .launch_assigned_task_assignments(&job_id)
             .unwrap();
@@ -2976,18 +3010,18 @@ mod scheduler_tests {
         let mut coord = CheckpointCoordinator::new(job_id, storage, 5_000, 0);
 
         // Accumulate 4 000 ms — below the 5 000 ms interval.
-        assert_eq!(coord.try_tick(4_000), None, "not yet due");
+        assert_eq!(coord.try_tick(4_000, 60_000), None, "not yet due");
         assert_eq!(
-            coord.try_tick(2_000),
+            coord.try_tick(2_000, 60_000),
             None,
             "zero running tasks skips initiate"
         );
         coord.set_expected_task_count(1);
-        assert_eq!(coord.try_tick(5_000), Some(1), "epoch 1 initiated");
+        assert_eq!(coord.try_tick(5_000, 60_000), Some(1), "epoch 1 initiated");
         // Epoch 1 is now in AwaitingAcks. Abort it to return to Idle.
         coord.abort_epoch("test reset");
         // Clock resets on initiate: another 5 000 ms triggers epoch 2.
-        assert_eq!(coord.try_tick(5_000), Some(2), "epoch 2 initiated");
+        assert_eq!(coord.try_tick(5_000, 60_000), Some(2), "epoch 2 initiated");
     }
 
     #[test]
@@ -2999,12 +3033,41 @@ mod scheduler_tests {
         let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 1);
 
         // First tick crosses the interval — epoch 1 initiated (now AwaitingAcks).
-        assert_eq!(coord.try_tick(1_000), Some(1));
+        assert_eq!(coord.try_tick(1_000, 60_000), Some(1));
         // While awaiting acks, further ticks must not initiate.
         assert_eq!(
-            coord.try_tick(10_000),
+            coord.try_tick(10_000, 60_000),
             None,
             "in-flight checkpoint blocks next"
+        );
+    }
+
+    #[test]
+    fn checkpoint_coordinator_aborts_stuck_epoch_after_timeout() {
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-tick-timeout").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 1);
+
+        assert_eq!(coord.try_tick(1_000, 5_000), Some(1));
+        assert!(coord.is_awaiting_acks());
+
+        assert_eq!(coord.try_tick(4_000, 5_000), None);
+        assert!(coord.is_awaiting_acks());
+
+        assert_eq!(coord.try_tick(1_000, 5_000), None);
+        assert!(
+            matches!(
+                coord.coordinator_state(),
+                CheckpointCoordinatorState::Failed { epoch: 1, .. }
+            ),
+            "stuck epoch must transition to Failed after the timeout elapses"
+        );
+
+        assert_eq!(
+            coord.try_tick(1_000, 5_000),
+            Some(2),
+            "timeout must unblock the next checkpoint epoch"
         );
     }
 

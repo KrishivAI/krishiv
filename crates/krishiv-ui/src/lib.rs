@@ -380,20 +380,10 @@ async fn healthz() -> &'static str {
 
 /// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
 async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
-    let body = match state.coordinator.read() {
-        Ok(coordinator) => {
-            let mut body = format_stability_metrics(&coordinator.stability_metrics());
-            body.push('\n');
-            body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
-            body
-        }
-        Err(_) => {
-            let mut body = format_stability_metrics(&StabilityMetrics::empty());
-            body.push('\n');
-            body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
-            body
-        }
-    };
+    let coordinator = state.coordinator.read().await;
+    let mut body = format_stability_metrics(&coordinator.stability_metrics());
+    body.push('\n');
+    body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
@@ -435,10 +425,7 @@ krishiv_shuffle_bytes_written_total {shuffle_bytes}
 
 async fn readyz(State(state): State<UiState>) -> Result<impl IntoResponse, UiError> {
     use krishiv_proto::CoordinatorState;
-    let coordinator = state
-        .coordinator
-        .read()
-        .map_err(|_| UiError::LockPoisoned)?;
+    let coordinator = state.coordinator.read().await;
     if coordinator.state() != CoordinatorState::Active {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -473,10 +460,7 @@ async fn api_executors(State(state): State<UiState>) -> Result<Json<ExecutorsRes
 }
 
 async fn api_queues(State(state): State<UiState>) -> Result<Json<QueuesResponse>, UiError> {
-    let coordinator = state
-        .coordinator
-        .read()
-        .map_err(|_| UiError::LockPoisoned)?;
+    let coordinator = state.coordinator.read().await;
 
     // Collect all distinct namespaces from active jobs plus the default namespace.
     let mut namespaces: Vec<Option<String>> = coordinator
@@ -518,10 +502,7 @@ async fn api_job_checkpoints(
     Path(job_id_str): Path<String>,
 ) -> Result<Json<JobCheckpointsResponse>, UiError> {
     let job_id = JobId::try_new(job_id_str.clone()).map_err(|e| UiError::Id(e.to_string()))?;
-    let coordinator = state
-        .coordinator
-        .read()
-        .map_err(|_| UiError::LockPoisoned)?;
+    let coordinator = state.coordinator.read().await;
 
     // Verify the job exists — returns UnknownJob (→ 404) if not.
     coordinator.job_detail_snapshot(&job_id)?;
@@ -565,10 +546,7 @@ async fn stylesheet() -> impl IntoResponse {
 }
 
 fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
-    let coordinator = state
-        .coordinator
-        .read()
-        .map_err(|_| UiError::LockPoisoned)?;
+    let coordinator = state.coordinator.blocking_read();
     Ok(StatusView {
         coordinator_id: coordinator.coordinator_id().to_string(),
         coordinator_state: coordinator.state().to_string(),
@@ -588,10 +566,7 @@ fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
 fn job_detail(state: &UiState, job_id: &str) -> UiResult<JobDetailView> {
     let job_id =
         JobId::try_new(job_id.to_owned()).map_err(|error| UiError::Id(error.to_string()))?;
-    let coordinator = state
-        .coordinator
-        .read()
-        .map_err(|_| UiError::LockPoisoned)?;
+    let coordinator = state.coordinator.blocking_read();
     let detail = coordinator.job_detail_snapshot(&job_id)?;
     Ok(JobDetailView::from_snapshot(&detail))
 }
@@ -900,9 +875,6 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{UiState, demo_state, empty_state, router};
-    #[allow(unused_imports)]
-    use serde_json;
-
     #[tokio::test]
     async fn health_route_reports_ok() {
         let response = router(empty_state().unwrap())

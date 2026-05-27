@@ -4,6 +4,13 @@ use std::env;
 use std::process;
 
 fn main() {
+    // Load .env file — optional, silently ignored if absent.
+    if let Err(e) = dotenvy::dotenv()
+        && !e.not_found()
+    {
+        eprintln!("warn: failed to load .env: {e}");
+    }
+
     // Initialise telemetry — opt-in via OTEL_EXPORTER_OTLP_ENDPOINT.
     let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     let _metrics = krishiv_metrics::init(krishiv_metrics::MetricsConfig {

@@ -152,50 +152,28 @@ impl ClusterControlPlane {
     }
 
     pub fn is_active(&self) -> bool {
-        self.shared
-            .read()
-            .map(|c| c.state() == krishiv_proto::CoordinatorState::Active)
-            .unwrap_or(false)
+        self.shared.blocking_read().state() == krishiv_proto::CoordinatorState::Active
     }
 
     pub fn promote_to_active(&self) -> SchedulerResult<()> {
-        self.shared
-            .write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .promote_to_active();
+        self.shared.blocking_write().promote_to_active();
         Ok(())
     }
 
     pub fn demote_to_standby(&self) -> SchedulerResult<()> {
-        self.shared
-            .write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .demote_to_standby();
+        self.shared.blocking_write().demote_to_standby();
         Ok(())
     }
 
     pub fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         if !self.leader.is_leader() {
-            let state = self
-                .shared
-                .read()
-                .map(|c| c.state())
-                .unwrap_or(krishiv_proto::CoordinatorState::Standby);
+            let state = self.shared.blocking_read().state();
             return Err(SchedulerError::InactiveCoordinator {
                 coordinator_id: self.coordinator_id.clone(),
                 state,
             });
         }
-        self.shared
-            .write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .submit_job(spec)
+        self.shared.blocking_write().submit_job(spec)
     }
 
     pub fn job_coordinator(&self, job_id: JobId) -> JobCoordinator {

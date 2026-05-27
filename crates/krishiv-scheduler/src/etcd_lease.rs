@@ -328,15 +328,15 @@ impl EtcdLeaseElection {
             .unwrap_or_else(|p| p.into_inner())
             .lease_id;
         self.clear_leader();
-        if lease_id != 0 {
-            if let Err(error) = client.lease_revoke(lease_id).await {
-                tracing::warn!(
-                    key = %self.lease_key,
-                    lease_id,
-                    %error,
-                    "etcd_lease: lease_revoke failed during release"
-                );
-            }
+        if lease_id != 0
+            && let Err(error) = client.lease_revoke(lease_id).await
+        {
+            tracing::warn!(
+                key = %self.lease_key,
+                lease_id,
+                %error,
+                "etcd_lease: lease_revoke failed during release"
+            );
         }
     }
 }

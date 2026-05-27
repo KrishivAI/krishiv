@@ -120,17 +120,26 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
         .close()
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
     let meta = fs::metadata(&file_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    let log_path = delta_log_dir(root).join(format!("{version:020}.json"));
-    let mut log = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let log_dir = delta_log_dir(root);
+    let log_path = log_dir.join(format!("{version:020}.json"));
+    let tmp_log_path = log_dir.join(format!("{version:020}.json.tmp"));
+
+    // Write commit log atomically: write to .tmp, fsync, rename.
     let commit = json!({"commitInfo":{"operation":"WRITE","timestamp":chrono::Utc::now().timestamp_millis()}});
-    writeln!(log, "{commit}").map_err(|e| LakehouseError::Io(e.to_string()))?;
     let add = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
-    writeln!(log, "{add}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+    {
+        let mut log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_log_path)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        writeln!(log, "{commit}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        writeln!(log, "{add}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        log.sync_all()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    }
+    fs::rename(&tmp_log_path, &log_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
     Ok(())
 }
 

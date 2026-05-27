@@ -265,7 +265,7 @@ impl GrpcCoordinatorService {
 
 ### P0-14 · Spark Connect CAST always emits STRING type
 
-**Crates:** `krishiv-spark-connect/src/translate.rs` line 192  
+**Crates:** historical `krishiv-spark-connect/src/translate.rs` line 192  
 **Finding:** `CAST({inner} AS STRING)` is emitted regardless of the `DataType` in the proto `Cast` message. Numeric and timestamp casts silently produce string columns. PySpark workloads using `.cast(IntegerType())` will get wrong types with no error.
 
 **Mitigation:** Map the Spark proto `DataType` to SQL type names and use them in the CAST expression:
@@ -282,7 +282,7 @@ fn spark_type_to_sql(dt: &spark_connect::DataType) -> &'static str {
 }
 ```
 
-**Validation:** `cargo test -p krishiv-spark-connect -- cast_preserves_type`.
+**Validation at the time:** `cargo test -p krishiv-spark-connect -- cast_preserves_type`.
 
 ---
 
@@ -661,9 +661,11 @@ Remove the permanent-`Unsupported` stubs or make them `#[cfg(not(feature = "kafk
 ### P2-6 · `krishiv-testkit` is empty
 
 **Crates:** `krishiv-testkit/src/lib.rs`  
-**Finding:** The crate declares `#![forbid(unsafe_code)]` and nothing else. Every crate defines its own local test helpers.
+**Finding:** The crate declared `#![forbid(unsafe_code)]` and nothing else. Every crate defined its own local test helpers.
 
-**Mitigation:** Populate with:
+**Disposition:** The empty crate was later removed from the repository.
+
+**Mitigation if reintroduced:** Populate with:
 - `fn make_batch(schema: SchemaRef, columns: Vec<ArrayRef>) -> RecordBatch`
 - `fn make_i32_batch(values: &[i32]) -> RecordBatch`
 - `struct MockSource` — configurable Arrow batch emitter
@@ -801,7 +803,7 @@ Remove the permanent-`Unsupported` stubs or make them `#[cfg(not(feature = "kafk
 | P3-23 | `krishiv-catalog` | `register_table` silently overwrites | Return `CatalogError::TableAlreadyExists` if present and `if_not_exists=false` |
 | P3-24 | `krishiv-catalog` | `FieldType::List` hardcodes `Int64` item type | Add `List(Box<FieldType>)` variant |
 | P3-25 | `krishiv-catalog` | `FieldType::Struct` maps to empty struct | Add `Struct(Vec<CatalogField>)` variant |
-| P3-26 | `krishiv-federation` | `FederationClient` trait is synchronous | Change to `async fn` trait methods (or `async_trait`) |
+| P3-26 | Historical `krishiv-federation` crate | `FederationClient` trait is synchronous | Keep federation work in active scheduler code; if a dedicated crate returns, use `async fn` trait methods (`async_trait` or equivalent) |
 | P3-27 | `krishiv-cep` | `SequentialPatternMatcher` has no partitioned-key wrapper | Add `PartitionedCepMatcher<K: Hash+Eq>` wrapping `HashMap<K, SequentialPatternMatcher>` |
 | P3-28 | `krishiv-chaos` | `FaultMode::Delay/Drop` never actually executed | Add a `FaultInjector::apply(mode, conn)` method that intercepts real calls |
 | P3-29 | `krishiv-upgrade-tests` | `CURRENT_VERSION` is a local constant | Import `SCHEMA_VERSION` from `krishiv-checkpoint` |
@@ -839,13 +841,13 @@ Run: `cargo check --workspace && cargo test --workspace`
 16. P1-12 + P1-13 + P1-14 + P1-15: Connectors correctness.
 17. P1-18: Row-level security.
 18. P1-20 + P1-21: Kafka connector and UDF wiring.
-19. P2-6: Populate `krishiv-testkit`.
+19. P2-6: If a shared test-support crate is reintroduced, populate it instead of keeping a stub.
 20. P2-3 + P2-4: First optimizer rules and CoalescePartitions execution.
 21. Remaining P2 items.
 
 ### Sprint 4 (P3 cleanup)
 
-22. All P3 items: Replace `unwrap()` calls, fix O(N) cancel, async AuditSink, federation sync→async.
+22. All P3 items: Replace `unwrap()` calls, fix O(N) cancel, async AuditSink, and keep federation work in active scheduler code until a dedicated crate is justified.
 
 ---
 

@@ -321,7 +321,9 @@ Workstreams are **sequential where noted**; within a workstream, tasks are paral
 | 11.2 | Regional CCP registers with global catalog; JCP stays regional | ADR-19.1 |
 | 11.3 | Routing policy integration tests (2 mock regions) | federation |
 
-**Gate:** `cargo test -p krishiv-federation` with networked fake global CP.
+**Gate:** if a dedicated federation crate is reintroduced, test it with a
+networked fake global control plane; otherwise keep the coverage in scheduler
+integration tests.
 
 ---
 

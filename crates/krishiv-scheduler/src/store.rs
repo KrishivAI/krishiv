@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use krishiv_proto::{
@@ -127,10 +128,11 @@ impl JsonFileMetadataStore {
             }
         };
         if bytes.is_empty() {
-            return Ok(Self {
-                path,
-                events: Vec::new(),
-                jobs: Vec::new(),
+            return Err(SchedulerError::Transport {
+                message: format!(
+                    "metadata store '{}' is empty; refusing to treat a torn write as an empty store",
+                    path.display()
+                ),
             });
         }
         let persisted: PersistedMetadata =
@@ -175,12 +177,47 @@ impl JsonFileMetadataStore {
             serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
                 message: format!("failed to encode metadata store: {error}"),
             })?;
-        std::fs::write(&self.path, bytes).map_err(|error| SchedulerError::Transport {
+        let tmp_path = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        let mut file =
+            std::fs::File::create(&tmp_path).map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to create temporary metadata store '{}': {error}",
+                    tmp_path.display()
+                ),
+            })?;
+        file.write_all(&bytes)
+            .map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to write temporary metadata store '{}': {error}",
+                    tmp_path.display()
+                ),
+            })?;
+        file.sync_all().map_err(|error| SchedulerError::Transport {
             message: format!(
-                "failed to write metadata store '{}': {error}",
+                "failed to fsync temporary metadata store '{}': {error}",
+                tmp_path.display()
+            ),
+        })?;
+        drop(file);
+        std::fs::rename(&tmp_path, &self.path).map_err(|error| SchedulerError::Transport {
+            message: format!(
+                "failed to atomically replace metadata store '{}': {error}",
                 self.path.display()
             ),
-        })
+        })?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| SchedulerError::Transport {
+                    message: format!(
+                        "failed to fsync metadata store directory '{}': {error}",
+                        parent.display()
+                    ),
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -741,6 +778,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
                 .transpose()
                 .map_err(invalid_metadata_id)?,
             attempt: value.attempt,
+            launch_in_flight: false,
             output_metadata: value.output_metadata.map(TaskOutputMetadata::from),
             last_failure_reason: value.last_failure_reason,
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.

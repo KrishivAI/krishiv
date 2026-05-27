@@ -1,18 +1,24 @@
 #![forbid(unsafe_code)]
 
 use std::error::Error;
+#[cfg(feature = "k8s")]
 use std::net::SocketAddr;
 
+#[cfg(feature = "k8s")]
 use krishiv_operator::{
     BootstrapExecutor, K8sLeaseElection, KubernetesControllerConfig, KubernetesControllerRuntime,
     run_kubernetes_controller_runtime_with_client,
 };
+#[cfg(feature = "k8s")]
 use krishiv_proto::CoordinatorId;
+#[cfg(feature = "k8s")]
 use krishiv_scheduler::serve_coordinator_executor_grpc_with_listener;
+#[cfg(feature = "k8s")]
 use krishiv_scheduler::{LeaderElection, SharedCoordinator};
-use krishiv_ui::{UiState, serve};
+#[cfg(feature = "k8s")]
 use kube::Client;
 
+#[cfg(feature = "k8s")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = OperatorCliConfig::parse(std::env::args().skip(1))?;
@@ -32,9 +38,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::try_default().await?;
     // A2/E3: do NOT eagerly start orchestration loops while still Standby.
     // Demote first so the lease loop can promote us atomically once acquired.
-    if let Ok(mut coord) = runtime.coordinator().write() {
-        coord.demote_to_standby();
-    }
+    runtime.coordinator().write().await.demote_to_standby();
     spawn_coordinator_leader_election(
         runtime.coordinator(),
         client.clone(),
@@ -56,6 +60,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(not(feature = "k8s"))]
+fn main() -> Result<(), Box<dyn Error>> {
+    let wants_help = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h");
+    if wants_help {
+        print!("{}", disabled_help());
+        return Ok(());
+    }
+    Err(String::from("krishiv-operator requires building with feature `k8s`").into())
+}
+
+#[cfg(feature = "k8s")]
 async fn run_controller_with_servers(
     client: Client,
     controller_config: KubernetesControllerConfig,
@@ -63,6 +80,14 @@ async fn run_controller_with_servers(
     status_addr: Option<SocketAddr>,
     executor_grpc_addr: Option<SocketAddr>,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(not(feature = "ui"))]
+    if status_addr.is_some() {
+        return Err(String::from(
+            "--status-addr requires building krishiv-operator with feature `ui`",
+        )
+        .into());
+    }
+
     let status_listener = match status_addr {
         Some(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -88,13 +113,13 @@ async fn run_controller_with_servers(
 
     match (status_listener, grpc_listener) {
         (Some(status_listener), Some(grpc_listener)) => {
-            let status_state = UiState::from_shared_coordinator(runtime.coordinator());
+            let status_coordinator = runtime.coordinator();
             let grpc_coordinator = runtime.coordinator().clone();
             tokio::select! {
                 result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
                     result?;
                 }
-                result = serve(status_listener, status_state) => {
+                result = serve_status(status_listener, status_coordinator) => {
                     result?;
                 }
                 result = serve_coordinator_executor_grpc_with_listener(grpc_listener, grpc_coordinator) => {
@@ -103,12 +128,12 @@ async fn run_controller_with_servers(
             }
         }
         (Some(status_listener), None) => {
-            let status_state = UiState::from_shared_coordinator(runtime.coordinator());
+            let status_coordinator = runtime.coordinator();
             tokio::select! {
                 result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
                     result?;
                 }
-                result = serve(status_listener, status_state) => {
+                result = serve_status(status_listener, status_coordinator) => {
                     result?;
                 }
             }
@@ -133,6 +158,24 @@ async fn run_controller_with_servers(
     Ok(())
 }
 
+#[cfg(feature = "ui")]
+async fn serve_status(
+    listener: tokio::net::TcpListener,
+    coordinator: SharedCoordinator,
+) -> std::io::Result<()> {
+    let state = krishiv_ui::UiState::from_shared_coordinator(coordinator);
+    krishiv_ui::serve(listener, state).await
+}
+
+#[cfg(not(feature = "ui"))]
+async fn serve_status(
+    _listener: tokio::net::TcpListener,
+    _coordinator: SharedCoordinator,
+) -> std::io::Result<()> {
+    unreachable!("serve_status is only reachable when feature `ui` is enabled")
+}
+
+#[cfg(feature = "k8s")]
 fn spawn_coordinator_leader_election(
     coordinator: SharedCoordinator,
     client: kube::Client,
@@ -151,9 +194,8 @@ fn spawn_coordinator_leader_election(
     tokio::spawn(async move {
         // Try to acquire synchronously before starting the periodic loop so
         // there is no window where two pods both think they are Active (A2).
-        if election.try_acquire().await
-            && let Ok(mut c) = coordinator.write()
-        {
+        if election.try_acquire().await {
+            let mut c = coordinator.write().await;
             c.promote_to_active();
             orchestration_abort = Some(coordinator.spawn_orchestration_loops_with_handles());
         }
@@ -165,9 +207,7 @@ fn spawn_coordinator_leader_election(
             let was_leader = election.is_leader();
             let acquired = election.try_acquire().await;
             if acquired {
-                if let Ok(mut c) = coordinator.write() {
-                    c.promote_to_active();
-                }
+                coordinator.write().await.promote_to_active();
                 if orchestration_abort.is_none() {
                     orchestration_abort =
                         Some(coordinator.spawn_orchestration_loops_with_handles());
@@ -175,17 +215,15 @@ fn spawn_coordinator_leader_election(
             } else if was_leader {
                 let renewed = election.renew().await;
                 if !renewed {
-                    if let Ok(mut c) = coordinator.write() {
-                        c.demote_to_standby();
-                    }
+                    coordinator.write().await.demote_to_standby();
                     if let Some(handles) = orchestration_abort.take() {
                         for h in handles {
                             h.abort();
                         }
                     }
                 }
-            } else if let Ok(mut c) = coordinator.write() {
-                c.demote_to_standby();
+            } else {
+                coordinator.write().await.demote_to_standby();
                 if let Some(handles) = orchestration_abort.take() {
                     for h in handles {
                         h.abort();
@@ -196,6 +234,15 @@ fn spawn_coordinator_leader_election(
     });
 }
 
+#[cfg(not(feature = "k8s"))]
+fn disabled_help() -> &'static str {
+    "Krishiv operator binary.\n\
+     \n\
+     This build was compiled without Kubernetes support.\n\
+     Rebuild with feature `k8s` or enable the default `cluster` feature.\n"
+}
+
+#[cfg(feature = "k8s")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OperatorCliConfig {
     namespace: Option<String>,
@@ -211,6 +258,7 @@ struct OperatorCliConfig {
     help: bool,
 }
 
+#[cfg(feature = "k8s")]
 impl OperatorCliConfig {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut config = Self {
@@ -363,13 +411,14 @@ impl OperatorCliConfig {
     }
 }
 
+#[cfg(feature = "k8s")]
 fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     args.next()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("missing value for {flag}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "k8s"))]
 mod tests {
     use super::OperatorCliConfig;
 

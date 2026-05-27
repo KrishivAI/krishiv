@@ -21,6 +21,9 @@ rdkafka = { version = "0.36", optional = true, default-features = false, feature
 
 [features]
 default = []
+# Taxonomy marker for the always-present Iceberg lakehouse surface. The code is
+# not split yet, but downstream crates can now express intent consistently.
+iceberg = []
 delta = []
 kafka = ["dep:rdkafka"]
 exactly-once-integration = []

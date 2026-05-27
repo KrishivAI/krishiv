@@ -150,17 +150,29 @@ pub enum NodeOp {
     },
     /// Tumbling event-time window.
     TumblingWindow {
+        #[serde(default)]
+        key_column: String,
+        #[serde(default)]
+        event_time_column: String,
         window_size_ms: u64,
         aggs: Vec<window::WindowAgg>,
     },
     /// Sliding event-time window.
     SlidingWindow {
+        #[serde(default)]
+        key_column: String,
+        #[serde(default)]
+        event_time_column: String,
         window_size_ms: u64,
         slide_ms: u64,
         aggs: Vec<window::WindowAgg>,
     },
     /// Session window on inactivity gap.
     SessionWindow {
+        #[serde(default)]
+        key_column: String,
+        #[serde(default)]
+        event_time_column: String,
         session_gap_ms: u64,
         aggs: Vec<window::WindowAgg>,
     },

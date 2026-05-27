@@ -1,6 +1,6 @@
 //! Key-group rescaling for checkpoint restore (R16 S4.2).
 
-use krishiv_state::key_group::{KeyGroupRange, NUM_KEY_GROUPS, key_group_ranges_for_parallelism};
+use krishiv_state::key_group::{KeyGroupRange, key_group_ranges_for_parallelism};
 
 /// Computes key-group → task slot mapping when restoring with new parallelism.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,17 +30,16 @@ impl KeyGroupRescaler {
     }
 
     /// Key-group range assigned to `task_index` in the new deployment.
-    pub fn range_for_task(&self, task_index: u32) -> KeyGroupRange {
-        self.new_ranges
-            .get(task_index as usize)
-            .copied()
-            .unwrap_or(KeyGroupRange::new(0, NUM_KEY_GROUPS - 1))
+    /// Returns `None` if `task_index` is out of range.
+    pub fn range_for_task(&self, task_index: u32) -> Option<KeyGroupRange> {
+        self.new_ranges.get(task_index as usize).copied()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use krishiv_state::key_group::NUM_KEY_GROUPS;
 
     #[test]
     fn rescale_4_to_2_maps_all_key_groups() {
@@ -49,7 +48,7 @@ mod tests {
         for kg in 0..NUM_KEY_GROUPS {
             let task = rescaler.task_for_key_group(kg);
             assert!(task < 2);
-            let range = rescaler.range_for_task(task);
+            let range = rescaler.range_for_task(task).expect("task index in range");
             assert!(range.contains(kg));
         }
     }
@@ -58,5 +57,19 @@ mod tests {
     fn rescale_2_to_4_expands_ranges() {
         let rescaler = KeyGroupRescaler::new(2, 4);
         assert_eq!(rescaler.new_ranges.len(), 4);
+    }
+
+    /// C12 regression: range_for_task must return None for out-of-range indices
+    /// (task_index >= new_parallelism) instead of panicking or returning garbage.
+    #[test]
+    fn range_for_task_out_of_range_returns_none() {
+        let rescaler = KeyGroupRescaler::new(4, 2);
+        assert!(rescaler.range_for_task(0).is_some());
+        assert!(rescaler.range_for_task(1).is_some());
+        assert!(
+            rescaler.range_for_task(2).is_none(),
+            "task_index >= parallelism must return None"
+        );
+        assert!(rescaler.range_for_task(999).is_none());
     }
 }

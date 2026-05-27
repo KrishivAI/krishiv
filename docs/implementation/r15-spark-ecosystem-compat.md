@@ -152,7 +152,11 @@ Out of scope:
 - [x] Return `UNIMPLEMENTED` gRPC status for unsupported relation/expression types with a descriptive message referencing the compatibility matrix.
 - [x] Write unit tests for each supported relation translator.
 
-**Validation**: `cargo test -p krishiv-spark-connect`
+**Historical note:** The detached `krishiv-spark-connect` crate was later
+removed from the repository rather than kept out-of-workspace. Any future Spark
+Connect work should return as an explicit gated workspace member.
+
+**Validation at the time**: `cargo test -p krishiv-spark-connect`
 
 ### S3.3 Spark Connect gRPC Server on Coordinator
 - [x] Add `SparkConnectService` tonic server implementing `spark.connect.SparkConnectService`.
@@ -163,7 +167,7 @@ Out of scope:
 - [x] Add `spark_connect_port` field to coordinator configuration.
 - [x] Write integration test: PySpark 3.5 client connects, runs TPC-H Q1, result matches expected.
 
-**Validation**: `cargo test -p krishiv-spark-connect -- integration`; `cargo check --workspace` clean.
+**Validation at the time**: `cargo test -p krishiv-spark-connect -- integration`; `cargo check --workspace` clean.
 
 ---
 

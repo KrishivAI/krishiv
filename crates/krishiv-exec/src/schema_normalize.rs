@@ -113,7 +113,7 @@ impl SchemaNormalizeOperator {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;

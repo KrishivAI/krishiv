@@ -1,6 +1,5 @@
 //! Two-phase Parquet commit with staging directory (R16 S5.2).
 
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use arrow::record_batch::RecordBatch;
@@ -70,7 +69,7 @@ impl TwoPhaseParquetSink {
                 std::fs::rename(entry.path(), dest).map_err(|e| io_err("commit staged file", e))?;
             }
         }
-        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::remove_dir_all(&staging).map_err(|e| io_err("remove staging dir", e))?;
         Ok(())
     }
 }
@@ -114,24 +113,15 @@ impl TwoPhaseCommitSink for TwoPhaseParquetSink {
                 message: "invalid staged path".into(),
             })?;
         let dest = self.final_dir().join(name);
-        match std::fs::hard_link(&handle.path, &dest) {
-            Ok(()) => {
-                std::fs::remove_file(&handle.path)
-                    .map_err(|e| io_err("remove staging after link", e))?;
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let _ = std::fs::remove_file(&handle.path);
-            }
-            Err(e) => {
-                return Err(io_err("hard link staged parquet", e));
-            }
-        }
+        // rename is atomic on POSIX — single metadata operation.
+        std::fs::rename(&handle.path, &dest).map_err(|e| io_err("commit staged parquet", e))?;
         self.staged_paths.remove(&handle.id);
         Ok(())
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        let _ = std::fs::remove_file(&handle.path);
+        std::fs::remove_file(&handle.path)
+            .map_err(|e| io_err("remove staging file on abort", e))?;
         self.staged_paths.remove(&handle.id);
         Ok(())
     }

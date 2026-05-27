@@ -48,9 +48,7 @@ pub async fn execute_batch_sql_coordinated(
     let spec = JobSpec::new(job_id.clone(), "batch-sql", JobKind::Batch).with_stage(stage);
 
     {
-        let mut coord = coordinator.write().map_err(|_| SchedulerError::Transport {
-            message: "coordinator lock poisoned".to_string(),
-        })?;
+        let mut coord = coordinator.write().await;
         coord.ensure_active()?;
         coord.submit_job(spec)?;
         coord.register_batch_sql_tables(job_id.clone(), tables.to_vec());
@@ -59,7 +57,7 @@ pub async fn execute_batch_sql_coordinated(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
         if tokio::time::Instant::now() >= deadline {
-            let _ = coordinator.write().map(|mut c| c.cancel_job(&job_id));
+            let _ = coordinator.write().await.cancel_job(&job_id);
             return Err(SchedulerError::Transport {
                 message: format!("batch SQL job {job_id} timed out after 300s"),
             });
@@ -68,9 +66,7 @@ pub async fn execute_batch_sql_coordinated(
         let _ = coordinator.drive_pending_task_launches().await;
 
         let state = {
-            let coord = coordinator.read().map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?;
+            let coord = coordinator.read().await;
             coord.job_snapshot(&job_id).map(|s| s.state())?
         };
 
@@ -78,9 +74,7 @@ pub async fn execute_batch_sql_coordinated(
             JobState::Succeeded => {
                 let batches = coordinator
                     .write()
-                    .map_err(|_| SchedulerError::Transport {
-                        message: "coordinator lock poisoned".to_string(),
-                    })?
+                    .await
                     .take_job_inline_results(&job_id)
                     .unwrap_or_default();
                 return Ok(BatchSqlOutcome {

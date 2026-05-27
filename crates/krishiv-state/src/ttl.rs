@@ -156,16 +156,22 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     /// the full configured TTL duration remaining.
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
         let entries = decode_snapshot_entries(bytes)?;
-        // Clear existing state and reload with fresh TTL prefixes.
+        let now_ms = unix_now_ms();
+        let expires_at_ms = now_ms + self.config.ttl_ms as i64;
+        // Pre-compute entries so the clear+insert phase has no fallible computation.
+        let precomputed: Vec<(Namespace, Vec<u8>, Vec<u8>)> = entries
+            .iter()
+            .map(|(op_id, state_name, key, raw_value)| {
+                let ns = Namespace::new(op_id, state_name);
+                let encoded = Self::encode(raw_value.to_vec(), expires_at_ms);
+                (ns, key.clone(), encoded)
+            })
+            .collect();
         let namespaces = self.inner.list_namespaces()?;
         for ns in &namespaces {
             self.inner.clear_namespace(ns)?;
         }
-        let now_ms = unix_now_ms();
-        let expires_at_ms = now_ms + self.config.ttl_ms as i64;
-        for (op_id, state_name, key, raw_value) in entries {
-            let ns = Namespace::new(&op_id, &state_name);
-            let encoded = Self::encode(raw_value, expires_at_ms);
+        for (ns, key, encoded) in precomputed {
             self.inner.put(&ns, key, encoded)?;
         }
         Ok(())

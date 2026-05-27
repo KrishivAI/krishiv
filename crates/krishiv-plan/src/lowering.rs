@@ -22,31 +22,43 @@ pub fn decode_task_fragment(fragment: &str) -> Option<NodeOp> {
 fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
     match op {
         NodeOp::TumblingWindow {
+            key_column,
+            event_time_column,
             window_size_ms,
             aggs,
         } => Some(encode_stream_fragment(&window_spec(
             WindowKind::Tumbling,
+            key_column.clone(),
+            event_time_column.clone(),
             *window_size_ms,
             None,
             None,
             aggs,
         ))),
         NodeOp::SlidingWindow {
+            key_column,
+            event_time_column,
             window_size_ms,
             slide_ms,
             aggs,
         } => Some(encode_stream_fragment(&window_spec(
             WindowKind::Sliding,
+            key_column.clone(),
+            event_time_column.clone(),
             *window_size_ms,
             Some(*slide_ms),
             None,
             aggs,
         ))),
         NodeOp::SessionWindow {
+            key_column,
+            event_time_column,
             session_gap_ms,
             aggs,
         } => Some(encode_stream_fragment(&window_spec(
             WindowKind::Session,
+            key_column.clone(),
+            event_time_column.clone(),
             0,
             None,
             Some(*session_gap_ms),
@@ -68,14 +80,16 @@ fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
 
 fn window_spec(
     window_kind: WindowKind,
+    key_column: String,
+    event_time_column: String,
     window_size_ms: u64,
     slide_ms: Option<u64>,
     session_gap_ms: Option<u64>,
     aggs: &[WindowAgg],
 ) -> WindowExecutionSpec {
     WindowExecutionSpec {
-        key_column: String::from("key"),
-        event_time_column: String::from("ts"),
+        key_column,
+        event_time_column,
         watermark_lag_ms: 0,
         window_kind,
         window_size_ms,
@@ -116,6 +130,8 @@ mod tests {
         use crate::ExecutionKind;
         let node = PlanNode::new("w1", "window", ExecutionKind::Streaming).with_op(
             NodeOp::TumblingWindow {
+                key_column: String::new(),
+                event_time_column: String::new(),
                 window_size_ms: 5_000,
                 aggs: vec![WindowAgg::count("count")],
             },

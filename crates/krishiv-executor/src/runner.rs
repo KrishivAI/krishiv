@@ -334,10 +334,10 @@ impl ExecutorTaskOutput {
         if let Some(stats) = &self.runtime_stats {
             meta = meta.with_runtime_stats(stats.clone());
         }
-        if !self.record_batches.is_empty() {
-            if let Ok(ipc) = encode_record_batches_ipc(&self.record_batches) {
-                meta = meta.with_inline_record_batch_ipc(ipc);
-            }
+        if !self.record_batches.is_empty()
+            && let Ok(ipc) = encode_record_batches_ipc(&self.record_batches)
+        {
+            meta = meta.with_inline_record_batch_ipc(ipc);
         }
         meta
     }
@@ -445,10 +445,10 @@ impl TaskRunner {
         req: InitiateCheckpointRequest,
         state_backend: &dyn StateBackend,
         storage: &(impl CheckpointStorage + ?Sized),
-    ) -> CheckpointAckRequest {
+    ) -> ExecutorResult<CheckpointAckRequest> {
         // Stale epoch: return an ack that signals the stale condition via epoch.
         if req.epoch <= self.last_acked_epoch {
-            return CheckpointAckRequest {
+            return Ok(CheckpointAckRequest {
                 job_id: req.job_id,
                 operator_id: self.operator_id.clone(),
                 task_id: self.task_id.clone(),
@@ -456,7 +456,7 @@ impl TaskRunner {
                 fencing_token: req.fencing_token,
                 source_offsets: vec![],
                 snapshot_path: None,
-            };
+            });
         }
 
         // Take a state snapshot (EXE-1: fail-closed — do not ack a new epoch on error).
@@ -464,15 +464,12 @@ impl TaskRunner {
             Ok(bytes) => bytes,
             Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => Vec::new(),
             Err(_) => {
-                return CheckpointAckRequest {
-                    job_id: req.job_id,
-                    operator_id: self.operator_id.clone(),
-                    task_id: self.task_id.clone(),
-                    epoch: self.last_acked_epoch,
-                    fencing_token: req.fencing_token,
-                    source_offsets: vec![],
-                    snapshot_path: None,
-                };
+                return Err(ExecutorError::LocalExecution {
+                    message: format!(
+                        "checkpoint snapshot failed for task {} at epoch {}",
+                        self.task_id, req.epoch
+                    ),
+                });
             }
         };
 
@@ -487,10 +484,15 @@ impl TaskRunner {
             // `storage` may be `?Sized`, so we cannot pass it to the
             // `&dyn CheckpointStorage`-accepting helper.  Call the trait
             // method directly using the same `snapshot_path` layout.
-            match storage.write_bytes(&path, &snapshot_bytes) {
-                Ok(()) => Some(path),
-                Err(_) => None,
-            }
+            storage
+                .write_bytes(&path, &snapshot_bytes)
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!(
+                        "checkpoint snapshot write failed for task {} at epoch {}: {error}",
+                        self.task_id, req.epoch
+                    ),
+                })?;
+            Some(path)
         } else {
             None
         };
@@ -507,7 +509,7 @@ impl TaskRunner {
 
         self.last_acked_epoch = req.epoch;
 
-        CheckpointAckRequest {
+        Ok(CheckpointAckRequest {
             job_id: req.job_id,
             operator_id: self.operator_id.clone(),
             task_id: self.task_id.clone(),
@@ -515,7 +517,7 @@ impl TaskRunner {
             fencing_token: req.fencing_token,
             source_offsets,
             snapshot_path: snap_path,
-        }
+        })
     }
 }
 
@@ -886,11 +888,22 @@ impl ExecutorTaskRunner {
         let mut checkpoint_runner = self
             .checkpoint_runners
             .entry(assignment.task_id().clone())
-            .or_insert_with(|| TaskRunner::new(assignment.task_id().clone()))
-            .clone();
-        let ack = checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage);
-        self.checkpoint_runners
-            .insert(assignment.task_id().clone(), checkpoint_runner);
+            .or_insert_with(|| TaskRunner::new(assignment.task_id().clone()));
+        let ack = match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if matches!(
+                    handle.runtime_flavor(),
+                    tokio::runtime::RuntimeFlavor::MultiThread
+                ) =>
+            {
+                tokio::task::block_in_place(|| {
+                    checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage)
+                })
+            }
+            _ => checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage),
+        }
+        .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        drop(checkpoint_runner);
         coordinator
             .checkpoint_ack(tonic::Request::new(ack))
             .await
@@ -950,7 +963,7 @@ impl ExecutorTaskRunner {
                 PlanFragment::new("checkpoint"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );
-            let _ = self
+            if let Err(error) = self
                 .initiate_checkpoint_and_deliver_ack(
                     &assignment,
                     req.clone(),
@@ -958,7 +971,10 @@ impl ExecutorTaskRunner {
                     storage,
                     coordinator,
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(task_id = %assignment.task_id(), error = %error, "checkpoint acknowledgement failed");
+            }
         }
         Ok(())
     }

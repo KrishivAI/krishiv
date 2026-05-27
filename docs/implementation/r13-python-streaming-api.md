@@ -70,7 +70,8 @@ Out of scope:
   - `DistributedBackend` struct exists; full Flight client — **GAP-RT-01** (R13).
   - `SingleNodeBackend` in-process coordinator — **GAP-RT-01**, S6.2 (R13).
   - `EmbeddedBackend` streaming redirect — **GAP-RT-03**, S6.3 (R13).
-  - `krishiv-federation` skeleton exists (**GAP-FD-01** remote client is R19).
+  - Federation remains scheduler-owned for now (**GAP-FD-01** remote client is
+    still an R19 concern; no standalone federation crate is present).
 - `cargo test --workspace` passes clean on the baseline before any R13 edits.
 - Python ≥ 3.10 in CI (for `match` statement in bridge code and PEP 604 union
   types in stubs).

@@ -15,6 +15,19 @@ path = "src/lib.rs"
 name = "krishiv"
 path = "src/main.rs"
 
+[features]
+# Product-facing crate defaults to the cluster-oriented surface. Lower-level
+# engine crates keep their own finer-grained features.
+default = ["cluster"]
+
+# Deployment surfaces
+cluster = ["flight-sql", "shuffle", "etcd"]
+flight-sql = ["dep:krishiv-flight-sql"]
+shuffle = ["dep:krishiv-shuffle"]
+etcd = ["krishiv-scheduler/etcd"]
+kafka = ["krishiv-connectors/kafka"]
+sqlite = ["krishiv-scheduler/sqlite"]
+
 [dependencies]
 krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-api = { path = "../krishiv-api" }
@@ -24,12 +37,13 @@ krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler", features = ["etcd"] }
+krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-executor = { path = "../krishiv-executor" }
-krishiv-flight-sql = { path = "../krishiv-flight-sql" }
-krishiv-shuffle = { path = "../krishiv-shuffle" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", optional = true }
+krishiv-shuffle = { path = "../krishiv-shuffle", optional = true }
 krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
+dotenvy = "0.15"
 tokio = { workspace = true }
 tonic = { workspace = true }
 serde = { workspace = true }

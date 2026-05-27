@@ -14,7 +14,7 @@ pub fn memo_key(content_hash: &str, chunk_index: usize) -> String {
     format!("{content_hash}:{chunk_index}")
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

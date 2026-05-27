@@ -21,7 +21,7 @@ use tokio::time::{Duration, interval};
 use crate::SqliteMetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore, LeaderElection,
-    SharedCoordinator, SingleNodeLeader, StabilityMetrics, scheduler_metrics,
+    SharedCoordinator, SingleNodeLeader, scheduler_metrics,
     serve_coordinator_executor_grpc_with_listener,
 };
 
@@ -201,10 +201,7 @@ pub async fn spawn_coordinator_sidecars(
             let mut ticker = interval(Duration::from_secs(5));
             loop {
                 ticker.tick().await;
-                let job_ids = gc_coordinator
-                    .write()
-                    .map(|mut c| c.take_gc_ready_jobs())
-                    .unwrap_or_default();
+                let job_ids = gc_coordinator.write().await.take_gc_ready_jobs();
                 for job_id in job_ids {
                     if let Err(e) = store.delete_job_partitions(job_id.as_str()).await {
                         eprintln!("shuffle GC failed for job {job_id}: {e}");
@@ -228,19 +225,17 @@ pub async fn spawn_coordinator_sidecars(
     }
 
     let tick_coordinator = coordinator.clone();
-    let tick_period_ms = tick_coordinator
-        .read()
-        .map(|c| c.config().tick_period_ms())
-        .unwrap_or(1_000);
+    let tick_period_ms = {
+        let coord = tick_coordinator.read().await;
+        coord.config().tick_period_ms()
+    };
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(tick_period_ms));
         loop {
             ticker.tick().await;
-            if let Ok(mut coord) = tick_coordinator.write() {
-                let tick_res = coord.coordinator_tick();
-                if let Err(e) = tick_res {
-                    tracing::warn!(error = %e, "coordinator tick failed");
-                }
+            let mut coord = tick_coordinator.write().await;
+            if let Err(e) = coord.coordinator_tick() {
+                tracing::warn!(error = %e, "coordinator tick failed");
             }
         }
     });
@@ -309,63 +304,57 @@ struct LiveExecutorView {
 }
 
 async fn api_jobs(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
-    let jobs = coordinator
-        .read()
-        .map(|coord| {
-            coord
-                .job_snapshots()
-                .into_iter()
-                .map(|job| LiveJobView {
-                    job_id: job.job_id().to_string(),
-                    kind: format!("{:?}", job.kind()),
-                    state: format!("{:?}", job.state()),
-                    stage_count: job.stage_count(),
-                    task_count: job.task_count(),
-                    assigned_task_count: job.assigned_task_count(),
-                    running_task_count: job.running_task_count(),
-                    succeeded_task_count: job.succeeded_task_count(),
-                    failed_task_count: job.failed_task_count(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let jobs = {
+        let coord = coordinator.read().await;
+        coord
+            .job_snapshots()
+            .into_iter()
+            .map(|job| LiveJobView {
+                job_id: job.job_id().to_string(),
+                kind: format!("{:?}", job.kind()),
+                state: format!("{:?}", job.state()),
+                stage_count: job.stage_count(),
+                task_count: job.task_count(),
+                assigned_task_count: job.assigned_task_count(),
+                running_task_count: job.running_task_count(),
+                succeeded_task_count: job.succeeded_task_count(),
+                failed_task_count: job.failed_task_count(),
+            })
+            .collect::<Vec<_>>()
+    };
     Json(LiveJobsResponse { jobs })
 }
 
 async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
-    let executors = coordinator
-        .read()
-        .map(|coord| {
-            coord
-                .executor_snapshots()
-                .into_iter()
-                .map(|record| {
-                    let descriptor = record.descriptor();
-                    LiveExecutorView {
-                        executor_id: record.executor_id().to_string(),
-                        host: descriptor.host().to_string(),
-                        slots: descriptor.slots(),
-                        state: format!("{:?}", record.state()),
-                        lease_generation: record.lease_generation().as_u64(),
-                        running_task_count: record.running_tasks().len(),
-                        last_heartbeat_tick: record.last_heartbeat_tick(),
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let executors = {
+        let coord = coordinator.read().await;
+        coord
+            .executor_snapshots()
+            .into_iter()
+            .map(|record| {
+                let descriptor = record.descriptor();
+                LiveExecutorView {
+                    executor_id: record.executor_id().to_string(),
+                    host: descriptor.host().to_string(),
+                    slots: descriptor.slots(),
+                    state: format!("{:?}", record.state()),
+                    lease_generation: record.lease_generation().as_u64(),
+                    running_task_count: record.running_tasks().len(),
+                    last_heartbeat_tick: record.last_heartbeat_tick(),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
     Json(LiveExecutorsResponse { executors })
 }
 
 async fn live_ui(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
-    let (state, jobs, executors) = match coordinator.read() {
-        Ok(coord) => (
-            format!("{:?}", coord.state()),
-            coord.job_snapshots(),
-            coord.executor_snapshots(),
-        ),
-        Err(_) => (String::from("Unavailable"), Vec::new(), Vec::new()),
-    };
+    let coord = coordinator.read().await;
+    let (state, jobs, executors) = (
+        format!("{:?}", coord.state()),
+        coord.job_snapshots(),
+        coord.executor_snapshots(),
+    );
 
     let mut body = String::from(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
@@ -424,16 +413,14 @@ async fn live_ui(State(coordinator): State<SharedCoordinator>) -> impl IntoRespo
 async fn readyz(
     State(coordinator): State<SharedCoordinator>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
-    match coordinator.read() {
-        Ok(c) if c.state() == CoordinatorState::Active => Ok("ready\n"),
-        Ok(_) => Err((
+    let c = coordinator.read().await;
+    if c.state() == CoordinatorState::Active {
+        Ok("ready\n")
+    } else {
+        Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "coordinator is not active\n".to_owned(),
-        )),
-        Err(_) => Err((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "coordinator lock poisoned\n".to_owned(),
-        )),
+        ))
     }
 }
 
@@ -445,10 +432,7 @@ async fn metrics(State(coordinator): State<SharedCoordinator>) -> impl IntoRespo
 }
 
 fn render_metrics_body(coordinator: &SharedCoordinator) -> String {
-    let m = coordinator
-        .read()
-        .map(|c| c.stability_metrics())
-        .unwrap_or_else(|_| StabilityMetrics::empty());
+    let m = coordinator.blocking_read().stability_metrics();
     let max_hb_age = m
         .heartbeat_ages()
         .iter()

@@ -97,7 +97,7 @@ where
                         content_hash: hash.clone(),
                         embedding: vector.clone(),
                         point_id,
-                        created_at_ms: 0,
+                        created_at_ms: crate::memo::now_ms(),
                     },
                 )?;
             }

@@ -13,15 +13,16 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-api = { path = "../krishiv-api" }
 krishiv-catalog = { path = "../krishiv-catalog" }
+krishiv-connectors = { path = "../krishiv-connectors", optional = true }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-schema-registry = { path = "../krishiv-schema-registry" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-state = { path = "../krishiv-state" }
-krishiv-ai = { path = "../krishiv-ai", features = ["fastembed-local"] }
+krishiv-ai = { path = "../krishiv-ai", optional = true }
 krishiv-udf = { path = "../krishiv-udf" }
-krishiv-vector-sinks = { path = "../krishiv-vector-sinks" }
+krishiv-vector-sinks = { path = "../krishiv-vector-sinks", optional = true }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 arrow = { workspace = true }
@@ -31,9 +32,16 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 
 [features]
-default = []
-kafka = []
-iceberg = []
+default = ["python"]
+python = []
+kafka = ["dep:krishiv-connectors", "krishiv-connectors/kafka"]
+# Taxonomy marker for Python Iceberg bindings; lakehouse code is still compiled
+# as a whole today, but the feature gives callers a stable opt-in name.
+iceberg = ["krishiv-lakehouse/iceberg"]
+ai = ["dep:krishiv-ai", "dep:krishiv-vector-sinks", "krishiv-ai/fastembed-local"]
+vector-sinks = ["ai"]
+qdrant = ["vector-sinks", "krishiv-vector-sinks/qdrant"]
+pgvector = ["vector-sinks", "krishiv-vector-sinks/pgvector"]
 
 [lints]
 workspace = true

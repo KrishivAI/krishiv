@@ -143,21 +143,19 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
 
 pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
     let mut builder = Session::builder().with_execution_mode(command.mode);
-    if command.mode == ExecutionMode::SingleNode {
-        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR") {
-            if !url.trim().is_empty() {
-                builder = builder.with_local_cluster(url);
-            }
-        }
+    if command.mode == ExecutionMode::SingleNode
+        && let Ok(url) = std::env::var("KRISHIV_COORDINATOR")
+        && !url.trim().is_empty()
+    {
+        builder = builder.with_local_cluster(url);
     }
-    if command.mode == ExecutionMode::Distributed || command.execution == QueryExecution::Remote {
-        if let Ok(url) = std::env::var("KRISHIV_COORDINATOR") {
-            if !url.trim().is_empty() {
-                builder = builder.with_coordinator(url.clone());
-                if command.execution == QueryExecution::Remote {
-                    builder = builder.with_remote_execution(true);
-                }
-            }
+    if (command.mode == ExecutionMode::Distributed || command.execution == QueryExecution::Remote)
+        && let Ok(url) = std::env::var("KRISHIV_COORDINATOR")
+        && !url.trim().is_empty()
+    {
+        builder = builder.with_coordinator(url.clone());
+        if command.execution == QueryExecution::Remote {
+            builder = builder.with_remote_execution(true);
         }
     }
     if command.api_key.is_some() {

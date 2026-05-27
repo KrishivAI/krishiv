@@ -59,15 +59,23 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         lease_token: u64,
     ) -> ShuffleResult<()> {
         let key = (id.job_id, id.stage_id, id.partition);
-        if let Some(expected) = self.lease_tokens.get(&key).map(|entry| *entry)
-            && lease_token != expected
-        {
-            return Err(ShuffleError::StaleLeaseToken {
-                expected,
-                actual: lease_token,
-            });
+        // Atomically compare-and-swap via DashMap entry API to close the
+        // TOCTOU gap between read and insert.
+        match self.lease_tokens.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut o) => {
+                let expected = *o.get();
+                if lease_token < expected {
+                    return Err(ShuffleError::StaleLeaseToken {
+                        expected,
+                        actual: lease_token,
+                    });
+                }
+                o.insert(lease_token);
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(lease_token);
+            }
         }
-        self.lease_tokens.insert(key, lease_token);
         Ok(())
     }
 
@@ -81,15 +89,22 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             partition.id.stage_id.clone(),
             partition.id.partition,
         );
-        if let Some(expected) = self.lease_tokens.get(&key).map(|entry| *entry) {
-            if lease_token < expected {
-                return Err(ShuffleError::StaleLeaseToken {
-                    expected,
-                    actual: lease_token,
-                });
+        match self.lease_tokens.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut o) => {
+                let expected = *o.get();
+                if lease_token < expected {
+                    return Err(ShuffleError::StaleLeaseToken {
+                        expected,
+                        actual: lease_token,
+                    });
+                }
+                // Advance the stored token so a zombie with the previous token
+                // cannot win a race by writing before the replacement arrives.
+                o.insert(lease_token);
             }
-        } else {
-            self.lease_tokens.insert(key, lease_token);
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(lease_token);
+            }
         }
 
         use arrow::ipc::writer::StreamWriter;

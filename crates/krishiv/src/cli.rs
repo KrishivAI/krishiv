@@ -175,7 +175,7 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
 }
 
 pub fn main_help() -> String {
-    String::from(
+    let mut help = String::from(
         "Krishiv hybrid compute framework\n\
          \n\
          Usage:\n\
@@ -194,19 +194,17 @@ pub fn main_help() -> String {
            checkpoints  List checkpoints for a streaming job (R6)\n\
            compat       PySpark migration compatibility tools (R15)\n\
            local        Start/stop/status a Spark-like local cluster\n\
-           cluster      Start/stop/status bare-metal clusterd + executors\n\
-           coordinator  Run active coordinator (distributed)\n\
-           clusterd     Run cluster control plane (CCP)\n\
-           job-coordinator  Run per-job coordinator (JCP)\n\
-           executor     Run data-plane executor worker\n\
-           flight-server  Run Arrow Flight SQL endpoint\n\
-           shuffle-svc  Run optional shuffle HTTP service\n\
-           help         Show help for a command (try: krishiv help daemons)\n\
+           cluster      Start/stop/status bare-metal clusterd + executors\n",
+    );
+    help.push_str(&crate::daemon_cmd::daemon_help_section());
+    help.push_str(
+        "  help         Show help for a command (try: krishiv help daemons)\n\
          \n\
          Options:\n\
            -c, --coordinator <URL>  Remote coordinator URL (or set KRISHIV_COORDINATOR)\n\
            -h, --help               Show help\n",
-    )
+    );
+    help
 }
 
 pub fn compat_help() -> String {
@@ -1058,6 +1056,28 @@ mod tests {
         let response = dispatch(&["--help"]);
         assert!(response.stdout.contains("stream"));
         assert!(response.stdout.contains("table"));
+    }
+
+    #[test]
+    fn top_level_help_mentions_flight_server_feature_state() {
+        let response = dispatch(&["--help"]);
+        #[cfg(feature = "flight-sql")]
+        assert!(response.stdout.contains("Run Arrow Flight SQL endpoint"));
+        #[cfg(not(feature = "flight-sql"))]
+        assert!(response.stdout.contains("build with feature `flight-sql`"));
+    }
+
+    #[test]
+    fn top_level_help_mentions_shuffle_feature_state() {
+        let response = dispatch(&["--help"]);
+        #[cfg(feature = "shuffle")]
+        assert!(
+            response
+                .stdout
+                .contains("Run optional shuffle HTTP service")
+        );
+        #[cfg(not(feature = "shuffle"))]
+        assert!(response.stdout.contains("build with feature `shuffle`"));
     }
 
     #[test]

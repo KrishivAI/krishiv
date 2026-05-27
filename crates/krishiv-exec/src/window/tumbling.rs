@@ -70,6 +70,10 @@ impl TumblingWindowOperator {
         backend: &mut dyn krishiv_state::StateBackend,
         namespace: &krishiv_state::Namespace,
     ) -> krishiv_state::StateResult<()> {
+        let op_id = namespace.operator_id();
+        let name = namespace.state_name();
+        let mut state_keys = Vec::with_capacity(self.accumulators.len());
+        let mut values = Vec::with_capacity(self.accumulators.len());
         for ((key, win_start), agg) in &self.accumulators {
             let payload = serde_json::json!({
                 "values": agg.values,
@@ -86,7 +90,16 @@ impl TumblingWindowOperator {
             state_key.extend_from_slice(key.as_bytes());
             state_key.push(0);
             state_key.extend_from_slice(&win_start.to_le_bytes());
-            backend.put(namespace, state_key, bytes)?;
+            state_keys.push(state_key);
+            values.push(bytes);
+        }
+        if !state_keys.is_empty() {
+            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+                .iter()
+                .zip(values.iter())
+                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+                .collect();
+            backend.put_batch(&batch_entries)?;
         }
         Ok(())
     }
@@ -97,6 +110,7 @@ impl TumblingWindowOperator {
         backend: &dyn krishiv_state::StateBackend,
         namespace: &krishiv_state::Namespace,
     ) -> krishiv_state::StateResult<()> {
+        let mut restored = HashMap::new();
         for key_bytes in backend.list_keys(namespace)? {
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
                 continue;
@@ -123,7 +137,7 @@ impl TumblingWindowOperator {
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
                 .unwrap_or_default();
             if let Some((key, win_start)) = parse_tumbling_state_key(&key_bytes) {
-                self.accumulators.insert(
+                restored.insert(
                     (key, win_start),
                     AggState {
                         values,
@@ -134,6 +148,7 @@ impl TumblingWindowOperator {
                 );
             }
         }
+        self.accumulators = restored;
         Ok(())
     }
 
@@ -303,7 +318,7 @@ pub(crate) fn build_window_record_batch(
 mod state_tests {
     use super::*;
     use crate::aggregate::AggFunction;
-    use krishiv_state::{InMemoryStateBackend, Namespace, StateBackend};
+    use krishiv_state::{InMemoryStateBackend, Namespace};
 
     #[test]
     fn tumbling_state_persist_and_restore_roundtrip() {

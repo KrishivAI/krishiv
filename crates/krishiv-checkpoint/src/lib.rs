@@ -268,6 +268,10 @@ pub fn manifest_path(job_id: &str, epoch: u64) -> String {
     format!("{}/manifest.sha256", epoch_dir(job_id, epoch))
 }
 
+fn latest_epoch_hint_path(job_id: &str) -> String {
+    format!("{job_id}/checkpoints/latest_epoch.json")
+}
+
 // ── CheckpointStorage trait ───────────────────────────────────────────────────
 
 /// Storage backend for checkpoint data.
@@ -376,7 +380,7 @@ pub fn write_epoch_metadata(
     })?;
     storage.write_bytes(&metadata_path(job_id, epoch), &json)?;
     storage.write_bytes(
-        &format!("{job_id}/checkpoints/latest_epoch.json"),
+        &latest_epoch_hint_path(job_id),
         epoch.to_string().as_bytes(),
     )
 }
@@ -509,11 +513,35 @@ pub fn delete_epoch(
 
 /// Find the most recent valid epoch.  Returns `Err(NoValidEpoch)` if none.
 pub fn latest_valid_epoch(storage: &dyn CheckpointStorage, job_id: &str) -> CheckpointResult<u64> {
+    if let Some(hinted) = read_latest_epoch_hint(storage, job_id)?
+        && validate_epoch(storage, job_id, hinted)?
+    {
+        return Ok(hinted);
+    }
+
     let epochs = list_valid_epochs(storage, job_id)?;
     epochs
         .into_iter()
         .last()
         .ok_or(CheckpointError::NoValidEpoch)
+}
+
+fn read_latest_epoch_hint(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+) -> CheckpointResult<Option<u64>> {
+    let Some(bytes) = storage.read_bytes(&latest_epoch_hint_path(job_id))? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|error| CheckpointError::Storage {
+        message: format!("latest epoch hint is not valid UTF-8: {error}"),
+    })?;
+    text.trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| CheckpointError::Storage {
+            message: format!("latest epoch hint is not a valid u64: {error}"),
+        })
 }
 
 // ── Fencing token enforcement ─────────────────────────────────────────────────

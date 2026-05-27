@@ -1,7 +1,9 @@
 //! Coordinator gRPC adapters.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use krishiv_checkpoint::CheckpointStorage;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CheckpointEpochInfo, CoordinatorExecutorService,
     CoordinatorManagementService, DeregisterExecutorRequest, DeregisterExecutorResponse,
@@ -49,10 +51,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
 
         let descriptor = request.descriptor().clone();
         let executor_id = descriptor.executor_id().clone();
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let mut coordinator = self.coordinator.write().await;
 
         let response = match coordinator.register_executor(descriptor) {
             Ok(lease_generation) => RegisterExecutorResponse::new(
@@ -84,10 +83,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let mut coordinator = self.coordinator.write().await;
 
         let response = match coordinator
             .deregister_executor(request.executor_id(), request.lease_generation())
@@ -155,10 +151,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         if !request.llm_quota_reports().is_empty() {
             heartbeat = heartbeat.with_llm_quota_reports(request.llm_quota_reports().to_vec());
         }
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let mut coordinator = self.coordinator.write().await;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {
             Ok(effects) => {
@@ -226,10 +219,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             update = update.with_output_metadata(output_metadata.clone());
         }
 
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let mut coordinator = self.coordinator.write().await;
 
         let response = match coordinator.apply_task_update(update) {
             Ok(TaskUpdateOutcome::Applied) => {
@@ -274,17 +264,10 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
         // GAP-CK-03: commit_epoch() calls sync disk I/O via LocalFsCheckpointStorage.
-        // Move the lock-acquire + storage write onto a blocking thread so the
-        // Tokio worker pool is not stalled.
-        let coordinator = self.coordinator.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            coordinator
-                .write()
-                .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))
-                .map(|mut c| c.handle_checkpoint_ack(ack))
-        })
-        .await
-        .map_err(|e| tonic::Status::internal(format!("checkpoint_ack task panicked: {e}")))??;
+        // Acquire the lock asynchronously (non-blocking), then move the guard
+        // onto a blocking thread for the storage write.
+        let mut coordinator = self.coordinator.write().await;
+        let response = tokio::task::block_in_place(|| coordinator.handle_checkpoint_ack(ack));
         Ok(tonic::Response::new(response))
     }
 }
@@ -304,10 +287,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         } else {
             Some(req.label)
         };
-        let mut coordinator = self
-            .coordinator
-            .write()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let mut coordinator = self.coordinator.write().await;
         let epoch = coordinator
             .savepoint_job(&job_id, label)
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
@@ -321,10 +301,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         let req = request.into_inner();
         let job_id = JobId::try_new(&req.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
-        let coordinator = self
-            .coordinator
-            .read()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let coordinator = self.coordinator.read().await;
         match coordinator.restore_job_from_checkpoint(&job_id, req.epoch, &req.storage_path) {
             Ok(_meta) => Ok(tonic::Response::new(RestoreJobResponse {
                 accepted: true,
@@ -347,26 +324,32 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         let req = request.into_inner();
         let job_id = JobId::try_new(&req.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
-        let coordinator = self
-            .coordinator
-            .read()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
-        let epoch_nums = coordinator
-            .list_job_checkpoints(&job_id)
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-        // Enrich each epoch with savepoint metadata if available.
+        let (epoch_nums, storage): (Vec<u64>, Option<Arc<dyn CheckpointStorage>>) = {
+            let coordinator = self.coordinator.read().await;
+            let epochs = coordinator
+                .list_job_checkpoints(&job_id)
+                .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            let storage = coordinator
+                .checkpoint_coordinator(&job_id)
+                .map(|c| Arc::clone(&c.storage));
+            (epochs, storage)
+        };
+        // Enrich each epoch with savepoint metadata.
+        // I/O is done outside the coordinator lock.
         let epochs = epoch_nums
             .into_iter()
             .map(|epoch| {
-                // Try to read metadata for savepoint labeling; skip on error.
-                let (is_savepoint, savepoint_label) = coordinator
-                    .checkpoint_coordinator(&job_id)
-                    .and_then(|coord| {
-                        let storage = coord.storage.as_ref();
-                        krishiv_checkpoint::read_epoch_metadata(storage, req.job_id.as_str(), epoch)
-                            .ok()
-                            .flatten()
-                            .map(|m| (m.is_savepoint, m.savepoint_label.unwrap_or_default()))
+                let (is_savepoint, savepoint_label) = storage
+                    .as_ref()
+                    .and_then(|s| {
+                        krishiv_checkpoint::read_epoch_metadata(
+                            s.as_ref(),
+                            req.job_id.as_str(),
+                            epoch,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|m| (m.is_savepoint, m.savepoint_label.unwrap_or_default()))
                     })
                     .unwrap_or((false, String::new()));
                 CheckpointEpochInfo {
@@ -390,10 +373,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         let req = request.into_inner();
         let job_id = JobId::try_new(&req.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
-        let coordinator = self
-            .coordinator
-            .read()
-            .map_err(|_| tonic::Status::internal("coordinator lock poisoned"))?;
+        let coordinator = self.coordinator.read().await;
         // Collect snapshot paths for the requested operator from the checkpoint coordinator.
         let snapshots = coordinator
             .checkpoint_coordinator(&job_id)

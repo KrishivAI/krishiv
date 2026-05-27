@@ -152,17 +152,16 @@ pub async fn run_kubernetes_controller_runtime_with_client(
     runtime: KubernetesControllerRuntime,
 ) -> OperatorResult<()> {
     let tick_coordinator = runtime.coordinator.clone();
-    let tick_period_ms = tick_coordinator
-        .read()
-        .map(|c| c.config().tick_period_ms())
-        .unwrap_or(1_000);
+    let tick_period_ms = {
+        let coord = tick_coordinator.read().await;
+        coord.config().tick_period_ms()
+    };
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_period_ms));
         loop {
             ticker.tick().await;
-            if let Ok(mut coord) = tick_coordinator.write()
-                && let Err(e) = coord.coordinator_tick()
-            {
+            let mut coord = tick_coordinator.write().await;
+            if let Err(e) = coord.coordinator_tick() {
                 tracing::warn!(error = %e, "embedded coordinator tick failed");
             }
         }
@@ -192,10 +191,7 @@ pub async fn reconcile_dynamic_object_with_runtime(
 ) -> OperatorResult<KubernetesReconcileReport> {
     let resource = resource_from_dynamic_object(&object)?;
     let (outcome, job_id) = {
-        let mut coordinator = runtime
-            .coordinator
-            .write()
-            .map_err(|_| OperatorError::CoordinatorLockPoisoned)?;
+        let mut coordinator = runtime.coordinator.write().await;
         let job_id = crate::reconciler::scheduler_job_id(&resource).ok();
         let outcome = runtime.reconciler.reconcile(&mut coordinator, &resource)?;
         (outcome, job_id)

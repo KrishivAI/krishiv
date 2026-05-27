@@ -17,7 +17,8 @@ window that must be complete before the enterprise packaging of R20.
 
 In scope:
 
-- `krishiv-federation` crate: multi-region coordinator client with routing and failover logic.
+- Multi-region federation currently remains scheduler-owned; introduce a
+  dedicated crate only when the R19 surface is large enough to justify it.
 - `ks.Session.connect(coordinators={region: url}, routing=..., failover=...)` Python API.
 - `RoutingPolicy.nearest(latency_threshold_ms)` and `FailoverPolicy.automatic(rpo_seconds, rto_seconds)`.
 - Global coordinator tier architecture per ADR-19.1: separate control plane (global job catalog) from data plane (regional task execution).
@@ -61,7 +62,7 @@ current state, and which region is authoritative for each job. The current
 single-coordinator design has no concept of region-local vs. global state.
 Before any federation code is written, the architecture of the global metadata
 tier must be decided — the choice determines every data structure and API
-in `krishiv-federation`.
+in a future dedicated federation module or crate.
 
 **Options**
 
@@ -245,14 +246,16 @@ pitch. Option A delivers genuine value for the target use case.
 
 ## Sprint 1 — Multi-Region Coordinator Federation
 
-### S1.1: krishiv-federation crate skeleton — new crate
+### S1.1: Dedicated federation crate — deferred
 
-- [ ] Create `crates/krishiv-federation/Cargo.toml` with dependencies: `tonic`, `krishiv-proto`, `krishiv-scheduler` (as a type-sharing dependency, not a runtime dependency), `tokio`, `tracing`.
+- [ ] If multi-region federation grows beyond the current scheduler HTTP path,
+      create a dedicated crate with explicit ownership and feature gating
+      instead of a placeholder workspace member.
 - [ ] Define `FederationClient` trait with methods: `submit_job`, `cancel_job`, `job_status`, `list_jobs`, `route_task(job_id) -> RegionUrl`.
 - [ ] Define `RegionMap: HashMap<String, Url>` and `RoutingPolicy` enum (`Nearest { latency_threshold_ms: u64 }`, `RoundRobin`, `DataLocality`).
 - [ ] Define `FailoverPolicy` struct with `rpo_seconds` and `rto_seconds` fields.
 
-**Validation**: `cargo build -p krishiv-federation`
+**Validation:** `cargo build -p <future-federation-crate>`
 
 ### S1.2: Global coordinator tier — krishiv-scheduler
 
@@ -263,21 +266,21 @@ pitch. Option A delivers genuine value for the target use case.
 
 **Validation**: `cargo test -p krishiv-scheduler`
 
-### S1.3: Latency-aware routing — krishiv-federation
+### S1.3: Latency-aware routing — dedicated federation module/crate
 
 - [ ] Implement `LatencyProber` that pings each coordinator endpoint via a lightweight `GET /health` HTTP call and records the round-trip latency with a 5-second exponential moving average.
 - [ ] Implement `RoutingPolicy::Nearest`: route to the region with the lowest EMA latency that is below `latency_threshold_ms`; fall back to any healthy region if all are above threshold.
 - [ ] Add a test using a mock HTTP server with configurable artificial delay asserting that the nearest region is selected correctly.
 
-**Validation**: `cargo test -p krishiv-federation`
+**Validation:** `cargo test -p <future-federation-crate-or-scheduler-module>`
 
-### S1.4: Failover logic — krishiv-federation
+### S1.4: Failover logic — dedicated federation module/crate
 
 - [ ] Implement `FailoverManager` that monitors coordinator health via `LatencyProber`. If a region fails `health_check_interval * 3` consecutive checks, mark it `RegionStatus::Unavailable`.
 - [ ] On region unavailability, `FederationClient::route_task` returns a different available region; in-flight jobs in the failed region are re-queued in the global coordinator.
 - [ ] Add a test that marks a region unavailable and asserts all subsequent `route_task` calls return a different region within `rto_seconds`.
 
-**Validation**: `cargo test -p krishiv-federation`
+**Validation:** `cargo test -p <future-federation-crate-or-scheduler-module>`
 
 ### S1.5: Python federation API — krishiv (Python bindings)
 
@@ -424,7 +427,7 @@ pitch. Option A delivers genuine value for the target use case.
 
 **Validation**: `cargo test -p krishiv-scheduler`
 
-### S5.3: Global job routing — krishiv-federation
+### S5.3: Global job routing — dedicated federation module/crate
 
 - [ ] Implement `JobRoutingPolicy` with `batch_jobs: JobRoutingStrategy` and `streaming_jobs: JobRoutingStrategy`.
 - [ ] `JobRoutingStrategy::CheapestRegion` calls `CloudPricingClient` to find the cheapest eligible region for the job's resource profile.
@@ -432,7 +435,7 @@ pitch. Option A delivers genuine value for the target use case.
 - [ ] `JobRoutingStrategy::DataLocality` inspects the job's input table locations (S3 bucket region tags, Iceberg catalog metadata) and prefers the region where the data resides.
 - [ ] Add tests for each routing strategy asserting the correct region is selected given mocked pricing and latency data.
 
-**Validation**: `cargo test -p krishiv-federation`
+**Validation:** `cargo test -p <future-federation-crate-or-scheduler-module>`
 
 ### S5.4: Serverless execution mode — krishiv-api, krishiv (Python bindings)
 

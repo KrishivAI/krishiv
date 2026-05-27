@@ -81,7 +81,7 @@ pub async fn merge_delta(
     when_matched_update: bool,
     when_not_matched_insert: bool,
 ) -> LakehouseResult<MergeDeltaResult> {
-    use std::collections::HashMap;
+    use std::collections::HashSet;
 
     if source_batches.is_empty() {
         return Ok(MergeDeltaResult::default());
@@ -91,51 +91,53 @@ pub async fn merge_delta(
     let source = concat_batches(&source_batches)?;
     let key = merge_key.to_string();
 
-    let source_keys = keys_column(
-        source
-            .column_by_name(&key)
-            .ok_or_else(|| LakehouseError::Io(format!("merge key {key} missing in source")))?,
-    );
-    let mut source_map: HashMap<String, usize> = HashMap::new();
-    for (i, k) in source_keys.iter().enumerate() {
-        if let Some(k) = k {
-            source_map.insert(k.clone(), i);
-        }
-    }
+    let source_col = source
+        .column_by_name(&key)
+        .ok_or_else(|| LakehouseError::Io(format!("merge key {key} missing in source")))?;
+    let target_col = target
+        .column_by_name(&key)
+        .ok_or_else(|| LakehouseError::Io(format!("merge key {key} missing in target")))?;
 
-    let target_keys = keys_column(
-        target
-            .column_by_name(&key)
-            .ok_or_else(|| LakehouseError::Io(format!("merge key {key} missing in target")))?,
-    );
-    let mut keep_indices = Vec::new();
-    let mut updated = 0u64;
-    for (i, k) in target_keys.iter().enumerate() {
-        if let Some(k) = k
-            && source_map.contains_key(k)
-        {
-            if when_matched_update {
-                updated += 1;
-            }
-            continue;
-        }
-        keep_indices.push(i as u32);
-    }
+    // Build a set of typed keys from source rows so we can classify each
+    // target row as matched or unmatched.  Keys are type-prefixed to prevent
+    // cross-type false matches (e.g. Int64(1) must not match String("1")).
+    let source_keys: HashSet<String> = keys_set(source_col.as_ref());
+
+    // Keep target rows whose key does NOT appear in source.
+    let keep_indices: Vec<u32> = target_keys_indices(target_col.as_ref(), &source_keys);
 
     let mut merged_batches = Vec::new();
     if !keep_indices.is_empty() {
         merged_batches.push(take_rows(&target, &keep_indices)?);
     }
-    let mut inserted = 0u64;
-    if when_not_matched_insert {
-        inserted = source.num_rows() as u64;
-        merged_batches.push(source);
-    }
+
+    // Split source rows into updates (key matched target) and inserts (key
+    // did not match target).  Build the target-key set once for O(1) checks.
+    let target_key_set: HashSet<String> = keys_set(target_col.as_ref());
+    let (update_indices, insert_indices): (Vec<u32>, Vec<u32>) =
+        (0..source.num_rows()).map(|i| i as u32).partition(|&i| {
+            typed_key(source_col.as_ref(), i as usize).is_some_and(|k| target_key_set.contains(&k))
+        });
+
+    let rows_updated = if when_matched_update && !update_indices.is_empty() {
+        merged_batches.push(take_rows(&source, &update_indices)?);
+        update_indices.len() as u64
+    } else {
+        0
+    };
+
+    let rows_inserted = if when_not_matched_insert && !insert_indices.is_empty() {
+        merged_batches.push(take_rows(&source, &insert_indices)?);
+        insert_indices.len() as u64
+    } else {
+        0
+    };
+
     let merged = concat_batches(&merged_batches)?;
     write_delta(target_path, vec![merged], DeltaWriteMode::Overwrite, false).await?;
     Ok(MergeDeltaResult {
-        rows_inserted: inserted,
-        rows_updated: updated,
+        rows_inserted,
+        rows_updated,
         rows_deleted: 0,
     })
 }
@@ -177,26 +179,49 @@ fn take_rows(batch: &RecordBatch, indices: &[u32]) -> LakehouseResult<RecordBatc
     RecordBatch::try_new(batch.schema(), cols).map_err(|e| LakehouseError::Io(e.to_string()))
 }
 
-fn keys_column(array: &dyn Array) -> Vec<Option<String>> {
+/// Build a set of typed key strings for a column, using type-prefixed
+/// formatting so that Int64(1) and String("1") do not collide.
+fn keys_set(array: &dyn Array) -> std::collections::HashSet<String> {
     (0..array.len())
-        .map(|row| value_as_string(array, row))
+        .filter_map(|row| typed_key(array, row))
         .collect()
 }
 
-fn value_as_string(array: &dyn Array, row: usize) -> Option<String> {
+/// Return target-row indices whose typed key is NOT in the source key set.
+fn target_keys_indices(
+    array: &dyn Array,
+    source_keys: &std::collections::HashSet<String>,
+) -> Vec<u32> {
+    (0..array.len())
+        .filter(|&i| {
+            let k = typed_key(array, i);
+            k.is_none() || !source_keys.contains(&k.unwrap())
+        })
+        .map(|i| i as u32)
+        .collect()
+}
+
+/// Format a single cell as a type-prefixed string key for hash-join.
+/// The prefix prevents cross-type collisions (Int64 1 vs String "1").
+fn typed_key(array: &dyn Array, row: usize) -> Option<String> {
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
         if a.is_null(row) {
             None
         } else {
-            Some(a.value(row).to_string())
+            Some(format!("utf8:{}", a.value(row)))
         }
     } else if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
         if a.is_null(row) {
             None
         } else {
-            Some(a.value(row).to_string())
+            Some(format!("i64:{}", a.value(row)))
         }
     } else {
+        // Unsupported type — warn and treat as non-matching.
+        eprintln!(
+            "warn: unsupported merge-key column type: {}",
+            array.data_type()
+        );
         None
     }
 }

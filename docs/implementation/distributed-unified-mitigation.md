@@ -36,6 +36,6 @@ Deliver production-grade unified batch + streaming on Kubernetes and bare metal 
 ## Next command
 
 ```bash
-cargo +stable test -p krishiv-scheduler -p krishiv-operator -p krishiv-executor -p krishiv-federation --lib
+cargo +stable test -p krishiv-scheduler -p krishiv-operator -p krishiv-executor --lib
 cargo +stable test -p krishiv-scheduler --test distributed_e2e
 ```

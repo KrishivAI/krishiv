@@ -3,8 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use krishiv_async_util::block_on;
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
     validate_epoch, validate_fencing_token,
@@ -120,30 +122,34 @@ impl SharedCoordinator {
     }
 
     /// Borrow the coordinator for read-only status snapshots.
-    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, Coordinator>> {
-        self.inner.read()
+    pub async fn read(&self) -> RwLockReadGuard<'_, Coordinator> {
+        self.inner.read().await
+    }
+
+    /// Borrow the coordinator for read-only status snapshots from synchronous callers.
+    pub fn blocking_read(&self) -> RwLockReadGuard<'_, Coordinator> {
+        block_on(self.inner.read())
     }
 
     /// Borrow the coordinator for scheduler mutations.
-    pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, Coordinator>> {
-        self.inner.write()
+    pub async fn write(&self) -> RwLockWriteGuard<'_, Coordinator> {
+        self.inner.write().await
+    }
+
+    /// Borrow the coordinator for scheduler mutations from synchronous callers.
+    pub fn blocking_write(&self) -> RwLockWriteGuard<'_, Coordinator> {
+        block_on(self.inner.write())
     }
 
     /// Advance the heartbeat clock by one tick (P0-4).
-    pub fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
-        self.write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .advance_heartbeat_clock(1)
+    pub async fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
+        self.write().await.advance_heartbeat_clock(1)
     }
 
     /// Launch and push all assigned tasks for non-terminal jobs (P0-4).
     pub async fn drive_pending_task_launches(&self) -> SchedulerResult<usize> {
         let job_ids = {
-            let coord = self.read().map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?;
+            let coord = self.read().await;
             coord
                 .jobs
                 .iter()
@@ -154,21 +160,29 @@ impl SharedCoordinator {
         let mut launched = 0usize;
         for job_id in job_ids {
             let targets = {
-                let mut coord = self.write().map_err(|_| SchedulerError::Transport {
-                    message: "coordinator lock poisoned".to_string(),
-                })?;
+                let mut coord = self.write().await;
                 let assignments = coord.launch_assigned_task_assignments(&job_id)?;
                 coord.resolve_assignment_targets(assignments)?
             };
             let channels = {
-                let coord = self.read().map_err(|_| SchedulerError::Transport {
-                    message: "coordinator lock poisoned".to_string(),
-                })?;
+                let coord = self.read().await;
                 coord.executor_channels.clone()
             };
-            let responses =
-                Coordinator::deliver_assignment_targets_with_channels(channels, targets).await?;
-            launched = launched.saturating_add(responses.len());
+            let delivery =
+                Coordinator::deliver_assignment_targets_with_channels(channels, targets).await;
+            match delivery {
+                Ok(responses) => {
+                    let mut coord = self.write().await;
+                    launched = launched.saturating_add(
+                        coord.apply_assignment_dispatch_responses(&job_id, &responses),
+                    );
+                }
+                Err(error) => {
+                    let mut coord = self.write().await;
+                    coord.clear_launch_in_flight_for_job(&job_id);
+                    return Err(error);
+                }
+            }
         }
         Ok(launched)
     }
@@ -192,7 +206,7 @@ impl SharedCoordinator {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if let Err(error) = heartbeat.advance_heartbeat_tick() {
+                if let Err(error) = heartbeat.advance_heartbeat_tick().await {
                     // Inactive coordinator is expected during failover; demote
                     // logs further down handle the case.  Other errors get warned.
                     let text = error.to_string();
@@ -591,7 +605,7 @@ impl Coordinator {
             let running = self.running_task_count_for_job(&job_id);
             if let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) {
                 coord.set_expected_task_count(running);
-                coord.try_tick(elapsed_ms);
+                coord.try_tick(elapsed_ms, self.config.checkpoint_ack_timeout_ms());
             }
         }
 
@@ -1276,7 +1290,7 @@ impl Coordinator {
     pub async fn deliver_assignment_targets(
         &self,
         targets: Vec<(String, ExecutorTaskAssignment)>,
-    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+    ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
         let channels = self.executor_channels.clone();
         Self::deliver_assignment_targets_with_channels(channels, targets).await
     }
@@ -1284,7 +1298,7 @@ impl Coordinator {
     pub(crate) async fn deliver_assignment_targets_with_channels(
         channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
         targets: Vec<(String, ExecutorTaskAssignment)>,
-    ) -> SchedulerResult<Vec<TaskStatusResponse>> {
+    ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         // Inbox-backed in-process targets do not have a gRPC endpoint: they are
@@ -1308,17 +1322,17 @@ impl Coordinator {
                 let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
                 let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
                 let response = client
-                    .assign_task(wire::executor_task_assignment_to_wire(assignment))
+                    .assign_task(wire::executor_task_assignment_to_wire(assignment.clone()))
                     .await
                     .map_err(|error| SchedulerError::Transport {
                         message: format!("assign_task to {endpoint}: {error}"),
                     })?
                     .into_inner();
-                wire::task_status_response_from_wire(response).map_err(|error| {
-                    SchedulerError::Transport {
+                wire::task_status_response_from_wire(response)
+                    .map(|decoded| (assignment, decoded))
+                    .map_err(|error| SchedulerError::Transport {
                         message: format!("wire decode from {endpoint}: {error}"),
-                    }
-                })
+                    })
             });
         }
 
@@ -1336,7 +1350,18 @@ impl Coordinator {
     ) -> SchedulerResult<Vec<TaskStatusResponse>> {
         let assignments = self.launch_assigned_task_assignments(job_id)?;
         let targets = self.resolve_assignment_targets(assignments)?;
-        self.deliver_assignment_targets(targets).await
+        let responses = match self.deliver_assignment_targets(targets).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                self.clear_launch_in_flight_for_job(job_id);
+                return Err(error);
+            }
+        };
+        self.apply_assignment_dispatch_responses(job_id, &responses);
+        Ok(responses
+            .into_iter()
+            .map(|(_, response)| response)
+            .collect())
     }
 
     /// Cancel a job and push `CancelTask` RPCs to all executors owning running tasks.
@@ -1448,13 +1473,12 @@ impl Coordinator {
             && let Some(store) = &self.store
         {
             let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = s.save_job(record) {
-                tracing::warn!(
-                    error = %e,
-                    job_id = %job_id,
-                    "failed to persist job to store after task update"
-                );
-            }
+            s.save_job(record).map_err(|e| SchedulerError::Transport {
+                message: format!(
+                    "failed to persist job {} to metadata store after task update: {e}",
+                    record.job_id()
+                ),
+            })?;
         }
         // P1.1: Remove streaming task index entries when job reaches a terminal state.
         let is_terminal = self
@@ -1496,19 +1520,73 @@ impl Coordinator {
         self.executors.list().to_vec()
     }
 
+    fn clear_launch_in_flight_for_job(&mut self, job_id: &JobId) {
+        let Some(job) = self.jobs.get_mut(job_id) else {
+            return;
+        };
+        for stage in &mut job.stages {
+            for task in stage.tasks_mut() {
+                if task.state() == TaskState::Assigned {
+                    task.clear_launch_in_flight();
+                }
+            }
+            stage.refresh_state();
+        }
+        job.refresh_state();
+    }
+
+    fn clear_launch_in_flight_for_task(&mut self, job_id: &JobId, task_id: &TaskId) {
+        let Some(job) = self.jobs.get_mut(job_id) else {
+            return;
+        };
+        for stage in &mut job.stages {
+            let mut changed = false;
+            for task in stage.tasks_mut() {
+                if task.task_id() == task_id && task.state() == TaskState::Assigned {
+                    task.clear_launch_in_flight();
+                    changed = true;
+                    break;
+                }
+            }
+            if changed {
+                stage.refresh_state();
+            }
+        }
+        job.refresh_state();
+    }
+
+    fn apply_assignment_dispatch_responses(
+        &mut self,
+        job_id: &JobId,
+        responses: &[(ExecutorTaskAssignment, TaskStatusResponse)],
+    ) -> usize {
+        let mut accepted = 0usize;
+        for (assignment, response) in responses {
+            match response.disposition() {
+                krishiv_proto::TransportDisposition::Accepted
+                | krishiv_proto::TransportDisposition::Duplicate => {
+                    accepted = accepted.saturating_add(1);
+                }
+                _ => self.clear_launch_in_flight_for_task(job_id, assignment.task_id()),
+            }
+        }
+        accepted
+    }
+
     fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
-        for job in self.jobs.values_mut() {
+        let mut jobs_to_reassign = Vec::new();
+        for (job_id, job) in &mut self.jobs {
             let mut job_affected = false;
             for stage in &mut job.stages {
                 let mut stage_affected = false;
                 for task in &mut stage.tasks {
-                    if task.state == TaskState::Running
-                        && task.assigned_executor.as_ref() == Some(lost_id)
+                    if task.assigned_executor.as_ref() == Some(lost_id)
+                        && (task.state == TaskState::Running
+                            || (task.state == TaskState::Assigned && task.launch_in_flight()))
                     {
-                        // Keep the assignment for the next launch attempt; the
-                        // attempt counter is not bumped here — it will be bumped
-                        // when `launch_assigned_task_assignments` is called next.
-                        task.state = TaskState::Assigned;
+                        task.state = TaskState::Pending;
+                        task.assigned_executor = None;
+                        task.clear_launch_in_flight();
                         stage_affected = true;
                         job_affected = true;
                     }
@@ -1519,6 +1597,12 @@ impl Coordinator {
             }
             if job_affected {
                 job.refresh_state();
+                jobs_to_reassign.push(job_id.clone());
+            }
+        }
+        for job_id in jobs_to_reassign {
+            if let Err(error) = self.assign_pending_tasks(&job_id) {
+                tracing::warn!(job_id = %job_id, error = %error, "failed to reassign tasks after executor loss");
             }
         }
     }

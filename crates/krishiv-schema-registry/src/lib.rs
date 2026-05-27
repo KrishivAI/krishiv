@@ -160,8 +160,10 @@ pub struct ProtobufDeserializer;
 
 #[async_trait]
 impl KafkaDeserializer for ProtobufDeserializer {
-    async fn decode(&self, payload: &[u8]) -> SchemaRegistryResult<RecordBatch> {
-        JsonSchemaDeserializer.decode(payload).await
+    async fn decode(&self, _payload: &[u8]) -> SchemaRegistryResult<RecordBatch> {
+        Err(SchemaRegistryError::Decode(
+            "Protobuf deserialization is not yet implemented; use Avro or JSON format".into(),
+        ))
     }
 
     fn arrow_schema(&self) -> SchemaRef {

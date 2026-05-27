@@ -27,9 +27,10 @@ pub fn plan_to_sql(plan: &PhysicalPlan) -> String {
             }
         }
         ExecutionKind::Streaming => {
+            let safe_name = name.replace('\'', "''").replace("*/", "* /");
             format!(
                 "/* krishiv-stream:{} */ SELECT 1 AS streaming_accepted",
-                name.replace('\'', "''")
+                safe_name
             )
         }
     }

@@ -24,7 +24,7 @@ R4–R10 unchecked items, R11 acceptance gate incomplete).
 
 | Metric | Value |
 |--------|------:|
-| Workspace crates | 35 (in `Cargo.toml`) + 2 out-of-workspace (`krishiv-cep`, `krishiv-spark-connect`) |
+| Workspace crates | 35 at audit time, plus 2 detached crates on disk (`krishiv-cep`, `krishiv-spark-connect`) |
 | `cargo check --workspace` | **PASS** (warnings only) |
 | `cargo clippy --workspace -- -D warnings` | **FAIL** — 3 crates with errors (`krishiv-state`, `krishiv-governance`, `krishiv-lakehouse`) |
 | `cargo fmt --check` | **FAIL** — 395 diffs across 27 crates |
@@ -44,10 +44,10 @@ R4–R10 unchecked items, R11 acceptance gate incomplete).
 ### GAP-B2: Two crates exist on disk but are excluded from workspace
 
 **Severity:** Low
-**Finding:** `krishiv-cep` and `krishiv-spark-connect` have source code in `crates/` but are not listed in `[workspace] members` in `Cargo.toml`. Their code is never compiled, tested, or linted.
+**Finding:** `krishiv-cep` and `krishiv-spark-connect` had source code in `crates/` but were not listed in `[workspace] members` in `Cargo.toml`. Their code was never compiled, tested, or linted.
 **Resolution:**
 - `krishiv-cep`: Add to workspace if ready, or document as experimental/deferred.
-- `krishiv-spark-connect`: Referenced in `gap-mitigation-plan.md` P0-14 but never compiled. Add to workspace behind a feature flag, or move to `experimental/` directory.
+- `krishiv-spark-connect`: This detached crate was later removed from the repository. If Spark Connect work resumes, reintroduce it as an explicit gated workspace crate instead of leaving it detached.
 
 ### GAP-B3: Three crates fail to link during `cargo test`
 
@@ -100,8 +100,8 @@ The coordinator binary (`krishiv_coordinator`) fails to link in test mode.
 ### GAP-T3: `krishiv-testkit` is nearly empty (90 lines, 0 tests)
 
 **Severity:** Low
-**Finding:** Per `gap-mitigation-plan.md` P2-6, this crate provides only basic `make_batch`, `MockSource`, `MockSink`, and `TestSession` stubs. Most crates define their own test helpers.
-**Resolution:** Populate with shared test utilities. Low priority — deduplication improves maintenance but doesn't affect correctness.
+**Finding:** Per `gap-mitigation-plan.md` P2-6, this crate provided only basic `make_batch`, `MockSource`, `MockSink`, and `TestSession` stubs. Most crates defined their own test helpers.
+**Resolution:** The crate was later removed from the repository. If shared test utilities become necessary again, reintroduce them only with concrete cross-crate reuse and ownership.
 
 ### GAP-T4: No `cargo test --workspace` CI gate
 

@@ -1,8 +1,7 @@
 //! etcd-backed durable metadata store for bare-metal cluster recovery.
 
-use std::sync::Mutex;
-
 use etcd_client::Client;
+use tokio::sync::Mutex;
 
 use crate::store::{
     EventLogEvent, MetadataStore, decode_metadata_snapshot, encode_metadata_snapshot,
@@ -50,12 +49,17 @@ impl EtcdMetadataStore {
 
     fn persist(&self) -> SchedulerResult<()> {
         let bytes = encode_metadata_snapshot(&self.events, &self.jobs)?;
-        let mut client = self.client.lock().unwrap_or_else(|p| p.into_inner());
-        futures::executor::block_on(client.put(METADATA_SNAPSHOT_KEY, bytes, None)).map_err(
-            |e| SchedulerError::Transport {
-                message: format!("etcd metadata snapshot write failed: {e}"),
-            },
-        )?;
+        let mut client = self.client.blocking_lock();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.put(
+                METADATA_SNAPSHOT_KEY,
+                bytes,
+                None,
+            ))
+        })
+        .map_err(|e| SchedulerError::Transport {
+            message: format!("etcd metadata snapshot write failed: {e}"),
+        })?;
         Ok(())
     }
 }

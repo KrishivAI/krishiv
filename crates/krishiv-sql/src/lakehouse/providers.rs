@@ -30,7 +30,10 @@ pub async fn register_delta_uri(
         .map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
         })?;
-    let provider = Arc::new(DeltaScanProvider { handle });
+    let schema = handle.schema().await.map_err(|e| SqlError::DataFusion {
+        message: e.to_string(),
+    })?;
+    let provider = Arc::new(DeltaScanProvider { handle, schema });
     ctx.register_table(table_name, provider)
         .map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
@@ -64,6 +67,7 @@ pub async fn register_hudi_uri(
 #[derive(Debug)]
 struct DeltaScanProvider {
     handle: krishiv_lakehouse::DeltaTableHandle,
+    schema: SchemaRef,
 }
 
 #[async_trait]
@@ -73,7 +77,7 @@ impl TableProvider for DeltaScanProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(arrow::datatypes::Schema::empty())
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -147,6 +151,8 @@ pub async fn register_scan_batches(
     name: &str,
     batches: Vec<RecordBatch>,
 ) -> SqlResult<()> {
+    // Allow overwriting an existing table (used by MERGE write-back).
+    let _ = ctx.deregister_table(name);
     let schema = batches
         .first()
         .map(|b| b.schema())

@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["qdrant", "pgvector", ]
+default = []
+vector-sinks = ["qdrant", "pgvector"]
 qdrant = ["dep:qdrant-client"]
 pgvector = ["dep:sqlx"]
 

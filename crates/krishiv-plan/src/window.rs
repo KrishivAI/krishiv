@@ -118,8 +118,8 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
         .unwrap_or_default();
 
     format!(
-        "{prefix}:key=key:time=ts:win={}:lag={}:{agg}{extra}{ttl}",
-        spec.window_size_ms, spec.watermark_lag_ms,
+        "{prefix}:key={}:time={}:win={}:lag={}:{agg}{extra}{ttl}",
+        spec.key_column, spec.event_time_column, spec.window_size_ms, spec.watermark_lag_ms,
     )
 }
 

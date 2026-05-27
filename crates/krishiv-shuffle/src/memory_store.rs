@@ -92,9 +92,12 @@ impl InMemoryShuffleStore {
                 return Ok(());
             };
 
+            // Read partition data under lock (clone is cheap — Arc bumps).
+            // Do NOT remove from partitions yet; only remove after the spill
+            // write succeeds, so a spill failure doesn't lose data.
             let (spill_partition, spill_size, spill_token) = {
-                let mut parts = shuffle_write_lock(&self.partitions)?;
-                let Some(partition) = parts.remove(&key_to_spill) else {
+                let parts = shuffle_read_lock(&self.partitions)?;
+                let Some(partition) = parts.get(&key_to_spill).cloned() else {
                     continue;
                 };
                 let spill_size = partition_memory_bytes(&partition);
@@ -105,12 +108,19 @@ impl InMemoryShuffleStore {
                 (partition, spill_size, spill_token)
             };
 
+            // Spill to disk. If this fails, the partition stays in memory
+            // and no data is lost — the caller can retry.
+            spill.write_partition(spill_partition, spill_token).await?;
+
+            // Spill succeeded — now safely remove from memory and account.
+            {
+                let mut parts = shuffle_write_lock(&self.partitions)?;
+                parts.remove(&key_to_spill);
+            }
             {
                 let mut used = shuffle_write_lock(&self.bytes_used)?;
                 *used = used.saturating_sub(spill_size);
             }
-
-            spill.write_partition(spill_partition, spill_token).await?;
             shuffle_write_lock(&self.spilled)?.insert(key_to_spill);
         }
     }
@@ -125,7 +135,7 @@ impl ShuffleStore for InMemoryShuffleStore {
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = shuffle_write_lock(&self.lease_tokens)?;
         if let Some(&expected) = leases.get(&key)
-            && lease_token != expected
+            && lease_token < expected
         {
             return Err(ShuffleError::StaleLeaseToken {
                 expected,
@@ -157,6 +167,9 @@ impl ShuffleStore for InMemoryShuffleStore {
                         actual: lease_token,
                     });
                 }
+                // Advance the stored token so a zombie with the previous token
+                // cannot win a race by writing before the replacement arrives.
+                leases.insert(key.clone(), lease_token);
             } else {
                 // Compatibility path for direct single-attempt writes: the first
                 // writer establishes the expected token for this partition.
@@ -165,41 +178,63 @@ impl ShuffleStore for InMemoryShuffleStore {
         }
 
         let new_size = partition_memory_bytes(&partition);
-        {
-            let mut used = shuffle_write_lock(&self.bytes_used)?;
-            if let Some(old) = shuffle_read_lock(&self.partitions)?.get(&key) {
-                *used = used.saturating_sub(partition_memory_bytes(old));
-            }
-        }
-        shuffle_write_lock(&self.spilled)?.remove(&key);
+
+        // Ensure capacity BEFORE mutating accounting state. If the spill
+        // fails, no state has changed yet and we can safely retry.
         self.ensure_memory_capacity(&key, new_size).await?;
 
+        // Mark as not spilled before updating partitions.
+        shuffle_write_lock(&self.spilled)?.remove(&key);
+
+        // Update partitions and bytes_used atomically in a single lock scope.
+        // This avoids the tear where bytes_used undercounts between the old-size
+        // subtraction and new-size addition, which would cause ensure_memory_capacity
+        // to incorrectly skip needed spills.
         {
             let mut parts = shuffle_write_lock(&self.partitions)?;
+            let old_size = parts.get(&key).map(partition_memory_bytes).unwrap_or(0);
             parts.insert(key.clone(), partition);
             let mut order = shuffle_write_lock(&self.spill_order)?;
             order.retain(|existing| existing != &key);
             order.push_back(key);
             let mut used = shuffle_write_lock(&self.bytes_used)?;
-            *used += new_size;
+            *used = used.saturating_sub(old_size).saturating_add(new_size);
         }
         Ok(())
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-        if shuffle_read_lock(&self.spilled)?.contains(&key)
-            && let Some(spill) = &self.spill_store
-        {
-            return spill.read_partition(id).await;
+        // Hold both read locks atomically to decide WHERE the partition lives
+        // and extract its data. This eliminates the transient invisibility
+        // window between write_partition (spilled.remove → partitions.insert)
+        // and ensure_memory_capacity (partitions.remove → spilled.insert).
+        // Under this combined scope, every partition exists in exactly one of
+        // {spilled, partitions, neither}.  Both guards are dropped before any
+        // async I/O (std::sync::RwLockReadGuard is not Send).
+        let (from_spill, data) = {
+            let spilled_guard = shuffle_read_lock(&self.spilled)?;
+            let parts_guard = shuffle_read_lock(&self.partitions)?;
+            if spilled_guard.contains(&key) {
+                (true, None)
+            } else {
+                (false, parts_guard.get(&key).cloned())
+            }
+        };
+        if from_spill {
+            match &self.spill_store {
+                Some(spill) => spill.read_partition(id).await,
+                None => Ok(None),
+            }
+        } else {
+            Ok(data)
         }
-        let guard = shuffle_read_lock(&self.partitions)?;
-        Ok(guard.get(&key).cloned())
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
-        shuffle_write_lock(&self.partitions)?.retain(|(jid, _, _), _| jid != job_id);
+        // Acquire locks in the same order as write_partition: lease_tokens → partitions → spilled → spill_order.
         shuffle_write_lock(&self.lease_tokens)?.retain(|(jid, _, _), _| jid != job_id);
+        shuffle_write_lock(&self.partitions)?.retain(|(jid, _, _), _| jid != job_id);
         shuffle_write_lock(&self.spilled)?.retain(|(jid, _, _)| jid != job_id);
         shuffle_write_lock(&self.spill_order)?.retain(|(jid, _, _)| jid != job_id);
         if let Some(spill) = &self.spill_store {

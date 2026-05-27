@@ -590,31 +590,12 @@ impl OptimizerRule for PredicatePushdownRule {
         "predicate-pushdown"
     }
 
-    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
-        let nodes = plan.nodes();
-        let mut filter_idx = None;
-        let mut join_idx = None;
-        for (i, node) in nodes.iter().enumerate() {
-            match node.op() {
-                Some(NodeOp::Filter) => filter_idx = Some(i),
-                Some(NodeOp::Join { .. }) => join_idx = Some(i),
-                _ => {}
-            }
-        }
-        let (Some(fi), Some(ji)) = (filter_idx, join_idx) else {
-            return None;
-        };
-        if fi <= ji {
-            return None;
-        }
-        let mut reordered = nodes.to_vec();
-        let filter_node = reordered.remove(fi);
-        reordered.insert(ji, filter_node);
-        let mut out = LogicalPlan::new(plan.name(), plan.kind());
-        for node in reordered {
-            out.add_node(node);
-        }
-        Some(out)
+    /// No-op: predicate pushdown requires expression-column-provenance analysis
+    /// to avoid incorrect results. The flat-list reordering below is commented out
+    /// because it moves any filter below any join without checking whether the
+    /// filter's predicate references columns from only one side of the join.
+    fn apply(&self, _plan: &LogicalPlan) -> Option<LogicalPlan> {
+        None
     }
 }
 

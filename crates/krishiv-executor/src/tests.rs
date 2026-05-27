@@ -2039,6 +2039,33 @@ mod executor_tests {
 
     use crate::runner::TaskRunner;
 
+    #[derive(Debug, Default)]
+    struct FailingCheckpointStorage;
+
+    impl CheckpointStorage for FailingCheckpointStorage {
+        fn write_bytes(
+            &self,
+            _path: &str,
+            _data: &[u8],
+        ) -> krishiv_checkpoint::CheckpointResult<()> {
+            Err(krishiv_checkpoint::CheckpointError::Storage {
+                message: "injected write failure".to_string(),
+            })
+        }
+
+        fn read_bytes(&self, _path: &str) -> krishiv_checkpoint::CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn list_dir(&self, _prefix: &str) -> krishiv_checkpoint::CheckpointResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn delete_prefix(&self, _prefix: &str) -> krishiv_checkpoint::CheckpointResult<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn executor_checkpoint_takes_state_snapshot_and_writes_to_storage() {
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
@@ -2058,7 +2085,9 @@ mod executor_tests {
             fencing_token: FencingToken::initial(),
         };
 
-        let ack = runner.handle_initiate_checkpoint(req, &backend, &storage);
+        let ack = runner
+            .handle_initiate_checkpoint(req, &backend, &storage)
+            .unwrap();
 
         assert_eq!(ack.epoch, 1, "ack epoch must match request");
         assert_eq!(ack.task_id, task_id);
@@ -2091,7 +2120,9 @@ mod executor_tests {
             epoch: 2,
             fencing_token: FencingToken::initial(),
         };
-        let ack = runner.handle_initiate_checkpoint(req, &backend_with_state, &storage);
+        let ack = runner
+            .handle_initiate_checkpoint(req, &backend_with_state, &storage)
+            .unwrap();
         assert!(
             ack.snapshot_path.is_some(),
             "ack must include snapshot_path when state backend produced snapshot bytes"
@@ -2119,7 +2150,9 @@ mod executor_tests {
             epoch: 1,
             fencing_token: FencingToken::initial(),
         };
-        let ack = runner.handle_initiate_checkpoint(req, &backend, &storage);
+        let ack = runner
+            .handle_initiate_checkpoint(req, &backend, &storage)
+            .unwrap();
         assert_eq!(ack.source_offsets.len(), 1);
         assert_eq!(ack.source_offsets[0].offset, 42);
 
@@ -2129,7 +2162,9 @@ mod executor_tests {
             epoch: 1,
             fencing_token: FencingToken::initial(),
         };
-        let ack2 = runner2.handle_initiate_checkpoint(req2, &backend, &storage);
+        let ack2 = runner2
+            .handle_initiate_checkpoint(req2, &backend, &storage)
+            .unwrap();
         assert!(
             ack2.source_offsets.is_empty(),
             "non-Kafka task must have no source offsets"
@@ -2149,7 +2184,9 @@ mod executor_tests {
             epoch: 5,
             fencing_token: FencingToken::initial(),
         };
-        let ack5 = runner.handle_initiate_checkpoint(req5, &backend, &storage);
+        let ack5 = runner
+            .handle_initiate_checkpoint(req5, &backend, &storage)
+            .unwrap();
         assert_eq!(ack5.epoch, 5, "first ack must be for epoch 5");
         assert_eq!(runner.last_acked_epoch, 5);
 
@@ -2158,7 +2195,9 @@ mod executor_tests {
             epoch: 3,
             fencing_token: FencingToken::initial(),
         };
-        let stale_ack = runner.handle_initiate_checkpoint(req3, &backend, &storage);
+        let stale_ack = runner
+            .handle_initiate_checkpoint(req3, &backend, &storage)
+            .unwrap();
         assert_eq!(
             stale_ack.epoch, 5,
             "stale ack epoch must be last_acked_epoch (5), not the stale request epoch (3)"
@@ -2167,6 +2206,34 @@ mod executor_tests {
             runner.last_acked_epoch, 5,
             "last_acked_epoch must not change on stale rejection"
         );
+    }
+
+    #[test]
+    fn executor_checkpoint_write_failure_does_not_ack_epoch() {
+        let storage = FailingCheckpointStorage;
+        let job_id = JobId::try_new("job-cp-write-fail").unwrap();
+        let mut runner = TaskRunner::new(TaskId::try_new("task-cp-write-fail").unwrap());
+
+        let mut backend = InMemoryStateBackend::new();
+        let ns = krishiv_state::Namespace::new("operator-task-cp-write-fail", "state");
+        backend.put(&ns, b"k".to_vec(), b"v".to_vec()).unwrap();
+
+        let req = InitiateCheckpointRequest {
+            job_id,
+            epoch: 9,
+            fencing_token: FencingToken::initial(),
+        };
+
+        let error = runner
+            .handle_initiate_checkpoint(req, &backend, &storage)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint snapshot write failed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(runner.last_acked_epoch, 0);
     }
 
     #[tokio::test]

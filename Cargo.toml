@@ -26,9 +26,36 @@ members = [
     "crates/krishiv-upgrade-tests",
     "crates/krishiv-bench",
     "crates/krishiv-chaos",
-    "crates/krishiv-federation",
     "crates/krishiv-async-util",
-    "crates/krishiv-testkit",
+    "crates/krishiv-sql-policy",
+    "crates/krishiv-cep",
+    "crates/krishiv-vector-sinks",
+]
+default-members = [
+    "crates/krishiv",
+    "crates/krishiv-api",
+    "crates/krishiv-catalog",
+    "crates/krishiv-checkpoint",
+    "crates/krishiv-connectors",
+    "crates/krishiv-executor",
+    "crates/krishiv-exec",
+    "crates/krishiv-optimizer",
+    "crates/krishiv-plan",
+    "crates/krishiv-proto",
+    "crates/krishiv-operator",
+    "crates/krishiv-runtime",
+    "crates/krishiv-scheduler",
+    "crates/krishiv-shuffle",
+    "crates/krishiv-sql",
+    "crates/krishiv-state",
+    "crates/krishiv-udf",
+    "crates/krishiv-ui",
+    "crates/krishiv-python",
+    "crates/krishiv-lakehouse",
+    "crates/krishiv-flight-sql",
+    "crates/krishiv-metrics",
+    "crates/krishiv-governance",
+    "crates/krishiv-async-util",
     "crates/krishiv-sql-policy",
     "crates/krishiv-cep",
     "crates/krishiv-vector-sinks",
@@ -107,4 +134,3 @@ debug = 1
 opt-level = 3
 lto = "thin"
 codegen-units = 16
-

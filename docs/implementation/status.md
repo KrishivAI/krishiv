@@ -2,6 +2,128 @@
 
 ## Current Phase
 
+**Phases 1–4 complete: data-loss, deadlock, crash-unsafe state, and high-severity correctness fixes (2026-05-27).**
+
+- Workspace maintenance: removed `krishiv-federation`, `krishiv-testkit`, and
+  detached `krishiv-spark-connect` after review confirmed they were either
+  isolated or not part of the compiled workspace. Federation behavior remains
+  implemented in `krishiv-scheduler`'s HTTP federation endpoints.
+- Workspace default-member pruning: `krishiv-bench`, `krishiv-chaos`, and
+  `krishiv-upgrade-tests` remain available as explicit `-p` targets but are no
+  longer part of the default workspace member set for routine `cargo` commands.
+- Feature-gate taxonomy added across product manifests:
+  core engine crates remain ungated by product surfaces, deployment-oriented
+  crates now declare `cluster` / `k8s` / `ui` / `flight-sql` / `etcd`, and
+  external integration crates expose `kafka` / `sqlite` / `iceberg` / `ai` /
+  `vector-sinks` / `qdrant` / `pgvector` / `python` entry points.
+- Feature-gate seam reduction in the top-level `krishiv` crate:
+  `krishiv-flight-sql` and `krishiv-shuffle` are now optional dependencies,
+  `cluster` expands to `flight-sql + shuffle + etcd`, daemon subcommands
+  return explicit feature-enable errors when compiled out, and top-level help
+  now shows the enabled/disabled state for `flight-server` and `shuffle-svc`.
+- Workspace compile-fix pass:
+  repaired the async `SharedCoordinator` migration fallout in
+  `krishiv-scheduler`, `krishiv-ui`, and `krishiv-operator` by converting
+  async call sites to `.await`, adding `blocking_read` / `blocking_write`
+  accessors for synchronous code and tests, and removing a broken duplicate
+  block in the UI metrics handler.
+- Validation for the removal pass: `cargo metadata --no-deps --format-version 1`
+  succeeds after the workspace change; crate directories and workspace member
+  entries were removed; active docs were updated to treat the removed crates as
+  historical or deferred.
+- Validation for the feature-gate seam pass:
+  `cargo metadata --no-deps --format-version 1` succeeds and shows
+  `krishiv-flight-sql` / `krishiv-shuffle` as optional dependencies of
+  `crates/krishiv`.
+- Validation for the compile-fix pass:
+  `cargo check` and `cargo check --workspace` both succeed from the workspace
+  root after the scheduler/operator/UI repairs.
+- Blockers for this pass:
+  none for `cargo check`; only residual warnings remain in
+  `krishiv-scheduler/src/store.rs` for unused metadata snapshot helpers.
+
+- Full source-code review of all 35 workspace crates — 250 findings (21 critical, ~40 high, ~75 medium, ~30 low, 6 architectural).
+- **Phase 1 — Data-loss/corruption fixes:**
+  - `krishiv-shuffle`: lease token advancement (`disk_store`, `memory_store`, `object_store`); spill data loss (`memory_store::ensure_memory_capacity` preserves data on spill failure); accounting corruption (`write_partition` moves state mutation after spill); DashMap `entry()` API closes TOCTOU (`object_store`).
+  - `krishiv-sql`: `merge.rs` — `concat_batches` error propagated (silent data loss fixed); Iceberg-only routing (removed `.` heuristic that broke catalog.schema.table names).
+  - `krishiv-lakehouse`: `delta_lake.rs` — merge updates now always included when `when_matched_update=true`; `rows_inserted` excludes updated rows; type-prefixed hash keys prevent cross-type false matches. `local_delta.rs` — commit log uses atomic temp-file+fsync+rename.
+  - `krishiv-executor`: `runner.rs` — `initiate_checkpoint_and_deliver_ack` uses `entry().or_insert_with()` in-place mutation (removed clone-modify-insert race window).
+- **Phase 2 — Deadlock fixes:**
+  - `krishiv-scheduler`: `grpc.rs` — `list_checkpoints` moved I/O outside coordinator lock (was `std::sync::RwLock` held across blocking `read_epoch_metadata`). `etcd_metadata.rs` — `std::sync::Mutex` → `tokio::sync::Mutex`, `futures::executor::block_on` → `Handle::current().block_on` with `block_in_place`.
+  - `krishiv-shuffle`: `memory_store.rs` — `delete_job_partitions` lock order aligned with `write_partition` (lease_tokens → partitions → spilled → spill_order) to prevent RW-lock inversion deadlock.
+- Validation: **271 tests pass** across 5 modified crates (shuffle 57, sql 24, lakehouse 17, executor 56, scheduler 117). Clippy clean on all modified crates.
+
+- `TumblingWindowOperator::persist_to_state` now uses `put_batch` instead of
+  individual `backend.put()` calls — single redb write transaction per persist
+  instead of O(open_windows) transactions.
+- `flight_client.rs:plan_to_sql` legacy streaming comment protocol now escapes
+  `*/` in plan names (defense-in-depth; primary path uses typed `KrishivFlightAction`).
+- Verified: interval_join `evict_before` eviction formula `watermark - max(lower, upper)`
+  is correct for both left/right buffers (both sides must use the upper bound).
+- `cargo test` on krishiv-exec (78/78), krishiv-runtime (28/28), krishiv-state (66/66): all pass.
+
+**Critical bug-fix sweep — all 22 C-series + H-series fixes, all unit tests green (2026-05-27).**
+
+- All 22 C-series critical bugs fixed (C1–C22): scheduler deadlock, broken DAG edges,
+  hardcoded column names, UDF stubs, Delta schema, object_store contract violation,
+  silent data corruption, lease token consistency, spill failure data loss,
+  Protobuf→JSON misrouting, non-SELECT wrapping, assert_batches_eq value comparison,
+  stuck checkpoint epochs, fragile merge key regex, Iceberg merge full-table-replace,
+  PredicatePushdownRule, launch_in_flight state machine.
+- H-series fixes: RAG `created_at_ms`, continuous window test, dotenv loading.
+- `cargo check` passes (1 minor warning: `NUM_KEY_GROUPS` unused in lib).
+- `cargo clippy --workspace --lib --tests --no-deps`: 0 errors, 16 pre-existing warnings.
+- All unit tests pass:
+  - `krishiv-scheduler`: 117/117 (was 109, +6 from new tests, +2 from C1/C22 regression)
+  - `krishiv-checkpoint`: 37/37 (+1 from C2/C22 regression test)
+  - `krishiv-shuffle`: 57/57 (+2 from C14/C15 regression tests)
+  - `krishiv-plan`: 24/24
+  - `krishiv-optimizer`: 29/29
+  - `krishiv-sql-policy`: 9/9 (+2 from C18 regression tests)
+  - `krishiv-sql`: 24/24 (incl. merge regression test)
+- Regression tests added for C1, C2/C22, C9, C12, C14, C15, C18.
+- Bug fix round 2: `register_scan_batches` now deregisters existing table first (merge write-back fix); `rows_inserted` in C9 merge is now `inserted - updated`.
+- Previously-excluded crates (`krishiv-ai`, `krishiv-lakehouse`, `krishiv-vector-sinks`,
+  `krishiv-schema-registry`) compile successfully.
+
+Key fix: `launch_assigned_task_assignments` no longer transitions tasks to `Running`
+immediately; they stay `Assigned` with `launch_in_flight=true` until the executor
+reports `Running`. `apply_status_update` accepts updates from `Assigned` state.
+`retry_stage` clears `launch_in_flight`. Tests updated for new Assigned-after-launch
+semantics. 16 previously-failing scheduler tests now pass.
+
+**Fault-tolerance hardening sweep — checkpoint correctness, launch safety, metadata durability (2026-05-27).**
+
+- `krishiv-executor`: checkpoint initiation is now fail-closed. Snapshot/write failures return an error instead of emitting a misleading ack for the new epoch; checkpoint fanout logs delivery failures; checkpoint snapshotting is moved off the async worker path with `block_in_place` in the async delivery flow.
+- `krishiv-scheduler`: launched tasks remain `Assigned` until an executor status update marks them `Running`; dispatch failures clear launch-in-flight state; executor-loss recovery now clears stranded launches and reassigns pending work. Added checkpoint ack timeout handling so stuck epochs abort and later epochs can proceed.
+- `krishiv-checkpoint`: `latest_valid_epoch` now uses `latest_epoch.json` as a fast path before falling back to a full manifest scan; metadata writes continue to be atomic.
+- `krishiv-scheduler` metadata store: JSON persistence now uses temp-file + `fsync` + atomic rename + parent-dir `fsync`; empty metadata files are treated as corruption, not as an empty cluster state.
+- `krishiv-shuffle`: disk/object-store lease registration now accepts monotonic lease replacement and still rejects stale registrations. Added regression coverage for replacement semantics.
+- Regression tests added for checkpoint timeout abort, launch-state semantics, checkpoint write failure fail-closed behavior, and lease replacement behavior.
+
+Validation:
+
+```bash
+cargo test -p krishiv-checkpoint --lib
+# 36 passed
+
+cargo test -p krishiv-shuffle --lib
+# 55 passed
+```
+
+Blockers:
+
+- `cargo test -p krishiv-scheduler --lib` is currently blocked by an existing unrelated `krishiv-ai` compile failure:
+  `crates/krishiv-ai/src/rag.rs:100:40` unresolved `krishiv_async_util`.
+- `cargo test -p krishiv-executor --lib` remains blocked by existing unrelated `krishiv-sql` compile failures in `crates/krishiv-sql/src/udf.rs` (DataFusion API drift: unresolved `TableFunctionImpl`, `Accumulator`, `DfScalar`, etc.).
+
+Next:
+
+- Fix the unrelated `krishiv-ai` / `krishiv-sql` compile breakages, then rerun:
+  `cargo test -p krishiv-scheduler --lib`
+  `cargo test -p krishiv-executor --lib`
+  `cargo test -p krishiv-checkpoint -p krishiv-shuffle --lib`
+
 **Unified sprint sweep — Flight→CCP proxy, typed fragments, multi-stage jobs (2026-05-27).**
 
 Branch `cursor/full-unified-sprints-5e3d`:
@@ -23,7 +145,10 @@ cargo test -p krishiv-scheduler -p krishiv-executor -p krishiv-runtime \
 # scheduler: 116 passed; executor/runtime/flight/plan: all passed
 ```
 
-**Next:** Session `submit_job`/`JobHandle` over management gRPC; federation `spec_json` → real `JobSpec` deserialize; Flight `DoPut`/`DoExchange` for streaming payloads; distributed e2e with live clusterd+executor.
+**Next:** Session `submit_job`/`JobHandle` over management gRPC; scheduler
+federation HTTP `spec_json` → real `JobSpec` deserialize; Flight `DoPut` /
+`DoExchange` for streaming payloads; distributed e2e with live
+clusterd+executor.
 
 ---
 
@@ -74,8 +199,8 @@ Validation (per-crate, completed in-session):
 ```bash
 cargo check --workspace --lib --bins --tests \
   --exclude krishiv-ai --exclude krishiv-lakehouse --exclude krishiv-vector-sinks \
-  --exclude krishiv-federation --exclude krishiv-chaos --exclude krishiv-python \
-  --exclude krishiv-spark-connect --exclude krishiv-bench --exclude krishiv-upgrade-tests \
+  --exclude krishiv-chaos --exclude krishiv-python \
+  --exclude krishiv-bench --exclude krishiv-upgrade-tests \
   --exclude krishiv-schema-registry
 # OK
 
@@ -100,9 +225,9 @@ cargo clippy -p krishiv-runtime -p krishiv-scheduler -p krishiv-executor \
 cargo fmt --all -- --check    # OK
 ```
 
-Excluded crates (`krishiv-ai`, `krishiv-lakehouse`, `krishiv-vector-sinks`,
-`krishiv-federation`, …) depend transitively on `native-tls`/`libssl-dev` which
-is not available in the local environment; they are unchanged.
+Excluded crates (`krishiv-ai`, `krishiv-lakehouse`, `krishiv-vector-sinks`, …)
+depend transitively on `native-tls`/`libssl-dev` which is not available in the
+local environment; they are unchanged.
 
 **Blocker:** none.
 
@@ -532,7 +657,8 @@ Validation: `cargo test --workspace --lib && cargo clippy --workspace -- -D warn
 ### Completed (commit 47c9a1f)
 - Extracted `krishiv-async-util` crate: panic-safe `block_on`, `unix_now_ms` helpers
 - Extracted `krishiv-sql-policy` crate: re-exports `PolicyEnforcingSqlEngine` from `krishiv-sql`
-- Added `krishiv-testkit` stub crate for future shared test utilities
+- Added a temporary `krishiv-testkit` stub crate for future shared test
+  utilities; the empty crate was later removed instead of being expanded
 - Wired `block_on` from `krishiv-async-util` into `krishiv-api` and `krishiv/src/cli.rs`
 - Created scheduler module files: admission, checkpoint, heartbeat, job, store
 - Created exec module files: adaptive (SpaceSaving), aggregate, join, queue, window
@@ -564,12 +690,14 @@ Slices S3–S6 completed in this session:
 ### S6: Deployment Layer Completeness
 - **S6.1**: `DistributedBackend { flight_url }` in `krishiv-runtime`; `SessionBuilder::with_coordinator(url)` in `krishiv-api`
 - **S6.4**: `SqliteMetadataStore` feature-gated (`--features sqlite`) in `krishiv-scheduler`; 3 tests pass
-- **S6.5**: `crates/krishiv-federation/` crate: `RegionId`, `RoutingPolicy`, `FederationClient`, `GlobalCoordinator`; 5 tests pass
+- **S6.5**: historical `crates/krishiv-federation/` crate: `RegionId`,
+  `RoutingPolicy`, `FederationClient`, `GlobalCoordinator`; 5 tests passed
 - **P1.23**: `Coordinator::persist_jobs_to_store` added to snapshot in-memory jobs to a `MetadataStore`
 
 ### Test Results (2026-05-22, post-rebase push bbe1113)
 ```
-cargo test -p krishiv-federation          → 5 passed
+cargo test -p krishiv-federation          → 5 passed at the time; the crate was
+later removed
 cargo test -p krishiv-optimizer           → 29 passed (includes CoalesceRule + CoalescePartitions node)
 cargo test -p krishiv-shuffle             → 49 passed (includes Lz4/Zstd round-trips)
 cargo test -p krishiv-scheduler           → 97 passed

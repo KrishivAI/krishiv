@@ -1,6 +1,8 @@
 //! Coordinator-side checkpoint barrier dispatch over gRPC (WS-4 / ADR-R16.1).
 
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
@@ -10,6 +12,38 @@ use crate::barrier_client::inject_barrier;
 use crate::barrier_tracker::CheckpointBarrierTracker;
 use crate::heartbeat::ExecutorRecord;
 use crate::{Coordinator, SchedulerResult};
+
+fn barrier_channels() -> &'static Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>
+{
+    static CHANNELS: OnceLock<Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>> =
+        OnceLock::new();
+    CHANNELS.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+}
+
+async fn get_or_connect_barrier_channel(
+    endpoint: &str,
+) -> Result<tonic::transport::Channel, String> {
+    let channels = barrier_channels();
+    {
+        let guard = channels.lock().await;
+        if let Some(channel) = guard.get(endpoint) {
+            return Ok(channel.clone());
+        }
+    }
+
+    let parsed = tonic::transport::Channel::from_shared(endpoint.to_owned())
+        .map_err(|e| format!("invalid barrier endpoint {endpoint}: {e}"))?;
+    let channel = parsed
+        .connect()
+        .await
+        .map_err(|e| format!("barrier connect {endpoint}: {e}"))?;
+
+    let mut guard = channels.lock().await;
+    Ok(guard
+        .entry(endpoint.to_owned())
+        .or_insert_with(|| channel.clone())
+        .clone())
+}
 
 /// One barrier round-trip target for a running task on an executor.
 #[derive(Debug, Clone)]
@@ -143,11 +177,7 @@ pub async fn dispatch_barrier_plan(
     let mut acks: Vec<(TaskId, krishiv_proto::wire::v1::BarrierAck)> = Vec::new();
     for target in &plan.targets {
         let checkpoint_id = format!("task:{}/cp-{}", target.task_id.as_str(), plan.epoch);
-        let channel = tonic::transport::Channel::from_shared(target.barrier_endpoint.clone())
-            .map_err(|e| format!("invalid barrier endpoint {}: {e}", target.barrier_endpoint))?
-            .connect()
-            .await
-            .map_err(|e| format!("barrier connect {}: {e}", target.barrier_endpoint))?;
+        let channel = get_or_connect_barrier_channel(&target.barrier_endpoint).await?;
         let mut client =
             krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient::new(channel);
         let barrier = CheckpointBarrier {
@@ -183,11 +213,7 @@ pub async fn drive_barrier_dispatches(
     timeout: Duration,
 ) -> SchedulerResult<()> {
     let plans = {
-        let coord = shared
-            .read()
-            .map_err(|_| crate::SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?;
+        let coord = shared.read().await;
         coord.pending_barrier_dispatch_plans()
     };
     for plan in plans {
@@ -196,11 +222,7 @@ pub async fn drive_barrier_dispatches(
         let fencing = plan.fencing_token;
         match dispatch_barrier_plan(&plan, timeout).await {
             Ok(acks) => {
-                let mut coord = shared
-                    .write()
-                    .map_err(|_| crate::SchedulerError::Transport {
-                        message: "coordinator lock poisoned".to_string(),
-                    })?;
+                let mut coord = shared.write().await;
                 coord.mark_barrier_dispatched(&job_id, epoch);
                 coord.apply_barrier_acks(&job_id, epoch, fencing, &acks);
             }

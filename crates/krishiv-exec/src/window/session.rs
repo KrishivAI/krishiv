@@ -91,17 +91,16 @@ impl SessionWindowOperator {
                 continue;
             }
             let key = format_key_value(batch, key_idx, row)?;
-            if let Some(existing) = self.sessions.get(&key) {
-                if event_time_ms > existing.last_event_time_ms.saturating_add(gap) {
-                    if let Some(s) = self.sessions.remove(&key) {
-                        output.push(self.build_output_batch(
-                            &key,
-                            s.session_start_ms,
-                            s.last_event_time_ms + gap,
-                            &s.agg,
-                        )?);
-                    }
-                }
+            if let Some(existing) = self.sessions.get(&key)
+                && event_time_ms > existing.last_event_time_ms.saturating_add(gap)
+                && let Some(s) = self.sessions.remove(&key)
+            {
+                output.push(self.build_output_batch(
+                    &key,
+                    s.session_start_ms,
+                    s.last_event_time_ms + gap,
+                    &s.agg,
+                )?);
             }
             let session = self.sessions.entry(key).or_insert_with(|| SessionState {
                 session_start_ms: event_time_ms,

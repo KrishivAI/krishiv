@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::VectorSinkError;
 use crate::config::VectorSinkConfig;
 use crate::memory::InMemoryVectorSink;
 use crate::pinecone::PineconeSink;

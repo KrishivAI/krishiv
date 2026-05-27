@@ -78,23 +78,29 @@ impl ObjectStoreCheckpointStorage {
     }
 
     /// Async list — preferred for callers in a Tokio context (D4).
+    /// Lists immediate children (one level deep) under `prefix`, not recursive.
     pub async fn list_dir_async_inner(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
         let path = self.object_path(prefix);
-        let mut names = Vec::new();
-        let mut stream = self.store.list(Some(&path));
-        while let Some(entry) =
-            stream
-                .next()
-                .await
-                .transpose()
-                .map_err(|e| CheckpointError::Storage {
-                    message: format!("object store list: {e}"),
-                })?
-        {
-            if let Some(name) = entry.location.parts().next_back() {
-                names.push(name.as_ref().to_string());
-            }
-        }
+        let result = self
+            .store
+            .list_with_delimiter(Some(&path))
+            .await
+            .map_err(|e| CheckpointError::Storage {
+                message: format!("object store list_with_delimiter: {e}"),
+            })?;
+        let mut names: Vec<String> = result
+            .common_prefixes
+            .iter()
+            .filter_map(|p| p.parts().next_back())
+            .map(|p| p.as_ref().to_string())
+            .collect();
+        names.extend(
+            result
+                .objects
+                .iter()
+                .filter_map(|obj| obj.location.parts().next_back())
+                .map(|p| p.as_ref().to_string()),
+        );
         Ok(names)
     }
 

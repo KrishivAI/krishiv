@@ -291,7 +291,7 @@ mod tests {
     fn multi_source_watermark_min_across_sources() {
         use std::collections::HashMap;
 
-        let mut spec = WindowExecutionSpec {
+        let spec = WindowExecutionSpec {
             key_column: "user_id".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,

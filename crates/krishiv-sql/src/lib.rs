@@ -974,7 +974,7 @@ mod tests {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
 
         let engine = SqlEngine::new();
 
@@ -1007,7 +1007,7 @@ mod tests {
 
 #[cfg(test)]
 mod udf_sql_tests {
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     use krishiv_udf::MultiplyScalarUdf;
 
@@ -1028,7 +1028,7 @@ mod udf_sql_tests {
                     use arrow::array::Int64Array;
                     use arrow::datatypes::{DataType, Field, Schema};
                     use arrow::record_batch::RecordBatch;
-                    use std::sync::{Arc, RwLock};
+                    use std::sync::Arc;
                     let schema =
                         Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
                     RecordBatch::try_new(

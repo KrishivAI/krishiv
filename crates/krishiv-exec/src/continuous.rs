@@ -256,12 +256,17 @@ mod tests {
     }
 
     #[test]
-    fn continuous_executor_accumulates_across_drains() {
+    fn continuous_executor_emits_window_after_watermark_passes_boundary() {
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        let mut spec = spec;
+        spec.watermark_lag_ms = 0;
         let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+        // Events at timestamp 1_000 and 12_000 span two tumbling windows [0, 10000) and [10000, 20000).
         let _ = exec.drain(vec![events_batch(1_000)]).expect("drain1");
-        let second = exec.drain(vec![events_batch(5_000)]).expect("drain2");
-        assert!(second.is_empty() || !second.is_empty());
+        // After receiving event at 12_000, watermark advances past the first window.
+        let second = exec.drain(vec![events_batch(12_000)]).expect("drain2");
+        // First window [0, 10000) should be emitted (at least one row).
+        assert!(!second.is_empty(), "expected first window to be emitted");
     }
 
     #[test]

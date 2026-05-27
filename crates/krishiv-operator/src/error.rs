@@ -43,6 +43,7 @@ impl From<SchedulerError> for OperatorError {
     }
 }
 
+#[cfg(feature = "k8s")]
 impl From<kube::Error> for OperatorError {
     fn from(value: kube::Error) -> Self {
         Self::Kubernetes {
@@ -51,6 +52,7 @@ impl From<kube::Error> for OperatorError {
     }
 }
 
+#[cfg(feature = "k8s")]
 impl From<kube::runtime::watcher::Error> for OperatorError {
     fn from(value: kube::runtime::watcher::Error) -> Self {
         Self::Kubernetes {

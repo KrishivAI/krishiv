@@ -5,15 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# The operator is a deployment surface; cluster builds keep both k8s and UI
+# enabled by default.
+default = ["cluster"]
+cluster = ["k8s", "ui"]
+k8s = ["dep:k8s-openapi", "dep:kube"]
+ui = ["dep:krishiv-ui"]
+
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
-k8s-openapi.workspace = true
+k8s-openapi = { workspace = true, optional = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
-krishiv-ui = { path = "../krishiv-ui" }
-kube.workspace = true
+krishiv-ui = { path = "../krishiv-ui", optional = true }
+kube = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net"] }

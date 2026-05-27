@@ -3829,6 +3829,7 @@ name = "krishiv"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "dotenvy",
  "krishiv-api",
  "krishiv-async-util",
  "krishiv-checkpoint",
@@ -4029,18 +4030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-federation"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "krishiv-flight-sql"
 version = "0.1.0"
 dependencies = [
@@ -4165,6 +4154,7 @@ dependencies = [
  "krishiv-ai",
  "krishiv-api",
  "krishiv-catalog",
+ "krishiv-connectors",
  "krishiv-exec",
  "krishiv-governance",
  "krishiv-lakehouse",
@@ -4313,13 +4303,6 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
-]
-
-[[package]]
-name = "krishiv-testkit"
-version = "0.1.0"
-dependencies = [
- "arrow",
 ]
 
 [[package]]

@@ -243,7 +243,7 @@ impl JobRecord {
             }
 
             for task in &mut stage.tasks {
-                if task.state == TaskState::Assigned {
+                if task.state == TaskState::Assigned && !task.launch_in_flight {
                     let executor_id = task.assigned_executor.clone().ok_or_else(|| {
                         SchedulerError::InvalidJob {
                             message: format!(
@@ -261,8 +261,8 @@ impl JobRecord {
                             executor_id: executor_id.clone(),
                         })?;
 
-                    task.state = TaskState::Running;
                     task.attempt = task.attempt.saturating_add(1);
+                    task.launch_in_flight = true;
                     let attempt_id = AttemptId::try_new(task.attempt).map_err(|error| {
                         SchedulerError::InvalidJob {
                             message: error.to_string(),
@@ -581,6 +581,7 @@ impl StageRecord {
         for task in &mut self.tasks {
             task.state = TaskState::Pending;
             task.assigned_executor = None;
+            task.launch_in_flight = false;
         }
     }
 
@@ -643,6 +644,7 @@ pub struct TaskRecord {
     pub(crate) state: TaskState,
     pub(crate) assigned_executor: Option<ExecutorId>,
     pub(crate) attempt: u32,
+    pub(crate) launch_in_flight: bool,
     pub(crate) output_metadata: Option<TaskOutputMetadata>,
     pub(crate) last_failure_reason: Option<String>,
     /// Last event-time watermark reported by the executor for this streaming task.
@@ -660,6 +662,7 @@ impl TaskRecord {
             state: TaskState::Pending,
             assigned_executor: None,
             attempt: 0,
+            launch_in_flight: false,
             output_metadata: None,
             last_failure_reason: None,
             last_watermark_ms: None,
@@ -685,6 +688,14 @@ impl TaskRecord {
     /// Current attempt number.
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    pub(crate) fn launch_in_flight(&self) -> bool {
+        self.launch_in_flight
+    }
+
+    pub(crate) fn clear_launch_in_flight(&mut self) {
+        self.launch_in_flight = false;
     }
 
     /// Last reported output metadata.
@@ -720,6 +731,7 @@ impl TaskRecord {
 
     pub(crate) fn cancel(&mut self) {
         self.state = TaskState::Cancelled;
+        self.launch_in_flight = false;
     }
 
     pub(crate) fn apply_status_update(
@@ -755,7 +767,9 @@ impl TaskRecord {
         }
 
         if self.state.is_terminal()
-            || (self.state != TaskState::Running && update.state() != TaskState::Running)
+            || (self.state != TaskState::Running
+                && self.state != TaskState::Assigned
+                && update.state() != TaskState::Running)
         {
             return Err(SchedulerError::StaleTaskAttempt {
                 task_id: self.task_id().clone(),
@@ -765,6 +779,7 @@ impl TaskRecord {
         }
 
         self.state = update.state();
+        self.launch_in_flight = false;
         self.assigned_executor = Some(update.executor_id().clone());
         self.attempt = update.attempt();
         if let Some(output_metadata) = update.output_metadata() {
@@ -1228,7 +1243,7 @@ fn job_spec_from_exchange_stages(
 }
 
 /// Topological order of plan nodes using declared `inputs()` edges.
-fn topo_sort_plan_nodes<'a>(nodes: &'a [PlanNode]) -> Vec<&'a PlanNode> {
+fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> Vec<&PlanNode> {
     use std::collections::{HashMap, VecDeque};
 
     let by_id: HashMap<&str, &PlanNode> = nodes.iter().map(|n| (n.id(), n)).collect();

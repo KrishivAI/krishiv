@@ -8,6 +8,7 @@
 use pyo3::prelude::*;
 
 mod agg;
+#[cfg(feature = "ai")]
 mod ai;
 mod batch;
 mod dataframe;
@@ -27,6 +28,20 @@ mod stream;
 mod stream_exec;
 mod udf;
 mod windows;
+
+#[cfg(not(feature = "ai"))]
+mod ai {
+    use pyo3::prelude::*;
+
+    pub fn register_ai_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+        let ai = PyModule::new(py, "ai")?;
+        parent.add_submodule(&ai)?;
+        py.import("sys")?
+            .getattr("modules")?
+            .set_item("krishiv.ai", &ai)?;
+        Ok(())
+    }
+}
 
 pub use agg::PyAggExpr;
 pub use batch::PyBatch;

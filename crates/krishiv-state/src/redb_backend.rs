@@ -267,7 +267,13 @@ impl StateBackend for RedbStateBackend {
                 Ok(())
             }
             Err(e) => {
-                drop(wtxn);
+                if let Err(abort_err) = wtxn.abort() {
+                    return Err(StateError::SnapshotIncomplete {
+                        message: format!(
+                            "load_snapshot failed (original: {e}, abort: {abort_err})"
+                        ),
+                    });
+                }
                 Err(e)
             }
         }

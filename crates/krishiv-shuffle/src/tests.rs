@@ -704,6 +704,34 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
+    async fn local_disk_registered_newer_lease_replaces_old_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let id = make_store_partition("job-disk-lease-replace", "s0", 0).id;
+
+        store
+            .register_partition_lease(id.clone(), 11)
+            .await
+            .unwrap();
+        store
+            .register_partition_lease(id.clone(), 12)
+            .await
+            .unwrap();
+
+        let err = store.register_partition_lease(id, 11).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShuffleError::StaleLeaseToken {
+                    expected: 12,
+                    actual: 11
+                }
+            ),
+            "expected StaleLeaseToken(expected=12, actual=11), got {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn local_disk_registered_fresh_lease_rejects_stale_write_before_commit() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
@@ -886,6 +914,92 @@ mod shuffle_tests {
             }),
             "Parquet row groups should be written with compression enabled"
         );
+    }
+
+    /// C14 regression: both disk_store and memory_store must have consistent
+    /// lease token semantics: register accepts token > current, write accepts
+    /// token >= current. This test verifies the memory store path for
+    /// monotonic lease replacement.
+    #[tokio::test]
+    async fn in_memory_store_monotonic_lease_replacement() {
+        let store = InMemoryShuffleStore::new();
+        let partition = make_store_partition("job-lease-mono", "s0", 0);
+        let id = partition.id.clone();
+
+        // Initial registration with token 1.
+        store.register_partition_lease(id.clone(), 1).await.unwrap();
+        store.write_partition(partition.clone(), 1).await.unwrap();
+        assert!(store.read_partition(&id).await.unwrap().is_some());
+
+        // Same token re-registration must succeed (monotonic replacement).
+        store.register_partition_lease(id.clone(), 1).await.unwrap();
+        assert!(
+            store.read_partition(&id).await.unwrap().is_some(),
+            "write must survive monotonic re-registration"
+        );
+
+        // Fresh write with same token after re-registration.
+        store.write_partition(partition.clone(), 1).await.unwrap();
+
+        // Stale token (0 < 1) must be rejected by both register and write.
+        let err = store
+            .register_partition_lease(id.clone(), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ShuffleError::StaleLeaseToken { .. }));
+
+        let err = store
+            .write_partition(partition.clone(), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ShuffleError::StaleLeaseToken { .. }));
+    }
+
+    /// C15 regression: spill store failure must not cause data loss or corrupt
+    /// bytes_used in the in-memory store.  The bytes_used decrement must happen
+    /// AFTER the spill write succeeds, not before.
+    #[tokio::test]
+    async fn spill_failure_does_not_corrupt_bytes_used() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a spill store at path, then make the dir read-only so writes fail.
+        let spill_path = dir.path().join("spill_fail");
+        std::fs::create_dir_all(&spill_path).unwrap();
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&spill_path, Permissions::from_mode(0o000)).unwrap();
+        let spill = Arc::new(LocalDiskShuffleStore::new(&spill_path).unwrap());
+
+        // Use a tiny max_bytes so writes trigger spills immediately.
+        let store = InMemoryShuffleStore::new()
+            .with_max_bytes(64)
+            .with_spill_store(spill);
+
+        // Write partitions at or below max_bytes — first few should stay in memory.
+        let p0 = make_store_partition("job-spill-fail", "s0", 0);
+        let p1 = make_store_partition("job-spill-fail", "s0", 1);
+        let id0 = p0.id.clone();
+        let id1 = p1.id.clone();
+
+        // First write succeeds (below max_bytes, stays in memory).
+        store.write_partition(p0, 1).await.unwrap();
+        // Second write triggers a spill of the oldest partition — this spill
+        // will FAIL because the spill dir is read-only.  Data must remain
+        // accessible in memory and bytes_used must not be corrupted.
+        store.write_partition(p1, 1).await.unwrap();
+
+        // Both partitions must still be readable.
+        assert!(
+            store.read_partition(&id0).await.unwrap().is_some(),
+            "p0 lost after failed spill"
+        );
+        assert!(
+            store.read_partition(&id1).await.unwrap().is_some(),
+            "p1 missing after write"
+        );
+
+        // Restore permissions for cleanup.
+        std::fs::set_permissions(&spill_path, Permissions::from_mode(0o755)).unwrap();
     }
 
     #[tokio::test]

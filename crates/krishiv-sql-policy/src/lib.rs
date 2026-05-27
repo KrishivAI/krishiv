@@ -161,6 +161,10 @@ impl PolicyEnforcingSqlEngine {
     }
 }
 
+fn is_select_query(query: &str) -> bool {
+    query.trim().to_uppercase().starts_with("SELECT")
+}
+
 fn apply_row_predicates(
     query: &str,
     principal: &Principal,
@@ -171,7 +175,7 @@ fn apply_row_predicates(
         .iter()
         .filter_map(|t| policy.row_predicate(principal, t))
         .collect();
-    if preds.is_empty() {
+    if preds.is_empty() || !is_select_query(query) {
         return query.to_string();
     }
     if preds.len() == 1 {
@@ -462,5 +466,48 @@ mod policy_tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(id_col.value(0), "REDACTED");
+    }
+
+    /// C18 regression: row predicates must NOT be applied to non-SELECT queries.
+    #[test]
+    fn is_select_query_rejects_non_select() {
+        assert!(is_select_query("SELECT * FROM t"));
+        assert!(is_select_query("  SELECT a, b FROM t"));
+        assert!(!is_select_query("WITH cte AS (SELECT 1) DELETE FROM t"));
+        assert!(!is_select_query("INSERT INTO t VALUES (1)"));
+        assert!(!is_select_query("UPDATE t SET a=1"));
+        assert!(!is_select_query("CREATE TABLE t (a INT)"));
+    }
+
+    #[test]
+    fn apply_row_predicates_skips_non_select() {
+        struct TestPolicy;
+        impl PolicyHook for TestPolicy {
+            fn check_table_access(&self, _: &Principal, _: &str) -> bool {
+                true
+            }
+            fn column_masking_rule(&self, _: &Principal, _: &str, _: &str) -> Option<MaskingRule> {
+                None
+            }
+            fn row_predicate(&self, _: &Principal, _: &str) -> Option<String> {
+                Some("deleted = false".into())
+            }
+        }
+        let p = Principal {
+            subject: "alice".into(),
+            role: Role::Reader,
+        };
+
+        // Non-SELECT must not get wrapped.
+        let result =
+            apply_row_predicates("INSERT INTO t VALUES (1)", &p, &["t".into()], &TestPolicy);
+        assert_eq!(
+            result, "INSERT INTO t VALUES (1)",
+            "non-SELECT must not be wrapped"
+        );
+
+        // SELECT must get wrapped.
+        let result = apply_row_predicates("SELECT * FROM t", &p, &["t".into()], &TestPolicy);
+        assert!(result.contains("__krishiv_rls"), "SELECT must be wrapped");
     }
 }

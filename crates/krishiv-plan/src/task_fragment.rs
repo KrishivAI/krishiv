@@ -76,6 +76,8 @@ mod tests {
     fn round_trip_typed_fragment() {
         let node =
             PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
+                key_column: String::new(),
+                event_time_column: String::new(),
                 window_size_ms: 1_000,
                 aggs: vec![],
             });

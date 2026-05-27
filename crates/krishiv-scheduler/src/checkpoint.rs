@@ -44,6 +44,8 @@ pub struct CheckpointCoordinator {
     /// Accumulated wall-clock ms since the last checkpoint was initiated.
     /// Driven by `try_tick`; resets on each successful `initiate()`.
     pub(crate) elapsed_ms: u64,
+    /// Wall-clock ms spent waiting for acks on the in-flight epoch.
+    pub(crate) awaiting_elapsed_ms: u64,
 }
 
 impl fmt::Debug for CheckpointCoordinator {
@@ -79,6 +81,7 @@ impl CheckpointCoordinator {
             pending_savepoint_label: None,
             pending_is_savepoint: false,
             elapsed_ms: 0,
+            awaiting_elapsed_ms: 0,
         }
     }
 
@@ -100,6 +103,7 @@ impl CheckpointCoordinator {
         }
         self.current_epoch += 1;
         self.elapsed_ms = 0;
+        self.awaiting_elapsed_ms = 0;
         self.pending_acks.clear();
         // Wall-clock approximation using a monotonic epoch counter for determinism.
         let initiated_at_ms = self.current_epoch * self.interval_ms;
@@ -118,11 +122,17 @@ impl CheckpointCoordinator {
     /// will fire the next epoch.
     ///
     /// Returns `Some(epoch)` if a checkpoint was initiated, `None` otherwise.
-    pub fn try_tick(&mut self, elapsed_ms: u64) -> Option<u64> {
-        if self.expected_task_count == 0 {
+    pub fn try_tick(&mut self, elapsed_ms: u64, ack_timeout_ms: u64) -> Option<u64> {
+        // Process awaiting-acks timeout even when expected_task_count is 0,
+        // so an epoch doesn't get stuck forever if all tasks finish during it.
+        if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
+            self.awaiting_elapsed_ms = self.awaiting_elapsed_ms.saturating_add(elapsed_ms);
+            if self.awaiting_elapsed_ms >= ack_timeout_ms {
+                self.abort_epoch("timed out waiting for checkpoint acknowledgements");
+            }
             return None;
         }
-        if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
+        if self.expected_task_count == 0 {
             return None;
         }
         self.elapsed_ms = self.elapsed_ms.saturating_add(elapsed_ms);
@@ -285,6 +295,7 @@ impl CheckpointCoordinator {
 
         self.state = CheckpointCoordinatorState::Committed { epoch };
         self.pending_is_savepoint = false;
+        self.awaiting_elapsed_ms = 0;
         Ok(epoch)
     }
 
@@ -298,6 +309,7 @@ impl CheckpointCoordinator {
         self.pending_is_savepoint = false;
         self.pending_savepoint_label = None;
         self.elapsed_ms = 0;
+        self.awaiting_elapsed_ms = 0;
         self.state = CheckpointCoordinatorState::Failed {
             epoch,
             reason: reason.to_owned(),
@@ -378,6 +390,27 @@ mod tests {
             }],
             snapshot_path: None,
         }
+    }
+
+    /// C2/C22 regression: try_tick must process timeout for awaiting-acks epochs
+    /// even when expected_task_count == 0.
+    #[test]
+    fn checkpoint_timeout_aborts_stuck_epoch_with_zero_expected_tasks() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-timeout-zero").unwrap();
+        let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 0);
+
+        // Start an epoch with 0 expected tasks.
+        assert_eq!(coord.initiate().unwrap(), 1);
+
+        // Tick with elapsed < ack_timeout — epoch should still be awaiting acks.
+        assert_eq!(coord.try_tick(100, 5_000), None);
+        assert!(coord.is_awaiting_acks());
+
+        // Tick with elapsed >= ack_timeout — epoch should abort.
+        assert_eq!(coord.try_tick(5_000, 5_000), None);
+        assert!(!coord.is_awaiting_acks());
     }
 
     #[test]

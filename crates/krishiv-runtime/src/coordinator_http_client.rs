@@ -73,6 +73,5 @@ pub async fn execute_coordinator_batch_sql(
         RuntimeError::transport(format!("batch-sql HTTP response decode failed: {e}"))
     })?;
     let _job_id = payload.job_id;
-    decode_inline_record_batches(&payload.inline_record_batch_ipc)
-        .map_err(|e| RuntimeError::transport(e))
+    decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
 }

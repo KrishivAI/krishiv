@@ -29,6 +29,9 @@ pub struct CoordinatorConfig {
     /// Used to convert tick counts into elapsed-time estimates for the
     /// per-job checkpoint interval timer.  Defaults to 1 000 ms (1 second).
     tick_period_ms: u64,
+    /// Maximum wall-clock time a checkpoint epoch may wait for executor acks
+    /// before the coordinator aborts it and allows the next epoch to proceed.
+    checkpoint_ack_timeout_ms: u64,
     /// Job-level LLM request quota per minute (R17).
     llm_quota_requests_per_minute: u32,
     /// Job-level LLM token quota per minute (R17).
@@ -44,6 +47,7 @@ impl CoordinatorConfig {
             memory_threshold_bytes: None,
             streaming_reattach_grace_ticks: 5,
             tick_period_ms: 1_000,
+            checkpoint_ack_timeout_ms: 30_000,
             llm_quota_requests_per_minute: 100,
             llm_quota_tokens_per_minute: 10_000,
         }
@@ -78,6 +82,12 @@ impl CoordinatorConfig {
         self
     }
 
+    #[must_use]
+    pub fn with_checkpoint_ack_timeout_ms(mut self, ms: u64) -> Self {
+        self.checkpoint_ack_timeout_ms = ms.max(1);
+        self
+    }
+
     /// Maximum number of stage-level retries after an executor reports failure.
     pub fn max_stage_retries(&self) -> u32 {
         self.max_stage_retries
@@ -101,6 +111,10 @@ impl CoordinatorConfig {
     /// Wall-clock milliseconds per heartbeat tick.
     pub fn tick_period_ms(&self) -> u64 {
         self.tick_period_ms
+    }
+
+    pub fn checkpoint_ack_timeout_ms(&self) -> u64 {
+        self.checkpoint_ack_timeout_ms
     }
 
     /// Job-level LLM request quota per minute (R17).

@@ -1306,8 +1306,8 @@ partial-update merge patterns, which is a data-loss-class defect.
 The multi-region coordinator federation must agree on which jobs exist, their
 current state, and which region is authoritative for each job. This is a
 fundamental distributed systems design decision that determines every data
-structure in `krishiv-federation`. It must be decided before any federation
-code is written.
+structure in a future dedicated federation module or crate. It must be decided
+before any expanded federation code is written.
 
 **Options**
 
@@ -1341,8 +1341,9 @@ Architecture:
   hold no durable state independently.
 - HA for the global coordinator: managed Postgres (cloud deployments) or the
   `krishiv-etcd` leader election implemented in R19 Sprint 4 (bare-metal).
-- The `krishiv-federation` crate defines a `FederationClient` trait with methods
-  `submit_job`, `cancel_job`, `job_status`, `list_jobs`, `route_task(job_id) → RegionUrl`.
+- A future dedicated federation module or crate may define a `FederationClient`
+  trait with methods `submit_job`, `cancel_job`, `job_status`, `list_jobs`,
+  `route_task(job_id) → RegionUrl`.
 - Option A (Raft) remains the correct long-term path for a fully peer-to-peer
   control plane and is scheduled as a future ADR beyond R20.
 

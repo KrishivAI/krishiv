@@ -780,7 +780,6 @@ mod tests {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
-        use datafusion::catalog::CatalogProvider as DfCatalogProvider;
         use datafusion::prelude::SessionContext;
 
         let catalog = Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
@@ -808,6 +807,7 @@ mod tests {
         assert_eq!(rows, 10);
     }
 
+    #[test]
     fn datafusion_bridge_unknown_schema_returns_none() {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 

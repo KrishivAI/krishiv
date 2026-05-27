@@ -36,9 +36,7 @@ pub async fn federation_submit_job(
     let stage = StageSpec::new(stage_id, "federated")
         .with_task(TaskSpec::new(task_id, "sql: SELECT 1 AS federation_ok"));
     let spec = JobSpec::new(job_id.clone(), "federated", JobKind::Batch).with_stage(stage);
-    let mut coord = coordinator
-        .write()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut coord = coordinator.write().await;
     coord.submit_job(spec).map_err(|e| match e {
         SchedulerError::NoExecutors => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
@@ -53,9 +51,7 @@ pub async fn federation_job_status(
     Path(job_id): Path<String>,
 ) -> Result<Json<FederationStatusResponse>, StatusCode> {
     let job_id = JobId::try_new(job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let coord = coordinator
-        .read()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let coord = coordinator.read().await;
     let snapshot = coord
         .job_snapshot(&job_id)
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -70,9 +66,7 @@ pub async fn federation_cancel_job(
     Path(job_id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let job_id = JobId::try_new(job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let mut coord = coordinator
-        .write()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut coord = coordinator.write().await;
     coord
         .cancel_job(&job_id)
         .map_err(|_| StatusCode::NOT_FOUND)?;

@@ -34,8 +34,9 @@ In scope:
     works in embedded mode without duplicating the operator loop (ADR-R12-05).
   - `MetadataStore` backend selection via CLI flag (`--metadata-backend sqlite`)
     so bare-metal deployments can persist coordinator state without Kubernetes.
-  - `krishiv-federation` crate skeleton with `FederationClient` trait and
-    `GlobalCoordinator` stub (structural prerequisite for R19; ADR-19.1 DECIDED).
+  - Historical federation crate skeleton with `FederationClient` trait and
+    `GlobalCoordinator` stub (later removed; active federation wiring now lives
+    in scheduler code until R19 justifies a dedicated crate again).
 
 Out of scope:
 
@@ -661,7 +662,7 @@ rebalance testing in Sprint 3.
 
 ---
 
-### S6.5: krishiv-federation crate skeleton — new crate
+### S6.5: krishiv-federation crate skeleton — historical
 
 - [x] `crates/krishiv-federation/Cargo.toml` created with `tokio` + `tracing`.
 - [x] `RegionId(String)` newtype with `Display` + `Hash`.
@@ -675,7 +676,11 @@ rebalance testing in Sprint 3.
 - [x] 5 tests all pass: round-robin routing, primary routing, empty error,
       submit/status no-ops.
 
-**Validation**: `cargo test -p krishiv-federation` → 5 passed
+**Historical note:** The standalone crate was later removed from the repository.
+Active federation behavior remains in `krishiv-scheduler`'s HTTP federation
+path.
+
+**Validation at the time**: `cargo test -p krishiv-federation` → 5 passed
 
 ---
 
@@ -698,8 +703,8 @@ rebalance testing in Sprint 3.
       embedded streaming redirect tests.
 - [ ] `cargo test -p krishiv-scheduler --features sqlite-metadata` — SQLite
       metadata store round-trip test.
-- [ ] `cargo test -p krishiv-federation` — `GlobalCoordinator` construction and
-      route_task tests.
+- [ ] If a standalone federation crate is reintroduced, add
+      `GlobalCoordinator` construction and `route_task` tests there.
 - [ ] `cargo test --workspace` — full suite passes.
 
 ## Acceptance Gate
@@ -729,8 +734,8 @@ R12 is complete when:
       `StreamBatch` values through the `SingleNodeBackend` redirect.
 - [ ] Coordinator binary starts with `--metadata-backend sqlite --metadata-path
       /tmp/test.db`, writes 3 jobs, restarts with the same path, reads back all 3.
-- [ ] `cargo test -p krishiv-federation` passes (crate exists, trait compiles,
-      `SingleRegionFederationClient` routes correctly).
+- [ ] If a standalone federation crate is reintroduced, its tests pass and it is
+      a real workspace member rather than a detached or placeholder crate.
 
 ## Maturity Gap and Risk Register
 

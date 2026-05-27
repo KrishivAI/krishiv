@@ -39,6 +39,8 @@ fn in_process_streaming_window_lowers_to_stream_fragment() {
     use krishiv_plan::window::WindowAgg;
     let node =
         PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
+            key_column: String::new(),
+            event_time_column: String::new(),
             window_size_ms: 1_000,
             aggs: vec![WindowAgg::count("count")],
         });

@@ -45,30 +45,15 @@ impl JobCoordinator {
 
     pub fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         self.ensure_job(&spec)?;
-        self.cluster
-            .write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .submit_job(spec)
+        self.cluster.blocking_write().submit_job(spec)
     }
 
     pub fn cancel_job(&self) -> SchedulerResult<()> {
-        self.cluster
-            .write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .cancel_job(&self.job_id)
+        self.cluster.blocking_write().cancel_job(&self.job_id)
     }
 
     pub fn job_snapshot(&self) -> SchedulerResult<JobSnapshot> {
-        self.cluster
-            .read()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?
-            .job_snapshot(&self.job_id)
+        self.cluster.blocking_read().job_snapshot(&self.job_id)
     }
 
     pub fn job_kind(&self) -> SchedulerResult<JobKind> {
@@ -79,16 +64,11 @@ impl JobCoordinator {
     /// job's id only.  Does NOT advance the heartbeat clock — that is the
     /// CCP's responsibility, doing it here would double-count ticks (A4).
     pub fn coordinator_tick(&self) -> SchedulerResult<()> {
-        let mut coord = self
-            .cluster
-            .write()
-            .map_err(|_| SchedulerError::Transport {
-                message: "coordinator lock poisoned".to_string(),
-            })?;
-        if self.job_snapshot().is_err() {
-            return Ok(());
+        if self.cluster.blocking_read().jobs.contains_key(&self.job_id) {
+            self.cluster
+                .blocking_write()
+                .launch_assigned_task_assignments(&self.job_id)?;
         }
-        coord.launch_assigned_task_assignments(&self.job_id)?;
         Ok(())
     }
 
@@ -108,14 +88,18 @@ impl JobCoordinator {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let job_ids = match cluster.read() {
-                    Ok(coord) if coord.job_snapshot(&job_id).is_ok() => vec![job_id.clone()],
-                    Ok(_) => continue,
-                    Err(_) => continue,
+                let job_ids = {
+                    let coord = cluster.read().await;
+                    if coord.job_snapshot(&job_id).is_ok() {
+                        vec![job_id.clone()]
+                    } else {
+                        continue;
+                    }
                 };
                 for jid in job_ids {
-                    let targets = match cluster.write() {
-                        Ok(mut coord) => match coord.launch_assigned_task_assignments(&jid) {
+                    let targets = {
+                        let mut coord = cluster.write().await;
+                        match coord.launch_assigned_task_assignments(&jid) {
                             Ok(assignments) => {
                                 match coord.resolve_assignment_targets(assignments) {
                                     Ok(targets) => targets,
@@ -132,12 +116,11 @@ impl JobCoordinator {
                                 }
                                 continue;
                             }
-                        },
-                        Err(_) => continue,
+                        }
                     };
-                    let channels = match cluster.read() {
-                        Ok(coord) => coord.executor_channels.clone(),
-                        Err(_) => continue,
+                    let channels = {
+                        let coord = cluster.read().await;
+                        coord.executor_channels.clone()
                     };
                     if let Err(error) =
                         Coordinator::deliver_assignment_targets_with_channels(channels, targets)
@@ -166,7 +149,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::{Coordinator, ExecutorDescriptor, ExecutorId};
+    use crate::{Coordinator, ExecutorDescriptor, ExecutorId, SharedCoordinator};
+
+    fn single_task_job(job_id: JobId) -> JobSpec {
+        let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage")
+            .with_task(TaskSpec::new(TaskId::try_new("t1").unwrap(), "task"));
+        JobSpec::new(job_id, "single-task", JobKind::Batch).with_stage(stage)
+    }
 
     #[test]
     fn job_coordinator_rejects_foreign_job_submit() {
@@ -187,5 +176,27 @@ mod tests {
             jcp.submit_job(foreign),
             Err(SchedulerError::InvalidJob { .. })
         ));
+    }
+
+    /// C1 regression: coordinator_tick must not deadlock when launch_assigned_task_assignments
+    /// takes the write lock while another thread holds the read lock.
+    #[test]
+    fn coordinator_tick_does_not_deadlock_with_concurrent_read() {
+        let coord_id = CoordinatorId::try_new("ccp-dl").unwrap();
+        let mut coord = Coordinator::active(coord_id);
+        let exec_id = ExecutorId::try_new("e1-dl").unwrap();
+        coord
+            .register_executor(ExecutorDescriptor::new(exec_id, "host", 1))
+            .unwrap();
+        let job_id = JobId::try_new("job-dl").unwrap();
+        coord.submit_job(single_task_job(job_id)).unwrap();
+        let shared = SharedCoordinator::new(coord);
+
+        let jcp = JobCoordinator::new(JobId::try_new("jcp-dl").unwrap(), shared.clone());
+
+        // Read lock (e.g. from job_snapshots) + coordinated_tick must not deadlock.
+        let _guard = shared.blocking_read();
+        jcp.coordinator_tick().unwrap();
+        drop(_guard);
     }
 }
