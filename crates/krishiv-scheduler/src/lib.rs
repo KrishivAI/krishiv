@@ -14,6 +14,8 @@ pub mod coordinator;
 pub mod error;
 pub mod grpc;
 pub mod leadership;
+#[cfg(feature = "etcd")]
+pub mod etcd_lease;
 pub mod metrics;
 
 pub mod barrier_client;
@@ -49,7 +51,7 @@ pub use coordinator::{Coordinator, SharedCoordinator};
 pub use coordinator_daemon::{
     CoordinatorDaemonConfig, JobCoordinatorDaemonConfig, build_shared_coordinator,
     coordinator_daemon_help, coordinator_http_router, job_coordinator_daemon_help,
-    parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
+    build_leader_election, parse_coordinator_daemon_config, parse_job_coordinator_daemon_config,
     run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
     run_standalone_coordinator, spawn_coordinator_sidecars,
 };
@@ -73,6 +75,8 @@ pub use job::{
 };
 pub use job_coordinator::JobCoordinator;
 pub use leadership::{LeaderElection, SingleNodeElection};
+#[cfg(feature = "etcd")]
+pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
 #[cfg(feature = "sqlite")]
 pub use store::SqliteMetadataStore;

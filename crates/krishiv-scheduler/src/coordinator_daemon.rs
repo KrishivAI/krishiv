@@ -21,9 +21,12 @@ use tokio::time::{Duration, interval};
 use crate::SqliteMetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore,
-    SharedCoordinator, StabilityMetrics, scheduler_metrics,
-    serve_coordinator_executor_grpc_with_listener,
+    SharedCoordinator, SingleNodeLeader, StabilityMetrics, scheduler_metrics,
+    serve_coordinator_executor_grpc_with_listener, LeaderElection,
 };
+
+#[cfg(feature = "etcd")]
+use crate::EtcdLeaseElection;
 
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +37,57 @@ pub struct CoordinatorDaemonConfig {
     pub shuffle_dir: Option<PathBuf>,
     pub metadata_backend: Option<String>,
     pub metadata_path: Option<PathBuf>,
+    /// `single` (default) or `etcd` (requires `feature = "etcd"` on clusterd builds).
+    pub leader_backend: String,
+    /// etcd gRPC endpoints (e.g. `http://127.0.0.1:2379`).
+    pub etcd_endpoints: Vec<String>,
+    /// Coordination key for CCP leader lease (default `/krishiv/ccp/leader`).
+    pub etcd_lease_key: String,
+    /// etcd lease TTL in seconds (default 15).
+    pub leader_lease_duration_s: u64,
     pub help: bool,
+}
+
+/// Build the leader-election backend for clusterd from daemon flags.
+pub async fn build_leader_election(
+    config: &CoordinatorDaemonConfig,
+) -> Result<Arc<dyn LeaderElection + Send + Sync>, Box<dyn Error>> {
+    match config.leader_backend.as_str() {
+        "single" => Ok(Arc::new(SingleNodeLeader::new())),
+        "etcd" => build_etcd_leader_election(config).await,
+        other => Err(format!(
+            "unknown --leader-backend '{other}' (supported: single, etcd)"
+        )
+        .into()),
+    }
+}
+
+async fn build_etcd_leader_election(
+    config: &CoordinatorDaemonConfig,
+) -> Result<Arc<dyn LeaderElection + Send + Sync>, Box<dyn Error>> {
+    #[cfg(feature = "etcd")]
+    {
+        if config.etcd_endpoints.is_empty() {
+            return Err(
+                "--leader-backend etcd requires at least one --etcd-endpoints value (or KRISHIV_ETCD_ENDPOINTS)".into(),
+            );
+        }
+        let election = EtcdLeaseElection::connect(
+            config.etcd_endpoints.clone(),
+            config.etcd_lease_key.clone(),
+            config.coordinator_id.clone(),
+            config.leader_lease_duration_s,
+        )
+        .await?;
+        Ok(Arc::new(election))
+    }
+    #[cfg(not(feature = "etcd"))]
+    {
+        let _ = config;
+        Err(
+            "etcd leader election requires building krishiv-scheduler with feature `etcd`".into(),
+        )
+    }
 }
 
 /// Build a shared coordinator from daemon configuration.
@@ -434,6 +487,15 @@ pub fn parse_coordinator_daemon_config(
         shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
         metadata_backend: env::var("KRISHIV_METADATA_BACKEND").ok(),
         metadata_path: env::var("KRISHIV_METADATA_PATH").ok().map(PathBuf::from),
+        leader_backend: env::var("KRISHIV_LEADER_BACKEND")
+            .unwrap_or_else(|_| String::from("single")),
+        etcd_endpoints: parse_etcd_endpoints_env(),
+        etcd_lease_key: env::var("KRISHIV_ETCD_LEADER_KEY")
+            .unwrap_or_else(|_| String::from("/krishiv/ccp/leader")),
+        leader_lease_duration_s: env::var("KRISHIV_LEADER_LEASE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15),
         help: false,
     };
     let mut args = args.into_iter();
@@ -469,6 +531,22 @@ pub fn parse_coordinator_daemon_config(
                     "--metadata-path",
                 )?));
             }
+            "--leader-backend" => {
+                config.leader_backend = next_daemon_arg(&mut args, "--leader-backend")?;
+            }
+            "--etcd-endpoints" => {
+                config.etcd_endpoints =
+                    parse_etcd_endpoints_list(&next_daemon_arg(&mut args, "--etcd-endpoints")?);
+            }
+            "--etcd-lease-key" => {
+                config.etcd_lease_key = next_daemon_arg(&mut args, "--etcd-lease-key")?;
+            }
+            "--leader-lease-secs" => {
+                let value = next_daemon_arg(&mut args, "--leader-lease-secs")?;
+                config.leader_lease_duration_s = value
+                    .parse()
+                    .map_err(|_| format!("invalid integer for --leader-lease-secs: {value}"))?;
+            }
             "--help" | "-h" => config.help = true,
             unknown => {
                 return Err(
@@ -480,7 +558,30 @@ pub fn parse_coordinator_daemon_config(
     if config.coordinator_id.trim().is_empty() {
         return Err("coordinator id cannot be empty".into());
     }
+    if config.leader_backend == "etcd" && config.etcd_endpoints.is_empty() {
+        return Err(
+            "--leader-backend etcd requires --etcd-endpoints or KRISHIV_ETCD_ENDPOINTS".into(),
+        );
+    }
+    if config.leader_lease_duration_s == 0 {
+        return Err("--leader-lease-secs must be greater than zero".into());
+    }
     Ok(config)
+}
+
+fn parse_etcd_endpoints_env() -> Vec<String> {
+    env::var("KRISHIV_ETCD_ENDPOINTS")
+        .ok()
+        .map(|raw| parse_etcd_endpoints_list(&raw))
+        .unwrap_or_default()
+}
+
+fn parse_etcd_endpoints_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn next_daemon_arg(
@@ -507,6 +608,10 @@ pub fn coordinator_daemon_help() -> &'static str {
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --metadata-backend <TYPE>   memory | json | sqlite\n\
        --metadata-path <PATH>      Durable metadata path (required for json/sqlite)\n\
+       --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
+       --etcd-endpoints <HOSTS>    Comma-separated etcd URLs (KRISHIV_ETCD_ENDPOINTS)\n\
+       --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
+       --leader-lease-secs <N>     etcd lease TTL seconds (default 15)\n\
        -h, --help                  Show help\n"
 }
 
@@ -529,18 +634,21 @@ pub async fn run_standalone_coordinator(
 /// Cluster control plane daemon (`krishiv-clusterd`).
 pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
     let shared = build_shared_coordinator(&config)?;
+    let leader = build_leader_election(&config).await?;
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
-    let ccp = Arc::new(ClusterControlPlane::from_shared(
+    let ccp = Arc::new(ClusterControlPlane::from_shared_with_leader(
         coordinator_id,
         shared.clone(),
+        leader,
     ));
     spawn_coordinator_sidecars(&shared, &config).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
-        "Krishiv clusterd (CCP) {} gRPC listening on {}",
+        "Krishiv clusterd (CCP) {} gRPC listening on {} (leader-backend={})",
         config.coordinator_id,
-        listener.local_addr()?
+        listener.local_addr()?,
+        config.leader_backend,
     );
     run_cluster_control_plane(ccp, listener).await
 }
@@ -734,6 +842,35 @@ mod parse_tests {
     fn parses_help_flag() {
         let config = parse_coordinator_daemon_config([String::from("--help")]).unwrap();
         assert!(config.help);
+    }
+
+    #[test]
+    fn parses_etcd_leader_flags() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--leader-backend"),
+            String::from("etcd"),
+            String::from("--etcd-endpoints"),
+            String::from("http://127.0.0.1:2379,http://127.0.0.2:2379"),
+            String::from("--etcd-lease-key"),
+            String::from("/krishiv/test/leader"),
+            String::from("--leader-lease-secs"),
+            String::from("30"),
+        ])
+        .unwrap();
+        assert_eq!(config.leader_backend, "etcd");
+        assert_eq!(config.etcd_endpoints.len(), 2);
+        assert_eq!(config.etcd_lease_key, "/krishiv/test/leader");
+        assert_eq!(config.leader_lease_duration_s, 30);
+    }
+
+    #[test]
+    fn rejects_etcd_backend_without_endpoints() {
+        let err = parse_coordinator_daemon_config([
+            String::from("--leader-backend"),
+            String::from("etcd"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("etcd-endpoints"));
     }
 
     #[test]

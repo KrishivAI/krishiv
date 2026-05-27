@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 sqlite = ["dep:rusqlite"]
+etcd = ["dep:etcd-client"]
 
 [dependencies]
 axum = { workspace = true }
@@ -28,6 +29,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tonic.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+etcd-client = { version = "0.14", optional = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
@@ -44,6 +46,7 @@ path = "src/bin/krishiv_coordinator.rs"
 [[bin]]
 name = "krishiv-clusterd"
 path = "src/bin/krishiv_clusterd.rs"
+required-features = ["etcd"]
 
 [[bin]]
 name = "krishiv-job-coordinator"
