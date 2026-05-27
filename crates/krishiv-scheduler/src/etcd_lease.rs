@@ -44,11 +44,7 @@ impl fmt::Debug for EtcdLeaseElection {
 }
 
 fn put_with_lease(key: &[u8], value: &[u8], lease_id: i64) -> TxnOp {
-    TxnOp::put(
-        key,
-        value,
-        Some(PutOptions::new().with_lease(lease_id)),
-    )
+    TxnOp::put(key, value, Some(PutOptions::new().with_lease(lease_id)))
 }
 
 impl EtcdLeaseElection {
@@ -151,10 +147,7 @@ impl EtcdLeaseElection {
             self.clear_leader();
         }
 
-        let lease_id = match client
-            .lease_grant(self.lease_duration_s as i64, None)
-            .await
-        {
+        let lease_id = match client.lease_grant(self.lease_duration_s as i64, None).await {
             Ok(resp) => resp.id(),
             Err(error) => {
                 tracing::warn!(
@@ -213,8 +206,7 @@ impl EtcdLeaseElection {
 
         let current_holder = String::from_utf8_lossy(kv.value());
         let is_ours = current_holder == self.holder_identity;
-        let lease_alive = kv.lease() != 0
-            && self.etcd_lease_alive(client, kv.lease()).await;
+        let lease_alive = kv.lease() != 0 && self.etcd_lease_alive(client, kv.lease()).await;
 
         if !is_ours && lease_alive {
             let _ = client.lease_revoke(lease_id).await;
@@ -366,9 +358,9 @@ impl LeaderElection for EtcdLeaseElection {
     fn is_leader(&self) -> bool {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if s.is_leader {
-            let expired = s.last_renewed_at.is_none_or(|t| {
-                t.elapsed().as_secs() > self.lease_duration_s.saturating_mul(2)
-            });
+            let expired = s
+                .last_renewed_at
+                .is_none_or(|t| t.elapsed().as_secs() > self.lease_duration_s.saturating_mul(2));
             if expired {
                 s.is_leader = false;
             }

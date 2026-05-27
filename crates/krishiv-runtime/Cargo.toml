@@ -14,6 +14,7 @@ krishiv-state = { path = "../krishiv-state" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-sql = { path = "../krishiv-sql" }
+reqwest = { workspace = true }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 futures = { workspace = true }

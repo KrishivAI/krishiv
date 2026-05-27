@@ -193,6 +193,8 @@ message TaskOutputMetadata {
   uint64 output_rows = 9;
   uint64 cpu_nanos = 10;
   uint64 spill_bytes = 11;
+  // Arrow IPC stream bytes for each inline result batch (SQL / window collect).
+  repeated bytes inline_record_batch_ipc = 12;
 }
 
 message TaskCancellationRequest {

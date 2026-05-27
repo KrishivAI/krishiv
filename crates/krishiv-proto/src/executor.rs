@@ -131,6 +131,8 @@ pub struct TaskOutputMetadata {
     shuffle_partitions: Vec<ShufflePartitionOutput>,
     /// Runtime statistics for this task execution.
     runtime_stats: Option<TaskRuntimeStats>,
+    /// Arrow IPC stream bytes per result batch for inline SQL/window collect.
+    inline_record_batch_ipc: Vec<Vec<u8>>,
 }
 
 impl TaskOutputMetadata {
@@ -148,6 +150,7 @@ impl TaskOutputMetadata {
             column_count,
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
+            inline_record_batch_ipc: Vec::new(),
         }
     }
 
@@ -193,6 +196,18 @@ impl TaskOutputMetadata {
     /// Runtime statistics for this task.
     pub fn runtime_stats(&self) -> Option<&TaskRuntimeStats> {
         self.runtime_stats.as_ref()
+    }
+
+    /// Inline Arrow IPC payloads for coordinator/Flight result fetch.
+    pub fn inline_record_batch_ipc(&self) -> &[Vec<u8>] {
+        &self.inline_record_batch_ipc
+    }
+
+    /// Attach inline result batches encoded as Arrow IPC stream bytes.
+    #[must_use]
+    pub fn with_inline_record_batch_ipc(mut self, batches: Vec<Vec<u8>>) -> Self {
+        self.inline_record_batch_ipc = batches;
+        self
     }
 }
 

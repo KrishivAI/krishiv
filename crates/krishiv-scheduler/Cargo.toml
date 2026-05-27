@@ -10,6 +10,7 @@ sqlite = ["dep:rusqlite"]
 etcd = ["dep:etcd-client"]
 
 [dependencies]
+arrow = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 krishiv-async-util = { path = "../krishiv-async-util" }

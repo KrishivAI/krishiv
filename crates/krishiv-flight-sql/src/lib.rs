@@ -49,7 +49,7 @@ impl KrishivFlightSqlService {
         Ok(Self {
             auth: None,
             policy: None,
-            host: FlightExecutionHost::new()?,
+            host: FlightExecutionHost::from_env()?,
         })
     }
 
@@ -541,7 +541,7 @@ fn encode_batches_ipc_bytes(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivA
 pub fn make_flight_sql_server()
 -> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService> {
     arrow_flight::flight_service_server::FlightServiceServer::new(
-        KrishivFlightSqlService::new().expect("flight host"),
+        KrishivFlightSqlService::with_host(FlightExecutionHost::from_env().expect("flight host")),
     )
 }
 

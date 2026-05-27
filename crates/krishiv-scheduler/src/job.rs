@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
-use krishiv_plan::{ExecutionKind as PlanExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
+use krishiv_plan::{
+    ExecutionKind as PlanExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode,
+};
 use krishiv_proto::{
     AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, ExecutorTaskAssignment,
-    InputPartition, JobId, JobKind, JobSpec, JobState, LeaseGeneration, OutputContract,
-    OutputContractKind, PlanFragment, StageId, StageSpec, StageState, StreamingTaskState,
-    TaskAssignment, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
-    TaskStatusUpdate,
+    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
+    OutputContract, OutputContractKind, PlanFragment, StageId, StageSpec, StageState,
+    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec,
+    TaskState, TaskStatusUpdate,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
@@ -212,6 +214,7 @@ impl JobRecord {
     pub(crate) fn launch_assigned_task_assignments(
         &mut self,
         executor_leases: &[(ExecutorId, LeaseGeneration)],
+        batch_sql_tables: Option<&[crate::batch_sql::BatchSqlTable]>,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
@@ -267,6 +270,24 @@ impl JobRecord {
                     })?;
                     let task_description = task.spec.description().to_owned();
                     let task_timeout_secs = task.spec.task_timeout_secs();
+                    let input_partitions = if let Some(tables) = batch_sql_tables {
+                        tables
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, table)| {
+                                InputPartition::new(format!("parquet-{idx}"), String::new())
+                                    .with_descriptor(InputPartitionDescriptor::LocalParquet {
+                                        table_name: table.table_name.clone(),
+                                        path: table.path.to_string_lossy().into_owned(),
+                                    })
+                            })
+                            .collect()
+                    } else {
+                        vec![InputPartition::new(
+                            task.task_id().as_str(),
+                            task_description.clone(),
+                        )]
+                    };
                     let mut assignment = ExecutorTaskAssignment::new(
                         TaskAttemptRef::new(
                             self.spec.job_id().clone(),
@@ -282,10 +303,7 @@ impl JobRecord {
                             format!("inline result for {}", task.task_id()),
                         ),
                     )
-                    .with_input_partitions(vec![InputPartition::new(
-                        task.task_id().as_str(),
-                        task_description,
-                    )]);
+                    .with_input_partitions(input_partitions);
                     if let Some(secs) = task_timeout_secs {
                         assignment = assignment.with_task_timeout_secs(secs);
                     }
@@ -1101,6 +1119,11 @@ fn job_spec_from_plan_parts(
     } else {
         plan_name.to_owned()
     };
+
+    if coalesced_partition_count.is_none() && plan_has_exchange_stages(nodes) {
+        return job_spec_from_exchange_stages(job_id, &job_name, job_kind, nodes);
+    }
+
     let stage_id = StageId::try_new("stage-1").map_err(|error| SchedulerError::InvalidPlan {
         message: error.to_string(),
     })?;
@@ -1145,5 +1168,136 @@ fn job_spec_from_plan_parts(
 }
 
 fn plan_node_description(node: &PlanNode) -> String {
-    krishiv_plan::encode_task_fragment(node)
+    krishiv_plan::encode_typed_task_fragment(node)
+}
+
+fn plan_has_exchange_stages(nodes: &[PlanNode]) -> bool {
+    nodes
+        .iter()
+        .any(|node| matches!(node.op(), Some(NodeOp::Exchange { .. })))
+}
+
+/// Split a physical plan into multiple stages at [`NodeOp::Exchange`] boundaries.
+fn job_spec_from_exchange_stages(
+    job_id: JobId,
+    job_name: &str,
+    job_kind: JobKind,
+    nodes: &[PlanNode],
+) -> SchedulerResult<JobSpec> {
+    let ordered = topo_sort_plan_nodes(nodes);
+    let mut stage_slices: Vec<Vec<&PlanNode>> = Vec::new();
+    let mut current: Vec<&PlanNode> = Vec::new();
+    for node in &ordered {
+        current.push(node);
+        if matches!(node.op(), Some(NodeOp::Exchange { .. })) {
+            stage_slices.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        stage_slices.push(current);
+    }
+    if stage_slices.is_empty() {
+        return Err(SchedulerError::InvalidPlan {
+            message: String::from("exchange staging produced no stages"),
+        });
+    }
+
+    let mut spec = JobSpec::new(job_id, job_name, job_kind);
+    let mut prev_stage_id: Option<StageId> = None;
+    for (stage_idx, slice) in stage_slices.iter().enumerate() {
+        let stage_id = StageId::try_new(format!("stage-{}", stage_idx + 1)).map_err(|error| {
+            SchedulerError::InvalidPlan {
+                message: error.to_string(),
+            }
+        })?;
+        let mut stage = StageSpec::new(stage_id.clone(), format!("{job_name}-stage-{stage_idx}"));
+        if let Some(upstream) = prev_stage_id.clone() {
+            stage = stage.with_upstream_stage(upstream);
+        }
+        for (task_idx, node) in slice.iter().enumerate() {
+            let task_id = TaskId::try_new(format!("task-{}-{}", stage_idx + 1, task_idx + 1))
+                .map_err(|error| SchedulerError::InvalidPlan {
+                    message: error.to_string(),
+                })?;
+            stage = stage.with_task(TaskSpec::new(task_id, plan_node_description(node)));
+        }
+        spec = spec.with_stage(stage);
+        prev_stage_id = Some(stage_id);
+    }
+    Ok(spec)
+}
+
+/// Topological order of plan nodes using declared `inputs()` edges.
+fn topo_sort_plan_nodes<'a>(nodes: &'a [PlanNode]) -> Vec<&'a PlanNode> {
+    use std::collections::{HashMap, VecDeque};
+
+    let by_id: HashMap<&str, &PlanNode> = nodes.iter().map(|n| (n.id(), n)).collect();
+    let mut in_degree: HashMap<&str, usize> = nodes.iter().map(|n| (n.id(), 0)).collect();
+    for node in nodes {
+        for input in node.inputs() {
+            if by_id.contains_key(input.as_str()) {
+                *in_degree.entry(node.id()).or_default() += 1;
+            }
+        }
+    }
+    let mut queue: VecDeque<&PlanNode> = nodes
+        .iter()
+        .filter(|n| in_degree.get(n.id()).copied().unwrap_or(0) == 0)
+        .collect();
+    let mut ordered: Vec<&PlanNode> = Vec::with_capacity(nodes.len());
+    while let Some(node) = queue.pop_front() {
+        ordered.push(node);
+        for other in nodes {
+            if other.inputs().iter().any(|inp| inp == node.id()) {
+                let deg = in_degree.get_mut(other.id()).expect("in_degree");
+                *deg = deg.saturating_sub(1);
+                if *deg == 0 {
+                    queue.push_back(other);
+                }
+            }
+        }
+    }
+    if ordered.len() != nodes.len() {
+        return nodes.iter().collect();
+    }
+    ordered
+}
+
+#[cfg(test)]
+mod exchange_stage_tests {
+    use super::*;
+    use krishiv_plan::{ExecutionKind, Partitioning, PlanNode};
+    use krishiv_proto::JobId;
+
+    #[test]
+    fn physical_plan_with_exchange_produces_multi_stage_job() {
+        let scan = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("t"),
+        });
+        let exchange = PlanNode::new("ex", "exchange", ExecutionKind::Batch)
+            .with_inputs(["scan"])
+            .with_op(NodeOp::Exchange {
+                partitioning: Partitioning::Hash {
+                    keys: vec![String::from("k")],
+                    buckets: 2,
+                },
+            });
+        let agg = PlanNode::new("agg", "aggregate", ExecutionKind::Batch)
+            .with_inputs(["ex"])
+            .with_op(NodeOp::Aggregate {
+                group_keys: vec![String::from("k")],
+            });
+        let plan = PhysicalPlan::new("exchange-plan", ExecutionKind::Batch)
+            .with_node(scan)
+            .with_node(exchange)
+            .with_node(agg);
+        let job_id = JobId::try_new("job-exchange-test").unwrap();
+        let spec = job_spec_from_physical_plan(job_id, &plan).unwrap();
+        assert_eq!(spec.stages().len(), 2);
+        assert_eq!(
+            spec.stages()[1].upstream_stage_ids().len(),
+            1,
+            "downstream stage must declare upstream dependency"
+        );
+    }
 }

@@ -23,15 +23,36 @@ pub struct FlightExecutionHost {
     cluster: Arc<InProcessCluster>,
     continuous: Arc<ContinuousStreamRegistry>,
     catalog: Arc<Mutex<HashMap<String, PathBuf>>>,
+    /// When set, batch SQL is executed via the cluster control plane HTTP API
+    /// (`POST /api/v1/batch-sql`) instead of an isolated in-process cluster.
+    coordinator_http: Option<String>,
 }
 
 impl FlightExecutionHost {
     pub fn new() -> Result<Self, Status> {
+        Self::from_env()
+    }
+
+    /// Build a host from environment variables.
+    ///
+    /// `KRISHIV_COORDINATOR_HTTP` — when set, routes batch SQL through the live
+    /// cluster control plane so executor-backed tasks run on the real fleet.
+    pub fn from_env() -> Result<Self, Status> {
+        let coordinator_http = std::env::var("KRISHIV_COORDINATOR_HTTP")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        Self::with_coordinator_http(coordinator_http)
+    }
+
+    /// Create a host with an optional coordinator HTTP base URL.
+    pub fn with_coordinator_http(coordinator_http: Option<String>) -> Result<Self, Status> {
         let cluster = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
         Ok(Self {
             cluster: Arc::new(cluster),
             continuous: Arc::new(ContinuousStreamRegistry::new()),
             catalog: Arc::new(Mutex::new(HashMap::new())),
+            coordinator_http,
         })
     }
 
@@ -43,6 +64,10 @@ impl FlightExecutionHost {
         Arc::clone(&self.continuous)
     }
 
+    pub fn coordinator_http_url(&self) -> Option<&str> {
+        self.coordinator_http.as_deref()
+    }
+
     pub async fn execute_sql(&self, raw_sql: &str) -> Result<Vec<RecordBatch>, Status> {
         let (directives, sql) = parse_sql(raw_sql);
         self.apply_catalog_directives(&directives)?;
@@ -51,9 +76,16 @@ impl FlightExecutionHost {
             return self.handle_control_directives(directives, &sql).await;
         }
 
-        let cluster = Arc::clone(&self.cluster);
         let tables = self.catalog_tables();
         let sql = sql.to_string();
+
+        if let Some(http_base) = self.coordinator_http.as_deref() {
+            return krishiv_runtime::execute_coordinator_batch_sql(http_base, &sql, &tables)
+                .await
+                .map_err(|e| Status::internal(e.to_string()));
+        }
+
+        let cluster = Arc::clone(&self.cluster);
         run_blocking(move || cluster.collect_batch_sql(&sql, &tables)).await
     }
 
@@ -164,15 +196,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn host_executes_simple_select() {
-        let host = FlightExecutionHost::new().unwrap();
+    async fn host_executes_simple_select_in_process() {
+        let host = FlightExecutionHost::with_coordinator_http(None).unwrap();
         let batches = host.execute_sql("SELECT 42 AS n").await.unwrap();
         assert!(!batches.is_empty());
     }
 
     #[tokio::test]
     async fn host_explain_directive() {
-        let host = FlightExecutionHost::new().unwrap();
+        let host = FlightExecutionHost::with_coordinator_http(None).unwrap();
         let sql = krishiv_runtime::flight_protocol::encode_explain_sql("SELECT 1");
         let batches = host.execute_sql(&sql).await.unwrap();
         assert!(!batches.is_empty());

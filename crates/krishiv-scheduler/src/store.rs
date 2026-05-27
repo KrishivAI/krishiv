@@ -960,3 +960,44 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
         }),
     }
 }
+
+/// Serialize coordinator metadata for etcd or other blob stores.
+pub(crate) fn encode_metadata_snapshot(
+    events: &[EventLogEvent],
+    jobs: &[JobRecord],
+) -> SchedulerResult<Vec<u8>> {
+    let persisted = PersistedMetadata {
+        schema_version: JSON_METADATA_SCHEMA_VERSION,
+        store_kind: String::from("krishiv.scheduler.metadata"),
+        events: events.iter().map(PersistedEvent::from).collect(),
+        jobs: jobs.iter().map(PersistedJobRecord::from).collect(),
+    };
+    serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
+        message: format!("failed to encode metadata snapshot: {error}"),
+    })
+}
+
+/// Restore coordinator metadata from a serialized snapshot blob.
+pub(crate) fn decode_metadata_snapshot(
+    bytes: &[u8],
+) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {
+    if bytes.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let persisted: PersistedMetadata =
+        serde_json::from_slice(bytes).map_err(|error| SchedulerError::InvalidJob {
+            message: format!("failed to decode metadata snapshot: {error}"),
+        })?;
+    persisted.validate_schema_version()?;
+    let events = persisted
+        .events
+        .into_iter()
+        .map(EventLogEvent::try_from)
+        .collect::<SchedulerResult<Vec<_>>>()?;
+    let jobs = persisted
+        .jobs
+        .into_iter()
+        .map(JobRecord::try_from)
+        .collect::<SchedulerResult<Vec<_>>>()?;
+    Ok((events, jobs))
+}
