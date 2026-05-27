@@ -3839,6 +3839,7 @@ dependencies = [
  "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-metrics",
+ "krishiv-operator",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-shuffle",

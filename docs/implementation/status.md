@@ -33,6 +33,11 @@
   dynamic status patch helpers) are `#[cfg(feature = "k8s")]`, and the
   operator binary now prints a clear rebuild-with-`k8s` message when compiled
   without Kubernetes support.
+- Feature-gate seam reduction in top-level `krishiv`:
+  `krishiv-operator` is now an optional dependency, the product crate exposes
+  real `k8s` / `ui` features that forward to `krishiv-operator`, and the
+  `distributed` module only re-exports Kubernetes/operator types when
+  `feature = "k8s"` is enabled.
 - Validation for the removal pass: `cargo metadata --no-deps --format-version 1`
   succeeds after the workspace change; crate directories and workspace member
   entries were removed; active docs were updated to treat the removed crates as
@@ -51,6 +56,14 @@
   the post-split no-default-features verification is being run in an isolated
   target dir (`/tmp/krishiv-operator-no-k8s`) because another workspace
   `cargo test` process was holding the shared target lock.
+- Validation for the top-level product gate pass:
+  `cargo metadata --no-deps --format-version 1` shows `krishiv-operator` as an
+  optional dependency of `crates/krishiv` and exposes
+  `k8s = ["dep:krishiv-operator", "krishiv-operator/k8s"]` plus
+  `ui = ["dep:krishiv-operator", "krishiv-operator/ui"]`. The
+  `cargo check -p krishiv --no-default-features --features k8s` verification is
+  being run in an isolated target dir (`/tmp/krishiv-k8s`) to avoid contention
+  with an unrelated workspace `cargo test`.
 - Blockers for this pass:
   none for `cargo check`; only residual warnings remain in
   `krishiv-scheduler/src/store.rs` for unused metadata snapshot helpers.

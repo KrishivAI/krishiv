@@ -133,6 +133,13 @@ pub mod distributed {
         run_cluster_control_plane, run_clusterd_daemon, run_job_coordinator_daemon,
         run_standalone_coordinator, spawn_coordinator_sidecars,
     };
+    #[cfg(feature = "k8s")]
+    pub use krishiv_operator::{
+        BootstrapExecutor, K8sLeaseElection, KubernetesControllerConfig,
+        KubernetesControllerRuntime, KubernetesReconcileReport, KrishivJobReconciler,
+        run_kubernetes_controller, run_kubernetes_controller_runtime_with_client,
+        run_kubernetes_controller_with_client,
+    };
 }
 
 /// Convenient glob import for the most common Krishiv types.

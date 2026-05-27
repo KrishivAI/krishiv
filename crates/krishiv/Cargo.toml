@@ -22,6 +22,8 @@ default = ["cluster"]
 
 # Deployment surfaces
 cluster = ["flight-sql", "shuffle", "etcd"]
+k8s = ["dep:krishiv-operator", "krishiv-operator/k8s"]
+ui = ["dep:krishiv-operator", "krishiv-operator/ui"]
 flight-sql = ["dep:krishiv-flight-sql"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
@@ -36,6 +38,7 @@ krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-operator = { path = "../krishiv-operator", optional = true }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-executor = { path = "../krishiv-executor" }
