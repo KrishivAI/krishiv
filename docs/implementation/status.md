@@ -7,6 +7,23 @@
 All confirmed gaps from `docs/engineering/gap-mitigation-plan.md` resolved;
 workspace crate checks pass; crate-specific tests continue to pass.
 
+### P1-5 ObjectStoreShuffleStore IPC compression (2026-05-28)
+
+Added `compression: ShuffleCompression` field and `with_compression()` builder to
+`ObjectStoreShuffleStore` in `krishiv-shuffle`. Write path uses
+`IpcWriteOptions::try_with_compression` mapping `Lz4→LZ4_FRAME`, `Zstd→ZSTD`.
+Arrow IPC reader decompresses transparently. Enabled `ipc_compression` workspace
+feature on the `arrow` dependency. Test: `object_store_ipc_compression_roundtrip`
+verifies all three codecs (None/Lz4/Zstd) round-trip correctly.
+
+Validation: `cargo test -p krishiv-shuffle --lib` → 58 passed, 0 failed.
+
+### P2-2 KrishivDataFrameOps trait (2026-05-28)
+
+Added `KrishivDataFrameOps` trait in `krishiv-sql/src/lib.rs`; `DataFrame` in
+`krishiv-api` now stores `Arc<dyn KrishivDataFrameOps>` instead of a concrete
+`SqlDataFrame`, eliminating DataFusion type leakage through the public API boundary.
+
 ### Gap-mitigation sweep (2026-05-28)
 
 Branch `claude/codebase-review-plan-jQOkr` — fixes across 7 commits:
@@ -50,7 +67,6 @@ cargo check -p krishiv-exec -p krishiv-state -p krishiv-connectors \
 ```
 
 Remaining deferred items (large scope or external deps):
-- P2-2: DataFusion type leakage through SqlDataFrame (major API refactor)
 - P1-10: Iceberg real FS backend (requires Iceberg catalog integration)
 
 ---
