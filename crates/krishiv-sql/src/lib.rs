@@ -98,8 +98,9 @@ pub struct SqlEngine {
     krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
     udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>>,
-    /// Table names that were registered as unbounded streaming sources.
-    streaming_sources: std::collections::HashSet<String>,
+    /// Table names registered as unbounded streaming sources.
+    /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
+    streaming_sources: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -127,7 +128,7 @@ impl SqlEngine {
             krishiv_catalog: None,
             view_registry: None,
             udf_registry: None,
-            streaming_sources: std::collections::HashSet::new(),
+            streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -145,22 +146,26 @@ impl SqlEngine {
             krishiv_catalog: Some(catalog),
             view_registry: None,
             udf_registry: None,
-            streaming_sources: std::collections::HashSet::new(),
+            streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
         })
     }
 
     /// Mark a table name as an unbounded streaming source.
     ///
-    /// Queries referencing these tables will be routed through the streaming
-    /// execution path rather than the batch path.
-    pub fn register_streaming_source(&mut self, name: &str) -> SqlResult<()> {
-        self.streaming_sources.insert(name.to_string());
+    /// Uses `Arc<RwLock<>>` so all `Session` clones sharing this engine see
+    /// the registration immediately.
+    pub fn register_streaming_source(&self, name: &str) -> SqlResult<()> {
+        self.streaming_sources
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
         Ok(())
     }
 
     /// Returns `true` if any table referenced in `sql` is a registered streaming source.
     pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool> {
-        if self.streaming_sources.is_empty() {
+        let sources = self.streaming_sources.read().unwrap_or_else(|e| e.into_inner());
+        if sources.is_empty() {
             return Ok(false);
         }
         let dialect = GenericDialect {};
@@ -173,7 +178,7 @@ impl SqlEngine {
                 // Extract the unqualified table name (last segment after dot).
                 let full = relation.to_string();
                 let table_name = full.split('.').next_back().unwrap_or(&full);
-                if self.streaming_sources.contains(table_name) {
+                if sources.contains(table_name) {
                     is_streaming = true;
                     return ControlFlow::Break(());
                 }

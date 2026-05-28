@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use krishiv_api::KrishivError;
 use krishiv_api::Session;
 
 /// Handle to a submitted streaming job.
@@ -47,7 +46,13 @@ impl StreamHandle {
     }
 
     /// Drain newly emitted output batches from a continuous streaming job.
+    ///
+    /// Returns an empty vec immediately for handles produced by synchronous
+    /// (batch / bounded-stream) `sink_to` calls, where the job is already done.
     pub fn poll_output(&self) -> crate::Result<Vec<arrow::record_batch::RecordBatch>> {
+        if self.job_id == "completed" {
+            return Ok(vec![]);
+        }
         krishiv_async_util::block_on(self.session.poll_stream_job(&self.job_id))
             .map_err(Into::into)
     }

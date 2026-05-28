@@ -481,9 +481,10 @@ impl Session {
     /// Mark a table name as an unbounded streaming source in the SQL engine.
     ///
     /// After this call, [`Session::is_streaming_query`] returns `true` for
-    /// any SQL that references `name`.  The caller is responsible for registering
-    /// the actual table provider separately.
-    pub fn register_unbounded(&mut self, name: &str) -> Result<()> {
+    /// any SQL that references `name`.  The registration is visible to all
+    /// clones of this session because the underlying set is shared via
+    /// `Arc<RwLock<>>`.
+    pub fn register_unbounded(&self, name: &str) -> Result<()> {
         self.sql_engine
             .register_streaming_source(name)
             .map_err(KrishivError::from)

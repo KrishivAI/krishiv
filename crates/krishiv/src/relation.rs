@@ -95,16 +95,8 @@ impl StreamingChain {
     fn execute_bounded(&self) -> krishiv_api::Result<Vec<StreamBatch>> {
         let spec = self.build_exec_spec()?;
 
-        // Register batches as a memory stream via the session.
-        let record_batches: Vec<RecordBatch> =
-            self.batches.iter().map(|b| b.batch().clone()).collect();
-        self.session
-            .register_memory_stream(self.source_name.clone(), record_batches)
-            .map_err(|e| KrishivError::Runtime {
-                message: e.to_string(),
-            })?;
-
         // Execute using the runtime's bounded window collection path.
+        // The runtime takes the input batches directly — no separate registration needed.
         let input: Vec<RecordBatch> = self.batches.iter().map(|b| b.batch().clone()).collect();
         let runtime = self.session.execution_runtime();
         let output = runtime
@@ -324,11 +316,24 @@ impl Relation {
                     let session_clone = chain.session.clone();
                     let job_id_clone = job_id.clone();
 
+                    // Propagate runtime-creation failure back to the caller via a
+                    // sync channel before we return the handle.
+                    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
                     std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
+                        let rt = match tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
-                            .expect("streaming sink background rt");
+                        {
+                            Ok(rt) => {
+                                let _ = ready_tx.send(Ok(()));
+                                rt
+                            }
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e.to_string()));
+                                return;
+                            }
+                        };
                         rt.block_on(async {
                             loop {
                                 // Check for cancellation.
@@ -343,11 +348,7 @@ impl Relation {
                                 match session_clone.poll_stream_job(&job_id_clone).await {
                                     Ok(batches) => {
                                         for batch in batches {
-                                            if sink
-                                                .write_batch_dyn(batch)
-                                                .await
-                                                .is_err()
-                                            {
+                                            if sink.write_batch_dyn(batch).await.is_err() {
                                                 return;
                                             }
                                         }
@@ -370,6 +371,12 @@ impl Relation {
                             let _ = sink.flush_dyn().await;
                         });
                     });
+
+                    // Wait for the thread to signal that its runtime started (or failed).
+                    ready_rx
+                        .recv()
+                        .unwrap_or(Err("background thread died before signalling".into()))
+                        .map_err(|msg| KrishivError::Runtime { message: msg })?;
 
                     Ok(handle)
                 }
