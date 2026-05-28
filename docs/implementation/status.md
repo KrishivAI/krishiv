@@ -2,6 +2,28 @@
 
 ## Current Phase
 
+**Streaming API bug-fix sweep — 7 bugs/gaps resolved (2026-05-28).**
+
+### Bug and Gap Fixes (2026-05-28)
+
+All 7 items from the streaming API audit fixed in commit `855aa81` on
+branch `claude/codebase-review-plan-jQOkr`.
+
+| ID | Kind | File(s) | Fix |
+|----|------|---------|-----|
+| B1 | Bug — silent data loss | `stream_exec.rs` | `key_by(["a","b"])` now raises a clear error instead of silently dropping all but the first key |
+| B2 | Bug — wrong API answer | `pipeline.rs`, `session.rs`, `relation.rs` | Added `bounded: bool` field to `StreamPipeline`; `PyRelation.is_bounded` uses it instead of the fragile `source_id.starts_with("memory:")` heuristic |
+| B3 | Bug — semantic confusion | `relation.rs` (Python), `stream_exec.rs` | `session_window(gap_ms)` now sets `size_ms=0` / `gap_ms=Some(gap_ms)` explicitly; `spec_from_pipeline` validates `gap_ms` is present for session windows |
+| B4 | Bug — plan registration skipped | `relation.rs` (Rust) | `StreamingChain::execute_bounded` switched from `runtime.collect_bounded_window` to `execute_windowed_stream`, which also calls `accept_plan` |
+| G1 | Gap — custom aggs unavailable on Relation | `relation.rs` (Rust), `session_ext.rs` | `agg_exprs: Option<Vec<AggExpr>>` field + `.agg(exprs)` builder on `Relation`; `AggExpr`/`AggFunction` re-exported from facade and prelude |
+| G2 | Gap — no sink_to on Python | `relation.rs` (Python), `Cargo.toml` | `PyRelation.write_parquet(path)` materialises any batch/bounded stream to a Parquet file |
+| G3 | Gap — multi-source watermarks zeroed | `pipeline.rs`, `relation.rs` (Python), `stream_exec.rs` | `source_watermarks: HashMap<String,u64>` on `StreamPipeline`; `PyRelation.with_source_watermark(source_id, lag_ms)` builder; `spec_from_pipeline` threads map into `LocalWindowExecutionSpec` |
+
+Validation: `cargo test -p krishiv -p krishiv-sql` → all suites pass, 0 failed.
+`cargo check -p krishiv -p krishiv-python` → clean (2 pre-existing warnings only).
+
+---
+
 **Unified batch+streaming Relation API — Phase 1-3 complete (2026-05-28).**
 
 ### Unified Relation API — Phase 1 (Rust), Phase 2 (Python), Phase 3 (SQL) (2026-05-28)
