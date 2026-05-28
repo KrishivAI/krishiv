@@ -27,6 +27,7 @@ pub mod live_table;
 pub mod spark_compat;
 pub mod spark_compat_date;
 mod udf;
+mod window_functions;
 
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
@@ -97,6 +98,8 @@ pub struct SqlEngine {
     krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
     udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>>,
+    /// Table names that were registered as unbounded streaming sources.
+    streaming_sources: std::collections::HashSet<String>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -116,11 +119,15 @@ impl Default for SqlEngine {
 impl SqlEngine {
     /// Create a local SQL engine.
     pub fn new() -> Self {
+        let context = SessionContext::new();
+        window_functions::register_window_functions(&context)
+            .expect("failed to register window functions");
         Self {
-            context: SessionContext::new(),
+            context,
             krishiv_catalog: None,
             view_registry: None,
             udf_registry: None,
+            streaming_sources: std::collections::HashSet::new(),
         }
     }
 
@@ -131,12 +138,52 @@ impl SqlEngine {
             "krishiv",
             Arc::new(DataFusionCatalogBridge::new(catalog.clone())),
         );
+        window_functions::register_window_functions(&context)
+            .expect("failed to register window functions");
         Ok(Self {
             context,
             krishiv_catalog: Some(catalog),
             view_registry: None,
             udf_registry: None,
+            streaming_sources: std::collections::HashSet::new(),
         })
+    }
+
+    /// Mark a table name as an unbounded streaming source.
+    ///
+    /// Queries referencing these tables will be routed through the streaming
+    /// execution path rather than the batch path.
+    pub fn register_streaming_source(&mut self, name: &str) -> SqlResult<()> {
+        self.streaming_sources.insert(name.to_string());
+        Ok(())
+    }
+
+    /// Returns `true` if any table referenced in `sql` is a registered streaming source.
+    pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool> {
+        if self.streaming_sources.is_empty() {
+            return Ok(false);
+        }
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        for stmt in &statements {
+            let mut is_streaming = false;
+            visit_relations(stmt, |relation| {
+                // relation.to_string() yields the fully-qualified name (e.g. "schema.table").
+                // Extract the unqualified table name (last segment after dot).
+                let full = relation.to_string();
+                let table_name = full.split('.').next_back().unwrap_or(&full);
+                if self.streaming_sources.contains(table_name) {
+                    is_streaming = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            if is_streaming {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Shared Krishiv catalog backing this engine, if configured.

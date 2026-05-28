@@ -471,6 +471,31 @@ impl Session {
         Ok(())
     }
 
+    /// Register a Parquet file as a bounded (batch) SQL table.
+    ///
+    /// Alias for [`register_parquet`] that matches the `register_unbounded` naming.
+    pub fn register_bounded(&self, name: &str, path: &Path) -> Result<()> {
+        self.register_parquet(name, path)
+    }
+
+    /// Mark a table name as an unbounded streaming source in the SQL engine.
+    ///
+    /// After this call, [`Session::is_streaming_query`] returns `true` for
+    /// any SQL that references `name`.  The caller is responsible for registering
+    /// the actual table provider separately.
+    pub fn register_unbounded(&mut self, name: &str) -> Result<()> {
+        self.sql_engine
+            .register_streaming_source(name)
+            .map_err(KrishivError::from)
+    }
+
+    /// Returns `true` if `sql` references any registered streaming source.
+    pub fn is_streaming_query(&self, sql: &str) -> Result<bool> {
+        self.sql_engine
+            .is_streaming_query(sql)
+            .map_err(KrishivError::from)
+    }
+
     /// Asynchronously register a local Parquet path as a SQL table.
     pub async fn register_parquet_async(
         &self,
