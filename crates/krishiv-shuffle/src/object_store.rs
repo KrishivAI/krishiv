@@ -1,5 +1,6 @@
 use crate::{
-    PartitionId, ShuffleError, ShufflePartition, ShuffleResult, ShuffleStore, store::PartitionKey,
+    PartitionId, ShuffleError, ShufflePartition, ShuffleResult, ShuffleStore,
+    compression::ShuffleCompression, store::PartitionKey,
 };
 use dashmap::DashMap;
 use object_store::{ObjectStore, ObjectStoreExt as _};
@@ -16,6 +17,7 @@ pub struct ObjectStoreShuffleStore {
     store: Arc<dyn object_store::ObjectStore>,
     prefix: object_store::path::Path,
     lease_tokens: Arc<DashMap<PartitionKey, u64>>,
+    compression: ShuffleCompression,
 }
 
 impl ObjectStoreShuffleStore {
@@ -31,7 +33,14 @@ impl ObjectStoreShuffleStore {
             store,
             prefix,
             lease_tokens: Arc::new(DashMap::new()),
+            compression: ShuffleCompression::None,
         }
+    }
+
+    /// Set the IPC compression codec for written partitions.
+    pub fn with_compression(mut self, compression: ShuffleCompression) -> Self {
+        self.compression = compression;
+        self
     }
 
     fn object_path(&self, id: &PartitionId) -> object_store::path::Path {
@@ -107,10 +116,19 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             }
         }
 
-        use arrow::ipc::writer::StreamWriter;
+        use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+
+        let ipc_compression = match self.compression {
+            ShuffleCompression::None => None,
+            ShuffleCompression::Lz4 => Some(arrow::ipc::CompressionType::LZ4_FRAME),
+            ShuffleCompression::Zstd => Some(arrow::ipc::CompressionType::ZSTD),
+        };
+        let write_options = IpcWriteOptions::default()
+            .try_with_compression(ipc_compression)
+            .map_err(|e| ShuffleError::Io(e.to_string()))?;
 
         let mut buf = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut buf, &partition.schema)
+        let mut writer = StreamWriter::try_new_with_options(&mut buf, &partition.schema, write_options)
             .map_err(|e| ShuffleError::Io(e.to_string()))?;
         for batch in &partition.batches {
             writer
