@@ -39,8 +39,8 @@ pub use config::ConnectorConfig;
 pub use error::{ConnectorError, ConnectorResult};
 pub use offset::{CommitHandle, Offset, OffsetCommitter, ParquetOffset};
 pub use quality::{
-    CompiledDataQualityConfig, CompiledQualityRule, DataQualityCheckResult, DataQualityConfig,
-    DataQualityRule, DeadLetterSink, QualityAction, RejectedRow,
+    CompiledDataQualityConfig, CompiledQualityRule, ConnectorQualityHook, DataQualityCheckResult,
+    DataQualityConfig, DataQualityRule, DeadLetterSink, QualityAction, RejectedRow,
 };
 pub use sink::{AtLeastOnceSinkContract, DynSink, PostWriteOffsetCommitProtocol, Sink};
 pub use source::Source;

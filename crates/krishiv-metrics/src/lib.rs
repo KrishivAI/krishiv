@@ -3,6 +3,8 @@
 //!
 //! OpenTelemetry metrics, traces, and structured log initialization for all Krishiv processes.
 
+pub mod grpc;
+
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;

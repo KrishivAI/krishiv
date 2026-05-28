@@ -345,6 +345,39 @@ mod proto_tests {
     }
 
     #[test]
+    fn source_throttle_commands_round_trip_on_wire() {
+        use crate::wire::{
+            executor_heartbeat_response_from_wire, executor_heartbeat_response_to_wire,
+        };
+
+        // Active throttle: rows_per_second = Some(500).
+        let response_with_limit = ExecutorHeartbeatResponse::new(
+            LeaseGeneration::initial(),
+            TransportDisposition::Accepted,
+        )
+        .with_throttle_commands(vec![HeartbeatThrottleCommand {
+            source_id: "src-kafka-0".into(),
+            rows_per_second: Some(500),
+        }]);
+        let wire = executor_heartbeat_response_to_wire(response_with_limit.clone());
+        let rt = executor_heartbeat_response_from_wire(wire).unwrap();
+        assert_eq!(rt.throttle_commands(), response_with_limit.throttle_commands());
+
+        // Cleared throttle: rows_per_second = None.
+        let response_clear = ExecutorHeartbeatResponse::new(
+            LeaseGeneration::initial(),
+            TransportDisposition::Accepted,
+        )
+        .with_throttle_commands(vec![HeartbeatThrottleCommand {
+            source_id: "src-kafka-0".into(),
+            rows_per_second: None,
+        }]);
+        let wire = executor_heartbeat_response_to_wire(response_clear.clone());
+        let rt = executor_heartbeat_response_from_wire(wire).unwrap();
+        assert_eq!(rt.throttle_commands(), response_clear.throttle_commands());
+    }
+
+    #[test]
     fn fencing_token_initial_is_one() {
         assert_eq!(FencingToken::initial().as_u64(), 1);
     }

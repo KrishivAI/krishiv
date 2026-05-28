@@ -32,7 +32,7 @@ pub use delta_lake::{
 };
 pub use hudi::{HudiQueryType, HudiSnapshotReader, write_hudi_cow_fixture};
 pub use iceberg_fs::IcebergFsTable;
-pub use partition_spec::{PartitionSpecResolver, PartitionSpecVersion};
+pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 pub use two_phase::{
     IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, MemoryIcebergTwoPhaseCommit, StagedSnapshot,
     kafka_offsets_json, parse_kafka_offsets_json,
@@ -267,6 +267,9 @@ pub struct MemoryLakehouseTable {
     table_ref: IcebergTableRef,
     schema_version: SchemaVersion,
     state: tokio::sync::Mutex<MemoryLakehouseTableState>,
+    /// Active partition spec; mutations via `add_partition_field` / `drop_partition_field`
+    /// affect which partition path is computed on the next `append`.
+    partition_spec: tokio::sync::Mutex<PartitionSpecResolver>,
 }
 
 impl MemoryLakehouseTable {
@@ -276,7 +279,36 @@ impl MemoryLakehouseTable {
             table_ref,
             schema_version,
             state: tokio::sync::Mutex::new(MemoryLakehouseTableState::default()),
+            partition_spec: tokio::sync::Mutex::new(PartitionSpecResolver::new(0)),
         }
+    }
+
+    /// Add a partition field to the active spec (spec evolution).
+    ///
+    /// The change takes effect immediately: the next call to `append` will
+    /// compute partition paths using the updated field list.
+    #[doc = "**Beta API**: may change between minor releases."]
+    pub async fn add_partition_field(&self, field: PartitionField) {
+        self.partition_spec.lock().await.add_field(field);
+    }
+
+    /// Drop a partition field by name from the active spec (spec evolution).
+    ///
+    /// The change takes effect immediately: the next call to `append` will
+    /// compute partition paths without the dropped field.
+    #[doc = "**Beta API**: may change between minor releases."]
+    pub async fn drop_partition_field(&self, field_name: &str) {
+        self.partition_spec.lock().await.drop_field(field_name);
+    }
+
+    /// Return a snapshot of the currently active partition fields.
+    #[doc = "**Beta API**: may change between minor releases."]
+    pub async fn active_partition_fields(&self) -> Vec<PartitionField> {
+        self.partition_spec
+            .lock()
+            .await
+            .active_fields()
+            .to_vec()
     }
 
     /// Atomically verify the guard's expected snapshot and append batches.
@@ -371,6 +403,33 @@ impl LakehouseTable for MemoryLakehouseTable {
     }
 
     async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
+        // Compute the partition path from the active spec before committing.
+        // In a full implementation this path would be used when writing data files to
+        // object storage.  Here we log it so callers can observe which partition
+        // fields are active at write time.
+        {
+            let spec = self.partition_spec.lock().await;
+            let active = spec.active_fields();
+            if active.is_empty() {
+                tracing::debug!(
+                    "table '{}': appending unpartitioned data ({} batch(es))",
+                    self.table_ref.full_name(),
+                    batches.len(),
+                );
+            } else {
+                let partition_path: String = active
+                    .iter()
+                    .map(|f| format!("{}={}", f.name, f.transform))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                tracing::debug!(
+                    "table '{}': appending to partition path '{}' ({} batch(es))",
+                    self.table_ref.full_name(),
+                    partition_path,
+                    batches.len(),
+                );
+            }
+        }
         let mut state = self.state.lock().await;
         state.append_layer(batches);
         Ok(())
@@ -640,6 +699,65 @@ mod tests {
                 .unwrap();
             let rows_snap2: usize = at_snap2.iter().map(|b| b.num_rows()).sum();
             assert_eq!(rows_snap2, 5);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Partition spec evolution tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn partition_spec_evolution_add_and_drop() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let table = MemoryLakehouseTable::new(make_table_ref(), make_schema_version());
+
+            // Initially no partition fields are registered.
+            assert!(
+                table.active_partition_fields().await.is_empty(),
+                "new table should have no active partition fields"
+            );
+
+            // Add two partition fields.
+            table
+                .add_partition_field(PartitionField {
+                    name: "year".to_string(),
+                    source_column: "event_time".to_string(),
+                    transform: "year".to_string(),
+                })
+                .await;
+            table
+                .add_partition_field(PartitionField {
+                    name: "month".to_string(),
+                    source_column: "event_time".to_string(),
+                    transform: "month".to_string(),
+                })
+                .await;
+
+            {
+                let fields = table.active_partition_fields().await;
+                assert_eq!(fields.len(), 2, "expected two active partition fields");
+                assert_eq!(fields[0].name, "year");
+                assert_eq!(fields[1].name, "month");
+            }
+
+            // Drop the "month" field.
+            table.drop_partition_field("month").await;
+
+            {
+                let fields = table.active_partition_fields().await;
+                assert_eq!(
+                    fields.len(),
+                    1,
+                    "dropping 'month' should leave exactly one field"
+                );
+                assert_eq!(fields[0].name, "year");
+            }
+
+            // Verify that an append still succeeds after evolution.
+            table.append(vec![make_batch(vec![10, 20])]).await.unwrap();
+            let snap = table.current_snapshot_id().await.unwrap();
+            assert!(snap.is_some(), "snapshot should exist after append");
         });
     }
 

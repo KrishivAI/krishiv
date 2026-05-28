@@ -224,12 +224,59 @@ impl WindowOperatorState {
             Self::SessionState(op) => op.purge_expired(),
         }
     }
+
+    /// Propagate the event-time watermark to the underlying TTL state backend.
+    ///
+    /// For TTL-backed variants (`TumblingState`, `SlidingState`, `SessionState`)
+    /// this forwards to the operator's `set_watermark`, which in turn calls
+    /// `StateBackend::set_watermark` on the inner `TtlStateBackend`.  Subsequent
+    /// calls to `purge_expired` and lazy read-time expiry checks will then use
+    /// event time rather than wall-clock time.
+    ///
+    /// Non-TTL variants are no-ops (the method is still valid to call; the
+    /// underlying plain operators carry no TTL state to evict).
+    fn set_watermark(&mut self, watermark_ms: i64) {
+        match self {
+            Self::Tumbling(_) | Self::Sliding(_) | Self::Session(_) => {}
+            Self::TumblingState(op) => op.set_watermark(watermark_ms),
+            Self::SlidingState(op) => op.set_watermark(watermark_ms),
+            Self::SessionState(op) => op.set_watermark(watermark_ms),
+        }
+    }
+}
+
+// ── StreamQualityHook ─────────────────────────────────────────────────────────
+
+/// Optional quality-gate hook for the streaming drain cycle (R10).
+///
+/// Implementations run data-quality rules against each emitted output batch.
+/// Accepted rows are returned; rejected rows are routed to a dead-letter output.
+/// The trait is defined here (in exec) so that `ContinuousWindowExecutor` can
+/// hold it without creating a circular dependency on `krishiv-connectors`.
+///
+/// Implement this trait in `krishiv-connectors` using `CompiledDataQualityConfig`
+/// and `DeadLetterSink`, then inject it via
+/// [`ContinuousWindowExecutor::with_quality_hook`].
+pub trait StreamQualityHook: Send {
+    /// Apply quality rules to one output `batch`.
+    ///
+    /// Returns the accepted sub-batch (possibly smaller than the input) and
+    /// the number of rejected rows routed to the dead-letter output.
+    fn filter(&mut self, batch: RecordBatch) -> ExecResult<(RecordBatch, usize)>;
 }
 
 /// Retains window operator state between continuous streaming drain cycles.
 pub struct ContinuousWindowExecutor {
     watermark: WatermarkTracker,
     operator: WindowOperatorState,
+    /// Optional data-quality gate applied to each emitted output batch.
+    quality_hook: Option<Box<dyn StreamQualityHook>>,
+    /// Most recently computed event-time watermark in milliseconds.
+    ///
+    /// Persisted across drain cycles so that `purge_expired` at the start of
+    /// each cycle uses the watermark from the previous cycle rather than falling
+    /// back to wall-clock time.  Starts at `i64::MIN` (no watermark seen yet).
+    last_watermark_ms: i64,
 }
 
 impl ContinuousWindowExecutor {
@@ -244,7 +291,21 @@ impl ContinuousWindowExecutor {
         Ok(Self {
             watermark: WatermarkTracker::new(&spec),
             operator: build_operator(&spec, &agg_exprs)?,
+            quality_hook: None,
+            last_watermark_ms: i64::MIN,
         })
+    }
+
+    /// Attach a data-quality hook that filters each output batch.
+    ///
+    /// When set, every batch emitted by the window operator passes through
+    /// [`StreamQualityHook::filter`] before being returned from [`drain`].
+    /// Rejected rows are handled by the hook implementation (e.g. written to a
+    /// dead-letter Parquet file or logged).
+    #[must_use]
+    pub fn with_quality_hook(mut self, hook: Box<dyn StreamQualityHook>) -> Self {
+        self.quality_hook = Some(hook);
+        self
     }
 
     /// Process newly arrived input batches and return any emitted output.
@@ -255,17 +316,47 @@ impl ContinuousWindowExecutor {
     /// deletes entries that have passed their `expires_at_ms` timestamp.
     /// This prevents unbounded growth from entries that were written once and
     /// never read again after expiry (lazy-delete alone is insufficient).
+    ///
+    /// Watermark propagation: before eviction, the operator's TTL state backend
+    /// is updated with the watermark computed during the *previous* drain cycle
+    /// (`last_watermark_ms`).  This ensures that `purge_expired` uses event time
+    /// rather than wall-clock time even for keys that were never read again after
+    /// expiry.  Within the batch loop, `set_watermark` is called again after each
+    /// watermark advance so that lazy read-time expiry also reflects event time.
     pub fn drain(&mut self, input_batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        // Propagate the most recently known event-time watermark to the TTL
+        // state backend before eviction so that purge_expired uses event time.
+        // On the very first drain cycle last_watermark_ms == i64::MIN and the
+        // backend falls back to wall-clock time (no-op for non-TTL operators).
+        if self.last_watermark_ms != i64::MIN {
+            self.operator.set_watermark(self.last_watermark_ms);
+        }
+
         // Eagerly evict stale TTL entries before processing new data.
         self.operator.purge_expired()?;
 
         if input_batches.is_empty() {
             return Ok(Vec::new());
         }
-        let mut output = Vec::new();
+        let mut raw: Vec<RecordBatch> = Vec::new();
         for batch in &input_batches {
             let wm = self.watermark.advance(batch)?;
-            output.extend(self.operator.process_batch(batch, wm)?);
+            // Keep the TTL backend's event-time reference current as the
+            // watermark advances within this drain cycle.
+            self.operator.set_watermark(wm);
+            self.last_watermark_ms = wm;
+            raw.extend(self.operator.process_batch(batch, wm)?);
+        }
+        if self.quality_hook.is_none() || raw.is_empty() {
+            return Ok(raw);
+        }
+        let hook = self.quality_hook.as_mut().unwrap();
+        let mut output = Vec::with_capacity(raw.len());
+        for batch in raw {
+            let (accepted, _rejected_count) = hook.filter(batch)?;
+            if accepted.num_rows() > 0 {
+                output.push(accepted);
+            }
         }
         Ok(output)
     }

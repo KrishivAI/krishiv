@@ -224,7 +224,10 @@ async fn heartbeat_loop(
         );
         tokio::spawn(async move {
             let _ = Server::builder()
-                .add_service(executor_barrier_grpc_server(barrier_service))
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    executor_barrier_grpc_server(barrier_service),
+                    krishiv_metrics::grpc::extract_trace_context,
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
         });
@@ -371,6 +374,15 @@ async fn heartbeat_loop(
                                     )
                                     .await;
                             }
+                        }
+                        // R7.2: Apply source throttle limits from the coordinator heartbeat
+                        // response.  The `SourceThrottleTable` is shared between the heartbeat
+                        // loop (writer) and all runner task slots (readers) via an Arc<DashMap>,
+                        // so no additional locking is required here.
+                        for tc in heartbeat.throttle_commands() {
+                            runner
+                                .source_throttle_limits
+                                .apply(&tc.source_id, tc.rows_per_second);
                         }
                     }
                     Err(error) => {

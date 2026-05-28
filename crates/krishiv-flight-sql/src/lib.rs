@@ -4,13 +4,18 @@
 
 mod host;
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::sql::server::FlightSqlService;
-use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
+use arrow_flight::sql::{
+    ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
+    ActionCreatePreparedStatementResult, CommandPreparedStatementQuery, CommandStatementQuery,
+    ProstMessageExt, SqlInfo, TicketStatementQuery,
+};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
@@ -19,6 +24,7 @@ use arrow_flight::{
 use futures::{Stream, stream};
 use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
+use uuid::Uuid;
 
 use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
 use krishiv_sql::SqlEngine;
@@ -32,6 +38,8 @@ pub struct KrishivFlightSqlService {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     host: FlightExecutionHost,
+    /// Map of opaque handle (UUID string) → SQL text for prepared statements.
+    prepared_statements: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for KrishivFlightSqlService {
@@ -39,7 +47,7 @@ impl std::fmt::Debug for KrishivFlightSqlService {
         f.debug_struct("KrishivFlightSqlService")
             .field("auth", &self.auth.is_some())
             .field("policy", &self.policy.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -50,6 +58,7 @@ impl KrishivFlightSqlService {
             auth: None,
             policy: None,
             host: FlightExecutionHost::from_env()?,
+            prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -59,6 +68,7 @@ impl KrishivFlightSqlService {
             auth: None,
             policy: None,
             host,
+            prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -347,6 +357,96 @@ impl FlightSqlService for KrishivFlightSqlService {
 
     // Required method — no-op for R8.1 beta (server doesn't serve SqlInfo)
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+
+    /// Create a server-side prepared statement and return an opaque handle.
+    ///
+    /// The handle is a UUID string stored in the `prepared_statements` map.
+    /// Clients pass it back via [`CommandPreparedStatementQuery`] to execute
+    /// the statement without re-parsing the SQL.
+    async fn do_action_create_prepared_statement(
+        &self,
+        query: ActionCreatePreparedStatementRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<ActionCreatePreparedStatementResult, Status> {
+        let handle = Uuid::new_v4().to_string();
+        self.prepared_statements
+            .lock()
+            .await
+            .insert(handle.clone(), query.query);
+        Ok(ActionCreatePreparedStatementResult {
+            prepared_statement_handle: handle.into_bytes().into(),
+            ..Default::default()
+        })
+    }
+
+    /// Return [`FlightInfo`] for a prepared statement (used by clients that
+    /// call `GetFlightInfo` before `DoGet`).
+    async fn get_flight_info_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let handle = std::str::from_utf8(&query.prepared_statement_handle)
+            .map_err(|e| {
+                Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
+            })?
+            .to_owned();
+
+        let sql = {
+            let map = self.prepared_statements.lock().await;
+            map.get(&handle)
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
+        };
+
+        // Delegate to the existing statement query path.
+        let cmd = CommandStatementQuery {
+            query: sql,
+            transaction_id: None,
+        };
+        self.get_flight_info_statement(cmd, request).await
+    }
+
+    /// Execute a prepared statement and stream results.
+    async fn do_get_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let handle = std::str::from_utf8(&query.prepared_statement_handle)
+            .map_err(|e| {
+                Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
+            })?
+            .to_owned();
+
+        let sql = {
+            let map = self.prepared_statements.lock().await;
+            map.get(&handle)
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
+        };
+
+        // Delegate to the existing statement execution path.
+        let ticket = TicketStatementQuery {
+            statement_handle: sql.into_bytes().into(),
+        };
+        self.do_get_statement(ticket, request).await
+    }
+
+    /// Close (drop) a previously created prepared statement.
+    async fn do_action_close_prepared_statement(
+        &self,
+        query: ActionClosePreparedStatementRequest,
+        _request: Request<arrow_flight::Action>,
+    ) -> Result<(), Status> {
+        let handle = std::str::from_utf8(&query.prepared_statement_handle)
+            .map_err(|e| {
+                Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
+            })?
+            .to_owned();
+        self.prepared_statements.lock().await.remove(&handle);
+        Ok(())
+    }
 
     /// Typed Krishiv `DoAction` handler (B3, D2).
     ///
@@ -896,6 +996,179 @@ mod tests {
             .do_get_statement(ticket, Request::new(Ticket::new(vec![])))
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── Prepared statement tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_prepared_statement_returns_handle() {
+        use arrow_flight::sql::ActionCreatePreparedStatementRequest;
+
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let req = ActionCreatePreparedStatementRequest {
+            query: "SELECT 42 AS answer".to_string(),
+            ..Default::default()
+        };
+        let result = svc
+            .do_action_create_prepared_statement(
+                req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await;
+        assert!(result.is_ok(), "create_prepared_statement must succeed");
+        let res = result.unwrap();
+        assert!(
+            !res.prepared_statement_handle.is_empty(),
+            "handle must be non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn do_get_prepared_statement_executes_stored_sql() {
+        use arrow_flight::sql::ActionCreatePreparedStatementRequest;
+
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+
+        // Create a prepared statement.
+        let create_req = ActionCreatePreparedStatementRequest {
+            query: "SELECT 99 AS val".to_string(),
+            ..Default::default()
+        };
+        let create_result = svc
+            .do_action_create_prepared_statement(
+                create_req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let handle = create_result.prepared_statement_handle;
+
+        // Execute via do_get_prepared_statement.
+        let exec_req = arrow_flight::sql::CommandPreparedStatementQuery {
+            prepared_statement_handle: handle,
+        };
+        let result = svc
+            .do_get_prepared_statement(exec_req, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_ok(), "do_get_prepared_statement must succeed");
+        let items: Vec<_> = result.unwrap().into_inner().collect().await;
+        assert!(!items.is_empty(), "must return at least a schema FlightData");
+        assert!(items[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn do_get_prepared_statement_unknown_handle_returns_not_found() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let req = arrow_flight::sql::CommandPreparedStatementQuery {
+            prepared_statement_handle: b"no-such-handle".to_vec().into(),
+        };
+        let result = svc
+            .do_get_prepared_statement(req, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn close_prepared_statement_removes_handle() {
+        use arrow_flight::sql::{
+            ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
+            CommandPreparedStatementQuery,
+        };
+
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+
+        // Create a prepared statement.
+        let create_req = ActionCreatePreparedStatementRequest {
+            query: "SELECT 1 AS x".to_string(),
+            ..Default::default()
+        };
+        let handle = svc
+            .do_action_create_prepared_statement(
+                create_req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .prepared_statement_handle;
+
+        // Close the prepared statement.
+        let close_req = ActionClosePreparedStatementRequest {
+            prepared_statement_handle: handle.clone(),
+        };
+        let close_result = svc
+            .do_action_close_prepared_statement(
+                close_req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await;
+        assert!(close_result.is_ok(), "close must succeed");
+
+        // Attempting to execute after close must return NotFound.
+        let exec_req = CommandPreparedStatementQuery {
+            prepared_statement_handle: handle,
+        };
+        let result = svc
+            .do_get_prepared_statement(exec_req, Request::new(Ticket::new(vec![])))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().code(),
+            tonic::Code::NotFound,
+            "after close, handle must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_flight_info_prepared_statement_returns_endpoint() {
+        use arrow_flight::sql::ActionCreatePreparedStatementRequest;
+
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+
+        // Create a prepared statement.
+        let create_req = ActionCreatePreparedStatementRequest {
+            query: "SELECT 7 AS n".to_string(),
+            ..Default::default()
+        };
+        let handle = svc
+            .do_action_create_prepared_statement(
+                create_req,
+                Request::new(arrow_flight::Action {
+                    r#type: String::new(),
+                    body: bytes::Bytes::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .prepared_statement_handle;
+
+        let info_req = arrow_flight::sql::CommandPreparedStatementQuery {
+            prepared_statement_handle: handle,
+        };
+        let descriptor = FlightDescriptor::new_cmd(vec![]);
+        let result = svc
+            .get_flight_info_prepared_statement(info_req, Request::new(descriptor))
+            .await;
+        assert!(result.is_ok(), "get_flight_info_prepared_statement must succeed");
+        let info = result.unwrap().into_inner();
+        assert_eq!(info.endpoint.len(), 1, "must return one endpoint");
+        assert!(
+            !info.endpoint[0].ticket.as_ref().unwrap().ticket.is_empty(),
+            "endpoint must carry a ticket"
+        );
     }
 
     // ── P0.13 — check_table_access enforcement ────────────────────────────────

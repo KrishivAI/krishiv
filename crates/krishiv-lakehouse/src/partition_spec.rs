@@ -62,6 +62,16 @@ impl PartitionSpecResolver {
             spec.fields.retain(|f| f.name != name);
         }
     }
+
+    /// Return the active partition fields for the current default spec.
+    ///
+    /// Returns an empty slice when no spec has been registered yet.
+    pub fn active_fields(&self) -> &[PartitionField] {
+        self.specs
+            .get(&self.default_spec_id)
+            .map(|s| s.fields.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 #[cfg(test)]

@@ -104,6 +104,8 @@ message ExecutorHeartbeatResponse {
   // R17: coordinator throttle directives for LLM UDF rate limiters.
   repeated LlmThrottleCommand llm_throttles = 5;
   repeated InitiateCheckpointCommand initiate_checkpoints = 6;
+  // R7.2: per-source backpressure credit directives from the adaptive governor.
+  repeated HeartbeatThrottleCommand source_throttles = 7;
 }
 
 message ExecutorTaskAssignment {
@@ -370,4 +372,12 @@ message LlmThrottleCommand {
   string model = 1;
   uint32 max_requests_per_minute = 2;
   uint64 max_tokens_per_minute = 3;
+}
+
+// R7.2: coordinator → executor per-source backpressure credit.
+// rows_per_second == 0 means "clear the throttle" (unlimited).
+message HeartbeatThrottleCommand {
+  string source_id = 1;
+  uint64 rows_per_second = 2;
+  bool throttle_cleared = 3;
 }

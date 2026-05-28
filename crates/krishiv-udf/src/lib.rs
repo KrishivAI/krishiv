@@ -519,4 +519,228 @@ mod tests {
             .expect("Int64");
         assert_eq!(col.value(0), 42);
     }
+
+    /// Verifies that a two-phase distributed UDAF merge produces the same
+    /// result as a single-partition aggregation over the concatenated data.
+    ///
+    /// Phase 1: each partition accumulates its own partial [`AggState`].
+    /// Phase 2: the partial states are merged via [`AggregateUdf::merge`].
+    /// The merged state is finalised and compared against a single-pass result
+    /// computed over all data in one shot.
+    #[test]
+    fn udaf_distributed_merge_matches_single_partition() {
+        let udf = SumAggUdf::new();
+
+        // -----------------------------------------------------------------
+        // Build two partitions with known values.
+        //   partition_a : [1, 2, 3, 4]  -> partial sum = 10
+        //   partition_b : [5, 6, 7]     -> partial sum = 18
+        //   combined                    -> total sum   = 28
+        // -----------------------------------------------------------------
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+
+        let partition_a = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+        )
+        .expect("valid partition_a batch");
+
+        let partition_b = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![5_i64, 6, 7]))],
+        )
+        .expect("valid partition_b batch");
+
+        // -----------------------------------------------------------------
+        // Phase 1 – accumulate each partition independently.
+        // -----------------------------------------------------------------
+        let mut state_a = AggState::default();
+        udf.accumulate(&mut state_a, &partition_a)
+            .expect("accumulate partition_a");
+
+        let mut state_b = AggState::default();
+        udf.accumulate(&mut state_b, &partition_b)
+            .expect("accumulate partition_b");
+
+        // Sanity-check the partial sums before merging.
+        let partial_a = udf
+            .finalize(AggState {
+                data: state_a.data.clone(),
+            })
+            .expect("finalize partial_a");
+        let partial_b = udf
+            .finalize(AggState {
+                data: state_b.data.clone(),
+            })
+            .expect("finalize partial_b");
+        assert!(
+            matches!(partial_a, ScalarValue::Int64(10)),
+            "partial sum of partition_a must be 10, got {partial_a:?}",
+        );
+        assert!(
+            matches!(partial_b, ScalarValue::Int64(18)),
+            "partial sum of partition_b must be 18, got {partial_b:?}",
+        );
+
+        // -----------------------------------------------------------------
+        // Phase 2 – merge the two partial states.
+        // -----------------------------------------------------------------
+        let merged_state = udf.merge(state_a, state_b).expect("merge partial states");
+
+        // -----------------------------------------------------------------
+        // Finalise the merged state (distributed path result).
+        // -----------------------------------------------------------------
+        let distributed_result = udf
+            .finalize(merged_state)
+            .expect("finalize merged state");
+
+        // -----------------------------------------------------------------
+        // Reference path: accumulate all rows in a single pass.
+        // -----------------------------------------------------------------
+        let all_values = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![
+                1_i64, 2, 3, 4, 5, 6, 7,
+            ]))],
+        )
+        .expect("valid all-values batch");
+
+        let mut single_state = AggState::default();
+        udf.accumulate(&mut single_state, &all_values)
+            .expect("accumulate single partition");
+        let single_result = udf
+            .finalize(single_state)
+            .expect("finalize single-partition state");
+
+        // -----------------------------------------------------------------
+        // Both paths must produce the same result (28).
+        // -----------------------------------------------------------------
+        assert!(
+            matches!(distributed_result, ScalarValue::Int64(28)),
+            "distributed merge must produce 28, got {distributed_result:?}",
+        );
+        assert!(
+            matches!(single_result, ScalarValue::Int64(28)),
+            "single-partition path must produce 28, got {single_result:?}",
+        );
+
+        // Also compare as i64 values for a cleaner assertion.
+        let distributed_val = match distributed_result {
+            ScalarValue::Int64(v) => v,
+            other => panic!("expected Int64, got {other:?}"),
+        };
+        let single_val = match single_result {
+            ScalarValue::Int64(v) => v,
+            other => panic!("expected Int64, got {other:?}"),
+        };
+        assert_eq!(
+            distributed_val, single_val,
+            "distributed merge ({distributed_val}) must equal single-partition result ({single_val})",
+        );
+    }
+
+    /// Verifies that merging with an empty (default) partial state is a
+    /// no-op, so a partition that contributes zero rows does not corrupt
+    /// the merged total.
+    #[test]
+    fn udaf_merge_with_empty_state_is_noop() {
+        let udf = SumAggUdf::new();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+
+        let partition = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 20, 30]))],
+        )
+        .expect("valid partition batch");
+
+        let mut non_empty_state = AggState::default();
+        udf.accumulate(&mut non_empty_state, &partition)
+            .expect("accumulate");
+
+        // Merge with an uninitialised (empty) state on the right.
+        let merged_right = udf
+            .merge(
+                AggState {
+                    data: non_empty_state.data.clone(),
+                },
+                AggState::default(),
+            )
+            .expect("merge with empty right");
+
+        // Merge with an uninitialised (empty) state on the left.
+        let merged_left = udf
+            .merge(
+                AggState::default(),
+                AggState {
+                    data: non_empty_state.data.clone(),
+                },
+            )
+            .expect("merge with empty left");
+
+        let result_right = udf.finalize(merged_right).expect("finalize right merge");
+        let result_left = udf.finalize(merged_left).expect("finalize left merge");
+
+        assert!(
+            matches!(result_right, ScalarValue::Int64(60)),
+            "merge with empty right must yield 60, got {result_right:?}",
+        );
+        assert!(
+            matches!(result_left, ScalarValue::Int64(60)),
+            "merge with empty left must yield 60, got {result_left:?}",
+        );
+    }
+
+    /// Verifies that merging three partial states in sequence (simulating a
+    /// three-partition distributed job) still yields the correct total.
+    #[test]
+    fn udaf_merge_three_partitions() {
+        let udf = SumAggUdf::new();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+
+        // Partition values and expected partial sums:
+        //   p1 : [100]        -> 100
+        //   p2 : [200, 300]   -> 500
+        //   p3 : [400, 500, 600] -> 1500
+        //   total             -> 2100
+        let make_batch = |vals: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vals))],
+            )
+            .expect("valid batch")
+        };
+
+        let mut s1 = AggState::default();
+        let mut s2 = AggState::default();
+        let mut s3 = AggState::default();
+
+        udf.accumulate(&mut s1, &make_batch(vec![100])).expect("acc p1");
+        udf.accumulate(&mut s2, &make_batch(vec![200, 300])).expect("acc p2");
+        udf.accumulate(&mut s3, &make_batch(vec![400, 500, 600])).expect("acc p3");
+
+        // Merge left-to-right: ((s1 merge s2) merge s3)
+        let m12 = udf.merge(s1, s2).expect("merge s1+s2");
+        let m123 = udf.merge(m12, s3).expect("merge (s1+s2)+s3");
+
+        let result = udf.finalize(m123).expect("finalize three-partition merge");
+
+        assert!(
+            matches!(result, ScalarValue::Int64(2100)),
+            "three-partition merge must yield 2100, got {result:?}",
+        );
+    }
 }

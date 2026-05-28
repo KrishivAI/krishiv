@@ -287,14 +287,39 @@ impl ExecutorRuntime {
             .map(tonic::Response::into_inner)
     }
 
+    /// Build an intercepted coordinator gRPC client for one-shot requests.
+    async fn connect_coordinator_client(
+        &self,
+    ) -> ExecutorTransportResult<
+        wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
+            tonic::service::interceptor::InterceptedService<
+                tonic::transport::Channel,
+                fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            >,
+        >,
+    > {
+        let channel = tonic::transport::Endpoint::from_shared(
+            self.config.coordinator_endpoint.clone(),
+        )
+        .map_err(|e| ExecutorTransportError::Transport {
+            message: e.to_string(),
+        })?
+        .connect()
+        .await?;
+        Ok(
+            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
+                channel,
+                krishiv_metrics::grpc::inject_trace_context
+                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            ),
+        )
+    }
+
     /// Register this executor through a networked coordinator gRPC endpoint.
     pub async fn register_with_grpc_endpoint(
         &self,
     ) -> ExecutorTransportResult<RegisterExecutorResponse> {
-        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-            self.config.coordinator_endpoint.clone(),
-        )
-        .await?;
+        let mut client = self.connect_coordinator_client().await?;
         let request = wire::register_executor_request_to_wire(self.registration_request());
         let response = client.register_executor(request).await?.into_inner();
         Ok(wire::register_executor_response_from_wire(response)?)
@@ -304,10 +329,7 @@ impl ExecutorRuntime {
     pub async fn deregister_with_grpc_endpoint(
         &self,
     ) -> ExecutorTransportResult<DeregisterExecutorResponse> {
-        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-            self.config.coordinator_endpoint.clone(),
-        )
-        .await?;
+        let mut client = self.connect_coordinator_client().await?;
         let request = wire::deregister_executor_request_to_wire(self.deregistration_request());
         let response = client.deregister_executor(request).await?.into_inner();
         Ok(wire::deregister_executor_response_from_wire(response)?)
@@ -317,10 +339,7 @@ impl ExecutorRuntime {
     pub async fn heartbeat_with_grpc_endpoint(
         &mut self,
     ) -> ExecutorTransportResult<ExecutorHeartbeatResponse> {
-        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-            self.config.coordinator_endpoint.clone(),
-        )
-        .await?;
+        let mut client = self.connect_coordinator_client().await?;
         let request = wire::executor_heartbeat_request_to_wire(self.heartbeat_request());
         let response = client.executor_heartbeat(request).await?.into_inner();
         let response = wire::executor_heartbeat_response_from_wire(response)?;
@@ -333,10 +352,7 @@ impl ExecutorRuntime {
         &self,
         request: CheckpointAckRequest,
     ) -> ExecutorTransportResult<CheckpointAckResponse> {
-        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-            self.config.coordinator_endpoint.clone(),
-        )
-        .await?;
+        let mut client = self.connect_coordinator_client().await?;
         let wire_req = wire::checkpoint_ack_request_to_wire(request);
         let response = client.checkpoint_ack(wire_req).await?.into_inner();
         Ok(wire::checkpoint_ack_response_from_wire(response)?)
@@ -346,10 +362,7 @@ impl ExecutorRuntime {
     pub async fn register_and_heartbeat_once(
         &mut self,
     ) -> ExecutorTransportResult<(RegisterExecutorResponse, ExecutorHeartbeatResponse)> {
-        let mut client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::connect(
-            self.config.coordinator_endpoint.clone(),
-        )
-        .await?;
+        let mut client = self.connect_coordinator_client().await?;
 
         let registration = client
             .register_executor(wire::register_executor_request_to_wire(
@@ -437,7 +450,12 @@ impl GrpcCoordinatorService {
     async fn client(
         &self,
     ) -> Result<
-        wire::v1::coordinator_executor_client::CoordinatorExecutorClient<tonic::transport::Channel>,
+        wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
+            tonic::service::interceptor::InterceptedService<
+                tonic::transport::Channel,
+                fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            >,
+        >,
         tonic::Status,
     > {
         self.pool
@@ -544,7 +562,10 @@ pub async fn serve_executor_task_grpc(
     inbox: ExecutorAssignmentInbox,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
-        .add_service(executor_task_grpc_server(inbox))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            executor_task_grpc_server(inbox),
+            krishiv_metrics::grpc::extract_trace_context,
+        ))
         .serve(addr)
         .await
 }
@@ -555,7 +576,10 @@ pub async fn serve_executor_task_grpc_with_listener(
     inbox: ExecutorAssignmentInbox,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
-        .add_service(executor_task_grpc_server(inbox))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            executor_task_grpc_server(inbox),
+            krishiv_metrics::grpc::extract_trace_context,
+        ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
 }

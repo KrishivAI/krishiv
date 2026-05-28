@@ -13,6 +13,7 @@ arrow = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
+krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-ai = { path = "../krishiv-ai" }
 krishiv-async-util = { path = "../krishiv-async-util" }

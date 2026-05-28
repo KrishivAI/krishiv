@@ -13,11 +13,11 @@ use crate::ids::{
 };
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::task::{
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
-    InputPartitionDescriptor, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
-    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-    TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse,
-    TransportDisposition,
+    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment,
+    HeartbeatThrottleCommand, InputPartition, InputPartitionDescriptor, MemoryKafkaRecord,
+    OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
+    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
 };
 
 pub mod v1 {
@@ -265,6 +265,11 @@ pub fn executor_heartbeat_response_to_wire(
                 fencing_token: cmd.fencing_token.as_u64(),
             })
             .collect(),
+        source_throttles: value
+            .throttle_commands()
+            .iter()
+            .map(heartbeat_throttle_command_to_wire)
+            .collect(),
     }
 }
 
@@ -287,6 +292,15 @@ pub fn executor_heartbeat_response_from_wire(
                 .llm_throttles
                 .into_iter()
                 .map(llm_throttle_command_from_wire)
+                .collect(),
+        );
+    }
+    if !value.source_throttles.is_empty() {
+        response = response.with_throttle_commands(
+            value
+                .source_throttles
+                .into_iter()
+                .map(heartbeat_throttle_command_from_wire)
                 .collect(),
         );
     }
@@ -324,6 +338,41 @@ fn llm_throttle_command_from_wire(value: v1::LlmThrottleCommand) -> crate::LlmTh
         model: value.model,
         max_requests_per_minute: value.max_requests_per_minute,
         max_tokens_per_minute: value.max_tokens_per_minute,
+    }
+}
+
+fn heartbeat_throttle_command_to_wire(
+    value: &HeartbeatThrottleCommand,
+) -> v1::HeartbeatThrottleCommand {
+    match value.rows_per_second {
+        Some(rps) => v1::HeartbeatThrottleCommand {
+            source_id: value.source_id.clone(),
+            rows_per_second: rps,
+            throttle_cleared: false,
+        },
+        None => v1::HeartbeatThrottleCommand {
+            source_id: value.source_id.clone(),
+            rows_per_second: 0,
+            throttle_cleared: true,
+        },
+    }
+}
+
+fn heartbeat_throttle_command_from_wire(
+    value: v1::HeartbeatThrottleCommand,
+) -> HeartbeatThrottleCommand {
+    let rows_per_second = if value.throttle_cleared {
+        None
+    } else if value.rows_per_second > 0 {
+        Some(value.rows_per_second)
+    } else {
+        // rows_per_second == 0 and throttle_cleared == false: treat as unlimited
+        // (defensive; prefer setting throttle_cleared = true on the sender side).
+        None
+    };
+    HeartbeatThrottleCommand {
+        source_id: value.source_id,
+        rows_per_second,
     }
 }
 

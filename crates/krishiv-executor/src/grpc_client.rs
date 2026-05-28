@@ -38,14 +38,20 @@ impl SharedLeaseGeneration {
     }
 }
 
+/// Type alias for the intercepted coordinator executor client.
+type InterceptedCoordinatorClient = wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
+    tonic::service::interceptor::InterceptedService<
+        Channel,
+        fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+    >,
+>;
+
 /// Reuses one coordinator gRPC channel across RPCs and stamps the live lease
 /// onto every outgoing executor-originated request.
 #[derive(Clone)]
 pub struct CoordinatorGrpcPool {
     endpoint: String,
-    client: Arc<
-        Mutex<Option<wire::v1::coordinator_executor_client::CoordinatorExecutorClient<Channel>>>,
-    >,
+    client: Arc<Mutex<Option<InterceptedCoordinatorClient>>>,
     lease: SharedLeaseGeneration,
 }
 
@@ -75,12 +81,7 @@ impl CoordinatorGrpcPool {
         self.lease.clone()
     }
 
-    pub async fn client(
-        &self,
-    ) -> Result<
-        wire::v1::coordinator_executor_client::CoordinatorExecutorClient<Channel>,
-        tonic::transport::Error,
-    > {
+    pub async fn client(&self) -> Result<InterceptedCoordinatorClient, tonic::transport::Error> {
         let mut guard = self.client.lock().await;
         if let Some(client) = guard.as_ref() {
             return Ok(client.clone());
@@ -93,7 +94,11 @@ impl CoordinatorGrpcPool {
             .keep_alive_while_idle(true)
             .connect()
             .await?;
-        let client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::new(channel);
+        let client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
+            channel,
+            krishiv_metrics::grpc::inject_trace_context
+                as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+        );
         *guard = Some(client.clone());
         Ok(client)
     }

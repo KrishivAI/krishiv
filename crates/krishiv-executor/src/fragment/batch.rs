@@ -56,7 +56,7 @@ pub(crate) async fn execute_batch_fragment(
 
     #[cfg(feature = "kafka")]
     if fragment == KAFKA_TO_PARQUET_FRAGMENT {
-        return execute_source_to_sink_pipeline(assignment).await;
+        return execute_source_to_sink_pipeline(runner, assignment).await;
     }
 
     if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
@@ -533,6 +533,7 @@ async fn execute_inmem_shuffle_read(
 
 #[cfg(feature = "kafka")]
 async fn execute_source_to_sink_pipeline(
+    runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_connectors::kafka::{
@@ -544,6 +545,9 @@ async fn execute_source_to_sink_pipeline(
     let (topic, partition, start_offset, batch) =
         parse_memory_kafka_partition(assignment.input_partitions())?;
     let sink_path = parse_parquet_sink_path(assignment.output_contract())?;
+    // Build the source_id used to look up any coordinator-issued throttle limit.
+    // Format mirrors the assignment partition descriptor: "<topic>/<partition>".
+    let source_id = format!("{topic}/{partition}");
     let mut source = InMemoryKafkaSource::new(topic, partition, start_offset, vec![batch]);
     let mut sink =
         ParquetSink::create(&sink_path).map_err(|error| ExecutorError::LocalExecution {
@@ -565,6 +569,10 @@ async fn execute_source_to_sink_pipeline(
                 message: format!("memory Kafka source read failed: {error}"),
             })?
     {
+        // R7.2: Log any active throttle limit for this source before emitting.
+        // Real token-bucket enforcement is a follow-on task; the log makes the
+        // wiring visible in traces so operators can confirm the limit arrived.
+        runner.source_throttle_limits.check_and_log(&source_id);
         row_count += batch.num_rows();
         batch_count += 1;
         column_count = batch.num_columns();
