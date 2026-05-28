@@ -51,6 +51,7 @@ impl SessionExt for Session {
                 watermark_lag_ms: 0,
                 window: None,
                 emit_mode: EmitMode::default(),
+                agg_exprs: None,
             }),
         }
     }
@@ -68,6 +69,7 @@ impl SessionExt for Session {
                 watermark_lag_ms: 0,
                 window: None,
                 emit_mode: EmitMode::default(),
+                agg_exprs: None,
             }),
         }
     }

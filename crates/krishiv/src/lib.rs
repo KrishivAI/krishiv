@@ -63,9 +63,10 @@
 // ── Session API ───────────────────────────────────────────────────────────────
 
 pub use krishiv_api::{
-    DataFrame, ExecutionMode, KeyedStream, KrishivError, MultiSourceWatermarkSpec, QueryResult,
-    RecordBatch, Session, SessionBuilder, SessionWindowedStream, SlidingWindowedStream,
-    StateTtlConfig, Stream, StreamBatch, StreamMode, WatermarkSpec, WindowedStream,
+    AggExpr, AggFunction, DataFrame, ExecutionMode, KeyedStream, KrishivError,
+    MultiSourceWatermarkSpec, QueryResult, RecordBatch, Session, SessionBuilder,
+    SessionWindowedStream, SlidingWindowedStream, StateTtlConfig, Stream, StreamBatch, StreamMode,
+    WatermarkSpec, WindowedStream,
 };
 
 // Arrow schema/type primitives re-exported so users never import `arrow` directly.
@@ -160,12 +161,12 @@ pub mod distributed {
 /// ```
 pub mod prelude {
     pub use crate::{
-        AggregateUdf, CommitHandle, ConnectorCapabilities, ConnectorConfig, ConnectorError,
-        DataFrame, DataType, EmitMode, Execute, ExecutionMode, Field, IcebergScanOptions,
-        IcebergTableRef, KeyedStream, KrishivError, LakehouseTable, Offset, QueryResult,
-        RecordBatch, Relation, Result, ScalarUdf, Schema, SchemaRef, Session, SessionBuilder,
-        SessionExt, SessionWindowedStream, Sink, SlidingWindowedStream, Source, StateTtlConfig,
-        Stream, StreamBatch, StreamHandle, StreamMode, TableUdf, UdfError, UdfRegistry,
-        WatermarkSpec, WindowSpec, WindowedStream,
+        AggExpr, AggFunction, AggregateUdf, CommitHandle, ConnectorCapabilities, ConnectorConfig,
+        ConnectorError, DataFrame, DataType, EmitMode, Execute, ExecutionMode, Field,
+        IcebergScanOptions, IcebergTableRef, KeyedStream, KrishivError, LakehouseTable, Offset,
+        QueryResult, RecordBatch, Relation, Result, ScalarUdf, Schema, SchemaRef, Session,
+        SessionBuilder, SessionExt, SessionWindowedStream, Sink, SlidingWindowedStream, Source,
+        StateTtlConfig, Stream, StreamBatch, StreamHandle, StreamMode, TableUdf, UdfError,
+        UdfRegistry, WatermarkSpec, WindowSpec, WindowedStream,
     };
 }

@@ -342,12 +342,13 @@ impl PySession {
 
     /// Create an unbounded streaming DataFrame backed by a named source.
     pub fn from_source(&self, name: String) -> PyResult<PyRelation> {
-        let pipeline = StreamPipeline::new(
+        let mut pipeline = StreamPipeline::new(
             self.inner.clone(),
             name,
             String::new(),
             0,
         );
+        pipeline.bounded = false;
         Ok(PyRelation::from_pipeline(pipeline))
     }
 
@@ -375,12 +376,14 @@ impl PySession {
         let pipeline = StreamPipeline {
             session: self.inner.clone(),
             source_id: format!("memory:{name}"),
+            bounded: true,
             watermark_column,
             max_lateness_ms,
             key_columns: Vec::new(),
             event_time_column: None,
             window: None,
             aggregations: Vec::new(),
+            source_watermarks: std::collections::HashMap::new(),
         };
         Ok(PyRelation::from_pipeline(pipeline))
     }

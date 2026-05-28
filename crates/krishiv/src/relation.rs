@@ -45,6 +45,8 @@ pub(crate) struct StreamingChain {
     pub(crate) watermark_lag_ms: u64,
     pub(crate) window: Option<WindowSpec>,
     pub(crate) emit_mode: EmitMode,
+    /// Custom aggregation expressions; defaults to COUNT(*) when None.
+    pub(crate) agg_exprs: Option<Vec<krishiv_api::AggExpr>>,
 }
 
 impl StreamingChain {
@@ -84,7 +86,10 @@ impl StreamingChain {
             watermark_lag_ms: self.watermark_lag_ms,
             window_kind,
             window_size_ms,
-            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            agg_exprs: self
+                .agg_exprs
+                .clone()
+                .unwrap_or_else(LocalWindowExecutionSpec::default_count_agg),
             state_ttl_ms,
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
@@ -94,15 +99,11 @@ impl StreamingChain {
     /// Execute over the bounded in-memory batches.
     fn execute_bounded(&self) -> krishiv_api::Result<Vec<StreamBatch>> {
         let spec = self.build_exec_spec()?;
-
-        // Execute using the runtime's bounded window collection path.
-        // The runtime takes the input batches directly — no separate registration needed.
         let input: Vec<RecordBatch> = self.batches.iter().map(|b| b.batch().clone()).collect();
-        let runtime = self.session.execution_runtime();
-        let output = runtime
-            .collect_bounded_window(&self.source_name, input, &spec)
+        // Use execute_windowed_stream so the plan is also registered via accept_plan
+        // (matching the behaviour of the older WindowedStream::collect_with_aggs path).
+        let output = krishiv_api::execute_windowed_stream(input, &spec)
             .map_err(KrishivError::from)?;
-
         Ok(output
             .into_iter()
             .enumerate()
@@ -231,6 +232,33 @@ impl Relation {
         match self.kind {
             RelationKind::Stream(mut chain) => {
                 chain.emit_mode = mode;
+                Relation {
+                    kind: RelationKind::Stream(chain),
+                }
+            }
+            RelationKind::Batch(_) => self,
+        }
+    }
+
+    /// Override the default COUNT(*) aggregation with custom expressions.
+    ///
+    /// ```rust,ignore
+    /// use krishiv_api::{AggExpr, AggFunction};
+    /// let result = session
+    ///     .from_bounded_stream("orders", batches)
+    ///     .key_by("customer_id")
+    ///     .with_event_time("ts")
+    ///     .window(WindowSpec::Tumbling { size_ms: 60_000 })
+    ///     .agg(vec![
+    ///         AggExpr { function: AggFunction::Sum, input_column: "amount".into(), output_column: "total".into() },
+    ///         AggExpr { function: AggFunction::Count, input_column: String::new(), output_column: "cnt".into() },
+    ///     ])
+    ///     .collect()?;
+    /// ```
+    pub fn agg(self, exprs: Vec<krishiv_api::AggExpr>) -> Self {
+        match self.kind {
+            RelationKind::Stream(mut chain) => {
+                chain.agg_exprs = Some(exprs);
                 Relation {
                     kind: RelationKind::Stream(chain),
                 }

@@ -101,10 +101,7 @@ impl PyRelation {
     pub fn is_bounded(&self) -> bool {
         match &self.kind {
             RelationKind::Batch(_) => true,
-            RelationKind::Stream(p) => {
-                // A pipeline from memory: prefix is bounded.
-                p.source_id.starts_with("memory:")
-            }
+            RelationKind::Stream(p) => p.bounded,
         }
     }
 
@@ -196,9 +193,31 @@ impl PyRelation {
         self.window("sliding", size_ms, Some(slide_ms), None)
     }
 
-    /// Convenience shorthand for `window("session", gap_ms)`.
+    /// Convenience shorthand for a session window with the given inactivity gap.
     pub fn session_window(&self, gap_ms: u64) -> PyResult<PyRelation> {
-        self.window("session", gap_ms, None, Some(gap_ms))
+        let p = self.ensure_stream("session_window")?;
+        let mut pipeline = p.clone();
+        pipeline.window = Some(WindowDescriptor {
+            kind: WindowKind::Session,
+            size_ms: 0,
+            slide_ms: None,
+            gap_ms: Some(gap_ms),
+        });
+        Ok(PyRelation::from_pipeline(pipeline))
+    }
+
+    /// Register a per-source watermark lag for multi-source streaming joins.
+    ///
+    /// Call once per source before `.collect()`. Each source uses its own lag;
+    /// the effective watermark is the minimum across all registered sources.
+    pub fn with_source_watermark(
+        &self,
+        source_id: String,
+        lag_ms: u64,
+    ) -> PyResult<PyRelation> {
+        let p = self.ensure_stream("with_source_watermark")?;
+        let pipeline = p.with_source_watermark(source_id, lag_ms);
+        Ok(PyRelation::from_pipeline(pipeline))
     }
 
     // ── Terminal operations ───────────────────────────────────────────────────
@@ -224,6 +243,34 @@ impl PyRelation {
     /// Convert results to a pandas DataFrame.
     pub fn to_pandas(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.collect(py)?.to_pandas(py)
+    }
+
+    /// Write all results to a Parquet file at `path`.
+    ///
+    /// Works for both batch and bounded streaming relations. Raises `RuntimeError`
+    /// for unbounded streams (use `sink_to` instead).
+    pub fn write_parquet(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        let result = py.detach(|| self.collect_internal())?;
+        py.detach(move || {
+            let batches = result.into_batches();
+            if batches.is_empty() {
+                return Ok(());
+            }
+            let schema = batches[0].schema();
+            let file = std::fs::File::create(&path)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            for batch in &batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            }
+            writer
+                .close()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
     }
 
     pub fn __repr__(&self) -> String {
