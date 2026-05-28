@@ -604,6 +604,15 @@ pub struct ExecutorTaskRunner {
     /// locally-injected barriers with this token so the coordinator does not
     /// reject acks from stale-token barriers after a leadership election.
     pub(crate) cached_coordinator_fencing_token: Arc<AtomicU64>,
+
+    /// Per-source `rows_per_second` throttle limits received from the
+    /// coordinator heartbeat response (R7.2).
+    ///
+    /// The heartbeat loop writes into this table via
+    /// `SourceThrottleTable::apply()`; source operators read from it via
+    /// `SourceThrottleTable::check_and_log()` or `active_limit()`.
+    /// Clone is cheap — all runner clones share the same underlying `DashMap`.
+    pub source_throttle_limits: crate::source_throttle::SourceThrottleTable,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -635,6 +644,10 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .cached_coordinator_fencing_token
                     .load(Ordering::Relaxed),
             )
+            .field(
+                "source_throttle_limits",
+                &self.source_throttle_limits.len(),
+            )
             .finish()
     }
 }
@@ -658,6 +671,7 @@ impl ExecutorTaskRunner {
             cached_coordinator_fencing_token: Arc::new(AtomicU64::new(
                 FencingToken::initial().as_u64(),
             )),
+            source_throttle_limits: crate::source_throttle::SourceThrottleTable::new(),
         }
     }
 
@@ -672,6 +686,16 @@ impl ExecutorTaskRunner {
     /// consumed by the runner loop and trigger checkpoint initiation.
     pub fn with_barrier_injector(mut self, injector: SharedBarrierInjector) -> Self {
         self.barrier_injector = Some(injector);
+        self
+    }
+
+    /// Attach a pre-created `SourceThrottleTable` so the heartbeat loop and
+    /// runner tasks share the same limit map (R7.2 backpressure credit wiring).
+    pub fn with_source_throttle_table(
+        mut self,
+        table: crate::source_throttle::SourceThrottleTable,
+    ) -> Self {
+        self.source_throttle_limits = table;
         self
     }
 

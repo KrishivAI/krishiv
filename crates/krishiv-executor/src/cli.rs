@@ -224,7 +224,10 @@ async fn heartbeat_loop(
         );
         tokio::spawn(async move {
             let _ = Server::builder()
-                .add_service(executor_barrier_grpc_server(barrier_service))
+                .add_service(tonic::service::interceptor(
+                    executor_barrier_grpc_server(barrier_service),
+                    krishiv_metrics::grpc::extract_trace_context,
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
         });

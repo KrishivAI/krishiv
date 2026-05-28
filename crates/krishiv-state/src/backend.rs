@@ -69,4 +69,15 @@ pub trait StateBackend: Send + Sync {
     fn purge_expired(&mut self) -> StateResult<usize> {
         Ok(0)
     }
+
+    /// Inform the backend of the current event-time watermark in milliseconds.
+    ///
+    /// When called on a [`TtlStateBackend`], subsequent `purge_expired` and
+    /// read-time expiry checks will use `watermark_ms` as "current time" instead
+    /// of the wall clock, enabling deterministic event-time-based eviction driven
+    /// by the streaming executor's watermark.
+    ///
+    /// The default implementation is a no-op — backends that do not implement
+    /// TTL expiry ignore the watermark.
+    fn set_watermark(&mut self, _watermark_ms: i64) {}
 }

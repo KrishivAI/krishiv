@@ -74,6 +74,15 @@ impl StateBackedTumblingWindowOperator {
             .purge_expired()
             .map_err(|e| ExecError::Arrow(e.to_string()))
     }
+
+    /// Propagate the event-time watermark to the underlying state backend.
+    ///
+    /// When the state backend is a [`krishiv_state::TtlStateBackend`], this
+    /// enables event-time-based TTL eviction instead of wall-clock eviction.
+    /// Call this before `purge_expired` each drain cycle.
+    pub fn set_watermark(&mut self, watermark_ms: i64) {
+        self.state.set_watermark(watermark_ms);
+    }
 }
 
 pub struct StateBackedSlidingWindowOperator {
@@ -138,6 +147,15 @@ impl StateBackedSlidingWindowOperator {
             .purge_expired()
             .map_err(|e| ExecError::Arrow(e.to_string()))
     }
+
+    /// Propagate the event-time watermark to the underlying state backend.
+    ///
+    /// When the state backend is a [`krishiv_state::TtlStateBackend`], this
+    /// enables event-time-based TTL eviction instead of wall-clock eviction.
+    /// Call this before `purge_expired` each drain cycle.
+    pub fn set_watermark(&mut self, watermark_ms: i64) {
+        self.state.set_watermark(watermark_ms);
+    }
 }
 
 pub struct StateBackedSessionWindowOperator {
@@ -197,5 +215,14 @@ impl StateBackedSessionWindowOperator {
         self.state
             .purge_expired()
             .map_err(|e| ExecError::Arrow(e.to_string()))
+    }
+
+    /// Propagate the event-time watermark to the underlying state backend.
+    ///
+    /// When the state backend is a [`krishiv_state::TtlStateBackend`], this
+    /// enables event-time-based TTL eviction instead of wall-clock eviction.
+    /// Call this before `purge_expired` each drain cycle.
+    pub fn set_watermark(&mut self, watermark_ms: i64) {
+        self.state.set_watermark(watermark_ms);
     }
 }

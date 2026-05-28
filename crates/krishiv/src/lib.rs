@@ -85,7 +85,9 @@ pub use krishiv_connectors::{
 // ── Lakehouse API ─────────────────────────────────────────────────────────────
 
 pub use krishiv_lakehouse::{
-    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaField, SchemaVersion,
+    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, MemoryLakehouseTable,
+    MultiWriterGuard, PartitionField, PartitionSpecResolver, PartitionSpecVersion, SchemaField,
+    SchemaVersion, check_write_precondition,
 };
 
 // ── Top-level aliases ─────────────────────────────────────────────────────────

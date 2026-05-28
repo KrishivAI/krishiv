@@ -22,6 +22,7 @@ use krishiv_catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridg
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+pub mod create_function_ddl;
 mod lakehouse;
 pub mod live_table;
 pub mod spark_compat;
@@ -382,6 +383,39 @@ impl SqlEngine {
         self.sync_scalar_udfs().await?;
         self.sync_aggregate_udfs().await?;
         self.sync_table_udfs().await?;
+
+        // ── Intercept CREATE FUNCTION … RETURNS TABLE ────────────────────────
+        // DataFusion does not understand this extended DDL syntax.  Parse it
+        // here, register a stub UDTF, and return a trivial empty DataFrame so
+        // callers see a successful DDL result rather than a parse error.
+        if create_function_ddl::is_create_function_returns_table(query) {
+            // Register in the Krishiv UDF registry if one is attached.
+            let _ddl = if let Some(registry) = &self.udf_registry {
+                let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+                create_function_ddl::register_udtf_from_sql(query, &mut guard)
+                    .map_err(|e| SqlError::DataFusion { message: e })?
+            } else {
+                // No shared registry — parse, build a temporary one, and sync
+                // the stub directly into the DataFusion context.
+                let ddl = create_function_ddl::parse_create_function(query)
+                    .map_err(|e| SqlError::DataFusion { message: e })?;
+                let mut tmp_registry = krishiv_udf::UdfRegistry::new();
+                let stub = create_function_ddl::StubTableUdf::from_ddl(&ddl);
+                tmp_registry.register_table(std::sync::Arc::new(stub));
+                udf::sync_table_udfs(&self.context, &tmp_registry)
+                    .map_err(SqlError::from)?;
+                ddl
+            };
+            // If a shared registry is attached, sync the new UDTF into DataFusion.
+            if self.udf_registry.is_some() {
+                self.sync_table_udfs().await?;
+            }
+            // Return a trivial empty DataFrame representing "DDL OK".
+            let dataframe = self.context.sql("SELECT 1 AS result WHERE 1 = 0").await?;
+            return Ok(SqlDataFrame::new("create-function-ddl", dataframe).with_query(query));
+        }
 
         if query
             .trim_start()
@@ -1146,5 +1180,87 @@ mod udf_sql_tests {
             .unwrap();
         assert_eq!(col.value(0), 6);
         assert_eq!(col.value(1), 12);
+    }
+}
+
+#[cfg(test)]
+mod udtf_ddl_tests {
+    use std::sync::Arc;
+
+    use super::SqlEngine;
+
+    /// `CREATE FUNCTION … RETURNS TABLE` must not return an error even when the
+    /// body is a stub and no real execution backend is wired up.
+    #[tokio::test]
+    async fn create_function_returns_table_does_not_error() {
+        let engine = SqlEngine::new();
+        let result = engine
+            .sql(
+                "CREATE FUNCTION my_udtf(arg1 INT) \
+                 RETURNS TABLE (col1 TEXT, col2 BIGINT) \
+                 LANGUAGE RUST \
+                 AS 'fn stub() {}'",
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "CREATE FUNCTION … RETURNS TABLE should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// With a shared `UdfRegistry` the stub must land in the registry after DDL.
+    #[tokio::test]
+    async fn create_function_returns_table_populates_udf_registry() {
+        let registry = Arc::new(std::sync::RwLock::new(krishiv_udf::UdfRegistry::new()));
+        let engine = SqlEngine::new().with_udf_registry(registry.clone());
+        engine
+            .sql(
+                "CREATE FUNCTION counts_udtf(n INT) \
+                 RETURNS TABLE (id BIGINT, label TEXT)",
+            )
+            .await
+            .expect("DDL should succeed");
+
+        let guard = registry.read().unwrap();
+        let found = guard.get_table("counts_udtf");
+        assert!(found.is_some(), "UDTF must be present in the UdfRegistry after DDL");
+        let schema = found.unwrap().output_schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "label");
+    }
+
+    /// Without a shared registry the DDL must still succeed (direct context path).
+    #[tokio::test]
+    async fn create_function_returns_table_no_registry_succeeds() {
+        let engine = SqlEngine::new(); // no udf_registry attached
+        let result = engine
+            .sql(
+                "CREATE FUNCTION no_reg_udtf(x INT) \
+                 RETURNS TABLE (val DOUBLE)",
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "DDL without registry should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// After DDL the DDL result DataFrame must be collectible and empty.
+    #[tokio::test]
+    async fn create_function_returns_table_result_is_empty() {
+        let engine = SqlEngine::new();
+        let df = engine
+            .sql(
+                "CREATE FUNCTION empty_udtf(x INT) \
+                 RETURNS TABLE (a TEXT)",
+            )
+            .await
+            .expect("DDL should succeed");
+        let batches = df.collect().await.expect("collect should succeed");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "DDL result should be empty");
     }
 }

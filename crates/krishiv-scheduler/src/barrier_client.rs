@@ -9,14 +9,20 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::barrier_tracker::CheckpointBarrierTracker;
 
 /// Send a checkpoint barrier to an executor and record the returned ack.
-pub async fn inject_barrier(
-    client: &mut krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient<
-        tonic::transport::Channel,
-    >,
+pub async fn inject_barrier<T>(
+    client: &mut krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient<T>,
     barrier: CheckpointBarrier,
     tracker: &mut CheckpointBarrierTracker,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody>,
+    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    T::ResponseBody:
+        http_body::Body<Data = bytes::Bytes> + std::marker::Send + 'static,
+    <T::ResponseBody as http_body::Body>::Error:
+        Into<Box<dyn std::error::Error + Send + Sync>> + std::marker::Send,
+{
     let (tx, rx) = mpsc::channel(2);
     tx.send(barrier)
         .await

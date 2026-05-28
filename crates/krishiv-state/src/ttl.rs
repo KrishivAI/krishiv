@@ -24,20 +24,52 @@ impl TtlConfig {
 /// Values are encoded as `[8-byte LE expires_at_ms][raw value bytes]`.
 /// Expired values are treated as absent (lazy deletion on read; the raw bytes
 /// remain in the inner store until the next write or `clear_namespace`).
+///
+/// When a watermark is set via [`TtlStateBackend::set_watermark`], expiry checks
+/// use event time instead of wall-clock time, enabling deterministic, reproducible
+/// eviction driven by the streaming executor's watermark.
 pub struct TtlStateBackend<B: StateBackend> {
     inner: B,
     config: TtlConfig,
+    /// Event-time watermark in milliseconds set by the streaming executor.
+    ///
+    /// When `Some`, `purge_expired` and read-time expiry checks use this value
+    /// as "current time" instead of `unix_now_ms()`.  This allows event-time-based
+    /// eviction to be driven from the watermark rather than wall-clock time.
+    watermark_ms: Option<i64>,
 }
 
 impl<B: StateBackend> TtlStateBackend<B> {
     /// Wrap `inner` with the given TTL config.
     pub fn new(inner: B, config: TtlConfig) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            config,
+            watermark_ms: None,
+        }
     }
 
     /// Access the underlying backend.
     pub fn inner(&self) -> &B {
         &self.inner
+    }
+
+    /// Set the event-time watermark used for TTL expiry checks.
+    ///
+    /// After this is called, `purge_expired` and lazy read-time expiry checks
+    /// will use `watermark_ms` as "current time" instead of `unix_now_ms()`.
+    /// Call this each drain cycle with the executor's latest watermark so that
+    /// TTL eviction is driven by event time rather than wall-clock time.
+    pub fn set_watermark(&mut self, watermark_ms: i64) {
+        self.watermark_ms = Some(watermark_ms);
+    }
+
+    /// Return the current "now" used for TTL comparisons.
+    ///
+    /// Returns the watermark if one has been set; otherwise falls back to
+    /// `unix_now_ms()` so that wall-clock TTL still works without a watermark.
+    fn now_ms(&self) -> i64 {
+        self.watermark_ms.unwrap_or_else(unix_now_ms)
     }
 
     fn encode(value: Vec<u8>, expires_at_ms: i64) -> Vec<u8> {
@@ -73,7 +105,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     fn get(&self, namespace: &Namespace, key: &[u8]) -> StateResult<Option<Vec<u8>>> {
         match self.inner.get(namespace, key)? {
             None => Ok(None),
-            Some(encoded) => Self::decode_if_live(encoded, unix_now_ms()),
+            Some(encoded) => Self::decode_if_live(encoded, self.now_ms()),
         }
     }
 
@@ -96,7 +128,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     }
 
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
-        let now_ms = unix_now_ms();
+        let now_ms = self.now_ms();
         let all_keys = self.inner.list_keys(namespace)?;
         let mut live = Vec::with_capacity(all_keys.len());
         for key in all_keys {
@@ -144,7 +176,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                         message: "ttl expiry prefix is not 8 bytes in snapshot".into(),
                     }
                 })?);
-            let now_ms = unix_now_ms();
+            let now_ms = self.now_ms();
             if now_ms >= expires_at_ms {
                 // Skip already-expired entries — they're invisible on read anyway.
                 continue;
@@ -166,6 +198,16 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         Ok(out)
     }
 
+    /// Forward the event-time watermark so that `purge_expired` and read-time
+    /// expiry checks use event time rather than wall-clock time.
+    ///
+    /// Delegates to the inherent [`TtlStateBackend::set_watermark`] method.
+    fn set_watermark(&mut self, watermark_ms: i64) {
+        // Call the inherent method directly (inherent methods take priority over
+        // trait methods when called via `self.`, so there is no recursion here).
+        TtlStateBackend::set_watermark(self, watermark_ms);
+    }
+
     /// GAP-15: Eagerly remove all expired entries from the inner backend.
     ///
     /// `TtlStateBackend` uses lazy deletion on reads — expired values are only
@@ -180,7 +222,7 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     ///
     /// Returns the number of entries removed.
     fn purge_expired(&mut self) -> StateResult<usize> {
-        let now_ms = unix_now_ms();
+        let now_ms = self.now_ms();
         let namespaces = self.inner.list_namespaces()?;
         let mut evicted = 0usize;
         for ns in &namespaces {

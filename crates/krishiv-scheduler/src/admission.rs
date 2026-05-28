@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use krishiv_proto::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -60,14 +60,23 @@ pub struct QuotaPolicy {
 /// against per-namespace or default policies. A job that would exceed any
 /// limit is returned as `Queued { position: 0 }` rather than rejected, so the
 /// caller may retry admission after earlier jobs complete.
+///
+/// When constructed via [`QuotaQueueManager::with_state_path`], `namespace_policies`
+/// are persisted to disk on every mutation and reloaded automatically on startup,
+/// so they survive coordinator restarts.
 #[derive(Debug)]
 pub struct QuotaQueueManager {
     default_policy: QuotaPolicy,
     namespace_policies: HashMap<String, QuotaPolicy>,
+    /// If `Some`, mutations to `namespace_policies` are atomically written to
+    /// this path so they survive process restarts.
+    state_path: Option<PathBuf>,
 }
 
 impl QuotaQueueManager {
     /// Create a quota manager with a default policy and optional per-namespace overrides.
+    ///
+    /// No persistence is configured; use [`Self::with_state_path`] for durable storage.
     pub fn new(
         default_policy: QuotaPolicy,
         namespace_policies: HashMap<String, QuotaPolicy>,
@@ -75,12 +84,112 @@ impl QuotaQueueManager {
         Self {
             default_policy,
             namespace_policies,
+            state_path: None,
         }
     }
 
     /// Create a quota manager with a single default policy applied to all namespaces.
     pub fn with_default(default_policy: QuotaPolicy) -> Self {
         Self::new(default_policy, HashMap::new())
+    }
+
+    /// Create a quota manager that persists `namespace_policies` to `path`.
+    ///
+    /// If `path` already exists its contents are deserialized and used as the
+    /// initial `namespace_policies` (log-warn on parse error). All subsequent
+    /// calls to [`Self::register_policy`] and [`Self::remove_policy`] atomically
+    /// flush the updated policies to disk so they survive coordinator restarts.
+    pub fn with_state_path(path: PathBuf) -> Self {
+        let mut mgr = Self::new(QuotaPolicy::default(), HashMap::new());
+        if path.exists() {
+            match fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<HashMap<String, QuotaPolicy>>(&content)
+                {
+                    Ok(policies) => {
+                        mgr.namespace_policies = policies;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "QuotaQueueManager: failed to deserialize state file; starting with empty policies"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "QuotaQueueManager: failed to read state file; starting with empty policies"
+                    );
+                }
+            }
+        }
+        mgr.state_path = Some(path);
+        mgr
+    }
+
+    /// Register (or replace) a per-namespace `policy`.
+    ///
+    /// If a `state_path` is configured the updated policies are atomically
+    /// flushed to disk.
+    pub fn register_policy(&mut self, namespace: String, policy: QuotaPolicy) {
+        self.namespace_policies.insert(namespace, policy);
+        self.persist();
+    }
+
+    /// Remove the per-namespace policy for `namespace`.
+    ///
+    /// Returns the removed policy, if any. If a `state_path` is configured the
+    /// updated policies are atomically flushed to disk.
+    pub fn remove_policy(&mut self, namespace: &str) -> Option<QuotaPolicy> {
+        let removed = self.namespace_policies.remove(namespace);
+        if removed.is_some() {
+            self.persist();
+        }
+        removed
+    }
+
+    /// Atomically persist `namespace_policies` to `state_path`.
+    ///
+    /// Writes to `<state_path>.tmp` first, then renames to `<state_path>` so a
+    /// partial write never corrupts the on-disk state. Errors are logged at
+    /// `WARN` level and never propagated — persistence is best-effort.
+    fn persist(&self) {
+        let Some(ref path) = self.state_path else {
+            return;
+        };
+
+        let json = match serde_json::to_string(&self.namespace_policies) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "QuotaQueueManager: failed to serialize namespace policies"
+                );
+                return;
+            }
+        };
+
+        let tmp_path = path.with_extension("tmp");
+        if let Err(e) = fs::write(&tmp_path, &json) {
+            tracing::warn!(
+                path = %tmp_path.display(),
+                error = %e,
+                "QuotaQueueManager: failed to write temporary state file"
+            );
+            return;
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, path) {
+            tracing::warn!(
+                src = %tmp_path.display(),
+                dst = %path.display(),
+                error = %e,
+                "QuotaQueueManager: failed to rename temporary state file"
+            );
+        }
     }
 
     fn policy_for(&self, namespace_id: Option<&str>) -> &QuotaPolicy {

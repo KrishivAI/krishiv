@@ -642,9 +642,13 @@ pub async fn serve_coordinator_executor_grpc(
 ) -> Result<(), tonic::transport::Error> {
     let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
-        .add_service(coordinator_executor_grpc_server(coordinator))
-        .add_service(coordinator_management_grpc_server(
-            coordinator_for_management,
+        .add_service(tonic::service::interceptor(
+            coordinator_executor_grpc_server(coordinator),
+            krishiv_metrics::grpc::extract_trace_context,
+        ))
+        .add_service(tonic::service::interceptor(
+            coordinator_management_grpc_server(coordinator_for_management),
+            krishiv_metrics::grpc::extract_trace_context,
         ))
         .serve(addr)
         .await
@@ -657,9 +661,13 @@ pub async fn serve_coordinator_executor_grpc_with_listener(
 ) -> Result<(), tonic::transport::Error> {
     let coordinator_for_management = coordinator.clone();
     tonic::transport::Server::builder()
-        .add_service(coordinator_executor_grpc_server(coordinator))
-        .add_service(coordinator_management_grpc_server(
-            coordinator_for_management,
+        .add_service(tonic::service::interceptor(
+            coordinator_executor_grpc_server(coordinator),
+            krishiv_metrics::grpc::extract_trace_context,
+        ))
+        .add_service(tonic::service::interceptor(
+            coordinator_management_grpc_server(coordinator_for_management),
+            krishiv_metrics::grpc::extract_trace_context,
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await

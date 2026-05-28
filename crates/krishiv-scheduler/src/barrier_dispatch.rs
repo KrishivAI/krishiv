@@ -179,7 +179,11 @@ pub async fn dispatch_barrier_plan(
         let checkpoint_id = format!("task:{}/cp-{}", target.task_id.as_str(), plan.epoch);
         let channel = get_or_connect_barrier_channel(&target.barrier_endpoint).await?;
         let mut client =
-            krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient::new(channel);
+            krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient::with_interceptor(
+                channel,
+                krishiv_metrics::grpc::inject_trace_context
+                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            );
         let barrier = CheckpointBarrier {
             epoch: plan.epoch,
             job_id: plan.job_id.as_str().to_owned(),

@@ -439,7 +439,6 @@ impl Coordinator {
     /// re-submitting the job from scratch.
     ///
     /// Returns throttle commands to forward back to the executor (R7.2 Group C).
-    /// Currently returns an empty vec unless adaptive source throttling is wired up.
     pub fn executor_heartbeat(
         &mut self,
         heartbeat: ExecutorHeartbeat,
@@ -455,7 +454,7 @@ impl Coordinator {
             self.apply_streaming_task_state(state);
         }
         // R7.2 Group D: process hot-key reports and record adaptive decisions.
-        self.process_hot_key_reports(&hot_key_reports);
+        let source_throttles = self.process_hot_key_reports(&hot_key_reports);
         if !llm_reports.is_empty() {
             self.llm_quota_aggregator.ingest(&llm_reports);
         }
@@ -467,23 +466,37 @@ impl Coordinator {
             .map(|e| e.lease_generation())
             .unwrap_or(fallback_lease);
         Ok(ExecutorHeartbeatEffects {
-            source_throttles: Vec::new(),
+            source_throttles,
             llm_throttles,
             checkpoint_commands,
             lease_generation,
         })
     }
 
-    /// Record adaptive decisions for incoming hot-key reports.
+    /// Record adaptive decisions for incoming hot-key reports and return throttle
+    /// commands to send back to the executor.
     ///
-    /// For each hot key whose heat_score exceeds the threshold, logs an
-    /// `AdaptiveDecisionLog` entry. If `disable_hot_key_splitting` is set,
-    /// the decision is logged with `applied: false`.
-    fn process_hot_key_reports(&mut self, reports: &[HeartbeatHotKeyReport]) {
+    /// For each hot key whose `heat_score` exceeds `HOT_KEY_HEAT_THRESHOLD`, an
+    /// `AdaptiveDecisionLog` entry is recorded AND a `ThrottleDecision` is returned
+    /// so the executor can immediately reduce the source's ingestion rate.
+    ///
+    /// The throttle rate is set to `(1.0 - heat_score) * base_rows_per_second`
+    /// (floor: 1 row/s) so hotter keys receive more aggressive throttling.
+    ///
+    /// If `disable_hot_key_splitting` is set the decision is logged with
+    /// `applied = false` and no throttle command is emitted.
+    fn process_hot_key_reports(
+        &mut self,
+        reports: &[HeartbeatHotKeyReport],
+    ) -> Vec<crate::adaptive::ThrottleDecision> {
+        const HOT_KEY_HEAT_THRESHOLD: f64 = 0.3;
+        const BASE_ROWS_PER_SECOND: u64 = 10_000;
+
         if reports.is_empty() {
-            return;
+            return Vec::new();
         }
         let now_ms = u64::try_from(krishiv_async_util::unix_now_ms()).unwrap_or(0);
+        let mut throttles = Vec::new();
 
         for report in reports {
             if report.job_id.is_empty() {
@@ -493,7 +506,8 @@ impl Coordinator {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let applied = !self.adaptive_override.disable_hot_key_splitting;
+            let is_hot = report.heat_score >= HOT_KEY_HEAT_THRESHOLD;
+            let applied = is_hot && !self.adaptive_override.disable_hot_key_splitting;
             let log = AdaptiveDecisionLog {
                 timestamp_ms: now_ms,
                 kind: AdaptiveDecisionKind::HotKeySplit,
@@ -508,7 +522,24 @@ impl Coordinator {
                 .entry(job_id)
                 .or_default()
                 .push(log);
+
+            if applied {
+                // Throttle the source proportional to its heat score.
+                let reduced_rate = ((1.0 - report.heat_score) * BASE_ROWS_PER_SECOND as f64)
+                    .max(1.0) as u64;
+                throttles.push(crate::adaptive::ThrottleDecision {
+                    source_id: report.source_id.clone(),
+                    rows_per_second: Some(reduced_rate),
+                });
+                tracing::info!(
+                    source_id = %report.source_id,
+                    heat_score = report.heat_score,
+                    throttle_rate = reduced_rate,
+                    "hot-key throttle applied"
+                );
+            }
         }
+        throttles
     }
 
     /// Update a task record's last-known watermark and source offset from executor-reported state.
@@ -1371,7 +1402,11 @@ impl Coordinator {
             let channels = Arc::clone(&channels);
             futures.push(async move {
                 let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
-                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                    channel,
+                    krishiv_metrics::grpc::inject_trace_context
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                );
                 let response = client
                     .assign_task(wire::executor_task_assignment_to_wire(assignment.clone()))
                     .await
@@ -1491,7 +1526,11 @@ impl Coordinator {
                         return;
                     }
                 };
-                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::new(channel);
+                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                    channel,
+                    krishiv_metrics::grpc::inject_trace_context
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                );
                 if let Err(err) = client
                     .cancel_task(wire::task_cancellation_request_to_wire(req))
                     .await
