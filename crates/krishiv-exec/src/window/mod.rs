@@ -112,6 +112,12 @@ impl MultiSourceWatermarkState {
     }
 
     /// Apply idle-source policy using current wall clock.
+    ///
+    /// GAP-14: Only advance the watermark for sources that have already seen at
+    /// least one real event (i.e. whose current watermark is not `i64::MIN`).
+    /// Advancing the watermark to `idle_watermark_ms` for a source that has
+    /// never emitted any events would allow windows to close before data arrives,
+    /// silently producing empty window output.
     pub fn apply_idle_source_policy(&mut self) {
         let Some(timeout_ms) = self.idle_timeout_ms else {
             return;
@@ -123,7 +129,11 @@ impl MultiSourceWatermarkState {
                     .source_watermarks
                     .entry(source_id.clone())
                     .or_insert(i64::MIN);
-                if self.idle_watermark_ms > *entry {
+                // Guard: only advance watermark if the source has seen events.
+                // A watermark of i64::MIN means no real event has ever been
+                // observed from this source; advancing it here would cause
+                // downstream windows to close without data.
+                if *entry != i64::MIN && self.idle_watermark_ms > *entry {
                     *entry = self.idle_watermark_ms;
                 }
             }
@@ -151,4 +161,70 @@ fn wall_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+
+    #[test]
+    fn watermark_state_returns_min_before_any_event() {
+        let w = WatermarkState::new(1_000);
+        assert_eq!(
+            w.current_watermark_ms(),
+            i64::MIN,
+            "no events → watermark must remain i64::MIN"
+        );
+    }
+
+    #[test]
+    fn watermark_state_advances_after_event() {
+        let mut w = WatermarkState::new(1_000);
+        w.advance(5_000);
+        assert_eq!(w.current_watermark_ms(), 4_000);
+    }
+
+    /// GAP-14: idle-source policy must NOT advance a watermark that is still
+    /// i64::MIN (source never emitted events).  Advancing it would close windows
+    /// before any data arrives, producing silent data loss.
+    #[test]
+    fn idle_source_policy_does_not_advance_watermark_for_never_seen_source() {
+        let mut state = MultiSourceWatermarkState::new()
+            .with_idle_source_policy(0, 99_999_999);
+
+        // Register source-a with one real event so it appears in last_update_ms.
+        // Intentionally set last_update_ms to 0 so the idle timeout always fires.
+        state.update("source-a", i64::MIN);
+
+        // Call apply_idle_source_policy — the source has seen no real events
+        // (watermark == i64::MIN) so the policy must leave it untouched.
+        state.apply_idle_source_policy();
+
+        assert_eq!(
+            state.effective_watermark_ms(),
+            i64::MIN,
+            "idle policy must not advance a never-seen source's watermark"
+        );
+    }
+
+    /// GAP-14 (positive case): a source that HAS seen events should be advanced
+    /// by the idle policy when the timeout expires.
+    #[test]
+    fn idle_source_policy_advances_watermark_for_idle_source_with_events() {
+        let idle_wm = 50_000i64;
+        let mut state = MultiSourceWatermarkState::new()
+            .with_idle_source_policy(0, idle_wm);
+
+        // Register source-a with a real event at t=1000; watermark = 1000.
+        state.update("source-a", 1_000);
+
+        // The idle timeout is 0 ms, so the policy fires immediately.
+        state.apply_idle_source_policy();
+
+        assert_eq!(
+            state.effective_watermark_ms(),
+            idle_wm,
+            "idle policy must advance watermark for a source that has seen events"
+        );
+    }
 }

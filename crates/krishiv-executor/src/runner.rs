@@ -574,6 +574,17 @@ pub struct ExecutorTaskRunner {
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
     /// Optional continuous streaming drain hook (in-process cluster).
     pub(crate) continuous_drainer: Option<Arc<dyn ContinuousJobDrainer>>,
+    /// Per-job stateful `ContinuousWindowExecutor` instances for `stream:loop:` fragments (GAP-6).
+    ///
+    /// Keyed by job-id string.  The executor is created on first use and
+    /// reused across drain cycles so that partial window state (e.g. an open
+    /// tumbling window that has not yet reached its watermark) accumulates
+    /// correctly across multiple invocations of the same `stream:loop:` task.
+    ///
+    /// `Arc<Mutex<…>>` because the runner is cloned between tasks but all
+    /// clones must share the same stateful executor for a given job.
+    pub(crate) loop_executors:
+        Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_exec::ContinuousWindowExecutor>>>>,
     /// Live executor lease generation, shared with the heartbeat loop.
     /// Used to stamp checkpoint-fanout RPCs without round-tripping through
     /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
@@ -596,6 +607,7 @@ impl fmt::Debug for ExecutorTaskRunner {
         f.debug_struct("ExecutorTaskRunner")
             .field("inbox", &self.inbox)
             .field("shuffle", &self.shuffle)
+            .field("loop_executors", &self.loop_executors.len())
             .field(
                 "inmem_shuffle",
                 &self
@@ -634,6 +646,7 @@ impl ExecutorTaskRunner {
             checkpoint_runners: Arc::new(DashMap::new()),
             running_attempts: None,
             continuous_drainer: None,
+            loop_executors: Arc::new(DashMap::new()),
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),
             ),
@@ -831,8 +844,12 @@ impl ExecutorTaskRunner {
         };
 
         let fragment = assignment.plan_fragment().description().trim();
+        // GAP-6: stream:loop: fragments complete each drain cycle and report
+        // Succeeded so the coordinator sees the windowed output.  Future drain
+        // cycles are triggered by re-assigning the task.
         let terminal_streaming_task = model == crate::ExecutionModel::Streaming
             && (fragment.starts_with("stream:continuous:")
+                || fragment.starts_with("stream:loop:")
                 || krishiv_plan::window::parse_stream_fragment(fragment).is_ok());
         let terminal_state =
             if model == crate::ExecutionModel::Streaming && !terminal_streaming_task {

@@ -603,9 +603,53 @@ impl Coordinator {
         let job_ids: Vec<JobId> = self.checkpoint_coordinators.keys().cloned().collect();
         for job_id in job_ids {
             let running = self.running_task_count_for_job(&job_id);
+
+            // Capture the awaiting epoch BEFORE ticking so we can detect a
+            // timeout-triggered abort (GAP-5).  An abort transitions the state
+            // from AwaitingAcks → Failed; if that happens we must clean up
+            // checkpoint_notify_sent and barrier_dispatch_sent entries for the
+            // aborted epoch so they don't accumulate forever and block future
+            // checkpoint rounds.
+            let pre_tick_awaiting: Option<u64> =
+                self.checkpoint_coordinators.get(&job_id).and_then(|c| {
+                    if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = &c.state {
+                        Some(*epoch)
+                    } else {
+                        None
+                    }
+                });
+
             if let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) {
                 coord.set_expected_task_count(running);
                 coord.try_tick(elapsed_ms, self.config.checkpoint_ack_timeout_ms());
+            }
+
+            // GAP-5: if try_tick aborted an in-flight epoch, remove all stale
+            // tracking entries that referenced that epoch.
+            //
+            // Without this cleanup:
+            //   - checkpoint_notify_sent retains (job_id, executor_id, epoch) for
+            //     every executor that was notified; since the epoch number is never
+            //     reused those entries would live until the coordinator shuts down.
+            //   - barrier_dispatch_sent retains (job_id, epoch); again the epoch is
+            //     unique so the entry is harmless for correctness but wastes memory.
+            if let Some(aborted_epoch) = pre_tick_awaiting {
+                let was_aborted =
+                    self.checkpoint_coordinators.get(&job_id).is_some_and(|c| {
+                        matches!(c.state, CheckpointCoordinatorState::Failed { .. })
+                    });
+                if was_aborted {
+                    self.checkpoint_notify_sent
+                        .retain(|(jid, _, e)| jid != &job_id || *e != aborted_epoch);
+                    self.barrier_dispatch_sent
+                        .retain(|(jid, e)| jid != &job_id || *e != aborted_epoch);
+                    tracing::warn!(
+                        job_id = %job_id,
+                        epoch = aborted_epoch,
+                        "checkpoint epoch aborted by ack timeout; \
+                         cleaned up stale notify and barrier-dispatch tracking entries"
+                    );
+                }
             }
         }
 

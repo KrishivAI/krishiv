@@ -111,10 +111,26 @@ impl EtcdLeaseElection {
         self.lease_duration_s
     }
 
-    fn mark_leader(&self, lease_id: i64, bump_fence: bool) {
+    /// Record a successful leadership acquisition.
+    ///
+    /// GAP-11: When running against a live etcd cluster, the fencing token is
+    /// set to the etcd cluster revision at the time the lease was granted (or
+    /// the lease ID if no revision header is available).  The etcd revision is a
+    /// globally monotonic i64 counter that only increases; using it as the
+    /// fencing token guarantees that any coordinator that wins a later election
+    /// always has a strictly higher token than coordinators from previous epochs,
+    /// even across restarts.  This prevents stale coordinators from committing
+    /// checkpoints after they have been superseded.
+    ///
+    /// In simulation mode (no etcd client), `token` is the incremented local
+    /// counter (see `try_acquire`), which preserves test determinism.
+    fn mark_leader(&self, lease_id: i64, token: u64) {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if bump_fence {
-            s.fencing_token = s.fencing_token.saturating_add(1);
+        // Monotonically advance: never decrease the fencing token (guard against
+        // etcd revisions that are somehow lower than a previous grant's revision,
+        // e.g. if the token was seeded by a simulation run then a live etcd run).
+        if token > s.fencing_token {
+            s.fencing_token = token;
         }
         s.is_leader = true;
         s.lease_id = lease_id;
@@ -147,18 +163,30 @@ impl EtcdLeaseElection {
             self.clear_leader();
         }
 
-        let lease_id = match client.lease_grant(self.lease_duration_s as i64, None).await {
-            Ok(resp) => resp.id(),
-            Err(error) => {
-                tracing::warn!(
-                    key = %self.lease_key,
-                    %error,
-                    "etcd_lease: lease_grant failed during try_acquire"
-                );
-                self.clear_leader();
-                return false;
-            }
-        };
+        // GAP-11: Capture the etcd cluster revision from the lease_grant response.
+        // This revision is a monotonically increasing global counter assigned by
+        // etcd at the time of the grant.  We use it as our fencing token so that
+        // any coordinator winning a later election always has a higher token —
+        // even across coordinator restarts — without relying on local state.
+        let (lease_id, grant_revision) =
+            match client.lease_grant(self.lease_duration_s as i64, None).await {
+                Ok(resp) => {
+                    let rev = resp
+                        .header()
+                        .map(|h| h.revision() as u64)
+                        .unwrap_or(resp.id() as u64);
+                    (resp.id(), rev)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        key = %self.lease_key,
+                        %error,
+                        "etcd_lease: lease_grant failed during try_acquire"
+                    );
+                    self.clear_leader();
+                    return false;
+                }
+            };
 
         let key = self.lease_key.as_bytes();
         let holder = self.holder_identity.as_bytes();
@@ -168,7 +196,7 @@ impl EtcdLeaseElection {
             .and_then([put_with_lease(key, holder, lease_id)]);
         match client.txn(create_txn).await {
             Ok(resp) if resp.succeeded() => {
-                self.mark_leader(lease_id, true);
+                self.mark_leader(lease_id, grant_revision);
                 return true;
             }
             Ok(_) => {}
@@ -220,7 +248,7 @@ impl EtcdLeaseElection {
             .and_then([put_with_lease(key, holder, lease_id)]);
         match client.txn(takeover_txn).await {
             Ok(resp) if resp.succeeded() => {
-                self.mark_leader(lease_id, true);
+                self.mark_leader(lease_id, grant_revision);
                 true
             }
             Ok(_) => {
@@ -373,11 +401,11 @@ impl LeaderElection for EtcdLeaseElection {
             let mut guard = client.lock().await;
             return self.etcd_try_acquire(&mut guard).await;
         }
-        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        s.fencing_token = s.fencing_token.saturating_add(1);
-        s.is_leader = true;
-        s.lease_id = 1;
-        s.last_renewed_at = Some(Instant::now());
+        let new_token = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            s.fencing_token.saturating_add(1)
+        };
+        self.mark_leader(1, new_token);
         true
     }
 

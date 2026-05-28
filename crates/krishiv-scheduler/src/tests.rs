@@ -3838,6 +3838,94 @@ mod scheduler_tests {
         assert!(coordinator2.job_detail_snapshot(&job_id).is_ok());
     }
 
+    /// GAP-5: When a checkpoint epoch is aborted due to ack timeout, the
+    /// coordinator's checkpoint_notify_sent and barrier_dispatch_sent sets must
+    /// be cleaned up so they don't accumulate indefinitely.
+    #[test]
+    fn checkpoint_abort_cleans_up_stale_tracking_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path().to_str().unwrap().to_owned();
+
+        // Short ack timeout (100 ms) and 1-second tick so a single tick of
+        // 1 000 ms blows past the 100 ms ack timeout.
+        let config = CoordinatorConfig::new(1, 100)
+            .with_tick_period_ms(1_000)
+            .with_checkpoint_ack_timeout_ms(100);
+        let mut coordinator =
+            Coordinator::active_with_config(CoordinatorId::try_new("coord-gap5").unwrap(), config);
+
+        let exec_id = ExecutorId::try_new("exec-gap5").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "host-1", 2))
+            .unwrap();
+
+        // Submit a streaming job; this creates a CheckpointCoordinator automatically.
+        let job_id = JobId::try_new("job-gap5").unwrap();
+        let task_id = TaskId::try_new("t-gap5").unwrap();
+        let stage_id = StageId::try_new("s-gap5").unwrap();
+        let stage = StageSpec::new(stage_id.clone(), "stage-gap5")
+            .with_task(TaskSpec::new(task_id.clone(), "fragment-gap5"));
+        let spec = JobSpec::new(job_id.clone(), "gap5-test", JobKind::Streaming)
+            .with_stage(stage)
+            .with_checkpoint(5_000, storage_path);
+        coordinator.submit_job(spec).unwrap();
+
+        // Transition the task to Running so the checkpoint quorum == 1.
+        let lease = coordinator
+            .executors
+            .find_executor(&exec_id)
+            .unwrap()
+            .lease_generation();
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        let attempt = assignments.first().map(|a| a.attempt_id().as_u32()).unwrap_or(1);
+        let update = TaskStatusUpdate::new(
+            job_id.clone(),
+            stage_id,
+            task_id,
+            exec_id.clone(),
+            TaskState::Running,
+            attempt,
+        )
+        .with_lease_generation(lease);
+        coordinator.apply_task_update(update).unwrap();
+
+        // Manually initiate an epoch so the checkpoint coordinator is in
+        // AwaitingAcks state, then inject stale tracking entries.
+        coordinator
+            .checkpoint_coordinators
+            .get_mut(&job_id)
+            .unwrap()
+            .initiate()
+            .unwrap();
+        let epoch = 1u64;
+        coordinator
+            .checkpoint_notify_sent
+            .insert((job_id.clone(), exec_id.clone(), epoch));
+        coordinator
+            .barrier_dispatch_sent
+            .insert((job_id.clone(), epoch));
+
+        assert_eq!(coordinator.checkpoint_notify_sent.len(), 1);
+        assert_eq!(coordinator.barrier_dispatch_sent.len(), 1);
+
+        // A single tick of 1_000 ms is well above the 100 ms ack timeout, so
+        // advance_heartbeat_clock must abort the epoch and clean up the stale entries.
+        coordinator.advance_heartbeat_clock(1).unwrap();
+
+        assert_eq!(
+            coordinator.checkpoint_notify_sent.len(),
+            0,
+            "checkpoint_notify_sent must be cleared after epoch abort (GAP-5)"
+        );
+        assert_eq!(
+            coordinator.barrier_dispatch_sent.len(),
+            0,
+            "barrier_dispatch_sent must be cleared after epoch abort (GAP-5)"
+        );
+    }
+
     #[test]
     fn batch_sql_decode_inline_ipc_roundtrip() {
         use arrow::array::Int64Array;

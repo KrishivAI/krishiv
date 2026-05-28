@@ -318,7 +318,7 @@ mod executor_tests {
         assert_eq!(dereg.disposition(), TransportDisposition::Accepted);
 
         {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.read().await;
             let snapshot = coordinator
                 .executor_snapshots()
                 .into_iter()
@@ -440,7 +440,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-runner-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -475,7 +475,7 @@ mod executor_tests {
         );
         assert!(inbox.is_empty().unwrap());
 
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.read().await;
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
@@ -581,7 +581,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-parquet-runner-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -615,7 +615,7 @@ mod executor_tests {
         );
         assert!(inbox.is_empty().unwrap());
 
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.read().await;
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
@@ -686,7 +686,7 @@ mod executor_tests {
 
         let job_id = JobId::try_new("job-network-runner-1").unwrap();
         let assignment = {
-            let mut scheduler = shared.write().unwrap();
+            let mut scheduler = shared.write().await;
             scheduler
                 .submit_job(single_task_job(job_id.clone()))
                 .unwrap();
@@ -726,7 +726,7 @@ mod executor_tests {
         assert!(inbox.is_empty().unwrap());
 
         {
-            let scheduler = shared.read().unwrap();
+            let scheduler = shared.read().await;
             let snapshot = scheduler.job_snapshot(&job_id).unwrap();
             assert_eq!(snapshot.state(), JobState::Succeeded);
             assert_eq!(snapshot.succeeded_task_count(), 1);
@@ -807,7 +807,7 @@ mod executor_tests {
 
         let job_id = JobId::try_new("job-network-parquet-runner-1").unwrap();
         let assignment = {
-            let mut scheduler = shared.write().unwrap();
+            let mut scheduler = shared.write().await;
             scheduler
                 .submit_job(parquet_scan_job(job_id.clone()))
                 .unwrap();
@@ -848,7 +848,7 @@ mod executor_tests {
         assert!(inbox.is_empty().unwrap());
 
         {
-            let scheduler = shared.read().unwrap();
+            let scheduler = shared.read().await;
             let snapshot = scheduler.job_snapshot(&job_id).unwrap();
             assert_eq!(snapshot.state(), JobState::Succeeded);
             assert_eq!(snapshot.succeeded_task_count(), 1);
@@ -959,7 +959,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-connector-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -1012,7 +1012,7 @@ mod executor_tests {
         );
         assert!(inbox.is_empty().unwrap());
 
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.read().await;
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
@@ -1039,7 +1039,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-object-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -1096,7 +1096,7 @@ mod executor_tests {
         assert_eq!(batch.num_rows(), 2);
         assert!(source.read_batch().await.unwrap().is_none());
 
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.read().await;
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
     }
@@ -1118,7 +1118,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-kafka-pipeline-1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -1189,7 +1189,7 @@ mod executor_tests {
         assert_eq!(batch.num_columns(), 2);
         assert!(source.read_batch().await.unwrap().is_none());
 
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.read().await;
         let snapshot = coordinator.job_snapshot(&job_id).unwrap();
         assert_eq!(snapshot.state(), JobState::Succeeded);
         assert_eq!(snapshot.succeeded_task_count(), 1);
@@ -1384,7 +1384,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-tpch-q1").unwrap();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -1424,7 +1424,7 @@ mod executor_tests {
         // ── Stage 0: shuffle-write ────────────────────────────────────────────
 
         let s0_launched = {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .launch_assigned_task_assignments(&job_id)
                 .unwrap()
@@ -1484,7 +1484,7 @@ mod executor_tests {
 
         // Verify stage-0 is now Succeeded in the coordinator.
         {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.read().await;
             let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
             let s0_stage = detail
                 .stages()
@@ -1502,7 +1502,7 @@ mod executor_tests {
 
         // Stage-1 should now be unblocked; launch its tasks.
         let s1_launched = {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .launch_assigned_task_assignments(&job_id)
                 .unwrap()
@@ -1575,7 +1575,7 @@ mod executor_tests {
 
         // Confirm the job reached Succeeded state.
         {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.read().await;
             let snapshot = coordinator.job_snapshot(&job_id).unwrap();
             assert_eq!(snapshot.state(), JobState::Succeeded);
 
@@ -1636,6 +1636,49 @@ mod executor_tests {
     }
 
     use crate::barrier::{BarrierSimulator, BarrierSnapshot};
+
+    // ── GAP-6 helpers ─────────────────────────────────────────────────────────
+
+    /// A drainer that returns a fixed set of Arrow batches exactly once, then
+    /// returns an empty vec on every subsequent call.  Used to verify that
+    /// `stream:loop:` fragments process batches via `ContinuousWindowExecutor`.
+    struct OneShotDrainer {
+        batches: std::sync::Mutex<Option<Vec<arrow::record_batch::RecordBatch>>>,
+    }
+
+    impl OneShotDrainer {
+        fn new(batches: Vec<arrow::record_batch::RecordBatch>) -> Arc<Self> {
+            Arc::new(Self {
+                batches: std::sync::Mutex::new(Some(batches)),
+            })
+        }
+    }
+
+    impl crate::ContinuousJobDrainer for OneShotDrainer {
+        fn drain_job(&self, _job_id: &str) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+            let mut guard = self.batches.lock().unwrap();
+            Ok(guard.take().unwrap_or_default())
+        }
+    }
+
+    fn make_loop_assignment(fragment: &str) -> ExecutorTaskAssignment {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("loop-job-1").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(fragment),
+            OutputContract::new(
+                krishiv_proto::OutputContractKind::InlineRecordBatches,
+                "loop output",
+            ),
+        )
+    }
 
     fn make_streaming_assignment(fragment: &str, partitions: Vec<&str>) -> ExecutorTaskAssignment {
         let ids = TaskAttemptRef::new(
@@ -1864,7 +1907,7 @@ mod executor_tests {
         let inbox = ExecutorAssignmentInbox::new();
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -1887,7 +1930,7 @@ mod executor_tests {
         }
 
         let (stage_id, task_id, attempt, lease) = {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.read().await;
             let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
             let stage_id = detail.stages()[0].stage_id().clone();
             let task_id = detail.stages()[0].tasks()[0].task_id().clone();
@@ -1931,7 +1974,7 @@ mod executor_tests {
 
         let state = shared
             .read()
-            .unwrap()
+            .await
             .job_snapshot(&job_id)
             .unwrap()
             .state();
@@ -1951,7 +1994,7 @@ mod executor_tests {
         ));
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(krishiv_proto::ExecutorDescriptor::new(
                     executor_id.clone(),
@@ -1974,7 +2017,7 @@ mod executor_tests {
         }
 
         let (task_id, lease) = {
-            let coordinator = shared.read().unwrap();
+            let coordinator = shared.read().await;
             let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
             let task_id = detail.stages()[0].tasks()[0].task_id().clone();
             let lease = coordinator.executor_snapshots()[0].lease_generation();
@@ -1982,7 +2025,7 @@ mod executor_tests {
         };
 
         {
-            let mut coordinator = shared.write().unwrap();
+            let mut coordinator = shared.write().await;
             let mut store = InMemoryMetadataStore::default();
             coordinator.persist_jobs_to_store(&mut store).unwrap();
             coordinator.recover_from_store(&store).unwrap();
@@ -2000,12 +2043,12 @@ mod executor_tests {
                 )]);
             shared
                 .write()
-                .unwrap()
+                .await
                 .executor_heartbeat(heartbeat)
                 .unwrap();
         }
 
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.read().await;
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
         let task = &detail.stages()[0].tasks()[0];
         assert_eq!(
@@ -2027,7 +2070,7 @@ mod executor_tests {
         drop(coordinator);
 
         assert_eq!(
-            shared.read().unwrap().job_snapshots().len(),
+            shared.read().await.job_snapshots().len(),
             1,
             "coordinator must not create a duplicate job on re-attach"
         );
@@ -2503,5 +2546,152 @@ mod executor_tests {
         assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
         assert_eq!(report.output().row_count(), 3);
         assert_eq!(report.output().column_count(), 2);
+    }
+
+    // ── GAP-6: stream:loop: tests ────────────────────────────────────────────
+
+    /// Verify that `stream:loop:` invokes `ContinuousWindowExecutor` and emits
+    /// closed-window batches after the watermark crosses the window boundary.
+    #[tokio::test]
+    async fn stream_loop_emits_window_via_continuous_executor() {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        // Build an input batch: events at t=100 and t=12_000 ms in a 10s window.
+        // With lag=0 the second event advances the watermark past the first window.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])) as _,
+                Arc::new(Int64Array::from(vec![100_i64, 12_000_i64])) as _,
+            ],
+        )
+        .unwrap();
+
+        let drainer = OneShotDrainer::new(vec![batch]);
+        let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+        let fragment = format!("stream:loop:loop-job-1|{window_spec}");
+
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+            .with_continuous_drainer(drainer as Arc<dyn crate::ContinuousJobDrainer>);
+
+        let assignment = make_loop_assignment(&fragment);
+        let output = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .expect("stream:loop execution should succeed");
+
+        assert_eq!(
+            output.kind(),
+            ExecutorTaskOutputKind::StreamingWindow,
+            "stream:loop should emit StreamingWindow output"
+        );
+        // The first tumbling window [0, 10000) must be emitted when the watermark
+        // advances past 10000 due to the event at ts=12000.
+        assert!(
+            output.row_count() > 0,
+            "stream:loop should emit at least one window row"
+        );
+    }
+
+    /// Verify that `stream:loop:` reuses the same `ContinuousWindowExecutor`
+    /// across multiple drain cycles (state is accumulated).
+    #[tokio::test]
+    async fn stream_loop_reuses_executor_state_across_drains() {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+
+        // First drain: single event in [0, 10000).  Window not yet emitted.
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![500_i64])) as _,
+            ],
+        )
+        .unwrap();
+
+        // Second drain: event that advances watermark past 10000, closing the window.
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![15_000_i64])) as _,
+            ],
+        )
+        .unwrap();
+
+        // The runner is CLONED between drains to simulate a re-used runner; its
+        // `loop_executors` Arc is shared so state survives.
+        let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+        let fragment = format!("stream:loop:loop-job-state|{window_spec}");
+
+        // Drainer 1: returns batch1 then empty.
+        struct SeqDrainer {
+            inner: std::sync::Mutex<std::collections::VecDeque<Vec<RecordBatch>>>,
+        }
+        impl crate::ContinuousJobDrainer for SeqDrainer {
+            fn drain_job(
+                &self,
+                _job_id: &str,
+            ) -> Result<Vec<RecordBatch>, String> {
+                Ok(self.inner.lock().unwrap().pop_front().unwrap_or_default())
+            }
+        }
+        let drainer = Arc::new(SeqDrainer {
+            inner: std::sync::Mutex::new(
+                std::collections::VecDeque::from(vec![vec![batch1], vec![batch2]]),
+            ),
+        });
+
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+            .with_continuous_drainer(drainer as Arc<dyn crate::ContinuousJobDrainer>);
+
+        // First drain: no window should be emitted yet.
+        let out1 = runner
+            .execute_streaming_fragment(&make_loop_assignment(&fragment))
+            .await
+            .expect("drain 1 ok");
+        assert_eq!(out1.row_count(), 0, "no window emitted on first drain");
+
+        // Second drain: reuse the same runner (shared loop_executors); window
+        // should now be emitted.
+        let out2 = runner
+            .execute_streaming_fragment(&make_loop_assignment(&fragment))
+            .await
+            .expect("drain 2 ok");
+        assert!(
+            out2.row_count() > 0,
+            "window must be emitted on second drain after watermark advances"
+        );
+    }
+
+    /// Verify that a missing drainer returns a clear InvalidAssignment error.
+    #[tokio::test]
+    async fn stream_loop_without_drainer_returns_error() {
+        let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+        let fragment = format!("stream:loop:no-drainer-job|{window_spec}");
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let assignment = make_loop_assignment(&fragment);
+        let result = runner.execute_streaming_fragment(&assignment).await;
+        assert!(
+            result.is_err(),
+            "stream:loop without drainer must return an error"
+        );
     }
 }

@@ -211,6 +211,19 @@ impl WindowOperatorState {
             Self::SessionState(op) => op.process_batch(batch, watermark_ms),
         }
     }
+
+    /// GAP-15: Evict expired entries from TTL-backed state variants.
+    ///
+    /// Non-TTL variants (Tumbling, Sliding, Session) are no-ops.
+    /// State-backed variants delegate to the underlying `StateBackend::purge_expired`.
+    fn purge_expired(&mut self) -> ExecResult<usize> {
+        match self {
+            Self::Tumbling(_) | Self::Sliding(_) | Self::Session(_) => Ok(0),
+            Self::TumblingState(op) => op.purge_expired(),
+            Self::SlidingState(op) => op.purge_expired(),
+            Self::SessionState(op) => op.purge_expired(),
+        }
+    }
 }
 
 /// Retains window operator state between continuous streaming drain cycles.
@@ -235,7 +248,17 @@ impl ContinuousWindowExecutor {
     }
 
     /// Process newly arrived input batches and return any emitted output.
+    ///
+    /// GAP-15: At the start of each drain cycle we call `purge_expired` on the
+    /// underlying window operator.  For non-TTL operators this is a no-op
+    /// (returns 0).  For TTL-backed operators it walks all namespaces once and
+    /// deletes entries that have passed their `expires_at_ms` timestamp.
+    /// This prevents unbounded growth from entries that were written once and
+    /// never read again after expiry (lazy-delete alone is insufficient).
     pub fn drain(&mut self, input_batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        // Eagerly evict stale TTL entries before processing new data.
+        self.operator.purge_expired()?;
+
         if input_batches.is_empty() {
             return Ok(Vec::new());
         }

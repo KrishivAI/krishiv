@@ -67,6 +67,13 @@ impl StateBackedTumblingWindowOperator {
             .persist_to_state(self.state.as_mut(), &self.namespace)
             .map_err(|e| ExecError::Arrow(e.to_string()))
     }
+
+    /// GAP-15: Evict expired entries from the underlying TTL state backend.
+    pub fn purge_expired(&mut self) -> ExecResult<usize> {
+        self.state
+            .purge_expired()
+            .map_err(|e| ExecError::Arrow(e.to_string()))
+    }
 }
 
 pub struct StateBackedSlidingWindowOperator {
@@ -124,6 +131,13 @@ impl StateBackedSlidingWindowOperator {
             .persist_to_state(self.state.as_mut(), &self.namespace)
             .map_err(|e| ExecError::Arrow(e.to_string()))
     }
+
+    /// GAP-15: Evict expired entries from the underlying TTL state backend.
+    pub fn purge_expired(&mut self) -> ExecResult<usize> {
+        self.state
+            .purge_expired()
+            .map_err(|e| ExecError::Arrow(e.to_string()))
+    }
 }
 
 pub struct StateBackedSessionWindowOperator {
@@ -175,6 +189,13 @@ impl StateBackedSessionWindowOperator {
     pub fn checkpoint(&mut self) -> ExecResult<()> {
         self.inner
             .persist_to_state(self.state.as_mut(), &self.namespace)
+            .map_err(|e| ExecError::Arrow(e.to_string()))
+    }
+
+    /// GAP-15: Evict expired entries from the underlying TTL state backend.
+    pub fn purge_expired(&mut self) -> ExecResult<usize> {
+        self.state
+            .purge_expired()
             .map_err(|e| ExecError::Arrow(e.to_string()))
     }
 }

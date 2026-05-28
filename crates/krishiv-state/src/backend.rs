@@ -56,4 +56,17 @@ pub trait StateBackend: Send + Sync {
             })
             .collect()
     }
+
+    /// Remove all entries whose TTL has expired (GAP-15).
+    ///
+    /// The default implementation is a no-op — non-TTL backends do not expire
+    /// entries.  `TtlStateBackend` overrides this to perform an eager scan-and-
+    /// delete pass, preventing unbounded memory growth from entries that were
+    /// written but never read again after they expired (lazy-delete only removes
+    /// entries on reads, so cold keys accumulate otherwise).
+    ///
+    /// Returns the number of entries evicted.
+    fn purge_expired(&mut self) -> StateResult<usize> {
+        Ok(0)
+    }
 }

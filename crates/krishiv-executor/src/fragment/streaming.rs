@@ -1,13 +1,36 @@
 //! Streaming fragment execution: unified bounded window path (all window kinds).
 
+use std::sync::{Arc, Mutex};
+
+use krishiv_exec::ContinuousWindowExecutor;
+
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_exec::execute_bounded_window;
-use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, WindowKind, parse_stream_fragment};
+use krishiv_plan::window::{
+    WindowAggKind, WindowExecutionSpec, WindowKind, parse_stream_fragment,
+};
 use krishiv_proto::ExecutorTaskAssignment;
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
 const STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
+
+/// Fragment prefix for continuous window loop execution (GAP-6).
+///
+/// Format: `stream:loop:<job_id>|<window_fragment>` where `<window_fragment>`
+/// is a full encoded window spec as produced by
+/// `krishiv_plan::window::encode_stream_fragment` (e.g.
+/// `stream:tw:key=user_id:time=ts:win=10000:lag=1000:agg=count`).
+///
+/// On each invocation the executor:
+///  1. Looks up (or creates) a per-job `ContinuousWindowExecutor` stored in
+///     `runner.loop_executors`.  State is retained across calls so partial
+///     windows accumulate correctly.
+///  2. Calls `runner.continuous_drainer.drain_job(job_id)` to fetch newly
+///     arrived input batches.
+///  3. Passes the batches through `ContinuousWindowExecutor::drain()`.
+///  4. Returns any newly emitted (closed) window batches.
+const STREAM_LOOP_PREFIX: &str = "stream:loop:";
 
 fn parsed_to_plan_spec(parsed: krishiv_plan::window::ParsedStreamFragment) -> WindowExecutionSpec {
     let (slide_ms, session_gap_ms) = match parsed.window_kind {
@@ -147,12 +170,109 @@ fn parse_stream_kafka_partitions(
     Ok(batches)
 }
 
+/// Execute a `stream:loop:` fragment using `ContinuousWindowExecutor` (GAP-6).
+///
+/// Creates or reuses a per-job stateful executor stored in
+/// `runner.loop_executors`.  Drains pending batches via `continuous_drainer`,
+/// passes them through the window operator, and returns emitted window batches.
+fn execute_loop_fragment(
+    runner: &ExecutorTaskRunner,
+    fragment: &str,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    let payload = fragment
+        .strip_prefix(STREAM_LOOP_PREFIX)
+        .expect("called with wrong prefix");
+
+    // Format: <job_id>|<window_fragment>
+    let (job_id, window_spec_str) =
+        payload
+            .split_once('|')
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: format!(
+                    "stream:loop fragment must be \
+                     stream:loop:<job_id>|<window_spec>; got: {fragment}"
+                ),
+            })?;
+    let job_id = job_id.trim();
+    let window_spec_str = window_spec_str.trim();
+
+    if job_id.is_empty() {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from("stream:loop fragment requires a non-empty job_id"),
+        });
+    }
+
+    // Fetch or create the stateful executor for this job.
+    let executor_entry = runner.loop_executors.entry(job_id.to_owned()).or_try_insert_with(|| {
+        let parsed = parse_stream_fragment(window_spec_str).map_err(|e| {
+            ExecutorError::InvalidAssignment {
+                message: format!("stream:loop invalid window spec '{window_spec_str}': {e}"),
+            }
+        })?;
+        let mut plan_spec = parsed_to_plan_spec(parsed);
+        // Normalise column names for Kafka-style data (same as bounded path).
+        plan_spec.key_column = String::from("key");
+        plan_spec.event_time_column = String::from("ts");
+        let exec = ContinuousWindowExecutor::new(plan_spec).map_err(|e| {
+            ExecutorError::InvalidAssignment {
+                message: format!("stream:loop failed to create window executor: {e}"),
+            }
+        })?;
+        Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
+    })?;
+    let executor_arc = executor_entry.value().clone();
+    drop(executor_entry); // release dashmap lock
+
+    // Get new input batches from the drainer.
+    let drainer = runner.continuous_drainer.as_ref().ok_or_else(|| {
+        ExecutorError::InvalidAssignment {
+            message: String::from(
+                "stream:loop fragment requires a continuous_drainer on the executor runner",
+            ),
+        }
+    })?;
+    let input_batches = drainer
+        .drain_job(job_id)
+        .map_err(|message| ExecutorError::LocalExecution { message })?;
+
+    // Process through the stateful window executor.
+    let output_batches = {
+        let mut exec = executor_arc
+            .lock()
+            .map_err(|_| ExecutorError::LocalExecution {
+                message: String::from(
+                    "stream:loop executor lock poisoned; executor state is inconsistent",
+                ),
+            })?;
+        exec.drain(input_batches)
+            .map_err(|e| ExecutorError::LocalExecution {
+                message: format!("stream:loop drain error: {e}"),
+            })?
+    };
+
+    let total_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
+    let total_batches = output_batches.len();
+    let column_count = output_batches.first().map(|b| b.num_columns()).unwrap_or(0);
+    Ok(ExecutorTaskOutput::streaming_window(
+        total_rows,
+        total_batches,
+        column_count,
+        output_batches,
+    ))
+}
+
 /// Execute a bounded streaming window fragment (tumbling, sliding, or session).
 pub(crate) async fn execute_streaming_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment = assignment.plan_fragment().description().trim();
+
+    // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
+    // shared across drain cycles via runner.loop_executors.
+    if fragment.starts_with(STREAM_LOOP_PREFIX) {
+        return execute_loop_fragment(runner, fragment);
+    }
 
     if let Some(job_id) = fragment.strip_prefix(STREAM_CONTINUOUS_PREFIX) {
         let job_id = job_id.trim();

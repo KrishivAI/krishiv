@@ -521,10 +521,46 @@ impl Source for RdkafkaKafkaSource {
         .await;
 
         match msg {
-            // Poll timeout — no message available; signal a momentary idle (not EOF).
-            Err(_timeout) => Ok(Some(arrow::record_batch::RecordBatch::new_empty(
-                std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-            ))),
+            // GAP-16: Poll timeout — no message available on this poll cycle.
+            // Check whether the consumer has reached the broker's high-water mark
+            // for this partition.  If so, return `Ok(None)` to signal EOF so the
+            // caller can stop polling instead of spinning indefinitely.
+            //
+            // `fetch_watermarks` is a synchronous metadata RPC; we run it on a
+            // blocking thread so it does not stall the async runtime.  On error
+            // we fall back to returning an empty batch (momentary idle) so the
+            // pipeline does not abort on a transient metadata failure.
+            Err(_timeout) => {
+                let consumer = self.consumer.clone();
+                let topic = self.topic.clone();
+                let partition = self.partition;
+                let next_offset = self
+                    .last_offset
+                    .map(|(_, o)| o + 1)
+                    .unwrap_or(0);
+
+                let at_eof = tokio::task::spawn_blocking(move || {
+                    use rdkafka::consumer::Consumer;
+                    match consumer.fetch_watermarks(
+                        &topic,
+                        partition,
+                        std::time::Duration::from_millis(500),
+                    ) {
+                        Ok((_low, high)) => next_offset >= high,
+                        Err(_) => false, // conservatively assume not at EOF on metadata error
+                    }
+                })
+                .await
+                .unwrap_or(false);
+
+                if at_eof {
+                    Ok(None)
+                } else {
+                    Ok(Some(arrow::record_batch::RecordBatch::new_empty(
+                        std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                    )))
+                }
+            }
             Ok(Err(e)) => Err(crate::ConnectorError::IoStr {
                 message: format!("rdkafka receive error: {e}"),
             }),
