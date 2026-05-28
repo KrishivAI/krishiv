@@ -2,6 +2,44 @@
 
 ## Current Phase
 
+**Unified batch+streaming Relation API — Phase 1-3 complete (2026-05-28).**
+
+### Unified Relation API — Phase 1 (Rust), Phase 2 (Python), Phase 3 (SQL) (2026-05-28)
+
+Implemented the three-phase unified batch+streaming API.
+
+**Phase 1 — Rust `Relation` type (crates/krishiv):**
+- `QueryResult` ergonomics: `into_batches()`, `IntoIterator`, `From<Vec<RecordBatch>>`
+- `StreamBatch::into_batch()`
+- `Relation` struct: unified batch SQL and windowed streaming; `.collect()`, `.sink_to()`, `.key_by()`, `.with_event_time()`, `.watermark()`, `.window()`, `.emit()`
+- `WindowSpec` enum: `Tumbling`, `Sliding`, `Session`
+- `EmitMode` enum: `Batch`, `PerWindow`, `Continuous`
+- `StreamHandle`: cancel + `poll_output()` for continuous jobs
+- `Execute` trait: generic dispatch over `Relation`
+- `SessionExt` extension: `relation()`, `from_parquet()`, `from_source()`, `from_bounded_stream()`
+- All new types exported from `krishiv` facade and prelude
+- Validation: `cargo test -p krishiv --lib` → 48 passed, 0 failed
+
+**Phase 2 — Python unified `DataFrame` (crates/krishiv-python):**
+- `PyDataFrame::collect()` returns `PyQueryResult` (was `String`)
+- `PyDataFrame::show(n)` new method
+- `PyQueryResult`: `to_arrow()`, `to_pandas()`, `show(n)`, `__iter__`
+- New `PyRelation` (exposed as Python `DataFrame`): unified batch+streaming
+- `PySession::dataframe()`, `from_source()`, `from_bounded_stream()` new entry points
+- Validation: `cargo check -p krishiv-python` → clean
+
+**Phase 3 — SQL window helper UDFs (crates/krishiv-sql):**
+- `tumble_start(ts, size)`, `tumble_end(ts, size)` — tumbling window boundaries
+- `hop_start(ts, slide, size)`, `hop_end(ts, slide, size)` — sliding window boundaries
+- Registered in `SqlEngine::new()` and `with_in_memory_catalog()`
+- `SqlEngine::register_streaming_source()` + `is_streaming_query()` for source-type routing
+- `Session::register_bounded()`, `register_unbounded()`, `is_streaming_query()`
+- Validation: `cargo test -p krishiv-sql --lib` → 41 passed (5 new), 0 failed
+
+Commit: `e62d7b6` on branch `claude/codebase-review-plan-jQOkr`
+
+---
+
 **Gap-mitigation sweep — P0/P1/P2 fix sprint complete (2026-05-28).**
 
 All confirmed gaps from `docs/engineering/gap-mitigation-plan.md` resolved;
