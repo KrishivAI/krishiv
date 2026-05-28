@@ -17,7 +17,8 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
-use krishiv_proto::{InitiateCheckpointRequest, JobId};
+use dashmap::DashMap;
+use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
 use krishiv_state::RedbStateBackend;
 use tokio::net::TcpListener;
@@ -240,9 +241,12 @@ async fn heartbeat_loop(
     // operators that exchange partitions between executors (B5).  When no
     // `--shuffle-dir` is provided we still create an in-memory shuffle store so
     // R4a typed shuffle write/read tasks succeed for tests.
+    let running_attempts: Arc<DashMap<String, TaskAttemptRef>> = Arc::new(DashMap::new());
+    runtime.set_running_attempts(running_attempts.clone());
     let mut runner_builder = ExecutorTaskRunner::new(inbox.clone())
         .with_live_lease(shared_lease.clone())
-        .with_barrier_injector(barrier_injector);
+        .with_barrier_injector(barrier_injector)
+        .with_running_attempts(running_attempts);
     if let Some(dir) = &shuffle_dir {
         let disk = Arc::new(
             LocalDiskShuffleStore::new(dir)

@@ -96,7 +96,24 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     }
 
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
-        self.inner.list_keys(namespace)
+        let now_ms = unix_now_ms();
+        let all_keys = self.inner.list_keys(namespace)?;
+        let mut live = Vec::with_capacity(all_keys.len());
+        for key in all_keys {
+            match self.inner.get(namespace, &key)? {
+                Some(encoded) if encoded.len() >= 8 => {
+                    let expires_at_ms = i64::from_le_bytes(
+                        encoded[..8].try_into().unwrap_or([0u8; 8]),
+                    );
+                    if now_ms < expires_at_ms {
+                        live.push(key);
+                    }
+                }
+                Some(_) => live.push(key), // not TTL-encoded — pass through
+                None => {}                  // concurrently deleted
+            }
+        }
+        Ok(live)
     }
 
     /// Snapshot state with TTL prefix stripped from values.

@@ -992,6 +992,13 @@ impl Coordinator {
         match self.checkpoint_coordinators.get_mut(&job_id) {
             None => CheckpointAckResponse::JobNotFound,
             Some(coord) => {
+                // P1-16: reject ACKs from superseded coordinators (stale fencing token).
+                let coordinator_token = coord.fencing_token();
+                if ack.fencing_token.as_u64() < coordinator_token.as_u64() {
+                    return CheckpointAckResponse::StaleFencingToken {
+                        current_token: coordinator_token.as_u64(),
+                    };
+                }
                 let current_epoch = coord.current_epoch();
                 match coord.receive_ack(ack.clone()) {
                     Ok(true) => {
