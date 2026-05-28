@@ -2696,4 +2696,42 @@ mod executor_tests {
             "stream:loop without drainer must return an error"
         );
     }
+
+    // ── R7.2 source throttle wiring ──────────────────────────────────────────
+
+    /// Verify that the `SourceThrottleTable` on `ExecutorTaskRunner` is shared
+    /// across runner clones (simulating the heartbeat loop writing, runner tasks
+    /// reading) and that `apply` + `active_limit` behave correctly.
+    #[test]
+    fn source_throttle_table_shared_across_runner_clones() {
+        use krishiv_proto::HeartbeatThrottleCommand;
+
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let clone = runner.clone();
+
+        // Simulate what the heartbeat loop does when it receives ThrottleDecisions.
+        let cmds = vec![
+            HeartbeatThrottleCommand {
+                source_id: "src-kafka-0".into(),
+                rows_per_second: Some(1000),
+            },
+            HeartbeatThrottleCommand {
+                source_id: "src-kafka-1".into(),
+                rows_per_second: None, // clear / unlimited
+            },
+        ];
+        for tc in &cmds {
+            runner.source_throttle_limits.apply(&tc.source_id, tc.rows_per_second);
+        }
+
+        // Reads through the clone (task runner side) must observe the updates.
+        assert_eq!(clone.source_throttle_limits.active_limit("src-kafka-0"), Some(1000));
+        assert_eq!(clone.source_throttle_limits.active_limit("src-kafka-1"), None);
+        assert_eq!(clone.source_throttle_limits.active_limit("src-kafka-99"), None);
+
+        // check_and_log should not panic regardless of whether a limit is active.
+        clone.source_throttle_limits.check_and_log("src-kafka-0");
+        clone.source_throttle_limits.check_and_log("src-kafka-1");
+        clone.source_throttle_limits.check_and_log("src-kafka-99");
+    }
 }

@@ -562,7 +562,7 @@ pub async fn serve_executor_task_grpc(
     inbox: ExecutorAssignmentInbox,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
-        .add_service(tonic::service::interceptor(
+        .add_service(tonic::service::interceptor::InterceptedService::new(
             executor_task_grpc_server(inbox),
             krishiv_metrics::grpc::extract_trace_context,
         ))
@@ -576,7 +576,7 @@ pub async fn serve_executor_task_grpc_with_listener(
     inbox: ExecutorAssignmentInbox,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
-        .add_service(tonic::service::interceptor(
+        .add_service(tonic::service::interceptor::InterceptedService::new(
             executor_task_grpc_server(inbox),
             krishiv_metrics::grpc::extract_trace_context,
         ))

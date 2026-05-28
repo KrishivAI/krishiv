@@ -16,12 +16,10 @@ pub async fn inject_barrier<T>(
     timeout: Duration,
 ) -> Result<(), String>
 where
-    T: tonic::client::GrpcService<tonic::body::BoxBody>,
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    T::ResponseBody:
-        http_body::Body<Data = bytes::Bytes> + std::marker::Send + 'static,
-    <T::ResponseBody as http_body::Body>::Error:
-        Into<Box<dyn std::error::Error + Send + Sync>> + std::marker::Send,
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
     let (tx, rx) = mpsc::channel(2);
     tx.send(barrier)

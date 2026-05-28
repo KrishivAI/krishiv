@@ -12,7 +12,7 @@
 //! Use [`extract_trace_context`] when registering a service:
 //! ```ignore
 //! Server::builder()
-//!     .add_service(tonic::service::interceptor(svc, extract_trace_context))
+//!     .add_service(tonic::service::interceptor::InterceptedService::new(svc, extract_trace_context))
 //!     .serve(addr)
 //!     .await?;
 //! ```
