@@ -48,6 +48,32 @@ impl QueryResult {
     pub fn pretty(&self) -> Result<String, crate::error::KrishivError> {
         krishiv_sql::pretty_batches(&self.batches).map_err(Into::into)
     }
+
+    /// Consume self and return the owned batches.
+    pub fn into_batches(self) -> Vec<RecordBatch> {
+        self.batches
+    }
+}
+
+impl IntoIterator for QueryResult {
+    type Item = RecordBatch;
+    type IntoIter = std::vec::IntoIter<RecordBatch>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.batches.into_iter()
+    }
+}
+
+impl From<Vec<RecordBatch>> for QueryResult {
+    fn from(batches: Vec<RecordBatch>) -> Self {
+        QueryResult::new(batches)
+    }
+}
+
+impl From<QueryResult> for Vec<RecordBatch> {
+    fn from(result: QueryResult) -> Self {
+        result.into_batches()
+    }
 }
 
 /// Stream batch wrapper.
@@ -71,6 +97,11 @@ impl StreamBatch {
     /// Record batch payload.
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
+    }
+
+    /// Consume self and return the owned batch.
+    pub fn into_batch(self) -> RecordBatch {
+        self.batch
     }
 }
 

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
     OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
-    read_epoch_metadata, read_operator_snapshot, write_epoch_metadata, write_manifest,
+    read_epoch_metadata, read_operator_snapshot, write_epoch_hint, write_epoch_metadata,
+    write_manifest,
 };
 use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 
@@ -291,6 +292,18 @@ impl CheckpointCoordinator {
             self.job_id.as_str(),
             epoch,
             &manifest,
+        )?;
+
+        // BUG-1: Epoch hint MUST be written last — after the manifest seals the
+        // epoch — so that `latest_valid_epoch` never returns an epoch whose
+        // manifest has not yet been written.  A crash between write_manifest and
+        // write_epoch_hint is safe: the next call to `latest_valid_epoch` falls
+        // back to `list_valid_epochs`, which will find the sealed epoch via its
+        // manifest file.
+        write_epoch_hint(
+            self.storage.as_ref(),
+            self.job_id.as_str(),
+            epoch,
         )?;
 
         self.state = CheckpointCoordinatorState::Committed { epoch };

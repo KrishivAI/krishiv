@@ -27,6 +27,7 @@ pub mod live_table;
 pub mod spark_compat;
 pub mod spark_compat_date;
 mod udf;
+mod window_functions;
 
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
@@ -97,6 +98,9 @@ pub struct SqlEngine {
     krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
     view_registry: Option<std::sync::Arc<std::sync::Mutex<MaterializedViewRegistry>>>,
     udf_registry: Option<std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>>,
+    /// Table names registered as unbounded streaming sources.
+    /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
+    streaming_sources: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -116,11 +120,15 @@ impl Default for SqlEngine {
 impl SqlEngine {
     /// Create a local SQL engine.
     pub fn new() -> Self {
+        let context = SessionContext::new();
+        window_functions::register_window_functions(&context)
+            .expect("failed to register window functions");
         Self {
-            context: SessionContext::new(),
+            context,
             krishiv_catalog: None,
             view_registry: None,
             udf_registry: None,
+            streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -131,12 +139,56 @@ impl SqlEngine {
             "krishiv",
             Arc::new(DataFusionCatalogBridge::new(catalog.clone())),
         );
+        window_functions::register_window_functions(&context)
+            .expect("failed to register window functions");
         Ok(Self {
             context,
             krishiv_catalog: Some(catalog),
             view_registry: None,
             udf_registry: None,
+            streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
         })
+    }
+
+    /// Mark a table name as an unbounded streaming source.
+    ///
+    /// Uses `Arc<RwLock<>>` so all `Session` clones sharing this engine see
+    /// the registration immediately.
+    pub fn register_streaming_source(&self, name: &str) -> SqlResult<()> {
+        self.streaming_sources
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+        Ok(())
+    }
+
+    /// Returns `true` if any table referenced in `sql` is a registered streaming source.
+    pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool> {
+        let sources = self.streaming_sources.read().unwrap_or_else(|e| e.into_inner());
+        if sources.is_empty() {
+            return Ok(false);
+        }
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        for stmt in &statements {
+            let mut is_streaming = false;
+            visit_relations(stmt, |relation| {
+                // relation.to_string() yields the fully-qualified name (e.g. "schema.table").
+                // Extract the unqualified table name (last segment after dot).
+                let full = relation.to_string();
+                let table_name = full.split('.').next_back().unwrap_or(&full);
+                if sources.contains(table_name) {
+                    is_streaming = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            if is_streaming {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Shared Krishiv catalog backing this engine, if configured.
@@ -398,6 +450,28 @@ fn extract_simple_view_name(query: &str) -> Option<String> {
     None
 }
 
+/// Engine-agnostic interface over a prepared query result.
+///
+/// Hides the concrete [`SqlDataFrame`] (which holds a DataFusion `DataFrame`)
+/// behind a stable trait so that `krishiv-api` and other callers are not
+/// forced to depend on DataFusion types.  `datafusion` stays an implementation
+/// detail inside `krishiv-sql`; a future engine swap only requires a new impl.
+#[async_trait::async_trait]
+pub trait KrishivDataFrameOps: Send + Sync {
+    /// Execute and collect all result batches.
+    async fn collect(&self) -> SqlResult<Vec<RecordBatch>>;
+    /// Execute, collect results, and return lightweight runtime statistics.
+    async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>;
+    /// Explain the physical and logical plan text (does not execute).
+    async fn explain(&self) -> SqlResult<String>;
+    /// Explain the logical plan text without executing.
+    fn explain_logical(&self) -> String;
+    /// Build a Krishiv [`LogicalPlan`] wrapper for this DataFrame.
+    fn krishiv_logical_plan(&self) -> LogicalPlan;
+    /// The original SQL query string, if any.
+    fn query(&self) -> Option<&str>;
+}
+
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
 #[derive(Debug, Clone)]
 pub struct SqlDataFrame {
@@ -496,6 +570,28 @@ impl SqlDataFrame {
 pub struct SqlExecutionStats {
     pub output_rows: u64,
     pub cpu_nanos: u64,
+}
+
+#[async_trait::async_trait]
+impl KrishivDataFrameOps for SqlDataFrame {
+    async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
+        SqlDataFrame::collect(self).await
+    }
+    async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
+        SqlDataFrame::collect_with_stats(self).await
+    }
+    async fn explain(&self) -> SqlResult<String> {
+        SqlDataFrame::explain(self).await
+    }
+    fn explain_logical(&self) -> String {
+        SqlDataFrame::explain_logical(self)
+    }
+    fn krishiv_logical_plan(&self) -> LogicalPlan {
+        SqlDataFrame::krishiv_logical_plan(self)
+    }
+    fn query(&self) -> Option<&str> {
+        SqlDataFrame::query(self)
+    }
 }
 
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.

@@ -9,7 +9,7 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
     BatchTableRegistration, ExecutionRuntime, JobId, JobState, JobStatus, LocalJobRegistry,
 };
-use krishiv_sql::SqlDataFrame;
+use krishiv_sql::KrishivDataFrameOps;
 
 use crate::error::{KrishivError, Result};
 use crate::types::{ExecutionMode, QueryResult};
@@ -18,7 +18,7 @@ use crate::types::{ExecutionMode, QueryResult};
 #[derive(Clone)]
 pub struct DataFrame {
     logical_plan: LogicalPlan,
-    sql_dataframe: Option<SqlDataFrame>,
+    sql_dataframe: Option<Arc<dyn KrishivDataFrameOps>>,
     sql_query: Option<String>,
     /// Pre-collected batches — set when the DataFrame is constructed from
     /// already-executed results (e.g. [`Session::sql_as`]).
@@ -66,7 +66,7 @@ impl DataFrame {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_sql_dataframe(
         mode: ExecutionMode,
-        sql_dataframe: SqlDataFrame,
+        sql_dataframe: impl KrishivDataFrameOps + 'static,
         sql_query: Option<String>,
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
@@ -77,7 +77,7 @@ impl DataFrame {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
             logical_plan,
-            sql_dataframe: Some(sql_dataframe),
+            sql_dataframe: Some(Arc::new(sql_dataframe)),
             sql_query,
             pre_collected: None,
             mode,

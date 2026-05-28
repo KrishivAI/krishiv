@@ -153,6 +153,13 @@ pub struct StageSpec {
     /// Number of shuffle output partitions this stage produces, if known.
     /// Coordinator uses this to pre-register Pending partition slots.
     output_partition_count: Option<u32>,
+    /// GAP-3: Maximum per-task failure attempts before the task is permanently
+    /// failed.  Defaults to 1 (no retries).  Setting to N means the task will
+    /// be retried up to N-1 times on transient failures before failing the stage.
+    ///
+    /// Per-task retries are preferred over whole-stage retries for large jobs
+    /// because only the failed task is reset, not all tasks.
+    max_task_attempts: u32,
 }
 
 impl StageSpec {
@@ -164,7 +171,23 @@ impl StageSpec {
             tasks: Vec::new(),
             upstream_stage_ids: Vec::new(),
             output_partition_count: None,
+            max_task_attempts: 1, // default: no retries
         }
+    }
+
+    /// Set the maximum number of per-task execution attempts.
+    ///
+    /// A value of 1 means no retries (default).  A value of 3 means each task
+    /// will be attempted up to 3 times on transient failure before the stage fails.
+    #[must_use]
+    pub fn with_max_task_attempts(mut self, n: u32) -> Self {
+        self.max_task_attempts = n.max(1);
+        self
+    }
+
+    /// Maximum per-task execution attempts configured for this stage.
+    pub fn max_task_attempts(&self) -> u32 {
+        self.max_task_attempts
     }
 
     /// Attach a task.

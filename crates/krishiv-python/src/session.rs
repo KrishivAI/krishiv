@@ -14,6 +14,8 @@ use crate::dataframe::PyDataFrame;
 use crate::errors::map_krishiv_error;
 use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
+use crate::pipeline::StreamPipeline;
+use crate::relation::PyRelation;
 use crate::stream::{PyStream, PyWindowedStream};
 use crate::stream_exec::spec_from_pipeline;
 
@@ -322,6 +324,68 @@ impl PySession {
                 })
                 .map_err(map_krishiv_error)
         })
+    }
+
+    /// Create a unified DataFrame backed by SQL (batch).
+    ///
+    /// Equivalent to `sql()` but returns a `DataFrame` usable in both batch
+    /// and streaming contexts via `SessionExt`-style API.
+    pub fn dataframe(&self, py: Python<'_>, query: String) -> PyResult<PyRelation> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .sql(&query)
+                .map(PyRelation::from_dataframe)
+                .map_err(map_krishiv_error)
+        })
+    }
+
+    /// Create an unbounded streaming DataFrame backed by a named source.
+    pub fn from_source(&self, name: String) -> PyResult<PyRelation> {
+        let mut pipeline = StreamPipeline::new(
+            self.inner.clone(),
+            name,
+            String::new(),
+            0,
+        );
+        pipeline.bounded = false;
+        Ok(PyRelation::from_pipeline(pipeline))
+    }
+
+    /// Create a bounded streaming DataFrame from in-memory `Batch` objects.
+    #[pyo3(signature = (name, batches, watermark_column="ts".to_string(), max_lateness_ms=0))]
+    pub fn from_bounded_stream(
+        &self,
+        name: String,
+        batches: Vec<PyBatch>,
+        watermark_column: String,
+        max_lateness_ms: u64,
+    ) -> PyResult<PyRelation> {
+        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
+            .into_iter()
+            .map(|b| b.record_batch().clone())
+            .collect();
+        let stream_batches: Vec<StreamBatch> = record_batches
+            .into_iter()
+            .enumerate()
+            .map(|(seq, b)| StreamBatch::new(seq as u64, b))
+            .collect();
+        self.inner
+            .register_memory_stream(name.clone(), stream_batches.iter().map(|sb| sb.batch().clone()).collect())
+            .map_err(map_krishiv_error)?;
+        let pipeline = StreamPipeline {
+            session: self.inner.clone(),
+            source_id: format!("memory:{name}"),
+            bounded: true,
+            watermark_column,
+            max_lateness_ms,
+            key_columns: Vec::new(),
+            event_time_column: None,
+            window: None,
+            aggregations: Vec::new(),
+            source_watermarks: std::collections::HashMap::new(),
+        };
+        Ok(PyRelation::from_pipeline(pipeline))
     }
 
     /// Submit a continuous streaming job. Returns the job id handle.

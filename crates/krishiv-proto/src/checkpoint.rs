@@ -54,4 +54,5 @@ pub enum CheckpointAckResponse {
     Accepted,
     StaleEpoch { current_epoch: u64 },
     JobNotFound,
+    StaleFencingToken { current_token: u64 },
 }

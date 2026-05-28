@@ -20,6 +20,7 @@ mod memo;
 mod migration;
 mod pipeline;
 mod query_result;
+mod relation;
 mod schema;
 mod session;
 mod sinks;
@@ -46,6 +47,7 @@ mod ai {
 pub use agg::PyAggExpr;
 pub use batch::PyBatch;
 pub use dataframe::PyDataFrame;
+pub use relation::PyRelation;
 pub use errors::{
     AuthorizationError, CheckpointError, ConnectorError, KrishivError, ModeError, QueryError,
     SchemaError, UdfError,
@@ -88,6 +90,8 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<stream::PyWindowedStream>()?;
     m.add_class::<batch::PyBatch>()?;
     m.add_class::<query_result::PyQueryResult>()?;
+    m.add_class::<query_result::PyQueryResultIter>()?;
+    m.add_class::<relation::PyRelation>()?;
     m.add_class::<job_status::PyJobStatus>()?;
     m.add_class::<schema::PySchema>()?;
     m.add_class::<windows::PyWindowSpec>()?;

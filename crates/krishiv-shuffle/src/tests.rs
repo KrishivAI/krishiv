@@ -850,6 +850,27 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
+    async fn object_store_ipc_compression_roundtrip() {
+        use crate::compression::ShuffleCompression;
+        for codec in [ShuffleCompression::None, ShuffleCompression::Lz4, ShuffleCompression::Zstd] {
+            let inner = Arc::new(InMemory::new());
+            let store = ObjectStoreShuffleStore::new(inner, "compress-test")
+                .with_compression(codec);
+            let partition = make_object_store_partition("job-compress", "s0", 0);
+            let id = partition.id.clone();
+            store.write_partition(partition, 1).await.unwrap_or_else(|e| {
+                panic!("write failed for codec {:?}: {e}", codec)
+            });
+            let read_back = store.read_partition(&id).await.unwrap_or_else(|e| {
+                panic!("read failed for codec {:?}: {e}", codec)
+            });
+            let read_back = read_back.unwrap_or_else(|| panic!("partition missing for codec {:?}", codec));
+            assert_eq!(read_back.batches.len(), 1, "codec {:?}", codec);
+            assert_eq!(read_back.batches[0].num_rows(), 1, "codec {:?}", codec);
+        }
+    }
+
+    #[tokio::test]
     async fn spills_to_disk_at_memory_limit() {
         let dir = tempfile::tempdir().unwrap();
         let spill = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());

@@ -1,3 +1,4 @@
+use krishiv_async_util::unix_now_ms;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::backend::StateBackend;
@@ -22,11 +23,37 @@ impl RedbStateBackend {
     ///
     /// The database is created if it does not yet exist.  Suitable for
     /// production use; state persists across executor restarts.
+    ///
+    /// P1-9: If the database file is corrupt (e.g. truncated after an OS crash),
+    /// the corrupt file is renamed to `<path>.corrupt.<unix_ms>` and a fresh
+    /// empty database is started so the process can continue rather than
+    /// panicking on startup.
     pub fn open(path: impl AsRef<std::path::Path>) -> StateResult<Self> {
-        let db = Database::create(path).map_err(db_err)?;
-        let this = Self { db };
-        this.ensure_table()?;
-        Ok(this)
+        let path = path.as_ref();
+        match Database::create(path) {
+            Ok(db) => {
+                let this = Self { db };
+                this.ensure_table()?;
+                Ok(this)
+            }
+            Err(e) => {
+                let ts = unix_now_ms();
+                let corrupt_path = format!("{}.corrupt.{ts}", path.display());
+                tracing::error!(
+                    path = %path.display(),
+                    corrupt_path = %corrupt_path,
+                    error = %e,
+                    "redb open failed; renaming corrupt file and starting fresh"
+                );
+                if let Err(rename_err) = std::fs::rename(path, &corrupt_path) {
+                    tracing::warn!(error = %rename_err, "failed to rename corrupt redb file");
+                }
+                let db = Database::create(path).map_err(db_err)?;
+                let this = Self { db };
+                this.ensure_table()?;
+                Ok(this)
+            }
+        }
     }
 
     /// Create an ephemeral in-memory redb database.

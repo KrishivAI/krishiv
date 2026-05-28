@@ -781,6 +781,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             launch_in_flight: false,
             output_metadata: value.output_metadata.map(TaskOutputMetadata::from),
             last_failure_reason: value.last_failure_reason,
+            failure_count: 0,
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.
             last_watermark_ms: None,
             last_source_offset: None,

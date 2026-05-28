@@ -63,9 +63,10 @@
 // ── Session API ───────────────────────────────────────────────────────────────
 
 pub use krishiv_api::{
-    DataFrame, ExecutionMode, KeyedStream, KrishivError, MultiSourceWatermarkSpec, QueryResult,
-    RecordBatch, Session, SessionBuilder, SessionWindowedStream, SlidingWindowedStream,
-    StateTtlConfig, Stream, StreamBatch, StreamMode, WatermarkSpec, WindowedStream,
+    AggExpr, AggFunction, DataFrame, ExecutionMode, KeyedStream, KrishivError,
+    MultiSourceWatermarkSpec, QueryResult, RecordBatch, Session, SessionBuilder,
+    SessionWindowedStream, SlidingWindowedStream, StateTtlConfig, Stream, StreamBatch, StreamMode,
+    WatermarkSpec, WindowedStream,
 };
 
 // Arrow schema/type primitives re-exported so users never import `arrow` directly.
@@ -91,6 +92,18 @@ pub use krishiv_lakehouse::{
 
 /// Krishiv result type — errors are always [`KrishivError`].
 pub type Result<T> = std::result::Result<T, KrishivError>;
+
+// ── Unified batch+streaming Relation API ──────────────────────────────────────
+
+pub mod execute;
+pub mod relation;
+pub mod session_ext;
+pub mod stream_handle;
+
+pub use execute::Execute;
+pub use relation::{EmitMode, Relation, WindowSpec};
+pub use session_ext::SessionExt;
+pub use stream_handle::StreamHandle;
 
 // ── Prelude ───────────────────────────────────────────────────────────────────
 
@@ -148,11 +161,12 @@ pub mod distributed {
 /// ```
 pub mod prelude {
     pub use crate::{
-        AggregateUdf, CommitHandle, ConnectorCapabilities, ConnectorConfig, ConnectorError,
-        DataFrame, DataType, ExecutionMode, Field, IcebergScanOptions, IcebergTableRef,
-        KeyedStream, KrishivError, LakehouseTable, Offset, QueryResult, RecordBatch, Result,
-        ScalarUdf, Schema, SchemaRef, Session, SessionBuilder, SessionWindowedStream, Sink,
-        SlidingWindowedStream, Source, StateTtlConfig, Stream, StreamBatch, StreamMode, TableUdf,
-        UdfError, UdfRegistry, WatermarkSpec, WindowedStream,
+        AggExpr, AggFunction, AggregateUdf, CommitHandle, ConnectorCapabilities, ConnectorConfig,
+        ConnectorError, DataFrame, DataType, EmitMode, Execute, ExecutionMode, Field,
+        IcebergScanOptions, IcebergTableRef, KeyedStream, KrishivError, LakehouseTable, Offset,
+        QueryResult, RecordBatch, Relation, Result, ScalarUdf, Schema, SchemaRef, Session,
+        SessionBuilder, SessionExt, SessionWindowedStream, Sink, SlidingWindowedStream, Source,
+        StateTtlConfig, Stream, StreamBatch, StreamHandle, StreamMode, TableUdf, UdfError,
+        UdfRegistry, WatermarkSpec, WindowSpec, WindowedStream,
     };
 }

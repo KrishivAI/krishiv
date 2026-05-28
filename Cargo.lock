@@ -4166,6 +4166,7 @@ dependencies = [
  "krishiv-state",
  "krishiv-udf",
  "krishiv-vector-sinks",
+ "parquet 58.3.0",
  "pyo3",
  "pyo3-arrow",
  "sha2",

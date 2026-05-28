@@ -1,5 +1,6 @@
 //! Shared streaming pipeline descriptor carried by Stream / KeyedStream / WindowedStream.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use krishiv_api::Session;
@@ -26,12 +27,16 @@ pub struct WindowDescriptor {
 pub struct StreamPipeline {
     pub session: Arc<Session>,
     pub source_id: String,
+    /// True for bounded (in-memory / SQL query) streams; false for unbounded sources.
+    pub bounded: bool,
     pub watermark_column: String,
     pub max_lateness_ms: u64,
     pub key_columns: Vec<String>,
     pub event_time_column: Option<String>,
     pub window: Option<WindowDescriptor>,
     pub aggregations: Vec<AggDescriptor>,
+    /// Per-source watermark lags for multi-source joins (source_id → lag_ms).
+    pub source_watermarks: HashMap<String, u64>,
 }
 
 impl StreamPipeline {
@@ -44,12 +49,14 @@ impl StreamPipeline {
         Self {
             session,
             source_id,
+            bounded: false,
             watermark_column,
             max_lateness_ms,
             key_columns: Vec::new(),
             event_time_column: None,
             window: None,
             aggregations: Vec::new(),
+            source_watermarks: HashMap::new(),
         }
     }
 
@@ -78,6 +85,13 @@ impl StreamPipeline {
     pub fn with_aggregations(&self, aggs: Vec<AggDescriptor>) -> Self {
         let mut next = self.clone();
         next.aggregations = aggs;
+        next
+    }
+
+    /// Add a per-source watermark lag for multi-source join pipelines.
+    pub fn with_source_watermark(&self, source_id: String, lag_ms: u64) -> Self {
+        let mut next = self.clone();
+        next.source_watermarks.insert(source_id, lag_ms);
         next
     }
 
@@ -121,3 +135,4 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+

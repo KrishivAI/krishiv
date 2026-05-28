@@ -542,6 +542,9 @@ impl StageRecord {
         update: TaskStatusUpdate,
         max_stage_retries: u32,
     ) -> SchedulerResult<TaskUpdateOutcome> {
+        // GAP-3: Per-task retry configuration from the stage spec.
+        let max_task_attempts = self.spec.max_task_attempts();
+
         let task = self
             .tasks
             .iter_mut()
@@ -555,10 +558,42 @@ impl StageRecord {
             return Ok(outcome);
         }
 
-        if update.state() == TaskState::Failed && self.retry_count < max_stage_retries {
-            self.retry_stage();
-            return Ok(TaskUpdateOutcome::Applied);
+        if update.state() == TaskState::Failed {
+            // GAP-3: Try per-task retry first.  If this specific task still has
+            // attempts remaining, reset only that task to Pending rather than
+            // retrying the entire stage (which would reset even succeeded tasks).
+            let task_failure_count = {
+                let task = self
+                    .tasks
+                    .iter_mut()
+                    .find(|t| t.task_id() == update.task_id())
+                    .unwrap(); // we already found this task above
+                task.failure_count = task.failure_count.saturating_add(1);
+                task.failure_count
+            };
+            if task_failure_count < max_task_attempts {
+                // Retry just this task.
+                if let Some(task) = self
+                    .tasks
+                    .iter_mut()
+                    .find(|t| t.task_id() == update.task_id())
+                {
+                    task.state = TaskState::Pending;
+                    task.assigned_executor = None;
+                    task.launch_in_flight = false;
+                    // Keep failure_count and last_failure_reason for diagnostics.
+                }
+                self.refresh_state();
+                return Ok(TaskUpdateOutcome::Applied);
+            }
+
+            // Per-task attempts exhausted — fall back to whole-stage retry if configured.
+            if self.retry_count < max_stage_retries {
+                self.retry_stage();
+                return Ok(TaskUpdateOutcome::Applied);
+            }
         }
+
         self.refresh_state();
         Ok(TaskUpdateOutcome::Applied)
     }
@@ -647,6 +682,9 @@ pub struct TaskRecord {
     pub(crate) launch_in_flight: bool,
     pub(crate) output_metadata: Option<TaskOutputMetadata>,
     pub(crate) last_failure_reason: Option<String>,
+    /// GAP-3: How many times this specific task has failed.  Used by
+    /// `apply_task_update` to decide whether to retry the task or fail it.
+    pub(crate) failure_count: u32,
     /// Last event-time watermark reported by the executor for this streaming task.
     /// `None` for batch tasks or streaming tasks that have not yet heartbeated.
     pub(crate) last_watermark_ms: Option<i64>,
@@ -665,6 +703,7 @@ impl TaskRecord {
             launch_in_flight: false,
             output_metadata: None,
             last_failure_reason: None,
+            failure_count: 0,
             last_watermark_ms: None,
             last_source_offset: None,
         }
@@ -799,6 +838,7 @@ impl TaskRecord {
             attempt: self.attempt,
             output_metadata: self.output_metadata.clone(),
             last_failure_reason: self.last_failure_reason.clone(),
+            failure_count: self.failure_count,
             source_capabilities: self.spec.source_capabilities.clone(),
             sink_capabilities: self.spec.sink_capabilities.clone(),
             last_watermark_ms: self.last_watermark_ms,
@@ -954,6 +994,8 @@ pub struct TaskSnapshot {
     pub(crate) attempt: u32,
     pub(crate) output_metadata: Option<TaskOutputMetadata>,
     pub(crate) last_failure_reason: Option<String>,
+    /// GAP-3: Number of times this specific task has failed (for observability).
+    pub(crate) failure_count: u32,
     /// Capability flags declared by the source connector for this task, if known.
     pub source_capabilities: Option<ConnectorCapabilityFlags>,
     /// Capability flags declared by the sink connector for this task, if known.
@@ -993,6 +1035,11 @@ impl TaskSnapshot {
     /// Last failure reason reported by the executor, if any.
     pub fn last_failure_reason(&self) -> Option<&str> {
         self.last_failure_reason.as_deref()
+    }
+
+    /// Number of times this specific task has failed (for observability).
+    pub fn failure_count(&self) -> u32 {
+        self.failure_count
     }
 
     /// Last event-time watermark reported by this streaming task (ms since epoch).

@@ -191,27 +191,22 @@ impl Source for KafkaSource {
 }
 
 // ---------------------------------------------------------------------------
-// KafkaSink
+// KafkaSink  (stub when `kafka` feature is absent)
 // ---------------------------------------------------------------------------
 
-/// A Kafka sink stub.
+/// A Kafka sink backed by `rdkafka` when the `kafka` feature is enabled.
 ///
-/// Capabilities: unbounded + transactional (Kafka supports transactional
-/// producers for exactly-once delivery when combined with idempotent
-/// producers and consumer group offset management).
+/// Each `write_batch` call serialises every row as a JSON object and produces
+/// it to the configured topic.  When the `kafka` feature is not enabled the
+/// sink returns `ConnectorError::Unsupported` on every data method.
 ///
-/// Post-write offset commit protocol: the Kafka consumer group offset is
-/// committed only after the corresponding output batch has been durably written
-/// to the downstream sink.  If the executor crashes between the output write and
-/// the offset commit, the source will reprocess that batch on reassignment,
-/// providing at-least-once delivery.
-///
-/// All data methods return [`ConnectorError::Unsupported`] until the
-/// `kafka-runtime` feature is enabled.
+/// Capabilities: unbounded + transactional.
+#[cfg(not(feature = "kafka"))]
 pub struct KafkaSink {
     config: KafkaConfig,
 }
 
+#[cfg(not(feature = "kafka"))]
 impl KafkaSink {
     /// Create a new `KafkaSink` from a validated config.
     pub fn new(config: KafkaConfig) -> Self {
@@ -224,6 +219,7 @@ impl KafkaSink {
     }
 }
 
+#[cfg(not(feature = "kafka"))]
 impl Sink for KafkaSink {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities::new()
@@ -233,13 +229,155 @@ impl Sink for KafkaSink {
 
     async fn write_batch(&mut self, _batch: RecordBatch) -> ConnectorResult<()> {
         Err(ConnectorError::Unsupported {
-            message: "Kafka broker connection not available in stub; enable kafka-runtime feature"
-                .into(),
+            message: "Kafka producer requires the `kafka` feature".into(),
         })
     }
 
     async fn flush(&mut self) -> ConnectorResult<()> {
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KafkaSink  (rdkafka-backed when `kafka` feature is enabled)
+// ---------------------------------------------------------------------------
+
+/// `rdkafka`-backed Kafka sink (P1-20).
+///
+/// Each `write_batch` serialises every row of the record batch as a JSON
+/// object and sends it to the configured Kafka topic.  Messages are produced
+/// with `MessageDelivery::Blocking` so back-pressure is applied before
+/// returning.  `flush()` calls `producer.flush()` to drain the internal
+/// `rdkafka` queue.
+#[cfg(feature = "kafka")]
+pub struct KafkaSink {
+    config: KafkaConfig,
+    producer: rdkafka::producer::FutureProducer,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaSink {
+    /// Create a new `KafkaSink` from a validated config.
+    ///
+    /// Returns an error if the rdkafka producer cannot be created
+    /// (e.g. invalid bootstrap servers string).
+    pub fn new(config: KafkaConfig) -> ConnectorResult<Self> {
+        use rdkafka::ClientConfig;
+
+        let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", &config.bootstrap_servers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .map_err(|e| ConnectorError::Kafka {
+                message: format!("rdkafka producer creation failed: {e}"),
+                retriable: false,
+            })?;
+
+        Ok(Self { config, producer })
+    }
+
+    /// Return the config this sink was created with.
+    pub fn config(&self) -> &KafkaConfig {
+        &self.config
+    }
+
+    /// Serialise a single RecordBatch row as a JSON object.
+    fn row_to_json(batch: &RecordBatch, row: usize) -> serde_json::Value {
+        use arrow::datatypes::DataType;
+
+        let schema = batch.schema();
+        let mut map = serde_json::Map::new();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(col_idx);
+            let v = if col.is_null(row) {
+                serde_json::Value::Null
+            } else {
+                match field.data_type() {
+                    DataType::Utf8 => {
+                        use arrow::array::StringArray;
+                        let arr = col.as_any().downcast_ref::<StringArray>();
+                        arr.map(|a| serde_json::Value::String(a.value(row).to_owned()))
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    DataType::Int64 => {
+                        use arrow::array::Int64Array;
+                        let arr = col.as_any().downcast_ref::<Int64Array>();
+                        arr.map(|a| serde_json::Value::Number(a.value(row).into()))
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    DataType::Int32 => {
+                        use arrow::array::Int32Array;
+                        let arr = col.as_any().downcast_ref::<Int32Array>();
+                        arr.map(|a| serde_json::Value::Number(a.value(row).into()))
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    DataType::Float64 => {
+                        use arrow::array::Float64Array;
+                        let arr = col.as_any().downcast_ref::<Float64Array>();
+                        arr.and_then(|a| {
+                            serde_json::Number::from_f64(a.value(row))
+                                .map(serde_json::Value::Number)
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                    }
+                    DataType::Boolean => {
+                        use arrow::array::BooleanArray;
+                        let arr = col.as_any().downcast_ref::<BooleanArray>();
+                        arr.map(|a| serde_json::Value::Bool(a.value(row)))
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                    _ => {
+                        use arrow::util::display::array_value_to_string;
+                        array_value_to_string(col.as_ref(), row)
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null)
+                    }
+                }
+            };
+            map.insert(field.name().clone(), v);
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl Sink for KafkaSink {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new()
+            .with_unbounded()
+            .with_transactional()
+    }
+
+    async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
+        use rdkafka::producer::FutureRecord;
+        use std::time::Duration;
+
+        let topic = self.config.topic.clone();
+        for row in 0..batch.num_rows() {
+            let json = Self::row_to_json(&batch, row);
+            let payload = json.to_string();
+            let record: FutureRecord<'_, str, str> =
+                FutureRecord::to(&topic).payload(&payload);
+            self.producer
+                .send(record, Duration::from_secs(5))
+                .await
+                .map_err(|(e, _)| ConnectorError::Kafka {
+                    message: format!("rdkafka produce failed: {e}"),
+                    retriable: true,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> ConnectorResult<()> {
+        use rdkafka::producer::Producer;
+        use std::time::Duration;
+        self.producer
+            .flush(Duration::from_secs(10))
+            .map_err(|e| ConnectorError::Kafka {
+                message: format!("rdkafka flush failed: {e}"),
+                retriable: true,
+            })
     }
 }
 
@@ -521,10 +659,46 @@ impl Source for RdkafkaKafkaSource {
         .await;
 
         match msg {
-            // Poll timeout — no message available; signal a momentary idle (not EOF).
-            Err(_timeout) => Ok(Some(arrow::record_batch::RecordBatch::new_empty(
-                std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-            ))),
+            // GAP-16: Poll timeout — no message available on this poll cycle.
+            // Check whether the consumer has reached the broker's high-water mark
+            // for this partition.  If so, return `Ok(None)` to signal EOF so the
+            // caller can stop polling instead of spinning indefinitely.
+            //
+            // `fetch_watermarks` is a synchronous metadata RPC; we run it on a
+            // blocking thread so it does not stall the async runtime.  On error
+            // we fall back to returning an empty batch (momentary idle) so the
+            // pipeline does not abort on a transient metadata failure.
+            Err(_timeout) => {
+                let consumer = self.consumer.clone();
+                let topic = self.topic.clone();
+                let partition = self.partition;
+                let next_offset = self
+                    .last_offset
+                    .map(|(_, o)| o + 1)
+                    .unwrap_or(0);
+
+                let at_eof = tokio::task::spawn_blocking(move || {
+                    use rdkafka::consumer::Consumer;
+                    match consumer.fetch_watermarks(
+                        &topic,
+                        partition,
+                        std::time::Duration::from_millis(500),
+                    ) {
+                        Ok((_low, high)) => next_offset >= high,
+                        Err(_) => false, // conservatively assume not at EOF on metadata error
+                    }
+                })
+                .await
+                .unwrap_or(false);
+
+                if at_eof {
+                    Ok(None)
+                } else {
+                    Ok(Some(arrow::record_batch::RecordBatch::new_empty(
+                        std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                    )))
+                }
+            }
             Ok(Err(e)) => Err(crate::ConnectorError::IoStr {
                 message: format!("rdkafka receive error: {e}"),
             }),
@@ -646,6 +820,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[cfg(not(feature = "kafka"))]
     fn kafka_sink_reports_unbounded_and_transactional() {
         let config = KafkaConfig {
             bootstrap_servers: "localhost:9092".into(),

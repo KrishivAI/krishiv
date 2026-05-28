@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
@@ -200,6 +201,13 @@ pub struct ExecutorTaskOutput {
     pub(crate) runtime_stats: Option<TaskRuntimeStats>,
     /// Record batches produced by streaming window operators (in-process / local path).
     pub(crate) record_batches: Vec<RecordBatch>,
+    /// GAP-2: Maximum event-time watermark (in milliseconds) reached by this
+    /// streaming window task.  `None` for batch and non-window tasks.
+    ///
+    /// The coordinator propagates this to downstream stage scheduling so that
+    /// a pipeline fan-out knows the global low watermark across all executor
+    /// tasks and can safely emit late-data decisions.
+    pub(crate) watermark_ms: Option<i64>,
 }
 
 impl ExecutorTaskOutput {
@@ -212,6 +220,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -229,6 +238,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -241,6 +251,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -253,6 +264,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -268,6 +280,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: partitions,
             runtime_stats: None,
             record_batches: Vec::new(),
+            watermark_ms: None,
         }
     }
 
@@ -286,6 +299,7 @@ impl ExecutorTaskOutput {
             shuffle_partitions: Vec::new(),
             runtime_stats: None,
             record_batches,
+            watermark_ms: None,
         }
     }
 
@@ -302,6 +316,20 @@ impl ExecutorTaskOutput {
     pub(crate) fn with_record_batches(mut self, batches: Vec<RecordBatch>) -> Self {
         self.record_batches = batches;
         self
+    }
+
+    /// Attach the maximum event-time watermark reached by this streaming task.
+    ///
+    /// Must be set for `StreamingWindow` outputs so that the coordinator can
+    /// track global low-watermark across all tasks and propagate it downstream.
+    pub(crate) fn with_watermark_ms(mut self, watermark_ms: i64) -> Self {
+        self.watermark_ms = Some(watermark_ms);
+        self
+    }
+
+    /// Maximum event-time watermark reached by this streaming window task, if any.
+    pub fn watermark_ms(&self) -> Option<i64> {
+        self.watermark_ms
     }
 
     /// Output kind.
@@ -342,6 +370,11 @@ impl ExecutorTaskOutput {
             && let Ok(ipc) = encode_record_batches_ipc(&self.record_batches)
         {
             meta = meta.with_inline_record_batch_ipc(ipc);
+        }
+        // GAP-2: Propagate watermark so the coordinator can track global low-watermark
+        // across all executor tasks for downstream stage scheduling.
+        if let Some(wm) = self.watermark_ms {
+            meta = meta.with_watermark_ms(wm);
         }
         meta
     }
@@ -545,6 +578,17 @@ pub struct ExecutorTaskRunner {
     pub(crate) running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
     /// Optional continuous streaming drain hook (in-process cluster).
     pub(crate) continuous_drainer: Option<Arc<dyn ContinuousJobDrainer>>,
+    /// Per-job stateful `ContinuousWindowExecutor` instances for `stream:loop:` fragments (GAP-6).
+    ///
+    /// Keyed by job-id string.  The executor is created on first use and
+    /// reused across drain cycles so that partial window state (e.g. an open
+    /// tumbling window that has not yet reached its watermark) accumulates
+    /// correctly across multiple invocations of the same `stream:loop:` task.
+    ///
+    /// `Arc<Mutex<…>>` because the runner is cloned between tasks but all
+    /// clones must share the same stateful executor for a given job.
+    pub(crate) loop_executors:
+        Arc<DashMap<String, Arc<std::sync::Mutex<krishiv_exec::ContinuousWindowExecutor>>>>,
     /// Live executor lease generation, shared with the heartbeat loop.
     /// Used to stamp checkpoint-fanout RPCs without round-tripping through
     /// the gRPC service (B10).  Defaults to `LeaseGeneration::initial()`.
@@ -554,6 +598,12 @@ pub struct ExecutorTaskRunner {
     /// enqueued here are drained by the runner loop and trigger checkpoint
     /// initiation.
     pub(crate) barrier_injector: Option<SharedBarrierInjector>,
+
+    /// Most-recently observed coordinator fencing token, cached from real gRPC
+    /// `InitiateCheckpointRequest` messages.  `drain_pending_barriers` stamps
+    /// locally-injected barriers with this token so the coordinator does not
+    /// reject acks from stale-token barriers after a leadership election.
+    pub(crate) cached_coordinator_fencing_token: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -561,6 +611,7 @@ impl fmt::Debug for ExecutorTaskRunner {
         f.debug_struct("ExecutorTaskRunner")
             .field("inbox", &self.inbox)
             .field("shuffle", &self.shuffle)
+            .field("loop_executors", &self.loop_executors.len())
             .field(
                 "inmem_shuffle",
                 &self
@@ -578,6 +629,12 @@ impl fmt::Debug for ExecutorTaskRunner {
                     .unwrap_or(0),
             )
             .field("live_lease", &self.live_lease.get())
+            .field(
+                "cached_coordinator_fencing_token",
+                &self
+                    .cached_coordinator_fencing_token
+                    .load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -593,10 +650,14 @@ impl ExecutorTaskRunner {
             checkpoint_runners: Arc::new(DashMap::new()),
             running_attempts: None,
             continuous_drainer: None,
+            loop_executors: Arc::new(DashMap::new()),
             live_lease: crate::grpc_client::SharedLeaseGeneration::new(
                 krishiv_proto::LeaseGeneration::initial(),
             ),
             barrier_injector: None,
+            cached_coordinator_fencing_token: Arc::new(AtomicU64::new(
+                FencingToken::initial().as_u64(),
+            )),
         }
     }
 
@@ -787,8 +848,12 @@ impl ExecutorTaskRunner {
         };
 
         let fragment = assignment.plan_fragment().description().trim();
+        // GAP-6: stream:loop: fragments complete each drain cycle and report
+        // Succeeded so the coordinator sees the windowed output.  Future drain
+        // cycles are triggered by re-assigning the task.
         let terminal_streaming_task = model == crate::ExecutionModel::Streaming
             && (fragment.starts_with("stream:continuous:")
+                || fragment.starts_with("stream:loop:")
                 || krishiv_plan::window::parse_stream_fragment(fragment).is_ok());
         let terminal_state =
             if model == crate::ExecutionModel::Streaming && !terminal_streaming_task {
@@ -946,6 +1011,11 @@ impl ExecutorTaskRunner {
             ExecutorTaskAssignment, OutputContract, OutputContractKind, PlanFragment,
             TaskAttemptRef,
         };
+        // Cache the live coordinator fencing token so that `drain_pending_barriers`
+        // (which cannot receive the token from the barrier proto itself) uses the
+        // most-recently seen token instead of always stamping FencingToken::initial().
+        self.cached_coordinator_fencing_token
+            .store(req.fencing_token.as_u64(), Ordering::SeqCst);
         for entry in self.checkpoint_runners.iter() {
             let task_id = entry.key().clone();
             // Prefer the real attempt ref from running_attempts.  Fall back to
@@ -1013,10 +1083,19 @@ impl ExecutorTaskRunner {
             let Ok(job_id) = JobId::try_new(&barrier.job_id) else {
                 continue;
             };
+            // Use the most-recently observed coordinator fencing token so the
+            // ack is not rejected after a leadership election.  Falls back to
+            // FencingToken::initial() only before any real checkpoint request
+            // has been received (which is safe: no prior leader exists yet).
+            let raw_token = self
+                .cached_coordinator_fencing_token
+                .load(Ordering::SeqCst);
+            let fencing_token = FencingToken::try_new(raw_token.max(1))
+                .unwrap_or_else(|_| FencingToken::initial());
             let req = InitiateCheckpointRequest {
                 job_id,
                 epoch: barrier.epoch,
-                fencing_token: FencingToken::initial(),
+                fencing_token,
             };
             if let Err(e) = self
                 .initiate_checkpoint_for_job(&req, state_backend, storage, coordinator)

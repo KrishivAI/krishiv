@@ -2,6 +2,135 @@
 
 ## Current Phase
 
+**Streaming API bug-fix sweep — 7 bugs/gaps resolved (2026-05-28).**
+
+### Bug and Gap Fixes (2026-05-28)
+
+All 7 items from the streaming API audit fixed in commit `855aa81` on
+branch `claude/codebase-review-plan-jQOkr`.
+
+| ID | Kind | File(s) | Fix |
+|----|------|---------|-----|
+| B1 | Bug — silent data loss | `stream_exec.rs` | `key_by(["a","b"])` now raises a clear error instead of silently dropping all but the first key |
+| B2 | Bug — wrong API answer | `pipeline.rs`, `session.rs`, `relation.rs` | Added `bounded: bool` field to `StreamPipeline`; `PyRelation.is_bounded` uses it instead of the fragile `source_id.starts_with("memory:")` heuristic |
+| B3 | Bug — semantic confusion | `relation.rs` (Python), `stream_exec.rs` | `session_window(gap_ms)` now sets `size_ms=0` / `gap_ms=Some(gap_ms)` explicitly; `spec_from_pipeline` validates `gap_ms` is present for session windows |
+| B4 | Bug — plan registration skipped | `relation.rs` (Rust) | `StreamingChain::execute_bounded` switched from `runtime.collect_bounded_window` to `execute_windowed_stream`, which also calls `accept_plan` |
+| G1 | Gap — custom aggs unavailable on Relation | `relation.rs` (Rust), `session_ext.rs` | `agg_exprs: Option<Vec<AggExpr>>` field + `.agg(exprs)` builder on `Relation`; `AggExpr`/`AggFunction` re-exported from facade and prelude |
+| G2 | Gap — no sink_to on Python | `relation.rs` (Python), `Cargo.toml` | `PyRelation.write_parquet(path)` materialises any batch/bounded stream to a Parquet file |
+| G3 | Gap — multi-source watermarks zeroed | `pipeline.rs`, `relation.rs` (Python), `stream_exec.rs` | `source_watermarks: HashMap<String,u64>` on `StreamPipeline`; `PyRelation.with_source_watermark(source_id, lag_ms)` builder; `spec_from_pipeline` threads map into `LocalWindowExecutionSpec` |
+
+Validation: `cargo test -p krishiv -p krishiv-sql` → all suites pass, 0 failed.
+`cargo check -p krishiv -p krishiv-python` → clean (2 pre-existing warnings only).
+
+---
+
+**Unified batch+streaming Relation API — Phase 1-3 complete (2026-05-28).**
+
+### Unified Relation API — Phase 1 (Rust), Phase 2 (Python), Phase 3 (SQL) (2026-05-28)
+
+Implemented the three-phase unified batch+streaming API.
+
+**Phase 1 — Rust `Relation` type (crates/krishiv):**
+- `QueryResult` ergonomics: `into_batches()`, `IntoIterator`, `From<Vec<RecordBatch>>`
+- `StreamBatch::into_batch()`
+- `Relation` struct: unified batch SQL and windowed streaming; `.collect()`, `.sink_to()`, `.key_by()`, `.with_event_time()`, `.watermark()`, `.window()`, `.emit()`
+- `WindowSpec` enum: `Tumbling`, `Sliding`, `Session`
+- `EmitMode` enum: `Batch`, `PerWindow`, `Continuous`
+- `StreamHandle`: cancel + `poll_output()` for continuous jobs
+- `Execute` trait: generic dispatch over `Relation`
+- `SessionExt` extension: `relation()`, `from_parquet()`, `from_source()`, `from_bounded_stream()`
+- All new types exported from `krishiv` facade and prelude
+- Validation: `cargo test -p krishiv --lib` → 48 passed, 0 failed
+
+**Phase 2 — Python unified `DataFrame` (crates/krishiv-python):**
+- `PyDataFrame::collect()` returns `PyQueryResult` (was `String`)
+- `PyDataFrame::show(n)` new method
+- `PyQueryResult`: `to_arrow()`, `to_pandas()`, `show(n)`, `__iter__`
+- New `PyRelation` (exposed as Python `DataFrame`): unified batch+streaming
+- `PySession::dataframe()`, `from_source()`, `from_bounded_stream()` new entry points
+- Validation: `cargo check -p krishiv-python` → clean
+
+**Phase 3 — SQL window helper UDFs (crates/krishiv-sql):**
+- `tumble_start(ts, size)`, `tumble_end(ts, size)` — tumbling window boundaries
+- `hop_start(ts, slide, size)`, `hop_end(ts, slide, size)` — sliding window boundaries
+- Registered in `SqlEngine::new()` and `with_in_memory_catalog()`
+- `SqlEngine::register_streaming_source()` + `is_streaming_query()` for source-type routing
+- `Session::register_bounded()`, `register_unbounded()`, `is_streaming_query()`
+- Validation: `cargo test -p krishiv-sql --lib` → 41 passed (5 new), 0 failed
+
+Commit: `e62d7b6` on branch `claude/codebase-review-plan-jQOkr`
+
+---
+
+**Gap-mitigation sweep — P0/P1/P2 fix sprint complete (2026-05-28).**
+
+All confirmed gaps from `docs/engineering/gap-mitigation-plan.md` resolved;
+workspace crate checks pass; crate-specific tests continue to pass.
+
+### P1-5 ObjectStoreShuffleStore IPC compression (2026-05-28)
+
+Added `compression: ShuffleCompression` field and `with_compression()` builder to
+`ObjectStoreShuffleStore` in `krishiv-shuffle`. Write path uses
+`IpcWriteOptions::try_with_compression` mapping `Lz4→LZ4_FRAME`, `Zstd→ZSTD`.
+Arrow IPC reader decompresses transparently. Enabled `ipc_compression` workspace
+feature on the `arrow` dependency. Test: `object_store_ipc_compression_roundtrip`
+verifies all three codecs (None/Lz4/Zstd) round-trip correctly.
+
+Validation: `cargo test -p krishiv-shuffle --lib` → 58 passed, 0 failed.
+
+### P2-2 KrishivDataFrameOps trait (2026-05-28)
+
+Added `KrishivDataFrameOps` trait in `krishiv-sql/src/lib.rs`; `DataFrame` in
+`krishiv-api` now stores `Arc<dyn KrishivDataFrameOps>` instead of a concrete
+`SqlDataFrame`, eliminating DataFusion type leakage through the public API boundary.
+
+### Gap-mitigation sweep (2026-05-28)
+
+Branch `claude/codebase-review-plan-jQOkr` — fixes across 7 commits:
+
+| Gap ID | Crate | Fix |
+|--------|-------|-----|
+| P1-7 | krishiv-state | `TtlStateBackend::list_keys` now filters expired entries before returning |
+| P1-8 | krishiv-exec | `purge_expired()` called at start of each drain cycle in `ContinuousWindowExecutor::drain` |
+| P1-9 / P2-14 | krishiv-state | `RedbStateBackend::open` renames corrupt file to `<path>.corrupt.<unix_ms>` and starts fresh |
+| P1-14 | krishiv-connectors | Kafka CDC offsets committed only *after* `on_batch` returns `Ok(())`; removed commit from inside `poll_events` |
+| P1-16 | krishiv-scheduler, krishiv-proto | Coordinator validates fencing token in `handle_checkpoint_ack`; `StaleFencingToken` proto variant + wire encoding |
+| P1-19 | krishiv-executor | `ExecutorRuntime` tracks running tasks via `DashMap`; heartbeat `running_attempts` populated from that map |
+| P1-20 | krishiv-connectors | `KafkaSink` split into `#[cfg(not(feature = "kafka"))]` stub and real `rdkafka::FutureProducer`-backed impl |
+| GAP-11 | krishiv-scheduler | `mark_leader` fencing token derived from etcd cluster revision (globally monotonic), not local bool |
+
+Verified items already implemented (no changes needed):
+- P1-11 (Lakehouse atomic append): `check_and_append` holds mutex across check+commit
+- P1-12 (Lakehouse scan snapshot_id): `batches_up_to_snapshot` implemented
+- P1-13 (FeatureStoreSink): fragment-based storage with `reload_from_fragments`
+- P1-17 (Checkpoint ACK delivery): `initiate_checkpoint_and_deliver_ack` in runner
+- P1-18 (Row-level security): `apply_row_predicates` injects WHERE clauses
+- P1-21 (UDAF/UDTF wiring): `sync_aggregate_udfs` / `sync_table_udfs` implemented
+- P2-3 (Optimizer rules): `PredicatePushdownRule` + `ProjectionPruningRule` in krishiv-optimizer
+- P2-4 (CoalescePartitions): `CoalescePartitionsOperator` in krishiv-exec, wired in scheduler
+- P2-8 (PolicyEnforcingSqlEngine in Flight SQL): `do_get_statement` uses `PolicyEnforcingSqlEngine`
+- P2-9 (LanceDbSink): fragment loading on `open()` restores prior state
+- P2-10 (QdrantSink): `query_nearest` extracts text/chunk_index from payload
+- P2-12 (LocalAggregator): `AggKey` typed enum replaces string-keyed map
+- P2-15 (AI LSH): bucket-based band-hash approach replaces O(n²)
+- P2-16 (AI KeepHighestScore): `dedup_indices` accepts scores parameter
+- P0-13 (RAG query registry): `RAG_VECTOR_SINKS` global LazyLock shares sink between index/query
+
+Validation:
+```bash
+cargo test -p krishiv-state --lib   # 66 passed
+cargo test -p krishiv-connectors --lib  # 70 passed
+cargo test -p krishiv-exec --lib    # 90 passed
+cargo check -p krishiv-exec -p krishiv-state -p krishiv-connectors \
+  -p krishiv-proto -p krishiv-executor -p krishiv-runtime -p krishiv-flight-sql
+# OK (2 pre-existing dead_code warnings in krishiv-scheduler/store.rs)
+```
+
+Remaining deferred items (large scope or external deps):
+- P1-10: Iceberg real FS backend (requires Iceberg catalog integration)
+
+---
+
 **Production readiness sweep — 30 items across all 4 phases complete (2026-05-27).**
 
 All fixes verified with `cargo check --workspace`; crate-specific tests continue to pass.

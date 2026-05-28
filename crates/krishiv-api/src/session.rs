@@ -471,6 +471,32 @@ impl Session {
         Ok(())
     }
 
+    /// Register a Parquet file as a bounded (batch) SQL table.
+    ///
+    /// Alias for [`register_parquet`] that matches the `register_unbounded` naming.
+    pub fn register_bounded(&self, name: &str, path: &Path) -> Result<()> {
+        self.register_parquet(name, path)
+    }
+
+    /// Mark a table name as an unbounded streaming source in the SQL engine.
+    ///
+    /// After this call, [`Session::is_streaming_query`] returns `true` for
+    /// any SQL that references `name`.  The registration is visible to all
+    /// clones of this session because the underlying set is shared via
+    /// `Arc<RwLock<>>`.
+    pub fn register_unbounded(&self, name: &str) -> Result<()> {
+        self.sql_engine
+            .register_streaming_source(name)
+            .map_err(KrishivError::from)
+    }
+
+    /// Returns `true` if `sql` references any registered streaming source.
+    pub fn is_streaming_query(&self, sql: &str) -> Result<bool> {
+        self.sql_engine
+            .is_streaming_query(sql)
+            .map_err(KrishivError::from)
+    }
+
     /// Asynchronously register a local Parquet path as a SQL table.
     pub async fn register_parquet_async(
         &self,
@@ -490,7 +516,7 @@ impl Session {
         Ok(())
     }
 
-    fn dataframe_from_sql(&self, sql_dataframe: krishiv_sql::SqlDataFrame) -> DataFrame {
+    fn dataframe_from_sql(&self, sql_dataframe: impl krishiv_sql::KrishivDataFrameOps + 'static) -> DataFrame {
         let sql_query = sql_dataframe.query().map(str::to_owned);
         DataFrame::from_sql_dataframe(
             self.mode,

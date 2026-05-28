@@ -96,7 +96,24 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     }
 
     fn list_keys(&self, namespace: &Namespace) -> StateResult<Vec<Vec<u8>>> {
-        self.inner.list_keys(namespace)
+        let now_ms = unix_now_ms();
+        let all_keys = self.inner.list_keys(namespace)?;
+        let mut live = Vec::with_capacity(all_keys.len());
+        for key in all_keys {
+            match self.inner.get(namespace, &key)? {
+                Some(encoded) if encoded.len() >= 8 => {
+                    let expires_at_ms = i64::from_le_bytes(
+                        encoded[..8].try_into().unwrap_or([0u8; 8]),
+                    );
+                    if now_ms < expires_at_ms {
+                        live.push(key);
+                    }
+                }
+                Some(_) => live.push(key), // not TTL-encoded — pass through
+                None => {}                  // concurrently deleted
+            }
+        }
+        Ok(live)
     }
 
     /// Snapshot state with TTL prefix stripped from values.
@@ -147,6 +164,42 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         }
         out[count_offset..count_offset + 8].copy_from_slice(&written.to_le_bytes());
         Ok(out)
+    }
+
+    /// GAP-15: Eagerly remove all expired entries from the inner backend.
+    ///
+    /// `TtlStateBackend` uses lazy deletion on reads — expired values are only
+    /// evicted when the key is explicitly fetched.  Keys that are written once
+    /// and never read again after expiry remain in the inner store indefinitely,
+    /// causing unbounded memory growth on long-running streaming jobs.
+    ///
+    /// This method performs an eager scan across all namespaces and deletes
+    /// every entry whose `expires_at_ms ≤ now`.  It is intended to be called
+    /// periodically (e.g. at the start of each `ContinuousWindowExecutor::drain`
+    /// cycle) rather than on every read so that the amortised GC cost is low.
+    ///
+    /// Returns the number of entries removed.
+    fn purge_expired(&mut self) -> StateResult<usize> {
+        let now_ms = unix_now_ms();
+        let namespaces = self.inner.list_namespaces()?;
+        let mut evicted = 0usize;
+        for ns in &namespaces {
+            let keys = self.inner.list_keys(ns)?;
+            for key in &keys {
+                if let Some(encoded) = self.inner.get(ns, key)? {
+                    if encoded.len() >= 8 {
+                        let expires_at_ms = i64::from_le_bytes(
+                            encoded[..8].try_into().unwrap_or([0u8; 8]),
+                        );
+                        if now_ms >= expires_at_ms {
+                            self.inner.delete(ns, key)?;
+                            evicted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(evicted)
     }
 
     /// Restore state from a snapshot, re-applying fresh TTL prefixes.

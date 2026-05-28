@@ -70,15 +70,14 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             .map(agg_descriptor_to_expr)
             .collect()
     };
-    let window_kind = match window.kind {
-        WindowKind::Tumbling => LocalWindowKind::Tumbling,
-        WindowKind::Sliding => LocalWindowKind::Sliding {
-            slide_ms: window.slide_ms.unwrap_or(window.size_ms),
-        },
-        WindowKind::Session => LocalWindowKind::Session {
-            gap_ms: window.gap_ms.unwrap_or(window.size_ms),
-        },
-    };
+    // B1: reject multi-column key_by — the runtime key_column field is a single string.
+    if pipeline.key_columns.len() > 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "multi-column key_by is not yet supported for windowed aggregation; \
+             provide a single key column (got: [{}])",
+            pipeline.key_columns.join(", ")
+        )));
+    }
     let key_column = pipeline
         .key_columns
         .first()
@@ -89,7 +88,29 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             )
         })
         .map_err(map_krishiv_error)?;
+    // B3: validate window-type-specific fields.
+    let window_kind = match window.kind {
+        WindowKind::Tumbling => LocalWindowKind::Tumbling,
+        WindowKind::Sliding => LocalWindowKind::Sliding {
+            slide_ms: window.slide_ms.unwrap_or(window.size_ms),
+        },
+        WindowKind::Session => {
+            let gap = window.gap_ms.ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "session window requires a gap_ms value; use session_window(gap_ms=N)",
+                )
+            })?;
+            LocalWindowKind::Session { gap_ms: gap }
+        }
+    };
     let state_ttl_ms = pipeline.session.state_ttl().map(|c| c.ttl_ms());
+    // G3: thread per-source watermark lags when set.
+    let source_watermark_lags = pipeline.source_watermarks.clone();
+    let source_id_column = if source_watermark_lags.is_empty() {
+        None
+    } else {
+        Some("source_id".to_string())
+    };
     Ok(LocalWindowExecutionSpec {
         key_column,
         event_time_column: event_time,
@@ -98,8 +119,8 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
         window_size_ms: window.size_ms,
         agg_exprs,
         state_ttl_ms,
-        source_watermark_lags: std::collections::HashMap::new(),
-        source_id_column: None,
+        source_watermark_lags,
+        source_id_column,
     })
 }
 

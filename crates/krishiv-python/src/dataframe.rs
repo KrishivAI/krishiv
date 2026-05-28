@@ -13,11 +13,18 @@ pub struct PyDataFrame {
 
 #[pymethods]
 impl PyDataFrame {
-    /// Collect and return a pretty-printed ASCII table (legacy convenience).
-    pub fn collect(&self, py: Python<'_>) -> PyResult<String> {
-        self.collect_pretty(py)
+    /// Collect and return a [`QueryResult`] with Arrow batches.
+    pub fn collect(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
+        let inner = self.inner.clone();
+        py.detach(move || {
+            inner
+                .collect()
+                .map(PyQueryResult::new)
+                .map_err(map_krishiv_error)
+        })
     }
 
+    /// Collect and return a pretty-printed ASCII table.
     pub fn collect_pretty(&self, py: Python<'_>) -> PyResult<String> {
         let inner = self.inner.clone();
         py.detach(move || {
@@ -28,15 +35,9 @@ impl PyDataFrame {
         })
     }
 
-    /// Collect into a [`QueryResult`] with Arrow batches.
+    /// Alias for collect() — returns Arrow batches.
     pub fn collect_batches(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
-        let inner = self.inner.clone();
-        py.detach(move || {
-            inner
-                .collect()
-                .map(PyQueryResult::new)
-                .map_err(map_krishiv_error)
-        })
+        self.collect(py)
     }
 
     pub fn collect_async(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
@@ -46,6 +47,12 @@ impl PyDataFrame {
                 .map(PyQueryResult::new)
                 .map_err(map_krishiv_error)
         })
+    }
+
+    /// Print up to `n` rows as an ASCII table to stdout.
+    #[pyo3(signature = (n=20))]
+    pub fn show(&self, py: Python<'_>, n: usize) -> PyResult<()> {
+        self.collect(py)?.show(n)
     }
 
     pub fn explain(&self, py: Python<'_>) -> PyResult<String> {

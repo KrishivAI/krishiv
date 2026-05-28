@@ -63,11 +63,22 @@ impl SlidingWindowOperator {
     }
 
     /// Persist open sliding window accumulators to `StateBackend`.
+    ///
+    /// Clears the namespace first so that stale entries for already-flushed
+    /// windows are removed and cannot be re-opened on checkpoint restore.
     pub fn persist_to_state(
         &self,
         backend: &mut dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
+        // Remove all previously persisted entries so closed windows don't
+        // survive into the next checkpoint snapshot.
+        backend.clear_namespace(namespace)?;
+
+        if self.accumulators.is_empty() {
+            return Ok(());
+        }
+
         let op_id = namespace.operator_id();
         let name = namespace.state_name();
         let mut state_keys = Vec::with_capacity(self.accumulators.len());
@@ -82,21 +93,22 @@ impl SlidingWindowOperator {
             let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
                 message: e.to_string(),
             })?;
-            let mut state_key = Vec::from(b"sw:");
-            state_key.extend_from_slice(key.as_bytes());
-            state_key.push(0);
+            // GAP-18: length-prefix encoding — format: b"sw:" | key_len_le_u32 | key_bytes | win_start_le_i64
+            let key_bytes = key.as_bytes();
+            let mut state_key = Vec::with_capacity(3 + 4 + key_bytes.len() + 8);
+            state_key.extend_from_slice(b"sw:");
+            state_key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            state_key.extend_from_slice(key_bytes);
             state_key.extend_from_slice(&win_start.to_le_bytes());
             state_keys.push(state_key);
             values.push(bytes);
         }
-        if !state_keys.is_empty() {
-            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
-                .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
-                .collect();
-            backend.put_batch(&batch_entries)?;
-        }
+        let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+            .collect();
+        backend.put_batch(&batch_entries)?;
         Ok(())
     }
 
@@ -255,14 +267,19 @@ impl SlidingWindowOperator {
 }
 
 fn parse_sliding_state_key(bytes: &[u8]) -> Option<(String, i64)> {
+    // GAP-18: length-prefix format: b"sw:" | key_len_le_u32 | key_bytes | win_start_le_i64
     const PREFIX: &[u8] = b"sw:";
     if !bytes.starts_with(PREFIX) {
         return None;
     }
     let rest = &bytes[PREFIX.len()..];
-    let sep = rest.iter().position(|b| *b == 0)?;
-    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
-    let win_bytes: [u8; 8] = rest.get(sep + 1..sep + 9)?.try_into().ok()?;
+    let key_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let key = std::str::from_utf8(rest.get(4..4 + key_len)?).ok()?.to_string();
+    let win_start_offset = 4 + key_len;
+    let win_bytes: [u8; 8] = rest
+        .get(win_start_offset..win_start_offset + 8)?
+        .try_into()
+        .ok()?;
     Some((key, i64::from_le_bytes(win_bytes)))
 }
 
@@ -328,12 +345,30 @@ mod sliding_state_tests {
 
     #[test]
     fn sliding_state_parse_key() {
-        let mut key = Vec::from(b"sw:mykey");
-        key.push(0);
+        // GAP-18: use length-prefix encoding
+        let key_str = "mykey";
+        let key_bytes = key_str.as_bytes();
+        let mut key = Vec::from(b"sw:");
+        key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(key_bytes);
         key.extend_from_slice(&42i64.to_le_bytes());
         let (k, w) = parse_sliding_state_key(&key).unwrap();
         assert_eq!(k, "mykey");
         assert_eq!(w, 42);
+    }
+
+    #[test]
+    fn sliding_state_parse_key_with_embedded_null() {
+        // GAP-18: keys containing null bytes must parse correctly with length-prefix.
+        let key_str = "key\x00with\x00nulls";
+        let key_bytes = key_str.as_bytes();
+        let mut key = Vec::from(b"sw:");
+        key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(key_bytes);
+        key.extend_from_slice(&100i64.to_le_bytes());
+        let (k, w) = parse_sliding_state_key(&key).unwrap();
+        assert_eq!(k, "key\x00with\x00nulls");
+        assert_eq!(w, 100);
     }
 
     #[test]

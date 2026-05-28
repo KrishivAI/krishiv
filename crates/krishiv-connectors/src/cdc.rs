@@ -131,6 +131,15 @@ pub trait CdcEventSource: Send {
     /// Returns an empty `Vec` when the source is exhausted (signals pipeline
     /// shutdown). Returns `Err` on unrecoverable source failures.
     fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String>;
+
+    /// Commit consumed offsets after a successful downstream write.
+    ///
+    /// Default implementation is a no-op (stateless / in-memory sources).
+    /// Kafka-backed sources must override this to flush consumer offsets only
+    /// after the batch has been durably committed downstream (P1-14).
+    fn commit_offsets(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// In-memory [`CdcEventSource`] backed by a pre-loaded `Vec<String>`.
@@ -266,6 +275,8 @@ impl CdcToLakehousePipeline {
             let batch =
                 build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
             on_batch(batch)?;
+            // P1-14: commit offsets only after the downstream sink write succeeds.
+            source.commit_offsets()?;
         }
         Ok(())
     }
@@ -591,7 +602,7 @@ impl RdkafkaCdcEventSource {
     /// On failure the error is logged but does not abort the pipeline (the
     /// consumer will reprocess from the last committed offset on restart,
     /// providing at-least-once semantics).
-    fn commit_offsets(&self) {
+    fn commit_offsets_inner(&self) {
         use rdkafka::consumer::Consumer;
         if let Err(e) = self
             .consumer
@@ -658,11 +669,12 @@ impl CdcEventSource for RdkafkaCdcEventSource {
             }
         }
 
-        if !events.is_empty() {
-            self.commit_offsets();
-        }
-
         Ok(events)
+    }
+
+    fn commit_offsets(&mut self) -> Result<(), String> {
+        self.commit_offsets_inner();
+        Ok(())
     }
 }
 

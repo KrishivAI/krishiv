@@ -57,11 +57,22 @@ impl SessionWindowOperator {
     }
 
     /// Persist open sessions to `StateBackend`.
+    ///
+    /// Clears the namespace first so that stale entries for already-closed
+    /// sessions are removed and cannot be re-opened on checkpoint restore.
     pub fn persist_to_state(
         &self,
         backend: &mut dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
+        // Remove all previously persisted entries so closed sessions don't
+        // survive into the next checkpoint snapshot.
+        backend.clear_namespace(namespace)?;
+
+        if self.sessions.is_empty() {
+            return Ok(());
+        }
+
         let op_id = namespace.operator_id();
         let name = namespace.state_name();
         let mut state_keys = Vec::with_capacity(self.sessions.len());
@@ -78,23 +89,24 @@ impl SessionWindowOperator {
             let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
                 message: e.to_string(),
             })?;
-            let mut state_key = Vec::from(b"ses:");
-            state_key.extend_from_slice(key.as_bytes());
-            state_key.push(0);
+            // GAP-18: length-prefix encoding.
+            // Format: b"ses:" | key_len_le_u32 | key_bytes | session_start_le_i64 | last_event_le_i64
+            let key_bytes_slice = key.as_bytes();
+            let mut state_key = Vec::with_capacity(4 + 4 + key_bytes_slice.len() + 16);
+            state_key.extend_from_slice(b"ses:");
+            state_key.extend_from_slice(&(key_bytes_slice.len() as u32).to_le_bytes());
+            state_key.extend_from_slice(key_bytes_slice);
             state_key.extend_from_slice(&session.session_start_ms.to_le_bytes());
-            state_key.push(0);
             state_key.extend_from_slice(&session.last_event_time_ms.to_le_bytes());
             state_keys.push(state_key);
             values.push(bytes);
         }
-        if !state_keys.is_empty() {
-            let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
-                .iter()
-                .zip(values.iter())
-                .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
-                .collect();
-            backend.put_batch(&batch_entries)?;
-        }
+        let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
+            .collect();
+        backend.put_batch(&batch_entries)?;
         Ok(())
     }
 
@@ -220,10 +232,18 @@ impl SessionWindowOperator {
     /// Flush sessions whose inactivity gap has passed the watermark.
     pub fn flush_closed_sessions(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
         let gap = self.spec.session_gap_ms as i64;
+        // Use saturating_add to prevent i64 overflow when last_event_time_ms is
+        // near i64::MAX (e.g. from a malformed event).  An overflow would wrap
+        // to a negative value, making every session appear closed spuriously.
         let closed: Vec<String> = self
             .sessions
             .keys()
-            .filter(|k| self.sessions[*k].last_event_time_ms + gap <= watermark_ms)
+            .filter(|k| {
+                self.sessions[*k]
+                    .last_event_time_ms
+                    .saturating_add(gap)
+                    <= watermark_ms
+            })
             .cloned()
             .collect();
         if closed.is_empty() {
@@ -274,13 +294,15 @@ impl SessionWindowOperator {
 }
 
 fn parse_session_state_key(bytes: &[u8]) -> Option<String> {
+    // GAP-18: length-prefix format.
+    // Format: b"ses:" | key_len_le_u32 | key_bytes | session_start_le_i64 | last_event_le_i64
     const PREFIX: &[u8] = b"ses:";
     if !bytes.starts_with(PREFIX) {
         return None;
     }
     let rest = &bytes[PREFIX.len()..];
-    let sep = rest.iter().position(|b| *b == 0)?;
-    let key = std::str::from_utf8(&rest[..sep]).ok()?.to_string();
+    let key_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+    let key = std::str::from_utf8(rest.get(4..4 + key_len)?).ok()?.to_string();
     Some(key)
 }
 
@@ -341,13 +363,30 @@ mod session_state_tests {
 
     #[test]
     fn session_state_parse_key() {
-        let mut key = Vec::from(b"ses:mykey");
-        key.push(0);
+        // GAP-18: use length-prefix encoding
+        let key_str = "mykey";
+        let key_bytes = key_str.as_bytes();
+        let mut key = Vec::from(b"ses:");
+        key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(key_bytes);
         key.extend_from_slice(&100i64.to_le_bytes());
-        key.push(0);
         key.extend_from_slice(&200i64.to_le_bytes());
         let k = parse_session_state_key(&key).unwrap();
         assert_eq!(k, "mykey");
+    }
+
+    #[test]
+    fn session_state_parse_key_with_embedded_null() {
+        // GAP-18: keys with null bytes must parse correctly.
+        let key_str = "user\x00id";
+        let key_bytes = key_str.as_bytes();
+        let mut key = Vec::from(b"ses:");
+        key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(key_bytes);
+        key.extend_from_slice(&100i64.to_le_bytes());
+        key.extend_from_slice(&200i64.to_le_bytes());
+        let k = parse_session_state_key(&key).unwrap();
+        assert_eq!(k, "user\x00id");
     }
 
     #[test]

@@ -603,9 +603,53 @@ impl Coordinator {
         let job_ids: Vec<JobId> = self.checkpoint_coordinators.keys().cloned().collect();
         for job_id in job_ids {
             let running = self.running_task_count_for_job(&job_id);
+
+            // Capture the awaiting epoch BEFORE ticking so we can detect a
+            // timeout-triggered abort (GAP-5).  An abort transitions the state
+            // from AwaitingAcks → Failed; if that happens we must clean up
+            // checkpoint_notify_sent and barrier_dispatch_sent entries for the
+            // aborted epoch so they don't accumulate forever and block future
+            // checkpoint rounds.
+            let pre_tick_awaiting: Option<u64> =
+                self.checkpoint_coordinators.get(&job_id).and_then(|c| {
+                    if let CheckpointCoordinatorState::AwaitingAcks { epoch, .. } = &c.state {
+                        Some(*epoch)
+                    } else {
+                        None
+                    }
+                });
+
             if let Some(coord) = self.checkpoint_coordinators.get_mut(&job_id) {
                 coord.set_expected_task_count(running);
                 coord.try_tick(elapsed_ms, self.config.checkpoint_ack_timeout_ms());
+            }
+
+            // GAP-5: if try_tick aborted an in-flight epoch, remove all stale
+            // tracking entries that referenced that epoch.
+            //
+            // Without this cleanup:
+            //   - checkpoint_notify_sent retains (job_id, executor_id, epoch) for
+            //     every executor that was notified; since the epoch number is never
+            //     reused those entries would live until the coordinator shuts down.
+            //   - barrier_dispatch_sent retains (job_id, epoch); again the epoch is
+            //     unique so the entry is harmless for correctness but wastes memory.
+            if let Some(aborted_epoch) = pre_tick_awaiting {
+                let was_aborted =
+                    self.checkpoint_coordinators.get(&job_id).is_some_and(|c| {
+                        matches!(c.state, CheckpointCoordinatorState::Failed { .. })
+                    });
+                if was_aborted {
+                    self.checkpoint_notify_sent
+                        .retain(|(jid, _, e)| jid != &job_id || *e != aborted_epoch);
+                    self.barrier_dispatch_sent
+                        .retain(|(jid, e)| jid != &job_id || *e != aborted_epoch);
+                    tracing::warn!(
+                        job_id = %job_id,
+                        epoch = aborted_epoch,
+                        "checkpoint epoch aborted by ack timeout; \
+                         cleaned up stale notify and barrier-dispatch tracking entries"
+                    );
+                }
             }
         }
 
@@ -948,6 +992,13 @@ impl Coordinator {
         match self.checkpoint_coordinators.get_mut(&job_id) {
             None => CheckpointAckResponse::JobNotFound,
             Some(coord) => {
+                // P1-16: reject ACKs from superseded coordinators (stale fencing token).
+                let coordinator_token = coord.fencing_token();
+                if ack.fencing_token.as_u64() < coordinator_token.as_u64() {
+                    return CheckpointAckResponse::StaleFencingToken {
+                        current_token: coordinator_token.as_u64(),
+                    };
+                }
                 let current_epoch = coord.current_epoch();
                 match coord.receive_ack(ack.clone()) {
                     Ok(true) => {
@@ -1344,13 +1395,33 @@ impl Coordinator {
     }
 
     /// Launch assigned tasks and push them to executor-owned task endpoints.
+    ///
+    /// # Lock safety (GAP-4)
+    ///
+    /// This method takes `&mut self` for the sync prepare phase
+    /// (`launch_assigned_task_assignments` + `resolve_assignment_targets`), then
+    /// clones the channel map and calls the **static** `deliver_assignment_targets_with_channels`
+    /// so `self` is NOT borrowed during the async network I/O.
+    ///
+    /// **Important**: If you call this through a `SharedCoordinator.write()` guard the write
+    /// lock is still held for the duration of the await, because the borrow lives for the
+    /// entire async function body.  For the production dispatch path use
+    /// `JobCoordinator::spawn_job_orchestration_loops`, which explicitly drops the write guard
+    /// before awaiting.  This method is intended for tests and CLI tools where no shared lock
+    /// is involved.
     pub async fn push_assigned_task_assignments(
         &mut self,
         job_id: &JobId,
     ) -> SchedulerResult<Vec<TaskStatusResponse>> {
         let assignments = self.launch_assigned_task_assignments(job_id)?;
         let targets = self.resolve_assignment_targets(assignments)?;
-        let responses = match self.deliver_assignment_targets(targets).await {
+        // GAP-4: Clone the channel map BEFORE the await point. Because
+        // `deliver_assignment_targets_with_channels` is a static method that owns
+        // `channels`, `self` is not borrowed across the network I/O yield points.
+        // Callers that hold a `SharedCoordinator.write()` guard should prefer the
+        // `JobCoordinator` pattern (acquire lock → collect targets → drop lock → deliver).
+        let channels = self.executor_channels.clone();
+        let responses = match Self::deliver_assignment_targets_with_channels(channels, targets).await {
             Ok(responses) => responses,
             Err(error) => {
                 self.clear_launch_in_flight_for_job(job_id);

@@ -3,13 +3,15 @@
 use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use krishiv_proto::{
     CheckpointAckRequest, CheckpointAckResponse, CoordinatorExecutorService,
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
-    LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskStatusRequest,
-    TaskStatusResponse, TransportVersion, wire,
+    LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef,
+    TaskStatusRequest, TaskStatusResponse, TransportVersion, wire,
 };
 
 use crate::grpc::executor_task_grpc_server;
@@ -170,15 +172,24 @@ impl ExecutorConfig {
 }
 
 /// Minimal executor runtime facade for the R3.1 bootstrap slice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExecutorRuntime {
     config: ExecutorConfig,
+    running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
 }
 
 impl ExecutorRuntime {
     /// Create an executor runtime.
     pub fn new(config: ExecutorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            running_attempts: None,
+        }
+    }
+
+    /// Wire a shared running-attempts map so heartbeats report live tasks (P1-19).
+    pub fn set_running_attempts(&mut self, running_attempts: Arc<DashMap<String, TaskAttemptRef>>) {
+        self.running_attempts = Some(running_attempts);
     }
 
     /// Runtime configuration.
@@ -249,11 +260,17 @@ impl ExecutorRuntime {
 
     /// Build an empty healthy heartbeat request for this executor.
     pub fn heartbeat_request(&self) -> ExecutorHeartbeatRequest {
+        let attempts: Vec<TaskAttemptRef> = self
+            .running_attempts
+            .as_ref()
+            .map(|map| map.iter().map(|entry| entry.value().clone()).collect())
+            .unwrap_or_default();
         ExecutorHeartbeatRequest::new(
             self.config.executor_id.clone(),
             self.config.lease_generation,
             ExecutorState::Healthy,
         )
+        .with_running_attempts(attempts)
     }
 
     /// Send a heartbeat through a tonic-shaped coordinator service.

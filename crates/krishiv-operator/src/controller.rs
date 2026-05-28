@@ -14,6 +14,7 @@ use kube::runtime::watcher::{self, Event as WatchEvent};
 use crate::dynamic::patch_krishivjob_status;
 use crate::dynamic::{krishivjob_api, resource_from_dynamic_object};
 use crate::error::{OperatorError, OperatorResult};
+use crate::pod_manager::PodLifecycleManager;
 use crate::reconciler::*;
 use crate::status::KrishivJobStatus;
 
@@ -28,13 +29,30 @@ pub struct KubernetesControllerConfig {
     field_selector: Option<String>,
     /// Optional bootstrap executor for R2 static scheduling.
     bootstrap_executor: Option<BootstrapExecutor>,
+    /// Coordinator gRPC endpoint injected into executor pod env vars.
+    ///
+    /// Defaults to `http://krishiv-coordinator:9090` if not set.
+    coordinator_endpoint: String,
 }
 
 /// Runtime state owned by the live R2 Kubernetes controller process.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KubernetesControllerRuntime {
     coordinator: SharedCoordinator,
     reconciler: KrishivJobReconciler,
+    /// Pod lifecycle manager — `None` when running without a Kubernetes client
+    /// (e.g. in unit tests that use the in-memory reconciler only).
+    pod_manager: Option<PodLifecycleManager>,
+}
+
+impl std::fmt::Debug for KubernetesControllerRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubernetesControllerRuntime")
+            .field("coordinator", &self.coordinator)
+            .field("reconciler", &self.reconciler)
+            .field("pod_manager", &self.pod_manager.is_some())
+            .finish()
+    }
 }
 
 impl KubernetesControllerRuntime {
@@ -48,7 +66,15 @@ impl KubernetesControllerRuntime {
         Ok(Self {
             coordinator: SharedCoordinator::new(coordinator),
             reconciler: KrishivJobReconciler::new(config.coordinator_id.clone()),
+            pod_manager: None,
         })
+    }
+
+    /// Attach a pod lifecycle manager — called by the live controller before
+    /// starting the watch loop so that submitted jobs get executor pods.
+    pub fn with_pod_manager(mut self, manager: PodLifecycleManager) -> Self {
+        self.pod_manager = Some(manager);
+        self
     }
 
     /// Shared coordinator handle used by the controller and status server.
@@ -59,6 +85,11 @@ impl KubernetesControllerRuntime {
     /// Reconciler bound to the active coordinator id.
     pub fn reconciler(&self) -> &KrishivJobReconciler {
         &self.reconciler
+    }
+
+    /// Pod lifecycle manager, if one has been configured.
+    pub fn pod_manager(&self) -> Option<&PodLifecycleManager> {
+        self.pod_manager.as_ref()
     }
 }
 
@@ -71,6 +102,7 @@ impl KubernetesControllerConfig {
             label_selector: None,
             field_selector: None,
             bootstrap_executor: None,
+            coordinator_endpoint: "http://krishiv-coordinator:9090".to_owned(),
         }
     }
 
@@ -82,6 +114,7 @@ impl KubernetesControllerConfig {
             label_selector: None,
             field_selector: None,
             bootstrap_executor: None,
+            coordinator_endpoint: "http://krishiv-coordinator:9090".to_owned(),
         }
     }
 
@@ -93,6 +126,11 @@ impl KubernetesControllerConfig {
     /// Coordinator id used by the live controller.
     pub fn coordinator_id(&self) -> &CoordinatorId {
         &self.coordinator_id
+    }
+
+    /// gRPC endpoint injected into executor pod environment variables.
+    pub fn coordinator_endpoint(&self) -> &str {
+        &self.coordinator_endpoint
     }
 
     /// Add a Kubernetes label selector.
@@ -113,6 +151,13 @@ impl KubernetesControllerConfig {
     #[must_use]
     pub fn with_bootstrap_executor(mut self, executor: BootstrapExecutor) -> Self {
         self.bootstrap_executor = Some(executor);
+        self
+    }
+
+    /// Override the coordinator endpoint injected into executor pods.
+    #[must_use]
+    pub fn with_coordinator_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.coordinator_endpoint = endpoint.into();
         self
     }
 }
@@ -141,7 +186,8 @@ pub async fn run_kubernetes_controller_with_client(
     client: Client,
     config: KubernetesControllerConfig,
 ) -> OperatorResult<()> {
-    let runtime = KubernetesControllerRuntime::new(&config)?;
+    let pod_manager = PodLifecycleManager::new(client.clone(), config.coordinator_endpoint());
+    let runtime = KubernetesControllerRuntime::new(&config)?.with_pod_manager(pod_manager);
     run_kubernetes_controller_runtime_with_client(client, config, runtime).await
 }
 
@@ -184,6 +230,13 @@ pub async fn run_kubernetes_controller_runtime_with_client(
 }
 
 /// Reconcile one Kubernetes dynamic object using a shared controller runtime.
+///
+/// # Pod lifecycle
+///
+/// - `ReconcileAction::Submitted`: executor Pods are created so the scheduler
+///   gets healthy executors to assign tasks to (BUG-2 fix).
+/// - `ReconcileAction::FinalizerRemoved`: executor Pods are deleted after the
+///   scheduler job is cancelled.
 pub async fn reconcile_dynamic_object_with_runtime(
     jobs: &Api<DynamicObject>,
     runtime: &KubernetesControllerRuntime,
@@ -196,22 +249,61 @@ pub async fn reconcile_dynamic_object_with_runtime(
         let outcome = runtime.reconciler.reconcile(&mut coordinator, &resource)?;
         (outcome, job_id)
     };
-    if matches!(outcome.action(), ReconcileAction::Submitted)
-        && let Some(job_id) = job_id
-    {
-        runtime.reconciler.ensure_dedicated_job_loop(
-            &runtime.coordinator,
-            &job_id,
-            resource.spec.dedicated_coordinator,
-        );
-        if resource.spec.dedicated_coordinator {
-            tracing::info!(
-                job_id = %job_id,
-                jcp_pod = %jcp_pod::jcp_pod_name(&job_id),
-                "dedicated JCP orchestration enabled (see k8s/manifests/jcp-pod-template.yaml)"
-            );
+
+    match outcome.action() {
+        ReconcileAction::Submitted => {
+            if let Some(ref job_id) = job_id {
+                // BUG-2: Create executor Pods so the scheduler has executors to
+                // assign tasks to.  Without pods, submitted jobs stay permanently
+                // in the WaitingForExecutors state.
+                if let Some(pod_manager) = runtime.pod_manager() {
+                    match pod_manager.create_executor_pods(&resource).await {
+                        Ok(executor_ids) => {
+                            tracing::info!(
+                                job_id = %job_id,
+                                pod_count = executor_ids.len(),
+                                "created executor pods for submitted job"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                job_id = %job_id,
+                                error = %err,
+                                "executor pod creation failed; job will remain WaitingForExecutors"
+                            );
+                        }
+                    }
+                }
+                runtime.reconciler.ensure_dedicated_job_loop(
+                    &runtime.coordinator,
+                    job_id,
+                    resource.spec.dedicated_coordinator,
+                );
+                if resource.spec.dedicated_coordinator {
+                    tracing::info!(
+                        job_id = %job_id,
+                        jcp_pod = %jcp_pod::jcp_pod_name(job_id),
+                        "dedicated JCP orchestration enabled (see k8s/manifests/jcp-pod-template.yaml)"
+                    );
+                }
+            }
         }
+        ReconcileAction::FinalizerRemoved => {
+            // Clean up executor Pods after the scheduler job is cancelled so
+            // orphaned pods don't linger in the namespace.
+            if let Some(pod_manager) = runtime.pod_manager() {
+                if let Err(err) = pod_manager.delete_executor_pods(&resource).await {
+                    tracing::warn!(
+                        job = resource.metadata.name,
+                        error = %err,
+                        "executor pod deletion failed (best-effort)"
+                    );
+                }
+            }
+        }
+        _ => {}
     }
+
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
 
     Ok(KubernetesReconcileReport {

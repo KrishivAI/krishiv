@@ -1075,6 +1075,9 @@ pub fn checkpoint_ack_response_to_wire(value: CheckpointAckResponse) -> v1::Chec
         CheckpointAckResponse::JobNotFound => {
             WireResult::JobNotFound(v1::CheckpointAckJobNotFound {})
         }
+        CheckpointAckResponse::StaleFencingToken { current_token } => {
+            WireResult::StaleFencingToken(v1::CheckpointAckStaleFencingToken { current_token })
+        }
     };
     v1::CheckpointAckResponse {
         result: Some(result),
@@ -1092,6 +1095,11 @@ pub fn checkpoint_ack_response_from_wire(
             current_epoch: s.current_epoch,
         }),
         Some(WireVariant::JobNotFound(_)) => Ok(CheckpointAckResponse::JobNotFound),
+        Some(WireVariant::StaleFencingToken(s)) => {
+            Ok(CheckpointAckResponse::StaleFencingToken {
+                current_token: s.current_token,
+            })
+        }
         None => Err(WireError::new(
             "missing required field `checkpoint_ack_response.result`",
         )),

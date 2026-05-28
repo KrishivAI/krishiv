@@ -12,6 +12,8 @@ pub mod error;
 pub mod jcp_pod;
 #[cfg(feature = "k8s")]
 pub mod lease;
+#[cfg(feature = "k8s")]
+pub mod pod_manager;
 pub mod pod_failure;
 pub mod queue_manager;
 pub mod reconciler;
@@ -34,6 +36,8 @@ pub use error::{OperatorError, OperatorResult};
 #[cfg(feature = "k8s")]
 pub use lease::K8sLeaseElection;
 pub use pod_failure::{ExecutorPodLaunchFailure, detect_executor_pod_launch_failure};
+#[cfg(feature = "k8s")]
+pub use pod_manager::{PodLifecycleManager, build_executor_pod_template};
 pub use queue_manager::{
     CrdQueueManager, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus, QUEUE_KIND,
 };
