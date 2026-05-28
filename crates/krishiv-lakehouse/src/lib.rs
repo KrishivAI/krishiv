@@ -30,7 +30,10 @@ pub use delta_lake::{
     DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, remove_merge_key_column,
     write_delta,
 };
-pub use hudi::{HudiQueryType, HudiSnapshotReader, write_hudi_cow_fixture};
+pub use hudi::{
+    HudiCowWriter, HudiQueryType, HudiSnapshotReader, HudiWriteResult, write_hudi_cow_append,
+    write_hudi_cow_fixture, write_hudi_cow_upsert,
+};
 pub use iceberg_fs::IcebergFsTable;
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
 pub use two_phase::{

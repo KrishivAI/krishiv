@@ -15,3 +15,4 @@ crates/krishiv-python/dist/
 *.pyc
 
 .krishiv/local/*.json
+.antigravitycli/

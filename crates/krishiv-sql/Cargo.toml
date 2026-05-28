@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 datafusion = { workspace = true }
 krishiv-catalog = { path = "../krishiv-catalog" }
+krishiv-cep = { path = "../krishiv-cep" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }

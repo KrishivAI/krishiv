@@ -2,6 +2,146 @@
 
 ## Current Phase
 
+**R12-R18 stub-to-implementation sprint — cross-release surfaces wired (2026-05-28).**
+
+### Remaining R12-R18 Sink Commit Pass (2026-05-28)
+
+Closed the in-repo CDC sink commit gap and workspace cleanup from the previous
+pass.
+
+- Added `CdcToLakehousePipeline::run_with_iceberg_sink()`.
+- Added `CdcToLakehousePipeline::run_with_iceberg_sink_until_commits()` for
+  bounded live-source certification runs.
+- `CdcEventSource` now exposes `poll_records()` with source partition/offset
+  metadata; the rdkafka implementation records real Kafka partition and offset
+  values in CDC events.
+- The CDC-to-Iceberg path now:
+  - polls Debezium events,
+  - uses the strict parser and schema evolution normalization,
+  - prepares an Iceberg two-phase snapshot,
+  - commits the snapshot with Kafka offset metadata,
+  - aborts the staged snapshot on commit failure, and
+  - calls `source.commit_offsets()` only after the Iceberg commit succeeds.
+- Added connector test coverage for CDC → Iceberg commit metadata:
+  committed snapshot IDs are returned, synthetic in-memory offsets are
+  preserved, and real source offset metadata is propagated into Iceberg summary
+  offsets.
+- Added a live Kafka CDC → Iceberg certification harness in
+  `crates/krishiv-connectors/tests/exactly_once_certification.rs`, gated by the
+  `kafka` feature and `KAFKA_BOOTSTRAP_SERVERS`. It creates a unique topic,
+  produces a Debezium record with `rdkafka`, consumes it via
+  `RdkafkaCdcEventSource`, commits through the Iceberg two-phase protocol, and
+  asserts committed Kafka offsets are present in snapshot metadata.
+- Added `.antigravitycli/` to `.gitignore` so local IDE connector state stays
+  out of the worktree.
+
+Validation:
+```bash
+cargo test -p krishiv-connectors --lib
+# 61 passed, 0 failed
+
+cargo test -p krishiv-connectors --test exactly_once_certification
+# 0 tests without optional features; compile OK
+
+cargo check -p krishiv-connectors --features kafka
+# OK
+
+cargo test -p krishiv-connectors --features kafka --test exactly_once_certification
+# 5 passed locally; live Kafka test self-skips when KAFKA_BOOTSTRAP_SERVERS is unset
+```
+
+Remaining external validation only: run the feature-gated certification command
+with `KAFKA_BOOTSTRAP_SERVERS` pointed at a real broker and extend the same
+pattern to a real Iceberg REST/FS catalog in CI.
+
+---
+
+### R12-R18 Cross-Release Implementation Pass (2026-05-28)
+
+Expanded the previous R18 Hudi core work into a broader implementation pass.
+
+- R12/R14 Kafka CDC:
+  - Added strict `parse_debezium_envelope_result()` errors for malformed JSON,
+    missing `op`, unknown `op`, and missing operation payloads.
+  - `CdcToLakehousePipeline::run_with_source()` now fails fast on malformed
+    Debezium events instead of silently dropping them.
+  - Added live-source semantics so rdkafka-backed sources can treat empty polls
+    as idle rather than exhausted.
+  - Added cross-batch schema evolution normalization for CDC batches using the
+    existing Arrow `SchemaNormalizeOperator`.
+  - `CdcToLakehousePipeline::run()` now constructs a real `RdkafkaCdcEventSource`
+    when compiled with `feature = "kafka"`; without the feature it returns an
+    explicit feature error.
+- R16 CEP / SQL:
+  - Added `cep_sql` parser/planner for the supported R16
+    `MATCH_RECOGNIZE` subset:
+    `PARTITION BY`, `ORDER BY`, linear `PATTERN (A B ...)`, and `WITHIN`.
+  - `plan_sql()` now emits a streaming logical plan for `MATCH_RECOGNIZE`.
+- R18 Hudi public API:
+  - Added Rust API methods `Session::write_hudi_append_async()` and
+    `Session::write_hudi_upsert_async()`.
+  - Added Python functions `write_hudi_append()` / `write_hudi_upsert()` and
+    `HudiWriteResult` bindings plus `.pyi` entries.
+
+Validation:
+```bash
+cargo test -p krishiv-connectors --lib
+# 59 passed, 0 failed
+
+cargo test -p krishiv-sql --lib
+# 56 passed, 0 failed
+
+cargo test -p krishiv-lakehouse --lib
+# 33 passed, 0 failed
+
+cargo check -p krishiv-api -p krishiv-python -p krishiv-sql -p krishiv-connectors
+# OK; warnings remain pre-existing in scheduler/sql/python
+```
+
+Remaining real external-system work: live Kafka broker certification with
+`feature = "kafka"`, true Delta Lake `delta-rs` replacement for the current local
+Delta log implementation, and full end-to-end CDC sink commits against Iceberg
+or Hudi in an integration environment.
+
+---
+
+**R18 Hudi Copy-On-Write write support — append/upsert implemented (2026-05-28).**
+
+### R18 Hudi Copy-On-Write Append/Upsert (2026-05-28)
+
+Implemented local Hudi Copy-On-Write write support in `krishiv-lakehouse`.
+
+- Added `HudiCowWriter`, `HudiWriteResult`, `write_hudi_cow_append()`, and
+  `write_hudi_cow_upsert()`.
+- Hudi commits now write both a full base Parquet file for snapshot reads and a
+  change Parquet file for incremental reads.
+- Snapshot reads prefer the latest CoW base file when writer metadata is
+  present; legacy fixture-style `file:` commit metadata remains supported.
+- Incremental reads return change files after `begin_instant`.
+- Upsert deduplicates incoming rows by typed primary key, replaces existing
+  matching rows, appends new keys, rejects missing/null key columns, and
+  enforces schema compatibility.
+- Fixed two validation blockers:
+  `krishiv-proto` now imports `HeartbeatThrottleCommand` from its defining
+  module, and `StubTableUdf::call()` handles Arrow's infallible
+  `RecordBatch::new_empty`.
+
+Validation:
+```bash
+cargo test -p krishiv-lakehouse --lib
+# 33 passed, 0 failed
+
+cargo check -p krishiv-lakehouse -p krishiv-sql -p krishiv-python
+# OK; warnings remain pre-existing in scheduler/sql/python
+```
+
+Next useful task: add SQL/Python write entry points for
+`write_hudi_cow_append()` and `write_hudi_cow_upsert()`, then add an
+integration test that writes through the public API and reads back through the
+existing Hudi SQL provider.
+
+---
+
 **Streaming API bug-fix sweep — 7 bugs/gaps resolved (2026-05-28).**
 
 ### Bug and Gap Fixes (2026-05-28)

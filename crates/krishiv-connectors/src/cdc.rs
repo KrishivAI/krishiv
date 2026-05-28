@@ -3,6 +3,7 @@
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A CDC operation type from Debezium.
@@ -53,6 +54,52 @@ pub struct CdcEvent {
     pub table: String,
 }
 
+/// Raw CDC source record plus its source offset identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawCdcRecord {
+    /// Raw Debezium JSON payload.
+    pub payload: String,
+    /// Kafka partition the record came from.
+    pub partition_id: u32,
+    /// Kafka offset of the record.
+    pub offset: i64,
+}
+
+impl RawCdcRecord {
+    /// Create a raw CDC record with source offset metadata.
+    pub fn new(payload: impl Into<String>, partition_id: u32, offset: i64) -> Self {
+        Self {
+            payload: payload.into(),
+            partition_id,
+            offset,
+        }
+    }
+}
+
+/// Error returned when a Debezium JSON envelope cannot be parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebeziumParseError {
+    InvalidJson(String),
+    MissingOp,
+    UnknownOp(String),
+    MissingPayload { op: CdcOp },
+}
+
+impl std::fmt::Display for DebeziumParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson(e) => write!(f, "invalid Debezium JSON: {e}"),
+            Self::MissingOp => f.write_str("Debezium envelope missing op field"),
+            Self::UnknownOp(op) => write!(f, "unknown Debezium op '{op}'"),
+            Self::MissingPayload { op } => {
+                write!(f, "Debezium envelope missing required payload for {op:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DebeziumParseError {}
+
 /// Deserialize a Debezium JSON envelope into a `CdcEvent`.
 ///
 /// Expected envelope structure:
@@ -63,9 +110,20 @@ pub struct CdcEvent {
 ///
 /// Returns `None` if the envelope is malformed or `op` is unrecognized.
 pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Option<CdcEvent> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let op_str = v["op"].as_str()?;
-    let op = CdcOp::from_debezium(op_str)?;
+    parse_debezium_envelope_result(json, partition_id, offset).ok()
+}
+
+/// Strict Debezium JSON parser used by production CDC pipelines.
+pub fn parse_debezium_envelope_result(
+    json: &str,
+    partition_id: u32,
+    offset: i64,
+) -> Result<CdcEvent, DebeziumParseError> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| DebeziumParseError::InvalidJson(e.to_string()))?;
+    let op_str = v["op"].as_str().ok_or(DebeziumParseError::MissingOp)?;
+    let op =
+        CdcOp::from_debezium(op_str).ok_or_else(|| DebeziumParseError::UnknownOp(op_str.into()))?;
 
     let source_lsn = v["source"]["lsn"].as_u64();
     let source_ts_ms = v["source"]["ts_ms"].as_i64();
@@ -108,8 +166,17 @@ pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Op
 
     let before = make_payload_batch(&v["before"]);
     let after = make_payload_batch(&v["after"]);
+    match &op {
+        CdcOp::Insert | CdcOp::Update | CdcOp::SnapshotRead if after.is_none() => {
+            return Err(DebeziumParseError::MissingPayload { op: op.clone() });
+        }
+        CdcOp::Delete if before.is_none() => {
+            return Err(DebeziumParseError::MissingPayload { op: op.clone() });
+        }
+        _ => {}
+    }
 
-    Some(CdcEvent {
+    Ok(CdcEvent {
         op,
         before,
         after,
@@ -131,6 +198,24 @@ pub trait CdcEventSource: Send {
     /// Returns an empty `Vec` when the source is exhausted (signals pipeline
     /// shutdown). Returns `Err` on unrecoverable source failures.
     fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String>;
+
+    /// Poll records with source offset identity.
+    ///
+    /// Sources that can expose real Kafka offsets should override this method.
+    /// The default preserves legacy in-memory behavior with synthetic offsets.
+    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, String> {
+        Ok(self
+            .poll_events(max)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| RawCdcRecord::new(payload, 0, i as i64))
+            .collect())
+    }
+
+    /// Whether an empty poll means temporary idleness instead of source exhaustion.
+    fn is_live(&self) -> bool {
+        false
+    }
 
     /// Commit consumed offsets after a successful downstream write.
     ///
@@ -186,6 +271,9 @@ pub struct CdcToLakehousePipeline {
     /// Defaults to 1000. Higher values reduce write amplification; lower values
     /// reduce end-to-end latency.
     pub batch_size: usize,
+    /// Keep output schemas compatible across CDC batches by null-filling new
+    /// columns and dropping deprecated columns according to the merged schema.
+    pub schema_evolution: bool,
 }
 
 impl CdcToLakehousePipeline {
@@ -205,6 +293,7 @@ impl CdcToLakehousePipeline {
             primary_key_columns,
             schema_registry_url: None,
             batch_size: 1000,
+            schema_evolution: true,
         }
     }
 
@@ -218,6 +307,13 @@ impl CdcToLakehousePipeline {
     #[must_use]
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Enable or disable cross-batch schema evolution normalization.
+    #[must_use]
+    pub fn with_schema_evolution(mut self, enabled: bool) -> Self {
+        self.schema_evolution = enabled;
         self
     }
 
@@ -243,7 +339,7 @@ impl CdcToLakehousePipeline {
     /// Polls `source` for up to `batch_size` raw Debezium JSON strings per
     /// iteration, parses them with [`parse_debezium_envelope`], builds an Arrow
     /// batch with [`build_batch_from_events`], and passes it to `on_batch`.
-    /// Stops when `source.poll_events` returns an empty slice (source
+    /// Stops when `source.poll_records` returns an empty slice (source
     /// exhausted) or the provided `shutdown` channel fires.
     pub async fn run_with_source<S, F>(
         &self,
@@ -256,29 +352,156 @@ impl CdcToLakehousePipeline {
         F: FnMut(RecordBatch) -> Result<(), String>,
     {
         self.validate()?;
+        let mut schema_state = CdcSchemaEvolutionState::default();
         loop {
             if *shutdown.borrow() {
                 break;
             }
-            let raw = source.poll_events(self.batch_size)?;
+            let raw = source.poll_records(self.batch_size)?;
             if raw.is_empty() {
-                break;
+                if source.is_live() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    continue;
+                } else {
+                    break;
+                }
             }
             let events: Vec<CdcEvent> = raw
                 .iter()
                 .enumerate()
-                .filter_map(|(i, json)| parse_debezium_envelope(json, 0, i as i64))
-                .collect();
+                .map(|(i, record)| {
+                    parse_debezium_envelope_result(
+                        &record.payload,
+                        record.partition_id,
+                        record.offset,
+                    )
+                    .map_err(|e| format!("Debezium parse error at batch index {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if events.is_empty() {
                 continue;
             }
-            let batch =
+            let mut batch =
                 build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
+            if self.schema_evolution {
+                batch = schema_state.normalize(batch)?;
+            }
             on_batch(batch)?;
             // P1-14: commit offsets only after the downstream sink write succeeds.
             source.commit_offsets()?;
         }
         Ok(())
+    }
+
+    /// Run CDC ingestion into an Iceberg two-phase sink.
+    ///
+    /// This is the certified in-process commit protocol used by CDC
+    /// integration tests: source offsets are committed only after the Iceberg
+    /// snapshot commit succeeds, and the committed offsets are written into the
+    /// snapshot metadata summary map.
+    pub async fn run_with_iceberg_sink<S, I>(
+        &self,
+        source: S,
+        iceberg: &I,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Vec<i64>, String>
+    where
+        S: CdcEventSource,
+        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+    {
+        self.run_with_iceberg_sink_inner(source, iceberg, shutdown, None)
+            .await
+    }
+
+    /// Run CDC ingestion into an Iceberg sink until `max_commits` snapshots commit.
+    ///
+    /// This is intended for live broker certification tests where a Kafka
+    /// source remains idle after the produced certification records are read.
+    pub async fn run_with_iceberg_sink_until_commits<S, I>(
+        &self,
+        source: S,
+        iceberg: &I,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        max_commits: usize,
+    ) -> Result<Vec<i64>, String>
+    where
+        S: CdcEventSource,
+        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+    {
+        self.run_with_iceberg_sink_inner(source, iceberg, shutdown, Some(max_commits))
+            .await
+    }
+
+    async fn run_with_iceberg_sink_inner<S, I>(
+        &self,
+        mut source: S,
+        iceberg: &I,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        max_commits: Option<usize>,
+    ) -> Result<Vec<i64>, String>
+    where
+        S: CdcEventSource,
+        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+    {
+        self.validate()?;
+        let mut schema_state = CdcSchemaEvolutionState::default();
+        let mut committed_snapshots = Vec::new();
+
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let raw = source.poll_records(self.batch_size)?;
+            if raw.is_empty() {
+                if source.is_live() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            let events = raw
+                .iter()
+                .enumerate()
+                .map(|(i, record)| {
+                    parse_debezium_envelope_result(
+                        &record.payload,
+                        record.partition_id,
+                        record.offset,
+                    )
+                    .map_err(|e| format!("Debezium parse error at batch index {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if events.is_empty() {
+                continue;
+            }
+
+            let mut batch =
+                build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
+            if self.schema_evolution {
+                batch = schema_state.normalize(batch)?;
+            }
+            let offsets = kafka_offsets_for_events(&events);
+            let staged = iceberg
+                .prepare(vec![batch])
+                .await
+                .map_err(|e| format!("iceberg prepare failed: {e}"))?;
+            let snapshot_id = match iceberg.commit(staged.clone(), offsets).await {
+                Ok(snapshot_id) => snapshot_id,
+                Err(e) => {
+                    let _ = iceberg.abort(staged).await;
+                    return Err(format!("iceberg commit failed: {e}"));
+                }
+            };
+            source.commit_offsets()?;
+            committed_snapshots.push(snapshot_id);
+            if max_commits.is_some_and(|max| committed_snapshots.len() >= max) {
+                break;
+            }
+        }
+
+        Ok(committed_snapshots)
     }
 
     /// Run the pipeline against a live Kafka cluster.
@@ -288,12 +511,72 @@ impl CdcToLakehousePipeline {
     /// `KafkaCdcEventSource` once that feature is enabled.
     pub async fn run(&self) -> Result<(), String> {
         self.validate()?;
-        Err(
-            "direct Kafka execution requires a CdcEventSource implementation; \
-             call run_with_source with a live source (rdkafka feature planned for R12)"
-                .to_string(),
-        )
+        #[cfg(feature = "kafka")]
+        {
+            let config = KafkaCdcConfig::new(
+                self.kafka_brokers.join(","),
+                format!("krishiv-cdc-{}", self.iceberg_table),
+                self.source_topic.clone(),
+            );
+            let source = RdkafkaCdcEventSource::new(&config)?;
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            self.run_with_source(source, |_batch| Ok(()), shutdown_rx)
+                .await
+        }
+        #[cfg(not(feature = "kafka"))]
+        {
+            Err(
+                "direct Kafka execution requires building krishiv-connectors with the `kafka` feature"
+                    .to_string(),
+            )
+        }
     }
+}
+
+fn kafka_offsets_for_events(events: &[CdcEvent]) -> BTreeMap<String, i64> {
+    let mut offsets = BTreeMap::new();
+    for event in events {
+        offsets.insert(
+            format!("{}-{}", event.table, event.partition_id),
+            event.offset + 1,
+        );
+    }
+    offsets
+}
+
+#[derive(Debug, Default)]
+struct CdcSchemaEvolutionState {
+    schema: Option<Arc<Schema>>,
+}
+
+impl CdcSchemaEvolutionState {
+    fn normalize(&mut self, batch: RecordBatch) -> Result<RecordBatch, String> {
+        let merged = match &self.schema {
+            Some(existing) => merge_string_schemas(existing, &batch.schema()),
+            None => batch.schema(),
+        };
+        self.schema = Some(merged.clone());
+        krishiv_exec::schema_normalize::SchemaNormalizeOperator::new(merged)
+            .normalize(&batch)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn merge_string_schemas(left: &Schema, right: &Schema) -> Arc<Schema> {
+    let mut fields = left
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    for field in right.fields() {
+        if !fields
+            .iter()
+            .any(|existing| existing.name() == field.name())
+        {
+            fields.push(field.as_ref().clone());
+        }
+    }
+    Arc::new(Schema::new(fields))
 }
 
 // ---------------------------------------------------------------------------
@@ -531,8 +814,8 @@ impl KafkaCdcConfig {
 /// A [`CdcEventSource`] backed by a real Kafka broker via `rdkafka`.
 ///
 /// Uses a `StreamConsumer` with group-level offset management.  After each
-/// successful `poll_events` batch the consumer commits offsets synchronously
-/// (at-least-once delivery; duplicates are possible on restart).
+/// successful downstream sink commit the consumer commits offsets
+/// synchronously.
 ///
 /// Construct with [`RdkafkaCdcEventSource::new`] and pass to
 /// [`CdcToLakehousePipeline::run_with_source`].
@@ -620,8 +903,16 @@ impl CdcEventSource for RdkafkaCdcEventSource {
     /// Each call blocks for at most `poll_timeout_ms` per message.  Returns an
     /// empty `Vec` when no messages are available within the timeout window
     /// (the pipeline interprets this as a momentary idle, not shutdown).
-    /// Commits consumer offsets after assembling the batch.
     fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+        Ok(self
+            .poll_records(max)?
+            .into_iter()
+            .map(|record| record.payload)
+            .collect())
+    }
+
+    /// Poll up to `max` Debezium records with real Kafka partition/offset metadata.
+    fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, String> {
         use rdkafka::Message;
 
         let mut events = Vec::with_capacity(max.min(64));
@@ -664,12 +955,19 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                             continue;
                         }
                     };
-                    events.push(payload);
+                    let partition_id = u32::try_from(msg.partition()).map_err(|_| {
+                        format!("rdkafka returned invalid partition {}", msg.partition())
+                    })?;
+                    events.push(RawCdcRecord::new(payload, partition_id, msg.offset()));
                 }
             }
         }
 
         Ok(events)
+    }
+
+    fn is_live(&self) -> bool {
+        true
     }
 
     fn commit_offsets(&mut self) -> Result<(), String> {
@@ -771,6 +1069,14 @@ mod tests {
         assert!(parse_debezium_envelope("{}", 0, 0).is_none());
         assert!(parse_debezium_envelope("not json", 0, 0).is_none());
         assert!(parse_debezium_envelope(r#"{"op":"z"}"#, 0, 0).is_none());
+    }
+
+    #[test]
+    fn strict_parser_reports_malformed_json_errors() {
+        let err = parse_debezium_envelope_result("not json", 0, 0).unwrap_err();
+        assert!(matches!(err, DebeziumParseError::InvalidJson(_)));
+        let err = parse_debezium_envelope_result(r#"{"op":"z"}"#, 0, 0).unwrap_err();
+        assert_eq!(err, DebeziumParseError::UnknownOp("z".into()));
     }
 
     #[test]
@@ -924,6 +1230,196 @@ mod tests {
         assert_eq!(batches_received.len(), 1, "expected one batch");
         let schema = batches_received[0].schema();
         assert!(schema.index_of("_op").is_ok(), "expected _op column");
+    }
+
+    #[tokio::test]
+    async fn run_with_source_errors_on_malformed_json() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+        let source = InMemoryCdcEventSource::new(["not json"]);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let result = pipeline
+            .run_with_source(source, |_| Ok(()), shutdown_rx)
+            .await;
+        assert!(result.unwrap_err().contains("Debezium parse error"));
+    }
+
+    #[tokio::test]
+    async fn run_with_source_normalizes_schema_evolution_across_batches() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        )
+        .with_batch_size(1);
+        let first = r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":1}}"#;
+        let second = r#"{"op":"c","source":{"lsn":2,"ts_ms":2,"table":"orders"},"after":{"id":2,"name":"bob"}}"#;
+        let source = InMemoryCdcEventSource::new([first, second]);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut schemas = Vec::new();
+
+        pipeline
+            .run_with_source(
+                source,
+                |batch| {
+                    schemas.push(
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|field| field.name().to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(())
+                },
+                shutdown_rx,
+            )
+            .await
+            .unwrap();
+
+        assert!(schemas[1].contains(&"name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_with_iceberg_sink_commits_snapshot_then_offsets() {
+        use krishiv_lakehouse::{
+            IcebergTableRef, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField,
+            SchemaVersion,
+        };
+
+        #[derive(Default)]
+        struct CommitTrackingSource {
+            events: std::collections::VecDeque<String>,
+            commits: usize,
+        }
+
+        impl CdcEventSource for CommitTrackingSource {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+                let n = max.min(self.events.len());
+                Ok(self.events.drain(..n).collect())
+            }
+
+            fn commit_offsets(&mut self) -> Result<(), String> {
+                self.commits += 1;
+                Ok(())
+            }
+        }
+
+        let schema = SchemaVersion {
+            schema_id: 1,
+            fields: vec![SchemaField {
+                id: 1,
+                name: "id".to_string(),
+                required: false,
+                data_type: "string".to_string(),
+            }],
+        };
+        let table = Arc::new(MemoryLakehouseTable::new(
+            IcebergTableRef::new("cat", "ns", "orders"),
+            schema,
+        ));
+        let iceberg = MemoryIcebergTwoPhaseCommit::new(table);
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+        let source = CommitTrackingSource {
+            events: [
+                r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":"1"}}"#
+                    .to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            commits: 0,
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let snapshots = pipeline
+            .run_with_iceberg_sink(source, &iceberg, shutdown_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshots.len(), 1);
+        let offsets = iceberg.committed_kafka_offsets().await;
+        assert_eq!(offsets.get("orders-0"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn run_with_iceberg_sink_preserves_source_offsets() {
+        use krishiv_lakehouse::{
+            IcebergTableRef, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField,
+            SchemaVersion,
+        };
+
+        struct MetadataSource {
+            records: std::collections::VecDeque<RawCdcRecord>,
+        }
+
+        impl CdcEventSource for MetadataSource {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+                Ok(self
+                    .poll_records(max)?
+                    .into_iter()
+                    .map(|record| record.payload)
+                    .collect())
+            }
+
+            fn poll_records(&mut self, max: usize) -> Result<Vec<RawCdcRecord>, String> {
+                let n = max.min(self.records.len());
+                Ok(self.records.drain(..n).collect())
+            }
+        }
+
+        let schema = SchemaVersion {
+            schema_id: 1,
+            fields: vec![SchemaField {
+                id: 1,
+                name: "id".to_string(),
+                required: false,
+                data_type: "string".to_string(),
+            }],
+        };
+        let table = Arc::new(MemoryLakehouseTable::new(
+            IcebergTableRef::new("cat", "ns", "orders"),
+            schema,
+        ));
+        let iceberg = MemoryIcebergTwoPhaseCommit::new(table);
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+        let source = MetadataSource {
+            records: [RawCdcRecord::new(
+                r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":"1"}}"#,
+                7,
+                41,
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let snapshots = pipeline
+            .run_with_iceberg_sink(source, &iceberg, shutdown_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshots.len(), 1);
+        let offsets = iceberg.committed_kafka_offsets().await;
+        assert_eq!(offsets.get("orders-7"), Some(&42));
     }
 
     #[tokio::test]

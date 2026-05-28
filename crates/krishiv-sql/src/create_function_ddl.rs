@@ -186,8 +186,7 @@ impl TableUdf for StubTableUdf {
 
     fn call(&self, _args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
         // Return an empty batch with the declared schema.
-        RecordBatch::new_empty(Arc::new(self.schema.clone()))
-            .map_err(|e| UdfError::Arrow(e.to_string()))
+        Ok(RecordBatch::new_empty(Arc::new(self.schema.clone())))
     }
 }
 

@@ -47,7 +47,6 @@ mod ai {
 pub use agg::PyAggExpr;
 pub use batch::PyBatch;
 pub use dataframe::PyDataFrame;
-pub use relation::PyRelation;
 pub use errors::{
     AuthorizationError, CheckpointError, ConnectorError, KrishivError, ModeError, QueryError,
     SchemaError, UdfError,
@@ -55,6 +54,7 @@ pub use errors::{
 pub use job_status::PyJobStatus;
 pub use live_table::{PyChangeFeedIter, PyLiveTable};
 pub use query_result::PyQueryResult;
+pub use relation::PyRelation;
 pub use schema::PySchema;
 pub use session::PySession;
 pub use sinks::{PyIcebergSink, PyKafkaSink, PyParquetSink};
@@ -116,7 +116,10 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(lakehouse::read_delta, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::read_hudi, m)?)?;
+    m.add_function(wrap_pyfunction!(lakehouse::write_hudi_append, m)?)?;
+    m.add_function(wrap_pyfunction!(lakehouse::write_hudi_upsert, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::schema_registry_confluent, m)?)?;
+    m.add_class::<lakehouse::PyHudiWriteResult>()?;
     m.add_class::<lakehouse::PySchemaRegistryConfig>()?;
     m.add_class::<lakehouse::PyGlueCatalog>()?;
     m.add_class::<lakehouse::PyNessieCatalog>()?;

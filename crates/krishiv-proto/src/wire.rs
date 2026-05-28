@@ -6,7 +6,7 @@ use std::fmt;
 use crate::checkpoint::{CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset};
 use crate::executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
-    ShufflePartitionOutput, TaskOutputMetadata, TaskRuntimeStats,
+    HeartbeatThrottleCommand, ShufflePartitionOutput, TaskOutputMetadata, TaskRuntimeStats,
 };
 use crate::ids::{
     AttemptId, ExecutorId, FencingToken, JobId, LeaseGeneration, StageId, TaskId, TransportVersion,
@@ -14,7 +14,7 @@ use crate::ids::{
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment,
-    HeartbeatThrottleCommand, InputPartition, InputPartitionDescriptor, MemoryKafkaRecord,
+    InputPartition, InputPartitionDescriptor, MemoryKafkaRecord,
     OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
     RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
     TaskStatusRequest, TaskStatusResponse, TransportDisposition,

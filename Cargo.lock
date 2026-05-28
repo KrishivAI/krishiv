@@ -4277,6 +4277,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "krishiv-catalog",
+ "krishiv-cep",
  "krishiv-lakehouse",
  "krishiv-optimizer",
  "krishiv-plan",

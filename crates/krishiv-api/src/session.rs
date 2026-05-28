@@ -516,7 +516,10 @@ impl Session {
         Ok(())
     }
 
-    fn dataframe_from_sql(&self, sql_dataframe: impl krishiv_sql::KrishivDataFrameOps + 'static) -> DataFrame {
+    fn dataframe_from_sql(
+        &self,
+        sql_dataframe: impl krishiv_sql::KrishivDataFrameOps + 'static,
+    ) -> DataFrame {
         let sql_query = sql_dataframe.query().map(str::to_owned);
         DataFrame::from_sql_dataframe(
             self.mode,
@@ -680,6 +683,61 @@ impl Session {
             .read_hudi(path, query_type, begin_instant)
             .await?;
         Ok(self.dataframe_from_sql(sql_dataframe))
+    }
+
+    /// Append a DataFrame into a local Hudi Copy-On-Write table (R18).
+    pub async fn write_hudi_append_async(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        dataframe: &DataFrame,
+    ) -> Result<krishiv_lakehouse::HudiWriteResult> {
+        let batches = dataframe.collect_async().await?.into_batches();
+        let writer = krishiv_lakehouse::HudiCowWriter::open(path);
+        let mut total = krishiv_lakehouse::HudiWriteResult {
+            instant: String::new(),
+            rows_inserted: 0,
+            rows_updated: 0,
+            snapshot_rows: 0,
+        };
+        for batch in batches {
+            let result = writer.append(batch).map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
+            total.instant = result.instant;
+            total.rows_inserted += result.rows_inserted;
+            total.rows_updated += result.rows_updated;
+            total.snapshot_rows = result.snapshot_rows;
+        }
+        Ok(total)
+    }
+
+    /// Upsert a DataFrame into a local Hudi Copy-On-Write table by key column (R18).
+    pub async fn write_hudi_upsert_async(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        key_column: &str,
+        dataframe: &DataFrame,
+    ) -> Result<krishiv_lakehouse::HudiWriteResult> {
+        let batches = dataframe.collect_async().await?.into_batches();
+        let writer = krishiv_lakehouse::HudiCowWriter::open(path);
+        let mut total = krishiv_lakehouse::HudiWriteResult {
+            instant: String::new(),
+            rows_inserted: 0,
+            rows_updated: 0,
+            snapshot_rows: 0,
+        };
+        for batch in batches {
+            let result = writer
+                .upsert(key_column, batch)
+                .map_err(|e| KrishivError::Runtime {
+                    message: e.to_string(),
+                })?;
+            total.instant = result.instant;
+            total.rows_inserted += result.rows_inserted;
+            total.rows_updated += result.rows_updated;
+            total.snapshot_rows = result.snapshot_rows;
+        }
+        Ok(total)
     }
 
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.

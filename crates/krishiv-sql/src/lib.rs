@@ -22,6 +22,7 @@ use krishiv_catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridg
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
+pub mod cep_sql;
 pub mod create_function_ddl;
 mod lakehouse;
 pub mod live_table;
@@ -30,6 +31,7 @@ pub mod spark_compat_date;
 mod udf;
 mod window_functions;
 
+pub use cep_sql::{MatchRecognizeStatement, parse_match_recognize};
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 
 /// SQL result alias.
@@ -633,6 +635,15 @@ pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan> {
     let query = query.into();
     if query.trim().is_empty() {
         return Err(SqlError::EmptyQuery);
+    }
+
+    if let Some(stmt) = cep_sql::parse_match_recognize(&query)? {
+        let logical_plan = cep_sql::plan_match_recognize(stmt, &query);
+        let optimized = Optimizer::default().optimize(logical_plan);
+        return Ok(SqlPlan {
+            query,
+            logical_plan: optimized.plan,
+        });
     }
 
     let logical_plan =

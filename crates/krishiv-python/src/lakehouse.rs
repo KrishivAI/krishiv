@@ -40,6 +40,67 @@ pub fn read_hudi(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+#[pyclass(name = "HudiWriteResult")]
+pub struct PyHudiWriteResult {
+    inner: krishiv_lakehouse::HudiWriteResult,
+}
+
+#[pymethods]
+impl PyHudiWriteResult {
+    #[getter]
+    pub fn instant(&self) -> String {
+        self.inner.instant.clone()
+    }
+
+    #[getter]
+    pub fn rows_inserted(&self) -> u64 {
+        self.inner.rows_inserted
+    }
+
+    #[getter]
+    pub fn rows_updated(&self) -> u64 {
+        self.inner.rows_updated
+    }
+
+    #[getter]
+    pub fn snapshot_rows(&self) -> u64 {
+        self.inner.snapshot_rows
+    }
+}
+
+#[pyfunction]
+pub fn write_hudi_append(
+    session: &PySession,
+    path: String,
+    dataframe: &PyDataFrame,
+) -> PyResult<PyHudiWriteResult> {
+    RUNTIME
+        .block_on(
+            session
+                .inner
+                .write_hudi_append_async(path, &dataframe.inner),
+        )
+        .map(|inner| PyHudiWriteResult { inner })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+#[pyfunction]
+pub fn write_hudi_upsert(
+    session: &PySession,
+    path: String,
+    key_column: String,
+    dataframe: &PyDataFrame,
+) -> PyResult<PyHudiWriteResult> {
+    RUNTIME
+        .block_on(
+            session
+                .inner
+                .write_hudi_upsert_async(path, &key_column, &dataframe.inner),
+        )
+        .map(|inner| PyHudiWriteResult { inner })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 #[pyfunction]
 #[pyo3(signature = (url, subject, format="avro"))]
 pub fn schema_registry_confluent(
