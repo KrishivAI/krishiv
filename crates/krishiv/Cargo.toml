@@ -29,6 +29,9 @@ shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
 sqlite = ["krishiv-scheduler/sqlite"]
+state = ["krishiv-connectors/state"]
+iceberg = ["krishiv-lakehouse/iceberg"]
+delta = ["krishiv-lakehouse/delta"]
 
 [dependencies]
 krishiv-async-util = { path = "../krishiv-async-util" }

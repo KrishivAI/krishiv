@@ -78,6 +78,7 @@ impl std::error::Error for LakehouseError {}
 /// Convenience result alias for lakehouse operations.
 pub type LakehouseResult<T> = Result<T, LakehouseError>;
 
+#[cfg(feature = "iceberg")]
 impl From<iceberg::Error> for LakehouseError {
     fn from(e: iceberg::Error) -> Self {
         LakehouseError::Iceberg(e.to_string())

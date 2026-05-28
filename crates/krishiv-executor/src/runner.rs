@@ -52,8 +52,11 @@ pub(crate) const LOCAL_PARQUET_PARTITION_PREFIX: &str = "local-parquet:";
 pub(crate) const CONNECTOR_PARQUET_PARTITION_PREFIX: &str = "connector-parquet:";
 pub(crate) const OBJECT_PARQUET_PARTITION_PREFIX: &str = "object-parquet:";
 pub(crate) const OBJECT_PARQUET_SINK_PREFIX: &str = "object-parquet-sink:";
+#[cfg(feature = "kafka")]
 pub(crate) const MEMORY_KAFKA_PARTITION_PREFIX: &str = "memory-kafka:";
+#[cfg(feature = "kafka")]
 pub(crate) const PARQUET_SINK_PREFIX: &str = "parquet-sink:";
+#[cfg(feature = "kafka")]
 pub(crate) const KAFKA_TO_PARQUET_FRAGMENT: &str = "connector-pipeline:kafka-to-parquet";
 pub(crate) const SHUFFLE_WRITE_PREFIX: &str = "shuffle-write:";
 
@@ -212,6 +215,7 @@ impl ExecutorTaskOutput {
         }
     }
 
+    #[cfg(feature = "kafka")]
     pub(crate) fn connector_pipeline(
         row_count: usize,
         batch_count: usize,

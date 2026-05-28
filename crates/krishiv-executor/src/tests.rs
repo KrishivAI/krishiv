@@ -1101,6 +1101,7 @@ mod executor_tests {
         assert_eq!(snapshot.state(), JobState::Succeeded);
     }
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn executor_runs_kafka_to_parquet_pipeline_on_real_runner() {
         use krishiv_connectors::Source;
@@ -1195,6 +1196,7 @@ mod executor_tests {
         assert_eq!(snapshot.succeeded_task_count(), 1);
     }
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn executor_rejects_kafka_to_parquet_without_parquet_sink_contract() {
         let assignment = ExecutorTaskAssignment::new(

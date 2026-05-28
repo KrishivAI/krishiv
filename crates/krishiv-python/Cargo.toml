@@ -32,16 +32,13 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 
 [features]
-default = ["python"]
-python = []
+default = []
 kafka = ["dep:krishiv-connectors", "krishiv-connectors/kafka"]
-# Taxonomy marker for Python Iceberg bindings; lakehouse code is still compiled
-# as a whole today, but the feature gives callers a stable opt-in name.
 iceberg = ["krishiv-lakehouse/iceberg"]
 ai = ["dep:krishiv-ai", "dep:krishiv-vector-sinks", "krishiv-ai/fastembed-local"]
 vector-sinks = ["ai"]
-qdrant = ["vector-sinks", "krishiv-vector-sinks/qdrant"]
-pgvector = ["vector-sinks", "krishiv-vector-sinks/pgvector"]
+qdrant = ["dep:krishiv-vector-sinks", "krishiv-vector-sinks/qdrant"]
+pgvector = ["dep:krishiv-vector-sinks", "krishiv-vector-sinks/pgvector"]
 
 [lints]
 workspace = true

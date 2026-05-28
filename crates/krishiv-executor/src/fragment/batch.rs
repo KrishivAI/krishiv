@@ -1,12 +1,14 @@
 //! Batch fragment execution: `execute_batch_fragment` and its helpers.
 
-use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "kafka")]
+use std::path::PathBuf;
 
 use krishiv_proto::{
-    ExecutorTaskAssignment, InputPartitionDescriptor, OutputContract, OutputContractDescriptor,
-    TaskRuntimeStats,
+    ExecutorTaskAssignment, TaskRuntimeStats,
 };
+#[cfg(feature = "kafka")]
+use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
 use krishiv_sql::SqlEngine;
 
 use super::common::{
@@ -15,10 +17,11 @@ use super::common::{
     write_object_parquet_sink,
 };
 use crate::runner::{
-    ExecutorTaskOutput, ExecutorTaskRunner, KAFKA_TO_PARQUET_FRAGMENT,
-    MEMORY_KAFKA_PARTITION_PREFIX, OBJECT_PARQUET_SINK_PREFIX, PARQUET_SINK_PREFIX,
-    SHUFFLE_WRITE_PREFIX,
+    ExecutorTaskOutput, ExecutorTaskRunner,
+    OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
 };
+#[cfg(feature = "kafka")]
+use crate::runner::{MEMORY_KAFKA_PARTITION_PREFIX, PARQUET_SINK_PREFIX, KAFKA_TO_PARQUET_FRAGMENT};
 use crate::{ExecutorError, ExecutorResult};
 
 /// Execute a batch (terminal) stage fragment.
@@ -51,6 +54,7 @@ pub(crate) async fn execute_batch_fragment(
         }
     }
 
+    #[cfg(feature = "kafka")]
     if fragment == KAFKA_TO_PARQUET_FRAGMENT {
         return execute_source_to_sink_pipeline(assignment).await;
     }
@@ -527,6 +531,7 @@ async fn execute_inmem_shuffle_read(
     ))
 }
 
+#[cfg(feature = "kafka")]
 async fn execute_source_to_sink_pipeline(
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -591,6 +596,7 @@ async fn execute_source_to_sink_pipeline(
     ))
 }
 
+#[cfg(feature = "kafka")]
 fn parse_parquet_sink_path(contract: &OutputContract) -> ExecutorResult<PathBuf> {
     let path = match contract.descriptor() {
         Some(OutputContractDescriptor::ParquetSink { path }) => path.as_str(),
@@ -613,6 +619,7 @@ fn parse_parquet_sink_path(contract: &OutputContract) -> ExecutorResult<PathBuf>
     Ok(PathBuf::from(path))
 }
 
+#[cfg(feature = "kafka")]
 fn parse_memory_kafka_partition(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<(String, i32, i64, arrow::record_batch::RecordBatch)> {

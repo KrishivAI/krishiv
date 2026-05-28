@@ -9,7 +9,7 @@ license.workspace = true
 arrow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-iceberg = { workspace = true }
+iceberg = { workspace = true, optional = true }
 parquet = { workspace = true }
 redb = { workspace = true }
 serde = { workspace = true }
@@ -21,9 +21,7 @@ rdkafka = { version = "0.36", optional = true, default-features = false, feature
 
 [features]
 default = []
-# Taxonomy marker for the always-present Iceberg lakehouse surface. The code is
-# not split yet, but downstream crates can now express intent consistently.
-iceberg = []
+iceberg = ["dep:iceberg"]
 delta = []
 kafka = ["dep:rdkafka"]
 exactly-once-integration = []

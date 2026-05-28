@@ -8,11 +8,14 @@
 pub mod cdc;
 pub mod cdc_router;
 pub mod feature_store;
+#[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod parquet;
 pub mod s3;
 pub mod transactional;
+#[cfg(feature = "kafka")]
 pub mod transactional_kafka;
+#[cfg(any(feature = "kafka", feature = "state"))]
 pub mod two_phase_parquet_s3;
 
 // Module facades
