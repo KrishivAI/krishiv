@@ -490,7 +490,7 @@ impl Session {
         Ok(())
     }
 
-    fn dataframe_from_sql(&self, sql_dataframe: krishiv_sql::SqlDataFrame) -> DataFrame {
+    fn dataframe_from_sql(&self, sql_dataframe: impl krishiv_sql::KrishivDataFrameOps + 'static) -> DataFrame {
         let sql_query = sql_dataframe.query().map(str::to_owned);
         DataFrame::from_sql_dataframe(
             self.mode,

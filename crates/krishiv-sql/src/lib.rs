@@ -398,6 +398,28 @@ fn extract_simple_view_name(query: &str) -> Option<String> {
     None
 }
 
+/// Engine-agnostic interface over a prepared query result.
+///
+/// Hides the concrete [`SqlDataFrame`] (which holds a DataFusion `DataFrame`)
+/// behind a stable trait so that `krishiv-api` and other callers are not
+/// forced to depend on DataFusion types.  `datafusion` stays an implementation
+/// detail inside `krishiv-sql`; a future engine swap only requires a new impl.
+#[async_trait::async_trait]
+pub trait KrishivDataFrameOps: Send + Sync {
+    /// Execute and collect all result batches.
+    async fn collect(&self) -> SqlResult<Vec<RecordBatch>>;
+    /// Execute, collect results, and return lightweight runtime statistics.
+    async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)>;
+    /// Explain the physical and logical plan text (does not execute).
+    async fn explain(&self) -> SqlResult<String>;
+    /// Explain the logical plan text without executing.
+    fn explain_logical(&self) -> String;
+    /// Build a Krishiv [`LogicalPlan`] wrapper for this DataFrame.
+    fn krishiv_logical_plan(&self) -> LogicalPlan;
+    /// The original SQL query string, if any.
+    fn query(&self) -> Option<&str>;
+}
+
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
 #[derive(Debug, Clone)]
 pub struct SqlDataFrame {
@@ -496,6 +518,28 @@ impl SqlDataFrame {
 pub struct SqlExecutionStats {
     pub output_rows: u64,
     pub cpu_nanos: u64,
+}
+
+#[async_trait::async_trait]
+impl KrishivDataFrameOps for SqlDataFrame {
+    async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
+        SqlDataFrame::collect(self).await
+    }
+    async fn collect_with_stats(&self) -> SqlResult<(Vec<RecordBatch>, SqlExecutionStats)> {
+        SqlDataFrame::collect_with_stats(self).await
+    }
+    async fn explain(&self) -> SqlResult<String> {
+        SqlDataFrame::explain(self).await
+    }
+    fn explain_logical(&self) -> String {
+        SqlDataFrame::explain_logical(self)
+    }
+    fn krishiv_logical_plan(&self) -> LogicalPlan {
+        SqlDataFrame::krishiv_logical_plan(self)
+    }
+    fn query(&self) -> Option<&str> {
+        SqlDataFrame::query(self)
+    }
 }
 
 /// Create a Krishiv logical plan wrapper for a SQL query without executing it.
