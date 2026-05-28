@@ -43,9 +43,16 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
             .map_err(|e| CheckpointError::Storage {
                 message: format!("s3 checkpoint store {url}: {e}"),
             })?;
+        // Use the parsed URI path as the storage prefix, falling back to
+        // "checkpoints" when no path component was provided.
+        let storage_prefix = if prefix.is_empty() {
+            "checkpoints".to_owned()
+        } else {
+            prefix.to_owned()
+        };
         return Ok(Arc::new(ObjectStoreCheckpointStorage::new(
             Arc::new(store),
-            "checkpoints",
+            storage_prefix,
         )));
     }
     let path = trimmed.strip_prefix("file://").unwrap_or(trimmed);

@@ -83,7 +83,7 @@ mod tests {
         assert!(pipe.effective_watermark() > i64::MIN);
         assert!(!pipe.side_router.is_late(&pipe.watermark, 950));
         assert!(pipe.side_router.is_late(&pipe.watermark, 700));
-        let mut aligner = BarrierAligner::new(2, Duration::from_secs(1));
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(1)).unwrap();
         aligner.buffer_data(0, batch(1));
         assert!(!aligner.on_barrier(0, 1).unwrap());
         assert!(aligner.on_barrier(1, 1).unwrap());

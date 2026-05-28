@@ -202,13 +202,21 @@ pub async fn run_kubernetes_controller_runtime_with_client(
         let coord = tick_coordinator.read().await;
         coord.config().tick_period_ms()
     };
-    tokio::spawn(async move {
+    // Shutdown signal so the tick loop can be cleanly stopped.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let tick_handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_period_ms));
         loop {
-            ticker.tick().await;
-            let mut coord = tick_coordinator.write().await;
-            if let Err(e) = coord.coordinator_tick() {
-                tracing::warn!(error = %e, "embedded coordinator tick failed");
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let mut coord = tick_coordinator.write().await;
+                    if let Err(e) = coord.coordinator_tick() {
+                        tracing::warn!(error = %e, "embedded coordinator tick failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    break;
+                }
             }
         }
     });
@@ -225,6 +233,10 @@ pub async fn run_kubernetes_controller_runtime_with_client(
             WatchEvent::Delete(_) | WatchEvent::Init | WatchEvent::InitDone => {}
         }
     }
+
+    // Signal the tick loop to stop cleanly.
+    let _ = shutdown_tx.send(true);
+    tick_handle.abort();
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::StateResult;
 use crate::namespace::Namespace;
@@ -48,9 +48,15 @@ pub trait ProcessingTimeTimerService: Send + Sync {
 }
 
 /// In-memory processing-time timer service for R5.2.
+///
+/// A secondary `HashMap<(namespace, key), fire_at_ms>` index enables O(1)
+/// cancel by identity without scanning the full `BTreeMap`.  Both structures
+/// are kept in sync by `register_processing_time_timer`,
+/// `cancel_processing_time_timer`, and `drain_fired_processing_time_timers`.
 #[derive(Debug, Default)]
 pub struct InMemoryProcessingTimeTimerService {
     timers: BTreeMap<ProcessingTimeTimerKey, ()>,
+    identity_index: HashMap<(Namespace, Vec<u8>), i64>,
 }
 
 impl InMemoryProcessingTimeTimerService {
@@ -62,6 +68,16 @@ impl InMemoryProcessingTimeTimerService {
 
 impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
     fn register_processing_time_timer(&mut self, timer: ProcessingTimeTimerKey) -> StateResult<()> {
+        let identity = (timer.namespace.clone(), timer.key.clone());
+        if let Some(old_fire_at) = self.identity_index.get(&identity).copied() {
+            let old_key = ProcessingTimeTimerKey {
+                fire_at_ms: old_fire_at,
+                namespace: timer.namespace.clone(),
+                key: timer.key.clone(),
+            };
+            self.timers.remove(&old_key);
+        }
+        self.identity_index.insert(identity, timer.fire_at_ms);
         self.timers.insert(timer, ());
         Ok(())
     }
@@ -71,8 +87,15 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
         namespace: &Namespace,
         key: &[u8],
     ) -> StateResult<()> {
-        self.timers
-            .retain(|t, _| !(t.namespace == *namespace && t.key == key));
+        let identity = (namespace.clone(), key.to_vec());
+        if let Some(fire_at_ms) = self.identity_index.remove(&identity) {
+            let timer_key = ProcessingTimeTimerKey {
+                fire_at_ms,
+                namespace: namespace.clone(),
+                key: key.to_vec(),
+            };
+            self.timers.remove(&timer_key);
+        }
         Ok(())
     }
 
@@ -83,9 +106,14 @@ impl ProcessingTimeTimerService for InMemoryProcessingTimeTimerService {
             key: vec![],
         };
         let pending = self.timers.split_off(&sentinel);
-        std::mem::replace(&mut self.timers, pending)
+        let fired: Vec<ProcessingTimeTimerKey> = std::mem::replace(&mut self.timers, pending)
             .into_keys()
-            .collect()
+            .collect();
+        for t in &fired {
+            self.identity_index
+                .remove(&(t.namespace.clone(), t.key.clone()));
+        }
+        fired
     }
 
     fn pending_count(&self) -> usize {

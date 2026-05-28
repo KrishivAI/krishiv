@@ -715,9 +715,9 @@ pub enum InputPartitionDescriptor {
         /// Empty string means in-process (single-node mode, read from InMemoryShuffleStore).
         flight_endpoint: String,
         /// Job id of the upstream stage.
-        job_id: String,
+        job_id: JobId,
         /// Stage id that produced this partition.
-        upstream_stage_id: String,
+        upstream_stage_id: StageId,
         /// Partition index.
         partition_id: u32,
     },

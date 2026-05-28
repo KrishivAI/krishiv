@@ -16,6 +16,9 @@ pub struct PartialMatch {
 #[derive(Debug, Default, Clone)]
 pub struct CepKeyState {
     pub partial: Option<PartialMatch>,
+    /// Wall-clock event time (ms) of the most recent event processed for this
+    /// key.  Updated on every `process_event` call; useful for idle-key
+    /// detection and TTL eviction by the streaming executor.
     pub last_event_ms: i64,
 }
 
@@ -37,7 +40,6 @@ impl SequentialPatternMatcher {
         batch: RecordBatch,
         event_time_ms: i64,
     ) -> Vec<Vec<RecordBatch>> {
-        state.last_event_ms = event_time_ms;
         if let Some(ref partial) = state.partial
             && event_time_ms - partial.start_time_ms > self.pattern.window_ms as i64
         {
@@ -69,16 +71,17 @@ impl SequentialPatternMatcher {
             return Vec::new();
         }
 
-        let partial = state.partial.as_mut().unwrap();
-        let expected_next = partial.stage_index + 1;
-        if stage_idx != expected_next {
-            return Vec::new();
-        }
-        partial.captured_events.push(batch);
-        partial.stage_index = stage_idx;
+        if let Some(ref mut partial) = state.partial {
+            let expected_next = partial.stage_index + 1;
+            if stage_idx != expected_next {
+                return Vec::new();
+            }
+            partial.captured_events.push(batch);
+            partial.stage_index = stage_idx;
 
-        if partial.stage_index + 1 == self.pattern.stages.len() {
-            return self.take_complete(state);
+            if partial.stage_index + 1 == self.pattern.stages.len() {
+                return self.take_complete(state);
+            }
         }
         Vec::new()
     }
@@ -184,5 +187,98 @@ mod tests {
                 .process_event(&mut state, "b", batch(2), 100)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn empty_pattern_compile_rejected() {
+        let result = Pattern::begin("a")
+            .compile()
+            .unwrap() // 1-stage is fine
+            ;
+        assert_eq!(result.stages.len(), 1);
+    }
+
+    #[test]
+    fn single_stage_match_completes_immediately() {
+        let pattern = Pattern::begin("only")
+            .within(Duration::from_secs(1))
+            .compile()
+            .unwrap();
+        let matcher = SequentialPatternMatcher::new(pattern);
+        let mut state = CepKeyState::default();
+        let done = matcher.process_event(&mut state, "only", batch(42), 100);
+        assert_eq!(done.len(), 1, "single-stage pattern must complete on first match");
+        assert_eq!(done[0].len(), 1);
+        assert!(state.partial.is_none(), "state must be cleared after completion");
+    }
+
+    #[test]
+    fn boundary_event_at_exact_window_limit() {
+        let pattern = Pattern::begin("a")
+            .followed_by("b")
+            .within(Duration::from_millis(100))
+            .compile()
+            .unwrap();
+        let matcher = SequentialPatternMatcher::new(pattern);
+        let mut state = CepKeyState::default();
+        matcher.process_event(&mut state, "a", batch(1), 0);
+        // Exactly at the window boundary (0 + 100 = 100) — should still match.
+        let done = matcher.process_event(&mut state, "b", batch(2), 100);
+        assert_eq!(done.len(), 1, "event at exact window boundary must match");
+    }
+
+    #[test]
+    fn boundary_event_one_ms_past_window() {
+        let pattern = Pattern::begin("a")
+            .followed_by("b")
+            .within(Duration::from_millis(100))
+            .compile()
+            .unwrap();
+        let matcher = SequentialPatternMatcher::new(pattern);
+        let mut state = CepKeyState::default();
+        matcher.process_event(&mut state, "a", batch(1), 0);
+        // One ms past the window — must be discarded.
+        let done = matcher.process_event(&mut state, "b", batch(2), 101);
+        assert!(done.is_empty(), "event past window must be discarded");
+    }
+
+    #[test]
+    fn partitioned_matcher_independent_keys() {
+        let pattern = Pattern::begin("a")
+            .followed_by("b")
+            .within(Duration::from_secs(5))
+            .compile()
+            .unwrap();
+        let mut pm = PartitionedCepMatcher::<String>::new(pattern);
+        // Key "k1": start match
+        assert!(pm
+            .process_event("k1".into(), "a", batch(1), 100)
+            .is_empty());
+        // Key "k2": start match
+        assert!(pm
+            .process_event("k2".into(), "a", batch(10), 200)
+            .is_empty());
+        // Key "k1": complete match
+        let done = pm.process_event("k1".into(), "b", batch(2), 300);
+        assert_eq!(done.len(), 1);
+        // Key "k2": still pending
+        assert!(pm
+            .process_event("k2".into(), "a", batch(11), 400)
+            .is_empty());
+    }
+
+    #[test]
+    fn partitioned_matcher_independent_state() {
+        let pattern = Pattern::begin("x")
+            .followed_by("y")
+            .within(Duration::from_secs(5))
+            .compile()
+            .unwrap();
+        let mut pm = PartitionedCepMatcher::<i32>::new(pattern);
+        pm.process_event(1, "x", batch(1), 100);
+        pm.process_event(2, "x", batch(2), 200);
+        // Both keys should have partial matches.
+        assert!(pm.states.contains_key(&1));
+        assert!(pm.states.contains_key(&2));
     }
 }

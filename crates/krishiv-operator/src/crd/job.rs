@@ -14,6 +14,9 @@ pub struct ObjectMeta {
     /// Resource namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    /// Kubernetes resource UID (populated from the API server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     /// Kubernetes generation observed by the controller.
     #[serde(default)]
     pub generation: i64,
@@ -34,6 +37,7 @@ impl ObjectMeta {
         Self {
             name: name.into(),
             namespace: Some(namespace.into()),
+            uid: None,
             generation: 1,
             labels: BTreeMap::new(),
             finalizers: Vec::new(),

@@ -280,8 +280,6 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<TriggerSavepointRequest>,
     ) -> Result<tonic::Response<TriggerSavepointResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id)
-            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let label = if req.label.is_empty() {
             None
         } else {
@@ -289,7 +287,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         };
         let mut coordinator = self.coordinator.write().await;
         let epoch = coordinator
-            .savepoint_job(&job_id, label)
+            .savepoint_job(&req.job_id, label)
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
         Ok(tonic::Response::new(TriggerSavepointResponse { epoch }))
     }
@@ -299,10 +297,8 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<RestoreJobRequest>,
     ) -> Result<tonic::Response<RestoreJobResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id)
-            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let coordinator = self.coordinator.read().await;
-        match coordinator.restore_job_from_checkpoint(&job_id, req.epoch, &req.storage_path) {
+        match coordinator.restore_job_from_checkpoint(&req.job_id, req.epoch, &req.storage_path) {
             Ok(_meta) => Ok(tonic::Response::new(RestoreJobResponse {
                 accepted: true,
                 message: format!(
@@ -322,15 +318,13 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<ListCheckpointsRequest>,
     ) -> Result<tonic::Response<ListCheckpointsResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id)
-            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let (epoch_nums, storage): (Vec<u64>, Option<Arc<dyn CheckpointStorage>>) = {
             let coordinator = self.coordinator.read().await;
             let epochs = coordinator
-                .list_job_checkpoints(&job_id)
+                .list_job_checkpoints(&req.job_id)
                 .map_err(|e| tonic::Status::internal(e.to_string()))?;
             let storage = coordinator
-                .checkpoint_coordinator(&job_id)
+                .checkpoint_coordinator(&req.job_id)
                 .map(|c| Arc::clone(&c.storage));
             (epochs, storage)
         };
@@ -371,12 +365,10 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<InspectStateRequest>,
     ) -> Result<tonic::Response<InspectStateResponse>, tonic::Status> {
         let req = request.into_inner();
-        let job_id = JobId::try_new(&req.job_id)
-            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let coordinator = self.coordinator.read().await;
         // Collect snapshot paths for the requested operator from the checkpoint coordinator.
         let snapshots = coordinator
-            .checkpoint_coordinator(&job_id)
+            .checkpoint_coordinator(&req.job_id)
             .map(|coord| {
                 coord
                     .pending_acks
@@ -524,8 +516,10 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         request: tonic::Request<wire::v1::TriggerSavepointRequest>,
     ) -> Result<tonic::Response<wire::v1::TriggerSavepointResponse>, tonic::Status> {
         let w = request.into_inner();
+        let job_id = JobId::try_new(w.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let domain = TriggerSavepointRequest {
-            job_id: w.job_id,
+            job_id,
             label: w.label,
         };
         let resp = CoordinatorManagementService::trigger_savepoint(
@@ -545,8 +539,10 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         request: tonic::Request<wire::v1::RestoreJobRequest>,
     ) -> Result<tonic::Response<wire::v1::RestoreJobResponse>, tonic::Status> {
         let w = request.into_inner();
+        let job_id = JobId::try_new(w.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let domain = RestoreJobRequest {
-            job_id: w.job_id,
+            job_id,
             epoch: w.epoch,
             storage_path: w.storage_path,
         };
@@ -565,7 +561,9 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         request: tonic::Request<wire::v1::ListCheckpointsRequest>,
     ) -> Result<tonic::Response<wire::v1::ListCheckpointsResponse>, tonic::Status> {
         let w = request.into_inner();
-        let domain = ListCheckpointsRequest { job_id: w.job_id };
+        let job_id = JobId::try_new(w.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
+        let domain = ListCheckpointsRequest { job_id };
         let resp = CoordinatorManagementService::list_checkpoints(
             &self.inner,
             tonic::Request::new(domain),
@@ -591,8 +589,10 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         request: tonic::Request<wire::v1::InspectStateRequest>,
     ) -> Result<tonic::Response<wire::v1::InspectStateResponse>, tonic::Status> {
         let w = request.into_inner();
+        let job_id = JobId::try_new(w.job_id)
+            .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let domain = InspectStateRequest {
-            job_id: w.job_id,
+            job_id,
             operator_id: w.operator_id,
         };
         let resp =

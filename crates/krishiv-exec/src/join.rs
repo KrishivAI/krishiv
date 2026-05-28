@@ -88,20 +88,6 @@ pub(crate) fn extract_agg_key(
     }
 }
 
-/// Compare two group-key string parts with numeric-first ordering.
-///
-/// When both parts parse as `i64` they are ordered numerically; a
-/// lexicographic tiebreaker (`ai.cmp(bi)`) ensures that distinct
-/// representations of the same integer (e.g. `"1"` vs `"01"`) still produce a
-/// stable, deterministic sort order across runs.
-#[allow(dead_code)]
-pub(crate) fn compare_key_parts(ai: &str, bi: &str) -> std::cmp::Ordering {
-    match (ai.parse::<i64>(), bi.parse::<i64>()) {
-        (Ok(an), Ok(bn)) => an.cmp(&bn).then_with(|| ai.cmp(bi)),
-        _ => ai.cmp(bi),
-    }
-}
-
 /// Serialize a single row value from the given column to a `String` for use as
 /// a hash-map key.  Supported types: `Int32`, `Int64`, `Utf8`.
 pub fn format_key_value(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecResult<String> {
@@ -359,6 +345,8 @@ pub struct StreamTableJoin {
     table: RecordBatch,
     /// Column name present in both the stream batch and the table.
     join_key_column: String,
+    /// Cached hash map for the table side, built lazily on first use.
+    cached_index: Option<Arc<HashMap<String, Vec<u32>>>>,
 }
 
 impl StreamTableJoin {
@@ -367,7 +355,27 @@ impl StreamTableJoin {
         Self {
             table,
             join_key_column: join_key_column.into(),
+            cached_index: None,
         }
+    }
+
+    fn table_index(&mut self) -> ExecResult<Arc<HashMap<String, Vec<u32>>>> {
+        if let Some(ref cached) = self.cached_index {
+            return Ok(Arc::clone(cached));
+        }
+        let table_key_idx = self
+            .table
+            .schema()
+            .index_of(&self.join_key_column)
+            .map_err(|_| ExecError::ColumnNotFound(self.join_key_column.clone()))?;
+        let mut index: HashMap<String, Vec<u32>> = HashMap::new();
+        for row in 0..self.table.num_rows() {
+            let key = format_key_value(&self.table, table_key_idx, row)?;
+            index.entry(key).or_default().push(row as u32);
+        }
+        let index = Arc::new(index);
+        self.cached_index = Some(Arc::clone(&index));
+        Ok(index)
     }
 
     /// Join `stream_batch` against the static table, returning the inner-join result.
@@ -375,7 +383,7 @@ impl StreamTableJoin {
     /// Output schema is the union of all columns from both sides.  If the same
     /// column name appears in both, the stream column takes precedence and the
     /// table column is dropped.
-    pub fn process_batch(&self, stream_batch: &RecordBatch) -> ExecResult<RecordBatch> {
+    pub fn process_batch(&mut self, stream_batch: &RecordBatch) -> ExecResult<RecordBatch> {
         let stream_key_idx = stream_batch
             .schema()
             .index_of(&self.join_key_column)
@@ -386,13 +394,7 @@ impl StreamTableJoin {
             .index_of(&self.join_key_column)
             .map_err(|_| ExecError::ColumnNotFound(self.join_key_column.clone()))?;
 
-        // Build key → row-index map for the table side using format_key_value
-        // so that Int32, Int64, and Utf8 key columns are all supported.
-        let mut table_index: HashMap<String, Vec<u32>> = HashMap::new();
-        for row in 0..self.table.num_rows() {
-            let key = format_key_value(&self.table, table_key_idx, row)?;
-            table_index.entry(key).or_default().push(row as u32);
-        }
+        let table_index = self.table_index()?;
 
         // Collect matching (stream_row, table_row) index pairs.
         let mut stream_rows: Vec<u32> = Vec::new();

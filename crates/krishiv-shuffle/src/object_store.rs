@@ -125,19 +125,19 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         };
         let write_options = IpcWriteOptions::default()
             .try_with_compression(ipc_compression)
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
 
         let mut buf = Vec::new();
         let mut writer = StreamWriter::try_new_with_options(&mut buf, &partition.schema, write_options)
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
         for batch in &partition.batches {
             writer
                 .write(batch)
-                .map_err(|e| ShuffleError::Io(e.to_string()))?;
+                .map_err(|e| crate::error::io_err(e.to_string()))?;
         }
         writer
             .finish()
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
 
         self.store
             .put(
@@ -145,7 +145,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
                 bytes::Bytes::from(buf).into(),
             )
             .await
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
         Ok(())
     }
 
@@ -156,19 +156,19 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         let result = self.store.get(&path).await;
         match result {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(ShuffleError::Io(e.to_string())),
+            Err(e) => Err(crate::error::io_err(e.to_string())),
             Ok(obj) => {
                 let data = obj
                     .bytes()
                     .await
-                    .map_err(|e| ShuffleError::Io(e.to_string()))?;
+                    .map_err(|e| crate::error::io_err(e.to_string()))?;
                 let cursor = std::io::Cursor::new(data.as_ref());
                 let mut reader = StreamReader::try_new(cursor, None)
-                    .map_err(|e| ShuffleError::Io(e.to_string()))?;
+                    .map_err(|e| crate::error::io_err(e.to_string()))?;
                 let schema = reader.schema();
                 let mut batches = Vec::new();
                 for batch_result in &mut reader {
-                    let batch = batch_result.map_err(|e| ShuffleError::Io(e.to_string()))?;
+                    let batch = batch_result.map_err(|e| crate::error::io_err(e.to_string()))?;
                     batches.push(batch);
                 }
                 Ok(Some(ShufflePartition {
@@ -195,7 +195,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             .map_ok(|meta| meta.location)
             .try_collect()
             .await
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
 
         self.store
             .delete_stream(
@@ -203,7 +203,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             )
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
 
         Ok(())
     }

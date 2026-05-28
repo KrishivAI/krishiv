@@ -293,7 +293,7 @@ pub(crate) async fn read_shuffle_flight_partitions(
             };
 
         let batches =
-            FlightShuffleClient::fetch(&flight_endpoint, &job_id, &upstream_stage_id, partition_id)
+            FlightShuffleClient::fetch(&flight_endpoint, job_id.as_str(), upstream_stage_id.as_str(), partition_id)
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
                     message: format!(

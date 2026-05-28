@@ -27,7 +27,8 @@ pub trait StateBackend: Send + Sync {
 
     /// Replace current state with the contents of a snapshot produced by `snapshot()`.
     ///
-    /// The backend is cleared before loading; partial failures leave the backend empty.
+    /// On failure the backend aborts the write transaction, preserving its prior
+    /// data (not leaving the backend empty).
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()>;
 
     /// Store multiple `(namespace_op_id, namespace_state_name, key, value)` entries.

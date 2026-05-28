@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::error::Error;
 use std::net::SocketAddr;
 
 use krishiv_ui::{demo_state, empty_state, serve};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::parse(std::env::args().skip(1))?;
     if config.help {
         print!("{}", ServerConfig::help());
@@ -34,7 +33,7 @@ struct ServerConfig {
 }
 
 impl ServerConfig {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, Box<dyn std::error::Error>> {
         let mut addr = "127.0.0.1:8080"
             .parse::<SocketAddr>()
             .expect("default UI address is valid");
@@ -54,7 +53,7 @@ impl ServerConfig {
                 }
                 "--demo" => demo = true,
                 "--help" | "-h" => help = true,
-                unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
+                unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help()).into()),
             }
         }
 

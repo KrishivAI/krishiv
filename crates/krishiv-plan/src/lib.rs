@@ -23,6 +23,29 @@ pub use task_fragment::{
     TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
 };
 
+/// Errors returned by plan encoding, decoding, and validation operations.
+#[derive(Debug, Clone)]
+pub enum PlanError {
+    /// Failed to parse a plan fragment or expression.
+    Parse(String),
+    /// Failed to encode a plan fragment to wire format.
+    Encode(String),
+    /// Plan validation failed (e.g. missing required fields).
+    Validation(String),
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(msg) => write!(f, "plan parse error: {msg}"),
+            Self::Encode(msg) => write!(f, "plan encode error: {msg}"),
+            Self::Validation(msg) => write!(f, "plan validation error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
+
 /// Data type for a plan schema field.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldType {

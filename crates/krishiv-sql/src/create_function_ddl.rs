@@ -136,11 +136,9 @@ fn sql_type_to_arrow(type_str: &str) -> Result<DataType, String> {
         "TIMESTAMP" | "DATETIME" => {
             Ok(DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None))
         }
-        _ => {
-            // Unknown type — default to Utf8 so the registration succeeds.
-            // A production implementation should error on unknown types.
-            Ok(DataType::Utf8)
-        }
+        _ => Err(format!(
+            "unsupported SQL type '{type_str}' in CREATE FUNCTION DDL"
+        )),
     }
 }
 

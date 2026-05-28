@@ -73,11 +73,12 @@ pub fn encode_batch_sql(query: &str, tables: &[BatchSqlTable]) -> String {
 }
 
 /// Encode remote continuous job registration.
-pub fn encode_continuous_register(job_id: &str, spec: &LocalWindowExecutionSpec) -> String {
+pub fn encode_continuous_register(job_id: &str, spec: &LocalWindowExecutionSpec) -> RuntimeResult<String> {
     let plan_spec = spec.to_plan_spec();
-    let json = serde_json::to_string(&plan_spec).expect("window spec serializes");
+    let json = serde_json::to_string(&plan_spec)
+        .map_err(|e| RuntimeError::transport(format!("window spec serialization: {e}")))?;
     let encoded = BASE64.encode(json.as_bytes());
-    format!("/* {CONTINUOUS_REGISTER}:{job_id}:{encoded} */ SELECT 1 AS registered")
+    Ok(format!("/* {CONTINUOUS_REGISTER}:{job_id}:{encoded} */ SELECT 1 AS registered"))
 }
 
 /// Encode remote continuous input push.
@@ -100,7 +101,8 @@ pub fn encode_bounded_window(
     input_batches: &[RecordBatch],
 ) -> RuntimeResult<String> {
     let plan_spec = spec.to_plan_spec();
-    let spec_json = serde_json::to_string(&plan_spec).expect("window spec serializes");
+    let spec_json = serde_json::to_string(&plan_spec)
+        .map_err(|e| RuntimeError::transport(format!("window spec serialization: {e}")))?;
     let spec_b64 = BASE64.encode(spec_json.as_bytes());
     let ipc = encode_batches_ipc(input_batches)?;
     Ok(format!(

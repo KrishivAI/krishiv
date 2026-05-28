@@ -53,6 +53,7 @@ enum RelationKind {
 pub struct PyRelation {
     kind: RelationKind,
     /// Cached collected result (used for repeated calls like `show` after `collect`).
+    #[allow(dead_code)]
     cached: Mutex<Option<PyQueryResult>>,
 }
 

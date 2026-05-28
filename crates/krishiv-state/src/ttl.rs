@@ -109,6 +109,12 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         }
     }
 
+    /// Store `value` under `key` in `namespace` with a TTL expiry.
+    ///
+    /// **Note:** The expiry deadline is computed from wall-clock time
+    /// (`unix_now_ms()`), even when a watermark has been set via
+    /// [`set_watermark`](Self::set_watermark).  The watermark only affects
+    /// read-time expiry checks and `purge_expired`, not the initial write.
     fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
         let expires_at_ms = unix_now_ms() + self.config.ttl_ms as i64;
         self.inner
@@ -219,6 +225,11 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     /// every entry whose `expires_at_ms ≤ now`.  It is intended to be called
     /// periodically (e.g. at the start of each `ContinuousWindowExecutor::drain`
     /// cycle) rather than on every read so that the amortised GC cost is low.
+    ///
+    /// **Performance note:** Each expired key deletion opens a separate write
+    /// transaction in `RedbStateBackend`.  For backends with many expired keys,
+    /// consider calling this method in a background task or batching deletions
+    /// to avoid latency spikes.
     ///
     /// Returns the number of entries removed.
     fn purge_expired(&mut self) -> StateResult<usize> {

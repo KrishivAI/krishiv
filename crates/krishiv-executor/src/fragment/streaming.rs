@@ -306,7 +306,7 @@ pub(crate) async fn execute_streaming_fragment(
     }
 
     let parsed = parse_stream_fragment(fragment)
-        .map_err(|e| ExecutorError::InvalidAssignment { message: e })?;
+        .map_err(|e| ExecutorError::InvalidAssignment { message: e.to_string() })?;
     let mut plan_spec = parsed_to_plan_spec(parsed);
 
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;

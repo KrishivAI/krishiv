@@ -866,3 +866,28 @@ fn p0_16_ttl_snapshot_bytes_are_not_ttl_prefixed() {
     let (_, _, _, stored_value) = &entries[0];
     assert_eq!(stored_value, b"raw-value");
 }
+
+// ── purge_expired ────────────────────────────────────────────────────────
+
+#[test]
+fn ttl_purge_expired_removes_stale_entries() {
+    let mut inner = InMemoryStateBackend::new();
+    let n = ns("op1", "session");
+    // Manually encode an already-expired entry (expires_at = 1 ms since epoch).
+    let expires_at_ms: i64 = 1;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&expires_at_ms.to_le_bytes());
+    encoded.extend_from_slice(b"stale");
+    inner.put(&n, b"expired".to_vec(), encoded).unwrap();
+
+    // Put a live entry via the normal path (TTL = 60s).
+    let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+    ttl.put(&n, b"live".to_vec(), b"val".to_vec()).unwrap();
+
+    let evicted = ttl.purge_expired().unwrap();
+    assert!(evicted >= 1, "expected at least 1 eviction, got {evicted}");
+    // The expired key must be gone.
+    assert!(ttl.get(&n, b"expired").unwrap().is_none());
+    // The live key must survive.
+    assert_eq!(ttl.get(&n, b"live").unwrap(), Some(b"val".to_vec()));
+}

@@ -9,6 +9,7 @@ pub enum UnsupportedCombinator {
     ZeroOrMore,
     NotFollowedBy,
     Branching,
+    ExactCount,
 }
 
 /// Pattern compilation error.
@@ -78,8 +79,9 @@ impl Pattern {
     }
 
     pub fn times(self, _n: u32) -> Result<Self, CepCompileError> {
-        // Exact-count only in R16; quantifiers deferred.
-        Ok(self)
+        Err(CepCompileError::UnsupportedCombinator(
+            UnsupportedCombinator::ExactCount,
+        ))
     }
 
     pub fn compile(self) -> Result<CompiledPattern, CepCompileError> {
@@ -126,6 +128,22 @@ mod tests {
         assert!(matches!(
             err,
             CepCompileError::UnsupportedCombinator(UnsupportedCombinator::OneOrMore)
+        ));
+    }
+
+    #[test]
+    fn empty_pattern_rejected() {
+        let p = Pattern::default();
+        let err = p.compile().unwrap_err();
+        assert!(matches!(err, CepCompileError::EmptyPattern));
+    }
+
+    #[test]
+    fn times_returns_unsupported() {
+        let err = Pattern::begin("a").times(3).unwrap_err();
+        assert!(matches!(
+            err,
+            CepCompileError::UnsupportedCombinator(UnsupportedCombinator::ExactCount)
         ));
     }
 }

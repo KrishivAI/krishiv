@@ -29,6 +29,8 @@ pub enum CatalogError {
     SchemaNotFound { name: String },
     /// The provided schema is structurally invalid.
     InvalidSchema { message: String },
+    /// An HTTP request to a remote catalog service failed.
+    Http { status: u16, message: String },
 }
 
 impl fmt::Display for CatalogError {
@@ -45,6 +47,9 @@ impl fmt::Display for CatalogError {
             }
             CatalogError::InvalidSchema { message } => {
                 write!(f, "invalid schema: {message}")
+            }
+            CatalogError::Http { status, message } => {
+                write!(f, "HTTP error {status}: {message}")
             }
         }
     }

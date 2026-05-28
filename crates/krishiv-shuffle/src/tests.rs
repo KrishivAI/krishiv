@@ -478,8 +478,8 @@ mod shuffle_tests {
         let partitioner = HashPartitioner::new("key", 4);
         let err = partitioner.partition(&batch).unwrap_err();
         assert!(
-            matches!(err, ShuffleError::Io(_)),
-            "expected Io error for unsupported type"
+            matches!(err, ShuffleError::TypeMismatch { .. }),
+            "expected TypeMismatch error for unsupported type"
         );
     }
 

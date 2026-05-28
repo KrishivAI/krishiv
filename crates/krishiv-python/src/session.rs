@@ -315,6 +315,7 @@ impl PySession {
                 .collect();
             inner
                 .memory_stream(name, stream_batches)
+                .map_err(map_krishiv_error)?
                 .collect_bounded()
                 .map(|collected| {
                     collected

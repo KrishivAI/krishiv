@@ -1522,8 +1522,8 @@ mod executor_tests {
                     InputPartitionDescriptor::ShuffleFlight {
                         table_name: String::from("lineitem"),
                         flight_endpoint: flight_endpoint.clone(),
-                        job_id: job_id.as_str().to_owned(),
-                        upstream_stage_id: stage0_id.as_str().to_owned(),
+                        job_id: job_id.clone(),
+                        upstream_stage_id: stage0_id.clone(),
                         partition_id: p,
                     },
                 )

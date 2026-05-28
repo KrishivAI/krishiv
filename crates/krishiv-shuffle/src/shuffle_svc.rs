@@ -44,10 +44,10 @@ pub async fn run_shuffle_svc(
         .route("/healthz", get(|| async { "ok\n" }))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
-    println!(
-        "krishiv-shuffle-svc listening on {} (dir={})",
-        listener.local_addr()?,
-        base_dir.as_ref().display()
+    tracing::info!(
+        addr = %listener.local_addr()?,
+        dir = %base_dir.as_ref().display(),
+        "krishiv-shuffle-svc listening"
     );
     axum::serve(listener, app).await?;
     Ok(())
@@ -66,7 +66,10 @@ async fn read_partition(
         .store
         .read_partition(&id)
         .await
-        .map_err(|_| StatusCode::NOT_FOUND)?
+        .map_err(|e| {
+            tracing::error!(error = %e, "read_partition failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .ok_or(StatusCode::NOT_FOUND)?;
     let rows: usize = part.batches.iter().map(|b| b.num_rows()).sum();
     Ok(format!("partition {} rows={rows}\n", id.partition))

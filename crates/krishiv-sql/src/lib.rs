@@ -176,7 +176,7 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
         for stmt in &statements {
             let mut is_streaming = false;
-            visit_relations(stmt, |relation| {
+            let _ = visit_relations(stmt, |relation| {
                 // relation.to_string() yields the fully-qualified name (e.g. "schema.table").
                 // Extract the unqualified table name (last segment after dot).
                 let full = relation.to_string();
@@ -472,18 +472,22 @@ impl SqlEngine {
 }
 
 fn extract_simple_view_name(query: &str) -> Option<String> {
-    let lower = query.to_lowercase();
-    if let Some(pos) = lower.find(" from ") {
-        let after = query[pos + 6..].trim();
-        let end = after
-            .find(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';')
-            .unwrap_or(after.len());
-        let name = after[..end].trim().to_string();
-        if !name.is_empty() {
-            return Some(name);
+    use std::ops::ControlFlow;
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, query).ok()?;
+    let mut result = None;
+    for stmt in &statements {
+        let _ = visit_relations(stmt, |relation| {
+            if result.is_none() {
+                result = Some(relation.to_string());
+            }
+            ControlFlow::Break(())
+        });
+        if result.is_some() {
+            break;
         }
     }
-    None
+    result
 }
 
 /// Engine-agnostic interface over a prepared query result.

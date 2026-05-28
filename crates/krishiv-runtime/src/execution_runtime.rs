@@ -159,11 +159,11 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         match self.mode {
             RuntimeMode::Embedded => {
-                let mut backend = EmbeddedBackend::default();
+                let backend = EmbeddedBackend::default();
                 backend.execute(plan)
             }
             RuntimeMode::SingleNode => {
-                let mut sn = SingleNodeBackend;
+                let sn = SingleNodeBackend;
                 sn.execute(plan)
             }
             RuntimeMode::Distributed => Err(RuntimeError::unsupported(
@@ -271,7 +271,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         if self.local_fallback.is_some() {
             return self.local_accept_plan(plan);
         }
-        let mut backend = DistributedBackend::new(self.flight_url.clone());
+        let backend = DistributedBackend::new(self.flight_url.clone());
         backend.execute(plan)
     }
 

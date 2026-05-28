@@ -212,8 +212,7 @@ impl DataFrame {
     }
 
     fn update_job(&self, id: &JobId, name: &str, state: JobState) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.upsert(JobStatus::new(id.clone(), name, state));
-        }
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.upsert(JobStatus::new(id.clone(), name, state));
     }
 }

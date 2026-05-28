@@ -1,7 +1,7 @@
 use crate::{
     PartitionId, ShuffleError, ShufflePartition, ShuffleResult, ShuffleStore,
     compression::{ShuffleCompression, parquet_writer_properties},
-    error::shuffle_write_lock,
+    error::{io_err, shuffle_write_lock},
     store::LeaseMap,
 };
 use std::collections::BTreeMap;
@@ -24,7 +24,7 @@ impl LocalDiskShuffleStore {
     pub fn new(base_dir: impl AsRef<Path>) -> ShuffleResult<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_dir).map_err(|e| {
-            ShuffleError::Io(format!(
+            io_err(format!(
                 "failed to create shuffle base dir '{}': {e}",
                 base_dir.display()
             ))
@@ -139,7 +139,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
             if let Some(parent) = final_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    ShuffleError::Io(format!("failed to create partition dir: {e}"))
+                    io_err(format!("failed to create partition dir: {e}"))
                 })?;
             }
 
@@ -147,7 +147,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let tmp_path = final_path.with_extension(format!("tmp.{tmp_suffix}"));
             {
                 let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| {
-                    ShuffleError::Io(format!(
+                    io_err(format!(
                         "failed to create temp partition file '{}': {e}",
                         tmp_path.display()
                     ))
@@ -155,15 +155,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 let schema = partition.schema.clone();
                 let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(writer_props))
                     .map_err(|e| {
-                        ShuffleError::Io(format!("failed to create Parquet writer: {e}"))
+                        io_err(format!("failed to create Parquet writer: {e}"))
                     })?;
                 for batch in &partition.batches {
                     writer.write(batch).map_err(|e| {
-                        ShuffleError::Io(format!("failed to write Parquet batch: {e}"))
+                        io_err(format!("failed to write Parquet batch: {e}"))
                     })?;
                 }
                 writer.close().map_err(|e| {
-                    ShuffleError::Io(format!("failed to close Parquet writer: {e}"))
+                    io_err(format!("failed to close Parquet writer: {e}"))
                 })?;
             }
 
@@ -173,13 +173,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let commit = {
                 let tokens = lease_tokens
                     .read()
-                    .map_err(|_| ShuffleError::Io("lease token lock poisoned".to_owned()))?;
+                    .map_err(|_| io_err("lease token lock poisoned"))?;
                 tokens.get(&key).copied().map_or(false, |t| t == lease_token)
             };
 
             if commit {
                 std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-                    ShuffleError::Io(format!(
+                    io_err(format!(
                         "failed to rename temp partition '{}' → '{}': {e}",
                         tmp_path.display(),
                         final_path.display()
@@ -196,7 +196,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             Ok(())
         })
         .await
-        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
+        .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
@@ -209,25 +209,26 @@ impl ShuffleStore for LocalDiskShuffleStore {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
             use std::fs::File;
 
-            if !path.exists() {
-                return Ok(None);
-            }
-            let file = File::open(&path).map_err(|e| {
-                ShuffleError::Io(format!(
-                    "failed to open partition file '{}': {e}",
-                    path.display()
-                ))
-            })?;
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(io_err(format!(
+                        "failed to open partition file '{}': {e}",
+                        path.display()
+                    )));
+                }
+            };
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-                .map_err(|e| ShuffleError::Io(format!("failed to build Parquet reader: {e}")))?;
+                .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
             let schema = builder.schema().clone();
             let reader = builder.build().map_err(|e| {
-                ShuffleError::Io(format!("failed to build Parquet batch reader: {e}"))
+                io_err(format!("failed to build Parquet batch reader: {e}"))
             })?;
             let mut batches = Vec::new();
             for result in reader {
                 let batch = result
-                    .map_err(|e| ShuffleError::Io(format!("error reading Parquet batch: {e}")))?;
+                    .map_err(|e| io_err(format!("error reading Parquet batch: {e}")))?;
                 batches.push(batch);
             }
             Ok(Some(ShufflePartition {
@@ -237,7 +238,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             }))
         })
         .await
-        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))?
+        .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
@@ -250,7 +251,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 Ok(()) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(ShuffleError::Io(format!(
+                    return Err(io_err(format!(
                         "failed to delete job partitions: {e}"
                     )));
                 }
@@ -258,7 +259,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             Ok(())
         })
         .await
-        .map_err(|e| ShuffleError::Io(format!("spawn_blocking join error: {e}")))??;
+        .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))??;
 
         // Clean up in-memory lease tokens for this job (in-memory, safe outside spawn_blocking).
         let mut tokens = shuffle_write_lock(&self.lease_tokens)?;

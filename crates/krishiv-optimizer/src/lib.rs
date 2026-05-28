@@ -12,6 +12,7 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
 // ── Cost model ────────────────────────────────────────────────────────────────
 
 /// Estimated cost of executing a plan.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cost {
     /// Estimated CPU time in nanoseconds.
@@ -25,6 +26,7 @@ pub struct Cost {
 /// Runtime statistics collected by an executor stage.
 ///
 /// These are fed back into AQE rules so the optimizer can re-plan in-flight.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeStats {
     /// Number of input rows processed.
@@ -73,7 +75,10 @@ pub trait AqeRule: Send + Sync {
     fn name(&self) -> &str;
 
     /// Apply the AQE rule given collected [`RuntimeStats`] for each stage.
-    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> PhysicalPlan;
+    ///
+    /// Return `Some(new_plan)` when the rule rewrites the plan, or `None` when
+    /// the plan is unchanged.
+    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan>;
 }
 
 /// A rule that applies streaming-specific rewrites to a [`LogicalPlan`].
@@ -231,6 +236,7 @@ impl SkewRule for ThresholdSkewRule {
 // ── CoalesceRule ──────────────────────────────────────────────────────────────
 
 /// Advice returned by the coalesce rule: which partition indices should be merged.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoalesceAdvice {
     /// Groups of partition indices to merge. Each inner `Vec` is one merged partition.
@@ -334,15 +340,15 @@ impl AqeRule for CoalesceRule {
     /// When `advise()` produces fewer groups than the current partition count,
     /// stamps `coalesced_partition_count` on the plan and appends a
     /// [`NodeOp::CoalescePartitions`] node carrying the computed target count.
-    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> PhysicalPlan {
+    fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
         if stats.is_empty() {
-            return plan;
+            return None;
         }
         let advice = self.advise(stats);
         let original_count = stats.len();
 
         if advice.groups.len() >= original_count || original_count == 0 {
-            return plan;
+            return None;
         }
 
         let target_partitions = self.target_partitions_from_stats(stats);
@@ -365,14 +371,17 @@ impl AqeRule for CoalesceRule {
         )
         .with_op(NodeOp::CoalescePartitions { target_partitions });
 
-        plan.with_node(coalesce_node)
-            .with_coalesced_partition_count(advice.groups.len())
+        Some(
+            plan.with_node(coalesce_node)
+                .with_coalesced_partition_count(advice.groups.len()),
+        )
     }
 }
 
 // ── SmallFilePlanner ──────────────────────────────────────────────────────────
 
 /// Per-file metadata used by [`SmallFilePlanner`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStats {
     pub path: String,
@@ -381,6 +390,7 @@ pub struct FileStats {
 
 /// Advice produced by [`SmallFilePlanner`]: a list of scan groups where each
 /// group of file paths should be handled by a single executor task.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitPlanAdvice {
     /// Each inner `Vec` is one task's worth of files.
@@ -521,19 +531,17 @@ impl AqeOptimizer {
         let mut applied = Vec::new();
 
         for rule in &self.always_rules {
-            let before = current.clone();
-            current = rule.apply(current, stats);
-            if current != before {
+            if let Some(new_plan) = rule.apply(current.clone(), stats) {
                 applied.push(rule.name().to_string());
+                current = new_plan;
             }
         }
 
         if !is_streaming {
             for rule in &self.guarded_rules {
-                let before = current.clone();
-                current = rule.apply(current, stats);
-                if current != before {
+                if let Some(new_plan) = rule.apply(current.clone(), stats) {
                     applied.push(rule.name().to_string());
+                    current = new_plan;
                 }
             }
         }
@@ -775,11 +783,11 @@ fn column_belongs_to_scan(col: &str, scan_columns: &[&str]) -> bool {
 }
 
 /// Drop no-op `Project` nodes that select zero columns.
-pub struct ConstantFoldingRule;
+pub struct EmptyProjectionRemovalRule;
 
-impl OptimizerRule for ConstantFoldingRule {
+impl OptimizerRule for EmptyProjectionRemovalRule {
     fn name(&self) -> &str {
-        "constant-folding"
+        "empty-projection-removal"
     }
 
     fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
@@ -807,7 +815,7 @@ pub fn default_logical_optimizer() -> Optimizer {
     let mut optimizer = Optimizer::new();
     optimizer.add_rule(Box::new(ProjectionPruningRule));
     optimizer.add_rule(Box::new(PredicatePushdownRule));
-    optimizer.add_rule(Box::new(ConstantFoldingRule));
+    optimizer.add_rule(Box::new(EmptyProjectionRemovalRule));
     optimizer
 }
 
@@ -1092,7 +1100,7 @@ mod tests {
             .collect();
         let plan = PhysicalPlan::new("test-plan", ExecutionKind::Batch);
         let rule = CoalesceRule::new(128 * 1024 * 1024); // 128 MiB
-        let result = rule.apply(plan, &stats);
+        let result = rule.apply(plan, &stats).expect("coalesce should fire");
         let coalesced = result
             .coalesced_partition_count()
             .expect("CoalesceRule must set coalesced_partition_count");
@@ -1115,10 +1123,9 @@ mod tests {
         let plan = PhysicalPlan::new("big-plan", ExecutionKind::Batch);
         let rule = CoalesceRule::new(128 * 1024 * 1024);
         let result = rule.apply(plan, &stats);
-        assert_eq!(
-            result.coalesced_partition_count(),
-            None,
-            "no coalescing should leave count unset"
+        assert!(
+            result.is_none(),
+            "no coalescing should return None"
         );
     }
 
@@ -1282,7 +1289,7 @@ mod tests {
             .with_target_partition_bytes(134_217_728); // target = 128 MiB
 
         let plan = PhysicalPlan::new("big-job", ExecutionKind::Batch);
-        let rewritten = AqeRule::apply(&rule, plan, &stats);
+        let rewritten = AqeRule::apply(&rule, plan, &stats).expect("coalesce should fire");
 
         // The plan must have had a CoalescePartitions node appended.
         let coalesce_node = rewritten
@@ -1329,10 +1336,10 @@ mod tests {
         let plan_clone = plan.clone();
         let rewritten = AqeRule::apply(&rule, plan, &stats);
 
-        // No coalescing: plan must be returned unchanged.
-        assert_eq!(
-            rewritten, plan_clone,
-            "plan must be unchanged when no partitions are small"
+        // No coalescing: plan must be returned unchanged (None).
+        assert!(
+            rewritten.is_none(),
+            "plan must be None when no partitions are small"
         );
     }
 

@@ -123,9 +123,10 @@ impl RedbStateBackend {
     }
 }
 
-fn db_err(e: impl std::fmt::Display) -> StateError {
+fn db_err(e: impl std::fmt::Display + std::fmt::Debug + Send + Sync + std::error::Error + 'static) -> StateError {
     StateError::BackendUnavailable {
         message: e.to_string(),
+        source: Some(Box::new(e)),
     }
 }
 
@@ -252,6 +253,11 @@ impl StateBackend for RedbStateBackend {
                 out.extend_from_slice(&raw_key);
                 out.extend_from_slice(&(val.len() as u64).to_le_bytes());
                 out.extend_from_slice(val);
+            } else {
+                tracing::warn!(
+                    key_len = k.value().len(),
+                    "snapshot: skipping entry with undecodable redb key"
+                );
             }
         }
         Ok(out)

@@ -127,8 +127,6 @@ impl Accumulator for KrishivAggregateAccumulator {
         if states.is_empty() {
             return Ok(());
         }
-        // Access buffers via the generic Array trait to avoid version-sensitive
-        // type downcasting (arrow 57 vs 58 in the dep tree).
         let data = arrow::array::Array::to_data(states[0].as_ref());
         let buffers = data.buffers();
         if buffers.len() < 2 {
@@ -139,16 +137,22 @@ impl Accumulator for KrishivAggregateAccumulator {
         let offset_slice = buffers[0].as_slice();
         let data_slice = buffers[1].as_slice();
         let len = states[0].len();
-        let offset_bytes = 4; // i32 offset size
+        // Determine offset width from the data type (i32 = 4, i64 = 8).
+        let offset_bytes = match states[0].data_type() {
+            arrow::datatypes::DataType::Binary
+            | arrow::datatypes::DataType::Utf8
+            | arrow::datatypes::DataType::LargeUtf8
+            | arrow::datatypes::DataType::LargeBinary => 8,
+            _ => 4, // i32 offsets (default BinaryArray)
+        };
         for i in 0..len {
-            let read_i32 = |off: usize| -> datafusion::error::Result<usize> {
-                let arr: [u8; 4] = offset_slice[off..off + 4].try_into().map_err(|_| {
-                    DataFusionError::Execution("merge_batch: invalid offset buffer".into())
-                })?;
-                Ok(i32::from_ne_bytes(arr) as usize)
-            };
-            let start = read_i32(i * offset_bytes)?;
-            let end = read_i32((i + 1) * offset_bytes)?;
+            let start = read_offset(offset_slice, i * offset_bytes, offset_bytes)?;
+            let end = read_offset(offset_slice, (i + 1) * offset_bytes, offset_bytes)?;
+            if end > data_slice.len() || start > end {
+                return Err(DataFusionError::Execution(
+                    "merge_batch: offset out of bounds".into(),
+                ));
+            }
             let other = krishiv_udf::AggState {
                 data: data_slice[start..end].to_vec(),
             };
@@ -177,6 +181,31 @@ impl Accumulator for KrishivAggregateAccumulator {
     fn state(&mut self) -> datafusion::error::Result<Vec<datafusion::scalar::ScalarValue>> {
         use datafusion::scalar::ScalarValue as DfScalar;
         Ok(vec![DfScalar::Binary(Some(self.state.data.clone()))])
+    }
+}
+
+fn read_offset(buf: &[u8], pos: usize, width: usize) -> datafusion::error::Result<usize> {
+    if pos + width > buf.len() {
+        return Err(DataFusionError::Execution(
+            "merge_batch: offset buffer underrun".into(),
+        ));
+    }
+    match width {
+        4 => {
+            let arr: [u8; 4] = buf[pos..pos + 4].try_into().map_err(|_| {
+                DataFusionError::Execution("merge_batch: invalid i32 offset".into())
+            })?;
+            Ok(i32::from_ne_bytes(arr) as usize)
+        }
+        8 => {
+            let arr: [u8; 8] = buf[pos..pos + 8].try_into().map_err(|_| {
+                DataFusionError::Execution("merge_batch: invalid i64 offset".into())
+            })?;
+            Ok(i64::from_ne_bytes(arr) as usize)
+        }
+        _ => Err(DataFusionError::Execution(format!(
+            "merge_batch: unsupported offset width {width}"
+        ))),
     }
 }
 

@@ -222,14 +222,8 @@ fn spawn_coordinator_leader_election(
                         }
                     }
                 }
-            } else {
-                coordinator.write().await.demote_to_standby();
-                if let Some(handles) = orchestration_abort.take() {
-                    for h in handles {
-                        h.abort();
-                    }
-                }
             }
+            // When !acquired && !was_leader we were already standby — no action needed.
         }
     });
 }

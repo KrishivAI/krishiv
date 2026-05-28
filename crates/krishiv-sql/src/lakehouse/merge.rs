@@ -121,7 +121,7 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
                 message: e.to_string(),
             })?
     } else if target.starts_with("iceberg:") {
-        let r = merge_iceberg_memory(ctx, &target, source_batches, merge_key).await?;
+        let r = dry_run_merge(ctx, &target, source_batches, merge_key).await?;
         krishiv_lakehouse::MergeDeltaResult {
             rows_inserted: r.rows_inserted,
             rows_updated: r.rows_updated,
@@ -136,7 +136,16 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
     Ok(vec![merge_result_batch(metrics)])
 }
 
-async fn merge_iceberg_memory(
+/// **Dry-run** merge for Iceberg in-memory tables.
+///
+/// This function simulates a MERGE INTO by computing how many rows would be
+/// inserted vs updated, but does **not** write the merged result back to the
+/// target table. It returns [`MergeResult`] metrics only.
+///
+/// A real MERGE INTO would need to join source + target on the key column,
+/// apply WHEN MATCHED / WHEN NOT MATCHED logic, and write the merged output
+/// back to the table. This is deferred to R2 when Iceberg write support lands.
+async fn dry_run_merge(
     ctx: &SessionContext,
     target: &str,
     source_batches: Vec<RecordBatch>,
@@ -337,7 +346,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = merge_iceberg_memory(&ctx, "iceberg:target_t", vec![source], "id")
+        let result = dry_run_merge(&ctx, "iceberg:target_t", vec![source], "id")
             .await
             .unwrap();
 

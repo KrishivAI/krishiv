@@ -87,8 +87,6 @@ pub enum ExecError {
     ColumnNotFound(String),
     /// A data type is not supported for this operation.
     UnsupportedType(String),
-    /// A `RecordBatch` did not match the expected schema for a physical operator.
-    UnexpectedBatchSchema,
     /// A window operator was constructed with an invalid configuration.
     InvalidWindowConfig(String),
     /// Incoming batch schema cannot be evolved to the target schema.
@@ -101,7 +99,6 @@ impl fmt::Display for ExecError {
             Self::Arrow(msg) => write!(f, "arrow error: {msg}"),
             Self::ColumnNotFound(col) => write!(f, "column not found: {col}"),
             Self::UnsupportedType(msg) => write!(f, "unsupported type: {msg}"),
-            Self::UnexpectedBatchSchema => write!(f, "unexpected record batch schema"),
             Self::InvalidWindowConfig(msg) => write!(f, "invalid window config: {msg}"),
             Self::IncompatibleSchemaEvolution(msg) => {
                 write!(f, "incompatible schema evolution: {msg}")
@@ -143,6 +140,7 @@ pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
 pub mod temporal_join;
+pub mod watermark_util;
 #[cfg(test)]
 pub mod watermark_e2e;
 pub mod window;
@@ -536,6 +534,34 @@ mod tests {
     }
 
     #[test]
+    fn local_agg_empty_group_min_max_avg_semantics() {
+        // Verify that AggState finalized values for empty groups use sentinel semantics.
+        use crate::aggregate::AggState;
+        let exprs = vec![
+            AggExpr {
+                function: AggFunction::Min,
+                input_column: "v".into(),
+                output_column: "min_v".into(),
+            },
+            AggExpr {
+                function: AggFunction::Max,
+                input_column: "v".into(),
+                output_column: "max_v".into(),
+            },
+            AggExpr {
+                function: AggFunction::Avg,
+                input_column: "v".into(),
+                output_column: "avg_v".into(),
+            },
+        ];
+        let state = AggState::new(&exprs);
+        // No updates → empty group.
+        assert_eq!(state.finalized_value(0, &exprs[0]), i64::MAX, "Min on empty group should be i64::MAX");
+        assert_eq!(state.finalized_value(1, &exprs[1]), i64::MIN, "Max on empty group should be i64::MIN");
+        assert!(state.finalized_avg(2).is_nan(), "Avg on empty group should be NaN");
+    }
+
+    #[test]
     fn local_agg_one_row_per_unique_key() {
         let batch = make_agg_batch(vec!["a", "b", "c", "a", "b"], vec![1, 2, 3, 4, 5]);
         let agg = LocalAggregator::new(
@@ -721,6 +747,36 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(sum, 60);
+    }
+
+    #[test]
+    fn window_avg_aggregation() {
+        let spec = TumblingWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Avg,
+                input_column: "val".into(),
+                output_column: "avg_val".into(),
+            }],
+        };
+        let mut op = TumblingWindowOperator::new(spec);
+        let batch = make_stream_batch(vec!["x", "x", "x"], vec![0, 100, 200], vec![10, 20, 30]);
+        let output = op.process_batch(&batch, 1000).unwrap();
+        assert_eq!(output.len(), 1);
+        let avg = output[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap()
+            .value(0);
+        assert!((avg - 20.0).abs() < 1e-9, "avg of 10,20,30 should be 20, got {avg}");
+        assert_eq!(
+            output[0].schema().field(3).data_type(),
+            &DataType::Float64,
+            "Avg output column must be Float64"
+        );
     }
 
     #[test]
@@ -917,6 +973,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sliding_window_avg_aggregation() {
+        let spec = SlidingWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            slide_ms: 500,
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Avg,
+                input_column: "val".into(),
+                output_column: "avg_val".into(),
+            }],
+        };
+        let mut op = SlidingWindowOperator::new(spec).unwrap();
+        let batch = make_stream_batch_i64(vec!["a", "a"], vec![100, 200], vec![10, 30]);
+        let out = op.process_batch(&batch, 2000).unwrap();
+        assert!(!out.is_empty(), "windows should close");
+        for b in &out {
+            assert_eq!(
+                b.schema().field(3).data_type(),
+                &DataType::Float64,
+                "Avg output column must be Float64"
+            );
+        }
+    }
+
     // ── SessionWindowOperator tests ───────────────────────────────────────────
 
     fn session_spec() -> SessionWindowSpec {
@@ -969,6 +1051,33 @@ mod tests {
         assert_eq!(out.len(), 2, "each key's session must close independently");
     }
 
+    #[test]
+    fn session_window_avg_aggregation() {
+        let spec = SessionWindowSpec {
+            key_column: "key".into(),
+            event_time_column: "ts".into(),
+            session_gap_ms: 500,
+            agg_exprs: vec![AggExpr {
+                function: AggFunction::Avg,
+                input_column: "val".into(),
+                output_column: "avg_val".into(),
+            }],
+        };
+        let mut op = SessionWindowOperator::new(spec);
+        let b1 = make_stream_batch_i64(vec!["a", "a"], vec![100, 200], vec![10, 30]);
+        let out = op.process_batch(&b1, 1000).unwrap();
+        assert!(!out.is_empty(), "session should close");
+        for b in &out {
+            assert_eq!(
+                b.schema().field(3).data_type(),
+                &DataType::Float64,
+                "Avg output column must be Float64"
+            );
+            let avg = b.column(3).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap().value(0);
+            assert!((avg - 20.0).abs() < 1e-9, "avg of 10,30 should be 20, got {avg}");
+        }
+    }
+
     // ── StreamTableJoin tests ─────────────────────────────────────────────────
 
     fn make_table() -> RecordBatch {
@@ -988,7 +1097,7 @@ mod tests {
 
     #[test]
     fn stream_table_join_inner_join() {
-        let join = StreamTableJoin::new(make_table(), "key");
+        let mut join = StreamTableJoin::new(make_table(), "key");
         let stream = make_stream_batch_i64(vec!["a", "b", "z"], vec![1, 2, 3], vec![10, 20, 30]);
         let result = join.process_batch(&stream).unwrap();
         // "z" has no match — only 2 output rows
@@ -1006,7 +1115,7 @@ mod tests {
 
     #[test]
     fn stream_table_join_no_matches_returns_empty() {
-        let join = StreamTableJoin::new(make_table(), "key");
+        let mut join = StreamTableJoin::new(make_table(), "key");
         let stream = make_stream_batch_i64(vec!["x", "y"], vec![1, 2], vec![10, 20]);
         let result = join.process_batch(&stream).unwrap();
         assert_eq!(result.num_rows(), 0);
@@ -1114,7 +1223,7 @@ mod tests {
         );
     }
 
-    // ── P0.10: UnexpectedBatchSchema test ─────────────────────────────────────
+    // ── P0.10: Wrong schema returns error test ────────────────────────────────
 
     /// Feed a batch whose event-time column is Float64 (not Int64) to
     /// `TumblingWindowOperator::process_batch` and verify an error is returned

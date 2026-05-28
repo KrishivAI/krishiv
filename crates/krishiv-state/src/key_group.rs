@@ -53,14 +53,11 @@ pub fn key_group_ranges_for_parallelism(parallelism: u32) -> Vec<KeyGroupRange> 
 }
 
 /// Map a key group to task index for `parallelism` slots.
+///
+/// Uses O(1) arithmetic: `task_idx = key_group * parallelism / NUM_KEY_GROUPS`.
 pub fn task_index_for_key_group(key_group: u16, parallelism: u32) -> u32 {
-    let ranges = key_group_ranges_for_parallelism(parallelism);
-    for (idx, range) in ranges.iter().enumerate() {
-        if range.contains(key_group) {
-            return idx as u32;
-        }
-    }
-    parallelism.saturating_sub(1)
+    let p = parallelism.max(1);
+    (key_group as u32) * p / u32::from(NUM_KEY_GROUPS)
 }
 
 #[cfg(test)]

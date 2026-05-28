@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use apache_avro::Reader;
 use apache_avro::types::Value;
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -225,8 +225,10 @@ fn avro_schema_to_data_type(schema: &apache_avro::Schema) -> DataType {
         Schema::Boolean => DataType::Boolean,
         Schema::Int => DataType::Int32,
         Schema::Long => DataType::Int64,
-        Schema::Float | Schema::Double => DataType::Float64,
-        Schema::Bytes | Schema::String => DataType::Utf8,
+        Schema::Float => DataType::Float32,
+        Schema::Double => DataType::Float64,
+        Schema::Bytes => DataType::Binary,
+        Schema::String => DataType::Utf8,
         Schema::Date => DataType::Date32,
         Schema::TimeMillis => DataType::Time32(arrow::datatypes::TimeUnit::Millisecond),
         Schema::TimeMicros => DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
@@ -342,12 +344,32 @@ fn avro_values_to_column(values: &[&Value], data_type: &DataType) -> ArrayRef {
                 .collect();
             Arc::new(arr)
         }
+        DataType::Float32 => {
+            let arr: Float32Array = values
+                .iter()
+                .map(|v| match unwrap_value(v) {
+                    Value::Float(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
         DataType::Float64 => {
             let arr: Float64Array = values
                 .iter()
                 .map(|v| match unwrap_value(v) {
                     Value::Float(f) => Some(*f as f64),
                     Value::Double(d) => Some(*d),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::Binary => {
+            let arr: BinaryArray = values
+                .iter()
+                .map(|v| match unwrap_value(v) {
+                    Value::Bytes(b) => Some(b.as_slice()),
                     _ => None,
                 })
                 .collect();
@@ -381,5 +403,46 @@ mod tests {
         let (_schema, batches) = d.decode(br#"{"k":1}"#).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn avro_schema_float_and_bytes_mapping() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {"name": "temperature", "type": "float"},
+                {"name": "payload", "type": "bytes"}
+            ]
+        }"#;
+        let avro_schema = apache_avro::Schema::parse_str(schema_json).unwrap();
+        let arrow_schema = avro_schema_to_arrow_schema(&avro_schema);
+        assert_eq!(
+            arrow_schema.field(0).data_type(),
+            &DataType::Float32,
+            "Avro Float must map to Arrow Float32"
+        );
+        assert_eq!(
+            arrow_schema.field(1).data_type(),
+            &DataType::Binary,
+            "Avro Bytes must map to Arrow Binary"
+        );
+    }
+
+    #[test]
+    fn avro_values_float32_and_binary_roundtrip() {
+        let values_float: Vec<Value> = vec![Value::Float(1.5), Value::Float(2.5)];
+        let refs_float: Vec<&Value> = values_float.iter().collect();
+        let arr = avro_values_to_column(&refs_float, &DataType::Float32);
+        let fa = arr.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(fa.value(0), 1.5);
+        assert_eq!(fa.value(1), 2.5);
+
+        let values_bytes: Vec<Value> = vec![Value::Bytes(vec![1, 2, 3]), Value::Bytes(vec![4, 5])];
+        let refs_bytes: Vec<&Value> = values_bytes.iter().collect();
+        let arr = avro_values_to_column(&refs_bytes, &DataType::Binary);
+        let ba = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(ba.value(0), &[1, 2, 3]);
+        assert_eq!(ba.value(1), &[4, 5]);
     }
 }

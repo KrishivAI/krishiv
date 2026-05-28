@@ -167,11 +167,16 @@ impl SlidingWindowOperator {
         let q = event_time_ms / slide;
         let r = event_time_ms % slide;
         let first = if r < 0 { (q - 1) * slide } else { q * slide };
-        let mut starts = Vec::new();
+        // Number of overlapping windows = ceil(size / slide).
+        let count = ((size + slide - 1) / slide) as usize;
+        let mut starts = Vec::with_capacity(count);
         let mut s = first;
-        // Walk back until the event is no longer inside the window.
-        while event_time_ms < s + size {
+        while s + size > event_time_ms {
             starts.push(s);
+            // Safety: break if decrement would go past any valid window.
+            if s.checked_sub(slide).is_none() {
+                break;
+            }
             s -= slide;
         }
         starts

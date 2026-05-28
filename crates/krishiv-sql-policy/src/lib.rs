@@ -42,7 +42,14 @@ impl PolicyEnforcingSqlEngine {
     }
 
     /// Borrow the underlying [`SqlEngine`].
-    pub fn inner(&self) -> &SqlEngine {
+    ///
+    /// # Security Warning
+    ///
+    /// This bypasses all policy enforcement (table access, column masking,
+    /// row-level security). Prefer `execute_as` or `prepare_authorized_query`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> &SqlEngine {
         &self.inner
     }
 
@@ -162,7 +169,29 @@ impl PolicyEnforcingSqlEngine {
 }
 
 fn is_select_query(query: &str) -> bool {
-    query.trim().to_uppercase().starts_with("SELECT")
+    let trimmed = query.trim().to_uppercase();
+    if trimmed.starts_with("SELECT") {
+        return true;
+    }
+    // CTE: WITH ... SELECT is a SELECT; WITH ... DELETE/INSERT/UPDATE is not.
+    if trimmed.starts_with("WITH ") {
+        // Check if the last statement keyword is SELECT (not DELETE/INSERT/UPDATE).
+        // A simple heuristic: look for the last occurrence of these keywords.
+        let data_keywords = ["DELETE", "INSERT", "UPDATE"];
+        // Find the last keyword occurrence to determine the outer statement type.
+        let last_select = trimmed.rfind("SELECT");
+        let last_data = data_keywords
+            .iter()
+            .filter_map(|kw| trimmed.rfind(kw))
+            .max();
+        match (last_select, last_data) {
+            (Some(s), Some(d)) => s > d,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    } else {
+        false
+    }
 }
 
 fn apply_row_predicates(
@@ -178,16 +207,17 @@ fn apply_row_predicates(
     if preds.is_empty() || !is_select_query(query) {
         return query.to_string();
     }
-    if preds.len() == 1 {
+    let predicate = preds.join(" AND ");
+
+    // Handle CTEs: wrap the whole WITH query as a subquery.
+    let trimmed = query.trim_start();
+    if trimmed.to_uppercase().starts_with("WITH ") {
         return format!(
-            "SELECT * FROM ({query}) AS __krishiv_rls WHERE {}",
-            preds[0]
+            "SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}"
         );
     }
-    format!(
-        "SELECT * FROM ({query}) AS __krishiv_rls WHERE {}",
-        preds.join(" AND ")
-    )
+
+    format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
 }
 
 /// Apply column-masking rules from `policy` to a single [`RecordBatch`].
@@ -273,9 +303,21 @@ fn masking_rule_for_field(
         return policy.column_masking_rule(principal, "", column_name);
     }
 
-    table_names
-        .iter()
-        .find_map(|table| policy.column_masking_rule(principal, table, column_name))
+    // Strip any table qualifier from the column name (e.g. "t.col" → "col").
+    let bare_col = column_name
+        .rsplit_once('.')
+        .map(|(_, c)| c)
+        .unwrap_or(column_name);
+
+    table_names.iter().find_map(|table| {
+        // First try the bare column name.
+        if let rule @ Some(_) = policy.column_masking_rule(principal, table, bare_col) {
+            return rule;
+        }
+        // Then try the fully-qualified "table.column" form for join results.
+        let qualified = format!("{table}.{bare_col}");
+        policy.column_masking_rule(principal, table, &qualified)
+    })
 }
 
 #[cfg(test)]
@@ -473,6 +515,7 @@ mod policy_tests {
     fn is_select_query_rejects_non_select() {
         assert!(is_select_query("SELECT * FROM t"));
         assert!(is_select_query("  SELECT a, b FROM t"));
+        assert!(is_select_query("WITH cte AS (SELECT 1) SELECT * FROM cte"));
         assert!(!is_select_query("WITH cte AS (SELECT 1) DELETE FROM t"));
         assert!(!is_select_query("INSERT INTO t VALUES (1)"));
         assert!(!is_select_query("UPDATE t SET a=1"));

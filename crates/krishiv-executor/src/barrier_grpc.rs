@@ -16,6 +16,8 @@ use crate::barrier_transport::SharedBarrierInjector;
 pub struct ExecutorBarrierService {
     pub injector: SharedBarrierInjector,
     pub task_id: String,
+    pub key_group_range_start: u32,
+    pub key_group_range_end: u32,
 }
 
 impl ExecutorBarrierService {
@@ -23,7 +25,17 @@ impl ExecutorBarrierService {
         Self {
             injector,
             task_id: task_id.into(),
+            key_group_range_start: 0,
+            key_group_range_end: 32_767,
         }
+    }
+
+    /// Create with an explicit key group range (distributed mode).
+    #[must_use]
+    pub fn with_key_group_range(mut self, start: u32, end: u32) -> Self {
+        self.key_group_range_start = start;
+        self.key_group_range_end = end;
+        self
     }
 }
 
@@ -45,6 +57,8 @@ impl BarrierService for ExecutorBarrierService {
         let (tx, rx) = mpsc::channel(16);
         let injector = self.injector.clone();
         let task_id = self.task_id.clone();
+        let key_group_range_start = self.key_group_range_start;
+        let key_group_range_end = self.key_group_range_end;
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 injector.enqueue(barrier.clone());
@@ -60,8 +74,8 @@ impl BarrierService for ExecutorBarrierService {
                             "checkpoint://{}/{}",
                             barrier.job_id, barrier.checkpoint_id
                         ),
-                        key_group_range_start: 0,
-                        key_group_range_end: 32_767,
+                        key_group_range_start,
+                        key_group_range_end,
                         schema_version: 1,
                     }),
                 };

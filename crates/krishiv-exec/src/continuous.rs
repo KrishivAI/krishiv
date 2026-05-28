@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
 use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
-use crate::operator_runtime::{max_event_time_ms, window_agg_to_expr};
+use crate::operator_runtime::window_agg_to_expr;
+use crate::watermark_util::advance_effective_watermark;
 use crate::window::MultiSourceWatermarkState;
 use crate::{
     AggExpr, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
@@ -46,68 +46,15 @@ impl WatermarkTracker {
     }
 
     fn advance(&mut self, batch: &RecordBatch) -> ExecResult<i64> {
-        if self.source_lags.is_empty() {
-            let max_ts = max_event_time_ms(batch, &self.event_time_column)?;
-            if max_ts > i64::MIN {
-                self.single.advance(max_ts);
-            }
-            return Ok(self.single.current_watermark_ms());
-        }
-        let source_col = self.source_id_column.as_deref().ok_or_else(|| {
-            ExecError::InvalidWindowConfig(
-                "multi-source watermark requires source_id_column".into(),
-            )
-        })?;
-        for (source_id, lag_ms) in &self.source_lags {
-            let max_ts = max_event_time_ms_for_source(
-                batch,
-                &self.event_time_column,
-                source_col,
-                source_id,
-            )?;
-            if max_ts > i64::MIN {
-                let wm = max_ts.saturating_sub(*lag_ms as i64);
-                self.multi.update(source_id, wm);
-            }
-        }
-        Ok(self.multi.effective_watermark_ms())
+        advance_effective_watermark(
+            batch,
+            &self.event_time_column,
+            self.source_id_column.as_deref(),
+            &self.source_lags,
+            &mut self.single,
+            &mut self.multi,
+        )
     }
-}
-
-fn max_event_time_ms_for_source(
-    batch: &RecordBatch,
-    time_col: &str,
-    source_col: &str,
-    source_id: &str,
-) -> ExecResult<i64> {
-    let time_idx = batch
-        .schema()
-        .index_of(time_col)
-        .map_err(|_| ExecError::ColumnNotFound(time_col.to_string()))?;
-    let source_idx = batch
-        .schema()
-        .index_of(source_col)
-        .map_err(|_| ExecError::ColumnNotFound(source_col.to_string()))?;
-    let times = batch
-        .column(time_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| ExecError::UnsupportedType(format!("{time_col} must be Int64")))?;
-    let sources = batch
-        .column(source_idx)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ExecError::UnsupportedType(format!("{source_col} must be Utf8")))?;
-    let mut max = i64::MIN;
-    for row in 0..batch.num_rows() {
-        if sources.value(row) == source_id {
-            let v = times.value(row);
-            if v > max {
-                max = v;
-            }
-        }
-    }
-    Ok(max)
 }
 
 fn build_operator(

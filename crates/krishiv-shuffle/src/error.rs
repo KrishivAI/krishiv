@@ -1,8 +1,8 @@
 /// Errors that can occur in shuffle operations.
 #[derive(Debug)]
 pub enum ShuffleError {
-    /// I/O failure, wrapping the original error message.
-    Io(String),
+    /// I/O failure, wrapping the original error.
+    Io(std::io::Error),
     /// The requested partition path does not exist on disk.
     PartitionNotFound {
         /// String representation of the path.
@@ -44,7 +44,7 @@ pub enum ShuffleError {
 impl std::fmt::Display for ShuffleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(msg) => write!(f, "shuffle I/O error: {msg}"),
+            Self::Io(e) => write!(f, "shuffle I/O error: {e}"),
             Self::PartitionNotFound { path } => {
                 write!(f, "shuffle partition not found: {path}")
             }
@@ -86,14 +86,30 @@ pub fn shuffle_read_lock<T>(
     lock.read().map_err(|_| ShuffleError::LockPoisoned)
 }
 
+/// Create a [`ShuffleError::Io`] from a string message by wrapping it in a
+/// custom `std::io::Error`.
+pub fn io_err(msg: impl Into<String>) -> ShuffleError {
+    ShuffleError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        msg.into(),
+    ))
+}
+
 /// Maximum shuffle ticket line length (P3-3).
 pub const MAX_SHUFFLE_TICKET_LEN: usize = 65_536;
 
-impl std::error::Error for ShuffleError {}
+impl std::error::Error for ShuffleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for ShuffleError {
     fn from(error: std::io::Error) -> Self {
-        Self::Io(error.to_string())
+        Self::Io(error)
     }
 }
 

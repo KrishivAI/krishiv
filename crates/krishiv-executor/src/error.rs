@@ -47,3 +47,9 @@ impl fmt::Display for ExecutorError {
 }
 
 impl Error for ExecutorError {}
+
+impl From<String> for ExecutorError {
+    fn from(message: String) -> Self {
+        Self::LocalExecution { message }
+    }
+}

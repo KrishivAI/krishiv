@@ -6,7 +6,16 @@
 //! from here rather than reinventing these patterns.
 
 use std::future::Future;
+use std::sync::LazyLock;
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+
+/// Lazily-initialized fallback Tokio runtime for `block_on` callers that have
+/// no active runtime (e.g. bare `#[test]` functions or `main()` without
+/// `#[tokio::main]`).  The runtime is created once on first use; if creation
+/// fails the process panics (equivalent to OOM-level failure).
+static FALLBACK_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Runtime::new().expect("failed to create fallback Tokio runtime")
+});
 
 /// Block on `fut`, safely bridging a synchronous caller into an async context.
 ///
@@ -15,14 +24,11 @@ use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 /// thread parks without spawning a second runtime — which would panic.
 ///
 /// When called with no active runtime (e.g. from `main()` or a `#[test]`),
-/// this creates a short-lived multi-thread runtime for the duration of the
-/// call.
+/// this uses a lazily-initialized shared fallback runtime.
 pub fn block_on<T, F: Future<Output = T>>(fut: F) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => tokio::runtime::Runtime::new()
-            .expect("failed to create Tokio runtime for block_on")
-            .block_on(fut),
+        Err(_) => FALLBACK_RUNTIME.block_on(fut),
     }
 }
 

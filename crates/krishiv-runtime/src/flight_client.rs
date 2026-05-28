@@ -159,7 +159,7 @@ pub async fn execute_remote_continuous_register(
     match do_action(flight_url, &action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
-            let sql = encode_continuous_register(job_id, spec);
+            let sql = encode_continuous_register(job_id, spec)?;
             let _ = execute_remote_sql(flight_url, &sql).await?;
             Ok(())
         }

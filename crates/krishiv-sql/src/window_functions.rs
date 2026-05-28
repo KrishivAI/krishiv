@@ -103,6 +103,7 @@ fn make_hop_end() -> datafusion::logical_expr::ScalarUDF {
 
 /// Extract an i64 value from a `ColumnarValue` argument (scalar or array).
 /// Returns `None` for SQL NULL.
+#[allow(dead_code)]
 fn extract_scalar_i64(cv: &ColumnarValue) -> Result<Option<i64>, DataFusionError> {
     use datafusion::scalar::ScalarValue;
     match cv {
@@ -161,6 +162,16 @@ fn apply2(
     // Array path.
     let a_arr = cast_to_int64_array(std::slice::from_ref(lhs), 0)?;
     let b_arr = cast_to_int64_array(std::slice::from_ref(rhs), 0)?;
+    if a_arr.len() != 1
+        && b_arr.len() != 1
+        && a_arr.len() != b_arr.len()
+    {
+        return Err(DataFusionError::Internal(format!(
+            "window function: incompatible array lengths {} and {}",
+            a_arr.len(),
+            b_arr.len()
+        )));
+    }
     let len = a_arr.len().max(b_arr.len());
     let a_val = |i: usize| if a_arr.len() == 1 { a_arr.value(0) } else { a_arr.value(i) };
     let b_val = |i: usize| if b_arr.len() == 1 { b_arr.value(0) } else { b_arr.value(i) };
@@ -197,11 +208,18 @@ fn apply3(
     let a_arr = cast_to_int64_array(std::slice::from_ref(a), 0)?;
     let b_arr = cast_to_int64_array(std::slice::from_ref(b), 0)?;
     let c_arr = cast_to_int64_array(std::slice::from_ref(c), 0)?;
-    let len = a_arr.len().max(b_arr.len()).max(c_arr.len());
+    let max_len = a_arr.len().max(b_arr.len()).max(c_arr.len());
+    for (name, len) in [("a", a_arr.len()), ("b", b_arr.len()), ("c", c_arr.len())] {
+        if len != 1 && len != max_len {
+            return Err(DataFusionError::Internal(format!(
+                "window function: argument '{name}' length {len} incompatible with max length {max_len}"
+            )));
+        }
+    }
     let a_val = |i: usize| if a_arr.len() == 1 { a_arr.value(0) } else { a_arr.value(i) };
     let b_val = |i: usize| if b_arr.len() == 1 { b_arr.value(0) } else { b_arr.value(i) };
     let c_val = |i: usize| if c_arr.len() == 1 { c_arr.value(0) } else { c_arr.value(i) };
-    let result: Int64Array = (0..len).map(|i| {
+    let result: Int64Array = (0..max_len).map(|i| {
         let ai = i.min(a_arr.len()-1);
         let bi = i.min(b_arr.len()-1);
         let ci = i.min(c_arr.len()-1);

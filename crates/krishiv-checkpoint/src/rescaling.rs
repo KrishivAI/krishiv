@@ -5,6 +5,8 @@ use krishiv_state::key_group::{KeyGroupRange, key_group_ranges_for_parallelism};
 /// Computes key-group → task slot mapping when restoring with new parallelism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyGroupRescaler {
+    /// Parallelism of the checkpoint being restored (stored for diagnostic
+    /// logging; not used in the key-group → task mapping arithmetic).
     pub old_parallelism: u32,
     pub new_parallelism: u32,
     pub new_ranges: Vec<KeyGroupRange>,
@@ -20,13 +22,10 @@ impl KeyGroupRescaler {
     }
 
     /// Task slot index in the new deployment for `key_group`.
+    ///
+    /// Uses O(1) arithmetic: `task_idx = key_group * new_parallelism / NUM_KEY_GROUPS`.
     pub fn task_for_key_group(&self, key_group: u16) -> u32 {
-        for (idx, range) in self.new_ranges.iter().enumerate() {
-            if range.contains(key_group) {
-                return idx as u32;
-            }
-        }
-        self.new_parallelism.saturating_sub(1)
+        (key_group as u32) * self.new_parallelism / krishiv_state::key_group::NUM_KEY_GROUPS as u32
     }
 
     /// Key-group range assigned to `task_index` in the new deployment.

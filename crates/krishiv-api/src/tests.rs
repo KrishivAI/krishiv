@@ -197,7 +197,7 @@ fn memory_stream_supports_bounded_map_filter_collect() {
     )]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
         .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
-    let stream = session.memory_stream("numbers", vec![StreamBatch::new(0, batch)]);
+    let stream = session.memory_stream("numbers", vec![StreamBatch::new(0, batch)]).unwrap();
     let mapped = stream
         .map_batches(|batch| batch.clone())
         .unwrap_or_else(|error| panic!("unexpected stream map error: {error}"));
@@ -225,7 +225,7 @@ fn unbounded_memory_stream_rejects_collect() {
 #[test]
 fn key_by_returns_keyed_stream_with_correct_column() {
     let session = Session::builder().build().unwrap();
-    let stream = session.memory_stream("events", vec![]);
+    let stream = session.memory_stream("events", vec![]).unwrap();
     let keyed: KeyedStream = stream.key_by("user_id");
     assert_eq!(keyed.key_column(), "user_id");
     assert!(keyed.event_time_column().is_none());
@@ -235,7 +235,7 @@ fn key_by_returns_keyed_stream_with_correct_column() {
 #[test]
 fn keyed_stream_builder_chain() {
     let session = Session::builder().build().unwrap();
-    let stream = session.memory_stream("events", vec![]);
+    let stream = session.memory_stream("events", vec![]).unwrap();
     let keyed = stream
         .key_by("user_id")
         .with_event_time("event_ts")
@@ -249,7 +249,7 @@ fn keyed_stream_builder_chain() {
 #[test]
 fn tumbling_window_carries_correct_config() {
     let session = Session::builder().build().unwrap();
-    let stream = session.memory_stream("events", vec![]);
+    let stream = session.memory_stream("events", vec![]).unwrap();
     let windowed: WindowedStream = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -277,7 +277,7 @@ fn tumbling_window_collect_executes_in_embedded_mode() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -303,7 +303,7 @@ fn sliding_window_collect_via_unified_runtime() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -328,7 +328,7 @@ fn session_window_collect_via_unified_runtime() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -354,7 +354,7 @@ fn session_subsequent_window_collects() {
     )
     .unwrap();
     for _ in 0..2 {
-        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch.clone())]);
+        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch.clone())]).unwrap();
         let _ = stream
             .key_by("user_id")
             .with_event_time("ts")
@@ -618,7 +618,7 @@ async fn distributed_window_collect_via_local_cluster() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -695,7 +695,7 @@ fn multi_source_watermark_window_collect_with_source_column() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]);
+    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")

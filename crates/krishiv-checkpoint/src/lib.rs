@@ -497,7 +497,23 @@ pub fn validate_epoch(
         match storage.read_bytes(&full)? {
             None => return Ok(false),
             Some(data) => {
-                if sha256_hex(&data) != *expected_hex {
+                // Stream-hash via BufReader to avoid loading large files into
+                // memory twice (once for read, once for digest).
+                use std::io::Read as _;
+                let mut reader = std::io::BufReader::new(data.as_slice());
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = reader.read(&mut buf).map_err(|e| CheckpointError::Storage {
+                        message: format!("reading {full} for hash: {e}"),
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let hash = format!("{:x}", hasher.finalize());
+                if hash != *expected_hex {
                     return Ok(false);
                 }
             }

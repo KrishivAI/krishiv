@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
-async-trait = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

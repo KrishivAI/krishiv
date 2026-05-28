@@ -5,6 +5,7 @@ use std::fmt;
 pub enum StateError {
     BackendUnavailable {
         message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     SnapshotUnsupported {
         backend: &'static str,
@@ -32,7 +33,7 @@ pub enum StateError {
 impl fmt::Display for StateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BackendUnavailable { message } => {
+            Self::BackendUnavailable { message, .. } => {
                 write!(f, "state backend unavailable: {message}")
             }
             Self::SnapshotUnsupported { backend } => {
@@ -57,7 +58,16 @@ impl fmt::Display for StateError {
     }
 }
 
-impl std::error::Error for StateError {}
+impl std::error::Error for StateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendUnavailable { source, .. } => {
+                source.as_ref().map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Convenience alias for state operation results.
 pub type StateResult<T> = Result<T, StateError>;

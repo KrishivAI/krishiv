@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::{CatalogError, CatalogResult};
 
@@ -62,10 +63,11 @@ pub struct GenericRestCatalog {
 
 impl GenericRestCatalog {
     pub fn new(config: RestCatalogConfig) -> Self {
-        Self {
-            config,
-            client: Client::new(),
-        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
+        Self { config, client }
     }
 
     fn url(&self, path: &str) -> String {
@@ -82,15 +84,19 @@ impl GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+        let resp = req.send().await.map_err(|e| CatalogError::Http {
+            status: 0,
             message: e.to_string(),
         })?;
         if !resp.status().is_success() {
-            return Err(CatalogError::InvalidSchema {
+            let status = resp.status().as_u16();
+            return Err(CatalogError::Http {
+                status,
                 message: resp.text().await.unwrap_or_default(),
             });
         }
-        resp.json().await.map_err(|e| CatalogError::InvalidSchema {
+        resp.json().await.map_err(|e| CatalogError::Http {
+            status: 0,
             message: e.to_string(),
         })
     }
@@ -136,11 +142,14 @@ impl IcebergCatalogClient for GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+        let resp = req.send().await.map_err(|e| CatalogError::Http {
+            status: 0,
             message: e.to_string(),
         })?;
         if !resp.status().is_success() {
-            return Err(CatalogError::InvalidSchema {
+            let status = resp.status().as_u16();
+            return Err(CatalogError::Http {
+                status,
                 message: resp.text().await.unwrap_or_default(),
             });
         }
@@ -160,11 +169,14 @@ impl IcebergCatalogClient for GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+        let resp = req.send().await.map_err(|e| CatalogError::Http {
+            status: 0,
             message: e.to_string(),
         })?;
         if !resp.status().is_success() {
-            return Err(CatalogError::InvalidSchema {
+            let status = resp.status().as_u16();
+            return Err(CatalogError::Http {
+                status,
                 message: resp.text().await.unwrap_or_default(),
             });
         }
@@ -187,11 +199,14 @@ impl IcebergCatalogClient for GenericRestCatalog {
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await.map_err(|e| CatalogError::InvalidSchema {
+        let resp = req.send().await.map_err(|e| CatalogError::Http {
+            status: 0,
             message: e.to_string(),
         })?;
         if !resp.status().is_success() {
-            return Err(CatalogError::InvalidSchema {
+            let status = resp.status().as_u16();
+            return Err(CatalogError::Http {
+                status,
                 message: resp.text().await.unwrap_or_default(),
             });
         }

@@ -34,7 +34,7 @@ pub fn scan_orphans(
     Ok(orphans)
 }
 
-/// Recursively collect all `.ipc` files under `dir`.
+/// Recursively collect all `.ipc` and `.tmp` files under `dir`.
 fn collect_ipc_files(
     dir: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
@@ -46,8 +46,11 @@ fn collect_ipc_files(
         let path = entry.path();
         if is_dir {
             collect_ipc_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("ipc") {
-            out.push(path);
+        } else {
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("ipc") | Some("tmp") => out.push(path),
+                _ => {}
+            }
         }
     }
     Ok(())

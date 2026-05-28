@@ -10,6 +10,26 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+/// Errors returned by [`init`].
+#[derive(Debug)]
+pub enum MetricsError {
+    /// The OTLP exporter pipeline failed to build.
+    OtlpBuild(String),
+    /// A tracing subscriber initialization error.
+    Subscriber(String),
+}
+
+impl std::fmt::Display for MetricsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OtlpBuild(msg) => write!(f, "OTLP exporter build failed: {msg}"),
+            Self::Subscriber(msg) => write!(f, "subscriber init failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for MetricsError {}
+
 /// **Beta API**: may change between minor releases.
 ///
 /// Selects the OTel span exporter backend used when initializing the tracer provider.
@@ -90,9 +110,9 @@ impl Drop for MetricsHandle {
 ///
 /// # Errors
 ///
-/// Returns an error string if the OTLP exporter pipeline fails to build (only
+/// Returns a [`MetricsError`] if the OTLP exporter pipeline fails to build (only
 /// possible when `config.otlp_endpoint` is `Some`).
-pub fn init(config: MetricsConfig) -> Result<MetricsHandle, String> {
+pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
     let filter_str = config.log_filter.as_deref().unwrap_or("info").to_string();
 
     let filter = tracing_subscriber::EnvFilter::new(&filter_str);
@@ -105,7 +125,7 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, String> {
             .with_tonic()
             .with_endpoint(endpoint)
             .build()
-            .map_err(|e| format!("OTLP exporter build failed: {e}"))?;
+            .map_err(|e| MetricsError::OtlpBuild(format!("{e}")))?;
 
         SdkTracerProvider::builder()
             .with_batch_exporter(exporter)

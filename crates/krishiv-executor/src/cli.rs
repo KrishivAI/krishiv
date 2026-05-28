@@ -26,7 +26,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
 
 /// Run the executor CLI (blocking async runtime).
-pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::ExecutorResult<()> {
     let config = ExecutorCliConfig::parse(args)?;
     if config.help {
         print!("{}", ExecutorCliConfig::help());
@@ -105,7 +105,7 @@ krishiv_executor_slots_total{{executor_id=\"{executor_id}\"}} {slots}
     )
 }
 
-fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
+fn print_contract_summary(runtime: &ExecutorRuntime) -> crate::ExecutorResult<()> {
     let registration = runtime.registration_request();
     let heartbeat = runtime.heartbeat_request();
 
@@ -128,7 +128,7 @@ fn print_contract_summary(runtime: &ExecutorRuntime) -> Result<(), String> {
     Ok(())
 }
 
-async fn register_once(runtime: &mut ExecutorRuntime) -> Result<(), String> {
+async fn register_once(runtime: &mut ExecutorRuntime) -> crate::ExecutorResult<()> {
     println!("{}", runtime.startup_summary());
     let (registration, heartbeat) = runtime
         .register_and_heartbeat_once()
@@ -163,7 +163,7 @@ async fn heartbeat_loop(
     shuffle_dir: Option<std::path::PathBuf>,
     checkpoint_uri: String,
     slots: usize,
-) -> Result<(), String> {
+) -> crate::ExecutorResult<()> {
     // Bind task/barrier listeners FIRST so the *first* register advertises real
     // endpoints — avoids the double-register race that previously bumped the
     // lease before the loop could observe it (B8).
@@ -289,7 +289,7 @@ async fn heartbeat_loop(
         let shutdown_flag = Arc::clone(&shutdown);
         tokio::spawn(async move {
             loop {
-                if shutdown_flag.load(Ordering::Relaxed) {
+                if shutdown_flag.load(Ordering::Acquire) {
                     tracing::info!(slot = slot_idx, "runner shutting down");
                     break;
                 }
@@ -318,14 +318,18 @@ async fn heartbeat_loop(
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
 
+    let base_backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+    let mut current_backoff = base_backoff;
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(heartbeat_interval_secs)) => {
                 match runtime.heartbeat_with_grpc_endpoint().await {
                     Ok(heartbeat) => {
                         use krishiv_proto::TransportDisposition;
-                        // Propagate to the shared atomic so runner RPCs see the new lease.
-                        shared_lease.set(heartbeat.lease_generation());
+                        // Reset backoff on successful heartbeat.
+                        current_backoff = base_backoff;
                         println!(
                             "heartbeat response version={} lease_generation={} disposition={} message={}",
                             heartbeat.version(),
@@ -358,6 +362,9 @@ async fn heartbeat_loop(
                             }
                             continue;
                         }
+                        // Only update the shared lease after confirming the
+                        // heartbeat disposition is not stale (fix: lease-generation race).
+                        shared_lease.set(heartbeat.lease_generation());
                         for cmd in heartbeat.checkpoint_commands() {
                             if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
                                 let req = InitiateCheckpointRequest {
@@ -387,15 +394,21 @@ async fn heartbeat_loop(
                     }
                     Err(error) => {
                         let text = error.to_string();
-                        tracing::warn!(error = %text, "heartbeat rpc failed; will retry");
+                        tracing::warn!(
+                            error = %text,
+                            backoff_secs = current_backoff.as_secs(),
+                            "heartbeat rpc failed; will retry with backoff"
+                        );
                         // Drop the cached channel so the next iteration reconnects.
                         coord_service.invalidate_channel().await;
+                        tokio::time::sleep(current_backoff).await;
+                        current_backoff = (current_backoff * 2).min(max_backoff);
                     }
                 }
             }
             _ = sigterm.recv() => {
                 println!("SIGTERM received — deregistering and shutting down");
-                shutdown.store(true, Ordering::Relaxed);
+                shutdown.store(true, Ordering::Release);
                 // Give in-flight tasks a brief window to observe the shutdown
                 // flag before we tear down the gRPC channel.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -443,7 +456,7 @@ enum ExecutorMode {
 }
 
 impl ExecutorCliConfig {
-    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+    pub fn parse(args: impl IntoIterator<Item = String>) -> crate::ExecutorResult<Self> {
         let mut config = Self {
             executor_id: env::var("KRISHIV_EXECUTOR_ID")
                 .unwrap_or_else(|_| String::from("exec-local")),
@@ -531,9 +544,11 @@ impl ExecutorCliConfig {
                         String::from("--heartbeat-interval-secs must be a positive integer")
                     })?;
                     if config.heartbeat_interval_secs == 0 {
-                        return Err(String::from(
-                            "--heartbeat-interval-secs must be greater than zero",
-                        ));
+                        return Err(crate::ExecutorError::LocalExecution {
+                            message: String::from(
+                                "--heartbeat-interval-secs must be greater than zero",
+                            ),
+                        });
                     }
                 }
                 "--shuffle-dir" => {
@@ -548,14 +563,16 @@ impl ExecutorCliConfig {
                     config.checkpoint_uri = next_arg(&mut args, "--checkpoint-uri")?;
                 }
                 "--help" | "-h" => config.help = true,
-                unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
+                unknown => return Err(crate::ExecutorError::LocalExecution {
+                    message: format!("unknown option: {unknown}\n\n{}", Self::help()),
+                }),
             }
         }
 
         Ok(config)
     }
 
-    fn into_executor_config(self) -> Result<ExecutorConfig, String> {
+    fn into_executor_config(self) -> crate::ExecutorResult<ExecutorConfig> {
         // Pre-populate task and barrier endpoints so that the FIRST register
         // call advertises real endpoints; the binary will rewrite them after
         // binding listeners (which use kernel-chosen ports if 0).  This avoids
@@ -576,11 +593,13 @@ impl ExecutorCliConfig {
         Ok(cfg)
     }
 
-    fn set_mode(&mut self, mode: ExecutorMode) -> Result<(), String> {
+    fn set_mode(&mut self, mode: ExecutorMode) -> crate::ExecutorResult<()> {
         if self.mode != ExecutorMode::DryRun && self.mode != mode {
-            return Err(String::from(
-                "--register-once and --connect are mutually exclusive",
-            ));
+            return Err(crate::ExecutorError::LocalExecution {
+                message: String::from(
+                    "--register-once and --connect are mutually exclusive",
+                ),
+            });
         }
         self.mode = mode;
         Ok(())
@@ -643,7 +662,7 @@ mod tests {
     fn rejects_unknown_option() {
         let error = ExecutorCliConfig::parse([String::from("--wat")]).unwrap_err();
 
-        assert!(error.contains("unknown option"));
+        assert!(error.to_string().contains("unknown option"));
     }
 
     #[test]
@@ -667,6 +686,6 @@ mod tests {
             ExecutorCliConfig::parse([String::from("--connect"), String::from("--register-once")])
                 .unwrap_err();
 
-        assert!(error.contains("mutually exclusive"));
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 }

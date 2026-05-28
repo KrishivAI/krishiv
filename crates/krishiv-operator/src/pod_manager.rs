@@ -173,16 +173,19 @@ impl PodLifecycleManager {
         labels.insert(EXECUTOR_ID_LABEL.to_owned(), executor_id.to_owned());
 
         // Owner reference — Kubernetes will GC the pod when the KrishivJob is deleted.
+        // Only set owner references when a UID is available; an empty UID causes
+        // the Kubernetes API to reject the owner reference.
         let owner_refs = resource
             .metadata
-            .generation
-            .checked_abs()
-            .map(|_| {
+            .uid
+            .as_deref()
+            .filter(|_| resource.metadata.generation >= 0)
+            .map(|uid| {
                 vec![OwnerReference {
                     api_version: format!("{API_GROUP}/{API_VERSION}"),
                     kind: KIND.to_owned(),
                     name: job_name.clone(),
-                    uid: String::new(), // UID not available in our CRD mock; leave empty.
+                    uid: uid.to_owned(),
                     controller: Some(true),
                     block_owner_deletion: Some(true),
                 }]

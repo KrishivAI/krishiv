@@ -24,7 +24,7 @@ impl SharedLeaseGeneration {
     }
 
     pub fn get(&self) -> LeaseGeneration {
-        let raw = self.inner.load(Ordering::SeqCst);
+        let raw = self.inner.load(Ordering::Acquire);
         // `LeaseGeneration::try_new` rejects 0 — `SharedLeaseGeneration` is
         // initialized via `LeaseGeneration::initial()` (=1) and only ever
         // monotonically increased, so this should always succeed.
@@ -34,7 +34,7 @@ impl SharedLeaseGeneration {
     pub fn set(&self, lease: LeaseGeneration) {
         let new_val = lease.as_u64();
         // Monotonic: never go backwards.  fetch_max returns the previous value.
-        self.inner.fetch_max(new_val, Ordering::SeqCst);
+        self.inner.fetch_max(new_val, Ordering::Release);
     }
 }
 
@@ -82,10 +82,14 @@ impl CoordinatorGrpcPool {
     }
 
     pub async fn client(&self) -> Result<InterceptedCoordinatorClient, tonic::transport::Error> {
-        let mut guard = self.client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
+        // Double-check pattern: lock, check, unlock, connect, re-lock, store.
+        {
+            let guard = self.client.lock().await;
+            if let Some(client) = guard.as_ref() {
+                return Ok(client.clone());
+            }
         }
+        // Lock released — connect without holding the mutex.
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
@@ -99,6 +103,11 @@ impl CoordinatorGrpcPool {
             krishiv_metrics::grpc::inject_trace_context
                 as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
         );
+        // Re-lock and store if still empty (another task may have connected first).
+        let mut guard = self.client.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
         *guard = Some(client.clone());
         Ok(client)
     }

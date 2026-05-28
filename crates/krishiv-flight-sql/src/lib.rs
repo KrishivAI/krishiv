@@ -38,6 +38,8 @@ pub struct KrishivFlightSqlService {
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     host: FlightExecutionHost,
+    /// Shared SQL engine for policy enforcement — created once during construction.
+    sql_engine: Arc<SqlEngine>,
     /// Map of opaque handle (UUID string) → SQL text for prepared statements.
     prepared_statements: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
@@ -58,6 +60,7 @@ impl KrishivFlightSqlService {
             auth: None,
             policy: None,
             host: FlightExecutionHost::from_env()?,
+            sql_engine: Arc::new(SqlEngine::new()),
             prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
@@ -68,6 +71,7 @@ impl KrishivFlightSqlService {
             auth: None,
             policy: None,
             host,
+            sql_engine: Arc::new(SqlEngine::new()),
             prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -93,7 +97,7 @@ impl KrishivFlightSqlService {
     fn policy_engine(&self) -> Option<PolicyEnforcingSqlEngine> {
         match (&self.auth, &self.policy) {
             (Some(auth), Some(policy)) => Some(PolicyEnforcingSqlEngine::new(
-                SqlEngine::new(),
+                (*self.sql_engine).clone(),
                 auth.clone(),
                 policy.clone(),
             )),

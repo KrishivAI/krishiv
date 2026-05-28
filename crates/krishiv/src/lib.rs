@@ -32,7 +32,7 @@
 //!     let session = Session::builder().build()?;
 //!     let batch: RecordBatch = todo!("build your Arrow batch");
 //!     let stream = session
-//!         .memory_stream("events", vec![StreamBatch::new(0, batch)])
+//!         .memory_stream("events", vec![StreamBatch::new(0, batch)])?
 //!         .key_by("user_id")
 //!         .with_event_time("event_ts")
 //!         .watermark(WatermarkSpec::fixed_lag_ms(5_000))

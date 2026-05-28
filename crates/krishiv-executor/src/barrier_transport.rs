@@ -50,11 +50,11 @@ impl SharedBarrierInjector {
     }
 
     pub fn enqueue(&self, barrier: CheckpointBarrier) {
-        self.inner.lock().unwrap().enqueue(barrier);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).enqueue(barrier);
     }
 
     pub fn next_barrier(&self) -> Option<CheckpointBarrier> {
-        self.inner.lock().unwrap().next_barrier()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).next_barrier()
     }
 }
 

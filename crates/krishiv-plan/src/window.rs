@@ -91,11 +91,12 @@ impl WindowExecutionSpec {
 
 /// Encode a window spec as an executor plan fragment description.
 pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
-    let agg = spec
-        .agg_exprs
-        .first()
-        .map(encode_agg)
-        .unwrap_or_else(|| "agg=count".to_string());
+    let aggs: Vec<String> = if spec.agg_exprs.is_empty() {
+        vec!["agg=count".to_string()]
+    } else {
+        spec.agg_exprs.iter().map(encode_agg).collect()
+    };
+    let agg = aggs.join(";");
 
     let prefix = match spec.window_kind {
         WindowKind::Tumbling => "stream:tw",
@@ -147,8 +148,10 @@ pub struct ParsedStreamFragment {
     pub agg: WindowAgg,
 }
 
+use crate::PlanError;
+
 /// Parse `stream:tw|sw|ses:...` fragment strings.
-pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, String> {
+pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, PlanError> {
     let (window_kind, payload) = if let Some(p) = fragment.strip_prefix("stream:tw:") {
         (WindowKind::Tumbling, p)
     } else if let Some(p) = fragment.strip_prefix("stream:sw:") {
@@ -156,9 +159,9 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Str
     } else if let Some(p) = fragment.strip_prefix("stream:ses:") {
         (WindowKind::Session, p)
     } else {
-        return Err(format!(
+        return Err(PlanError::Parse(format!(
             "streaming fragment must start with stream:tw:, stream:sw:, or stream:ses:; got: {fragment}"
-        ));
+        )));
     };
 
     let mut key_col = None;
@@ -178,7 +181,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Str
         }
         let (k, v) = part
             .split_once('=')
-            .ok_or_else(|| format!("streaming fragment field must be k=v; got '{part}'"))?;
+            .ok_or_else(|| PlanError::Parse(format!("streaming fragment field must be k=v; got '{part}'")))?;
         match k.trim() {
             "key" => key_col = Some(v.trim().to_owned()),
             "time" => time_col = Some(v.trim().to_owned()),
@@ -186,35 +189,35 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Str
                 window_ms = Some(
                     v.trim()
                         .parse::<u64>()
-                        .map_err(|e| format!("invalid win value '{v}': {e}"))?,
+                        .map_err(|e| PlanError::Parse(format!("invalid win value '{v}': {e}")))?,
                 );
             }
             "lag" => {
                 lag_ms = Some(
                     v.trim()
                         .parse::<u64>()
-                        .map_err(|e| format!("invalid lag value '{v}': {e}"))?,
+                        .map_err(|e| PlanError::Parse(format!("invalid lag value '{v}': {e}")))?,
                 );
             }
             "slide" => {
                 slide_ms = Some(
                     v.trim()
                         .parse::<u64>()
-                        .map_err(|e| format!("invalid slide value '{v}': {e}"))?,
+                        .map_err(|e| PlanError::Parse(format!("invalid slide value '{v}': {e}")))?,
                 );
             }
             "gap" => {
                 session_gap_ms = Some(
                     v.trim()
                         .parse::<u64>()
-                        .map_err(|e| format!("invalid gap value '{v}': {e}"))?,
+                        .map_err(|e| PlanError::Parse(format!("invalid gap value '{v}': {e}")))?,
                 );
             }
             "ttl" => {
                 ttl_ms = Some(
                     v.trim()
                         .parse::<u64>()
-                        .map_err(|e| format!("invalid ttl value '{v}': {e}"))?,
+                        .map_err(|e| PlanError::Parse(format!("invalid ttl value '{v}': {e}")))?,
                 );
             }
             "agg" => agg_kind = Some(v.trim().to_owned()),
@@ -228,43 +231,43 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Str
         Some("sum") => WindowAgg {
             kind: WindowAggKind::Sum,
             input_column: agg_col.clone().ok_or_else(|| {
-                String::from("stream fragment with agg=sum requires col=<column>")
+                PlanError::Parse(String::from("stream fragment with agg=sum requires col=<column>"))
             })?,
             output_column: format!("sum_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("min") => WindowAgg {
             kind: WindowAggKind::Min,
             input_column: agg_col.clone().ok_or_else(|| {
-                String::from("stream fragment with agg=min requires col=<column>")
+                PlanError::Parse(String::from("stream fragment with agg=min requires col=<column>"))
             })?,
             output_column: format!("min_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("max") => WindowAgg {
             kind: WindowAggKind::Max,
             input_column: agg_col.clone().ok_or_else(|| {
-                String::from("stream fragment with agg=max requires col=<column>")
+                PlanError::Parse(String::from("stream fragment with agg=max requires col=<column>"))
             })?,
             output_column: format!("max_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("avg") => WindowAgg {
             kind: WindowAggKind::Avg,
             input_column: agg_col.clone().ok_or_else(|| {
-                String::from("stream fragment with agg=avg requires col=<column>")
+                PlanError::Parse(String::from("stream fragment with agg=avg requires col=<column>"))
             })?,
             output_column: format!("avg_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some(other) => {
-            return Err(format!(
+            return Err(PlanError::Parse(format!(
                 "unknown streaming aggregate '{other}', expected count|sum|min|max|avg"
-            ));
+            )));
         }
     };
 
     Ok(ParsedStreamFragment {
         window_kind,
-        key_col: key_col.ok_or_else(|| String::from("stream fragment missing key=<col>"))?,
-        time_col: time_col.ok_or_else(|| String::from("stream fragment missing time=<col>"))?,
-        window_ms: window_ms.ok_or_else(|| String::from("stream fragment missing win=<ms>"))?,
+        key_col: key_col.ok_or_else(|| PlanError::Parse(String::from("stream fragment missing key=<col>")))?,
+        time_col: time_col.ok_or_else(|| PlanError::Parse(String::from("stream fragment missing time=<col>")))?,
+        window_ms: window_ms.ok_or_else(|| PlanError::Parse(String::from("stream fragment missing win=<ms>")))?,
         lag_ms: lag_ms.unwrap_or(0),
         slide_ms,
         session_gap_ms,

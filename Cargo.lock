@@ -3936,7 +3936,6 @@ name = "krishiv-cep"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "serde",
 ]
 
 [[package]]
@@ -4146,6 +4145,7 @@ dependencies = [
  "prost-build 0.14.3",
  "prost-types 0.14.3",
  "protoc-bin-vendored",
+ "serde",
  "tonic 0.14.6",
  "tonic-prost",
  "tonic-prost-build",
@@ -4318,7 +4318,6 @@ name = "krishiv-udf"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "async-trait",
 ]
 
 [[package]]

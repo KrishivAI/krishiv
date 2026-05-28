@@ -51,8 +51,17 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
         return Err(corrupt(&format!("unsupported snapshot version {version}")));
     }
     let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
+    const MAX_ENTRIES: usize = 1_000_000;
+    if count > MAX_ENTRIES {
+        return Err(corrupt(&format!(
+            "entry count {count} exceeds maximum {MAX_ENTRIES}"
+        )));
+    }
     let mut pos = 12usize;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::new();
+    entries
+        .try_reserve(count)
+        .map_err(|_| corrupt(&format!("failed to allocate {count} entries")))?;
 
     for _ in 0..count {
         let op_id_b = read_lp_bytes(bytes, &mut pos)

@@ -278,6 +278,12 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
+    // Periodic eviction: remove entries older than 1 hour to prevent unbounded growth.
+    if AUDIT_DEDUP.len() > 1024 {
+        AUDIT_DEDUP.retain(|_, ts| now_ms.saturating_sub(*ts) < 3_600_000);
+    }
+
     if let Some(entry) = AUDIT_DEDUP.get(&key)
         && now_ms.saturating_sub(*entry) < AUDIT_DEDUP_TTL_MS
     {

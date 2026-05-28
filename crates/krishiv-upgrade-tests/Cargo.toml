@@ -2,6 +2,7 @@
 name = "krishiv-upgrade-tests"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dev-dependencies]
@@ -9,3 +10,6 @@ krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-catalog = { path = "../krishiv-catalog" }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

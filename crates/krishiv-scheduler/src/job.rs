@@ -1230,7 +1230,7 @@ fn job_spec_from_plan_parts(
 }
 
 fn plan_node_description(node: &PlanNode) -> String {
-    krishiv_plan::encode_typed_task_fragment(node)
+    krishiv_plan::encode_typed_task_fragment(node).unwrap_or_else(|e| format!("encode error: {e}"))
 }
 
 fn plan_has_exchange_stages(nodes: &[PlanNode]) -> bool {

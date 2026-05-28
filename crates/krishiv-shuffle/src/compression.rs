@@ -1,4 +1,4 @@
-use crate::{ShuffleError, ShuffleResult};
+use crate::ShuffleResult;
 use arrow::record_batch::RecordBatch;
 
 /// Compression algorithm for shuffle block data.
@@ -26,7 +26,7 @@ impl ShuffleCompression {
             ShuffleCompression::None => Ok(data.to_vec()),
             ShuffleCompression::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
             ShuffleCompression::Zstd => {
-                zstd::encode_all(data, 0).map_err(|e| ShuffleError::Io(e.to_string()))
+                zstd::encode_all(data, 0).map_err(|e| crate::error::io_err(e.to_string()))
             }
         }
     }
@@ -36,9 +36,9 @@ impl ShuffleCompression {
         match self {
             ShuffleCompression::None => Ok(data.to_vec()),
             ShuffleCompression::Lz4 => lz4_flex::decompress_size_prepended(data)
-                .map_err(|e| ShuffleError::Io(e.to_string())),
+                .map_err(|e| crate::error::io_err(e.to_string())),
             ShuffleCompression::Zstd => {
-                zstd::decode_all(data).map_err(|e| ShuffleError::Io(e.to_string()))
+                zstd::decode_all(data).map_err(|e| crate::error::io_err(e.to_string()))
             }
         }
     }

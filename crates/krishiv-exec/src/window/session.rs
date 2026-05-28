@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
-use crate::aggregate::{AggExpr, AggState};
+use crate::aggregate::{AggExpr, AggFunction, AggState};
 use crate::join::format_key_value;
 use crate::{ExecError, ExecResult};
 
@@ -276,7 +276,11 @@ impl SessionWindowOperator {
             Field::new("session_end_ms", DataType::Int64, false),
         ];
         for agg in &self.spec.agg_exprs {
-            fields.push(Field::new(&agg.output_column, DataType::Int64, false));
+            let dtype = match agg.function {
+                AggFunction::Avg => DataType::Float64,
+                _ => DataType::Int64,
+            };
+            fields.push(Field::new(&agg.output_column, dtype, false));
         }
         let schema = Arc::new(Schema::new(fields));
         let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![
@@ -285,9 +289,16 @@ impl SessionWindowOperator {
             Arc::new(Int64Array::from(vec![session_end_ms])),
         ];
         for (i, agg) in self.spec.agg_exprs.iter().enumerate() {
-            columns.push(Arc::new(Int64Array::from(vec![
-                state.finalized_value(i, agg),
-            ])));
+            match agg.function {
+                AggFunction::Avg => {
+                    columns.push(Arc::new(Float64Array::from(vec![state.finalized_avg(i)])));
+                }
+                _ => {
+                    columns.push(Arc::new(Int64Array::from(vec![
+                        state.finalized_value(i, agg),
+                    ])));
+                }
+            }
         }
         Ok(RecordBatch::try_new(schema, columns)?)
     }

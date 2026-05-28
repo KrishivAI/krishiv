@@ -2,6 +2,7 @@
 name = "krishiv-chaos"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]
@@ -18,4 +19,7 @@ krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-operator = { path = "../krishiv-operator" }
 arrow = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
+
+[lints]
+workspace = true

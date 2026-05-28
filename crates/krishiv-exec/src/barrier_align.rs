@@ -38,15 +38,18 @@ pub struct BarrierAligner {
 }
 
 impl BarrierAligner {
-    pub fn new(input_count: usize, alignment_timeout: Duration) -> Self {
-        Self {
-            input_count: input_count.max(1),
+    pub fn new(input_count: usize, alignment_timeout: Duration) -> Result<Self, String> {
+        if input_count == 0 {
+            return Err("input_count must be greater than zero".into());
+        }
+        Ok(Self {
+            input_count,
             barrier_inputs_seen: HashSet::new(),
             current_epoch: None,
-            buffers: (0..input_count.max(1)).map(|_| VecDeque::new()).collect(),
+            buffers: (0..input_count).map(|_| VecDeque::new()).collect(),
             alignment_deadline: None,
             alignment_timeout,
-        }
+        })
     }
 
     /// Record a data batch on `input_index` while alignment is in progress.
@@ -125,12 +128,18 @@ mod tests {
 
     #[test]
     fn barrier_alignment_buffers_until_all_inputs_ready() {
-        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5));
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
         aligner.buffer_data(0, batch(1));
         assert!(!aligner.on_barrier(0, 1).unwrap());
         aligner.buffer_data(0, batch(2));
         assert!(aligner.on_barrier(1, 1).unwrap());
         let released = aligner.drain_buffer(0);
         assert_eq!(released.len(), 2);
+    }
+
+    #[test]
+    fn barrier_align_zero_input_count_returns_error() {
+        let result = BarrierAligner::new(0, Duration::from_secs(5));
+        assert!(result.is_err(), "input_count=0 must return Err");
     }
 }

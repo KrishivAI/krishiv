@@ -11,6 +11,14 @@ use crate::{JobRecord, SchedulerError, SchedulerResult};
 const METADATA_SNAPSHOT_KEY: &str = "/krishiv/metadata/snapshot";
 
 /// Durable metadata store backed by a single etcd snapshot key.
+///
+/// # Size limit
+///
+/// etcd has a default maximum value size of **1.5 MiB**.  If the encoded
+/// metadata snapshot exceeds this limit the `persist()` call will fail with
+/// an etcd `RequestTooLarge` error.  A `tracing::warn!` is emitted when the
+/// snapshot exceeds 1 MiB so operators can detect approaching the limit
+/// before writes start failing.
 pub struct EtcdMetadataStore {
     client: Mutex<Client>,
     events: Vec<EventLogEvent>,
@@ -49,6 +57,14 @@ impl EtcdMetadataStore {
 
     fn persist(&self) -> SchedulerResult<()> {
         let bytes = encode_metadata_snapshot(&self.events, &self.jobs)?;
+        // etcd default max value size is 1.5 MiB; warn early at 1 MiB.
+        const WARN_THRESHOLD: usize = 1024 * 1024;
+        if bytes.len() > WARN_THRESHOLD {
+            tracing::warn!(
+                size_bytes = bytes.len(),
+                "etcd metadata snapshot exceeds 1 MiB; etcd default limit is 1.5 MiB"
+            );
+        }
         let mut client = self.client.blocking_lock();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(client.put(

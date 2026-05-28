@@ -304,6 +304,24 @@ pub fn executor_heartbeat_response_from_wire(
                 .collect(),
         );
     }
+    if !value.initiate_checkpoints.is_empty() {
+        use crate::ids::{FencingToken, JobId};
+        use crate::task::InitiateCheckpointCommand;
+        let cmds: Vec<InitiateCheckpointCommand> = value
+            .initiate_checkpoints
+            .into_iter()
+            .filter_map(|cmd| {
+                let job_id = JobId::try_new(cmd.job_id).ok()?;
+                let fencing_token = FencingToken::try_new(cmd.fencing_token).ok()?;
+                Some(InitiateCheckpointCommand {
+                    job_id,
+                    epoch: cmd.epoch,
+                    fencing_token,
+                })
+            })
+            .collect();
+        response = response.with_checkpoint_commands(cmds);
+    }
     Ok(response)
 }
 
@@ -754,8 +772,8 @@ fn input_partition_descriptor_to_wire(
             kind: v1::InputPartitionDescriptorKind::ShuffleFlight as i32,
             table_name: table_name.clone(),
             shuffle_flight_endpoint: flight_endpoint.clone(),
-            shuffle_job_id: job_id.clone(),
-            shuffle_upstream_stage_id: upstream_stage_id.clone(),
+            shuffle_job_id: job_id.as_str().to_owned(),
+            shuffle_upstream_stage_id: upstream_stage_id.as_str().to_owned(),
             shuffle_partition_id: *partition_id,
             ..Default::default()
         },
@@ -818,11 +836,13 @@ fn input_partition_descriptor_from_wire(
                 &value.shuffle_upstream_stage_id,
                 "shuffle upstream stage id",
             )?;
+            require_non_empty(&value.shuffle_job_id, "shuffle job id")?;
             Ok(InputPartitionDescriptor::ShuffleFlight {
                 table_name: value.table_name,
                 flight_endpoint: value.shuffle_flight_endpoint,
-                job_id: value.shuffle_job_id,
-                upstream_stage_id: value.shuffle_upstream_stage_id,
+                job_id: JobId::try_new(value.shuffle_job_id).map_err(WireError::from_id)?,
+                upstream_stage_id: StageId::try_new(value.shuffle_upstream_stage_id)
+                    .map_err(WireError::from_id)?,
                 partition_id: value.shuffle_partition_id,
             })
         }

@@ -107,4 +107,9 @@ impl fmt::Display for SchedulerError {
     }
 }
 
+/// NOTE: `source()` returns `None` for all variants because no variant wraps an
+/// inner `dyn Error`.  Variants that carry a `message: String` describe the
+/// cause inline.  If future variants wrap boxed errors (e.g. `StoreError`,
+/// `EtcdError`, `LeaseError`), their `source()` must delegate to the inner
+/// error to preserve the error chain.
 impl Error for SchedulerError {}

@@ -40,7 +40,7 @@ impl HashPartitioner {
         let schema = batch.schema();
         let col_idx = schema
             .index_of(&self.key_column)
-            .map_err(|e| ShuffleError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
         let key_col = batch.column(col_idx);
 
         let n = self.buckets as usize;
@@ -127,7 +127,9 @@ impl HashPartitioner {
                 });
             }
             other => {
-                return Err(ShuffleError::Io(format!("unsupported key type: {other}")));
+                return Err(ShuffleError::TypeMismatch {
+                    expected: format!("supported partition key type (Int32, Int64, Utf8, Utf8View, LargeUtf8), got {other}"),
+                });
             }
         }
 
@@ -143,11 +145,11 @@ impl HashPartitioner {
                     .iter()
                     .map(|col| {
                         take(col.as_ref(), &index_arr, None)
-                            .map_err(|e| ShuffleError::Io(e.to_string()))
+                            .map_err(|e| crate::error::io_err(e.to_string()))
                     })
                     .collect::<ShuffleResult<_>>()?;
                 let partition_batch = RecordBatch::try_new(schema.clone(), columns)
-                    .map_err(|e| ShuffleError::Io(e.to_string()))?;
+                    .map_err(|e| crate::error::io_err(e.to_string()))?;
                 result.push(partition_batch);
             }
         }

@@ -34,6 +34,25 @@ impl InProcessCoordinatorBridge {
     }
 }
 
+impl Drop for InProcessCoordinatorBridge {
+    fn drop(&mut self) {
+        if let Ok(coord) = self.coordinator.lock() {
+            let running: usize = coord
+                .job_snapshots()
+                .iter()
+                .map(|j| j.assigned_task_count())
+                .sum();
+            if running > 0 {
+                tracing::warn!(
+                    running_tasks = running,
+                    "InProcessCoordinatorBridge dropped with in-flight tasks; \
+                     tasks will not receive further status updates"
+                );
+            }
+        }
+    }
+}
+
 fn lock_coord(
     coordinator: &Arc<Mutex<Coordinator>>,
 ) -> Result<std::sync::MutexGuard<'_, Coordinator>, tonic::Status> {

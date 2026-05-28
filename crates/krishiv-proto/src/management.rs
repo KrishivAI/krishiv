@@ -1,10 +1,12 @@
 //! Management RPC types.
 
+use crate::ids::JobId;
+
 /// Domain types for the coordinator management service (GAP-RT-04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerSavepointRequest {
-    pub job_id: String,
-    /// Empty string means no label. Use `label_opt()` for `Option<String>`.
+    pub job_id: JobId,
+    /// Empty string means no label.
     pub label: String,
 }
 
@@ -15,7 +17,7 @@ pub struct TriggerSavepointResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreJobRequest {
-    pub job_id: String,
+    pub job_id: JobId,
     pub epoch: u64,
     pub storage_path: String,
 }
@@ -28,7 +30,7 @@ pub struct RestoreJobResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListCheckpointsRequest {
-    pub job_id: String,
+    pub job_id: JobId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +47,7 @@ pub struct ListCheckpointsResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectStateRequest {
-    pub job_id: String,
+    pub job_id: JobId,
     pub operator_id: String,
 }
 

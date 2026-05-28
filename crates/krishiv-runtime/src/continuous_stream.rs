@@ -148,6 +148,6 @@ mod tests {
             .push_input("job-1", vec![batch(1_000)])
             .expect("push");
         let out = registry.drain_job("job-1").expect("drain");
-        assert!(out.is_empty() || !out.is_empty());
+        assert!(out.is_empty(), "no window boundary reached yet, expected empty output");
     }
 }

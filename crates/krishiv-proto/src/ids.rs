@@ -51,6 +51,7 @@ macro_rules! id_type {
     ($name:ident, $kind:literal) => {
         #[doc = concat!("Typed ", $kind, " identifier.")]
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         pub struct $name(String);
 
         impl $name {

@@ -48,9 +48,10 @@ impl MemoCache {
             .lock()
             .map_err(|_| ExecError::Arrow("memo cache lock poisoned".into()))?;
 
-        if !map.contains_key(&key) {
-            order.push_back(key);
+        if map.contains_key(&key) {
+            order.retain(|k| k != &key);
         }
+        order.push_back(key);
         map.insert(key, encoded);
 
         while order.len() > self.max_entries {
@@ -151,5 +152,36 @@ mod tests {
         cache.store(k3, batch(3)).unwrap();
         assert!(cache.lookup_or_miss(k1).is_none());
         assert!(cache.lookup_or_miss(k3).is_some());
+    }
+
+    #[test]
+    fn memo_lru_re_insert_promotes_key() {
+        let cache = MemoCache::new(2);
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        cache.store(k1, batch(1)).unwrap();
+        cache.store(k2, batch(2)).unwrap();
+        // Re-store k1 — this should promote it to the back of the LRU.
+        cache.store(k1, batch(10)).unwrap();
+        // k2 should still be accessible (not evicted).
+        let hit = cache.lookup_or_miss(k2).unwrap();
+        assert_eq!(
+            hit.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        // k1 should have the updated value.
+        let hit1 = cache.lookup_or_miss(k1).unwrap();
+        assert_eq!(
+            hit1.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
     }
 }

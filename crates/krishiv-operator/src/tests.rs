@@ -109,8 +109,8 @@ mod operator_tests {
         let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
 
         assert_eq!(outcome.action(), ReconcileAction::Observed);
-        assert_eq!(outcome.status().tasks.assigned, 0);
-        assert_eq!(outcome.status().tasks.running, 2);
+        assert_eq!(outcome.status().tasks.assigned, 2);
+        assert_eq!(outcome.status().tasks.running, 0);
     }
 
     #[test]
@@ -232,7 +232,7 @@ mod operator_tests {
 
         let runtime = KubernetesControllerRuntime::new(&config).unwrap();
         let shared = runtime.coordinator();
-        let coordinator = shared.read().unwrap();
+        let coordinator = shared.blocking_read();
 
         assert_eq!(coordinator.coordinator_id().as_str(), "coord-1");
         assert_eq!(coordinator.executor_snapshots().len(), 1);
@@ -532,7 +532,7 @@ mod operator_tests {
             ExecutorState::Lost
         );
         let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
-        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Assigned);
+        assert_eq!(detail.stages()[0].tasks()[0].state(), TaskState::Pending);
     }
 
     // ── R7.1 CrdQueueManager tests ───────────────────────────────────────────

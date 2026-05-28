@@ -1,6 +1,6 @@
 //! Typed task fragments with explicit execution kind (unified batch/streaming).
 
-use crate::{ExecutionKind, NodeOp, PlanNode};
+use crate::{ExecutionKind, NodeOp, PlanError, PlanNode};
 
 const FRAGMENT_PREFIX: &str = "krishiv-fragment:";
 
@@ -19,9 +19,10 @@ impl TypedTaskFragment {
         }
     }
 
-    pub fn encode(&self) -> String {
-        let json = serde_json::to_string(self).expect("fragment json");
-        format!("{FRAGMENT_PREFIX}{json}")
+    pub fn encode(&self) -> Result<String, PlanError> {
+        let json = serde_json::to_string(self)
+            .map_err(|e| PlanError::Encode(format!("fragment json: {e}")))?;
+        Ok(format!("{FRAGMENT_PREFIX}{json}"))
     }
 
     pub fn decode(fragment: &str) -> Option<Self> {
@@ -57,7 +58,7 @@ impl TypedTaskFragment {
 }
 
 /// Encode a plan node as a typed task fragment string for the scheduler/executor.
-pub fn encode_typed_task_fragment(node: &PlanNode) -> String {
+pub fn encode_typed_task_fragment(node: &PlanNode) -> Result<String, PlanError> {
     let body = crate::encode_task_fragment(node);
     TypedTaskFragment::new(node.kind(), body).encode()
 }
@@ -81,7 +82,7 @@ mod tests {
                 window_size_ms: 1_000,
                 aggs: vec![],
             });
-        let encoded = encode_typed_task_fragment(&node);
+        let encoded = encode_typed_task_fragment(&node).expect("encode");
         let decoded = TypedTaskFragment::decode_or_legacy(&encoded);
         assert_eq!(decoded.execution_kind, ExecutionKind::Streaming);
         assert!(decoded.body.starts_with("stream:"));

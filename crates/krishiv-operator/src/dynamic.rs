@@ -23,6 +23,16 @@ pub fn resource_from_dynamic_object(object: &DynamicObject) -> OperatorResult<Kr
 }
 
 /// Patch `metadata.finalizers` to include the Krishiv job finalizer (P0-6).
+///
+/// # Risk: `force=true` field manager conflicts
+///
+/// This function uses `PatchParams::apply(FIELD_MANAGER).force()`.  The
+/// `force` flag causes this field manager to **take ownership** of any fields
+/// that conflict with other managers.  If another controller or webhook has
+/// set finalizers on this resource, the force-apply may overwrite or remove
+/// those entries.  Use `Patch::Merge` or a strategic-merge patch without
+/// `force` if coexistence with other finalizer-setting controllers is
+/// required.
 pub async fn patch_krishivjob_finalizer(
     jobs: &Api<DynamicObject>,
     resource: &KrishivJobResource,

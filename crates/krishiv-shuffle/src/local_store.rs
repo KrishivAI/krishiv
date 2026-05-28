@@ -1,4 +1,5 @@
 use crate::{CompressionCodec, ShuffleCompression, ShuffleError, ShufflePath, ShuffleResult};
+use crate::error::io_err;
 use std::path::PathBuf;
 
 /// Local-disk shuffle store.
@@ -82,13 +83,13 @@ impl LocalShuffleStore {
             Ok(bytes) => {
                 // Validate and parse the KSH magic header.
                 if bytes.len() < 4 {
-                    return Err(ShuffleError::Io(format!(
+                    return Err(io_err(format!(
                         "shuffle file too short to contain header: {}",
                         final_path.display()
                     )));
                 }
                 if bytes[0] != 0x4B || bytes[1] != 0x53 || bytes[2] != 0x48 {
-                    return Err(ShuffleError::Io(format!(
+                    return Err(io_err(format!(
                         "invalid shuffle file magic bytes in: {}",
                         final_path.display()
                     )));
@@ -98,7 +99,7 @@ impl LocalShuffleStore {
                     0x01 => ShuffleCompression::Lz4,
                     0x02 => ShuffleCompression::Zstd,
                     other => {
-                        return Err(ShuffleError::Io(format!(
+                        return Err(io_err(format!(
                             "unknown shuffle codec byte 0x{other:02X} in: {}",
                             final_path.display()
                         )));
@@ -111,7 +112,7 @@ impl LocalShuffleStore {
                     path: final_path.display().to_string(),
                 })
             }
-            Err(e) => Err(ShuffleError::Io(e.to_string())),
+            Err(e) => Err(crate::error::io_err(e.to_string())),
         }
     }
 
@@ -123,7 +124,7 @@ impl LocalShuffleStore {
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ShuffleError::Io(e.to_string())),
+            Err(e) => Err(crate::error::io_err(e.to_string())),
         }
     }
 }

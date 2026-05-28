@@ -13,6 +13,14 @@ pub fn set_grpc_auth_provider(provider: Arc<dyn krishiv_governance::AuthProvider
 }
 
 /// Validate `auth` when a provider is configured; otherwise allow anonymous access.
+///
+/// # Security
+///
+/// Auth is **opt-in per-handler**.  Each gRPC handler or HTTP endpoint must
+/// call `validate_grpc_auth` explicitly — the function is NOT automatically
+/// applied by middleware.  Handlers that omit the call accept anonymous
+/// traffic.  In production deployments, ensure every mutating endpoint
+/// validates the `AuthContext` before acting on the request.
 pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
     let Some(provider) = GRPC_AUTH_PROVIDER.get() else {
         return Ok(());

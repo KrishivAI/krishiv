@@ -187,11 +187,18 @@ impl AggState {
     /// Return the finalized integer value for position `i`.
     pub(crate) fn finalized_value(&self, i: usize, expr: &AggExpr) -> i64 {
         match expr.function {
-            AggFunction::Min | AggFunction::Max => {
+            AggFunction::Min => {
                 if self.has_value[i] {
                     self.values[i]
                 } else {
-                    0
+                    i64::MAX
+                }
+            }
+            AggFunction::Max => {
+                if self.has_value[i] {
+                    self.values[i]
+                } else {
+                    i64::MIN
                 }
             }
             _ => self.values[i],
@@ -200,7 +207,7 @@ impl AggState {
 
     pub(crate) fn finalized_avg(&self, i: usize) -> f64 {
         if self.avg_counts[i] == 0 {
-            0.0
+            f64::NAN
         } else {
             self.avg_sums[i] / self.avg_counts[i] as f64
         }

@@ -46,10 +46,10 @@ pub fn encode_stream_kafka_partition(
             })?;
         let ts = time_arr.value(row);
         let val = if let Some(vidx) = value_idx {
-            format_key_value(batch, vidx, row)
-                .map_err(|e| RuntimeError::transport(e.to_string()))?
-                .parse::<i64>()
-                .unwrap_or(0)
+            let raw = format_key_value(batch, vidx, row)
+                .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            raw.parse::<i64>()
+                .map_err(|e| RuntimeError::transport(format!("value column parse error: {e}")))?
         } else {
             0
         };

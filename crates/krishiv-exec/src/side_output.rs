@@ -36,7 +36,7 @@ impl SideOutputRouter {
     /// Classify `event_time_ms` relative to current watermark.
     pub fn is_late(&self, watermark: &WatermarkState, event_time_ms: i64) -> bool {
         let threshold = self.spec.lateness_threshold_ms as i64;
-        event_time_ms < watermark.current_watermark_ms() - threshold
+        event_time_ms < watermark.current_watermark_ms().saturating_sub(threshold)
     }
 }
 
