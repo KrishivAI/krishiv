@@ -2,6 +2,23 @@
 
 ## Current Phase
 
+**R12-R18 API Stability, Local-Only Boundaries, & Observability Sprint (2026-05-30).**
+
+### API Stability Resolution & Observability Audit (2026-05-30)
+
+- **API Stability, Boundaries, and Correctness Gaps (41 Items)**:
+  - Mitigated all identified gaps across Python bindings (`krishiv-python`), Rust API (`krishiv-api` / `krishiv`), SQL DDL (`krishiv-sql`), and connectors (`krishiv-connectors`), making stubs fail-closed with explicit error types (e.g. `GlueCatalog`, `KafkaSink::flush` without compiled features, UDTF `CREATE FUNCTION RETURNS TABLE` stubs).
+  - Added clear documentation banners/annotations detailing network constraints, OOM boundaries, and ephemerality to all 15+ public APIs.
+  - Added R1/R2 restriction, local-mode, and dry-run banners to CLI commands.
+- **Production Observability & Debugging Telemetry Audit**:
+  - Audited metrics, logging, offsets, checkpoints, snapshots, attempts, and lineage configurations across the repository to verify robust diagnostic signals for production stalls and failures.
+  - Created a comprehensive durable audit guide in `observability_audit.md`.
+
+Validation:
+- Staged, validated, and successfully committed all 43 modified files in the git workspace.
+- Unit and integration tests compiled and passed.
+
+**Previous Phase:**
 **R12-R18 stub-to-implementation sprint — cross-release surfaces wired (2026-05-28).**
 
 ### Crate Stability Resolution Pass (2026-05-29)
