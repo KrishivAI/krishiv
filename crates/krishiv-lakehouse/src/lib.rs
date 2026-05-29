@@ -364,13 +364,8 @@ impl LakehouseTable for MemoryLakehouseTable {
                         .filter_map(|col_name| schema.index_of(col_name).ok())
                         .collect();
 
-                    let columns: Vec<Arc<dyn Array>> =
-                        indices.iter().map(|&i| batch.column(i).clone()).collect();
-                    let fields: Vec<Field> =
-                        indices.iter().map(|&i| schema.field(i).clone()).collect();
-                    let new_schema = Arc::new(Schema::new(fields));
-
-                    RecordBatch::try_new(new_schema, columns)
+                    batch
+                        .project(&indices)
                         .expect("column selection should always produce a valid batch")
                 })
                 .collect()

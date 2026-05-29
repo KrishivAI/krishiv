@@ -16,11 +16,11 @@ pub fn set_grpc_auth_provider(provider: Arc<dyn krishiv_governance::AuthProvider
 ///
 /// # Security
 ///
-/// Auth is **opt-in per-handler**.  Each gRPC handler or HTTP endpoint must
-/// call `validate_grpc_auth` explicitly — the function is NOT automatically
-/// applied by middleware.  Handlers that omit the call accept anonymous
-/// traffic.  In production deployments, ensure every mutating endpoint
-/// validates the `AuthContext` before acting on the request.
+/// Auth is **mandatory for mutating RPCs**.  Every mutating gRPC handler
+/// must either use the [`auth_interceptor`] middleware or call this function
+/// directly (wrapped by the [`require_auth!`] macro) before acting on the
+/// request.  Anonymous traffic is only permitted when no auth provider is
+/// configured.
 pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
     let Some(provider) = GRPC_AUTH_PROVIDER.get() else {
         return Ok(());
@@ -66,6 +66,28 @@ impl AuthContext {
             Self::Bearer { subject } => subject.as_str(),
         }
     }
+}
+
+/// Tonic interceptor that enforces auth on every incoming request.
+///
+/// When no auth provider is configured all requests pass through.  Otherwise
+/// the request must carry a valid bearer token in the `authorization`
+/// metadata header.
+pub fn auth_interceptor(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+    let ctx = extract_auth_context(req.metadata());
+    validate_grpc_auth(&ctx)?;
+    Ok(req)
+}
+
+/// Macro that every mutating gRPC handler MUST use at its entry point.
+///
+/// Expands to `validate_grpc_auth($auth)?`, returning an
+/// `unauthenticated` tonic status when auth is required but missing.
+#[macro_export]
+macro_rules! require_auth {
+    ($auth:expr) => {
+        $crate::auth::validate_grpc_auth($auth)?
+    };
 }
 
 /// Extract an `AuthContext` from the gRPC request metadata.

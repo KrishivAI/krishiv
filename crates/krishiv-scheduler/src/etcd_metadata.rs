@@ -65,17 +65,17 @@ impl EtcdMetadataStore {
                 "etcd metadata snapshot exceeds 1 MiB; etcd default limit is 1.5 MiB"
             );
         }
-        let mut client = self.client.blocking_lock();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.put(
-                METADATA_SNAPSHOT_KEY,
-                bytes,
-                None,
-            ))
-        })
-        .map_err(|e| SchedulerError::Transport {
-            message: format!("etcd metadata snapshot write failed: {e}"),
-        })?;
+        let mut client = self.client.blocking_lock().clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(client.put(METADATA_SNAPSHOT_KEY, bytes, None))
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("etcd metadata snapshot write failed: {e}"),
+                })
+        });
+        krishiv_async_util::block_on(handle).map_err(|e| SchedulerError::Transport {
+            message: format!("spawn_blocking join failed: {e}"),
+        })??;
         Ok(())
     }
 }

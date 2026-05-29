@@ -163,7 +163,7 @@ fn apply_multi_source_watermark(keyed: &KeyedStream, spec: &mut LocalWindowExecu
             .iter()
             .map(|(id, ws)| (id.clone(), ws.lag_ms()))
             .collect();
-        spec.source_id_column = Some(String::from("source_id"));
+        spec.source_id_column = ms.source_id_column().map(|s| s.to_string());
     }
 }
 
@@ -225,6 +225,7 @@ fn execute_windowed_inner(
 #[derive(Debug, Clone, Default)]
 pub struct MultiSourceWatermarkSpec {
     source_specs: std::collections::HashMap<String, WatermarkSpec>,
+    source_id_column: Option<String>,
 }
 
 impl MultiSourceWatermarkSpec {
@@ -240,9 +241,21 @@ impl MultiSourceWatermarkSpec {
         self
     }
 
+    /// Set the column name that identifies the source in each row.
+    #[must_use]
+    pub fn with_source_id_column(mut self, column: impl Into<String>) -> Self {
+        self.source_id_column = Some(column.into());
+        self
+    }
+
     /// The configured per-source specs.
     pub fn source_specs(&self) -> &std::collections::HashMap<String, WatermarkSpec> {
         &self.source_specs
+    }
+
+    /// The source id column name, if configured.
+    pub fn source_id_column(&self) -> Option<&str> {
+        self.source_id_column.as_deref()
     }
 }
 

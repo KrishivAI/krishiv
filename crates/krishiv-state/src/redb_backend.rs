@@ -37,6 +37,22 @@ impl RedbStateBackend {
                 Ok(this)
             }
             Err(e) => {
+                // Only recover from corruption.  Other errors (permissions,
+                // disk-full, lock contention) must be surfaced so the caller can
+                // react correctly rather than silently losing state.
+                let is_corrupt = matches!(
+                    e,
+                    redb::DatabaseError::Storage(redb::StorageError::Corrupted(_))
+                );
+                if !is_corrupt {
+                    return Err(StateError::BackendUnavailable {
+                        message: format!("redb open failed (not corruption): {e}"),
+                        source: Some(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))),
+                    });
+                }
                 let ts = unix_now_ms();
                 let corrupt_path = format!("{}.corrupt.{ts}", path.display());
                 tracing::error!(

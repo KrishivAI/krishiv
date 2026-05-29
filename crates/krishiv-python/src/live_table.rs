@@ -35,9 +35,8 @@ impl PyLiveTable {
     }
 
     pub fn drop(&self) -> PyResult<()> {
-        let reg = LiveTableRegistry::new();
         let sql = format!("DROP LIVE TABLE {}", self.name);
-        execute_live_table_ddl(&std::sync::Mutex::new(reg), &sql)
+        execute_live_table_ddl(&LIVE_TABLE_REGISTRY, &sql)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(())
     }
@@ -119,13 +118,15 @@ impl PyChangeFeedIter {
     }
 }
 
+static LIVE_TABLE_REGISTRY: std::sync::LazyLock<std::sync::Mutex<LiveTableRegistry>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(LiveTableRegistry::new()));
+
 pub fn create_live_table(name: String, query: String) -> PyResult<PyLiveTable> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let store = Arc::new(MemoryDeltaStore::new());
     let exec = CreateLiveTableExec::new(name.clone(), query.clone(), schema, Some(store.clone()));
-    let reg = LiveTableRegistry::new();
     let ddl = format!("CREATE LIVE TABLE {name} AS {query}");
-    execute_live_table_ddl(&std::sync::Mutex::new(reg), &ddl)
+    execute_live_table_ddl(&LIVE_TABLE_REGISTRY, &ddl)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyLiveTable { name, store, exec })
 }

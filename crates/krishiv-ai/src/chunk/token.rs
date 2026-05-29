@@ -35,18 +35,23 @@ impl TokenAwareChunker {
         if max_tokens == 0 {
             return 0;
         }
+        // Use char_indices so every probe is at a valid UTF-8 boundary,
+        // preventing panic on multi-byte characters.
+        let char_indices: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
         let mut lo = 0usize;
-        let mut hi = text.len();
+        let mut hi = char_indices.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.token_len(&text[..mid]) <= max_tokens {
+            let byte_pos = char_indices[mid];
+            if self.token_len(&text[..byte_pos]) <= max_tokens {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        // lo is the first index where tokens exceed max_tokens, or text.len() if all fit
-        lo.min(text.len()).max(1.min(text.len()))
+        // lo is the first char index where tokens exceed max_tokens
+        let byte_pos = char_indices.get(lo).copied().unwrap_or(text.len());
+        byte_pos.min(text.len()).max(1.min(text.len()))
     }
 }
 

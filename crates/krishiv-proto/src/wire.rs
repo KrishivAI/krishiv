@@ -14,10 +14,10 @@ use crate::ids::{
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::task::{
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
-    InputPartitionDescriptor, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
-    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
-    TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse,
-    TransportDisposition,
+    InputPartitionDescriptor, KeyGroupRange, MemoryKafkaRecord, OutputContract,
+    OutputContractDescriptor, OutputContractKind, PlanFragment, RegisterExecutorRequest,
+    RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest,
+    TaskStatusResponse, TransportDisposition,
 };
 
 pub mod v1 {
@@ -414,6 +414,9 @@ pub fn executor_task_assignment_to_wire(
         plan_fragment: Some(plan_fragment_to_wire(value.plan_fragment())),
         output_contract: Some(output_contract_to_wire(value.output_contract())),
         task_timeout_secs: value.task_timeout_secs().unwrap_or(0),
+        key_group_range_start: value.key_group_range().start(),
+        key_group_range_end: value.key_group_range().end(),
+        has_key_group_range: true,
     }
 }
 
@@ -451,6 +454,12 @@ pub fn executor_task_assignment_from_wire(
     .with_input_partitions(input_partitions);
     if value.task_timeout_secs > 0 {
         assignment = assignment.with_task_timeout_secs(value.task_timeout_secs);
+    }
+    if value.has_key_group_range {
+        assignment = assignment.with_key_group_range(KeyGroupRange::new(
+            value.key_group_range_start,
+            value.key_group_range_end,
+        ));
     }
     Ok(assignment)
 }

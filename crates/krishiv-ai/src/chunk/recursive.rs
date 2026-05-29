@@ -34,14 +34,17 @@ impl RecursiveTextChunker {
         let sep = &self.separators[sep_idx];
         if sep.is_empty() {
             let mut parts = Vec::new();
-            let mut start = 0usize;
-            while start < text.len() {
-                let end = (start + self.chunk_size).min(text.len());
-                parts.push((start, end, text[start..end].to_string()));
-                if end == text.len() {
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            let mut start_idx = 0usize;
+            while start_idx < chars.len() {
+                let end_idx = (start_idx + self.chunk_size).min(chars.len());
+                let start_byte = chars[start_idx].0;
+                let end_byte = chars.get(end_idx).map(|(i, _)| *i).unwrap_or(text.len());
+                parts.push((start_byte, end_byte, text[start_byte..end_byte].to_string()));
+                if end_idx == chars.len() {
                     break;
                 }
-                start = end.saturating_sub(self.chunk_overlap);
+                start_idx = end_idx.saturating_sub(self.chunk_overlap);
             }
             return parts;
         }

@@ -687,13 +687,9 @@ impl Source for RdkafkaKafkaSource {
                 .await
                 .unwrap_or(false);
 
-                if at_eof {
-                    Ok(None)
-                } else {
-                    Ok(Some(arrow::record_batch::RecordBatch::new_empty(
-                        std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-                    )))
-                }
+                // Return Ok(None) both at EOF and on idle timeout so the caller
+                // can back off instead of busy-looping on empty batches.
+                Ok(None)
             }
             Ok(Err(e)) => Err(crate::ConnectorError::IoStr {
                 message: format!("rdkafka receive error: {e}"),

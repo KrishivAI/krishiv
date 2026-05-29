@@ -120,6 +120,9 @@ message ExecutorTaskAssignment {
   PlanFragment plan_fragment = 9;
   OutputContract output_contract = 10;
   uint64 task_timeout_secs = 11;
+  uint32 key_group_range_start = 12;
+  uint32 key_group_range_end = 13;
+  bool has_key_group_range = 14;
 }
 
 message InputPartition {

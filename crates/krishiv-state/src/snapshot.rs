@@ -89,5 +89,12 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
         entries.push((op_id, state_name, key, value));
     }
 
+    if pos != bytes.len() {
+        return Err(corrupt(&format!(
+            "trailing garbage after {count} entries: {} extra bytes",
+            bytes.len() - pos
+        )));
+    }
+
     Ok(entries)
 }

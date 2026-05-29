@@ -997,7 +997,11 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
                 let l = meta.savepoint_label.unwrap_or_default();
                 (k, l)
             }
-            _ => ("unknown", String::new()),
+            Ok(None) => ("unknown", String::new()),
+            Err(e) => {
+                eprintln!("warning: failed to read epoch metadata for {epoch}: {e}");
+                ("error", String::new())
+            }
         };
         out.push_str(&format!("{epoch}\t{kind}\t{label}\n"));
     }

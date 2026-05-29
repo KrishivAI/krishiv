@@ -86,61 +86,20 @@ impl TableProvider for DeltaScanProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[datafusion::logical_expr::Expr],
-        _limit: Option<usize>,
+        filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let schema = self.schema();
-        let mut batches = self
+        let batches = self
             .handle
             .scan_batches()
             .await
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
 
-        // Apply projection to reduce columns per batch before MemTable.
-        let out_schema: SchemaRef = if let Some(proj) = projection {
-            let fields: Vec<_> = proj.iter().map(|&i| schema.field(i).clone()).collect();
-            let out = Arc::new(arrow::datatypes::Schema::new(fields));
-            batches = batches
-                .into_iter()
-                .map(|batch| {
-                    let columns: Vec<_> = proj.iter().map(|&i| batch.column(i).clone()).collect();
-                    RecordBatch::try_new(out.clone(), columns)
-                        .map_err(|e| DataFusionError::External(e.to_string().into()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out
-        } else {
-            schema
-        };
-
-        // Apply limit to reduce row count before MemTable.
-        if let Some(limit) = _limit {
-            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-            if limit < total {
-                let mut accumulated = 0;
-                let mut limited = Vec::new();
-                for batch in batches {
-                    let start = accumulated;
-                    accumulated += batch.num_rows();
-                    if start >= limit {
-                        break;
-                    }
-                    let remaining = limit - start;
-                    if remaining >= batch.num_rows() {
-                        limited.push(batch);
-                    } else {
-                        limited.push(batch.slice(0, remaining));
-                        break;
-                    }
-                }
-                batches = limited;
-            }
-        }
-
-        let table = MemTable::try_new(out_schema, vec![batches])?;
-        let plan = table.scan(_state, None, _filters, None).await?;
+        let table = MemTable::try_new(schema, vec![batches])?;
+        let plan = table.scan(state, projection, filters, limit).await?;
         Ok(plan)
     }
 }
@@ -174,54 +133,13 @@ impl TableProvider for HudiScanProvider {
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let schema = self.schema();
-        let mut batches = self
+        let batches = self
             .reader
             .scan_batches()
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
 
-        // Apply projection to reduce columns per batch before MemTable.
-        let out_schema: SchemaRef = if let Some(proj) = projection {
-            let fields: Vec<_> = proj.iter().map(|&i| schema.field(i).clone()).collect();
-            let out = Arc::new(arrow::datatypes::Schema::new(fields));
-            batches = batches
-                .into_iter()
-                .map(|batch| {
-                    let columns: Vec<_> = proj.iter().map(|&i| batch.column(i).clone()).collect();
-                    RecordBatch::try_new(out.clone(), columns)
-                        .map_err(|e| DataFusionError::External(e.to_string().into()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out
-        } else {
-            schema
-        };
-
-        // Apply limit to reduce row count before MemTable.
-        if let Some(limit_val) = limit {
-            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-            if limit_val < total {
-                let mut accumulated = 0;
-                let mut limited = Vec::new();
-                for batch in batches {
-                    let start = accumulated;
-                    accumulated += batch.num_rows();
-                    if start >= limit_val {
-                        break;
-                    }
-                    let remaining = limit_val - start;
-                    if remaining >= batch.num_rows() {
-                        limited.push(batch);
-                    } else {
-                        limited.push(batch.slice(0, remaining));
-                        break;
-                    }
-                }
-                batches = limited;
-            }
-        }
-
-        let table = MemTable::try_new(out_schema, vec![batches])?;
-        table.scan(state, None, filters, None).await
+        let table = MemTable::try_new(schema, vec![batches])?;
+        table.scan(state, projection, filters, limit).await
     }
 }
 

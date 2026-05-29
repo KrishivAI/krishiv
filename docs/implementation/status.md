@@ -4,6 +4,135 @@
 
 **R12-R18 stub-to-implementation sprint — cross-release surfaces wired (2026-05-28).**
 
+### Crate Stability Resolution Pass (2026-05-29)
+
+Continued the crate stability plan work from
+`docs/implementation/crate-review-mitigation-plan.md` after confirming the
+requested `docs/implementation/crate-stability-resolution-plan.md` path is not
+present in this worktree.
+
+- Fixed the critical `krishiv-shuffle` in-memory spill race from
+  `review_report.md`:
+  - `InMemoryShuffleStore` now serializes the spill-enabled write critical
+    section across capacity enforcement and final in-memory insertion.
+  - This prevents a spill task from cloning an older partition, awaiting disk
+    I/O, and then deleting a newer replacement written by another task.
+  - Added `concurrent_spill_does_not_delete_newer_replacement`.
+- Corrected the existing spill failure regression test to match the store
+  contract: failed spill I/O returns an error, keeps existing in-memory data
+  readable, does not commit the incoming partition, and supports retry after
+  the spill sink is fixed.
+- Fixed Phase 1 item 1.11 from the crate review plan:
+  `krishiv cluster start` now uses `127.0.0.1` for executor barrier gRPC
+  addresses instead of the invalid `127.0.0.0`.
+  Added `executor_barrier_addr_uses_loopback_host`.
+
+Validation:
+```bash
+cargo test -p krishiv-shuffle --lib concurrent_spill_does_not_delete_newer_replacement
+# 1 passed, 0 failed
+
+cargo test -p krishiv-shuffle --lib spill_failure_does_not_corrupt_bytes_used
+# 1 passed, 0 failed
+
+cargo test -p krishiv --lib executor_barrier_addr_uses_loopback_host
+# 1 passed, 0 failed
+
+cargo test -p krishiv-shuffle --lib -- --skip flight_server_serves_partition_and_client_reads_it --skip flight_client_returns_error_for_missing_partition
+# 85 passed, 0 failed, 2 filtered out
+```
+
+Known validation caveat:
+`cargo test -p krishiv-shuffle --lib` without skips still fails in this sandbox
+because the two Flight tests attempt local listener binding and receive
+`Operation not permitted`.
+
+Next useful task: continue Phase 1 high-severity stability fixes, starting with
+executor lease-generation race hardening or hardcoded key-group range removal.
+
+---
+
+### Crate Stability Key-Group Range Pass (2026-05-29)
+
+Implemented Phase 1 item 1.13 from
+`docs/implementation/crate-review-mitigation-plan.md`.
+
+- Added `KeyGroupRange` to the `krishiv-proto` task assignment domain model.
+- Extended `ExecutorTaskAssignment` wire encoding with
+  `key_group_range_start` / `key_group_range_end` fields plus explicit
+  `has_key_group_range` presence so legacy wire messages still default to the
+  full single-node range while `0..0` remains representable.
+- Scheduler launch assignments now compute an inclusive key-group range per
+  stage task from stage parallelism and attach it to each executor assignment.
+- Executor barrier handling now has a shared task-id keyed key-group registry:
+  - `ExecutorTaskRunner` records the assignment range when a task starts and
+    clears it with the running-attempt entry.
+  - `ExecutorBarrierService` uses the registered task range when generating
+    checkpoint `StateHandle` metadata.
+  - The service still defaults to the full `0..32767` range when no task range
+    is registered, preserving single-node behavior.
+- Added focused tests for assignment wire round-trip, scheduler range splitting,
+  barrier service range lookup, and checkpoint-id task parsing.
+
+Validation:
+```bash
+cargo test -p krishiv-proto --lib
+# 61 passed, 0 failed
+
+cargo test -p krishiv-scheduler --lib key_group_ranges_split_stage_parallelism
+# 1 passed, 0 failed; pre-existing dead_code warnings in scheduler/store.rs
+
+cargo test -p krishiv-executor --lib service_uses_registered_task_key_group_range
+# 1 passed, 0 failed
+
+cargo test -p krishiv-executor --lib checkpoint_id_task_parser_rejects_empty_task
+# 1 passed, 0 failed
+
+cargo check -p krishiv-scheduler -p krishiv-executor
+# OK; pre-existing scheduler/store.rs dead_code warnings remain
+```
+
+Next useful task: continue Phase 1 item 1.12 by adding a direct regression test
+for stale heartbeat lease responses and successful re-registration lease
+updates, or audit/fix Phase 1 item 1.10 proto heartbeat field coverage if the
+lease behavior is already fully tested elsewhere.
+
+---
+
+### Crate Stability Lease-Generation Pass (2026-05-29)
+
+Implemented Phase 1 item 1.12 from
+`docs/implementation/crate-review-mitigation-plan.md`.
+
+- `ExecutorRuntime::heartbeat_with_grpc_endpoint()` no longer mutates the
+  runtime lease before the CLI can inspect the heartbeat disposition.
+- The executor heartbeat loop now applies heartbeat lease updates only through
+  `apply_non_stale_heartbeat_lease()`, which refuses `StaleLease` and
+  `UnknownExecutor` responses.
+- Successful re-registration updates both the runtime config lease and the
+  shared lease handle through `apply_successful_reregister_lease()`.
+- Added direct regression tests proving:
+  - a stale heartbeat response does not advance runtime or shared lease state;
+  - a successful re-registration advances both lease holders.
+
+Validation:
+```bash
+cargo test -p krishiv-executor --lib stale_heartbeat_does_not_advance_runtime_or_shared_lease
+# 1 passed, 0 failed
+
+cargo test -p krishiv-executor --lib successful_reregister_advances_runtime_and_shared_lease
+# 1 passed, 0 failed
+
+cargo check -p krishiv-executor
+# OK
+```
+
+Next useful task: audit/fix Phase 1 item 1.10 proto heartbeat field coverage
+(`streaming_task_states`, `hot_key_reports`, `trace_context`,
+`checkpoint_commands`) and add missing round-trip tests.
+
+---
+
 ### Remaining R12-R18 Sink Commit Pass (2026-05-28)
 
 Closed the in-repo CDC sink commit gap and workspace cleanup from the previous

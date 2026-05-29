@@ -9,7 +9,7 @@ use krishiv_proto::wire::v1::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::barrier_transport::SharedBarrierInjector;
+use crate::barrier_transport::{SharedBarrierInjector, SharedKeyGroupRanges};
 
 /// Serves barrier injection and returns acknowledgments after enqueue.
 #[derive(Clone)]
@@ -18,6 +18,7 @@ pub struct ExecutorBarrierService {
     pub task_id: String,
     pub key_group_range_start: u32,
     pub key_group_range_end: u32,
+    pub key_group_ranges: SharedKeyGroupRanges,
 }
 
 impl ExecutorBarrierService {
@@ -27,6 +28,7 @@ impl ExecutorBarrierService {
             task_id: task_id.into(),
             key_group_range_start: 0,
             key_group_range_end: 32_767,
+            key_group_ranges: SharedKeyGroupRanges::new(),
         }
     }
 
@@ -36,6 +38,22 @@ impl ExecutorBarrierService {
         self.key_group_range_start = start;
         self.key_group_range_end = end;
         self
+    }
+
+    /// Use the task-id keyed ranges populated from executor assignments.
+    #[must_use]
+    pub fn with_key_group_ranges(mut self, ranges: SharedKeyGroupRanges) -> Self {
+        self.key_group_ranges = ranges;
+        self
+    }
+
+    /// Resolve the state-handle key-group range for a task ack.
+    pub fn key_group_range_for_task(&self, task_id: &str) -> (u32, u32) {
+        if let Some(range) = self.key_group_ranges.get(task_id) {
+            (range.start(), range.end())
+        } else {
+            (self.key_group_range_start, self.key_group_range_end)
+        }
     }
 }
 
@@ -59,11 +77,18 @@ impl BarrierService for ExecutorBarrierService {
         let task_id = self.task_id.clone();
         let key_group_range_start = self.key_group_range_start;
         let key_group_range_end = self.key_group_range_end;
+        let key_group_ranges = self.key_group_ranges.clone();
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 injector.enqueue(barrier.clone());
                 let ack_task_id = task_id_from_checkpoint_id(&barrier.checkpoint_id)
                     .unwrap_or_else(|| task_id.clone());
+                let (key_group_range_start, key_group_range_end) =
+                    if let Some(assigned_range) = key_group_ranges.get(&ack_task_id) {
+                        (assigned_range.start(), assigned_range.end())
+                    } else {
+                        (key_group_range_start, key_group_range_end)
+                    };
                 let ack = BarrierAck {
                     epoch: barrier.epoch,
                     job_id: barrier.job_id.clone(),
@@ -121,5 +146,33 @@ pub async fn send_barrier_and_wait_ack(
         Ok(Some(Err(status))) => Err(status),
         Ok(None) => Err(tonic::Status::internal("barrier stream closed")),
         Err(_) => Err(tonic::Status::deadline_exceeded("barrier ack timeout")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use krishiv_proto::KeyGroupRange;
+
+    use super::*;
+
+    #[test]
+    fn service_uses_registered_task_key_group_range() {
+        let ranges = SharedKeyGroupRanges::new();
+        ranges.set("task-1", KeyGroupRange::new(1024, 2047));
+        let service = ExecutorBarrierService::new(SharedBarrierInjector::new(), "exec-1")
+            .with_key_group_range(0, 32_767)
+            .with_key_group_ranges(ranges);
+
+        assert_eq!(service.key_group_range_for_task("task-1"), (1024, 2047));
+        assert_eq!(service.key_group_range_for_task("task-2"), (0, 32_767));
+    }
+
+    #[test]
+    fn checkpoint_id_task_parser_rejects_empty_task() {
+        assert_eq!(
+            task_id_from_checkpoint_id("task:stream-task/checkpoint-1").as_deref(),
+            Some("stream-task")
+        );
+        assert!(task_id_from_checkpoint_id("task:/checkpoint-1").is_none());
     }
 }

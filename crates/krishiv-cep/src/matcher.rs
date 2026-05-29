@@ -106,6 +106,7 @@ where
 {
     pattern: CompiledPattern,
     states: std::collections::HashMap<K, (SequentialPatternMatcher, CepKeyState)>,
+    max_partitions: usize,
 }
 
 impl<K> PartitionedCepMatcher<K>
@@ -116,6 +117,7 @@ where
         Self {
             pattern: pattern.clone(),
             states: std::collections::HashMap::new(),
+            max_partitions: 1024,
         }
     }
 
@@ -132,9 +134,20 @@ where
                 CepKeyState::default(),
             )
         });
-        entry
+        let result = entry
             .0
-            .process_event(&mut entry.1, stage_name, batch, event_time_ms)
+            .process_event(&mut entry.1, stage_name, batch, event_time_ms);
+        if self.states.len() > self.max_partitions {
+            if let Some(stalest) = self
+                .states
+                .iter()
+                .min_by_key(|(_, (_, state))| state.last_event_ms)
+                .map(|(k, _)| k.clone())
+            {
+                self.states.remove(&stalest);
+            }
+        }
+        result
     }
 }
 

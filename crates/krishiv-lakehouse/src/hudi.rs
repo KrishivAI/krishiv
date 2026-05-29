@@ -96,12 +96,27 @@ impl HudiSnapshotReader {
 
         if commit_metadata.iter().any(|meta| meta.base_file.is_some()) {
             return match self.query_type {
-                HudiQueryType::Snapshot => Ok(commit_metadata
-                    .iter()
-                    .rev()
-                    .find_map(|meta| meta.base_file.as_ref())
-                    .map(|path| vec![self.table_path.join(path)])
-                    .unwrap_or_default()),
+                HudiQueryType::Snapshot => {
+                    let mut files = Vec::new();
+                    let mut last_base_idx = None;
+                    for (i, meta) in commit_metadata.iter().enumerate().rev() {
+                        if meta.base_file.is_some() {
+                            last_base_idx = Some(i);
+                            break;
+                        }
+                    }
+                    if let Some(idx) = last_base_idx {
+                        for meta in &commit_metadata[idx..] {
+                            if let Some(base) = &meta.base_file {
+                                files.push(self.table_path.join(base));
+                            }
+                            if let Some(change) = &meta.change_file {
+                                files.push(self.table_path.join(change));
+                            }
+                        }
+                    }
+                    Ok(files)
+                }
                 HudiQueryType::Incremental => Ok(commit_metadata
                     .iter()
                     .filter_map(|meta| meta.change_file.as_ref().or(meta.base_file.as_ref()))
@@ -216,21 +231,23 @@ impl HudiCowWriter {
         let instant = instant.into();
         validate_instant(&instant)?;
         let current = self.current_snapshot_batch()?;
-        let merged = match current {
+        let (base_batch, snapshot_rows) = match current {
             Some(existing) if existing.num_rows() > 0 => {
-                concat_batches(&[existing, batch.clone()])?
+                (None, existing.num_rows() as u64 + batch.num_rows() as u64)
             }
-            _ => batch.clone(),
+            _ => (Some(&batch), batch.num_rows() as u64),
         };
-        self.write_commit(
+        let result = self.write_commit(
             &instant,
             "append",
             None,
-            &merged,
+            base_batch,
             &batch,
             batch.num_rows() as u64,
             0,
-        )
+            snapshot_rows,
+        )?;
+        Ok(result)
     }
 
     /// Upsert rows by primary-key column using a generated Hudi instant.
@@ -286,10 +303,11 @@ impl HudiCowWriter {
             &instant,
             "upsert",
             Some(key_column),
-            &merged,
+            Some(&merged),
             &source,
             rows_inserted,
             rows_updated,
+            merged.num_rows() as u64,
         )
     }
 
@@ -312,10 +330,11 @@ impl HudiCowWriter {
         instant: &str,
         action: &str,
         key_column: Option<&str>,
-        base_batch: &RecordBatch,
+        base_batch: Option<&RecordBatch>,
         change_batch: &RecordBatch,
         rows_inserted: u64,
         rows_updated: u64,
+        snapshot_rows: u64,
     ) -> LakehouseResult<HudiWriteResult> {
         fs::create_dir_all(self.table_path.join(".hoodie/timeline"))
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -336,16 +355,18 @@ impl HudiCowWriter {
         }
         fs::create_dir_all(&commit_dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
 
-        let base_rel = format!("{instant}/base-0.parquet");
+        let base_rel = base_batch.map(|_| format!("{instant}/base-0.parquet"));
         let change_rel = format!("{instant}/changes-0.parquet");
-        write_parquet_batch(&self.table_path.join(&base_rel), base_batch)?;
+        if let Some(base) = base_batch {
+            write_parquet_batch(&self.table_path.join(base_rel.as_ref().unwrap()), base)?;
+        }
         write_parquet_batch(&self.table_path.join(&change_rel), change_batch)?;
 
         let metadata = HudiCommitMetadata {
             instant: instant.to_string(),
             action: action.to_string(),
             key_column: key_column.map(str::to_string),
-            base_file: Some(base_rel),
+            base_file: base_rel,
             change_file: Some(change_rel),
             legacy_files: Vec::new(),
         };
@@ -356,7 +377,7 @@ impl HudiCowWriter {
             instant: instant.to_string(),
             rows_inserted,
             rows_updated,
-            snapshot_rows: base_batch.num_rows() as u64,
+            snapshot_rows,
         })
     }
 }

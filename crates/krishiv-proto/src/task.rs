@@ -10,6 +10,35 @@ use crate::ids::*;
 use crate::io::*;
 use crate::lifecycle::*;
 
+/// Inclusive key-group range assigned to a stateful task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyGroupRange {
+    start: u32,
+    end: u32,
+}
+
+impl KeyGroupRange {
+    /// Create an inclusive key-group range.
+    pub fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    /// Full single-node/default key-group range.
+    pub fn full() -> Self {
+        Self::new(0, 32_767)
+    }
+
+    /// First key group in the inclusive range.
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    /// Last key group in the inclusive range.
+    pub fn end(&self) -> u32 {
+        self.end
+    }
+}
+
 /// Task placement result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskAssignment {
@@ -981,6 +1010,7 @@ pub struct ExecutorTaskAssignment {
     trace_context: Option<TraceContext>,
     shuffle_write: Option<ShuffleWriteConfig>,
     shuffle_read: Option<ShuffleReadConfig>,
+    key_group_range: KeyGroupRange,
 }
 
 impl ExecutorTaskAssignment {
@@ -1007,6 +1037,7 @@ impl ExecutorTaskAssignment {
             trace_context: None,
             shuffle_write: None,
             shuffle_read: None,
+            key_group_range: KeyGroupRange::full(),
         }
     }
 
@@ -1120,6 +1151,18 @@ impl ExecutorTaskAssignment {
     /// Shuffle read configuration, if this task reads from the shuffle store.
     pub fn shuffle_read(&self) -> Option<&ShuffleReadConfig> {
         self.shuffle_read.as_ref()
+    }
+
+    /// Attach the inclusive key-group range owned by this task.
+    #[must_use]
+    pub fn with_key_group_range(mut self, range: KeyGroupRange) -> Self {
+        self.key_group_range = range;
+        self
+    }
+
+    /// Inclusive key-group range owned by this task.
+    pub fn key_group_range(&self) -> KeyGroupRange {
+        self.key_group_range
     }
 }
 

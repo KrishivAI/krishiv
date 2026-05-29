@@ -71,12 +71,16 @@ impl GenericRestCatalog {
     }
 
     fn url(&self, path: &str) -> String {
-        format!(
-            "{}/{}/{}",
+        let base = format!(
+            "{}/{}",
             self.config.base_url.trim_end_matches('/'),
-            self.config.prefix.trim_matches('/'),
-            path.trim_start_matches('/')
-        )
+            self.config.prefix.trim_matches('/')
+        );
+        let mut url = url::Url::parse(&base).expect("invalid base URL");
+        url.path_segments_mut()
+            .expect("cannot be a cannot-be-a-base URL")
+            .push(path.trim_start_matches('/'));
+        url.to_string()
     }
 
     async fn get_json(&self, url: String) -> CatalogResult<serde_json::Value> {

@@ -109,8 +109,12 @@ impl std::error::Error for DebeziumParseError {}
 /// ```
 ///
 /// Returns `None` if the envelope is malformed or `op` is unrecognized.
-pub fn parse_debezium_envelope(json: &str, partition_id: u32, offset: i64) -> Option<CdcEvent> {
-    parse_debezium_envelope_result(json, partition_id, offset).ok()
+pub fn parse_debezium_envelope(
+    json: &str,
+    partition_id: u32,
+    offset: i64,
+) -> Result<CdcEvent, DebeziumParseError> {
+    parse_debezium_envelope_result(json, partition_id, offset)
 }
 
 /// Strict Debezium JSON parser used by production CDC pipelines.
@@ -1065,10 +1069,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_malformed_envelope_returns_none() {
-        assert!(parse_debezium_envelope("{}", 0, 0).is_none());
-        assert!(parse_debezium_envelope("not json", 0, 0).is_none());
-        assert!(parse_debezium_envelope(r#"{"op":"z"}"#, 0, 0).is_none());
+    fn parse_malformed_envelope_returns_err() {
+        assert!(parse_debezium_envelope("{}", 0, 0).is_err());
+        assert!(parse_debezium_envelope("not json", 0, 0).is_err());
+        assert!(parse_debezium_envelope(r#"{"op":"z"}"#, 0, 0).is_err());
     }
 
     #[test]

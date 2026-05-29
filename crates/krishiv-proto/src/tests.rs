@@ -129,11 +129,16 @@ mod proto_tests {
             PlanFragment::new("scan parquet"),
             OutputContract::new(OutputContractKind::InlineRecordBatches, "return result"),
         )
-        .with_input_partitions(vec![InputPartition::new("part-1", "first file split")]);
+        .with_input_partitions(vec![InputPartition::new("part-1", "first file split")])
+        .with_key_group_range(KeyGroupRange::new(8192, 16383));
 
         assert_eq!(assignment.attempt_id(), AttemptId::initial());
         assert_eq!(assignment.lease_generation(), LeaseGeneration::initial());
         assert_eq!(assignment.input_partitions()[0].partition_id(), "part-1");
+        assert_eq!(
+            assignment.key_group_range(),
+            KeyGroupRange::new(8192, 16383)
+        );
         assert_eq!(
             assignment.output_contract().kind(),
             OutputContractKind::InlineRecordBatches
@@ -155,12 +160,41 @@ mod proto_tests {
             PlanFragment::new("scan parquet"),
             OutputContract::new(OutputContractKind::InlineRecordBatches, "return result"),
         )
-        .with_input_partitions(vec![InputPartition::new("part-1", "first file split")]);
+        .with_input_partitions(vec![InputPartition::new("part-1", "first file split")])
+        .with_key_group_range(KeyGroupRange::new(1024, 2047));
 
         let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone());
         let round_trip = crate::wire::executor_task_assignment_from_wire(wire).unwrap();
 
         assert_eq!(round_trip, assignment);
+    }
+
+    #[test]
+    fn executor_task_assignment_distinguishes_missing_and_zero_key_group_range() {
+        let ids = TaskAttemptRef::new(
+            JobId::try_new("job-kg-zero").unwrap(),
+            StageId::try_new("stage-1").unwrap(),
+            TaskId::try_new("task-1").unwrap(),
+            AttemptId::initial(),
+        );
+        let assignment = ExecutorTaskAssignment::new(
+            ids,
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("scan parquet"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "return result"),
+        )
+        .with_key_group_range(KeyGroupRange::new(0, 0));
+
+        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone());
+        let round_trip = crate::wire::executor_task_assignment_from_wire(wire.clone()).unwrap();
+        assert_eq!(round_trip.key_group_range(), KeyGroupRange::new(0, 0));
+
+        let mut legacy_wire = wire;
+        legacy_wire.has_key_group_range = false;
+        let legacy_round_trip =
+            crate::wire::executor_task_assignment_from_wire(legacy_wire).unwrap();
+        assert_eq!(legacy_round_trip.key_group_range(), KeyGroupRange::full());
     }
 
     #[test]

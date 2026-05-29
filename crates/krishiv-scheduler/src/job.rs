@@ -5,14 +5,28 @@ use krishiv_plan::{
 };
 use krishiv_proto::{
     AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, ExecutorTaskAssignment,
-    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
-    OutputContract, OutputContractKind, PlanFragment, StageId, StageSpec, StageState,
-    StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId, TaskOutputMetadata, TaskSpec,
-    TaskState, TaskStatusUpdate,
+    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, KeyGroupRange,
+    LeaseGeneration, OutputContract, OutputContractKind, PlanFragment, StageId, StageSpec,
+    StageState, StreamingTaskState, TaskAssignment, TaskAttemptRef, TaskId, TaskOutputMetadata,
+    TaskSpec, TaskState, TaskStatusUpdate,
 };
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
 use crate::{ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOutcome};
+
+const MAX_KEY_GROUPS: u32 = 32_768;
+
+fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
+    let p = parallelism.max(1) as u32;
+    let idx = task_index as u32;
+    let base = MAX_KEY_GROUPS / p;
+    let rem = MAX_KEY_GROUPS % p;
+    let extra_before = idx.min(rem);
+    let start = idx.saturating_mul(base) + extra_before;
+    let count = base + u32::from(idx < rem);
+    let end = start + count - 1;
+    KeyGroupRange::new(start, end)
+}
 
 /// Result of a `Coordinator::submit_job` call.
 ///
@@ -231,6 +245,7 @@ impl JobRecord {
 
         for stage in &mut self.stages {
             let stage_id = stage.stage_id().clone();
+            let stage_parallelism = stage.tasks.len();
 
             // Skip stages whose upstream shuffle dependencies are not yet complete.
             let upstream_ready = stage
@@ -242,7 +257,7 @@ impl JobRecord {
                 continue;
             }
 
-            for task in &mut stage.tasks {
+            for (task_index, task) in stage.tasks.iter_mut().enumerate() {
                 if task.state == TaskState::Assigned && !task.launch_in_flight {
                     let executor_id = task.assigned_executor.clone().ok_or_else(|| {
                         SchedulerError::InvalidJob {
@@ -303,7 +318,8 @@ impl JobRecord {
                             format!("inline result for {}", task.task_id()),
                         ),
                     )
-                    .with_input_partitions(input_partitions);
+                    .with_input_partitions(input_partitions)
+                    .with_key_group_range(key_group_range_for_task(task_index, stage_parallelism));
                     if let Some(secs) = task_timeout_secs {
                         assignment = assignment.with_task_timeout_secs(secs);
                     }
@@ -1362,5 +1378,16 @@ mod exchange_stage_tests {
             1,
             "downstream stage must declare upstream dependency"
         );
+    }
+
+    #[test]
+    fn key_group_ranges_split_stage_parallelism() {
+        let first = key_group_range_for_task(0, 4);
+        let second = key_group_range_for_task(1, 4);
+        let last = key_group_range_for_task(3, 4);
+
+        assert_eq!((first.start(), first.end()), (0, 8191));
+        assert_eq!((second.start(), second.end()), (8192, 16383));
+        assert_eq!((last.start(), last.end()), (24576, 32767));
     }
 }

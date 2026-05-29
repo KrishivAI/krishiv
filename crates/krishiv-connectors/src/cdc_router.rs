@@ -75,7 +75,7 @@ impl CdcRouter {
         let raw = source.poll_events(max).map_err(ConnectorError::Cdc)?;
         let mut routed = 0usize;
         for (i, json) in raw.iter().enumerate() {
-            if let Some(event) = crate::cdc::parse_debezium_envelope(json, 0, i as i64) {
+            if let Ok(event) = crate::cdc::parse_debezium_envelope(json, 0, i as i64) {
                 self.route_event(&event)?;
                 routed += 1;
             }

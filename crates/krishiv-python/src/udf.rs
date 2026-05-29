@@ -2,7 +2,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampNanosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
@@ -40,91 +44,87 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
 
     fn call(&self, batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
         Python::attach(|py| {
+            macro_rules! to_py_list {
+                ($col:expr, $arr_ty:ty, $native:ty, $field:expr) => {{
+                    let arr = $col.as_any().downcast_ref::<$arr_ty>().ok_or_else(|| {
+                        krishiv_udf::UdfError::InvalidArgument {
+                            message: format!(
+                                "column '{}' declared {} but downcast failed",
+                                $field.name(),
+                                stringify!($arr_ty)
+                            ),
+                        }
+                    })?;
+                    let mut cells = Vec::with_capacity(arr.len());
+                    for v in arr.iter() {
+                        cells.push(match v {
+                            Some(x) => Some(x.into_pyobject(py).map_err(|e| {
+                                krishiv_udf::UdfError::Execution {
+                                    message: e.to_string(),
+                                }
+                            })?),
+                            None => None,
+                        });
+                    }
+                    let list =
+                        PyList::new(py, cells).map_err(|e| krishiv_udf::UdfError::Execution {
+                            message: e.to_string(),
+                        })?;
+                    list.into_any()
+                }};
+            }
+
+            macro_rules! from_py_list {
+                ($result:expr, $native:ty, $arr_ty:ty, $nrows:expr) => {{
+                    let list = $result.cast_bound::<PyList>(py).map_err(|e| {
+                        krishiv_udf::UdfError::Execution {
+                            message: format!(
+                                "UDF must return a list for {} output: {e}",
+                                stringify!($arr_ty)
+                            ),
+                        }
+                    })?;
+                    let mut values: Vec<Option<$native>> = Vec::with_capacity($nrows);
+                    for item in list.iter() {
+                        let v = if item.is_none() {
+                            None
+                        } else {
+                            Some(item.extract::<$native>().map_err(|e| {
+                                krishiv_udf::UdfError::Execution {
+                                    message: format!(
+                                        "cannot convert item to {}: {e}",
+                                        stringify!($native)
+                                    ),
+                                }
+                            })?)
+                        };
+                        values.push(v);
+                    }
+                    Ok(Arc::new(<$arr_ty>::from(values)) as ArrayRef)
+                }};
+            }
+
             let dict = PyDict::new(py);
             for (idx, field) in batch.schema().fields().iter().enumerate() {
                 let col = batch.column(idx);
                 let py_list = match field.data_type() {
-                    DataType::Int64 => {
-                        let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                            krishiv_udf::UdfError::InvalidArgument {
-                                message: format!(
-                                    "column '{}' declared Int64 but downcast failed",
-                                    field.name()
-                                ),
-                            }
-                        })?;
-                        let mut cells = Vec::with_capacity(arr.len());
-                        for v in arr.iter() {
-                            cells.push(match v {
-                                Some(x) => Some(x.into_pyobject(py).map_err(|e| {
-                                    krishiv_udf::UdfError::Execution {
-                                        message: e.to_string(),
-                                    }
-                                })?),
-                                None => None,
-                            });
-                        }
-                        let list = PyList::new(py, cells).map_err(|e| {
-                            krishiv_udf::UdfError::Execution {
-                                message: e.to_string(),
-                            }
-                        })?;
-                        list.into_any()
-                    }
-                    DataType::Float64 => {
-                        let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                            krishiv_udf::UdfError::InvalidArgument {
-                                message: format!(
-                                    "column '{}' declared Float64 but downcast failed",
-                                    field.name()
-                                ),
-                            }
-                        })?;
-                        let mut cells = Vec::with_capacity(arr.len());
-                        for v in arr.iter() {
-                            cells.push(match v {
-                                Some(x) => Some(x.into_pyobject(py).map_err(|e| {
-                                    krishiv_udf::UdfError::Execution {
-                                        message: e.to_string(),
-                                    }
-                                })?),
-                                None => None,
-                            });
-                        }
-                        let list = PyList::new(py, cells).map_err(|e| {
-                            krishiv_udf::UdfError::Execution {
-                                message: e.to_string(),
-                            }
-                        })?;
-                        list.into_any()
-                    }
-                    DataType::Utf8 => {
-                        use arrow::array::Array;
-                        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                            krishiv_udf::UdfError::InvalidArgument {
-                                message: format!(
-                                    "column '{}' declared Utf8 but downcast failed",
-                                    field.name()
-                                ),
-                            }
-                        })?;
-                        let mut cells = Vec::with_capacity(arr.len());
-                        for v in arr.iter() {
-                            cells.push(match v {
-                                Some(x) => Some(x.into_pyobject(py).map_err(|e| {
-                                    krishiv_udf::UdfError::Execution {
-                                        message: e.to_string(),
-                                    }
-                                })?),
-                                None => None,
-                            });
-                        }
-                        let list = PyList::new(py, cells).map_err(|e| {
-                            krishiv_udf::UdfError::Execution {
-                                message: e.to_string(),
-                            }
-                        })?;
-                        list.into_any()
+                    DataType::Int8 => to_py_list!(col, Int8Array, i8, field),
+                    DataType::Int16 => to_py_list!(col, Int16Array, i16, field),
+                    DataType::Int32 => to_py_list!(col, Int32Array, i32, field),
+                    DataType::Int64 => to_py_list!(col, Int64Array, i64, field),
+                    DataType::UInt8 => to_py_list!(col, UInt8Array, u8, field),
+                    DataType::UInt16 => to_py_list!(col, UInt16Array, u16, field),
+                    DataType::UInt32 => to_py_list!(col, UInt32Array, u32, field),
+                    DataType::UInt64 => to_py_list!(col, UInt64Array, u64, field),
+                    DataType::Float32 => to_py_list!(col, Float32Array, f32, field),
+                    DataType::Float64 => to_py_list!(col, Float64Array, f64, field),
+                    DataType::Boolean => to_py_list!(col, BooleanArray, bool, field),
+                    DataType::Utf8 => to_py_list!(col, StringArray, &str, field),
+                    DataType::LargeUtf8 => to_py_list!(col, LargeStringArray, &str, field),
+                    DataType::Date32 => to_py_list!(col, Date32Array, i32, field),
+                    DataType::Date64 => to_py_list!(col, Date64Array, i64, field),
+                    DataType::Timestamp(_, _) => {
+                        to_py_list!(col, TimestampNanosecondArray, i64, field)
                     }
                     dt => {
                         return Err(krishiv_udf::UdfError::InvalidArgument {
@@ -148,68 +148,23 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
 
             let nrows = batch.num_rows();
             match self.output_field.data_type() {
-                DataType::Int64 => {
-                    let list = result.cast_bound::<PyList>(py).map_err(|e| {
-                        krishiv_udf::UdfError::Execution {
-                            message: format!("UDF must return a list for Int64 output: {e}"),
-                        }
-                    })?;
-                    let mut values: Vec<Option<i64>> = Vec::with_capacity(nrows);
-                    for item in list.iter() {
-                        let v = if item.is_none() {
-                            None
-                        } else {
-                            Some(item.extract::<i64>().map_err(|e| {
-                                krishiv_udf::UdfError::Execution {
-                                    message: format!("cannot convert item to i64: {e}"),
-                                }
-                            })?)
-                        };
-                        values.push(v);
-                    }
-                    Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
-                }
-                DataType::Float64 => {
-                    let list = result.cast_bound::<PyList>(py).map_err(|e| {
-                        krishiv_udf::UdfError::Execution {
-                            message: format!("UDF must return a list for Float64 output: {e}"),
-                        }
-                    })?;
-                    let mut values: Vec<Option<f64>> = Vec::with_capacity(nrows);
-                    for item in list.iter() {
-                        let v = if item.is_none() {
-                            None
-                        } else {
-                            Some(item.extract::<f64>().map_err(|e| {
-                                krishiv_udf::UdfError::Execution {
-                                    message: format!("cannot convert item to f64: {e}"),
-                                }
-                            })?)
-                        };
-                        values.push(v);
-                    }
-                    Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
-                }
-                DataType::Utf8 => {
-                    let list = result.cast_bound::<PyList>(py).map_err(|e| {
-                        krishiv_udf::UdfError::Execution {
-                            message: format!("UDF must return a list for Utf8 output: {e}"),
-                        }
-                    })?;
-                    let mut values: Vec<Option<String>> = Vec::with_capacity(nrows);
-                    for item in list.iter() {
-                        let v = if item.is_none() {
-                            None
-                        } else {
-                            Some(item.extract::<String>().map_err(|e| {
-                                krishiv_udf::UdfError::Execution {
-                                    message: format!("cannot convert item to String: {e}"),
-                                }
-                            })?)
-                        };
-                        values.push(v);
-                    }
-                    Ok(Arc::new(StringArray::from(values)) as ArrayRef)
+                DataType::Int8 => from_py_list!(result, i8, Int8Array, nrows),
+                DataType::Int16 => from_py_list!(result, i16, Int16Array, nrows),
+                DataType::Int32 => from_py_list!(result, i32, Int32Array, nrows),
+                DataType::Int64 => from_py_list!(result, i64, Int64Array, nrows),
+                DataType::UInt8 => from_py_list!(result, u8, UInt8Array, nrows),
+                DataType::UInt16 => from_py_list!(result, u16, UInt16Array, nrows),
+                DataType::UInt32 => from_py_list!(result, u32, UInt32Array, nrows),
+                DataType::UInt64 => from_py_list!(result, u64, UInt64Array, nrows),
+                DataType::Float32 => from_py_list!(result, f32, Float32Array, nrows),
+                DataType::Float64 => from_py_list!(result, f64, Float64Array, nrows),
+                DataType::Boolean => from_py_list!(result, bool, BooleanArray, nrows),
+                DataType::Utf8 => from_py_list!(result, String, StringArray, nrows),
+                DataType::LargeUtf8 => from_py_list!(result, String, LargeStringArray, nrows),
+                DataType::Date32 => from_py_list!(result, i32, Date32Array, nrows),
+                DataType::Date64 => from_py_list!(result, i64, Date64Array, nrows),
+                DataType::Timestamp(_, _) => {
+                    from_py_list!(result, i64, TimestampNanosecondArray, nrows)
                 }
                 dt => Err(krishiv_udf::UdfError::InvalidArgument {
                     message: format!("unsupported output data type: {dt}"),
@@ -232,11 +187,27 @@ pub const UDF_META_ATTR: &str = "__krishiv_udf__";
 
 pub(crate) fn parse_arrow_type(name: &str) -> PyResult<DataType> {
     match name.to_ascii_lowercase().as_str() {
-        "int64" | "long" | "int" => Ok(DataType::Int64),
-        "float64" | "double" | "float" => Ok(DataType::Float64),
-        "utf8" | "string" | "str" => Ok(DataType::Utf8),
+        "int8" | "tinyint" => Ok(DataType::Int8),
+        "int16" | "smallint" => Ok(DataType::Int16),
+        "int32" | "int" | "integer" => Ok(DataType::Int32),
+        "int64" | "long" | "bigint" => Ok(DataType::Int64),
+        "uint8" => Ok(DataType::UInt8),
+        "uint16" => Ok(DataType::UInt16),
+        "uint32" => Ok(DataType::UInt32),
+        "uint64" => Ok(DataType::UInt64),
+        "float32" | "float" | "real" => Ok(DataType::Float32),
+        "float64" | "double" => Ok(DataType::Float64),
+        "boolean" | "bool" => Ok(DataType::Boolean),
+        "utf8" | "string" | "str" | "varchar" => Ok(DataType::Utf8),
+        "largeutf8" | "large_string" => Ok(DataType::LargeUtf8),
+        "date32" | "date" => Ok(DataType::Date32),
+        "date64" => Ok(DataType::Date64),
+        "timestamp" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Nanosecond,
+            None,
+        )),
         other => Err(SchemaError::new_err(format!(
-            "unsupported Arrow type '{other}'; use int64, float64, or utf8"
+            "unsupported Arrow type '{other}'"
         ))),
     }
 }

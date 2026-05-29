@@ -282,7 +282,7 @@ impl LocalAggregator {
                 AggFunction::Avg => DataType::Float64,
                 _ => DataType::Int64,
             };
-            fields.push(Field::new(&agg.output_column, dtype, false));
+            fields.push(Field::new(&agg.output_column, dtype, true));
         }
         let out_schema = Arc::new(Schema::new(fields));
 

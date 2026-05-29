@@ -6,7 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -169,29 +169,17 @@ impl PolicyEnforcingSqlEngine {
 }
 
 fn is_select_query(query: &str) -> bool {
-    let trimmed = query.trim().to_uppercase();
-    if trimmed.starts_with("SELECT") {
-        return true;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    let dialect = GenericDialect {};
+    let statements = match Parser::parse_sql(&dialect, query) {
+        Ok(stmts) => stmts,
+        Err(_) => return false,
+    };
+    if statements.is_empty() {
+        return false;
     }
-    // CTE: WITH ... SELECT is a SELECT; WITH ... DELETE/INSERT/UPDATE is not.
-    if trimmed.starts_with("WITH ") {
-        // Check if the last statement keyword is SELECT (not DELETE/INSERT/UPDATE).
-        // A simple heuristic: look for the last occurrence of these keywords.
-        let data_keywords = ["DELETE", "INSERT", "UPDATE"];
-        // Find the last keyword occurrence to determine the outer statement type.
-        let last_select = trimmed.rfind("SELECT");
-        let last_data = data_keywords
-            .iter()
-            .filter_map(|kw| trimmed.rfind(kw))
-            .max();
-        match (last_select, last_data) {
-            (Some(s), Some(d)) => s > d,
-            (Some(_), None) => true,
-            _ => false,
-        }
-    } else {
-        false
-    }
+    matches!(statements[0], sqlparser::ast::Statement::Query(_))
 }
 
 fn apply_row_predicates(
@@ -250,17 +238,22 @@ fn apply_masking(
                 columns.push(new_null_array(col.data_type(), batch.num_rows()));
             }
             Some(MaskingRule::Redact) => {
-                let redacted: StringArray = (0..batch.num_rows())
-                    .map(|row| {
-                        if col.is_null(row) {
-                            None
-                        } else {
-                            Some("REDACTED")
-                        }
-                    })
-                    .collect();
-                fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
-                columns.push(Arc::new(redacted));
+                use arrow::array::new_null_array;
+                fields.push(field.as_ref().clone());
+                if matches!(col.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                    let redacted: StringArray = (0..batch.num_rows())
+                        .map(|row| {
+                            if col.is_null(row) {
+                                None
+                            } else {
+                                Some("REDACTED")
+                            }
+                        })
+                        .collect();
+                    columns.push(Arc::new(redacted));
+                } else {
+                    columns.push(new_null_array(col.data_type(), batch.num_rows()));
+                }
             }
             Some(MaskingRule::Hash) => {
                 let options = FormatOptions::default();
@@ -477,7 +470,7 @@ mod policy_tests {
 
     #[tokio::test]
     async fn redact_policy_can_mask_non_string_columns() {
-        use arrow::array::StringArray;
+        use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         let engine = make_engine_with_policy(Arc::new(RedactColumnPolicy {
@@ -485,7 +478,6 @@ mod policy_tests {
         }));
         let p = engine.authenticate("key1").unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        use arrow::array::Int64Array;
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
         engine
@@ -498,14 +490,17 @@ mod policy_tests {
             .execute_as(&p, "SELECT id FROM people")
             .await
             .unwrap();
-        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Int64);
         let id_col = batches[0]
             .column_by_name("id")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(id_col.value(0), "REDACTED");
+        assert!(
+            id_col.is_null(0),
+            "non-string redact must preserve type with null"
+        );
     }
 
     /// C18 regression: row predicates must NOT be applied to non-SELECT queries.

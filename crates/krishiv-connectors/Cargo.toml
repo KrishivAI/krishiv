@@ -16,6 +16,7 @@ state = ["dep:krishiv-state"]
 arrow = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
+krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-proto = { path = "../krishiv-proto" }

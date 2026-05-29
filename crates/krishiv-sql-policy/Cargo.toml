@@ -10,6 +10,7 @@ arrow = { workspace = true }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-sql = { path = "../krishiv-sql" }
 sha2 = { workspace = true }
+sqlparser = "0.61"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

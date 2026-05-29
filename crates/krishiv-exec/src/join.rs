@@ -208,14 +208,12 @@ impl HashJoin {
             .map_err(|_| ExecError::ColumnNotFound(self.right_key.clone()))?;
 
         // Build phase: hash map from serialized key → list of right row indices.
-        // Using Arc<str> avoids per-row String allocation for probe lookups.
-        let mut build_map: HashMap<Arc<str>, Vec<u32>> = HashMap::with_capacity(right.num_rows());
+        // Using String as the key avoids the extra Arc<str> allocation per row
+        // (format_key_value already returns a String).
+        let mut build_map: HashMap<String, Vec<u32>> = HashMap::with_capacity(right.num_rows());
         for row in 0..right.num_rows() {
             let key = format_key_value(right, right_key_idx, row)?;
-            build_map
-                .entry(Arc::<str>::from(key.as_str()))
-                .or_default()
-                .push(row as u32);
+            build_map.entry(key).or_default().push(row as u32);
         }
 
         // Probe phase: collect (left_row, right_row) pairs.
@@ -224,8 +222,7 @@ impl HashJoin {
 
         for row in 0..left.num_rows() {
             let key = format_key_value(left, left_key_idx, row)?;
-            let probe_key: Arc<str> = Arc::<str>::from(key.as_str());
-            if let Some(right_rows) = build_map.get(&probe_key) {
+            if let Some(right_rows) = build_map.get(&key) {
                 for &r in right_rows {
                     left_indices.push(row as u32);
                     right_indices.push(r);

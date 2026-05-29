@@ -230,7 +230,9 @@ impl TumblingWindowOperator {
         }
 
         // Advance internal watermark AFTER accumulating this batch.
-        self.prev_watermark_ms = new_watermark_ms;
+        if new_watermark_ms >= self.prev_watermark_ms {
+            self.prev_watermark_ms = new_watermark_ms;
+        }
 
         self.flush_closed_windows(new_watermark_ms)
     }

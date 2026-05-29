@@ -40,8 +40,8 @@ pub struct KrishivFlightSqlService {
     host: FlightExecutionHost,
     /// Shared SQL engine for policy enforcement — created once during construction.
     sql_engine: Arc<SqlEngine>,
-    /// Map of opaque handle (UUID string) → SQL text for prepared statements.
-    prepared_statements: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// LRU cache of opaque handle (UUID string) → SQL text for prepared statements.
+    prepared_statements: Arc<tokio::sync::Mutex<lru::LruCache<String, String>>>,
 }
 
 impl std::fmt::Debug for KrishivFlightSqlService {
@@ -61,7 +61,9 @@ impl KrishivFlightSqlService {
             policy: None,
             host: FlightExecutionHost::from_env()?,
             sql_engine: Arc::new(SqlEngine::new()),
-            prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            ))),
         })
     }
 
@@ -72,7 +74,9 @@ impl KrishivFlightSqlService {
             policy: None,
             host,
             sql_engine: Arc::new(SqlEngine::new()),
-            prepared_statements: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            prepared_statements: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            ))),
         }
     }
 
@@ -340,7 +344,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .execute_sql(query)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            self.apply_policy_masking(&principal, "", raw)?
+            self.apply_policy_masking(&principal, query, raw)?
         };
 
         let schema: Arc<Schema> = if batches.is_empty() {
@@ -376,7 +380,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         self.prepared_statements
             .lock()
             .await
-            .insert(handle.clone(), query.query);
+            .put(handle.clone(), query.query);
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into_bytes().into(),
             ..Default::default()
@@ -397,7 +401,7 @@ impl FlightSqlService for KrishivFlightSqlService {
             .to_owned();
 
         let sql = {
-            let map = self.prepared_statements.lock().await;
+            let mut map = self.prepared_statements.lock().await;
             map.get(&handle)
                 .cloned()
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
@@ -424,7 +428,7 @@ impl FlightSqlService for KrishivFlightSqlService {
             .to_owned();
 
         let sql = {
-            let map = self.prepared_statements.lock().await;
+            let mut map = self.prepared_statements.lock().await;
             map.get(&handle)
                 .cloned()
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
@@ -448,7 +452,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                 Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
             })?
             .to_owned();
-        self.prepared_statements.lock().await.remove(&handle);
+        self.prepared_statements.lock().await.pop(&handle);
         Ok(())
     }
 
@@ -593,7 +597,7 @@ impl KrishivFlightSqlService {
                         .await
                         .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
                         .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                encode_batches_ipc_bytes(&batches)
+                encode_batches_ipc(&batches)
             }
             A::BoundedWindow(body) => {
                 let input_batches = krishiv_runtime::decode_batches(&body.batches_b64)
@@ -607,7 +611,7 @@ impl KrishivFlightSqlService {
                 .await
                 .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
                 .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                encode_batches_ipc_bytes(&result)
+                encode_batches_ipc(&result)
             }
             A::Explain(body) => {
                 let text = krishiv_sql::explain_sql(&body.sql)
@@ -618,7 +622,7 @@ impl KrishivFlightSqlService {
     }
 }
 
-fn encode_batches_ipc_bytes(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {
+fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionError> {
     if batches.is_empty() {
         return Ok(Vec::new());
     }

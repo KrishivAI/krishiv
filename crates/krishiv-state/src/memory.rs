@@ -83,7 +83,7 @@ impl StateBackend for InMemoryStateBackend {
     }
 
     fn snapshot(&self) -> StateResult<Vec<u8>> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.store.len() * 64);
         out.extend_from_slice(&1u32.to_le_bytes()); // version
         out.extend_from_slice(&(self.store.len() as u64).to_le_bytes());
         for ((op_id, state_name, key), value) in &self.store {

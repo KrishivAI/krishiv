@@ -627,16 +627,16 @@ impl OptimizerRule for PredicatePushdownRule {
                 _ => continue,
             };
 
-            let scan_info = node
+            let scan_indices: Vec<usize> = node
                 .inputs()
                 .iter()
                 .filter_map(|input_id| id_to_idx.get(input_id.as_str()).copied())
-                .find(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Scan { .. })));
+                .filter(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Scan { .. })))
+                .collect();
 
-            let Some(scan_idx) = scan_info else {
+            if scan_indices.is_empty() {
                 continue;
-            };
-            let scan_node = &nodes[scan_idx];
+            }
 
             let conjuncts: Vec<&str> = predicate
                 .split(" AND ")
@@ -648,37 +648,41 @@ impl OptimizerRule for PredicatePushdownRule {
                 continue;
             }
 
-            let scan_columns: Vec<&str> = scan_node
-                .output_schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect();
+            for scan_idx in scan_indices {
+                let scan_node = &nodes[scan_idx];
 
-            let mut pushable: Vec<String> = Vec::new();
-            let mut remaining: Vec<String> = Vec::new();
+                let scan_columns: Vec<&str> = scan_node
+                    .output_schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect();
 
-            for conjunct in &conjuncts {
-                let cols = extract_column_refs(conjunct);
-                let can_push = !cols.is_empty()
-                    && cols
-                        .iter()
-                        .all(|c| column_belongs_to_scan(c, &scan_columns));
+                let mut pushable: Vec<String> = Vec::new();
+                let mut remaining: Vec<String> = Vec::new();
 
-                if can_push {
-                    pushable.push(conjunct.to_string());
-                } else {
-                    remaining.push(conjunct.to_string());
+                for conjunct in &conjuncts {
+                    let cols = extract_column_refs(conjunct);
+                    let can_push = !cols.is_empty()
+                        && cols
+                            .iter()
+                            .all(|c| column_belongs_to_scan(c, &scan_columns));
+
+                    if can_push {
+                        pushable.push(conjunct.to_string());
+                    } else {
+                        remaining.push(conjunct.to_string());
+                    }
                 }
-            }
 
-            if !pushable.is_empty() {
-                pushdowns.push(Pushdown {
-                    filter_idx: i,
-                    scan_idx,
-                    pushable,
-                    remaining,
-                });
+                if !pushable.is_empty() {
+                    pushdowns.push(Pushdown {
+                        filter_idx: i,
+                        scan_idx,
+                        pushable,
+                        remaining,
+                    });
+                }
             }
         }
 
@@ -788,19 +792,39 @@ impl OptimizerRule for EmptyProjectionRemovalRule {
     }
 
     fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
-        let mut nodes: Vec<PlanNode> = plan.nodes().to_vec();
-        let before = nodes.len();
-        nodes.retain(|node| {
-            !matches!(
-                node.op(),
-                Some(NodeOp::Project { columns }) if columns.is_empty()
-            )
-        });
-        if nodes.len() == before {
+        let nodes: Vec<PlanNode> = plan.nodes().to_vec();
+        let mut removed: Vec<(String, Vec<String>)> = Vec::new();
+        let mut new_nodes: Vec<PlanNode> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if matches!(node.op(), Some(NodeOp::Project { columns }) if columns.is_empty()) {
+                removed.push((node.id().to_string(), node.inputs().to_vec()));
+            } else {
+                new_nodes.push(node);
+            }
+        }
+        if removed.is_empty() {
             return None;
         }
+        for (removed_id, removed_inputs) in &removed {
+            for node in &mut new_nodes {
+                let inputs: Vec<String> = node.inputs().to_vec();
+                if inputs.contains(removed_id) {
+                    let new_inputs: Vec<String> = inputs
+                        .iter()
+                        .flat_map(|input| {
+                            if input == removed_id {
+                                removed_inputs.clone()
+                            } else {
+                                vec![input.clone()]
+                            }
+                        })
+                        .collect();
+                    *node = node.clone().with_inputs(new_inputs);
+                }
+            }
+        }
         let mut out = LogicalPlan::new(plan.name(), plan.kind());
-        for node in nodes {
+        for node in new_nodes {
             out.add_node(node);
         }
         Some(out)

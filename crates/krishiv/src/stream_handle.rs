@@ -67,6 +67,14 @@ impl StreamHandle {
     }
 }
 
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        // Signal the background polling thread to exit so it does not leak
+        // after the handle goes out of scope.
+        let _ = self.cancel();
+    }
+}
+
 impl std::fmt::Debug for StreamHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamHandle")

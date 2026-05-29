@@ -33,7 +33,10 @@ pub(crate) fn block_on_async<F, T>(future: F) -> Result<T, krishiv_api::KrishivE
 where
     F: std::future::Future<Output = Result<T, krishiv_api::KrishivError>>,
 {
-    crate::RUNTIME.block_on(future)
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => crate::RUNTIME.block_on(future),
+    }
 }
 
 /// A Krishiv query session.
@@ -383,6 +386,7 @@ impl PySession {
             window: None,
             aggregations: Vec::new(),
             source_watermarks: std::collections::HashMap::new(),
+            source_id_column: None,
         };
         Ok(PyRelation::from_pipeline(pipeline))
     }

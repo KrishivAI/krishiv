@@ -17,6 +17,10 @@
 //!     .await?;
 //! ```
 
+use opentelemetry::propagation::{Extractor, TextMapPropagator};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
 /// Tonic client interceptor: reads `current_traceparent()` and inserts it as
 /// the `"traceparent"` metadata key on every outgoing request.
 ///
@@ -32,19 +36,33 @@ pub fn inject_trace_context(
     Ok(req)
 }
 
+struct MetadataExtractor<'a>(&'a tonic::metadata::MetadataMap);
+
+impl<'a> Extractor for MetadataExtractor<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .map(|k| match k {
+                tonic::metadata::KeyRef::Ascii(key) => key.as_str(),
+                tonic::metadata::KeyRef::Binary(key) => key.as_str(),
+            })
+            .collect()
+    }
+}
+
 /// Tonic server interceptor: reads `"traceparent"` from request metadata and
-/// records it on the current `tracing` span so downstream spans inherit the
-/// W3C trace context.
+/// sets it as the parent span context so downstream spans inherit the W3C trace
+/// context.
 ///
 /// When the header is absent or malformed the request is forwarded unchanged.
 pub fn extract_trace_context(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-    if let Some(val) = req
-        .metadata()
-        .get("traceparent")
-        .and_then(|v| v.to_str().ok())
-    {
-        tracing::Span::current().record("traceparent", val);
-    }
+    let propagator = TraceContextPropagator::new();
+    let parent_ctx = propagator.extract(&MetadataExtractor(req.metadata()));
+    let _ = tracing::Span::current().set_parent(parent_ctx);
     Ok(req)
 }
 

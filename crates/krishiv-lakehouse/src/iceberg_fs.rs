@@ -192,12 +192,14 @@ impl LakehouseTable for IcebergFsTable {
         let next_id = layers.last().map(|l| l.snapshot_id + 1).unwrap_or(1);
         let file_name = format!("snap-{next_id:05}.parquet");
         let path = self.root.join("data").join(&file_name);
-        Self::write_parquet_file(&path, &batches)?;
+        let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
+        Self::write_parquet_file(&tmp_path, &batches)?;
         layers.push(FsLayer {
             snapshot_id: next_id,
-            path,
+            path: path.clone(),
         });
         Self::persist_metadata(&layers, &self.root)?;
+        fs::rename(&tmp_path, &path).map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(())
     }
 

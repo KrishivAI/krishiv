@@ -276,13 +276,15 @@ fn proto_fields_to_arrow_schema(fields: &[ProtoField]) -> SchemaRef {
 }
 
 /// Decode protobuf wire format (field-tag + value pairs) into a Vec of rows.
+/// Uses `prost` encoding primitives and the field list as a descriptor set.
 fn decode_protobuf_wire(
     data: &[u8],
     fields: &[ProtoField],
 ) -> SchemaRegistryResult<Vec<Vec<ProtoValue>>> {
+    use bytes::Buf;
     let mut rows: Vec<Vec<ProtoValue>> = Vec::new();
     let current_row: Vec<ProtoValue> = vec![ProtoValue::Null; fields.len()];
-    let mut pos = 0;
+    let mut buf = data;
 
     let field_map: std::collections::HashMap<u32, usize> = fields
         .iter()
@@ -290,56 +292,53 @@ fn decode_protobuf_wire(
         .map(|(i, f)| (f.field_number, i))
         .collect();
 
-    while pos < data.len() {
-        let (tag, new_pos) = read_varint(data, pos)?;
-        let field_number = (tag >> 3) as u32;
-        let wire_type = (tag & 0x07) as u8;
+    while buf.has_remaining() {
+        let (tag, wire_type) = prost::encoding::decode_key(&mut buf)
+            .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
+        let field_number = tag;
+        let idx = field_map.get(&field_number).copied();
 
         match wire_type {
-            0 => {
-                let (value, next) = read_varint(data, new_pos)?;
-                if let Some(&idx) = field_map.get(&field_number) {
+            prost::encoding::WireType::Varint => {
+                let value = prost::encoding::decode_varint(&mut buf)
+                    .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
+                if let Some(i) = idx {
                     if rows.is_empty() || current_row.iter().all(|v| matches!(v, ProtoValue::Null))
                     {
                         rows.push(current_row.clone());
                     }
-                    rows.last_mut().unwrap()[idx] = ProtoValue::Int64(value as i64);
+                    rows.last_mut().unwrap()[i] = ProtoValue::Int64(value as i64);
                 }
-                pos = next;
             }
-            1 => {
-                if new_pos + 8 > data.len() {
+            prost::encoding::WireType::SixtyFourBit => {
+                if buf.remaining() < 8 {
                     break;
                 }
-                let bytes: [u8; 8] = data[new_pos..new_pos + 8].try_into().map_err(|_| {
-                    SchemaRegistryError::Decode("failed to read 64-bit value".into())
-                })?;
-                let value = f64::from_le_bytes(bytes);
-                if let Some(&idx) = field_map.get(&field_number) {
+                let value = buf.get_f64_le();
+                if let Some(i) = idx {
                     if rows.is_empty() || current_row.iter().all(|v| matches!(v, ProtoValue::Null))
                     {
                         rows.push(current_row.clone());
                     }
-                    rows.last_mut().unwrap()[idx] = ProtoValue::Float64(value);
+                    rows.last_mut().unwrap()[i] = ProtoValue::Float64(value);
                 }
-                pos = new_pos + 8;
             }
-            2 => {
-                let (len, next) = read_varint(data, new_pos)?;
-                let len = len as usize;
-                if next + len > data.len() {
+            prost::encoding::WireType::LengthDelimited => {
+                let len = prost::encoding::decode_varint(&mut buf)
+                    .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?
+                    as usize;
+                if buf.remaining() < len {
                     break;
                 }
-                let bytes = &data[next..next + len];
-                if let Some(&idx) = field_map.get(&field_number) {
-                    let text = String::from_utf8_lossy(bytes).to_string();
+                let chunk = buf.copy_to_bytes(len);
+                if let Some(i) = idx {
+                    let text = String::from_utf8_lossy(&chunk).to_string();
                     if rows.is_empty() || current_row.iter().all(|v| matches!(v, ProtoValue::Null))
                     {
                         rows.push(current_row.clone());
                     }
-                    rows.last_mut().unwrap()[idx] = ProtoValue::String(text);
+                    rows.last_mut().unwrap()[i] = ProtoValue::String(text);
                 }
-                pos = next + len;
             }
             _ => break,
         }
@@ -359,33 +358,6 @@ enum ProtoValue {
     Int64(i64),
     Float64(f64),
     String(String),
-}
-
-/// Read a varint from protobuf wire format.
-fn read_varint(data: &[u8], pos: usize) -> SchemaRegistryResult<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    let mut i = pos;
-    loop {
-        if i >= data.len() {
-            return Err(SchemaRegistryError::Decode(
-                "truncated varint in protobuf wire format".into(),
-            ));
-        }
-        let byte = data[i];
-        result |= ((byte & 0x7F) as u64) << shift;
-        i += 1;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(SchemaRegistryError::Decode(
-                "varint exceeds 64-bit range".into(),
-            ));
-        }
-    }
-    Ok((result, i))
 }
 
 /// Convert decoded protobuf rows into Arrow RecordBatches.
@@ -446,22 +418,19 @@ fn proto_values_to_column(values: &[&ProtoValue], data_type: &DataType) -> Array
             Arc::new(arr)
         }
         _ => {
-            let arr: StringArray = values
+            // Build owned strings first, then borrow them for StringArray
+            // construction (the array copies the bytes, so no leak is needed).
+            let strings: Vec<Option<String>> = values
                 .iter()
                 .map(|v| match v {
-                    ProtoValue::String(s) => Some(s.as_str()),
-                    ProtoValue::Int64(i) => {
-                        let s = format!("{i}");
-                        Some(Box::leak(s.into_boxed_str()) as &str)
-                    }
-                    ProtoValue::Float64(f) => {
-                        let s = format!("{f}");
-                        Some(Box::leak(s.into_boxed_str()) as &str)
-                    }
+                    ProtoValue::String(s) => Some(s.clone()),
+                    ProtoValue::Int64(i) => Some(format!("{i}")),
+                    ProtoValue::Float64(f) => Some(format!("{f}")),
                     ProtoValue::Null => None,
                 })
                 .collect();
-            Arc::new(arr)
+            let opts: Vec<Option<&str>> = strings.iter().map(|s| s.as_deref()).collect();
+            Arc::new(StringArray::from(opts))
         }
     }
 }

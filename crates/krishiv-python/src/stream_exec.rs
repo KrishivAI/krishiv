@@ -24,7 +24,7 @@ fn agg_descriptor_to_expr(desc: &AggDescriptor) -> AggExpr {
     }
 }
 
-fn resolve_input_batches(
+async fn resolve_input_batches(
     pipeline: &StreamPipeline,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, krishiv_api::KrishivError> {
     if let Some(name) = pipeline.source_id.strip_prefix("memory:") {
@@ -36,8 +36,8 @@ fn resolve_input_batches(
     }
     let upper = pipeline.source_id.to_ascii_uppercase();
     if upper.contains("SELECT") || upper.contains("FROM") {
-        let df = block_on_async(pipeline.session.sql_async(&pipeline.source_id))?;
-        let result = block_on_async(df.collect_async())?;
+        let df = pipeline.session.sql_async(&pipeline.source_id).await?;
+        let result = df.collect_async().await?;
         return Ok(result.batches().to_vec());
     }
     Err(krishiv_api::KrishivError::unsupported(
@@ -109,7 +109,10 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
     let source_id_column = if source_watermark_lags.is_empty() {
         None
     } else {
-        Some("source_id".to_string())
+        pipeline
+            .source_id_column
+            .clone()
+            .or_else(|| Some("source_id".to_string()))
     };
     Ok(LocalWindowExecutionSpec {
         key_column,
@@ -126,7 +129,7 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
 
 pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatch>> {
     let spec = spec_from_pipeline(pipeline)?;
-    let input = resolve_input_batches(pipeline).map_err(map_krishiv_error)?;
+    let input = block_on_async(resolve_input_batches(pipeline)).map_err(map_krishiv_error)?;
     let output = krishiv_api::execute_windowed_stream(input, &spec)
         .map_err(|e| map_krishiv_error(krishiv_api::KrishivError::from(e)))?;
     Ok(output.into_iter().map(PyBatch::from_record_batch).collect())

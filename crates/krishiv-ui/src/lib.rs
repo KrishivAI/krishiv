@@ -8,6 +8,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{Path, State};
@@ -33,6 +34,7 @@ pub type UiResult<T> = Result<T, UiError>;
 #[derive(Debug, Clone)]
 pub struct UiState {
     coordinator: SharedCoordinator,
+    metrics_cache: Arc<std::sync::Mutex<(String, std::time::Instant)>>,
 }
 
 impl UiState {
@@ -43,7 +45,13 @@ impl UiState {
 
     /// Create UI state from a shared coordinator runtime handle.
     pub fn from_shared_coordinator(coordinator: SharedCoordinator) -> Self {
-        Self { coordinator }
+        Self {
+            coordinator,
+            metrics_cache: Arc::new(std::sync::Mutex::new((
+                String::new(),
+                std::time::Instant::now() - std::time::Duration::from_secs(100),
+            ))),
+        }
     }
 }
 
@@ -381,9 +389,18 @@ async fn healthz() -> &'static str {
 /// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
 async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
     let coordinator = state.coordinator.read().await;
-    let mut body = format_stability_metrics(&coordinator.stability_metrics());
-    body.push('\n');
-    body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
+    let mut cache = state.metrics_cache.lock().unwrap();
+    let now = std::time::Instant::now();
+    let body = if now.duration_since(cache.1).as_secs() >= 1 || cache.0.is_empty() {
+        let mut body = format_stability_metrics(&coordinator.stability_metrics());
+        body.push('\n');
+        body.push_str(&krishiv_metrics::global_metrics().render_prometheus());
+        cache.0 = body.clone();
+        cache.1 = now;
+        body
+    } else {
+        cache.0.clone()
+    };
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
@@ -432,12 +449,12 @@ async fn readyz(State(state): State<UiState>) -> Result<impl IntoResponse, UiErr
             "coordinator is not active\n",
         ));
     }
-    let _snapshot = status_snapshot(&state)?;
+    let _snapshot = status_snapshot(&state).await?;
     Ok((StatusCode::OK, "ready\n"))
 }
 
 async fn api_jobs(State(state): State<UiState>) -> Result<Json<JobsResponse>, UiError> {
-    let snapshot = status_snapshot(&state)?;
+    let snapshot = status_snapshot(&state).await?;
     Ok(Json(JobsResponse {
         jobs: snapshot.jobs,
     }))
@@ -448,12 +465,12 @@ async fn api_job_detail(
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetailResponse>, UiError> {
     Ok(Json(JobDetailResponse {
-        job: job_detail(&state, &job_id)?,
+        job: job_detail(&state, &job_id).await?,
     }))
 }
 
 async fn api_executors(State(state): State<UiState>) -> Result<Json<ExecutorsResponse>, UiError> {
-    let snapshot = status_snapshot(&state)?;
+    let snapshot = status_snapshot(&state).await?;
     Ok(Json(ExecutorsResponse {
         executors: snapshot.executors,
     }))
@@ -517,7 +534,7 @@ async fn api_job_checkpoints(
 }
 
 async fn ui_jobs(State(state): State<UiState>) -> Result<Html<String>, UiError> {
-    let snapshot = status_snapshot(&state)?;
+    let snapshot = status_snapshot(&state).await?;
     let template = JobsTemplate {
         coordinator_id: snapshot.coordinator_id,
         coordinator_state: snapshot.coordinator_state,
@@ -531,11 +548,11 @@ async fn ui_job_detail(
     State(state): State<UiState>,
     Path(job_id): Path<String>,
 ) -> Result<Html<String>, UiError> {
-    let snapshot = status_snapshot(&state)?;
+    let snapshot = status_snapshot(&state).await?;
     let template = JobTemplate {
         coordinator_id: snapshot.coordinator_id,
         coordinator_state: snapshot.coordinator_state,
-        job: job_detail(&state, &job_id)?,
+        job: job_detail(&state, &job_id).await?,
         executors: snapshot.executors,
     };
     Ok(Html(template.render()?))
@@ -545,8 +562,8 @@ async fn stylesheet() -> impl IntoResponse {
     ([(CONTENT_TYPE, "text/css; charset=utf-8")], STYLE)
 }
 
-fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
-    let coordinator = state.coordinator.blocking_read();
+async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
+    let coordinator = state.coordinator.read().await;
     Ok(StatusView {
         coordinator_id: coordinator.coordinator_id().to_string(),
         coordinator_state: coordinator.state().to_string(),
@@ -563,10 +580,10 @@ fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
     })
 }
 
-fn job_detail(state: &UiState, job_id: &str) -> UiResult<JobDetailView> {
+async fn job_detail(state: &UiState, job_id: &str) -> UiResult<JobDetailView> {
     let job_id =
         JobId::try_new(job_id.to_owned()).map_err(|error| UiError::Id(error.to_string()))?;
-    let coordinator = state.coordinator.blocking_read();
+    let coordinator = state.coordinator.read().await;
     let detail = coordinator.job_detail_snapshot(&job_id)?;
     Ok(JobDetailView::from_snapshot(&detail))
 }

@@ -21,6 +21,7 @@ use krishiv_state::StateBackend;
 
 use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierInjector,
+    SharedKeyGroupRanges,
     fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
 
@@ -598,6 +599,7 @@ pub struct ExecutorTaskRunner {
     /// enqueued here are drained by the runner loop and trigger checkpoint
     /// initiation.
     pub(crate) barrier_injector: Option<SharedBarrierInjector>,
+    pub(crate) key_group_ranges: Option<SharedKeyGroupRanges>,
 
     /// Most-recently observed coordinator fencing token, cached from real gRPC
     /// `InitiateCheckpointRequest` messages.  `drain_pending_barriers` stamps
@@ -665,6 +667,7 @@ impl ExecutorTaskRunner {
                 krishiv_proto::LeaseGeneration::initial(),
             ),
             barrier_injector: None,
+            key_group_ranges: None,
             cached_coordinator_fencing_token: Arc::new(AtomicU64::new(
                 FencingToken::initial().as_u64(),
             )),
@@ -683,6 +686,12 @@ impl ExecutorTaskRunner {
     /// consumed by the runner loop and trigger checkpoint initiation.
     pub fn with_barrier_injector(mut self, injector: SharedBarrierInjector) -> Self {
         self.barrier_injector = Some(injector);
+        self
+    }
+
+    /// Attach the key-group range registry used by the barrier service.
+    pub fn with_key_group_ranges(mut self, ranges: SharedKeyGroupRanges) -> Self {
+        self.key_group_ranges = Some(ranges);
         self
     }
 
@@ -789,6 +798,12 @@ impl ExecutorTaskRunner {
                 assignment.attempt_id(),
             );
             running_map.insert(assignment.task_id().as_str().to_string(), attempt);
+        }
+        if let Some(ranges) = &self.key_group_ranges {
+            ranges.set(
+                assignment.task_id().as_str().to_string(),
+                assignment.key_group_range(),
+            );
         }
 
         // If a CancelTask RPC arrived while this task was queued, finish here
@@ -973,6 +988,9 @@ impl ExecutorTaskRunner {
     fn clear_running_attempt(&self, assignment: &ExecutorTaskAssignment) {
         if let Some(running_map) = &self.running_attempts {
             running_map.remove(assignment.task_id().as_str());
+        }
+        if let Some(ranges) = &self.key_group_ranges {
+            ranges.remove(assignment.task_id().as_str());
         }
     }
 

@@ -62,10 +62,9 @@ impl TwoPhaseParquetSink {
             for entry in std::fs::read_dir(&staging).map_err(|e| io_err("read staging dir", e))? {
                 let entry = entry.map_err(|e| io_err("read staging entry", e))?;
                 let dest = base_dir.join("data").join(entry.file_name());
-                if dest.exists() {
-                    std::fs::remove_file(&dest)
-                        .map_err(|e| io_err("remove existing final file", e))?;
-                }
+                // On POSIX rename() atomically replaces the destination; deleting
+                // first creates a window where the file is missing and can lose
+                // data if a reader accesses the path during the gap.
                 std::fs::rename(entry.path(), dest).map_err(|e| io_err("commit staged file", e))?;
             }
         }

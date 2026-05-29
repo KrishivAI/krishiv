@@ -913,6 +913,73 @@ mod shuffle_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_spill_does_not_delete_newer_replacement() {
+        fn partition_with_value(
+            job_id: &str,
+            stage_id: &str,
+            partition: u32,
+            value: i32,
+        ) -> ShufflePartition {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![value; 128]))],
+            )
+            .unwrap();
+            ShufflePartition {
+                id: PartitionId {
+                    job_id: job_id.to_owned(),
+                    stage_id: stage_id.to_owned(),
+                    partition,
+                },
+                schema,
+                batches: vec![batch],
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let store = Arc::new(
+            InMemoryShuffleStore::new()
+                .with_max_bytes(64)
+                .with_spill_store(Arc::clone(&spill)),
+        );
+
+        let old_p0 = partition_with_value("job-spill-race", "s0", 0, 1);
+        let id0 = old_p0.id.clone();
+        store.write_partition(old_p0, 1).await.unwrap();
+
+        let replace_store = Arc::clone(&store);
+        let replace = tokio::spawn(async move {
+            replace_store
+                .write_partition(partition_with_value("job-spill-race", "s0", 0, 99), 2)
+                .await
+        });
+
+        let spill_store = Arc::clone(&store);
+        let trigger_spill = tokio::spawn(async move {
+            spill_store
+                .write_partition(partition_with_value("job-spill-race", "s0", 1, 2), 1)
+                .await
+        });
+
+        replace.await.unwrap().unwrap();
+        trigger_spill.await.unwrap().unwrap();
+
+        let read = store
+            .read_partition(&id0)
+            .await
+            .unwrap()
+            .expect("newer replacement must remain readable");
+        let values = read.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 99);
+    }
+
     #[tokio::test]
     async fn parquet_store_writes_compressed() {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -992,12 +1059,22 @@ mod shuffle_tests {
     async fn spill_failure_does_not_corrupt_bytes_used() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Create a spill store at path, then make the dir read-only so writes fail.
+        // Create a spill store at path, then use chattr +i to make it
+        // immutable (works regardless of root vs non-root file permissions).
         let spill_path = dir.path().join("spill_fail");
         std::fs::create_dir_all(&spill_path).unwrap();
-        use std::fs::Permissions;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&spill_path, Permissions::from_mode(0o000)).unwrap();
+        use std::process::Command;
+        let made_immutable = Command::new("chattr")
+            .args(["+i", &spill_path.to_string_lossy()])
+            .status()
+            .map_or(false, |s| s.success());
+        if !made_immutable {
+            // Fallback: set read-only permissions (chattr may require
+            // CAP_LINUX_IMMUTABLE on some systems; 0o000 stops non-root writes).
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&spill_path, Permissions::from_mode(0o000)).unwrap();
+        }
         let spill = Arc::new(LocalDiskShuffleStore::new(&spill_path).unwrap());
 
         // Use a tiny max_bytes so writes trigger spills immediately.
@@ -1014,22 +1091,37 @@ mod shuffle_tests {
         // First write succeeds (below max_bytes, stays in memory).
         store.write_partition(p0, 1).await.unwrap();
         // Second write triggers a spill of the oldest partition — this spill
-        // will FAIL because the spill dir is read-only.  Data must remain
+        // will FAIL because the spill dir is immutable. Existing data must remain
         // accessible in memory and bytes_used must not be corrupted.
-        store.write_partition(p1, 1).await.unwrap();
+        let err = store.write_partition(p1.clone(), 1).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::Io(_)),
+            "expected spill I/O failure, got {err}"
+        );
 
-        // Both partitions must still be readable.
+        // The existing partition must still be readable. The failed incoming
+        // partition is not committed; callers can retry after fixing the sink.
         assert!(
             store.read_partition(&id0).await.unwrap().is_some(),
             "p0 lost after failed spill"
         );
         assert!(
-            store.read_partition(&id1).await.unwrap().is_some(),
-            "p1 missing after write"
+            store.read_partition(&id1).await.unwrap().is_none(),
+            "p1 should not be committed after failed spill"
         );
 
-        // Restore permissions for cleanup.
+        // Clear the immutable flag and verify the same write can be retried cleanly.
+        let _ = Command::new("chattr")
+            .args(["-i", &spill_path.to_string_lossy()])
+            .status();
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&spill_path, Permissions::from_mode(0o755)).unwrap();
+        store.write_partition(p1, 1).await.unwrap();
+        assert!(
+            store.read_partition(&id1).await.unwrap().is_some(),
+            "p1 missing after retry"
+        );
     }
 
     #[tokio::test]

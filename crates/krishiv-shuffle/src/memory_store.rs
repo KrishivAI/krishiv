@@ -7,6 +7,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex;
 
 /// An in-memory shuffle store backed by a `BTreeMap` under an `RwLock`.
 ///
@@ -24,6 +25,7 @@ pub struct InMemoryShuffleStore {
     spill_store: Option<Arc<LocalDiskShuffleStore>>,
     spill_order: Arc<RwLock<VecDeque<PartitionKey>>>,
     spilled: Arc<RwLock<BTreeSet<PartitionKey>>>,
+    spill_lock: Arc<Mutex<()>>,
 }
 
 impl Default for InMemoryShuffleStore {
@@ -36,6 +38,7 @@ impl Default for InMemoryShuffleStore {
             spill_store: None,
             spill_order: Arc::new(RwLock::new(VecDeque::new())),
             spilled: Arc::new(RwLock::new(BTreeSet::new())),
+            spill_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -59,7 +62,7 @@ impl InMemoryShuffleStore {
         self
     }
 
-    async fn ensure_memory_capacity(
+    async fn ensure_memory_capacity_locked(
         &self,
         incoming_key: &PartitionKey,
         incoming_size: usize,
@@ -113,15 +116,17 @@ impl InMemoryShuffleStore {
             spill.write_partition(spill_partition, spill_token).await?;
 
             // Spill succeeded — now safely remove from memory and account.
+            // Acquire all three locks in the same scope to prevent a window
+            // where the partition is absent from both partitions and spilled
+            // (which would cause read_partition to return None).
             {
                 let mut parts = shuffle_write_lock(&self.partitions)?;
-                parts.remove(&key_to_spill);
-            }
-            {
+                let mut spilled = shuffle_write_lock(&self.spilled)?;
                 let mut used = shuffle_write_lock(&self.bytes_used)?;
+                parts.remove(&key_to_spill);
+                spilled.insert(key_to_spill);
                 *used = used.saturating_sub(spill_size);
             }
-            shuffle_write_lock(&self.spilled)?.insert(key_to_spill);
         }
     }
 }
@@ -179,9 +184,15 @@ impl ShuffleStore for InMemoryShuffleStore {
 
         let new_size = partition_memory_bytes(&partition);
 
+        let _spill_guard = if self.max_bytes.is_some() && self.spill_store.is_some() {
+            Some(self.spill_lock.lock().await)
+        } else {
+            None
+        };
+
         // Ensure capacity BEFORE mutating accounting state. If the spill
         // fails, no state has changed yet and we can safely retry.
-        self.ensure_memory_capacity(&key, new_size).await?;
+        self.ensure_memory_capacity_locked(&key, new_size).await?;
 
         // Mark as not spilled before updating partitions.
         shuffle_write_lock(&self.spilled)?.remove(&key);

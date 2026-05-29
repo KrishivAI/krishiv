@@ -157,10 +157,10 @@ impl MultiSourceWatermarkState {
 }
 
 fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

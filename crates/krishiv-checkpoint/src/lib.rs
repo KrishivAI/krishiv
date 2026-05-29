@@ -544,7 +544,7 @@ pub fn list_valid_epochs(
             Ok(false) => tracing::warn!(job_id, epoch, "excluding invalid checkpoint epoch"),
             Err(e) => {
                 tracing::warn!(job_id, epoch, error = %e, "checkpoint epoch validation failed");
-                return Err(e);
+                continue;
             }
         }
     }

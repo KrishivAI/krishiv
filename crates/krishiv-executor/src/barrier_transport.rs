@@ -1,8 +1,9 @@
 //! gRPC checkpoint barrier injection (R16 S1.2).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use krishiv_proto::KeyGroupRange;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
 
 /// Receives barriers from the coordinator and dispatches to source injectors.
@@ -61,6 +62,40 @@ impl SharedBarrierInjector {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .next_barrier()
+    }
+}
+
+/// Task-id keyed state-handle key-group ranges used by the barrier service.
+#[derive(Clone, Default)]
+pub struct SharedKeyGroupRanges {
+    inner: Arc<Mutex<HashMap<String, KeyGroupRange>>>,
+}
+
+impl SharedKeyGroupRanges {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, task_id: impl Into<String>, range: KeyGroupRange) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.into(), range);
+    }
+
+    pub fn get(&self, task_id: &str) -> Option<KeyGroupRange> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .copied()
+    }
+
+    pub fn remove(&self, task_id: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(task_id);
     }
 }
 

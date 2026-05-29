@@ -11,7 +11,7 @@ use krishiv_proto::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
     ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
     LeaseGeneration, RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef,
-    TaskStatusRequest, TaskStatusResponse, TransportVersion, wire,
+    TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,
 };
 
 use crate::grpc::executor_task_grpc_server;
@@ -341,9 +341,7 @@ impl ExecutorRuntime {
         let mut client = self.connect_coordinator_client().await?;
         let request = wire::executor_heartbeat_request_to_wire(self.heartbeat_request());
         let response = client.executor_heartbeat(request).await?.into_inner();
-        let response = wire::executor_heartbeat_response_from_wire(response)?;
-        self.apply_lease_generation(response.lease_generation());
-        Ok(response)
+        Ok(wire::executor_heartbeat_response_from_wire(response)?)
     }
 
     /// Send a checkpoint acknowledgement to the coordinator over gRPC.
@@ -379,7 +377,9 @@ impl ExecutorRuntime {
             .await?
             .into_inner();
         let heartbeat = wire::executor_heartbeat_response_from_wire(heartbeat)?;
-        self.apply_lease_generation(heartbeat.lease_generation());
+        if heartbeat.disposition() == TransportDisposition::Accepted {
+            self.apply_lease_generation(heartbeat.lease_generation());
+        }
 
         Ok((registration, heartbeat))
     }

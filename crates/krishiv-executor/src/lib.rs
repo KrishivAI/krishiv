@@ -32,7 +32,9 @@ pub use execution_model::ExecutionModel;
 // Re-exports of barrier, runner, transport, and grpc types.
 pub use barrier::{BarrierSimulator, BarrierSnapshot};
 pub use barrier_grpc::{ExecutorBarrierService, executor_barrier_grpc_server};
-pub use barrier_transport::{BarrierInjector, SharedBarrierInjector, make_checkpoint_barrier};
+pub use barrier_transport::{
+    BarrierInjector, SharedBarrierInjector, SharedKeyGroupRanges, make_checkpoint_barrier,
+};
 pub use grpc::{ExecutorTaskGrpcService, ExecutorTaskInboxService, executor_task_grpc_server};
 pub use runner::{
     ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,

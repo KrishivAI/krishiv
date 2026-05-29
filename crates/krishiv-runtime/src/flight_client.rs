@@ -234,8 +234,7 @@ pub async fn execute_remote_bounded_window(
 }
 
 fn is_unimplemented(e: &RuntimeError) -> bool {
-    matches!(e, RuntimeError::Transport { message } if message.contains("Unimplemented")
-                                                       || message.contains("invalid"))
+    matches!(e, RuntimeError::Transport { message } if message.contains("Unimplemented"))
 }
 
 fn decode_ipc_response(body: &[u8]) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {

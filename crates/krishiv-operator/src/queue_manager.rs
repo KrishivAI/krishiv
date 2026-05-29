@@ -132,7 +132,9 @@ impl QueueManager for CrdQueueManager {
                 .saturating_add(spec.cpu_limit_nanos().unwrap_or(0))
                 > limit
         {
-            return SubmitOutcome::Queued { position: 0 };
+            return SubmitOutcome::Queued {
+                position: quota.active_job_count.saturating_add(1),
+            };
         }
         if let Some(limit) = policy.memory_bytes_limit
             && quota
@@ -140,7 +142,9 @@ impl QueueManager for CrdQueueManager {
                 .saturating_add(spec.memory_limit_bytes().unwrap_or(0))
                 > limit
         {
-            return SubmitOutcome::Queued { position: 0 };
+            return SubmitOutcome::Queued {
+                position: quota.active_job_count.saturating_add(1),
+            };
         }
         SubmitOutcome::Accepted
     }

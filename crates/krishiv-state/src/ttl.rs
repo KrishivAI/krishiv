@@ -116,7 +116,10 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
     /// [`set_watermark`](Self::set_watermark).  The watermark only affects
     /// read-time expiry checks and `purge_expired`, not the initial write.
     fn put(&mut self, namespace: &Namespace, key: Vec<u8>, value: Vec<u8>) -> StateResult<()> {
-        let expires_at_ms = unix_now_ms() + self.config.ttl_ms as i64;
+        // Use watermark-aware now_ms() so that writes and reads agree on the
+        // effective clock, preventing keys from appearing immediately expired
+        // when the event-time watermark lags wall-clock time.
+        let expires_at_ms = self.now_ms() + self.config.ttl_ms as i64;
         self.inner
             .put(namespace, key, Self::encode(value, expires_at_ms))
     }
@@ -141,7 +144,11 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
             match self.inner.get(namespace, &key)? {
                 Some(encoded) if encoded.len() >= 8 => {
                     let expires_at_ms =
-                        i64::from_le_bytes(encoded[..8].try_into().unwrap_or([0u8; 8]));
+                        i64::from_le_bytes(encoded[..8].try_into().map_err(|_| {
+                            StateError::CorruptEntry {
+                                message: "TTL entry has invalid timestamp bytes".into(),
+                            }
+                        })?);
                     if now_ms < expires_at_ms {
                         live.push(key);
                     }

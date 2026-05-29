@@ -127,7 +127,7 @@ impl Accumulator for KrishivAggregateAccumulator {
         if states.is_empty() {
             return Ok(());
         }
-        let data = arrow::array::Array::to_data(states[0].as_ref());
+        let data = states[0].to_data();
         let buffers = data.buffers();
         if buffers.len() < 2 {
             return Err(DataFusionError::Execution(
@@ -195,13 +195,13 @@ fn read_offset(buf: &[u8], pos: usize, width: usize) -> datafusion::error::Resul
             let arr: [u8; 4] = buf[pos..pos + 4].try_into().map_err(|_| {
                 DataFusionError::Execution("merge_batch: invalid i32 offset".into())
             })?;
-            Ok(i32::from_ne_bytes(arr) as usize)
+            Ok(i32::from_le_bytes(arr) as usize)
         }
         8 => {
             let arr: [u8; 8] = buf[pos..pos + 8].try_into().map_err(|_| {
                 DataFusionError::Execution("merge_batch: invalid i64 offset".into())
             })?;
-            Ok(i64::from_ne_bytes(arr) as usize)
+            Ok(i64::from_le_bytes(arr) as usize)
         }
         _ => Err(DataFusionError::Execution(format!(
             "merge_batch: unsupported offset width {width}"

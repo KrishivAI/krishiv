@@ -28,6 +28,7 @@ pub struct FeatureStoreSink {
     root: PathBuf,
     table: String,
     live: RwLock<Vec<FeatureRow>>,
+    live_index: RwLock<BTreeMap<String, Vec<usize>>>,
     next_fragment_id: RwLock<u64>,
 }
 
@@ -42,6 +43,7 @@ impl FeatureStoreSink {
             root,
             table,
             live: RwLock::new(Vec::new()),
+            live_index: RwLock::new(BTreeMap::new()),
             next_fragment_id: RwLock::new(0),
         };
         sink.reload_from_fragments()?;
@@ -80,6 +82,21 @@ impl FeatureStoreSink {
         if let Ok(mut guard) = self.live.write() {
             *guard = rows;
         }
+        if let Ok(live_guard) = self.live.read() {
+            let mut index = BTreeMap::new();
+            for (idx, row) in live_guard.iter().enumerate() {
+                let entity_id = row
+                    .entity_key
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("|");
+                index.entry(entity_id).or_insert_with(Vec::new).push(idx);
+            }
+            if let Ok(mut index_guard) = self.live_index.write() {
+                *index_guard = index;
+            }
+        }
         if let Ok(mut guard) = self.next_fragment_id.write() {
             *guard = max_fragment.saturating_add(1);
         }
@@ -93,7 +110,24 @@ impl FeatureStoreSink {
                 .live
                 .write()
                 .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
+            let start_idx = guard.len();
             guard.extend(rows.iter().cloned());
+            let mut index_guard = self
+                .live_index
+                .write()
+                .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
+            for (offset, row) in rows.iter().enumerate() {
+                let entity_id = row
+                    .entity_key
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("|");
+                index_guard
+                    .entry(entity_id)
+                    .or_insert_with(Vec::new)
+                    .push(start_idx + offset);
+            }
         }
         self.flush_parquet(rows)
     }
@@ -174,15 +208,16 @@ impl FeatureStoreSink {
             .live
             .read()
             .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
+        let index_guard = self
+            .live_index
+            .read()
+            .map_err(|e| ConnectorError::Parquet(format!("feature store lock: {e}")))?;
         let mut best: BTreeMap<String, (u64, f64)> = BTreeMap::new();
-        for row in guard.iter() {
-            let row_id = row
-                .entity_key
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("|");
-            if row_id != entity_id || row.created_at_ms > timestamp_ms {
+        let empty = Vec::new();
+        let row_indices = index_guard.get(&entity_id).unwrap_or(&empty);
+        for &idx in row_indices {
+            let row = &guard[idx];
+            if row.created_at_ms > timestamp_ms {
                 continue;
             }
             if let Some(ttl) = row.ttl_ms

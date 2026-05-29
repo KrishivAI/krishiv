@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 use krishiv_async_util::block_on;
-use krishiv_executor::{ContinuousJobDrainer, ExecutorAssignmentInbox, ExecutorTaskRunner};
+use krishiv_executor::{
+    ContinuousJobDrainer, ExecutorAssignmentInbox, ExecutorTaskOutputKind, ExecutorTaskRunner,
+};
 use krishiv_plan::window::{WindowExecutionSpec, encode_stream_fragment};
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, InputPartitionDescriptor, JobId,
@@ -266,7 +268,18 @@ impl InProcessStreamingRuntime {
                     .await
                     .map_err(|e| RuntimeError::transport(e.message()))?
                 {
-                    output_batches.extend(report.output().record_batches().to_vec());
+                    // Only collect terminal-stage outputs (SQL, connector pipeline,
+                    // streaming window).  Intermediate shuffle-write reports must
+                    // not be concatenated into the final result set.
+                    let kind = report.output().kind();
+                    if matches!(
+                        kind,
+                        ExecutorTaskOutputKind::Sql
+                            | ExecutorTaskOutputKind::ConnectorPipeline
+                            | ExecutorTaskOutputKind::StreamingWindow
+                    ) {
+                        output_batches.extend(report.output().record_batches().to_vec());
+                    }
                 }
             }
         })?;

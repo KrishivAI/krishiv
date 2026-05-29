@@ -48,12 +48,12 @@ impl LanceDbSink {
             index: InMemoryVectorSink::new(),
             manifest: RwLock::new(HashMap::new()),
         };
-        sink.load_existing_fragments()?;
+        sink.load_existing_fragments().await?;
         Ok(sink)
     }
 
     /// Reload Parquet fragments written in prior runs (P2-9).
-    fn load_existing_fragments(&mut self) -> VectorSinkResult<()> {
+    async fn load_existing_fragments(&mut self) -> VectorSinkResult<()> {
         let table_dir = self.uri.join(&self.table_name);
         if !table_dir.is_dir() {
             return Ok(());
@@ -76,8 +76,7 @@ impl LanceDbSink {
             for batch in reader {
                 let batch = batch.map_err(|e| VectorSinkError::Query(e.to_string()))?;
                 let restored = Self::arrow_batch_to_embedding(&batch, self.vector_dim)?;
-                // P2-9: reload is sync; block on in-memory index upsert.
-                futures::executor::block_on(self.index.upsert_batch(&restored))?;
+                self.index.upsert_batch(&restored).await?;
                 if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
                     self.manifest
                         .write()
@@ -226,11 +225,10 @@ impl VectorSink for LanceDbSink {
     async fn upsert_batch(&self, batch: &EmbeddingBatch) -> VectorSinkResult<()> {
         self.index.upsert_batch(batch).await?;
         let record = Self::batch_to_arrow(batch, self.vector_dim)?;
-        for row in 0..batch.len() {
-            let id = point_id_from_doc_epoch(&batch.doc_ids[row], batch.epoch);
-            let slice = record.slice(row, 1);
-            self.write_fragment(&id, &slice)?;
-        }
+        // Write the entire batch as a single Parquet fragment instead of one
+        // file per row, which was catastrophic for filesystem overhead.
+        let batch_id = point_id_from_doc_epoch("batch", batch.epoch);
+        self.write_fragment(&batch_id, &record)?;
         Ok(())
     }
 

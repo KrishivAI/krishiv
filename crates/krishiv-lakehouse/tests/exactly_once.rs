@@ -67,7 +67,7 @@ async fn exactly_once_ten_thousand_rows_after_crash() {
         let parsed: Vec<_> = raw
             .iter()
             .enumerate()
-            .filter_map(|(i, j)| parse_debezium_envelope(j, 0, i as i64))
+            .filter_map(|(i, j)| parse_debezium_envelope(j, 0, i as i64).ok())
             .collect();
         let batch = build_batch_from_events(&parsed).unwrap();
         let staged = tpc.prepare(vec![batch.clone()]).await.unwrap();
@@ -92,7 +92,7 @@ async fn exactly_once_ten_thousand_rows_after_crash() {
         let parsed: Vec<_> = raw
             .iter()
             .enumerate()
-            .filter_map(|(i, j)| parse_debezium_envelope(j, 0, (5000 + i) as i64))
+            .filter_map(|(i, j)| parse_debezium_envelope(j, 0, (5000 + i) as i64).ok())
             .collect();
         let batch = build_batch_from_events(&parsed).unwrap();
         let staged = tpc.prepare(vec![batch.clone()]).await.unwrap();

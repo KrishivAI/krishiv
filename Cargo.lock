@@ -3861,6 +3861,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "fastembed",
+ "futures",
  "hex",
  "krishiv-plan",
  "krishiv-vector-sinks",
@@ -3975,6 +3976,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "krishiv-async-util",
  "krishiv-exec",
  "krishiv-lakehouse",
  "krishiv-proto",
@@ -4046,6 +4048,7 @@ dependencies = [
  "krishiv-runtime",
  "krishiv-sql",
  "krishiv-sql-policy",
+ "lru",
  "prost 0.14.3",
  "sha2",
  "tokio",
@@ -4242,7 +4245,9 @@ dependencies = [
  "apache-avro 0.17.0",
  "arrow",
  "async-trait",
+ "bytes",
  "dashmap",
+ "prost 0.14.3",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -4299,6 +4304,7 @@ dependencies = [
  "krishiv-governance",
  "krishiv-sql",
  "sha2",
+ "sqlparser",
  "tokio",
 ]
 
@@ -4666,6 +4672,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
+]
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
 ]
 
 [[package]]

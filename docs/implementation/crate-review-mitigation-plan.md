@@ -8,6 +8,20 @@ and **stable maturity** by fixing all bugs, gaps, and standards violations.
 
 **Current state (2026-05-28):** ~25 Critical/High, ~60 Medium, ~165 Low/Info issues.
 
+**Progress update (2026-05-29):**
+- Fixed the `krishiv-shuffle` in-memory spill replacement race reported in
+  `review_report.md`: spill-enabled writes now serialize capacity enforcement
+  and final insertion, preventing a successful spill from deleting a newer
+  replacement partition.
+- Fixed Phase 1 item 1.11: `krishiv cluster start` now advertises executor
+  barrier gRPC endpoints on `127.0.0.1`, not `127.0.0.0`.
+- Fixed Phase 1 item 1.13: executor task assignments now carry key-group
+  ranges through scheduler, proto wire, runner registration, and barrier
+  `StateHandle` acks; legacy/single-node default remains `0..32767`.
+- Fixed Phase 1 item 1.12: stale heartbeat lease responses no longer advance
+  runtime/shared lease state; successful re-registration advances both.
+- Validation is recorded in `docs/implementation/status.md`.
+
 ---
 
 ## Phase 1: Critical Correctness Bugs (Week 1)
@@ -128,6 +142,7 @@ and **stable maturity** by fixing all bugs, gaps, and standards violations.
 **File:** `crates/krishiv/src/cluster_cmd.rs:181`
 **Severity:** High
 **Fix:** `127.0.0.0` → `127.0.0.1`
+**Status:** Fixed 2026-05-29; covered by `executor_barrier_addr_uses_loopback_host`.
 
 ### 1.12 — Lease-Generation Race [KRISHIV-EXECUTOR]
 
@@ -136,6 +151,9 @@ and **stable maturity** by fixing all bugs, gaps, and standards violations.
 **Fix:**
 - Only update `shared_lease` after successful re-registration, not from stale response.
 - Add test simulating stale lease response.
+**Status:** Fixed 2026-05-29; covered by
+`stale_heartbeat_does_not_advance_runtime_or_shared_lease` and
+`successful_reregister_advances_runtime_and_shared_lease`.
 
 ### 1.13 — Hardcoded Key Group Range [KRISHIV-EXECUTOR]
 
@@ -145,6 +163,9 @@ and **stable maturity** by fixing all bugs, gaps, and standards violations.
 - Accept `key_group_range` as a constructor parameter.
 - In `ExecutorTaskRunner`, pass the assigned key group range from the task assignment.
 - Default to `0..32767` only for single-node mode.
+**Status:** Fixed 2026-05-29; covered by proto assignment round-trip,
+`key_group_ranges_split_stage_parallelism`, and
+`service_uses_registered_task_key_group_range`.
 
 ---
 

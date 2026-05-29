@@ -9,8 +9,8 @@ use std::time::Duration;
 use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
-    ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector, ShuffleContext,
-    executor_barrier_grpc_server, serve_executor_task_grpc_with_listener,
+    ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector, SharedKeyGroupRanges,
+    ShuffleContext, executor_barrier_grpc_server, serve_executor_task_grpc_with_listener,
 };
 use axum::Router;
 use axum::http::header::CONTENT_TYPE;
@@ -154,6 +154,32 @@ async fn register_once(runtime: &mut ExecutorRuntime) -> crate::ExecutorResult<(
     Ok(())
 }
 
+fn apply_non_stale_heartbeat_lease(
+    runtime: &mut ExecutorRuntime,
+    shared_lease: &SharedLeaseGeneration,
+    heartbeat: &krishiv_proto::ExecutorHeartbeatResponse,
+) -> bool {
+    use krishiv_proto::TransportDisposition;
+    if matches!(
+        heartbeat.disposition(),
+        TransportDisposition::StaleLease | TransportDisposition::UnknownExecutor
+    ) {
+        return false;
+    }
+    runtime.apply_lease_generation(heartbeat.lease_generation());
+    shared_lease.set(heartbeat.lease_generation());
+    true
+}
+
+fn apply_successful_reregister_lease(
+    runtime: &mut ExecutorRuntime,
+    shared_lease: &SharedLeaseGeneration,
+    response: &krishiv_proto::RegisterExecutorResponse,
+) {
+    runtime.apply_lease_generation(response.lease_generation());
+    shared_lease.set(response.lease_generation());
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn heartbeat_loop(
     runtime: &mut ExecutorRuntime,
@@ -217,11 +243,13 @@ async fn heartbeat_loop(
         });
     }
     let barrier_injector: SharedBarrierInjector = Default::default();
+    let key_group_ranges = SharedKeyGroupRanges::new();
     if let Some(listener) = barrier_listener {
         let barrier_service = ExecutorBarrierService::new(
             barrier_injector.clone(),
             runtime.config().executor_id().as_str(),
-        );
+        )
+        .with_key_group_ranges(key_group_ranges.clone());
         tokio::spawn(async move {
             let _ = Server::builder()
                 .add_service(tonic::service::interceptor::InterceptedService::new(
@@ -249,6 +277,7 @@ async fn heartbeat_loop(
     let mut runner_builder = ExecutorTaskRunner::new(inbox.clone())
         .with_live_lease(shared_lease.clone())
         .with_barrier_injector(barrier_injector)
+        .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts);
     if let Some(dir) = &shuffle_dir {
         let disk = Arc::new(
@@ -352,8 +381,11 @@ async fn heartbeat_loop(
                             );
                             match runtime.register_with_grpc_endpoint().await {
                                 Ok(response) => {
-                                    runtime.apply_lease_generation(response.lease_generation());
-                                    shared_lease.set(response.lease_generation());
+                                    apply_successful_reregister_lease(
+                                        runtime,
+                                        &shared_lease,
+                                        &response,
+                                    );
                                     coord_service.invalidate_channel().await;
                                 }
                                 Err(error) => {
@@ -364,7 +396,7 @@ async fn heartbeat_loop(
                         }
                         // Only update the shared lease after confirming the
                         // heartbeat disposition is not stale (fix: lease-generation race).
-                        shared_lease.set(heartbeat.lease_generation());
+                        apply_non_stale_heartbeat_lease(runtime, &shared_lease, &heartbeat);
                         for cmd in heartbeat.checkpoint_commands() {
                             if let Ok(job_id) = JobId::try_new(cmd.job_id.as_str()) {
                                 let req = InitiateCheckpointRequest {
@@ -635,7 +667,16 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutorCliConfig, ExecutorMode};
+    use super::{
+        ExecutorCliConfig, ExecutorMode, apply_non_stale_heartbeat_lease,
+        apply_successful_reregister_lease,
+    };
+    use crate::grpc_client::SharedLeaseGeneration;
+    use crate::{ExecutorConfig, ExecutorRuntime};
+    use krishiv_proto::{
+        ExecutorHeartbeatResponse, ExecutorId, LeaseGeneration, RegisterExecutorResponse,
+        TransportDisposition,
+    };
 
     #[test]
     fn parses_explicit_config() {
@@ -656,6 +697,46 @@ mod tests {
         assert_eq!(config.slots, 2);
         assert_eq!(config.coordinator_endpoint, "http://coordinator");
         assert_eq!(config.mode, ExecutorMode::DryRun);
+    }
+
+    #[test]
+    fn stale_heartbeat_does_not_advance_runtime_or_shared_lease() {
+        let mut runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-lease", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let shared_lease = SharedLeaseGeneration::new(LeaseGeneration::initial());
+        let stale_lease = LeaseGeneration::initial().next();
+        let stale = ExecutorHeartbeatResponse::new(stale_lease, TransportDisposition::StaleLease);
+
+        assert!(!apply_non_stale_heartbeat_lease(
+            &mut runtime,
+            &shared_lease,
+            &stale
+        ));
+        assert_eq!(
+            runtime.config().lease_generation(),
+            LeaseGeneration::initial()
+        );
+        assert_eq!(shared_lease.get(), LeaseGeneration::initial());
+    }
+
+    #[test]
+    fn successful_reregister_advances_runtime_and_shared_lease() {
+        let mut runtime = ExecutorRuntime::new(
+            ExecutorConfig::new("exec-lease", "pod-a", 1, "http://coordinator").unwrap(),
+        );
+        let shared_lease = SharedLeaseGeneration::new(LeaseGeneration::initial());
+        let next_lease = LeaseGeneration::initial().next();
+        let response = RegisterExecutorResponse::new(
+            ExecutorId::try_new("exec-lease").unwrap(),
+            next_lease,
+            TransportDisposition::Accepted,
+        );
+
+        apply_successful_reregister_lease(&mut runtime, &shared_lease, &response);
+
+        assert_eq!(runtime.config().lease_generation(), next_lease);
+        assert_eq!(shared_lease.get(), next_lease);
     }
 
     #[test]

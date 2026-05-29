@@ -523,8 +523,10 @@ impl krishiv_exec::continuous::StreamQualityHook for ConnectorQualityHook {
         let rejected_count = result.rejected.len();
 
         // Build a boolean mask: true → accepted, false → rejected.
+        let accepted_set: std::collections::HashSet<usize> =
+            result.accepted_indices.iter().copied().collect();
         let keep_mask: BooleanArray = (0..batch.num_rows())
-            .map(|i| Some(result.accepted_indices.contains(&i)))
+            .map(|i| Some(accepted_set.contains(&i)))
             .collect();
 
         let accepted = arrow::compute::filter_record_batch(&batch, &keep_mask).map_err(|e| {
@@ -534,7 +536,7 @@ impl krishiv_exec::continuous::StreamQualityHook for ConnectorQualityHook {
         // Buffer rejected rows for async forwarding.
         if rejected_count > 0 {
             let reject_mask: BooleanArray = (0..batch.num_rows())
-                .map(|i| Some(!result.accepted_indices.contains(&i)))
+                .map(|i| Some(!accepted_set.contains(&i)))
                 .collect();
             let rejected_batch = arrow::compute::filter_record_batch(&batch, &reject_mask)
                 .map_err(|e| {

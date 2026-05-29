@@ -278,8 +278,17 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             .ok_or_else(|| PlanError::Parse(String::from("stream fragment missing key=<col>")))?,
         time_col: time_col
             .ok_or_else(|| PlanError::Parse(String::from("stream fragment missing time=<col>")))?,
-        window_ms: window_ms
-            .ok_or_else(|| PlanError::Parse(String::from("stream fragment missing win=<ms>")))?,
+        window_ms: {
+            let ms = window_ms.ok_or_else(|| {
+                PlanError::Parse(String::from("stream fragment missing win=<ms>"))
+            })?;
+            if ms == 0 {
+                return Err(PlanError::Parse(String::from(
+                    "stream fragment window size must be > 0",
+                )));
+            }
+            ms
+        },
         lag_ms: lag_ms.unwrap_or(0),
         slide_ms,
         session_gap_ms,

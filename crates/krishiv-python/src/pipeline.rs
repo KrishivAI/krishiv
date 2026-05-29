@@ -37,6 +37,8 @@ pub struct StreamPipeline {
     pub aggregations: Vec<AggDescriptor>,
     /// Per-source watermark lags for multi-source joins (source_id → lag_ms).
     pub source_watermarks: HashMap<String, u64>,
+    /// Column name that identifies the source for multi-source watermark reconciliation.
+    pub source_id_column: Option<String>,
 }
 
 impl StreamPipeline {
@@ -57,6 +59,7 @@ impl StreamPipeline {
             window: None,
             aggregations: Vec::new(),
             source_watermarks: HashMap::new(),
+            source_id_column: None,
         }
     }
 
@@ -92,6 +95,13 @@ impl StreamPipeline {
     pub fn with_source_watermark(&self, source_id: String, lag_ms: u64) -> Self {
         let mut next = self.clone();
         next.source_watermarks.insert(source_id, lag_ms);
+        next
+    }
+
+    /// Set the source-id column used for multi-source watermark reconciliation.
+    pub fn with_source_id_column(&self, column: String) -> Self {
+        let mut next = self.clone();
+        next.source_id_column = Some(column);
         next
     }
 

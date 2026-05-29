@@ -706,7 +706,7 @@ impl Session {
             total.instant = result.instant;
             total.rows_inserted += result.rows_inserted;
             total.rows_updated += result.rows_updated;
-            total.snapshot_rows = result.snapshot_rows;
+            total.snapshot_rows += result.snapshot_rows;
         }
         Ok(total)
     }
@@ -735,7 +735,7 @@ impl Session {
             total.instant = result.instant;
             total.rows_inserted += result.rows_inserted;
             total.rows_updated += result.rows_updated;
-            total.snapshot_rows = result.snapshot_rows;
+            total.snapshot_rows += result.snapshot_rows;
         }
         Ok(total)
     }

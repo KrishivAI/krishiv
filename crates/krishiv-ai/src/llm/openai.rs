@@ -124,9 +124,14 @@ impl OpenAiLlmUdf {
 #[async_trait]
 impl LlmUdf for OpenAiLlmUdf {
     async fn call_batch(&self, prompts: &[String]) -> Result<Vec<LlmResponse>, LlmError> {
-        let mut out = Vec::with_capacity(prompts.len());
+        use futures::stream::{FuturesOrdered, StreamExt};
+        let mut futures = FuturesOrdered::new();
         for prompt in prompts {
-            out.push(self.call_one(prompt.clone()).await?);
+            futures.push(self.call_one(prompt.clone()));
+        }
+        let mut out = Vec::with_capacity(prompts.len());
+        while let Some(result) = futures.next().await {
+            out.push(result?);
         }
         Ok(out)
     }

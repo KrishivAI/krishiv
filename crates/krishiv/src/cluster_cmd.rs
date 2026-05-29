@@ -141,6 +141,15 @@ fn parse_http_addr(args: &[&str]) -> Result<Option<String>, String> {
     Ok(addr)
 }
 
+fn executor_bind_addrs(idx: usize) -> (String, String) {
+    let port = 50055u16 + idx as u16;
+    let barrier_port = 50056u16 + idx as u16;
+    (
+        format!("127.0.0.1:{port}"),
+        format!("127.0.0.1:{barrier_port}"),
+    )
+}
+
 fn cluster_start(args: &[&str]) -> CliResponse {
     let (data_dir, executor_count) = match parse_data_dir(args) {
         Ok(v) => v,
@@ -159,7 +168,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         Ok(addr) => addr,
         Err(e) => return CliResponse::err(e, 1),
     };
-    let clusterd_pid = spawn_krishiv_daemon(
+    let clusterd_pid = match spawn_krishiv_daemon(
         "clusterd",
         &[
             "--grpc-addr",
@@ -171,14 +180,13 @@ fn cluster_start(args: &[&str]) -> CliResponse {
             "--metadata-path",
             meta,
         ],
-    )
-    .ok();
+    ) {
+        Ok(pid) => pid,
+        Err(e) => return CliResponse::err(format!("failed to spawn clusterd: {e}"), 1),
+    };
     let mut executor_pids = Vec::new();
     for i in 0..executor_count {
-        let port = 50055u16 + i as u16;
-        let barrier_port = 50056u16 + i as u16;
-        let task_addr = format!("127.0.0.1:{port}");
-        let barrier_addr = format!("127.0.0.0:{barrier_port}");
+        let (task_addr, barrier_addr) = executor_bind_addrs(i);
         let exec_id = format!("exec-{i}");
         if let Ok(pid) = spawn_krishiv_daemon(
             "executor",
@@ -202,7 +210,7 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         ui_url: ui_url_from_http_addr(&http_addr),
         metadata_path,
         data_dir: data_dir.clone(),
-        clusterd_pid,
+        clusterd_pid: Some(clusterd_pid),
         executor_pids,
         ui_pid: None,
     };
@@ -214,6 +222,19 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         data_dir.display(),
         cfg.ui_url
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executor_bind_addrs;
+
+    #[test]
+    fn executor_barrier_addr_uses_loopback_host() {
+        let (task_addr, barrier_addr) = executor_bind_addrs(0);
+
+        assert_eq!(task_addr, "127.0.0.1:50055");
+        assert_eq!(barrier_addr, "127.0.0.1:50056");
+    }
 }
 
 fn cluster_stop(args: &[&str]) -> CliResponse {
