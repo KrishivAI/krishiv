@@ -70,6 +70,29 @@ impl std::error::Error for VectorSinkError {}
 
 pub type VectorSinkResult<T> = Result<T, VectorSinkError>;
 
+/// Validates a SQL/GraphQL identifier (table name, class name, etc.) to prevent injection.
+/// Allowed: ^[A-Za-z_][A-Za-z0-9_]*$ (per S2 in crate-stability-resolution-plan).
+pub fn validate_identifier(name: &str) -> VectorSinkResult<()> {
+    if name.is_empty() {
+        return Err(VectorSinkError::Connection(
+            "identifier cannot be empty".into(),
+        ));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(VectorSinkError::Connection(format!(
+            "invalid identifier (must start with letter or _): {name}"
+        )));
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(VectorSinkError::Connection(format!(
+            "invalid identifier (only alphanumeric + _ allowed): {name}"
+        )));
+    }
+    Ok(())
+}
+
 /// Vector store sink contract (ADR-R17.3 idempotent upsert).
 #[async_trait]
 pub trait VectorSink: Send + Sync {

@@ -95,11 +95,17 @@ pub fn read_table(path: &str, version: Option<u64>) -> LakehouseResult<Vec<Recor
 pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> LakehouseResult<()> {
     let root = Path::new(path);
     fs::create_dir_all(root).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let mut removed_paths: Vec<String> = Vec::new();
     if overwrite && root.exists() {
         for entry in fs::read_dir(root).map_err(|e| LakehouseError::Io(e.to_string()))? {
             let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "parquet") {
+                let file_name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                removed_paths.push(file_name);
                 fs::remove_file(p).ok();
             }
         }
@@ -116,10 +122,15 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
             .write(batch)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
     }
-    writer
-        .close()
+    // S6: Use into_inner + fsync for atomic commit semantics.
+    let mut file = writer
+        .into_inner()
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
-    let meta = fs::metadata(&file_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
     let log_dir = delta_log_dir(root);
     let log_path = log_dir.join(format!("{version:020}.json"));
     let tmp_log_path = log_dir.join(format!("{version:020}.json.tmp"));
@@ -135,11 +146,20 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
             .open(&tmp_log_path)
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         writeln!(log, "{commit}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // S6: Emit remove actions for every file deleted during overwrite.
+        for removed in &removed_paths {
+            let remove = json!({"remove":{"path":removed,"dataChange":true,"deletionTimestamp":chrono::Utc::now().timestamp_millis()}});
+            writeln!(log, "{remove}").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        }
         writeln!(log, "{add}").map_err(|e| LakehouseError::Io(e.to_string()))?;
         log.sync_all()
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
     }
     fs::rename(&tmp_log_path, &log_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    // Fsync the parent directory so the rename is durable.
+    if let Ok(dir_file) = File::open(&log_dir) {
+        dir_file.sync_all().ok();
+    }
     Ok(())
 }
 

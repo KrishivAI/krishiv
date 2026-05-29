@@ -663,6 +663,149 @@ pub fn generate_replay_bundle(
     })
 }
 
+/// Path to the immutable savepoint prefix for a job.
+fn savepoint_prefix(job_id: &str) -> String {
+    format!("{job_id}/savepoints")
+}
+
+/// Path to a specific savepoint epoch directory.
+fn savepoint_epoch_dir(job_id: &str, savepoint_epoch: u64) -> String {
+    format!("{}/{:020}", savepoint_prefix(job_id), savepoint_epoch)
+}
+
+/// C11: Create an immutable savepoint from the latest committed checkpoint.
+///
+/// Copies all checkpoint files (metadata, state snapshots, manifest) to a
+/// separate `savepoints/` prefix that is excluded from normal checkpoint
+/// garbage collection.  The savepoint persists until explicitly deleted by
+/// the administrator.
+///
+/// Returns the savepoint epoch (same as the source checkpoint epoch) and
+/// the serialized metadata.
+pub fn create_savepoint(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    label: Option<&str>,
+) -> CheckpointResult<(u64, CheckpointMetadata)> {
+    let epoch = latest_valid_epoch(storage, job_id)?;
+    let mut metadata =
+        read_epoch_metadata(storage, job_id, epoch)?.ok_or(CheckpointError::NoValidEpoch)?;
+    metadata.is_savepoint = true;
+    metadata.savepoint_label = label.map(str::to_string);
+
+    let savepoint_dir = savepoint_epoch_dir(job_id, epoch);
+    let epoch_dir = epoch_dir(job_id, epoch);
+
+    // Copy metadata to savepoint prefix.
+    let metadata_json =
+        serde_json::to_vec_pretty(&metadata).map_err(|e| CheckpointError::Storage {
+            message: format!("savepoint metadata serialize: {e}"),
+        })?;
+    storage.write_bytes(&format!("{savepoint_dir}/metadata.json"), &metadata_json)?;
+
+    // Copy operator state snapshots.
+    for snap in &metadata.operator_snapshots {
+        let src_path = &snap.snapshot_path;
+        if let Some(data) = storage.read_bytes(src_path)? {
+            let rel = snap
+                .snapshot_path
+                .strip_prefix(&format!("{epoch_dir}/"))
+                .unwrap_or(&snap.snapshot_path);
+            storage.write_bytes(&format!("{savepoint_dir}/{rel}"), &data)?;
+        }
+    }
+
+    // Copy manifest.
+    let manifest_bytes = storage
+        .read_bytes(&manifest_path(job_id, epoch))?
+        .ok_or_else(|| CheckpointError::NoValidEpoch)?;
+    storage.write_bytes(&format!("{savepoint_dir}/manifest.sha256"), &manifest_bytes)?;
+
+    Ok((epoch, metadata))
+}
+
+/// C11: Restore from an immutable savepoint.
+///
+/// Reads savepoint metadata and validates that the current coordinator's
+/// fencing token is equal to or greater than the savepoint's fencing token.
+/// Returns the savepoint metadata and the list of valid savepoint epochs
+/// available for this job.
+pub fn restore_savepoint(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    savepoint_epoch: u64,
+    current_fencing_token: u64,
+) -> CheckpointResult<CheckpointMetadata> {
+    let savepoint_dir = savepoint_epoch_dir(job_id, savepoint_epoch);
+
+    let meta_path = format!("{savepoint_dir}/metadata.json");
+    let metadata = storage
+        .read_bytes(&meta_path)?
+        .ok_or(CheckpointError::NoValidEpoch)
+        .and_then(|bytes| {
+            serde_json::from_slice::<CheckpointMetadata>(&bytes).map_err(|e| {
+                CheckpointError::Corrupt {
+                    epoch: savepoint_epoch,
+                    message: format!("savepoint metadata JSON parse: {e}"),
+                }
+            })
+        })?;
+
+    validate_fencing_token(&metadata, current_fencing_token)?;
+
+    // Copy savepoint files back into the active checkpoints directory for restore.
+    let epoch_dir = epoch_dir(job_id, savepoint_epoch);
+    storage.write_bytes(
+        &format!("{epoch_dir}/metadata.json"),
+        &serde_json::to_vec_pretty(&metadata).map_err(|e| CheckpointError::Storage {
+            message: format!("metadata serialize: {e}"),
+        })?,
+    )?;
+
+    for snap in &metadata.operator_snapshots {
+        let savepoint_snap = format!(
+            "{savepoint_dir}/{}/{}/state.bin",
+            snap.operator_id, snap.task_id
+        );
+        if let Some(data) = storage.read_bytes(&savepoint_snap)? {
+            let target = snapshot_path(job_id, savepoint_epoch, &snap.operator_id, &snap.task_id);
+            storage.write_bytes(&target, &data)?;
+        }
+    }
+
+    let saved_manifest_path = format!("{savepoint_dir}/manifest.sha256");
+    if let Some(manifest_data) = storage.read_bytes(&saved_manifest_path)? {
+        storage.write_bytes(&manifest_path(job_id, savepoint_epoch), &manifest_data)?;
+    }
+
+    Ok(metadata)
+}
+
+/// List all savepoint epochs for a job.
+pub fn list_savepoints(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+) -> CheckpointResult<Vec<u64>> {
+    let prefix = savepoint_prefix(job_id);
+    let names = storage.list_dir(&prefix)?;
+    let mut epochs: Vec<u64> = names
+        .into_iter()
+        .filter_map(|n| n.parse::<u64>().ok())
+        .collect();
+    epochs.sort_unstable();
+    Ok(epochs)
+}
+
+/// Delete a savepoint (no-op if the savepoint does not exist).
+pub fn delete_savepoint(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    savepoint_epoch: u64,
+) -> CheckpointResult<()> {
+    let dir = savepoint_epoch_dir(job_id, savepoint_epoch);
+    storage.delete_prefix(&dir)
+}
+
 // ── LocalFsCheckpointStorage ──────────────────────────────────────────────────
 
 /// Filesystem-backed checkpoint storage for tests.

@@ -396,6 +396,14 @@ impl LakehouseTable for MemoryLakehouseTable {
         }
     }
 
+    /// **Alpha**: Appends record batches to the in-memory delta log.
+    ///
+    /// **Not transactional**: If the process crashes between mutex acquire and
+    /// commit, in-flight data is lost. No WAL or S3 multipart staging is used.
+    ///
+    /// **Partition path note**: Partition paths are computed and logged at write
+    /// time for observability, but are not used to route data to external storage.
+    /// In a production implementation this path would target object storage.
     async fn append(&self, batches: Vec<RecordBatch>) -> Result<(), LakehouseError> {
         // Compute the partition path from the active spec before committing.
         // In a full implementation this path would be used when writing data files to

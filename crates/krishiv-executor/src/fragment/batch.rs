@@ -172,7 +172,9 @@ pub(crate) async fn execute_batch_fragment(
         );
     }
 
-    Ok(ExecutorTaskOutput::placeholder())
+    Err(ExecutorError::InvalidAssignment {
+        message: format!("unsupported batch fragment type: {}", fragment),
+    })
 }
 
 /// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.

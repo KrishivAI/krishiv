@@ -64,7 +64,16 @@ impl IntervalJoinState {
         };
         let mut matches = Vec::new();
         for other in other_buf.iter() {
-            let delta = event_time_ms - other.event_time_ms;
+            // C4: Evaluate with fixed left/right orientation.
+            // A left event at time L matches a right event at time R when
+            // lower_bound_ms <= R - L <= upper_bound_ms.
+            // For push_left: L = event_time_ms, R = other.event_time_ms, delta = R - L.
+            // For push_right: R = event_time_ms, L = other.event_time_ms, delta = R - L.
+            let delta = if is_left {
+                other.event_time_ms - event_time_ms
+            } else {
+                event_time_ms - other.event_time_ms
+            };
             if delta >= self.spec.lower_bound_ms && delta <= self.spec.upper_bound_ms {
                 if is_left {
                     matches.push((batch.clone(), other.batch.clone()));
@@ -81,7 +90,14 @@ impl IntervalJoinState {
     }
 
     pub fn evict_before(&mut self, watermark_ms: i64) {
-        let horizon = watermark_ms - self.spec.upper_bound_ms.max(self.spec.lower_bound_ms);
+        // C4: Eviction horizon uses max absolute bound so asymmetric intervals
+        // don't prematurely evict the longer side.
+        let bound = self
+            .spec
+            .upper_bound_ms
+            .abs()
+            .max(self.spec.lower_bound_ms.abs());
+        let horizon = watermark_ms - bound;
         self.left.retain(|e| e.event_time_ms >= horizon);
         self.right.retain(|e| e.event_time_ms >= horizon);
     }

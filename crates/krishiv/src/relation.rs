@@ -92,6 +92,9 @@ impl StreamingChain {
                 .clone()
                 .unwrap_or_else(LocalWindowExecutionSpec::default_count_agg),
             state_ttl_ms,
+            // NOTE(R5.2 gap): source_watermark_lags and source_id_column are always
+            // empty/None here. Multi-source watermark from StreamingChain is not yet
+            // plumbed through this path. See MultiSourceWatermarkSpec.
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         })
@@ -279,6 +282,8 @@ impl Relation {
     /// * Batch: executes the SQL query and returns all batches.
     /// * Bounded stream: runs the windowed aggregation in-process.
     /// * Unbounded stream: returns an error — use [`sink_to`] instead.
+    ///
+    /// **Note**: Batch collect is local-only. Unbounded streams always error here — use `sink_to()`.
     pub fn collect(self) -> crate::Result<QueryResult> {
         match self.kind {
             RelationKind::Batch(df) => df.collect(),
@@ -302,6 +307,10 @@ impl Relation {
     ///   returns a completed handle.
     /// * Unbounded stream: submits a continuous job to the runtime, spawns a
     ///   background thread to poll and write, and returns an active handle.
+    ///
+    /// **Execution mode**: In embedded and single-node mode, submits to an
+    /// in-process cluster. For distributed execution, configure the session
+    /// with `SessionBuilder::with_remote_execution(true)` and a coordinator URL.
     pub fn sink_to(
         self,
         mut sink: impl krishiv_connectors::DynSink + 'static,

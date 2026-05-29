@@ -59,7 +59,10 @@ impl KeyedStream {
         self
     }
 
-    /// Configure multi-source watermark reconciliation (R5.2).
+    /// Configure multi-source watermark reconciliation.
+    ///
+    /// **Alpha (R5.2)**: Multi-source watermark configuration. Not yet plumbed
+    /// through all execution paths in the Relation API.
     #[must_use]
     pub fn with_multi_source_watermark(mut self, spec: MultiSourceWatermarkSpec) -> Self {
         self.multi_source_watermark = Some(spec);
@@ -218,8 +221,9 @@ fn execute_windowed_inner(
         .collect())
 }
 
-/// Multi-source watermark configuration (R5.2).
+/// Multi-source watermark configuration.
 ///
+/// **Alpha (R5.2)**: Multi-source watermark config. May change between minor releases.
 /// Each source can have its own fixed-lag watermark.  The effective watermark
 /// across all sources is the minimum, so a stalled source blocks all windows.
 #[derive(Debug, Clone, Default)]
@@ -259,7 +263,9 @@ impl MultiSourceWatermarkSpec {
     }
 }
 
-/// State TTL (time-to-live) configuration for streaming operators (R5.2).
+/// State TTL (time-to-live) configuration for streaming operators.
+///
+/// **Alpha (R5.2)**: State TTL configuration. Not yet enforced in all operator paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateTtlConfig {
     ttl_ms: u64,
@@ -408,7 +414,10 @@ impl SlidingWindowedStream {
 
 impl KeyedStream {
     /// Create a sliding event-time window of total size `window_size_ms` advancing
-    /// by `slide_ms` (R5.2).
+    /// by `slide_ms`.
+    ///
+    /// **Alpha (R5.2)**: Not yet fully implemented. Bounded streams only; unbounded
+    /// streams will error at runtime.
     pub fn sliding_window(self, window_size_ms: u64, slide_ms: u64) -> SlidingWindowedStream {
         SlidingWindowedStream {
             keyed: self,
@@ -417,7 +426,10 @@ impl KeyedStream {
         }
     }
 
-    /// Create a session window that closes after `session_gap_ms` of inactivity (R5.2).
+    /// Create a session window that closes after `session_gap_ms` of inactivity.
+    ///
+    /// **Alpha (R5.2)**: Not yet fully implemented. Bounded streams only; unbounded
+    /// streams will error at runtime.
     pub fn session_window(self, session_gap_ms: u64) -> SessionWindowedStream {
         SessionWindowedStream {
             keyed: self,

@@ -10,4 +10,5 @@ workspace = true
 
 [dependencies]
 krishiv-plan = { path = "../krishiv-plan" }
+sqlparser = "0.61"
 tracing = { workspace = true }

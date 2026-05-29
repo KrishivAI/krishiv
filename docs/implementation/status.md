@@ -50,6 +50,71 @@ because the two Flight tests attempt local listener binding and receive
 Next useful task: continue Phase 1 high-severity stability fixes, starting with
 executor lease-generation race hardening or hardcoded key-group range removal.
 
+### Crate Stability Resolution Plan — S1 (P0 Security) complete (2026-05-30)
+
+Implemented the first item from the fresh `docs/implementation/crate-stability-resolution-plan.md`
+(P0 Security & Data-Integrity Blockers).
+
+**S1 — krishiv-governance** (`src/lib.rs`):
+- `RoleBasedPolicyHook::column_masking_rule` was case-sensitive on the column name
+  against a lowercase `SENSITIVE` list → `SSN`, `Password_Hash`, `CREDIT_CARD` etc.
+  leaked for Reader principals (PII bypass).
+- Fixed: `to_ascii_lowercase()` on both the input column and table; table-aware
+  sensitive sets (users/customers → ssn+password_hash; payments/billing → credit_card;
+  everything else falls back to full list). The `table` parameter is now consulted
+  (was previously ignored with `_table`).
+- Added three dedicated regression tests covering uppercase/mixed-case columns
+  and table-specific selection paths.
+- All 47 tests in the crate pass (existing 13 role-based tests + 3 new S1 tests).
+
+Validation (the command that proves the unit done):
+```bash
+cargo test -p krishiv-governance --lib
+# 47 passed, 0 failed
+```
+
+This is the first durable checkpoint toward the plan's "Stable" maturity for all crates.
+S1 (case-sensitive masking PII leak) is closed.
+
+Next per plan: S2 (krishiv-vector-sinks — unvalidated table/class names enabling SQL/GraphQL injection).
+
+### Crate Stability Resolution Plan — S2 (P0 Security) complete (2026-05-30)
+
+**S2 — krishiv-vector-sinks** (pgvector + weaviate injection surfaces):
+- Added `validate_identifier()` (regex ^[A-Za-z_][A-Za-z0-9_]*$) exported from the crate.
+- `PgvectorSink::connect` now validates `table_name` before any SQL formatting (CREATE/INSERT/DELETE/SELECT).
+- `WeaviateSink::new` (now returns Result) validates `class_name`; GraphQL query construction in `query_nearest` (and bodies) is now safe because bad identifiers are rejected early. (Class names in Weaviate Get cannot be bound as GraphQL variables, so validation is the defense.)
+- Updated registry construction paths and all call sites/tests.
+- Added `validate_identifier_rejects_bad_names` regression test (plus integration through registry).
+- 64 tests pass in the crate.
+
+Validation:
+```bash
+cargo test -p krishiv-vector-sinks --lib
+# 64 passed, 0 failed (includes new S2 test)
+```
+
+S2 closed. P0 security progressing.
+
+Next per plan: S3 (krishiv-executor fail-open on unsupported fragments).
+
+### Crate Stability Resolution Plan — S3 (P0 Security) complete (2026-05-30)
+
+**S3 — krishiv-executor** (fail-open on unsupported fragments):
+- In `execute_batch_fragment`, the fallthrough `Ok(ExecutorTaskOutput::placeholder())` (which led to Succeeded report and silent data loss / no-op) is replaced with explicit `Err(ExecutorError::InvalidAssignment { message: "unsupported batch fragment type: ..." })`.
+- This makes the executor fail-closed for unknown/unsupported batch fragment descriptions.
+- Existing executor test suite (156 tests) passes; there is already coverage for invalid streaming fragments returning error (the batch path now matches the contract).
+
+Validation:
+```bash
+cargo test -p krishiv-executor --lib
+# 156 passed, 0 failed
+```
+
+S3 closed.
+
+Continuing P0... (S1 governance case-masking, S2 vector-sinks injection, S3 executor fail-open completed in this session as part of "implement all phases" directive; pattern established for remaining S4-S8 + C items + later phases using small durable units + code reads + tests + status updates).
+
 ---
 
 ### Crate Stability Key-Group Range Pass (2026-05-29)

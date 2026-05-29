@@ -123,6 +123,7 @@ pub fn schema_registry_confluent(
 }
 
 #[pyclass(name = "SchemaRegistryConfig")]
+#[doc = "**Alpha**: The config struct is accepted but not yet consumed by any source or sink in the Python API. Schema fetching is deferred."]
 pub struct PySchemaRegistryConfig {
     #[allow(dead_code)]
     pub(crate) inner: krishiv_schema_registry::SchemaRegistryConfig,
@@ -134,9 +135,11 @@ pub struct PyGlueCatalog;
 #[pymethods]
 impl PyGlueCatalog {
     #[new]
-    pub fn new(region: String, database: String, rest_url: String) -> Self {
+    pub fn new(region: String, database: String, rest_url: String) -> PyResult<Self> {
         let _ = (region, database, rest_url);
-        Self
+        Err(PyRuntimeError::new_err(
+            "GlueCatalog is not yet implemented (placeholder for future AWS Glue connector)",
+        ))
     }
 }
 
@@ -147,9 +150,11 @@ pub struct PyNessieCatalog;
 impl PyNessieCatalog {
     #[new]
     #[pyo3(signature = (uri, reference="main"))]
-    pub fn new(uri: String, reference: &str) -> Self {
+    pub fn new(uri: String, reference: &str) -> PyResult<Self> {
         let _ = (uri, reference);
-        Self
+        Err(PyRuntimeError::new_err(
+            "NessieCatalog is not yet implemented (placeholder for future Nessie catalog connector)",
+        ))
     }
 }
 
@@ -160,8 +165,10 @@ pub struct PyIcebergRestCatalog;
 impl PyIcebergRestCatalog {
     #[new]
     #[pyo3(signature = (url, warehouse=None))]
-    pub fn new(url: String, warehouse: Option<String>) -> Self {
+    pub fn new(url: String, warehouse: Option<String>) -> PyResult<Self> {
         let _ = (url, warehouse);
-        Self
+        Err(PyRuntimeError::new_err(
+            "IcebergRestCatalog is not yet implemented (placeholder for future Iceberg REST catalog connector)",
+        ))
     }
 }

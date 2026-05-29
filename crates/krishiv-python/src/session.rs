@@ -71,6 +71,12 @@ impl PySession {
     }
 
     #[classmethod]
+    /// Create a session connected to a remote coordinator.
+    ///
+    /// **Note**: Remote execution is only enabled when the environment variable
+    /// `KRISHIV_REMOTE_EXEC=1` is set. Without it, SQL queries run locally
+    /// even when a coordinator URL is provided.
+    /// For fully remote execution, set `KRISHIV_REMOTE_EXEC=1`.
     pub fn connect(_cls: &Bound<'_, PyType>, url: String) -> PyResult<Self> {
         let mut builder = krishiv_api::SessionBuilder::new().with_coordinator(url);
         if remote_execution_from_env() {
@@ -345,6 +351,10 @@ impl PySession {
     }
 
     /// Create an unbounded streaming DataFrame backed by a named source.
+    ///
+    /// **Local-only**: In embedded and single-node mode, the source is resolved
+    /// in-process. Distributed execution requires `KRISHIV_REMOTE_EXEC=1` or
+    /// builder remote_execution to be enabled.
     pub fn from_source(&self, name: String) -> PyResult<PyRelation> {
         let mut pipeline = StreamPipeline::new(self.inner.clone(), name, String::new(), 0);
         pipeline.bounded = false;

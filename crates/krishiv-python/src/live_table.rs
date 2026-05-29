@@ -14,6 +14,10 @@ use pyo3::prelude::*;
 use crate::PyBatch;
 
 /// Live table backed by an in-process delta log.
+///
+/// **Alpha (R14)**: Backed by `MemoryDeltaStore`. Data is not persisted
+/// across process restarts. There is no connection to an external CDC source
+/// (Kafka, Debezium) through this Python API in this release.
 #[pyclass(name = "LiveTable")]
 pub struct PyLiveTable {
     name: String,
@@ -49,7 +53,10 @@ impl PyLiveTable {
         })
     }
 
-    /// Test helper: ingest one row with the given op label.
+    /// **Alpha test helper**: Ingest a single row for unit testing.
+    ///
+    /// Only supports the hardcoded single-column `id: i64` schema.
+    /// Not suitable for general-purpose data ingestion.
     pub fn ingest_row(&self, value: i64, op: &str) -> PyResult<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))])

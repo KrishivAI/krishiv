@@ -10,19 +10,15 @@ use crate::operator_runtime::window_agg_to_expr;
 use crate::watermark_util::advance_effective_watermark;
 use crate::window::MultiSourceWatermarkState;
 use crate::{
-    AggExpr, ExecError, ExecResult, SessionWindowOperator, SessionWindowSpec,
-    SlidingWindowOperator, SlidingWindowSpec, StateBackedSessionWindowOperator,
-    StateBackedSlidingWindowOperator, StateBackedTumblingWindowOperator, TumblingWindowOperator,
-    TumblingWindowSpec, WatermarkState,
+    AggExpr, ExecError, ExecResult, SessionWindowSpec, SlidingWindowSpec,
+    StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
+    StateBackedTumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
 
 enum WindowOperatorState {
-    Tumbling(TumblingWindowOperator),
-    TumblingState(Box<StateBackedTumblingWindowOperator>),
-    Sliding(SlidingWindowOperator),
-    SlidingState(Box<StateBackedSlidingWindowOperator>),
-    Session(SessionWindowOperator),
-    SessionState(Box<StateBackedSessionWindowOperator>),
+    Tumbling(Box<StateBackedTumblingWindowOperator>),
+    Sliding(Box<StateBackedSlidingWindowOperator>),
+    Session(Box<StateBackedSessionWindowOperator>),
 }
 
 /// Tracks single- or multi-source watermark state for continuous execution.
@@ -36,9 +32,15 @@ struct WatermarkTracker {
 
 impl WatermarkTracker {
     fn new(spec: &WindowExecutionSpec) -> Self {
+        let mut multi = MultiSourceWatermarkState::new();
+        if !spec.source_watermark_lags.is_empty() {
+            // C2: Configure idle-source policy to prevent one stalled source
+            // from freezing all windows. Default: mark idle after 5 min.
+            multi = multi.with_idle_source_policy(300_000, i64::MAX);
+        }
         Self {
             single: WatermarkState::new(spec.watermark_lag_ms),
-            multi: MultiSourceWatermarkState::new(),
+            multi,
             source_lags: spec.source_watermark_lags.clone(),
             source_id_column: spec.source_id_column.clone(),
             event_time_column: spec.event_time_column.clone(),
@@ -55,6 +57,11 @@ impl WatermarkTracker {
             &mut self.multi,
         )
     }
+
+    /// C2: Apply idle-source policy so stalled sources don't hold back all windows.
+    fn apply_idle_source_policy(&mut self) {
+        self.multi.apply_idle_source_policy();
+    }
 }
 
 fn build_operator(
@@ -69,23 +76,20 @@ fn build_operator(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            if let Some(ttl_ms) = spec.state_ttl_ms {
-                let inner = InMemoryStateBackend::new();
-                let state: Box<dyn StateBackend> =
-                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
-                let op = StateBackedTumblingWindowOperator::new(
-                    tw_spec,
-                    state,
-                    "continuous-window",
-                    "tumbling",
-                )
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-                Ok(WindowOperatorState::TumblingState(Box::new(op)))
+            let inner = InMemoryStateBackend::new();
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
             } else {
-                Ok(WindowOperatorState::Tumbling(TumblingWindowOperator::new(
-                    tw_spec,
-                )))
-            }
+                Box::new(inner)
+            };
+            let op = StateBackedTumblingWindowOperator::new(
+                tw_spec,
+                state,
+                "continuous-window",
+                "tumbling",
+            )
+            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            Ok(WindowOperatorState::Tumbling(Box::new(op)))
         }
         WindowKind::Sliding => {
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
@@ -96,23 +100,20 @@ fn build_operator(
                 slide_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            if let Some(ttl_ms) = spec.state_ttl_ms {
-                let inner = InMemoryStateBackend::new();
-                let state: Box<dyn StateBackend> =
-                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
-                let op = StateBackedSlidingWindowOperator::new(
-                    sw_spec,
-                    state,
-                    "continuous-window",
-                    "sliding",
-                )
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-                Ok(WindowOperatorState::SlidingState(Box::new(op)))
+            let inner = InMemoryStateBackend::new();
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
             } else {
-                Ok(WindowOperatorState::Sliding(SlidingWindowOperator::new(
-                    sw_spec,
-                )?))
-            }
+                Box::new(inner)
+            };
+            let op = StateBackedSlidingWindowOperator::new(
+                sw_spec,
+                state,
+                "continuous-window",
+                "sliding",
+            )
+            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            Ok(WindowOperatorState::Sliding(Box::new(op)))
         }
         WindowKind::Session => {
             let gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
@@ -122,23 +123,20 @@ fn build_operator(
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            if let Some(ttl_ms) = spec.state_ttl_ms {
-                let inner = InMemoryStateBackend::new();
-                let state: Box<dyn StateBackend> =
-                    Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)));
-                let op = StateBackedSessionWindowOperator::new(
-                    sess_spec,
-                    state,
-                    "continuous-window",
-                    "session",
-                )
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-                Ok(WindowOperatorState::SessionState(Box::new(op)))
+            let inner = InMemoryStateBackend::new();
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
             } else {
-                Ok(WindowOperatorState::Session(SessionWindowOperator::new(
-                    sess_spec,
-                )))
-            }
+                Box::new(inner)
+            };
+            let op = StateBackedSessionWindowOperator::new(
+                sess_spec,
+                state,
+                "continuous-window",
+                "session",
+            )
+            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            Ok(WindowOperatorState::Session(Box::new(op)))
         }
     }
 }
@@ -151,43 +149,33 @@ impl WindowOperatorState {
     ) -> ExecResult<Vec<RecordBatch>> {
         match self {
             Self::Tumbling(op) => op.process_batch(batch, watermark_ms),
-            Self::TumblingState(op) => op.process_batch(batch, watermark_ms),
             Self::Sliding(op) => op.process_batch(batch, watermark_ms),
-            Self::SlidingState(op) => op.process_batch(batch, watermark_ms),
             Self::Session(op) => op.process_batch(batch, watermark_ms),
-            Self::SessionState(op) => op.process_batch(batch, watermark_ms),
         }
     }
 
-    /// GAP-15: Evict expired entries from TTL-backed state variants.
-    ///
-    /// Non-TTL variants (Tumbling, Sliding, Session) are no-ops.
-    /// State-backed variants delegate to the underlying `StateBackend::purge_expired`.
     fn purge_expired(&mut self) -> ExecResult<usize> {
         match self {
-            Self::Tumbling(_) | Self::Sliding(_) | Self::Session(_) => Ok(0),
-            Self::TumblingState(op) => op.purge_expired(),
-            Self::SlidingState(op) => op.purge_expired(),
-            Self::SessionState(op) => op.purge_expired(),
+            Self::Tumbling(op) => op.purge_expired(),
+            Self::Sliding(op) => op.purge_expired(),
+            Self::Session(op) => op.purge_expired(),
         }
     }
 
-    /// Propagate the event-time watermark to the underlying TTL state backend.
-    ///
-    /// For TTL-backed variants (`TumblingState`, `SlidingState`, `SessionState`)
-    /// this forwards to the operator's `set_watermark`, which in turn calls
-    /// `StateBackend::set_watermark` on the inner `TtlStateBackend`.  Subsequent
-    /// calls to `purge_expired` and lazy read-time expiry checks will then use
-    /// event time rather than wall-clock time.
-    ///
-    /// Non-TTL variants are no-ops (the method is still valid to call; the
-    /// underlying plain operators carry no TTL state to evict).
     fn set_watermark(&mut self, watermark_ms: i64) {
         match self {
-            Self::Tumbling(_) | Self::Sliding(_) | Self::Session(_) => {}
-            Self::TumblingState(op) => op.set_watermark(watermark_ms),
-            Self::SlidingState(op) => op.set_watermark(watermark_ms),
-            Self::SessionState(op) => op.set_watermark(watermark_ms),
+            Self::Tumbling(op) => op.set_watermark(watermark_ms),
+            Self::Sliding(op) => op.set_watermark(watermark_ms),
+            Self::Session(op) => op.set_watermark(watermark_ms),
+        }
+    }
+
+    /// C3: Persist operator state so crash recovery can restore open windows.
+    fn checkpoint(&mut self) -> ExecResult<()> {
+        match self {
+            Self::Tumbling(op) => op.checkpoint(),
+            Self::Sliding(op) => op.checkpoint(),
+            Self::Session(op) => op.checkpoint(),
         }
     }
 }
@@ -271,6 +259,10 @@ impl ContinuousWindowExecutor {
     /// expiry.  Within the batch loop, `set_watermark` is called again after each
     /// watermark advance so that lazy read-time expiry also reflects event time.
     pub fn drain(&mut self, input_batches: Vec<RecordBatch>) -> ExecResult<Vec<RecordBatch>> {
+        // C2: Apply idle-source policy before processing so idle sources don't
+        // freeze all windows when they stop emitting data.
+        self.watermark.apply_idle_source_policy();
+
         // Propagate the most recently known event-time watermark to the TTL
         // state backend before eviction so that purge_expired uses event time.
         // On the very first drain cycle last_watermark_ms == i64::MIN and the
@@ -311,6 +303,16 @@ impl ContinuousWindowExecutor {
     /// Borrow the underlying window spec fields (for diagnostics).
     pub fn uses_multi_source_watermark(&self) -> bool {
         !self.watermark.source_lags.is_empty()
+    }
+
+    /// C3: Persist operator state to the state backend for crash recovery.
+    ///
+    /// Delegates to the underlying operator's `checkpoint()` which writes
+    /// accumulated window state to the configured `StateBackend`.  Callers
+    /// (the runtime drain loop) should invoke this periodically so that open
+    /// windows survive executor restarts.
+    pub fn checkpoint(&mut self) -> ExecResult<()> {
+        self.operator.checkpoint()
     }
 }
 

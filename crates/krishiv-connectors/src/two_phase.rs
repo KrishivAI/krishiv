@@ -48,6 +48,8 @@ pub trait TwoPhaseCommitSink: Send {
 // InMemoryTwoPhaseCommitSink
 // ---------------------------------------------------------------------------
 
+/// **Testing only**: In-memory implementation for unit tests. Not for production use.
+///
 /// In-memory two-phase commit sink for deterministic testing.
 ///
 /// `prepare` stages a batch under `(epoch, handle_id)`.

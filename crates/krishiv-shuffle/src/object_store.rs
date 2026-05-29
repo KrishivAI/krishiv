@@ -43,20 +43,27 @@ impl ObjectStoreShuffleStore {
         self
     }
 
-    fn object_path(&self, id: &PartitionId) -> object_store::path::Path {
+    fn object_path(&self, id: &PartitionId) -> ShuffleResult<object_store::path::Path> {
+        crate::validate_safe_id(&id.job_id, "job_id")?;
+        crate::validate_safe_id(&id.stage_id, "stage_id")?;
         let key = format!("{}/{}/{}.ipc", id.job_id, id.stage_id, id.partition);
         if self.prefix.as_ref().is_empty() {
-            object_store::path::Path::from(key.as_str())
+            Ok(object_store::path::Path::from(key.as_str()))
         } else {
-            object_store::path::Path::from(format!("{}/{key}", self.prefix).as_str())
+            Ok(object_store::path::Path::from(
+                format!("{}/{key}", self.prefix).as_str(),
+            ))
         }
     }
 
-    fn job_prefix(&self, job_id: &str) -> object_store::path::Path {
+    fn job_prefix(&self, job_id: &str) -> ShuffleResult<object_store::path::Path> {
+        crate::validate_safe_id(job_id, "job_id")?;
         if self.prefix.as_ref().is_empty() {
-            object_store::path::Path::from(job_id)
+            Ok(object_store::path::Path::from(job_id))
         } else {
-            object_store::path::Path::from(format!("{}/{job_id}", self.prefix).as_str())
+            Ok(object_store::path::Path::from(
+                format!("{}/{job_id}", self.prefix).as_str(),
+            ))
         }
     }
 }
@@ -67,6 +74,8 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         id: PartitionId,
         lease_token: u64,
     ) -> ShuffleResult<()> {
+        crate::validate_safe_id(&id.job_id, "job_id")?;
+        crate::validate_safe_id(&id.stage_id, "stage_id")?;
         let key = (id.job_id, id.stage_id, id.partition);
         // Atomically compare-and-swap via DashMap entry API to close the
         // TOCTOU gap between read and insert.
@@ -142,7 +151,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
 
         self.store
             .put(
-                &self.object_path(&partition.id),
+                &self.object_path(&partition.id)?,
                 bytes::Bytes::from(buf).into(),
             )
             .await
@@ -153,7 +162,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         use arrow::ipc::reader::StreamReader;
 
-        let path = self.object_path(id);
+        let path = self.object_path(id)?;
         let result = self.store.get(&path).await;
         match result {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -189,7 +198,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
 
         // P2.9: collect all object paths, then issue a single batch-delete stream
         // rather than O(N) serial round-trips.
-        let prefix = self.job_prefix(job_id);
+        let prefix = self.job_prefix(job_id)?;
         let paths: Vec<object_store::path::Path> = self
             .store
             .list(Some(&prefix))

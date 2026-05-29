@@ -234,7 +234,10 @@ impl Sink for KafkaSink {
     }
 
     async fn flush(&mut self) -> ConnectorResult<()> {
-        Ok(())
+        Err(ConnectorError::Unsupported {
+            message: "Kafka sink flush requires the `kafka` feature (pip install krishiv[kafka])"
+                .to_string(),
+        })
     }
 }
 
@@ -380,10 +383,11 @@ impl Sink for KafkaSink {
     }
 }
 
-// ---------------------------------------------------------------------------
 // In-memory Kafka test harness
 // ---------------------------------------------------------------------------
 
+/// **Testing only**: In-memory implementation for unit tests. Not for production use.
+///
 /// Deterministic in-memory Kafka-like source used by executor and connector
 /// certification tests until the real broker-backed runtime is added.
 ///
@@ -974,5 +978,26 @@ mod tests {
         // implement `Source` the test will not compile.
         fn assert_source<T: crate::Source>() {}
         assert_source::<super::RdkafkaKafkaSource>();
+    }
+
+    #[tokio::test]
+    async fn kafka_sink_stub_flush_returns_error() {
+        #[cfg(not(feature = "kafka"))]
+        {
+            use crate::Sink;
+            let config = KafkaConfig {
+                bootstrap_servers: "localhost:9092".to_string(),
+                topic: "events".to_string(),
+                group_id: "krishiv-default".to_string(),
+            };
+            let mut sink = KafkaSink::new(config);
+            let result = sink.flush().await;
+            assert!(
+                result.is_err(),
+                "flush on stub KafkaSink must return an error"
+            );
+            let err = result.err().unwrap().to_string();
+            assert!(err.contains("Kafka sink flush requires the `kafka` feature"));
+        }
     }
 }

@@ -9,6 +9,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 /// Global memo cache shared across transform calls in the session.
+///
+/// **Note**: Resets on interpreter restart. Not persisted to disk.
 pub static MEMO_CACHE: std::sync::LazyLock<MemoCache> =
     std::sync::LazyLock::new(|| MemoCache::new(10_000));
 
@@ -48,6 +50,10 @@ pub fn memo_lookup_or_store(key: [u8; 32], batch: RecordBatch) -> Result<RecordB
 }
 
 #[pyfunction]
+/// **Alpha (R14)**: Perform memoized transformation.
+///
+/// **Note**: The `_schema_json` parameter is accepted but not used for schema validation
+/// against the record batch in this release.
 pub fn memo_transform_call(
     source_hash: Vec<u8>,
     _schema_json: String,

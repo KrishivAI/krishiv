@@ -6,7 +6,9 @@ use serde_json::json;
 
 use crate::batch::EmbeddingBatch;
 use crate::id::point_id_from_doc_epoch;
-use crate::traits::{PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult};
+use crate::traits::{
+    PayloadFilter, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult, validate_identifier,
+};
 
 /// Weaviate REST vector sink.
 #[derive(Clone)]
@@ -23,13 +25,15 @@ impl WeaviateSink {
         base_url: impl Into<String>,
         class_name: impl Into<String>,
         api_key: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> VectorSinkResult<Self> {
+        let class_name = class_name.into();
+        validate_identifier(&class_name)?;
+        Ok(Self {
             client: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            class_name: class_name.into(),
+            class_name,
             api_key,
-        }
+        })
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -191,7 +195,7 @@ mod tests {
             .with_body(body.to_string())
             .create_async()
             .await;
-        let sink = WeaviateSink::new(server.url(), "Document", None);
+        let sink = WeaviateSink::new(server.url(), "Document", None).unwrap();
         let hits = sink.query_nearest(&[0.1, 0.2], 1, None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "hello");
@@ -207,7 +211,7 @@ mod tests {
             .expect(2)
             .create_async()
             .await;
-        let sink = WeaviateSink::new(server.url(), "Document", None);
+        let sink = WeaviateSink::new(server.url(), "Document", None).unwrap();
         let batch = EmbeddingBatch::new(
             vec!["d1".into()],
             vec![vec![0.1, 0.2]],

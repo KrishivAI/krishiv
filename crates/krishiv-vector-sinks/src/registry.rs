@@ -84,7 +84,7 @@ impl VectorSinkRegistry {
                 base_url,
                 class_name,
                 api_key.clone(),
-            ))),
+            )?)),
             VectorSinkConfig::Pinecone {
                 host,
                 api_key,

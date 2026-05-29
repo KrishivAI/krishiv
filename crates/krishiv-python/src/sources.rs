@@ -51,6 +51,15 @@ pub fn read_parquet(
 
 #[pyfunction]
 #[pyo3(signature = (session, topic, bootstrap_servers, *, schema=None, group_id=None))]
+/// Read a Kafka topic as a streaming source.
+///
+/// **Feature gate**: Requires `pip install krishiv[kafka]` or building with `--features kafka`.
+/// Without the feature, raises `ConnectorError` immediately.
+///
+/// **Alpha (with feature)**: With the `kafka` feature, returns a `Stream` descriptor.
+/// The `schema` and `group_id` parameters are accepted but currently ignored.
+/// The returned stream has no watermark set — call `.with_watermark(column, lag_ms)`
+/// before windowing.
 pub fn read_kafka(
     session: &PySession,
     topic: String,
@@ -79,6 +88,13 @@ pub fn read_kafka(
 
 #[pyfunction]
 #[pyo3(signature = (session, catalog_uri, table_name, *, schema=None))]
+/// Read an Iceberg table as a streaming source.
+///
+/// **Feature gate**: Requires `pip install krishiv[iceberg]` or building with `--features iceberg`.
+///
+/// **Alpha (with feature)**: Performs an in-memory validation scan only. The `catalog_uri`
+/// is not used for real REST catalog connectivity — it is stored as a source identifier.
+/// The returned stream has no watermark set.
 pub fn read_iceberg(
     session: &PySession,
     catalog_uri: String,

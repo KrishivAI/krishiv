@@ -140,6 +140,11 @@ impl PySchema {
     }
 }
 
+/// Convert a Python type annotation to an Arrow `DataType`.
+///
+/// **Supported types**: `str`, `int`, `float`, `bool`, `bytes`, `datetime.datetime`,
+/// and `Optional[X]` wrapping any of the above.
+/// All other annotations raise `SchemaError`.
 fn python_annotation_to_arrow(py: Python<'_>, ann: Bound<'_, PyAny>) -> PyResult<DataType> {
     let builtins = py.import("builtins")?;
     let typing = py.import("typing")?;

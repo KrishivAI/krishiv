@@ -18,6 +18,8 @@ pub fn table_help() -> String {
          Options:\n\
            --path <PATH>              Table path (required)\n\
            --format <FORMAT>          parquet | delta | hudi (required)\n\
+                                      Note: delta and hudi read local filesystem paths only.\n\
+                                      S3 and remote catalog support is planned for a future release.\n\
            --version <N>              Delta table version (optional)\n\
            --hudi-query <snapshot|incremental>  Hudi query type (default: snapshot)\n\
            --hudi-begin <INSTANT>     Hudi incremental begin instant (optional)\n\
@@ -48,6 +50,14 @@ fn run_table_read(args: &[&str]) -> CliResponse {
         Ok(c) => c,
         Err(e) => return CliResponse::err(format!("{e}\n\n{}", table_help()), 2),
     };
+    if matches!(&cmd.format, TableFormat::Delta | TableFormat::Hudi) {
+        let fmt_str = match &cmd.format {
+            TableFormat::Delta => "Delta",
+            TableFormat::Hudi => "Hudi",
+            _ => "",
+        };
+        eprintln!("[alpha] Reading local {fmt_str} table — remote/S3 paths are not yet supported.");
+    }
     let session = match SessionBuilder::new().build() {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),

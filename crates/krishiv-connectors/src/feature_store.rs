@@ -312,6 +312,8 @@ fn read_feature_rows_from_parquet(path: &Path) -> ConnectorResult<Vec<FeatureRow
     Ok(rows)
 }
 
+/// **Testing only**: In-memory implementation for unit tests. Not for production use.
+///
 /// In-memory Kafka-style streaming source for feature updates (tests).
 #[derive(Debug, Default)]
 pub struct InMemoryFeatureStream {

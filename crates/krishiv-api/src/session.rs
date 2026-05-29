@@ -329,9 +329,12 @@ impl Session {
         Arc::clone(&self.runtime)
     }
 
-    /// Returns an error if the session was built for a deployment mode whose
-    /// routing does not match the runtime — for example a Distributed session
-    /// whose runtime is silently using the in-process fallback (B2 guard).
+    /// Validate that the session routing configuration is consistent.
+    ///
+    /// **Important**: This method is NOT called automatically by any session method.
+    /// In `Distributed` mode without `remote_execution=true`, SQL queries will
+    /// silently fall through to local execution. Call this method explicitly to
+    /// surface misconfiguration errors early (B2 guard).
     pub fn check_routing(&self) -> Result<()> {
         match self.mode {
             ExecutionMode::Distributed => {
@@ -661,7 +664,10 @@ impl Session {
         block_on(self.read_parquet_async(path))
     }
 
-    /// Read a Delta Lake table directory (R18).
+    /// Read a Delta Lake table directory.
+    ///
+    /// **Local-only (R18)**: Reads from a local `_delta_log/*.json` directory.
+    /// S3 paths and `delta-rs` integration are not yet implemented in this release.
     pub async fn read_delta_async(
         &self,
         path: impl AsRef<str>,
@@ -671,7 +677,10 @@ impl Session {
         Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
-    /// Read a Hudi table directory (R18).
+    /// Read a Hudi table directory.
+    ///
+    /// **Local-only (R18)**: Reads local Copy-on-Write Parquet files.
+    /// Remote Hudi catalogs and S3 paths are not yet supported.
     pub async fn read_hudi_async(
         &self,
         path: impl AsRef<str>,
@@ -685,7 +694,11 @@ impl Session {
         Ok(self.dataframe_from_sql(sql_dataframe))
     }
 
-    /// Append a DataFrame into a local Hudi Copy-On-Write table (R18).
+    /// Append a DataFrame into a local Hudi Copy-On-Write table.
+    ///
+    /// **Local-only (R18)**: Writes to a local CoW Parquet directory.
+    /// S3, object-store URIs, and remote Iceberg catalogs are not supported.
+    /// The `path` argument must be a local filesystem path.
     pub async fn write_hudi_append_async(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -711,7 +724,11 @@ impl Session {
         Ok(total)
     }
 
-    /// Upsert a DataFrame into a local Hudi Copy-On-Write table by key column (R18).
+    /// Upsert a DataFrame into a local Hudi Copy-On-Write table by key column.
+    ///
+    /// **Local-only (R18)**: Writes to a local CoW Parquet directory by key column.
+    /// S3, object-store URIs, and remote Iceberg catalogs are not supported.
+    /// The `path` argument must be a local filesystem path.
     pub async fn write_hudi_upsert_async(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -769,6 +786,11 @@ impl Session {
     }
 
     /// Create an unbounded local memory stream placeholder.
+    ///
+    /// **Alpha placeholder**: Returns a `Stream` struct with no data attached.
+    /// There is currently no API to push batches into this stream after creation.
+    /// Use `Session::memory_stream()` with pre-loaded batches, or
+    /// `Session::submit_stream_job()` for continuous streaming jobs.
     pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Stream {
         Stream::for_session(
             name,

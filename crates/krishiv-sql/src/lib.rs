@@ -95,6 +95,15 @@ impl SqlPlan {
 }
 
 /// Local SQL engine backed by DataFusion.
+///
+/// **Local-only**: All SQL execution is in-process via DataFusion. No distributed SQL
+/// execution path is available in this crate.
+/// This crate is scoped to R1 — DataFusion will be abstracted behind
+/// the `KrishivDataFrameOps` trait in future releases.
+///
+/// Methods like `register_parquet`, `read_delta`, and `read_hudi` treat
+/// path arguments as local filesystem paths. S3/GCS paths require the
+/// object-store connector layer.
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
@@ -417,9 +426,13 @@ impl SqlEngine {
             if self.udf_registry.is_some() {
                 self.sync_table_udfs().await?;
             }
-            // Return a trivial empty DataFrame representing "DDL OK".
-            let dataframe = self.context.sql("SELECT 1 AS result WHERE 1 = 0").await?;
-            return Ok(SqlDataFrame::new("create-function-ddl", dataframe).with_query(query));
+            // UDTFs are stubs and not yet implemented — return an explicit error to prevent silent data loss.
+            return Err(SqlError::Unsupported {
+                feature: "CREATE FUNCTION RETURNS TABLE is not yet implemented — \
+                          the function body is captured but not executed. \
+                          Calling this function will fail until UDTF execution is added."
+                    .to_string(),
+            });
         }
 
         if query
@@ -788,8 +801,8 @@ impl MaterializedViewDefinition {
 
 /// In-memory registry for materialized view definitions and their cached results.
 ///
-/// In production, results would be persisted to `RedbStateBackend`. For R10
-/// the registry is in-memory and resets on process restart.
+/// **Alpha (R10)**: In-memory only. View state is not persisted and resets on process restart.
+/// In production, results would be persisted to `RedbStateBackend`.
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
     definitions: HashMap<String, MaterializedViewDefinition>,
@@ -1203,14 +1216,13 @@ mod udf_sql_tests {
 
 #[cfg(test)]
 mod udtf_ddl_tests {
-    use std::sync::Arc;
-
     use super::SqlEngine;
+    use super::SqlError;
 
-    /// `CREATE FUNCTION … RETURNS TABLE` must not return an error even when the
-    /// body is a stub and no real execution backend is wired up.
+    /// `CREATE FUNCTION … RETURNS TABLE` must return an unsupported error
+    /// since UDTFs are stubs and not yet implemented.
     #[tokio::test]
-    async fn create_function_returns_table_does_not_error() {
+    async fn create_function_returns_table_errors() {
         let engine = SqlEngine::new();
         let result = engine
             .sql(
@@ -1220,68 +1232,18 @@ mod udtf_ddl_tests {
                  AS 'fn stub() {}'",
             )
             .await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
         assert!(
-            result.is_ok(),
-            "CREATE FUNCTION … RETURNS TABLE should succeed, got: {:?}",
-            result.err()
+            matches!(err, SqlError::Unsupported { .. }),
+            "expected Unsupported error, got {:?}",
+            err
         );
-    }
-
-    /// With a shared `UdfRegistry` the stub must land in the registry after DDL.
-    #[tokio::test]
-    async fn create_function_returns_table_populates_udf_registry() {
-        let registry = Arc::new(std::sync::RwLock::new(krishiv_udf::UdfRegistry::new()));
-        let engine = SqlEngine::new().with_udf_registry(registry.clone());
-        engine
-            .sql(
-                "CREATE FUNCTION counts_udtf(n INT) \
-                 RETURNS TABLE (id BIGINT, label TEXT)",
-            )
-            .await
-            .expect("DDL should succeed");
-
-        let guard = registry.read().unwrap();
-        let found = guard.get_table("counts_udtf");
+        let msg = err.to_string();
         assert!(
-            found.is_some(),
-            "UDTF must be present in the UdfRegistry after DDL"
+            msg.contains("CREATE FUNCTION RETURNS TABLE is not yet implemented"),
+            "expected 'not yet implemented' message, got '{}'",
+            msg
         );
-        let schema = found.unwrap().output_schema();
-        assert_eq!(schema.fields().len(), 2);
-        assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(schema.field(1).name(), "label");
-    }
-
-    /// Without a shared registry the DDL must still succeed (direct context path).
-    #[tokio::test]
-    async fn create_function_returns_table_no_registry_succeeds() {
-        let engine = SqlEngine::new(); // no udf_registry attached
-        let result = engine
-            .sql(
-                "CREATE FUNCTION no_reg_udtf(x INT) \
-                 RETURNS TABLE (val DOUBLE)",
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "DDL without registry should succeed, got: {:?}",
-            result.err()
-        );
-    }
-
-    /// After DDL the DDL result DataFrame must be collectible and empty.
-    #[tokio::test]
-    async fn create_function_returns_table_result_is_empty() {
-        let engine = SqlEngine::new();
-        let df = engine
-            .sql(
-                "CREATE FUNCTION empty_udtf(x INT) \
-                 RETURNS TABLE (a TEXT)",
-            )
-            .await
-            .expect("DDL should succeed");
-        let batches = df.collect().await.expect("collect should succeed");
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 0, "DDL result should be empty");
     }
 }

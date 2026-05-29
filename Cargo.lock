@@ -4131,6 +4131,7 @@ name = "krishiv-optimizer"
 version = "0.1.0"
 dependencies = [
  "krishiv-plan",
+ "sqlparser",
  "tracing",
 ]
 

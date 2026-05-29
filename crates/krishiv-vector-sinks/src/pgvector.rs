@@ -10,6 +10,7 @@ mod imp {
     use crate::id::point_id_from_doc_epoch;
     use crate::traits::{
         PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, VectorSinkResult,
+        validate_identifier,
     };
 
     fn vector_to_pg(v: &[f32]) -> String {
@@ -36,6 +37,8 @@ mod imp {
             table_name: impl Into<String>,
             vector_dim: usize,
         ) -> VectorSinkResult<Self> {
+            let table_name = table_name.into();
+            validate_identifier(&table_name)?;
             let pool = PgPoolOptions::new()
                 .max_connections(5)
                 .connect(database_url)
@@ -43,7 +46,7 @@ mod imp {
                 .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
             let sink = Self {
                 pool,
-                table_name: table_name.into(),
+                table_name,
                 vector_dim,
             };
             sink.ensure_table().await?;

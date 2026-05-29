@@ -206,11 +206,20 @@ impl K8sLeaseElection {
                 }
 
                 // Patch the existing lease (optimistic concurrency via resourceVersion).
-                let resource_version = existing
+                // S7: Fail when resourceVersion is None or empty — an empty version
+                // makes optimistic-concurrency an unconditional write (split-brain).
+                let Some(resource_version) = existing
                     .metadata
                     .resource_version
                     .clone()
-                    .unwrap_or_default();
+                    .filter(|v| !v.is_empty())
+                else {
+                    tracing::warn!(
+                        lease = %self.lease_name,
+                        "k8s_lease: missing resourceVersion during try_acquire — cannot patch safely"
+                    );
+                    return false;
+                };
                 let patch_value = serde_json::json!({
                     "apiVersion": "coordination.k8s.io/v1",
                     "kind": "Lease",
@@ -303,11 +312,23 @@ impl K8sLeaseElection {
             return false;
         }
 
-        let resource_version = existing
+        // S7: Fail when resourceVersion is None or empty.
+        let Some(resource_version) = existing
             .metadata
             .resource_version
             .clone()
-            .unwrap_or_default();
+            .filter(|v| !v.is_empty())
+        else {
+            tracing::warn!(
+                lease = %self.lease_name,
+                "k8s_lease: missing resourceVersion during renew — cannot patch safely"
+            );
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_leader = false;
+            return false;
+        };
         let now = Self::now_micro();
         let patch_value = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",

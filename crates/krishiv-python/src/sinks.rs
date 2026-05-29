@@ -25,6 +25,14 @@ impl PyParquetSink {
 }
 
 #[pyclass(name = "KafkaSink")]
+/// Kafka sink configuration.
+///
+/// **Note**: This is a configuration descriptor only. It does not establish a broker
+/// connection or produce messages. Wire it into a pipeline via `PyRelation.sink_to()`
+/// (not yet implemented) or use the `kafka` feature connector directly.
+///
+/// **Feature gate**: Constructing this object succeeds even when the `kafka` feature
+/// is not compiled in, but actual message production requires the feature.
 pub struct PyKafkaSink {
     topic: String,
     bootstrap_servers: String,
@@ -59,6 +67,14 @@ impl PyKafkaSink {
 }
 
 #[pyclass(name = "IcebergSink")]
+/// Iceberg sink configuration.
+///
+/// **Note**: This is a configuration descriptor only. It does not establish a connection
+/// or write data to an Iceberg table. Wire it into a pipeline via `PyRelation.sink_to()`
+/// (not yet implemented) or use the `iceberg` feature connector directly.
+///
+/// **Feature gate**: Constructing this object succeeds even when the `iceberg` feature
+/// is not compiled in, but actual message production requires the feature.
 pub struct PyIcebergSink {
     catalog: String,
     table: String,

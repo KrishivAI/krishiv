@@ -17,6 +17,10 @@ pub fn stream_help() -> String {
     String::from(
         "Continuous streaming window jobs.\n\
          \n\
+         Note: In this release, stream commands run in an in-process cluster.\n\
+         Jobs are not persisted between CLI invocations — state is lost when\n\
+         this process exits. Use --coordinator <URL> for durable job management.\n\
+         \n\
          Usage:\n\
            krishiv stream submit --job-id <ID> [WINDOW OPTIONS]\n\
            krishiv stream push --job-id <ID> --parquet <path>\n\
@@ -69,6 +73,9 @@ fn run_stream_submit(args: &[&str]) -> CliResponse {
         Ok(s) => s,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
+    eprintln!(
+        "[local-mode] Stream job running in-process — state will be lost when this process exits."
+    );
     match session.submit_stream_job(&spec.job_id, spec.window_spec) {
         Ok(id) => CliResponse::ok(format!(
             "Submitted continuous stream job {id} (window: {})\n",

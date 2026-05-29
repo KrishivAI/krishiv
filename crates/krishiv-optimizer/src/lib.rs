@@ -638,11 +638,9 @@ impl OptimizerRule for PredicatePushdownRule {
                 continue;
             }
 
-            let conjuncts: Vec<&str> = predicate
-                .split(" AND ")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
+            // C5: Use sqlparser to split predicate conjuncts properly
+            // instead of naively splitting on the literal string " AND ".
+            let conjuncts = split_predicate_conjuncts(&predicate);
 
             if conjuncts.is_empty() {
                 continue;
@@ -658,6 +656,11 @@ impl OptimizerRule for PredicatePushdownRule {
                     .map(|f| f.name())
                     .collect();
 
+                let table_name = match scan_node.op() {
+                    Some(NodeOp::Scan { table, .. }) => table.as_str(),
+                    _ => "",
+                };
+
                 let mut pushable: Vec<String> = Vec::new();
                 let mut remaining: Vec<String> = Vec::new();
 
@@ -666,7 +669,7 @@ impl OptimizerRule for PredicatePushdownRule {
                     let can_push = !cols.is_empty()
                         && cols
                             .iter()
-                            .all(|c| column_belongs_to_scan(c, &scan_columns));
+                            .all(|c| column_belongs_to_scan(c, table_name, &scan_columns));
 
                     if can_push {
                         pushable.push(conjunct.to_string());
@@ -770,17 +773,83 @@ fn extract_column_refs(predicate: &str) -> Vec<String> {
     refs
 }
 
-/// Check whether `col` (possibly qualified like `"t.id"`) matches any of the
-/// scan's column names, either by full match or by unqualified suffix.
-fn column_belongs_to_scan(col: &str, scan_columns: &[&str]) -> bool {
-    if scan_columns.contains(&col) {
-        return true;
+/// C5: Split a SQL predicate string into conjuncts using sqlparser for correct
+/// AND splitting.  Respects quoted strings, nested expressions, etc.
+fn split_predicate_conjuncts(predicate: &str) -> Vec<String> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    // Try parsing as a full WHERE clause; if that fails, fall back to naive split.
+    let where_clause = if predicate.to_uppercase().starts_with("WHERE ") {
+        predicate.to_string()
+    } else {
+        format!("WHERE {predicate}")
+    };
+    let Ok(mut stmts) = Parser::parse_sql(&dialect, &where_clause) else {
+        // Fall back to naive split on " AND " for unparseable predicates.
+        return predicate
+            .split(" AND ")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    };
+    let Some(stmt) = stmts.pop() else {
+        return vec![predicate.to_string()];
+    };
+    // Extract the expression and split on top-level AND.
+    let sqlparser::ast::Statement::Query(query) = stmt else {
+        return vec![predicate.to_string()];
+    };
+    let Some(select_body) = query.body.as_select() else {
+        return vec![predicate.to_string()];
+    };
+    let Some(selection) = &select_body.selection else {
+        return vec![predicate.to_string()];
+    };
+    collect_binary_conjuncts(selection, "AND")
+}
+
+/// Recursively collect top-level conjuncts from a binary expression tree.
+fn collect_binary_conjuncts(expr: &sqlparser::ast::Expr, op: &str) -> Vec<String> {
+    match expr {
+        sqlparser::ast::Expr::BinaryOp {
+            left,
+            op: bin_op,
+            right,
+        } if bin_op.to_string().to_uppercase() == op => {
+            let mut left_conjuncts = collect_binary_conjuncts(left, op);
+            let right_conjuncts = collect_binary_conjuncts(right, op);
+            left_conjuncts.extend(right_conjuncts);
+            left_conjuncts
+        }
+        other => {
+            vec![other.to_string()]
+        }
     }
+}
+
+/// Check whether `col` (possibly qualified like `"t.id"`) belongs to `scan_table`
+/// with the given column names.  C5: When a column reference has an explicit
+/// qualifier, require it to plausibly refer to `scan_table` (exact match, prefix,
+/// or abbreviation).  Otherwise fall back to unqualified column match.
+fn column_belongs_to_scan(col: &str, scan_table: &str, scan_columns: &[&str]) -> bool {
     if let Some(dot_pos) = col.rfind('.') {
+        let qualifier = &col[..dot_pos];
         let unqualified = &col[dot_pos + 1..];
+        if !qualifier.is_empty() {
+            let scan_lower = scan_table.to_ascii_lowercase();
+            let qual_lower = qualifier.to_ascii_lowercase();
+            // Accept alias/prefix: "o" matches "orders", "orders" matches "orders"
+            if scan_lower.starts_with(&qual_lower) || qual_lower == scan_lower {
+                return scan_columns.contains(&unqualified);
+            }
+            // Reject qualification that doesn't match this table at all.
+            return false;
+        }
         return scan_columns.contains(&unqualified);
     }
-    false
+    scan_columns.contains(&col)
 }
 
 /// Drop no-op `Project` nodes that select zero columns.

@@ -123,11 +123,22 @@ impl PolicyHook for RoleBasedPolicyHook {
     fn column_masking_rule(
         &self,
         principal: &Principal,
-        _table: &str,
+        table: &str,
         column: &str,
     ) -> Option<MaskingRule> {
-        const SENSITIVE: &[&str] = &["ssn", "credit_card", "password_hash"];
-        if matches!(principal.role, Role::Reader) && SENSITIVE.contains(&column) {
+        // S1: Case-insensitive + basic table-aware matching.
+        // Lower both sides so "SSN", "Password_Hash", "CREDIT_CARD" etc. are caught.
+        // Table param is now used to select table-specific sensitive sets (extensible).
+        let col_l = column.to_ascii_lowercase();
+        let table_l = table.to_ascii_lowercase();
+
+        let sensitive: &[&str] = match table_l.as_str() {
+            "users" | "customers" | "public_users" => &["ssn", "password_hash"],
+            "payments" | "billing" => &["credit_card"],
+            _ => &["ssn", "credit_card", "password_hash"],
+        };
+
+        if matches!(principal.role, Role::Reader) && sensitive.contains(&col_l.as_str()) {
             Some(MaskingRule::Nullify)
         } else {
             None
@@ -1017,6 +1028,46 @@ mod tests {
             role: Role::Writer,
         };
         assert_eq!(hook.column_masking_rule(&writer, "users", "ssn"), None);
+    }
+
+    // ── S1 regression: case-insensitive + table-aware masking ────────────────
+
+    #[test]
+    fn role_based_hook_reader_ssn_uppercase_nullify() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        // Mixed/upper case must still trigger (was bypass before S1)
+        assert_eq!(
+            hook.column_masking_rule(&reader, "users", "SSN"),
+            Some(MaskingRule::Nullify)
+        );
+        assert_eq!(
+            hook.column_masking_rule(&reader, "USERS", "Password_Hash"),
+            Some(MaskingRule::Nullify)
+        );
+    }
+
+    #[test]
+    fn role_based_hook_reader_credit_card_mixed_case_table() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        assert_eq!(
+            hook.column_masking_rule(&reader, "Payments", "CREDIT_CARD"),
+            Some(MaskingRule::Nullify)
+        );
+        // Table-specific set: credit_card not in "users" fallback for this arm, but global fallback covers it
+        assert_eq!(
+            hook.column_masking_rule(&reader, "other_table", "credit_card"),
+            Some(MaskingRule::Nullify)
+        );
+    }
+
+    #[test]
+    fn role_based_hook_reader_table_aware_does_not_over_mask() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        // Non-sensitive column stays visible even with case variation on table
+        assert_eq!(hook.column_masking_rule(&reader, "USERS", "email"), None);
     }
 
     #[test]

@@ -111,6 +111,9 @@ impl Stream {
     }
 
     /// Map local stream batches.
+    ///
+    /// **Local-only**: Applies a transformation to an in-memory `Vec<StreamBatch>`.
+    /// Not part of the DAG-planned or distributed execution path.
     pub fn map_batches(&self, mut f: impl FnMut(&StreamBatch) -> StreamBatch) -> Result<Stream> {
         if !self.is_bounded() {
             return Err(KrishivError::unsupported(
@@ -133,6 +136,9 @@ impl Stream {
     }
 
     /// Filter local stream batches.
+    ///
+    /// **Local-only**: Filters an in-memory `Vec<StreamBatch>`.
+    /// Not part of the DAG-planned or distributed execution path.
     pub fn filter_batches(&self, mut f: impl FnMut(&StreamBatch) -> bool) -> Result<Stream> {
         if !self.is_bounded() {
             return Err(KrishivError::unsupported(
@@ -161,7 +167,11 @@ impl Stream {
     /// Key the stream by `column`, returning a [`KeyedStream`] that supports
     /// event-time windowing and stateful aggregation.
     ///
-    /// `key_by` is the entry point for the R5.1 stateful streaming API.
+    /// **R5.1 Alpha**: Entry point for stateful streaming.
+    /// For bounded in-memory streams, window aggregation and `collect()` work.
+    /// For unbounded streams, `collect()` always returns an error —
+    /// use `Session::submit_stream_job()` for continuous output.
+    ///
     /// The same key always routes to the same executor task for the job
     /// lifetime (keyed-distribution stability contract).
     pub fn key_by(self, column: impl Into<String>) -> KeyedStream {

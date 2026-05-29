@@ -158,6 +158,7 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
             2,
         ),
         ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
+        ["compat", ..] => CliResponse::ok("compat (R15): PySpark migration tools are not yet implemented in this release.\nThis command is a placeholder for future functionality.\n".to_string()),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
         ["stream", rest @ ..] => crate::stream_cmd::run_stream(rest),
@@ -342,6 +343,9 @@ fn run_jobs(args: &[&str]) -> CliResponse {
             2,
         );
     }
+    eprintln!(
+        "[local-mode] Jobs are local to this process. Persistent job history is not yet implemented."
+    );
     let session = match Session::builder().build() {
         Ok(session) => session,
         Err(error) => return CliResponse::err(format!("{error}\n"), 1),
@@ -768,13 +772,17 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
                  Note: in local mode the coordinator holds no running jobs.\n"
             ))
         }
-        Err(e) => CliResponse::err(
-            format!(
-                "Savepoint failed for job {job_id}: {e}\n\
-                 Ensure the job is a running streaming job with checkpoint_interval_ms set.\n"
-            ),
-            1,
-        ),
+        Err(e) => {
+            eprintln!("[local-mode] No streaming jobs are running in local mode.");
+            eprintln!("Use --coordinator <URL> to trigger a savepoint on a live cluster.");
+            CliResponse::err(
+                format!(
+                    "Savepoint failed for job {job_id}: {e}\n\
+                     Ensure the job is a running streaming job with checkpoint_interval_ms set.\n"
+                ),
+                1,
+            )
+        }
     }
 }
 
@@ -885,7 +893,7 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
         .map(|l| format!(" ({l})"))
         .unwrap_or_default();
     CliResponse::ok(format!(
-        "Restore plan\n\
+        "[Dry-run, local-mode] Restore plan (no changes applied):\n\
          Job:              {job_id}\n\
          Epoch:            {epoch_num}\n\
          Type:             {kind}{label}\n\
@@ -894,7 +902,7 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
          Operator snapshots:{snapshot_count}\n\
          Fencing token:    {ft}\n\
          \n\
-         To apply: use --coordinator <URL> to trigger restore on a live cluster.\n",
+         To apply this restore, rerun with --coordinator <URL>.\n",
         ft = meta.fencing_token,
     ))
 }

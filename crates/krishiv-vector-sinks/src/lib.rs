@@ -25,7 +25,9 @@ pub use id::point_id_from_doc_epoch;
 pub use memory::InMemoryVectorSink;
 pub use pinecone::PineconeSink;
 pub use registry::VectorSinkRegistry;
-pub use traits::{PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError};
+pub use traits::{
+    PayloadFilter, PayloadValue, ScoredChunk, VectorSink, VectorSinkError, validate_identifier,
+};
 pub use weaviate::WeaviateSink;
 
 pub use lancedb_sink::LanceDbSink;
@@ -534,6 +536,19 @@ mod tests {
             let sink = VectorSinkRegistry::from_config(&config).await.unwrap();
             assert_eq!(sink.sink_name(), "weaviate");
         });
+    }
+
+    // S2 regression: validate_identifier prevents injection
+    #[test]
+    fn validate_identifier_rejects_bad_names() {
+        use crate::traits::validate_identifier;
+        assert!(validate_identifier("good_name").is_ok());
+        assert!(validate_identifier("_leading_underscore_ok").is_ok());
+        assert!(validate_identifier("bad-name").is_err());
+        assert!(validate_identifier("bad name").is_err());
+        assert!(validate_identifier("123start").is_err());
+        assert!(validate_identifier("select; drop").is_err());
+        assert!(validate_identifier("").is_err());
     }
 
     #[test]

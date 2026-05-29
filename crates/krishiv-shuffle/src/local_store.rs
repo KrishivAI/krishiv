@@ -44,6 +44,8 @@ impl LocalShuffleStore {
     /// 4. Writes the header + compressed bytes.
     /// 5. Atomically renames staging path → final path.
     pub async fn write_partition(&self, path: &ShufflePath, data: &[u8]) -> ShuffleResult<()> {
+        crate::validate_safe_id(&path.job_id, "job_id")?;
+        crate::validate_safe_id(&path.stage_id, "stage_id")?;
         let compressed = self.compression.compress(data)?;
         let codec_byte = match self.compression {
             ShuffleCompression::None => 0x00u8,
@@ -78,6 +80,8 @@ impl LocalShuffleStore {
     /// Returns `PartitionNotFound` if the final path does not exist.
     /// Returns `Io` error if the magic bytes are invalid or the codec byte is unknown.
     pub async fn read_partition(&self, path: &ShufflePath) -> ShuffleResult<Vec<u8>> {
+        crate::validate_safe_id(&path.job_id, "job_id")?;
+        crate::validate_safe_id(&path.stage_id, "stage_id")?;
         let final_path = self.base_dir.join(path.final_name());
         match tokio::fs::read(&final_path).await {
             Ok(bytes) => {
@@ -120,6 +124,7 @@ impl LocalShuffleStore {
     ///
     /// No-ops if the directory does not exist.
     pub async fn delete_job(&self, job_id: &str) -> ShuffleResult<()> {
+        crate::validate_safe_id(job_id, "job_id")?;
         let dir = self.base_dir.join(job_id);
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),

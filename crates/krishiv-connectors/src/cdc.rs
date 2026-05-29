@@ -728,7 +728,7 @@ fn safe_payload_column(name: &str) -> String {
 ///
 /// Construct via the builder pattern and pass to [`RdkafkaCdcEventSource::new`].
 #[cfg(feature = "kafka")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KafkaCdcConfig {
     /// Comma-separated list of `host:port` bootstrap broker addresses.
     pub bootstrap_servers: String,
@@ -745,6 +745,27 @@ pub struct KafkaCdcConfig {
     pub sasl_username: Option<String>,
     /// SASL password.  `None` for unauthenticated connections.
     pub sasl_password: Option<String>,
+}
+
+#[cfg(feature = "kafka")]
+impl std::fmt::Debug for KafkaCdcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaCdcConfig")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("group_id", &self.group_id)
+            .field("topic", &self.topic)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field(
+                "sasl_username",
+                &self.sasl_username.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "sasl_password",
+                &self.sasl_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(feature = "kafka")]

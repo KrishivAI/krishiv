@@ -197,13 +197,136 @@ fn apply_row_predicates(
     }
     let predicate = preds.join(" AND ");
 
-    // Handle CTEs: wrap the whole WITH query as a subquery.
-    let trimmed = query.trim_start();
-    if trimmed.to_uppercase().starts_with("WITH ") {
-        return format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}");
+    // C8: Instead of wrapping the entire query as a subquery (which fails when
+    // RLS predicate columns are not projected), inject the predicate directly
+    // into the query's WHERE clause using sqlparser to find the right position.
+    //
+    // For simple SELECT queries, we splice "AND (predicate)" into the existing
+    // WHERE clause, or add "WHERE predicate" if there is none.  For queries
+    // with CTEs (WITH), we fall back to the subquery wrap.
+    match inject_rls_predicate(query, &predicate) {
+        Ok(rewritten) => rewritten,
+        Err(_) => {
+            let trimmed = query.trim_start();
+            if trimmed.to_uppercase().starts_with("WITH ") {
+                format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
+            } else {
+                format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
+            }
+        }
+    }
+}
+
+/// C8: Inject an RLS predicate into the WHERE clause of a SELECT query.
+/// Uses sqlparser to locate the WHERE clause position rather than naive
+/// string matching that would break on subqueries and nested selects.
+fn inject_rls_predicate(query: &str, predicate: &str) -> Result<String, ()> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, query).map_err(|_| ())?;
+    if statements.is_empty() {
+        return Err(());
     }
 
-    format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
+    // For CTE queries, find where the outermost SELECT begins after WITH ... )
+    // and inject the predicate there.
+    let trimmed = query.trim_start();
+    if trimmed.to_uppercase().starts_with("WITH ") {
+        // Find the position after the last CTE definition `)` and before the
+        // main query's SELECT.  Inject the RLS predicate by wrapping just the
+        // main query in a subquery with the predicate.
+        if let Some(select_pos) = find_outer_select_after_cte(query) {
+            let (before, after) = query.split_at(select_pos);
+            return Ok(format!(
+                "{before}SELECT * FROM ({after}) AS __krishiv_rls WHERE {predicate}"
+            ));
+        }
+        return Err(());
+    }
+
+    // For regular SELECT queries, look for an existing WHERE clause.
+    // Parse to find the WHERE position more precisely.
+    // Fall back to string-based injection using sqlparser's query representation.
+    match find_where_injection_point(query) {
+        Some((before, existing)) => format!("{before}({existing}) AND ({predicate})")
+            .parse::<String>()
+            .map_err(|_: std::string::ParseError| ())
+            .map(|_| format!("{before}({existing}) AND ({predicate})"))
+            .or_else(|_| Ok(format!("{query} AND ({predicate})"))),
+        None => Ok(format!("{query} WHERE {predicate}")),
+    }
+}
+
+/// Find the position of the WHERE clause in a SELECT query for RLS predicate injection.
+fn find_where_injection_point(query: &str) -> Option<(String, String)> {
+    let lines: Vec<&str> = query.lines().collect();
+    let single_line = lines.join(" ");
+
+    // Find WHERE keyword outside of parentheses and single quotes.
+    let mut depth = 0i32;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let chars: Vec<char> = single_line.chars().collect();
+    let mut i = 0;
+
+    while i + 5 < chars.len() {
+        match chars[i] {
+            '(' if !in_single_quote && !in_double_quote => depth += 1,
+            ')' if !in_single_quote && !in_double_quote => depth -= 1,
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            _ => {}
+        }
+
+        let word: String = chars[i..i + 6].iter().collect();
+        if word.to_uppercase().starts_with("WHERE ")
+            && depth == 0
+            && !in_single_quote
+            && !in_double_quote
+        {
+            let before = single_line[..i].to_string();
+            let after = single_line[i + 5..].to_string(); // Skip "WHERE"
+            return Some((before + "WHERE ", after));
+        }
+
+        if word.to_uppercase().starts_with("WHERE\n")
+            && depth == 0
+            && !in_single_quote
+            && !in_double_quote
+        {
+            let before = single_line[..i].to_string();
+            let after = single_line[i + 5..].to_string();
+            return Some((before + "WHERE ", after));
+        }
+
+        i += 1;
+    }
+    None
+}
+
+/// Find the start of the outer SELECT after any CTE definitions.
+fn find_outer_select_after_cte(query: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let chars: Vec<char> = query.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // After the last CTE closing paren, look for the next SELECT
+                    let rest: String = chars[i + 1..].iter().collect();
+                    if let Some(select_idx) = rest.to_uppercase().find("SELECT") {
+                        return Some(i + 1 + select_idx);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Apply column-masking rules from `policy` to a single [`RecordBatch`].

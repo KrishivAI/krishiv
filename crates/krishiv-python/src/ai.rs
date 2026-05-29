@@ -132,6 +132,18 @@ fn chunk(text: &str, chunker: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
 
 #[pyfunction]
 #[pyo3(signature = (documents, model="sentence-transformers/all-MiniLM-L6-v2", epoch=1))]
+/// Index documents for RAG (Retrieval-Augmented Generation).
+///
+/// **Alpha (R17)**: Vectors are stored in process memory (`InMemoryVectorSink`) and are
+/// lost when the Python interpreter restarts. The memo deduplication store is written
+/// to a temporary directory and is also ephemeral.
+///
+/// **Network requirement**: Downloads the embedding model from HuggingFace Hub on
+/// first call. Ensure network access is available.
+///
+/// **CPU only**: Embedding runs on CPU. GPU and ONNX acceleration are not yet supported.
+///
+/// `rag_query` must be called in the same interpreter session after `rag_index`.
 fn rag_index(
     documents: Vec<(String, String)>,
     model: &str,
@@ -177,6 +189,11 @@ fn rag_index(
 
 #[pyfunction]
 #[pyo3(signature = (query_text, model="sentence-transformers/all-MiniLM-L6-v2", top_k=5))]
+/// Query the in-process RAG index.
+///
+/// **Alpha (R17)**: Requires a prior call to `rag_index` with the same model in the
+/// current interpreter session. Raises `RuntimeError` if no index is found.
+/// State is not persisted between interpreter restarts.
 fn rag_query(query_text: &str, model: &str, top_k: usize) -> PyResult<Vec<(String, f32)>> {
     let key = ModelKey {
         model_name: model.to_string(),

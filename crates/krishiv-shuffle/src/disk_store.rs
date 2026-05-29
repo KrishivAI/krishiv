@@ -48,11 +48,14 @@ impl LocalDiskShuffleStore {
         self.compression
     }
 
-    fn partition_path(&self, id: &PartitionId) -> PathBuf {
-        self.base_dir
+    fn partition_path(&self, id: &PartitionId) -> ShuffleResult<PathBuf> {
+        crate::validate_safe_id(&id.job_id, "job_id")?;
+        crate::validate_safe_id(&id.stage_id, "stage_id")?;
+        Ok(self
+            .base_dir
             .join(&id.job_id)
             .join(&id.stage_id)
-            .join(format!("{}.parquet", id.partition))
+            .join(format!("{}.parquet", id.partition)))
     }
 }
 
@@ -62,6 +65,8 @@ impl ShuffleStore for LocalDiskShuffleStore {
         id: PartitionId,
         lease_token: u64,
     ) -> ShuffleResult<()> {
+        crate::validate_safe_id(&id.job_id, "job_id")?;
+        crate::validate_safe_id(&id.stage_id, "stage_id")?;
         let key = (id.job_id, id.stage_id, id.partition);
         let mut leases = shuffle_write_lock(&self.lease_tokens)?;
         if let Some(&expected) = leases.get(&key)
@@ -123,9 +128,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
             }
         }
 
-        let final_path = self.partition_path(&partition.id);
+        let final_path = self.partition_path(&partition.id)?;
         let writer_props = parquet_writer_properties(self.compression);
         let lease_tokens = Arc::clone(&self.lease_tokens);
+        let parent_dir = final_path.parent().map(PathBuf::from);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -159,9 +165,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         .write(batch)
                         .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
                 }
-                writer
-                    .close()
-                    .map_err(|e| io_err(format!("failed to close Parquet writer: {e}")))?;
+                // S4: Sync temp file to durable storage before commit.
+                let mut tmp_file = writer
+                    .into_inner()
+                    .map_err(|e| io_err(format!("failed to finalize Parquet writer: {e}")))?;
+                tmp_file
+                    .sync_all()
+                    .map_err(|e| io_err(format!("failed to fsync temp file: {e}")))?;
             }
 
             // Phase 2: Re-acquire the lock and commit via rename only if our token
@@ -185,6 +195,12 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         final_path.display()
                     ))
                 })?;
+                // S4: Fsync the parent directory so the rename is durable.
+                if let Some(ref parent) = parent_dir {
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        dir.sync_all().ok();
+                    }
+                }
             } else {
                 // Newer writer won — silently discard this temp file.
                 let _ = std::fs::remove_file(&tmp_path);
@@ -200,7 +216,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
-        let path = self.partition_path(id);
+        let path = self.partition_path(id)?;
         let id = id.clone();
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
@@ -242,6 +258,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
     }
 
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
+        crate::validate_safe_id(job_id, "job_id")?;
         let dir = self.base_dir.join(job_id);
         let job_id_owned = job_id.to_owned();
 

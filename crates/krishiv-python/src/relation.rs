@@ -226,6 +226,10 @@ impl PyRelation {
     // ── Terminal operations ───────────────────────────────────────────────────
 
     /// Collect results into a `QueryResult`.
+    ///
+    /// **Warning**: Materializes the entire result in process memory. For large or
+    /// unbounded streaming relations this may cause out-of-memory (OOM) errors.
+    /// Use `sink_to()` or a streaming sink for continuous output.
     pub fn collect(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
         py.detach(|| self.collect_internal().map(PyQueryResult::new))
     }
