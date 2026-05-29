@@ -478,6 +478,71 @@ impl OpenLineageEmitter for HttpEmitter {
     }
 }
 
+// ── AsyncHttpEmitter ──────────────────────────────────────────────────────────
+
+/// **Beta API**: Asynchronous HTTP emitter — buffers lineage events in a bounded channel
+/// and delivers them in a background task, ensuring network delays or API outages never
+/// stall scheduler operations or job runs.
+pub struct AsyncHttpEmitter {
+    sender: tokio::sync::mpsc::Sender<RunEvent>,
+}
+
+impl AsyncHttpEmitter {
+    /// **Beta API**: Create a new [`AsyncHttpEmitter`] pointing at the endpoint URL
+    /// with a bounded capacity (e.g. 1024 events) and spawn its delivery worker task.
+    pub fn new(endpoint: impl Into<String>, capacity: usize) -> Self {
+        let endpoint_str = endpoint.into();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<RunEvent>(capacity);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("reqwest client");
+
+        tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                let response = client
+                    .post(&endpoint_str)
+                    .json(&event)
+                    .send()
+                    .await;
+                match response {
+                    Ok(resp) => {
+                        if let Err(e) = resp.error_for_status() {
+                            let status = e.status().map_or(0, |s| s.as_u16());
+                            tracing::warn!(
+                                target: "krishiv::lineage",
+                                status = status,
+                                error = %e,
+                                "failed to deliver async lineage event: http status error"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "krishiv::lineage",
+                            error = %e,
+                            "failed to deliver async lineage event: transport failure"
+                        );
+                    }
+                }
+            }
+        });
+
+        Self { sender }
+    }
+}
+
+#[async_trait::async_trait]
+impl OpenLineageEmitter for AsyncHttpEmitter {
+    async fn emit(&self, event: RunEvent) -> Result<(), EmitError> {
+        self.sender
+            .send(event)
+            .await
+            .map_err(|e| EmitError::Transport(format!("failed to enqueue lineage event: {e}")))?;
+        Ok(())
+    }
+}
+
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
 ///
 /// Example output: `"2024-05-21T12:34:56.789000000Z"`
@@ -822,6 +887,31 @@ mod tests {
         let emitter = HttpEmitter::new(format!("{}/lineage", server.url()));
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok(), "200 must succeed");
+    }
+
+    #[tokio::test]
+    async fn async_http_emitter_delivers_in_background() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/lineage")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let emitter = AsyncHttpEmitter::new(format!("{}/lineage", server.url()), 10);
+        let event = sample_run_event();
+        assert!(emitter.emit(event).await.is_ok(), "Async emit must succeed");
+
+        // Wait a brief moment for the background worker to deliver the event and satisfy the mock
+        let mut success = false;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if mock.matched() {
+                success = true;
+                break;
+            }
+        }
+        assert!(success, "Async emitter failed to deliver event to mock server in background");
     }
 
     // ── AuditLog dedup edge cases ───────────────────────────────────────────

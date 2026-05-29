@@ -109,8 +109,7 @@ impl HudiSnapshotReader {
                         for meta in &commit_metadata[idx..] {
                             if let Some(base) = &meta.base_file {
                                 files.push(self.table_path.join(base));
-                            }
-                            if let Some(change) = &meta.change_file {
+                            } else if let Some(change) = &meta.change_file {
                                 files.push(self.table_path.join(change));
                             }
                         }
