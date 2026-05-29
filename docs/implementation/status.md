@@ -13,10 +13,14 @@
 - **Production Observability & Debugging Telemetry Audit**:
   - Audited metrics, logging, offsets, checkpoints, snapshots, attempts, and lineage configurations across the repository to verify robust diagnostic signals for production stalls and failures.
   - Created a comprehensive durable audit guide in `observability_audit.md`.
+- **Telemetry & Engine Hardening (Best Architectural Decisions)**:
+  - Implemented `AsyncHttpEmitter` in `krishiv-governance` to decouple critical scheduler transitions from blocking HTTP OpenLineage delivery using a Tokio bounded channel and background task worker.
+  - Fixed a pre-existing Hudi Copy-on-Write duplicate-counting bug in `HudiSnapshotReader::parquet_files_for_commits` where snapshot queries double-counted initial batches written with both base and change files. Prioritized `base_file` and fell back to `change_file`, enabling all 99 `krishiv-lakehouse` tests to pass cleanly.
 
 Validation:
-- Staged, validated, and successfully committed all 43 modified files in the git workspace.
-- Unit and integration tests compiled and passed.
+- Added `async_http_emitter_delivers_in_background` integration test; all 48 tests in `krishiv-governance` pass cleanly.
+- Resolved Hudi CoW append and upsert row failures; all 99 tests in `krishiv-lakehouse` pass cleanly.
+- Successfully staged, verified, and committed all modified files across the workspace.
 
 **Previous Phase:**
 **R12-R18 stub-to-implementation sprint — cross-release surfaces wired (2026-05-28).**
