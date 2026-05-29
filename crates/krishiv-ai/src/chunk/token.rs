@@ -45,7 +45,8 @@ impl TokenAwareChunker {
                 hi = mid;
             }
         }
-        lo.saturating_sub(1).max(1.min(text.len()))
+        // lo is the first index where tokens exceed max_tokens, or text.len() if all fit
+        lo.min(text.len()).max(1.min(text.len()))
     }
 }
 
@@ -93,5 +94,79 @@ mod tests {
         let c = TokenAwareChunker::new(8, 2, "cl100k_base");
         let chunks = c.chunk(&"word ".repeat(200));
         assert!(chunks.len() > 1);
+    }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn empty_text() {
+        let c = TokenAwareChunker::new(10, 2, "cl100k_base");
+        let chunks = c.chunk("");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn short_text_single_chunk() {
+        let c = TokenAwareChunker::new(100, 10, "cl100k_base");
+        let chunks = c.chunk("hello");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hello");
+    }
+
+    #[test]
+    fn chunk_indices_sequential() {
+        let c = TokenAwareChunker::new(5, 1, "cl100k_base");
+        let chunks = c.chunk(&"word ".repeat(50));
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i);
+        }
+    }
+
+    #[test]
+    fn overlap_creates_multiple_chunks() {
+        let c = TokenAwareChunker::new(8, 2, "cl100k_base");
+        let text = &"word ".repeat(100);
+        let chunks = c.chunk(text);
+        assert!(chunks.len() > 1);
+    }
+
+    #[test]
+    fn new_enforces_min_tokens() {
+        let c = TokenAwareChunker::new(0, 0, "cl100k_base");
+        assert_eq!(c.max_tokens, 1);
+    }
+
+    #[test]
+    fn new_with_various_tokenizers() {
+        let _ = TokenAwareChunker::new(10, 2, "cl100k_base");
+        let _ = TokenAwareChunker::new(10, 2, "p50k_base");
+        let _ = TokenAwareChunker::new(10, 2, "r50k_base");
+    }
+
+    #[test]
+    fn token_len_proxy() {
+        let c = TokenAwareChunker::new(100, 0, "cl100k_base");
+        // ~4 chars per token proxy
+        assert_eq!(c.token_len(""), 0);
+        assert!(c.token_len("a") >= 1);
+        assert!(c.token_len("abcdefgh") >= 1);
+    }
+
+    #[test]
+    fn slice_by_tokens_zero_max() {
+        let c = TokenAwareChunker::new(10, 0, "cl100k_base");
+        let result = c.slice_by_tokens("hello", 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn large_text() {
+        let c = TokenAwareChunker::new(50, 10, "cl100k_base");
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+        let chunks = c.chunk(&text);
+        assert!(chunks.len() > 1);
+        // All text should be covered
+        let total_len: usize = chunks.iter().map(|c| c.text.len()).sum();
+        assert!(total_len >= text.len());
     }
 }

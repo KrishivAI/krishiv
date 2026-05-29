@@ -197,7 +197,9 @@ fn memory_stream_supports_bounded_map_filter_collect() {
     )]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
         .unwrap_or_else(|error| panic!("unexpected record batch error: {error}"));
-    let stream = session.memory_stream("numbers", vec![StreamBatch::new(0, batch)]).unwrap();
+    let stream = session
+        .memory_stream("numbers", vec![StreamBatch::new(0, batch)])
+        .unwrap();
     let mapped = stream
         .map_batches(|batch| batch.clone())
         .unwrap_or_else(|error| panic!("unexpected stream map error: {error}"));
@@ -277,7 +279,9 @@ fn tumbling_window_collect_executes_in_embedded_mode() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
+    let stream = session
+        .memory_stream("events", vec![StreamBatch::new(0, batch)])
+        .unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -303,7 +307,9 @@ fn sliding_window_collect_via_unified_runtime() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
+    let stream = session
+        .memory_stream("events", vec![StreamBatch::new(0, batch)])
+        .unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -328,7 +334,9 @@ fn session_window_collect_via_unified_runtime() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
+    let stream = session
+        .memory_stream("events", vec![StreamBatch::new(0, batch)])
+        .unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -354,7 +362,9 @@ fn session_subsequent_window_collects() {
     )
     .unwrap();
     for _ in 0..2 {
-        let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch.clone())]).unwrap();
+        let stream = session
+            .memory_stream("events", vec![StreamBatch::new(0, batch.clone())])
+            .unwrap();
         let _ = stream
             .key_by("user_id")
             .with_event_time("ts")
@@ -601,6 +611,7 @@ async fn distributed_session_sql_collects_via_local_coordinator() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running local cluster on 127.0.0.1:50051"]
 async fn distributed_window_collect_via_local_cluster() {
     let session = Session::builder()
         .with_local_cluster("http://127.0.0.1:50051")
@@ -618,7 +629,9 @@ async fn distributed_window_collect_via_local_cluster() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
+    let stream = session
+        .memory_stream("events", vec![StreamBatch::new(0, batch)])
+        .unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -695,7 +708,9 @@ fn multi_source_watermark_window_collect_with_source_column() {
         ],
     )
     .unwrap();
-    let stream = session.memory_stream("events", vec![StreamBatch::new(0, batch)]).unwrap();
+    let stream = session
+        .memory_stream("events", vec![StreamBatch::new(0, batch)])
+        .unwrap();
     let out = stream
         .key_by("user_id")
         .with_event_time("ts")

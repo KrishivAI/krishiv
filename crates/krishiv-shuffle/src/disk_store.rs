@@ -138,9 +138,8 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let tmp_suffix = TMP_CTR.fetch_add(1, Ordering::Relaxed);
 
             if let Some(parent) = final_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    io_err(format!("failed to create partition dir: {e}"))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io_err(format!("failed to create partition dir: {e}")))?;
             }
 
             // Phase 1 (continued): Write to a temp file alongside the final path.
@@ -154,17 +153,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 })?;
                 let schema = partition.schema.clone();
                 let mut writer = ArrowWriter::try_new(tmp_file, schema, Some(writer_props))
-                    .map_err(|e| {
-                        io_err(format!("failed to create Parquet writer: {e}"))
-                    })?;
+                    .map_err(|e| io_err(format!("failed to create Parquet writer: {e}")))?;
                 for batch in &partition.batches {
-                    writer.write(batch).map_err(|e| {
-                        io_err(format!("failed to write Parquet batch: {e}"))
-                    })?;
+                    writer
+                        .write(batch)
+                        .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
                 }
-                writer.close().map_err(|e| {
-                    io_err(format!("failed to close Parquet writer: {e}"))
-                })?;
+                writer
+                    .close()
+                    .map_err(|e| io_err(format!("failed to close Parquet writer: {e}")))?;
             }
 
             // Phase 2: Re-acquire the lock and commit via rename only if our token
@@ -174,7 +171,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 let tokens = lease_tokens
                     .read()
                     .map_err(|_| io_err("lease token lock poisoned"))?;
-                tokens.get(&key).copied().map_or(false, |t| t == lease_token)
+                tokens
+                    .get(&key)
+                    .copied()
+                    .map_or(false, |t| t == lease_token)
             };
 
             if commit {
@@ -222,13 +222,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let builder = ParquetRecordBatchReaderBuilder::try_new(file)
                 .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
             let schema = builder.schema().clone();
-            let reader = builder.build().map_err(|e| {
-                io_err(format!("failed to build Parquet batch reader: {e}"))
-            })?;
+            let reader = builder
+                .build()
+                .map_err(|e| io_err(format!("failed to build Parquet batch reader: {e}")))?;
             let mut batches = Vec::new();
             for result in reader {
-                let batch = result
-                    .map_err(|e| io_err(format!("error reading Parquet batch: {e}")))?;
+                let batch =
+                    result.map_err(|e| io_err(format!("error reading Parquet batch: {e}")))?;
                 batches.push(batch);
             }
             Ok(Some(ShufflePartition {
@@ -251,9 +251,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 Ok(()) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(io_err(format!(
-                        "failed to delete job partitions: {e}"
-                    )));
+                    return Err(io_err(format!("failed to delete job partitions: {e}")));
                 }
             }
             Ok(())

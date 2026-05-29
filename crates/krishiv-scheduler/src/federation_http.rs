@@ -3,9 +3,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use krishiv_proto::{
-    JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
-};
+use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::{SchedulerError, SharedCoordinator};
@@ -74,8 +72,7 @@ impl TryFrom<FederatedJobWire> for JobSpec {
             let stage_id = StageId::try_new(sw.stage_id).map_err(|_| StatusCode::BAD_REQUEST)?;
             let mut stage = StageSpec::new(stage_id, sw.name);
             for tw in sw.tasks {
-                let task_id =
-                    TaskId::try_new(tw.task_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+                let task_id = TaskId::try_new(tw.task_id).map_err(|_| StatusCode::BAD_REQUEST)?;
                 stage = stage.with_task(TaskSpec::new(task_id, tw.description));
             }
             spec = spec.with_stage(stage);
@@ -89,11 +86,10 @@ pub async fn federation_submit_job(
     Json(body): Json<FederationSubmitBody>,
 ) -> Result<Json<FederationSubmitResponse>, StatusCode> {
     let job_id = JobId::try_new(body.job_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let wire: FederatedJobWire =
-        serde_json::from_str(&body.spec_json).map_err(|e| {
-            tracing::warn!(error = %e, "failed to deserialize federation spec_json");
-            StatusCode::BAD_REQUEST
-        })?;
+    let wire: FederatedJobWire = serde_json::from_str(&body.spec_json).map_err(|e| {
+        tracing::warn!(error = %e, "failed to deserialize federation spec_json");
+        StatusCode::BAD_REQUEST
+    })?;
     let spec = JobSpec::try_from(wire)?;
     tracing::debug!(job_id = %job_id, "federation submit (deserialized spec_json)");
     let mut coord = coordinator.write().await;

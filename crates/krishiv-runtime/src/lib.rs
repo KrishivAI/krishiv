@@ -15,7 +15,7 @@ pub mod continuous_stream;
 mod coordinator_http_client;
 pub mod execution_runtime;
 pub mod flight_action;
-mod flight_client;
+pub mod flight_client;
 pub mod flight_protocol;
 pub mod in_process;
 pub mod in_process_cluster;
@@ -473,7 +473,11 @@ mod distributed_flight_tests {
 mod tests {
     use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
-    use super::{EmbeddedBackend, ExecutionBackend, SingleNodeBackend, is_streaming_plan};
+    use super::{
+        DistributedBackend, EmbeddedBackend, ExecutionBackend, ExecutionReport, JobId, JobState,
+        JobStatus, LocalJobRegistry, RuntimeError, SingleNodeBackend, TaskReport, TaskSpec,
+        accept_local_plan, is_streaming_plan,
+    };
 
     #[test]
     fn embedded_backend_accepts_bootstrap_plan() {
@@ -502,6 +506,253 @@ mod tests {
         let backend = SingleNodeBackend;
         let report = backend.execute(&plan).expect("execute");
         assert_eq!(report.backend(), "single-node");
+        assert!(report.accepted());
+    }
+
+    #[test]
+    fn runtime_error_display_unsupported() {
+        let err = RuntimeError::unsupported("shuffle");
+        assert_eq!(err.to_string(), "unsupported runtime feature: shuffle");
+    }
+
+    #[test]
+    fn runtime_error_display_transport() {
+        let err = RuntimeError::transport("connection refused");
+        assert_eq!(err.to_string(), "transport error: connection refused");
+    }
+
+    #[test]
+    fn runtime_error_display_plan_rejected() {
+        let err = RuntimeError::plan_rejected("missing output schema");
+        assert_eq!(err.to_string(), "plan rejected: missing output schema");
+    }
+
+    #[test]
+    fn runtime_error_display_partial_result() {
+        let err = RuntimeError::partial_result(3, 1);
+        assert_eq!(
+            err.to_string(),
+            "partial result: 3 partitions succeeded, 1 failed"
+        );
+    }
+
+    #[test]
+    fn runtime_error_display_invalid_state() {
+        let err = RuntimeError::InvalidState {
+            message: "job not found".into(),
+        };
+        assert_eq!(err.to_string(), "invalid runtime state: job not found");
+    }
+
+    #[test]
+    fn runtime_error_is_std_error() {
+        let err = RuntimeError::unsupported("test");
+        let e: &dyn std::error::Error = &err;
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn runtime_error_clone_and_eq() {
+        let err1 = RuntimeError::transport("fail");
+        let err2 = err1.clone();
+        assert_eq!(err1, err2);
+    }
+
+    #[test]
+    fn job_id_new_and_as_str() {
+        let id = JobId::new("job-42");
+        assert_eq!(id.as_str(), "job-42");
+    }
+
+    #[test]
+    fn job_id_empty_string() {
+        let id = JobId::new("");
+        assert_eq!(id.as_str(), "");
+    }
+
+    #[test]
+    fn job_id_special_chars() {
+        let id = JobId::new("j-1.2_3");
+        assert_eq!(id.as_str(), "j-1.2_3");
+    }
+
+    #[test]
+    fn job_id_clone_eq_hash() {
+        let a = JobId::new("x");
+        let b = a.clone();
+        assert_eq!(a, b);
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(a, 1);
+        assert_eq!(map.get(&b), Some(&1));
+    }
+
+    #[test]
+    fn job_state_display_pending() {
+        assert_eq!(JobState::Pending.to_string(), "pending");
+    }
+
+    #[test]
+    fn job_state_display_running() {
+        assert_eq!(JobState::Running.to_string(), "running");
+    }
+
+    #[test]
+    fn job_state_display_succeeded() {
+        assert_eq!(JobState::Succeeded.to_string(), "succeeded");
+    }
+
+    #[test]
+    fn job_state_display_failed() {
+        assert_eq!(JobState::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn job_status_constructors_and_accessors() {
+        let id = JobId::new("j1");
+        let status = JobStatus::new(id.clone(), "my-job", JobState::Running);
+        assert_eq!(status.id(), &id);
+        assert_eq!(status.name(), "my-job");
+        assert_eq!(status.state(), JobState::Running);
+    }
+
+    #[test]
+    fn job_status_clone_and_eq() {
+        let s1 = JobStatus::new(JobId::new("j1"), "j", JobState::Pending);
+        let s2 = s1.clone();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn local_job_registry_empty_list() {
+        let reg = LocalJobRegistry::default();
+        assert!(reg.list().is_empty());
+    }
+
+    #[test]
+    fn local_job_registry_upsert_adds_new() {
+        let mut reg = LocalJobRegistry::default();
+        let s = JobStatus::new(JobId::new("j1"), "job1", JobState::Pending);
+        reg.upsert(s);
+        assert_eq!(reg.list().len(), 1);
+        assert_eq!(reg.list()[0].id().as_str(), "j1");
+    }
+
+    #[test]
+    fn local_job_registry_upsert_replaces_existing() {
+        let mut reg = LocalJobRegistry::default();
+        reg.upsert(JobStatus::new(JobId::new("j1"), "v1", JobState::Pending));
+        reg.upsert(JobStatus::new(JobId::new("j1"), "v2", JobState::Running));
+        assert_eq!(reg.list().len(), 1);
+        assert_eq!(reg.list()[0].name(), "v2");
+        assert_eq!(reg.list()[0].state(), JobState::Running);
+    }
+
+    #[test]
+    fn local_job_registry_snapshot() {
+        let mut reg = LocalJobRegistry::default();
+        reg.upsert(JobStatus::new(JobId::new("j1"), "a", JobState::Pending));
+        reg.upsert(JobStatus::new(JobId::new("j2"), "b", JobState::Running));
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn task_spec_accessors() {
+        let t = TaskSpec::new("t-1", "do stuff");
+        assert_eq!(t.id(), "t-1");
+        assert_eq!(t.description(), "do stuff");
+    }
+
+    #[test]
+    fn task_spec_clone_and_eq() {
+        let t1 = TaskSpec::new("t", "desc");
+        let t2 = t1.clone();
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn task_report_accessors() {
+        let r = TaskReport::new("t-1", JobState::Succeeded);
+        assert_eq!(r.task_id(), "t-1");
+        assert_eq!(r.state(), JobState::Succeeded);
+    }
+
+    #[test]
+    fn task_report_clone_and_eq() {
+        let r1 = TaskReport::new("t", JobState::Failed);
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn execution_report_accessors() {
+        let r = ExecutionReport::new("single-node", "plan-1", ExecutionKind::Batch, true);
+        assert_eq!(r.backend(), "single-node");
+        assert_eq!(r.plan_name(), "plan-1");
+        assert_eq!(r.kind(), ExecutionKind::Batch);
+        assert!(r.accepted());
+    }
+
+    #[test]
+    fn execution_report_not_accepted() {
+        let r = ExecutionReport::new("embedded", "p", ExecutionKind::Streaming, false);
+        assert!(!r.accepted());
+    }
+
+    #[test]
+    fn execution_report_clone_and_eq() {
+        let r1 = ExecutionReport::new("b", "p", ExecutionKind::Batch, true);
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn accept_local_plan_rejects_empty_name() {
+        let plan = PhysicalPlan::new("  ", ExecutionKind::Batch);
+        let err = accept_local_plan("test", &plan).unwrap_err();
+        assert!(matches!(err, RuntimeError::PlanRejected { .. }));
+    }
+
+    #[test]
+    fn accept_local_plan_accepts_valid_name() {
+        let plan = PhysicalPlan::new("my-plan", ExecutionKind::Batch);
+        let report = accept_local_plan("backend", &plan).unwrap();
+        assert!(report.accepted());
+        assert_eq!(report.backend(), "backend");
+    }
+
+    #[test]
+    fn distributed_backend_new_and_flight_url() {
+        let b = DistributedBackend::new("http://localhost:50051");
+        assert_eq!(b.flight_url(), "http://localhost:50051");
+        assert_eq!(b.backend_name(), "distributed");
+    }
+
+    #[test]
+    fn distributed_backend_clone() {
+        let b = DistributedBackend::new("http://x");
+        let b2 = b.clone();
+        assert_eq!(b2.flight_url(), "http://x");
+    }
+
+    #[test]
+    fn single_node_backend_name() {
+        let b = SingleNodeBackend;
+        assert_eq!(b.backend_name(), "single-node");
+    }
+
+    #[test]
+    fn embedded_backend_name() {
+        let b = EmbeddedBackend::default();
+        assert_eq!(b.backend_name(), "embedded");
+    }
+
+    #[test]
+    fn single_node_accepts_batch_plan() {
+        let plan = PhysicalPlan::new("SELECT 1", ExecutionKind::Batch);
+        let b = SingleNodeBackend;
+        let report = b.execute(&plan).unwrap();
         assert!(report.accepted());
     }
 }

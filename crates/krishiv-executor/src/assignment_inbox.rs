@@ -98,3 +98,157 @@ impl ExecutorAssignmentInbox {
         Ok(self.len()? == 0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use krishiv_proto::{
+        AttemptId, ExecutorId, ExecutorTaskAssignment, JobId, LeaseGeneration, OutputContract,
+        OutputContractKind, PlanFragment, StageId, TaskAttemptRef, TaskId,
+    };
+
+    fn make_assignment(task_id: &str) -> ExecutorTaskAssignment {
+        ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-1").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new(task_id).unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        )
+    }
+
+    #[test]
+    fn new_inbox_is_empty() {
+        let inbox = ExecutorAssignmentInbox::new();
+        assert!(inbox.is_empty().unwrap());
+        assert_eq!(inbox.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn push_increases_length() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox.push(make_assignment("task-1")).unwrap();
+        assert_eq!(inbox.len().unwrap(), 1);
+        assert!(!inbox.is_empty().unwrap());
+    }
+
+    #[test]
+    fn pop_next_returns_pushed_assignment() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let assignment = make_assignment("task-1");
+        inbox.push(assignment).unwrap();
+        let popped = inbox.pop_next().unwrap().unwrap();
+        assert_eq!(popped.task_id().as_str(), "task-1");
+        assert!(inbox.is_empty().unwrap());
+    }
+
+    #[test]
+    fn pop_next_returns_none_on_empty() {
+        let inbox = ExecutorAssignmentInbox::new();
+        assert!(inbox.pop_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn pop_next_fifo_order() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox.push(make_assignment("task-1")).unwrap();
+        inbox.push(make_assignment("task-2")).unwrap();
+        inbox.push(make_assignment("task-3")).unwrap();
+        assert_eq!(
+            inbox.pop_next().unwrap().unwrap().task_id().as_str(),
+            "task-1"
+        );
+        assert_eq!(
+            inbox.pop_next().unwrap().unwrap().task_id().as_str(),
+            "task-2"
+        );
+        assert_eq!(
+            inbox.pop_next().unwrap().unwrap().task_id().as_str(),
+            "task-3"
+        );
+        assert!(inbox.pop_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn cancel_task_removes_from_queue() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox.push(make_assignment("task-1")).unwrap();
+        inbox.push(make_assignment("task-2")).unwrap();
+        let task_id = TaskId::try_new("task-1").unwrap();
+        let removed = inbox.cancel_task(&task_id).unwrap();
+        assert!(removed);
+        assert_eq!(inbox.len().unwrap(), 1);
+        assert_eq!(
+            inbox.pop_next().unwrap().unwrap().task_id().as_str(),
+            "task-2"
+        );
+    }
+
+    #[test]
+    fn cancel_task_marks_as_cancelled() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let task_id = TaskId::try_new("task-1").unwrap();
+        inbox.cancel_task(&task_id).unwrap();
+        assert!(inbox.is_task_cancelled(&task_id).unwrap());
+    }
+
+    #[test]
+    fn cancel_task_not_in_queue_marks_cancelled() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let task_id = TaskId::try_new("task-1").unwrap();
+        let removed = inbox.cancel_task(&task_id).unwrap();
+        assert!(!removed);
+        assert!(inbox.is_task_cancelled(&task_id).unwrap());
+    }
+
+    #[test]
+    fn clear_cancelled_task_removes_from_cancelled_set() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let task_id = TaskId::try_new("task-1").unwrap();
+        inbox.cancel_task(&task_id).unwrap();
+        assert!(inbox.is_task_cancelled(&task_id).unwrap());
+        inbox.clear_cancelled_task(&task_id).unwrap();
+        assert!(!inbox.is_task_cancelled(&task_id).unwrap());
+    }
+
+    #[test]
+    fn assignments_returns_all() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox.push(make_assignment("task-1")).unwrap();
+        inbox.push(make_assignment("task-2")).unwrap();
+        let all = inbox.assignments().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].task_id().as_str(), "task-1");
+        assert_eq!(all[1].task_id().as_str(), "task-2");
+    }
+
+    #[test]
+    fn clone_shares_state() {
+        let inbox1 = ExecutorAssignmentInbox::new();
+        let inbox2 = inbox1.clone();
+        inbox1.push(make_assignment("task-1")).unwrap();
+        assert_eq!(inbox2.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn cancel_multiple_tasks() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox.push(make_assignment("task-1")).unwrap();
+        inbox.push(make_assignment("task-2")).unwrap();
+        inbox.push(make_assignment("task-3")).unwrap();
+        let t1 = TaskId::try_new("task-1").unwrap();
+        let t3 = TaskId::try_new("task-3").unwrap();
+        inbox.cancel_task(&t1).unwrap();
+        inbox.cancel_task(&t3).unwrap();
+        assert_eq!(inbox.len().unwrap(), 1);
+        assert_eq!(
+            inbox.pop_next().unwrap().unwrap().task_id().as_str(),
+            "task-2"
+        );
+    }
+}

@@ -39,12 +39,13 @@ impl SharedLeaseGeneration {
 }
 
 /// Type alias for the intercepted coordinator executor client.
-type InterceptedCoordinatorClient = wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
-    tonic::service::interceptor::InterceptedService<
-        Channel,
-        fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-    >,
->;
+type InterceptedCoordinatorClient =
+    wire::v1::coordinator_executor_client::CoordinatorExecutorClient<
+        tonic::service::interceptor::InterceptedService<
+            Channel,
+            fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+        >,
+    >;
 
 /// Reuses one coordinator gRPC channel across RPCs and stamps the live lease
 /// onto every outgoing executor-originated request.
@@ -98,11 +99,12 @@ impl CoordinatorGrpcPool {
             .keep_alive_while_idle(true)
             .connect()
             .await?;
-        let client = wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
-            channel,
-            krishiv_metrics::grpc::inject_trace_context
-                as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-        );
+        let client =
+            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
+                channel,
+                krishiv_metrics::grpc::inject_trace_context
+                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            );
         // Re-lock and store if still empty (another task may have connected first).
         let mut guard = self.client.lock().await;
         if let Some(existing) = guard.as_ref() {

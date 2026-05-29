@@ -346,7 +346,7 @@ mod scheduler_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_registers_executor_through_shared_coordinator() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -372,7 +372,7 @@ mod scheduler_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_applies_executor_heartbeat_to_shared_coordinator() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -435,7 +435,7 @@ mod scheduler_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_reports_stale_lease_heartbeat_as_domain_response() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -561,7 +561,7 @@ mod scheduler_tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn grpc_service_registers_and_heartbeats_over_network() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -655,7 +655,7 @@ mod scheduler_tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn grpc_deregister_transitions_executor_to_removed() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-deregister").unwrap(),
@@ -731,7 +731,7 @@ mod scheduler_tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_routes_task_status_updates() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -775,7 +775,7 @@ mod scheduler_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_reports_duplicate_task_status_as_domain_response() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -827,7 +827,7 @@ mod scheduler_tests {
         assert_eq!(duplicate.disposition(), TransportDisposition::Duplicate);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_reports_stale_task_attempt_as_domain_response() {
         let shared = SharedCoordinator::new(Coordinator::active_with_config(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -3655,14 +3655,17 @@ mod scheduler_tests {
                 key: "hot-key".into(),
                 estimated_count: 500,
                 max_error: 10,
-                heat_score: 0.25,
+                heat_score: 0.35,
                 job_id: job_id.as_str().to_owned(),
                 source_id: "src-0".into(),
             }]);
 
         let effects = coordinator.executor_heartbeat(heartbeat).unwrap();
-        // Default config: no throttle commands issued.
-        assert!(effects.source_throttles.is_empty());
+        // heat_score 0.35 >= HOT_KEY_HEAT_THRESHOLD 0.3 → throttle IS applied.
+        assert!(
+            !effects.source_throttles.is_empty(),
+            "source throttle must be issued when heat_score >= threshold"
+        );
         assert!(effects.llm_throttles.is_empty());
 
         let log = coordinator.adaptive_decision_log(&job_id);
@@ -3879,7 +3882,10 @@ mod scheduler_tests {
         let assignments = coordinator
             .launch_assigned_task_assignments(&job_id)
             .unwrap();
-        let attempt = assignments.first().map(|a| a.attempt_id().as_u32()).unwrap_or(1);
+        let attempt = assignments
+            .first()
+            .map(|a| a.attempt_id().as_u32())
+            .unwrap_or(1);
         let update = TaskStatusUpdate::new(
             job_id.clone(),
             stage_id,

@@ -2,8 +2,8 @@ use std::path::Path;
 
 use krishiv_api::{Session, StreamBatch};
 
-use crate::relation::{EmitMode, Relation, RelationKind, StreamingChain};
 use crate::Result;
+use crate::relation::{EmitMode, Relation, RelationKind, StreamingChain};
 
 /// Extension trait that adds unified batch+streaming entry points to [`Session`].
 ///

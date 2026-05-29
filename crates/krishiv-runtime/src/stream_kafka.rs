@@ -65,3 +65,186 @@ pub fn encode_stream_kafka_partition(
         records.join("|")
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::encode_stream_kafka_partition;
+
+    fn make_batch(keys: &[&str], times: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())) as _,
+                Arc::new(Int64Array::from(times.to_vec())) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_batch_with_value(keys: &[&str], times: &[i64], values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())) as _,
+                Arc::new(Int64Array::from(times.to_vec())) as _,
+                Arc::new(Int64Array::from(values.to_vec())) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn happy_path_single_row() {
+        let batch = make_batch(&["user1"], &[1000]);
+        let result =
+            encode_stream_kafka_partition("events", 0, 0, &batch, "key", "ts", None).unwrap();
+        assert!(result.starts_with("stream-kafka:events:0:0:"));
+        assert!(result.contains("key=user1"));
+        assert!(result.contains("ts=1000"));
+        assert!(result.contains("val=0"));
+    }
+
+    #[test]
+    fn happy_path_multiple_rows() {
+        let batch = make_batch(&["a", "b", "c"], &[100, 200, 300]);
+        let result =
+            encode_stream_kafka_partition("topic", 1, 10, &batch, "key", "ts", None).unwrap();
+        assert!(result.contains("|"));
+        let records: Vec<&str> = result.split('|').collect();
+        assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn with_value_column() {
+        let batch = make_batch_with_value(&["k1"], &[1000], &[42]);
+        let result =
+            encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", Some("val")).unwrap();
+        assert!(result.contains("val=42"));
+    }
+
+    #[test]
+    fn with_value_column_multiple() {
+        let batch = make_batch_with_value(&["k1", "k2"], &[1000, 2000], &[10, 20]);
+        let result =
+            encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", Some("val")).unwrap();
+        assert!(result.contains("val=10"));
+        assert!(result.contains("val=20"));
+    }
+
+    #[test]
+    fn missing_key_column_error() {
+        let batch = make_batch(&["a"], &[1000]);
+        let err = encode_stream_kafka_partition("t", 0, 0, &batch, "nonexistent", "ts", None)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("key column 'nonexistent' not found")
+        );
+    }
+
+    #[test]
+    fn missing_time_column_error() {
+        let batch = make_batch(&["a"], &[1000]);
+        let err = encode_stream_kafka_partition("t", 0, 0, &batch, "key", "nonexistent", None)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("time column 'nonexistent' not found")
+        );
+    }
+
+    #[test]
+    fn missing_value_column_error() {
+        let batch = make_batch(&["a"], &[1000]);
+        let err =
+            encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", Some("nonexistent"))
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("value column 'nonexistent' not found")
+        );
+    }
+
+    #[test]
+    fn empty_batch_error() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(Vec::<&str>::new())) as _,
+                Arc::new(Int64Array::from(Vec::<i64>::new())) as _,
+            ],
+        )
+        .unwrap();
+        let err = encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("stream-kafka encoder requires at least one row")
+        );
+    }
+
+    #[test]
+    fn format_contains_topic_partition_offset() {
+        let batch = make_batch(&["k"], &[1000]);
+        let result =
+            encode_stream_kafka_partition("my-topic", 3, 42, &batch, "key", "ts", None).unwrap();
+        assert_eq!(result, "stream-kafka:my-topic:3:42:key=k,ts=1000,val=0");
+    }
+
+    #[test]
+    fn non_int64_time_column_error() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(StringArray::from(vec!["not-a-timestamp"])) as _,
+            ],
+        )
+        .unwrap();
+        let err = encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", None).unwrap_err();
+        assert!(err.to_string().contains("must be Int64"));
+    }
+
+    #[test]
+    fn value_column_not_parseable_as_i64() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1000])) as _,
+                Arc::new(StringArray::from(vec!["not-a-number"])) as _,
+            ],
+        )
+        .unwrap();
+        let err =
+            encode_stream_kafka_partition("t", 0, 0, &batch, "key", "ts", Some("val")).unwrap_err();
+        assert!(err.to_string().contains("value column parse error"));
+    }
+}

@@ -53,4 +53,61 @@ mod tests {
         assert!(router.is_late(&state, 8_000));
         assert!(!router.is_late(&state, 9_500));
     }
+
+    #[test]
+    fn zero_threshold_exact_watermark_boundary() {
+        let mut state = WatermarkState::new(0);
+        state.advance(1000);
+        let router = SideOutputRouter::new(SideOutput::new("late", 0), "ts");
+        // event_time < watermark → late
+        assert!(router.is_late(&state, 999));
+        // event_time == watermark → not late (strict less-than)
+        assert!(!router.is_late(&state, 1000));
+        // event_time > watermark → not late
+        assert!(!router.is_late(&state, 1001));
+    }
+
+    #[test]
+    fn not_late_before_watermark_advanced() {
+        let mut state = WatermarkState::new(0);
+        state.advance(500);
+        let router = SideOutputRouter::new(SideOutput::new("late", 200), "ts");
+        // watermark=500, threshold=200 → effective threshold=300
+        // event at 400: 400 < 300? No → not late
+        assert!(!router.is_late(&state, 400));
+        // event at 200: 200 < 300? Yes → late
+        assert!(router.is_late(&state, 200));
+    }
+
+    #[test]
+    fn high_threshold_prevents_lateness() {
+        let mut state = WatermarkState::new(0);
+        state.advance(10_000);
+        // Very high threshold: 20000
+        let router = SideOutputRouter::new(SideOutput::new("late", 20_000), "ts");
+        // watermark=10000, threshold=20000 → effective = 10000 - 20000 underflow = 0 (saturating_sub)
+        assert!(!router.is_late(&state, 0));
+    }
+
+    #[test]
+    fn side_output_fields_correctly_set() {
+        let so = SideOutput::new("dlq", 5000);
+        assert_eq!(so.name, "dlq");
+        assert_eq!(so.lateness_threshold_ms, 5000);
+    }
+
+    #[test]
+    fn router_stores_event_time_column() {
+        let router = SideOutputRouter::new(SideOutput::new("late", 100), "event_ts");
+        assert_eq!(router.event_time_column, "event_ts");
+    }
+
+    #[test]
+    fn router_debug_trait() {
+        let router = SideOutputRouter::new(SideOutput::new("late", 100), "ts");
+        let dbg = format!("{:?}", router);
+        assert!(dbg.contains("SideOutputRouter"));
+        assert!(dbg.contains("late"));
+        assert!(dbg.contains("ts"));
+    }
 }

@@ -632,6 +632,8 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::fs;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn batch(rows: &[(i64, &str)]) -> RecordBatch {
@@ -738,6 +740,205 @@ mod tests {
         let dir = tempdir().unwrap();
         let writer = HudiCowWriter::open(dir.path());
         let err = writer.upsert_at("20240101120000", "missing", batch(&[(1, "a")]));
+        assert!(matches!(err, Err(LakehouseError::Io(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // HudiQueryType tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn hudi_query_type_default_is_snapshot() {
+        let qt = HudiQueryType::default();
+        assert_eq!(qt, HudiQueryType::Snapshot);
+    }
+
+    #[test]
+    fn hudi_query_type_variants_are_distinct() {
+        assert_ne!(HudiQueryType::Snapshot, HudiQueryType::Incremental);
+    }
+
+    #[test]
+    fn hudi_query_type_clone_eq() {
+        let qt = HudiQueryType::Incremental;
+        let cloned = qt;
+        assert_eq!(qt, cloned);
+    }
+
+    #[test]
+    fn hudi_query_type_debug_format() {
+        assert_eq!(format!("{:?}", HudiQueryType::Snapshot), "Snapshot");
+        assert_eq!(format!("{:?}", HudiQueryType::Incremental), "Incremental");
+    }
+
+    // ------------------------------------------------------------------
+    // HudiCowWriter Debug / constructor tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn hudi_cow_writer_debug_format() {
+        let dir = tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        let dbg = format!("{:?}", writer);
+        assert!(dbg.contains("HudiCowWriter"));
+    }
+
+    #[test]
+    fn hudi_cow_writer_open_creates_writer() {
+        let dir = tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        assert!(dir.path().exists());
+        let _ = writer;
+    }
+
+    // ------------------------------------------------------------------
+    // validate_instant tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_instant_rejects_empty() {
+        assert!(validate_instant("").is_err());
+    }
+
+    #[test]
+    fn validate_instant_rejects_special_chars() {
+        assert!(validate_instant("2024/01/01").is_err());
+        assert!(validate_instant("2024 01 01").is_err());
+        assert!(validate_instant("abc@def").is_err());
+    }
+
+    #[test]
+    fn validate_instant_accepts_valid() {
+        assert!(validate_instant("20240101120000").is_ok());
+        assert!(validate_instant("20240101_120000").is_ok());
+        assert!(validate_instant("commit-123").is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // deduplicate_by_key_last tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn deduplicate_by_key_last_keeps_last_occurrence() {
+        let batch = batch(&[(1, "first"), (2, "second"), (1, "third")]);
+        let deduped = deduplicate_by_key_last(&batch, "id").unwrap();
+        assert_eq!(deduped.num_rows(), 2);
+        let names = names(&deduped);
+        // BTreeMap iterates in key order: key 1 -> "third", key 2 -> "second"
+        assert_eq!(names, vec!["third", "second"]);
+    }
+
+    #[test]
+    fn deduplicate_by_key_last_single_row() {
+        let batch = batch(&[(42, "only")]);
+        let deduped = deduplicate_by_key_last(&batch, "id").unwrap();
+        assert_eq!(deduped.num_rows(), 1);
+        assert_eq!(names(&deduped), vec!["only"]);
+    }
+
+    #[test]
+    fn deduplicate_by_key_last_all_unique() {
+        let batch = batch(&[(1, "a"), (2, "b"), (3, "c")]);
+        let deduped = deduplicate_by_key_last(&batch, "id").unwrap();
+        assert_eq!(deduped.num_rows(), 3);
+    }
+
+    #[test]
+    fn deduplicate_by_key_last_rejects_missing_column() {
+        let batch = batch(&[(1, "a")]);
+        let err = deduplicate_by_key_last(&batch, "nonexistent");
+        assert!(matches!(err, Err(LakehouseError::Io(_))));
+    }
+
+    // ------------------------------------------------------------------
+    // HudiWriteResult tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn hudi_write_result_fields() {
+        let result = HudiWriteResult {
+            instant: "20240101120000".to_string(),
+            rows_inserted: 5,
+            rows_updated: 3,
+            snapshot_rows: 10,
+        };
+        assert_eq!(result.instant, "20240101120000");
+        assert_eq!(result.rows_inserted, 5);
+        assert_eq!(result.rows_updated, 3);
+        assert_eq!(result.snapshot_rows, 10);
+    }
+
+    #[test]
+    fn hudi_write_result_eq() {
+        let a = HudiWriteResult {
+            instant: "t".to_string(),
+            rows_inserted: 1,
+            rows_updated: 2,
+            snapshot_rows: 3,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ------------------------------------------------------------------
+    // HudiSnapshotReader not-found errors
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn hudi_snapshot_reader_missing_timeline() {
+        let dir = tempdir().unwrap();
+        let reader = HudiSnapshotReader::open(dir.path());
+        let err = reader.scan_batches();
+        assert!(matches!(err, Err(LakehouseError::NotFound { .. })));
+    }
+
+    #[test]
+    fn hudi_snapshot_reader_empty_timeline() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".hoodie/timeline")).unwrap();
+        let reader = HudiSnapshotReader::open(dir.path());
+        let batches = reader.scan_batches().unwrap();
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn hudi_incremental_requires_begin_instant() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".hoodie/timeline")).unwrap();
+        let reader =
+            HudiSnapshotReader::open(dir.path()).with_query_type(HudiQueryType::Incremental);
+        let err = reader.scan_batches();
+        assert!(matches!(err, Err(LakehouseError::Io(_))));
+    }
+
+    #[test]
+    fn hudi_cow_append_rejects_duplicate_instant() {
+        let dir = tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        writer
+            .append_at("20240101120000", batch(&[(1, "a")]))
+            .unwrap();
+        let err = writer.append_at("20240101120000", batch(&[(2, "b")]));
+        assert!(matches!(err, Err(LakehouseError::Concurrency { .. })));
+    }
+
+    #[test]
+    fn hudi_cow_upsert_rejects_null_key() {
+        let dir = tempdir().unwrap();
+        let writer = HudiCowWriter::open(dir.path());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        let err = writer.upsert_at("20240101120000", "id", batch);
         assert!(matches!(err, Err(LakehouseError::Io(_))));
     }
 }

@@ -890,7 +890,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_jobs_returns_demo_job() {
         let response = router(demo_state().unwrap())
             .oneshot(
@@ -910,7 +910,7 @@ mod tests {
         assert!(body.contains("running"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_jobs_reads_shared_runtime_state() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-runtime").unwrap(),
@@ -948,7 +948,7 @@ mod tests {
         assert!(body.contains("runtime-executor"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_job_detail_returns_stage_and_task_data() {
         let response = router(demo_state().unwrap())
             .oneshot(
@@ -969,7 +969,7 @@ mod tests {
         assert!(body.contains("exec-demo-1"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn missing_job_returns_not_found() {
         let response = router(demo_state().unwrap())
             .oneshot(
@@ -1029,7 +1029,7 @@ mod tests {
         assert!(!body.contains("krishiv_running_tasks_total"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn ui_jobs_renders_html() {
         let response = router(demo_state().unwrap())
             .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
@@ -1108,7 +1108,7 @@ mod tests {
         assert_eq!(namespaces[0]["namespace_id"], serde_json::Value::Null);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_jobs_includes_priority_and_resource_usage() {
         let response = router(demo_state().unwrap())
             .oneshot(

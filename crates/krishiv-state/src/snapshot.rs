@@ -46,11 +46,19 @@ pub fn decode_snapshot_entries(bytes: &[u8]) -> StateResult<Vec<SnapshotEntry>> 
     if bytes.len() < 12 {
         return Err(corrupt("too short"));
     }
-    let version = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(
+        bytes[0..4]
+            .try_into()
+            .map_err(|_| corrupt("failed to read version bytes"))?,
+    );
     if version != 1 {
         return Err(corrupt(&format!("unsupported snapshot version {version}")));
     }
-    let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
+    let count = u64::from_le_bytes(
+        bytes[4..12]
+            .try_into()
+            .map_err(|_| corrupt("failed to read entry count bytes"))?,
+    ) as usize;
     const MAX_ENTRIES: usize = 1_000_000;
     if count > MAX_ENTRIES {
         return Err(corrupt(&format!(

@@ -12,9 +12,9 @@ pub mod error;
 pub mod jcp_pod;
 #[cfg(feature = "k8s")]
 pub mod lease;
+pub mod pod_failure;
 #[cfg(feature = "k8s")]
 pub mod pod_manager;
-pub mod pod_failure;
 pub mod queue_manager;
 pub mod reconciler;
 pub mod status;

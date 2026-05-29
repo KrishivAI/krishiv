@@ -61,9 +61,9 @@ impl fmt::Display for StateError {
 impl std::error::Error for StateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::BackendUnavailable { source, .. } => {
-                source.as_ref().map(|e| e.as_ref() as &(dyn std::error::Error + 'static))
-            }
+            Self::BackendUnavailable { source, .. } => source
+                .as_ref()
+                .map(|e| e.as_ref() as &(dyn std::error::Error + 'static)),
             _ => None,
         }
     }

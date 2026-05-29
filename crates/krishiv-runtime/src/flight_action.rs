@@ -169,8 +169,39 @@ pub fn decode_batches(encoded: &str) -> RuntimeResult<Vec<RecordBatch>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
     use krishiv_plan::window::WindowExecutionSpec;
+
+    fn test_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 5_000])) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn round_trip_register_parquet() {
+        let action = KrishivFlightAction::RegisterParquet(RegisterParquetBody {
+            table: "events".into(),
+            path: PathBuf::from("/data/events.parquet"),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        assert_eq!(decoded, action);
+        assert_eq!(decoded.action_type(), "krishiv.v1.register_parquet");
+    }
 
     #[test]
     fn round_trip_continuous_register() {
@@ -185,6 +216,73 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_continuous_push_with_batches() {
+        let batch = test_batch();
+        let batches_b64 = encode_batches(&[batch]).unwrap();
+        let action = KrishivFlightAction::ContinuousPush(ContinuousPushBody {
+            job_id: "push-job".into(),
+            batches_b64: batches_b64.clone(),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        match decoded {
+            KrishivFlightAction::ContinuousPush(body) => {
+                assert_eq!(body.job_id, "push-job");
+                assert_eq!(body.batches_b64, batches_b64);
+                let decoded_batches = decode_batches(&body.batches_b64).unwrap();
+                assert_eq!(decoded_batches.len(), 1);
+                assert_eq!(decoded_batches[0].num_rows(), 2);
+            }
+            other => panic!("expected ContinuousPush, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_continuous_drain() {
+        let action = KrishivFlightAction::ContinuousDrain(ContinuousDrainBody {
+            job_id: "drain-job".into(),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        assert_eq!(decoded, action);
+        assert_eq!(decoded.action_type(), "krishiv.v1.continuous.drain");
+    }
+
+    #[test]
+    fn round_trip_bounded_window() {
+        let batch = test_batch();
+        let batches_b64 = encode_batches(&[batch]).unwrap();
+        let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+            topic: "events".into(),
+            spec: WindowExecutionSpec::tumbling("user_id", "ts", 5_000),
+            batches_b64: batches_b64.clone(),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        match decoded {
+            KrishivFlightAction::BoundedWindow(body) => {
+                assert_eq!(body.topic, "events");
+                assert_eq!(body.spec.window_size_ms, 5_000);
+                assert_eq!(body.batches_b64, batches_b64);
+                let decoded_batches = decode_batches(&body.batches_b64).unwrap();
+                assert_eq!(decoded_batches[0].num_rows(), 2);
+            }
+            other => panic!("expected BoundedWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_explain() {
+        let action = KrishivFlightAction::Explain(ExplainBody {
+            sql: "SELECT 1".into(),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        assert_eq!(decoded, action);
+        assert_eq!(decoded.action_type(), "krishiv.v1.explain");
+    }
+
+    #[test]
     fn action_type_prefix_is_stable() {
         let a = KrishivFlightAction::Explain(ExplainBody {
             sql: "SELECT 1".into(),
@@ -192,5 +290,363 @@ mod tests {
         assert_eq!(a.action_type(), "krishiv.v1.explain");
         assert_eq!(strip_action_type(&a.action_type()), Some("explain"));
         assert_eq!(strip_action_type("other.action"), None);
+    }
+
+    #[test]
+    fn action_types_for_all_variants() {
+        let register = KrishivFlightAction::RegisterParquet(RegisterParquetBody {
+            table: "t".into(),
+            path: PathBuf::from("/t.parquet"),
+        });
+        assert_eq!(register.action_type(), "krishiv.v1.register_parquet");
+
+        let continuous_reg = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
+            job_id: "j".into(),
+            spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
+        });
+        assert_eq!(
+            continuous_reg.action_type(),
+            "krishiv.v1.continuous.register"
+        );
+
+        let push = KrishivFlightAction::ContinuousPush(ContinuousPushBody {
+            job_id: "j".into(),
+            batches_b64: String::new(),
+        });
+        assert_eq!(push.action_type(), "krishiv.v1.continuous.push");
+
+        let drain =
+            KrishivFlightAction::ContinuousDrain(ContinuousDrainBody { job_id: "j".into() });
+        assert_eq!(drain.action_type(), "krishiv.v1.continuous.drain");
+
+        let bounded = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+            topic: "t".into(),
+            spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
+            batches_b64: String::new(),
+        });
+        assert_eq!(bounded.action_type(), "krishiv.v1.bounded_window");
+
+        let explain = KrishivFlightAction::Explain(ExplainBody {
+            sql: "SELECT 1".into(),
+        });
+        assert_eq!(explain.action_type(), "krishiv.v1.explain");
+    }
+
+    #[test]
+    fn encode_batches_empty() {
+        let encoded = encode_batches(&[]).unwrap();
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn encode_decode_batches_roundtrip() {
+        let batch = test_batch();
+        let encoded = encode_batches(&[batch]).unwrap();
+        let decoded = decode_batches(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].num_rows(), 2);
+        assert_eq!(decoded[0].num_columns(), 2);
+    }
+
+    #[test]
+    fn encode_decode_multiple_batches() {
+        let batch1 = test_batch();
+        let schema = batch1.schema();
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["c"])) as _,
+                Arc::new(Int64Array::from(vec![9_000])) as _,
+            ],
+        )
+        .unwrap();
+        let encoded = encode_batches(&[batch1, batch2]).unwrap();
+        let decoded = decode_batches(&encoded).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].num_rows(), 2);
+        assert_eq!(decoded[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn decode_empty_string_returns_empty() {
+        let decoded = decode_batches("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn from_action_body_invalid_json_fails() {
+        let err = KrishivFlightAction::from_action_body(b"not json").unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn round_trip_continuous_register_sliding_window() {
+        let spec = WindowExecutionSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 500,
+            window_kind: krishiv_plan::window::WindowKind::Sliding,
+            window_size_ms: 30_000,
+            slide_ms: Some(10_000),
+            session_gap_ms: None,
+            agg_exprs: WindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: Some(60_000),
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        };
+        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
+            job_id: "sliding-job".into(),
+            spec,
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        match decoded {
+            KrishivFlightAction::ContinuousRegister(body) => {
+                assert_eq!(
+                    body.spec.window_kind,
+                    krishiv_plan::window::WindowKind::Sliding
+                );
+                assert_eq!(body.spec.slide_ms, Some(10_000));
+                assert_eq!(body.spec.state_ttl_ms, Some(60_000));
+            }
+            other => panic!("expected ContinuousRegister, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_bounded_window_with_session_spec() {
+        let spec = WindowExecutionSpec {
+            key_column: "user_id".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: krishiv_plan::window::WindowKind::Session,
+            window_size_ms: 15_000,
+            slide_ms: None,
+            session_gap_ms: Some(5_000),
+            agg_exprs: WindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        };
+        let batch = test_batch();
+        let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+            topic: "user-events".into(),
+            spec,
+            batches_b64: encode_batches(&[batch]).unwrap(),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        match decoded {
+            KrishivFlightAction::BoundedWindow(body) => {
+                assert_eq!(body.topic, "user-events");
+                assert_eq!(
+                    body.spec.window_kind,
+                    krishiv_plan::window::WindowKind::Session
+                );
+                assert_eq!(body.spec.session_gap_ms, Some(5_000));
+            }
+            other => panic!("expected BoundedWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_batches_invalid_base64() {
+        let err = decode_batches("!!!invalid-base64!!!").unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn decode_batches_invalid_ipc_bytes() {
+        let valid_b64 = BASE64.encode(b"this is not ipc data");
+        let err = decode_batches(&valid_b64).unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn from_action_body_empty_bytes() {
+        let err = KrishivFlightAction::from_action_body(b"").unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn from_action_body_wrong_json_structure() {
+        let json = serde_json::to_vec(&serde_json::json!({"not": "a valid action"})).unwrap();
+        let err = KrishivFlightAction::from_action_body(&json).unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn encode_batches_returns_empty_string_for_empty_input() {
+        let result = encode_batches(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn encode_decode_multiple_batches_preserves_count() {
+        let b1 = test_batch();
+        let schema = b1.schema();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["x"])) as _,
+                Arc::new(Int64Array::from(vec![7_777])) as _,
+            ],
+        )
+        .unwrap();
+        let b3 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["y", "z"])) as _,
+                Arc::new(Int64Array::from(vec![100, 200])) as _,
+            ],
+        )
+        .unwrap();
+        let encoded = encode_batches(&[b1, b2, b3]).unwrap();
+        let decoded = decode_batches(&encoded).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].num_rows(), 2);
+        assert_eq!(decoded[1].num_rows(), 1);
+        assert_eq!(decoded[2].num_rows(), 2);
+    }
+
+    #[test]
+    fn action_type_prefix_constant() {
+        assert_eq!(ACTION_TYPE_PREFIX, "krishiv.v1.");
+    }
+
+    #[test]
+    fn strip_action_type_returns_none_for_unknown() {
+        assert_eq!(strip_action_type("completely.different"), None);
+        assert_eq!(strip_action_type(""), None);
+        assert_eq!(strip_action_type("krishiv.v1."), Some(""));
+        assert_eq!(strip_action_type("krishiv.v1.foo"), Some("foo"));
+    }
+
+    #[test]
+    fn action_type_returns_correct_prefix_for_all_variants() {
+        let variants = vec![
+            KrishivFlightAction::RegisterParquet(RegisterParquetBody {
+                table: "t".into(),
+                path: "/t.parquet".into(),
+            }),
+            KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
+                job_id: "j".into(),
+                spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
+            }),
+            KrishivFlightAction::ContinuousPush(ContinuousPushBody {
+                job_id: "j".into(),
+                batches_b64: String::new(),
+            }),
+            KrishivFlightAction::ContinuousDrain(ContinuousDrainBody { job_id: "j".into() }),
+            KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+                topic: "t".into(),
+                spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
+                batches_b64: String::new(),
+            }),
+            KrishivFlightAction::Explain(ExplainBody {
+                sql: "SELECT 1".into(),
+            }),
+        ];
+        for v in variants {
+            let at = v.action_type();
+            assert!(at.starts_with(ACTION_TYPE_PREFIX));
+        }
+    }
+
+    #[test]
+    fn round_trip_register_parquet_with_long_path() {
+        let action = KrishivFlightAction::RegisterParquet(RegisterParquetBody {
+            table: "events".into(),
+            path: PathBuf::from("/very/long/path/to/data/events/partition-001.parquet"),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn round_trip_continuous_drain_special_job_id() {
+        let action = KrishivFlightAction::ContinuousDrain(ContinuousDrainBody {
+            job_id: "my-job-123_v2.test".into(),
+        });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn round_trip_explain_complex_sql() {
+        let sql = "SELECT a, b, COUNT(*) as cnt FROM t1 JOIN t2 ON t1.id = t2.id GROUP BY a, b HAVING COUNT(*) > 10 ORDER BY cnt DESC LIMIT 100";
+        let action = KrishivFlightAction::Explain(ExplainBody { sql: sql.into() });
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        match decoded {
+            KrishivFlightAction::Explain(body) => assert_eq!(body.sql, sql),
+            other => panic!("expected Explain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_decode_batches_preserves_schema() {
+        let batch = test_batch();
+        let encoded = encode_batches(&[batch]).unwrap();
+        let decoded = decode_batches(&encoded).unwrap();
+        assert_eq!(decoded[0].schema().field(0).name(), "user_id");
+        assert_eq!(decoded[0].schema().field(1).name(), "ts");
+    }
+
+    #[test]
+    fn register_parquet_body_serde_round_trip() {
+        let body = RegisterParquetBody {
+            table: "my_table".into(),
+            path: PathBuf::from("/data/my_table.parquet"),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let decoded: RegisterParquetBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn continuous_push_body_serde_round_trip() {
+        let body = ContinuousPushBody {
+            job_id: "push-1".into(),
+            batches_b64: "abc123".into(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let decoded: ContinuousPushBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn continuous_drain_body_serde_round_trip() {
+        let body = ContinuousDrainBody {
+            job_id: "drain-1".into(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let decoded: ContinuousDrainBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn explain_body_serde_round_trip() {
+        let body = ExplainBody {
+            sql: "SELECT 1".into(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let decoded: ExplainBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn bounded_window_body_serde_round_trip() {
+        let body = BoundedWindowBody {
+            topic: "events".into(),
+            spec: WindowExecutionSpec::tumbling("k", "ts", 5_000),
+            batches_b64: String::new(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let decoded: BoundedWindowBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.topic, body.topic);
+        assert_eq!(decoded.spec.window_size_ms, 5_000);
     }
 }

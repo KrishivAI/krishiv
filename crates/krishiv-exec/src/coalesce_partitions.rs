@@ -89,4 +89,82 @@ mod tests {
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 4);
     }
+
+    #[test]
+    fn coalesce_empty_inputs_returns_empty() {
+        let out = coalesce_partition_batches(&[], 4).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn coalesce_single_input_returns_as_is() {
+        let inputs = vec![batch(&[1])];
+        let out = coalesce_partition_batches(&inputs, 2).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn coalesce_inputs_fewer_than_target_returns_as_is() {
+        let inputs = vec![batch(&[1]), batch(&[2])];
+        let out = coalesce_partition_batches(&inputs, 5).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_zero_target_treated_as_one() {
+        let inputs = vec![batch(&[1]), batch(&[2]), batch(&[3])];
+        let out = coalesce_partition_batches(&inputs, 0).unwrap();
+        // target becomes 1, so all 3 batches are merged into 1
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 3);
+    }
+
+    #[test]
+    fn coalesce_preserves_data_values() {
+        let inputs = vec![batch(&[10, 20]), batch(&[30, 40])];
+        let out = coalesce_partition_batches(&inputs, 1).unwrap();
+        assert_eq!(out.len(), 1);
+        let ids = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut vals: Vec<i32> = (0..ids.len()).map(|i| ids.value(i)).collect();
+        vals.sort();
+        assert_eq!(vals, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn coalesce_target_equals_input_count() {
+        let inputs = vec![batch(&[1]), batch(&[2]), batch(&[3])];
+        let out = coalesce_partition_batches(&inputs, 3).unwrap();
+        assert_eq!(out.len(), 3);
+    }
+
+    // ── CoalescePartitionsOperator tests ──────────────────────────────────────
+
+    #[test]
+    fn operator_new_clamps_to_minimum_one() {
+        let op = CoalescePartitionsOperator::new(0);
+        assert_eq!(op.target_partitions(), 1);
+    }
+
+    #[test]
+    fn operator_execute_coalesces() {
+        let op = CoalescePartitionsOperator::new(2);
+        let inputs = vec![batch(&[1]), batch(&[2]), batch(&[3])];
+        let out = op.execute(inputs).unwrap();
+        assert!(out.len() <= 2);
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn operator_debug_trait() {
+        let op = CoalescePartitionsOperator::new(4);
+        let dbg = format!("{:?}", op);
+        assert!(dbg.contains("CoalescePartitionsOperator"));
+        assert!(dbg.contains("4"));
+    }
 }

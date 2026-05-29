@@ -86,7 +86,12 @@ impl PyQueryResult {
     /// Iterate over batches.
     pub fn __iter__(slf: PyRef<'_, Self>) -> PyQueryResultIter {
         PyQueryResultIter {
-            batches: slf.inner.batches().iter().map(|b| PyBatch::from_record_batch(b.clone())).collect(),
+            batches: slf
+                .inner
+                .batches()
+                .iter()
+                .map(|b| PyBatch::from_record_batch(b.clone()))
+                .collect(),
             pos: 0,
         }
     }

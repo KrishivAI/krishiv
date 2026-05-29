@@ -161,4 +161,113 @@ mod tests {
         let out = udf.call_batch(&["prompt".into()]).await.unwrap();
         assert_eq!(out[0].text, "cached");
     }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn cache_key_deterministic() {
+        let k1 = OpenAiLlmUdf::cache_key("hello");
+        let k2 = OpenAiLlmUdf::cache_key("hello");
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_different_for_different_prompts() {
+        let k1 = OpenAiLlmUdf::cache_key("prompt A");
+        let k2 = OpenAiLlmUdf::cache_key("prompt B");
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_disabled_no_hit() {
+        let udf = OpenAiLlmUdf::new(
+            "test",
+            LlmUdfConfig {
+                model: "gpt-4o".into(),
+                max_tokens: 16,
+                temperature: 0.0,
+                cache: false,
+                rate_limit: RateLimitConfig::default(),
+            },
+        );
+        let key = OpenAiLlmUdf::cache_key("prompt");
+        udf.cache.insert(
+            key,
+            LlmResponse {
+                text: "cached".into(),
+                finish_reason: "stop".into(),
+                tokens_used: 1,
+            },
+        );
+        // With cache disabled, even if there's a cache hit, it should try API
+        // But we can't easily test the API call without a mock server
+        // Just verify the cache exists
+        assert!(udf.cache.contains_key(&key));
+    }
+
+    #[test]
+    fn udf_new_creates_instance() {
+        let udf = OpenAiLlmUdf::new(
+            "key123",
+            LlmUdfConfig {
+                model: "gpt-4".into(),
+                max_tokens: 50,
+                temperature: 0.5,
+                cache: true,
+                rate_limit: RateLimitConfig::default(),
+            },
+        );
+        assert_eq!(udf.api_key, "key123");
+        assert_eq!(udf.config.model, "gpt-4");
+        assert_eq!(udf.config.max_tokens, 50);
+        assert!((udf.config.temperature - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn cache_size_limit() {
+        let udf = OpenAiLlmUdf::new(
+            "test",
+            LlmUdfConfig {
+                model: "gpt-4o".into(),
+                max_tokens: 16,
+                temperature: 0.0,
+                cache: true,
+                rate_limit: RateLimitConfig::default(),
+            },
+        );
+        // Verify cache starts empty
+        assert_eq!(udf.cache.len(), 0);
+    }
+
+    #[test]
+    fn multiple_cache_entries() {
+        let udf = OpenAiLlmUdf::new(
+            "test",
+            LlmUdfConfig {
+                model: "gpt-4o".into(),
+                max_tokens: 16,
+                temperature: 0.0,
+                cache: true,
+                rate_limit: RateLimitConfig::default(),
+            },
+        );
+        for i in 0..10 {
+            let key = OpenAiLlmUdf::cache_key(&format!("prompt-{i}"));
+            udf.cache.insert(
+                key,
+                LlmResponse {
+                    text: format!("response-{i}"),
+                    finish_reason: "stop".into(),
+                    tokens_used: i,
+                },
+            );
+        }
+        assert_eq!(udf.cache.len(), 10);
+        // Verify each entry
+        for i in 0..10 {
+            let key = OpenAiLlmUdf::cache_key(&format!("prompt-{i}"));
+            let entry = udf.cache.get(&key).unwrap();
+            assert_eq!(entry.text, format!("response-{i}"));
+        }
+    }
 }

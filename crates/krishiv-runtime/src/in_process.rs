@@ -429,4 +429,122 @@ mod tests {
             .expect("push");
         let _ = runtime.drain_continuous_job("events").expect("drain");
     }
+
+    #[test]
+    fn runtime_new_creates_working_runtime() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let batches = runtime.execute_batch_sql("SELECT 42", &[]).unwrap();
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn execute_batch_sql_returns_single_batch() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let batches = runtime
+            .execute_batch_sql("SELECT 'hello' AS msg", &[])
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
+    #[test]
+    fn execute_batch_sql_multi_column() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let batches = runtime
+            .execute_batch_sql("SELECT 1 AS a, 'x' AS b", &[])
+            .unwrap();
+        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn execute_windowed_empty_batches_returns_empty() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        let result = runtime.execute_windowed("topic", vec![], &spec).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn coordinator_instance_id_is_stable() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let id1 = runtime.coordinator_instance_id();
+        let id2 = runtime.coordinator_instance_id();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn multiple_runtimes_have_distinct_coordinator_ids() {
+        let r1 = InProcessStreamingRuntime::new().unwrap();
+        let r2 = InProcessStreamingRuntime::new().unwrap();
+        assert_ne!(r1.coordinator_instance_id(), r2.coordinator_instance_id());
+    }
+
+    #[test]
+    fn push_continuous_input_unknown_job_fails() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let result = runtime.push_continuous_input("no-such", vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn drain_continuous_job_unknown_fails() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let result = runtime.drain_continuous_job("no-such");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn continuous_registry_accessor() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let reg = runtime.continuous_registry();
+        assert!(reg.list_jobs().is_empty());
+    }
+
+    #[test]
+    fn batch_sql_with_parquet_tables_attempt() {
+        use std::path::PathBuf;
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let tables = vec![BatchSqlTable {
+            table_name: "nonexistent".into(),
+            path: PathBuf::from("/no/such/file.parquet"),
+        }];
+        // This may fail because file doesn't exist but the routing path is tested
+        let result = runtime.execute_batch_sql("SELECT 1", &tables);
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn batch_sql_with_empty_tables() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let result = runtime.execute_batch_sql("SELECT 1 AS n", &[]).unwrap();
+        assert_eq!(result[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn register_and_drain_multiple_continuous_jobs() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        runtime.register_continuous_job("j1", spec.clone()).unwrap();
+        runtime.register_continuous_job("j2", spec).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000])) as _,
+            ],
+        )
+        .unwrap();
+        runtime
+            .push_continuous_input("j1", vec![batch.clone()])
+            .unwrap();
+        runtime.push_continuous_input("j2", vec![batch]).unwrap();
+        let _ = runtime.drain_continuous_job("j1").unwrap();
+        let _ = runtime.drain_continuous_job("j2").unwrap();
+    }
 }

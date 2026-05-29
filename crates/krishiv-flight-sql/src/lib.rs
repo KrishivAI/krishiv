@@ -1063,7 +1063,10 @@ mod tests {
             .await;
         assert!(result.is_ok(), "do_get_prepared_statement must succeed");
         let items: Vec<_> = result.unwrap().into_inner().collect().await;
-        assert!(!items.is_empty(), "must return at least a schema FlightData");
+        assert!(
+            !items.is_empty(),
+            "must return at least a schema FlightData"
+        );
         assert!(items[0].is_ok());
     }
 
@@ -1166,7 +1169,10 @@ mod tests {
         let result = svc
             .get_flight_info_prepared_statement(info_req, Request::new(descriptor))
             .await;
-        assert!(result.is_ok(), "get_flight_info_prepared_statement must succeed");
+        assert!(
+            result.is_ok(),
+            "get_flight_info_prepared_statement must succeed"
+        );
         let info = result.unwrap().into_inner();
         assert_eq!(info.endpoint.len(), 1, "must return one endpoint");
         assert!(
@@ -1321,5 +1327,238 @@ mod tests {
         // Null original values stay null.
         assert!(arr.is_null(1));
         assert_eq!(arr.value(2), "REDACTED");
+    }
+
+    // ── MaskingRule::Nullify tests ──────────────────────────────────────────
+
+    struct NullifyAllPolicy;
+
+    impl PolicyHook for NullifyAllPolicy {
+        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
+            true
+        }
+        fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> {
+            Some(MaskingRule::Nullify)
+        }
+    }
+
+    #[test]
+    fn nullify_int64_produces_all_nulls() {
+        use arrow::array::{Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            true,
+        )]));
+        let col = Arc::new(Int64Array::from(vec![Some(100i64), Some(200i64)]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        let principal = make_principal();
+        let policy = NullifyAllPolicy;
+        let result = mask_batch(&batch, &principal, "payments", &policy).unwrap();
+
+        assert_eq!(
+            result.schema().field(0).data_type(),
+            &DataType::Int64,
+            "Nullify must preserve Int64 type"
+        );
+        for i in 0..result.num_rows() {
+            assert!(result.column(0).is_null(i));
+        }
+    }
+
+    #[test]
+    fn nullify_utf8_produces_all_nulls() {
+        use arrow::array::{Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let col = Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        let principal = make_principal();
+        let policy = NullifyAllPolicy;
+        let result = mask_batch(&batch, &principal, "users", &policy).unwrap();
+
+        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
+        let arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(arr.is_null(0));
+        assert!(arr.is_null(1));
+    }
+
+    // ── MaskingRule::Hash tests ─────────────────────────────────────────────
+
+    struct HashAllPolicy;
+
+    impl PolicyHook for HashAllPolicy {
+        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
+            true
+        }
+        fn column_masking_rule(&self, _p: &Principal, _t: &str, _c: &str) -> Option<MaskingRule> {
+            Some(MaskingRule::Hash)
+        }
+    }
+
+    #[test]
+    fn hash_utf8_produces_sha256_hex() {
+        use arrow::array::{Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let col = Arc::new(StringArray::from(vec![Some("Alice"), None]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+
+        let principal = make_principal();
+        let policy = HashAllPolicy;
+        let result = mask_batch(&batch, &principal, "users", &policy).unwrap();
+
+        // Hash output is Utf8
+        assert_eq!(result.schema().field(0).data_type(), &DataType::Utf8);
+        let arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        // Non-null value is hashed
+        let hash = arr.value(0);
+        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Null stays null
+        assert!(arr.is_null(1));
+    }
+
+    // ── Selective masking tests ─────────────────────────────────────────────
+
+    struct SelectivePolicy;
+
+    impl PolicyHook for SelectivePolicy {
+        fn check_table_access(&self, _p: &Principal, _t: &str) -> bool {
+            true
+        }
+        fn column_masking_rule(
+            &self,
+            _p: &Principal,
+            _t: &str,
+            column_name: &str,
+        ) -> Option<MaskingRule> {
+            if column_name == "secret" {
+                Some(MaskingRule::Redact)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn selective_masking_only_affects_target_column() {
+        use arrow::array::{Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("secret", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1i64), Some(2i64)]))
+                    as Arc<dyn arrow::array::Array>,
+                Arc::new(StringArray::from(vec![Some("classified"), Some("public")])),
+            ],
+        )
+        .unwrap();
+
+        let principal = make_principal();
+        let policy = SelectivePolicy;
+        let result = mask_batch(&batch, &principal, "table", &policy).unwrap();
+
+        // id column is untouched
+        let id_arr = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_arr.value(0), 1);
+        assert_eq!(id_arr.value(1), 2);
+
+        // secret column is redacted
+        let secret_arr = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(secret_arr.value(0), "REDACTED");
+        assert_eq!(secret_arr.value(1), "REDACTED");
+    }
+
+    // ── Empty batch masking ─────────────────────────────────────────────────
+
+    #[test]
+    fn mask_empty_batch_returns_empty() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
+        let batch = RecordBatch::new_empty(schema);
+
+        let principal = make_principal();
+        let policy = RedactAllPolicy;
+        let result = mask_batch(&batch, &principal, "table", &policy).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    // ── Service Debug format ────────────────────────────────────────────────
+
+    #[test]
+    fn service_debug_format() {
+        let svc = KrishivFlightSqlService::new().expect("flight host");
+        let debug = format!("{:?}", svc);
+        assert!(debug.contains("KrishivFlightSqlService"));
+        assert!(debug.contains("auth: false"));
+        assert!(debug.contains("policy: false"));
+    }
+
+    #[test]
+    fn service_with_auth_debug_shows_true() {
+        let auth = Arc::new(StaticApiKeyAuthProvider::new(vec![(
+            "key".to_string(),
+            "user".to_string(),
+            Role::Reader,
+        )]));
+        let svc = KrishivFlightSqlService::new()
+            .expect("flight host")
+            .with_auth(auth);
+        let debug = format!("{:?}", svc);
+        assert!(debug.contains("auth: true"));
+    }
+
+    // ── Host tests ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_execute_empty_sql() {
+        let host = FlightExecutionHost::with_coordinator_http(None).unwrap();
+        // Empty SQL is handled by DataFusion; behavior depends on implementation.
+        // Just verify it doesn't panic.
+        let _result = host.execute_sql("").await;
+    }
+
+    #[test]
+    fn host_coordinator_http_none() {
+        let host = FlightExecutionHost::with_coordinator_http(None).unwrap();
+        assert!(host.coordinator_http_url().is_none());
+    }
+
+    #[test]
+    fn host_coordinator_http_some() {
+        let host =
+            FlightExecutionHost::with_coordinator_http(Some("http://coord:8080".into())).unwrap();
+        assert_eq!(host.coordinator_http_url(), Some("http://coord:8080"));
     }
 }

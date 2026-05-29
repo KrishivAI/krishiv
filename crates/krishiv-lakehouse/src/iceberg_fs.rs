@@ -255,4 +255,128 @@ mod tests {
         assert_eq!(rows, 5);
         assert_eq!(reopened.current_snapshot_id().await.unwrap(), Some(2));
     }
+
+    #[tokio::test]
+    async fn iceberg_fs_scan_empty_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "empty");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        let result = table.scan(&IcebergScanOptions::new()).await.unwrap();
+        assert!(result.is_empty());
+        assert_eq!(table.current_snapshot_id().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_append_empty_batches_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        table.append(vec![]).await.unwrap();
+        assert_eq!(table.current_snapshot_id().await.unwrap(), None);
+        let result = table.scan(&IcebergScanOptions::new()).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_scan_with_row_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        table
+            .append(vec![batch(vec![1, 2, 3, 4, 5])])
+            .await
+            .unwrap();
+        let result = table
+            .scan(&IcebergScanOptions::new().with_row_limit(2))
+            .await
+            .unwrap();
+        let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2);
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_scan_with_snapshot_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        table.append(vec![batch(vec![1, 2])]).await.unwrap();
+        let snap1 = table.current_snapshot_id().await.unwrap().unwrap();
+        table.append(vec![batch(vec![3, 4, 5])]).await.unwrap();
+
+        let at_snap1 = table
+            .scan(&IcebergScanOptions::new().with_snapshot(snap1))
+            .await
+            .unwrap();
+        let rows: usize = at_snap1.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2);
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_snapshot_id_increments() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        assert_eq!(table.current_snapshot_id().await.unwrap(), None);
+        table.append(vec![batch(vec![1])]).await.unwrap();
+        assert_eq!(table.current_snapshot_id().await.unwrap(), Some(1));
+        table.append(vec![batch(vec![2])]).await.unwrap();
+        assert_eq!(table.current_snapshot_id().await.unwrap(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_read_parquet_file_nonexistent_returns_empty() {
+        let path = PathBuf::from("/nonexistent/path/file.parquet");
+        let result = IcebergFsTable::read_parquet_file(&path).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_table_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("my_cat", "my_ns", "my_table");
+        let table = IcebergFsTable::new(dir.path(), table_ref.clone(), schema_version()).unwrap();
+        assert_eq!(table.table_ref(), &table_ref);
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_schema_returns_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let sv = schema_version();
+        let table = IcebergFsTable::new(dir.path(), table_ref, sv).unwrap();
+        let result = table.schema().await.unwrap();
+        assert_eq!(result.schema_id, 1);
+        assert_eq!(result.fields[0].name, "x");
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_multiple_appends_accumulate() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        for i in 0..5 {
+            table.append(vec![batch(vec![i])]).await.unwrap();
+        }
+        let result = table.scan(&IcebergScanOptions::new()).await.unwrap();
+        let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 5);
+        assert_eq!(table.current_snapshot_id().await.unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_data_files_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        table.append(vec![batch(vec![1, 2])]).await.unwrap();
+        let data_dir = dir.path().join("data");
+        let files: Vec<_> = fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        let meta_path = dir.path().join("metadata.json");
+        assert!(meta_path.exists());
+    }
 }

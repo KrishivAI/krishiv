@@ -154,4 +154,289 @@ mod tests {
         let kept = dedup.dedup_indices_unscored(&embeddings);
         assert_eq!(kept.len(), 2);
     }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn empty_embeddings() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.9,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        let kept = dedup.dedup_indices_unscored(&[]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn single_embedding() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.9,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        let embeddings = vec![vec![1.0, 2.0, 3.0]];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept, vec![0]);
+    }
+
+    #[test]
+    fn three_identical_dedup_to_one() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0], vec![1.0, 0.0]];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0], 0);
+    }
+
+    #[test]
+    fn keep_last_strategy() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepLast,
+        });
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0], 1);
+    }
+
+    #[test]
+    fn keep_highest_score_strategy() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepHighestScore,
+        });
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let scores = vec![0.5, 0.9];
+        let kept = dedup.dedup_indices(&embeddings, &scores);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0], 1); // higher score kept
+    }
+
+    #[test]
+    fn keep_highest_score_equal_scores() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepHighestScore,
+        });
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let scores = vec![0.5, 0.5];
+        let kept = dedup.dedup_indices(&embeddings, &scores);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0], 0); // first kept when scores equal
+    }
+
+    #[test]
+    fn cosine_same_vector() {
+        let sim = SemanticDedup::cosine(&[1.0, 0.0], &[1.0, 0.0]);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_orthogonal_vectors() {
+        let sim = SemanticDedup::cosine(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(sim.abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_opposite_vectors() {
+        let sim = SemanticDedup::cosine(&[1.0, 0.0], &[-1.0, 0.0]);
+        assert!((sim + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_zero_vector_returns_zero() {
+        let sim = SemanticDedup::cosine(&[0.0, 0.0], &[1.0, 0.0]);
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn cosine_both_zero_vectors() {
+        let sim = SemanticDedup::cosine(&[0.0, 0.0], &[0.0, 0.0]);
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn cosine_high_dimensional() {
+        let a: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        let sim = SemanticDedup::cosine(&a, &b);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dedup_all_orthogonal_vectors() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        let embeddings = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn dedup_with_scores_len_mismatch() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepHighestScore,
+        });
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let scores = vec![0.5]; // shorter than embeddings
+        let kept = dedup.dedup_indices(&embeddings, &scores);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn dedup_preserves_original_indices() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        let embeddings = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&0));
+        assert!(kept.contains(&1));
+    }
+
+    #[test]
+    fn dedup_strategy_debug() {
+        let s = DedupStrategy::KeepFirst;
+        let debug = format!("{:?}", s);
+        assert!(debug.contains("KeepFirst"));
+    }
+
+    #[test]
+    fn dedup_strategy_clone() {
+        let s = DedupStrategy::KeepHighestScore;
+        let c = s;
+        assert_eq!(c, DedupStrategy::KeepHighestScore);
+    }
+
+    #[test]
+    fn dedup_config_clone() {
+        let config = SemanticDedupConfig {
+            threshold: 0.85,
+            strategy: DedupStrategy::KeepLast,
+        };
+        let c = config.clone();
+        assert_eq!(c.threshold, 0.85);
+        assert_eq!(c.strategy, DedupStrategy::KeepLast);
+    }
+
+    #[test]
+    fn dedup_config_debug() {
+        let config = SemanticDedupConfig {
+            threshold: 0.5,
+            strategy: DedupStrategy::KeepFirst,
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("0.5"));
+    }
+
+    #[test]
+    fn dedup_new() {
+        let config = SemanticDedupConfig {
+            threshold: 0.9,
+            strategy: DedupStrategy::KeepFirst,
+        };
+        let dedup = SemanticDedup::new(config);
+        assert_eq!(dedup.config.threshold, 0.9);
+    }
+
+    #[test]
+    fn dedup_threshold_exactly_at_boundary() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 1.0,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        // Identical unit vectors have cosine = 1.0
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn dedup_threshold_just_below_boundary() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 1.0 + f32::EPSILON,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        // Identical vectors have cosine = 1.0, which is < 1.0 + epsilon
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn dedup_many_similar_pairs() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        let mut embeddings = Vec::new();
+        for i in 0..50 {
+            // Each vector is unique and orthogonal enough
+            let mut v = vec![0.0f32; 50];
+            v[i] = 1.0;
+            embeddings.push(v);
+        }
+        // All are orthogonal (different axes), so all should be kept
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 50);
+    }
+
+    #[test]
+    fn band_hash_deterministic() {
+        let a = SemanticDedup::band_hash(&[1.0, 2.0, 3.0]);
+        let b = SemanticDedup::band_hash(&[1.0, 2.0, 3.0]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn band_hash_different_inputs() {
+        let a = SemanticDedup::band_hash(&[1.0, 2.0]);
+        let b = SemanticDedup::band_hash(&[3.0, 4.0]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn lsh_candidates_finds_similar() {
+        let embeddings: Vec<Vec<f32>> = (0..1100).map(|i| vec![i as f32; 100]).collect();
+        let pairs = SemanticDedup::lsh_candidates(&embeddings);
+        // With 1100 embeddings (>= 1000), LSH is used
+        // Should find some candidates (at minimum, no crash)
+        assert!(!pairs.is_empty() || embeddings.len() < 1000);
+    }
+
+    #[test]
+    fn dedup_small_set_uses_brute_force() {
+        let dedup = SemanticDedup::new(SemanticDedupConfig {
+            threshold: 0.99,
+            strategy: DedupStrategy::KeepFirst,
+        });
+        // 999 embeddings (< 1000), brute force path
+        // Use orthogonal vectors so none are duplicates
+        let embeddings: Vec<Vec<f32>> = (0..999)
+            .map(|i| {
+                let mut v = vec![0.0f32; 999];
+                v[i] = 1.0;
+                v
+            })
+            .collect();
+        let kept = dedup.dedup_indices_unscored(&embeddings);
+        assert_eq!(kept.len(), 999);
+    }
 }

@@ -96,11 +96,10 @@ fn init_sliding(
     state: &dyn StateBackend,
     ns: &Namespace,
 ) -> StateResult<SlidingWindowOperator> {
-    let mut inner = SlidingWindowOperator::new(spec).map_err(|e| {
-        krishiv_state::StateError::CorruptEntry {
+    let mut inner =
+        SlidingWindowOperator::new(spec).map_err(|e| krishiv_state::StateError::CorruptEntry {
             message: e.to_string(),
-        }
-    })?;
+        })?;
     inner.restore_from_state(state, ns)?;
     Ok(inner)
 }

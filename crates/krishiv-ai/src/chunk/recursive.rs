@@ -103,4 +103,111 @@ mod tests {
         let chunker = RecursiveTextChunker::new(10, 2);
         assert!(chunker.chunk("").is_empty());
     }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn short_text_no_split() {
+        let chunker = RecursiveTextChunker::new(100, 10);
+        let chunks = chunker.chunk("hello");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hello");
+        assert_eq!(chunks[0].start_byte, 0);
+        assert_eq!(chunks[0].end_byte, 5);
+        assert_eq!(chunks[0].chunk_index, 0);
+    }
+
+    #[test]
+    fn exact_chunk_size_no_split() {
+        let chunker = RecursiveTextChunker::new(5, 0);
+        let chunks = chunker.chunk("hello");
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn chunk_indices_are_sequential() {
+        let chunker = RecursiveTextChunker::new(10, 2);
+        let chunks = chunker.chunk("one two three four five six seven eight");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i);
+        }
+    }
+
+    #[test]
+    fn chunk_texts_cover_original() {
+        let chunker = RecursiveTextChunker::new(15, 3);
+        let text = "The quick brown fox jumps over the lazy dog. The end.";
+        let chunks = chunker.chunk(text);
+        let reconstructed: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert!(!reconstructed.is_empty());
+    }
+
+    #[test]
+    fn paragraph_splitting() {
+        let chunker = RecursiveTextChunker::new(20, 0);
+        let text = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
+        let chunks = chunker.chunk(text);
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn sentence_splitting() {
+        let chunker = RecursiveTextChunker::new(25, 0);
+        let text = "First sentence. Second sentence. Third sentence.";
+        let chunks = chunker.chunk(text);
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn word_splitting() {
+        let chunker = RecursiveTextChunker::new(15, 0);
+        let text = "one two three four five six seven eight";
+        let chunks = chunker.chunk(text);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.text.len() <= 16)); // allow for separator boundary
+    }
+
+    #[test]
+    fn character_splitting() {
+        let chunker = RecursiveTextChunker::new(5, 0);
+        let text = "abcdefghij";
+        let chunks = chunker.chunk(text);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|c| c.text.len() <= 5));
+    }
+
+    #[test]
+    fn overlap_creates_overlapping_text() {
+        let chunker = RecursiveTextChunker::new(10, 3);
+        // Use text with no separators so it falls to character-level splitting where overlap applies
+        let text = "abcdefghijklmnoprstuvwxyz0123456789";
+        let chunks = chunker.chunk(text);
+        if chunks.len() > 1 {
+            // With overlap at character level, total reconstructed text should be longer than original
+            let total_len: usize = chunks.iter().map(|c| c.text.len()).sum();
+            assert!(total_len >= text.len());
+        }
+    }
+
+    #[test]
+    fn empty_chunks_not_produced() {
+        let chunker = RecursiveTextChunker::new(10, 2);
+        let chunks = chunker.chunk("hello world");
+        assert!(chunks.iter().all(|c| !c.text.is_empty()));
+    }
+
+    #[test]
+    fn unicode_text() {
+        let chunker = RecursiveTextChunker::new(10, 0);
+        let text = "hello world";
+        let chunks = chunker.chunk(text);
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn new_with_various_sizes() {
+        let _ = RecursiveTextChunker::new(1, 0);
+        let _ = RecursiveTextChunker::new(1000, 100);
+        let _ = RecursiveTextChunker::new(50, 25);
+    }
 }

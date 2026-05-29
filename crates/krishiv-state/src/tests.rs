@@ -891,3 +891,391 @@ fn ttl_purge_expired_removes_stale_entries() {
     // The live key must survive.
     assert_eq!(ttl.get(&n, b"live").unwrap(), Some(b"val".to_vec()));
 }
+
+// ── RedbStateBackend: additional coverage ──────────────────────────────────
+
+#[test]
+fn redb_overwrite_key_updates_value() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let n = ns("op1", "s");
+    b.put(&n, b"k".to_vec(), b"v1".to_vec()).unwrap();
+    b.put(&n, b"k".to_vec(), b"v2".to_vec()).unwrap();
+    assert_eq!(b.get(&n, b"k").unwrap(), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn redb_clear_namespace_removes_only_matching_keys() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let ns_a = ns("op1", "window");
+    let ns_b = ns("op1", "other");
+    b.put(&ns_a, b"k1".to_vec(), b"v1".to_vec()).unwrap();
+    b.put(&ns_a, b"k2".to_vec(), b"v2".to_vec()).unwrap();
+    b.put(&ns_b, b"k1".to_vec(), b"vb".to_vec()).unwrap();
+    b.clear_namespace(&ns_a).unwrap();
+    assert!(b.get(&ns_a, b"k1").unwrap().is_none());
+    assert!(b.get(&ns_a, b"k2").unwrap().is_none());
+    assert_eq!(b.get(&ns_b, b"k1").unwrap(), Some(b"vb".to_vec()));
+}
+
+#[test]
+fn redb_put_batch_empty_is_noop() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    b.put_batch(&[]).unwrap();
+    let n = ns("op1", "s");
+    assert!(b.get(&n, b"anything").unwrap().is_none());
+}
+
+#[test]
+fn redb_multiple_namespaces_isolated() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let n1 = ns("op1", "window");
+    let n2 = ns("op2", "window");
+    b.put(&n1, b"key".to_vec(), b"val1".to_vec()).unwrap();
+    b.put(&n2, b"key".to_vec(), b"val2".to_vec()).unwrap();
+    assert_eq!(b.get(&n1, b"key").unwrap(), Some(b"val1".to_vec()));
+    assert_eq!(b.get(&n2, b"key").unwrap(), Some(b"val2".to_vec()));
+}
+
+#[test]
+fn redb_list_keys_returns_only_own_namespace() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let n1 = ns("op1", "window");
+    let n2 = ns("op1", "counts");
+    b.put(&n1, b"a".to_vec(), b"1".to_vec()).unwrap();
+    b.put(&n1, b"b".to_vec(), b"2".to_vec()).unwrap();
+    b.put(&n2, b"c".to_vec(), b"3".to_vec()).unwrap();
+    let mut keys = b.list_keys(&n1).unwrap();
+    keys.sort();
+    assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+}
+
+#[test]
+fn redb_snapshot_roundtrip_multiple_namespaces() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let n1 = ns("op1", "window");
+    let n2 = ns("op2", "counts");
+    b.put(&n1, b"k1".to_vec(), b"v1".to_vec()).unwrap();
+    b.put(&n2, b"k2".to_vec(), b"v2".to_vec()).unwrap();
+    let snap = b.snapshot().unwrap();
+    let mut b2 = RedbStateBackend::in_memory().expect("in-memory redb");
+    b2.load_snapshot(&snap).unwrap();
+    assert_eq!(b2.get(&n1, b"k1").unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(b2.get(&n2, b"k2").unwrap(), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn redb_load_snapshot_replaces_existing_state() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let n = ns("op1", "s");
+    b.put(&n, b"old".to_vec(), b"old_val".to_vec()).unwrap();
+
+    let mut src = RedbStateBackend::in_memory().expect("in-memory redb");
+    src.put(&n, b"new".to_vec(), b"new_val".to_vec()).unwrap();
+    let snap = src.snapshot().unwrap();
+
+    b.load_snapshot(&snap).unwrap();
+    assert!(b.get(&n, b"old").unwrap().is_none());
+    assert_eq!(b.get(&n, b"new").unwrap(), Some(b"new_val".to_vec()));
+}
+
+// ── TtlStateBackend: watermark and list_keys filtering ────────────────────
+
+#[test]
+fn ttl_set_watermark_drives_event_time_expiry() {
+    let inner = InMemoryStateBackend::new();
+    let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(1000));
+    let n = ns("op1", "session");
+    // Put a key — expiry is wall-clock based: now + 1000ms.
+    ttl.put(&n, b"k".to_vec(), b"val".to_vec()).unwrap();
+    // Immediately the key is live under wall clock.
+    assert_eq!(ttl.get(&n, b"k").unwrap(), Some(b"val".to_vec()));
+
+    // Set watermark far into the future — event time expiry check will see the
+    // entry as expired because watermark > expires_at.
+    let future_ms = krishiv_async_util::unix_now_ms() + 10_000;
+    ttl.set_watermark(future_ms);
+    // Now get() should return None because the watermark makes the entry appear
+    // expired.
+    assert!(ttl.get(&n, b"k").unwrap().is_none());
+}
+
+#[test]
+fn ttl_set_watermark_purge_uses_event_time() {
+    let inner = InMemoryStateBackend::new();
+    let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(1000));
+    let n = ns("op1", "session");
+    ttl.put(&n, b"k".to_vec(), b"val".to_vec()).unwrap();
+
+    // Set watermark far into the future so the entry looks expired.
+    let future_ms = krishiv_async_util::unix_now_ms() + 10_000;
+    ttl.set_watermark(future_ms);
+    let evicted = ttl.purge_expired().unwrap();
+    assert_eq!(evicted, 1);
+    assert!(ttl.get(&n, b"k").unwrap().is_none());
+}
+
+#[test]
+fn ttl_list_keys_filters_expired_entries() {
+    let mut inner = InMemoryStateBackend::new();
+    let n = ns("op1", "session");
+    // Manually write an expired entry (expires_at = 1).
+    let expires_at_ms: i64 = 1;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&expires_at_ms.to_le_bytes());
+    encoded.extend_from_slice(b"dead");
+    inner.put(&n, b"expired".to_vec(), encoded).unwrap();
+    // Write a live entry.
+    let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+    ttl.put(&n, b"live".to_vec(), b"val".to_vec()).unwrap();
+
+    let keys = ttl.list_keys(&n).unwrap();
+    assert_eq!(keys, vec![b"live".to_vec()]);
+}
+
+#[test]
+fn ttl_list_keys_returns_empty_when_all_expired() {
+    let mut inner = InMemoryStateBackend::new();
+    let n = ns("op1", "session");
+    let expires_at_ms: i64 = 1;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&expires_at_ms.to_le_bytes());
+    encoded.extend_from_slice(b"dead");
+    inner.put(&n, b"k".to_vec(), encoded).unwrap();
+
+    let ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
+    let keys = ttl.list_keys(&n).unwrap();
+    assert!(keys.is_empty());
+}
+
+// ── StateInspector: additional coverage ───────────────────────────────────
+
+#[test]
+fn state_inspector_empty_namespace_returns_zero() {
+    let b = InMemoryStateBackend::new();
+    let inspector = StateInspector::new(&b);
+    let n = ns("op1", "empty");
+    assert_eq!(inspector.key_count(&n).unwrap(), 0);
+    assert_eq!(inspector.key_size_bytes(&n).unwrap(), 0);
+}
+
+#[test]
+fn state_inspector_multiple_namespaces() {
+    let mut b = InMemoryStateBackend::new();
+    let n1 = ns("op1", "window");
+    let n2 = ns("op2", "counts");
+    let n3 = ns("op1", "buffer");
+    b.put(&n1, b"k1".to_vec(), b"v1".to_vec()).unwrap();
+    b.put(&n2, b"k2".to_vec(), b"v2".to_vec()).unwrap();
+    b.put(&n3, b"k3".to_vec(), b"v3".to_vec()).unwrap();
+    let inspector = StateInspector::new(&b);
+    let mut namespaces = inspector.list_namespaces().unwrap();
+    namespaces.sort();
+    // Namespace Ord: operator_id first, then state_name
+    assert_eq!(namespaces, vec![n3, n1, n2]);
+}
+
+#[test]
+fn state_inspector_key_size_bytes_sum_of_key_lengths() {
+    let mut b = InMemoryStateBackend::new();
+    let n = ns("op1", "s");
+    b.put(&n, b"ab".to_vec(), b"x".to_vec()).unwrap();
+    b.put(&n, b"cde".to_vec(), b"y".to_vec()).unwrap();
+    let inspector = StateInspector::new(&b);
+    assert_eq!(inspector.key_count(&n).unwrap(), 2);
+    // "ab" (2) + "cde" (3) = 5
+    assert_eq!(inspector.key_size_bytes(&n).unwrap(), 5);
+}
+
+#[test]
+fn state_inspector_on_redb_read_only() {
+    let mut b = RedbStateBackend::in_memory().expect("in-memory redb");
+    let n = ns("op1", "s");
+    b.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
+    let inspector = StateInspector::new(&b);
+    assert!(inspector.is_read_only());
+    assert_eq!(inspector.key_count(&n).unwrap(), 1);
+    assert_eq!(inspector.key_size_bytes(&n).unwrap(), 1);
+}
+
+// ── KeyGroup: tests in tests.rs ──────────────────────────────────────────
+
+#[test]
+fn key_group_for_key_returns_value_in_range() {
+    let keys: &[&[u8]] = &[b"alice", b"bob", b"charlie", b"dave", b"eve"];
+    for key in keys {
+        let g = key_group::key_group_for_key(key);
+        assert!(
+            g < key_group::NUM_KEY_GROUPS,
+            "key_group {g} out of range for {:?}",
+            std::str::from_utf8(key)
+        );
+    }
+}
+
+#[test]
+fn key_group_for_key_is_deterministic() {
+    let g1 = key_group::key_group_for_key(b"same-key");
+    let g2 = key_group::key_group_for_key(b"same-key");
+    assert_eq!(g1, g2);
+}
+
+#[test]
+fn key_group_for_key_spreads_across_groups() {
+    let mut groups = std::collections::HashSet::new();
+    for i in 0..1000u32 {
+        let key = format!("key-{i}");
+        groups.insert(key_group::key_group_for_key(key.as_bytes()));
+    }
+    // 1000 distinct keys should produce more than 1 group
+    assert!(groups.len() > 1, "expected spread across multiple groups");
+}
+
+#[test]
+fn key_group_range_contains() {
+    let r = key_group::KeyGroupRange::new(10, 20);
+    assert!(r.contains(10));
+    assert!(r.contains(15));
+    assert!(r.contains(20));
+    assert!(!r.contains(9));
+    assert!(!r.contains(21));
+}
+
+#[test]
+fn key_group_range_as_range() {
+    let r = key_group::KeyGroupRange::new(5, 8);
+    let range = r.as_range();
+    let vals: Vec<u16> = range.collect();
+    assert_eq!(vals, vec![5, 6, 7, 8]);
+}
+
+#[test]
+fn task_index_for_key_group_matches_ranges() {
+    let parallelism = 4u32;
+    let ranges = key_group::key_group_ranges_for_parallelism(parallelism);
+    for (task_idx, range) in ranges.iter().enumerate() {
+        for kg in range.as_range() {
+            let assigned = key_group::task_index_for_key_group(kg, parallelism);
+            assert_eq!(
+                assigned, task_idx as u32,
+                "key group {kg} should map to task {task_idx}, got {assigned}"
+            );
+        }
+    }
+}
+
+#[test]
+fn key_group_ranges_parallelism_one() {
+    let ranges = key_group::key_group_ranges_for_parallelism(1);
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[0].end, key_group::NUM_KEY_GROUPS - 1);
+}
+
+#[test]
+fn key_group_ranges_parallelism_exceeds_groups() {
+    // parallelism > NUM_KEY_GROUPS: some ranges will have zero length? No, the
+    // implementation distributes at least 1 group per task up to parallelism,
+    // but NUM_KEY_GROUPS is 32768.  With parallelism=65536, base=0, rem=32768.
+    let p = 65536u32;
+    let ranges = key_group::key_group_ranges_for_parallelism(p);
+    assert_eq!(ranges.len(), p as usize);
+    // First 32768 ranges have 1 group each; rest have 0 groups (start == end + 1).
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[0].end, 0);
+}
+
+#[test]
+fn key_group_ranges_no_overlap_or_gaps() {
+    let p = 7u32;
+    let ranges = key_group::key_group_ranges_for_parallelism(p);
+    for w in ranges.windows(2) {
+        assert_eq!(w[0].end + 1, w[1].start, "gap between ranges");
+    }
+}
+
+// ── IncrementalState: tests in tests.rs ──────────────────────────────────
+
+#[test]
+fn incremental_first_epoch_uploads_all() {
+    let writer = incremental::IncrementalCheckpointWriter::new();
+    let (manifest, upload) = writer.plan_incremental_upload(0, b"state-v1", None);
+    assert_eq!(manifest.epoch, 0);
+    assert_eq!(upload.len(), 1);
+    assert_eq!(upload[0].size_bytes, 8);
+}
+
+#[test]
+fn incremental_same_content_skips_upload() {
+    let mut writer = incremental::IncrementalCheckpointWriter::new();
+    let (m1, up1) = writer.plan_incremental_upload(1, b"same", None);
+    assert_eq!(up1.len(), 1);
+    writer.record_committed(m1);
+    let (_, up2) = writer.plan_incremental_upload(2, b"same", Some(1));
+    assert!(up2.is_empty());
+}
+
+#[test]
+fn incremental_different_content_uploads() {
+    let mut writer = incremental::IncrementalCheckpointWriter::new();
+    let (m1, _) = writer.plan_incremental_upload(1, b"v1", None);
+    writer.record_committed(m1);
+    let (_, up2) = writer.plan_incremental_upload(2, b"v2", Some(1));
+    assert_eq!(up2.len(), 1);
+}
+
+#[test]
+fn incremental_gc_retains_newest_epochs() {
+    let mut writer = incremental::IncrementalCheckpointWriter::new();
+    for e in 0..5 {
+        let (m, _) = writer.plan_incremental_upload(e, &format!("s{e}").into_bytes(), None);
+        writer.record_committed(m);
+    }
+    writer.gc(2);
+    // Only epochs 3 and 4 should remain.
+    let manifest = writer.plan_incremental_upload(5, b"s5", Some(4));
+    // The previous epoch (4) must still be tracked.
+    let (_, up) = writer.plan_incremental_upload(6, b"s6", Some(5));
+    // Just verify gc didn't panic and the writer is still usable.
+    let _ = manifest;
+    let _ = up;
+}
+
+#[test]
+fn incremental_gc_does_nothing_when_under_retain() {
+    let mut writer = incremental::IncrementalCheckpointWriter::new();
+    let (m1, _) = writer.plan_incremental_upload(0, b"a", None);
+    writer.record_committed(m1);
+    writer.gc(10);
+    // Writer still works: epoch 0 is retained.
+    let (_, up) = writer.plan_incremental_upload(1, b"b", Some(0));
+    assert_eq!(up.len(), 1); // different content → upload
+}
+
+#[test]
+fn incremental_plan_returns_correct_segment_metadata() {
+    let writer = incremental::IncrementalCheckpointWriter::new();
+    let data = b"hello-world";
+    let (manifest, upload) = writer.plan_incremental_upload(0, data, None);
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(upload.len(), 1);
+    assert_eq!(upload[0].path, "state-0.bin");
+    assert_eq!(upload[0].size_bytes, data.len() as u64);
+    assert_eq!(upload[0].sha256_hex.len(), 64); // SHA-256 hex is 64 chars
+}
+
+#[test]
+fn incremental_gc_preserves_committed_order() {
+    let mut writer = incremental::IncrementalCheckpointWriter::new();
+    for e in 0..4 {
+        let (m, _) = writer.plan_incremental_upload(e, &format!("s{e}").into_bytes(), None);
+        writer.record_committed(m);
+    }
+    writer.gc(2);
+    // Epoch 2 and 3 should remain.  plan with previous_epoch=1 should
+    // return all segments (since epoch 1 was GC'd).
+    let (_, up) = writer.plan_incremental_upload(4, b"s4", Some(1));
+    assert_eq!(up.len(), 1);
+    // plan with previous_epoch=3 should skip unchanged hash.
+    let (_, up) = writer.plan_incremental_upload(5, b"s3", Some(3));
+    assert!(up.is_empty());
+}

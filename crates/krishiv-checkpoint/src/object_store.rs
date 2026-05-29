@@ -201,4 +201,213 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, b"{}");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_read_nonexistent_returns_none() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "prefix");
+        let result = storage
+            .read_bytes_async_inner("no/such/file.bin")
+            .await
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_write_overwrites_existing() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        storage
+            .write_bytes_async_inner("f.bin", b"first")
+            .await
+            .unwrap();
+        storage
+            .write_bytes_async_inner("f.bin", b"second")
+            .await
+            .unwrap();
+        let data = storage
+            .read_bytes_async_inner("f.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"second");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_empty_data_roundtrip() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        storage
+            .write_bytes_async_inner("empty.bin", b"")
+            .await
+            .unwrap();
+        let data = storage
+            .read_bytes_async_inner("empty.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_list_dir_returns_children() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        storage
+            .write_bytes_async_inner("a/file1.bin", b"1")
+            .await
+            .unwrap();
+        storage
+            .write_bytes_async_inner("a/file2.bin", b"2")
+            .await
+            .unwrap();
+        storage
+            .write_bytes_async_inner("b/file3.bin", b"3")
+            .await
+            .unwrap();
+        let mut children = storage.list_dir_async_inner("a").await.unwrap();
+        children.sort();
+        assert_eq!(children, vec!["file1.bin", "file2.bin"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_list_dir_empty_prefix() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        let children = storage.list_dir_async_inner("nonexistent").await.unwrap();
+        assert!(children.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_delete_prefix_removes_entries() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        storage
+            .write_bytes_async_inner("del/a.bin", b"1")
+            .await
+            .unwrap();
+        storage
+            .write_bytes_async_inner("del/b.bin", b"2")
+            .await
+            .unwrap();
+        storage
+            .write_bytes_async_inner("keep/c.bin", b"3")
+            .await
+            .unwrap();
+        storage.delete_prefix_async_inner("del").await.unwrap();
+        assert!(
+            storage
+                .read_bytes_async_inner("del/a.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .read_bytes_async_inner("del/b.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .read_bytes_async_inner("keep/c.bin")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_delete_prefix_nonexistent_is_noop() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        storage
+            .delete_prefix_async_inner("no/such/prefix")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_sync_trait_write_read_roundtrip() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        use crate::CheckpointStorage;
+        storage.write_bytes("sync/path.bin", b"sync-data").unwrap();
+        let data = storage.read_bytes("sync/path.bin").unwrap().unwrap();
+        assert_eq!(data, b"sync-data");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_sync_trait_list_dir() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        use crate::CheckpointStorage;
+        storage.write_bytes("dir/a.bin", b"1").unwrap();
+        storage.write_bytes("dir/b.bin", b"2").unwrap();
+        let mut children = storage.list_dir("dir").unwrap();
+        children.sort();
+        assert_eq!(children, vec!["a.bin", "b.bin"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_sync_trait_delete_prefix() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        use crate::CheckpointStorage;
+        storage.write_bytes("rm/a.bin", b"1").unwrap();
+        storage.write_bytes("rm/b.bin", b"2").unwrap();
+        storage.delete_prefix("rm").unwrap();
+        assert!(storage.read_bytes("rm/a.bin").unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_large_data_roundtrip() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let storage = ObjectStoreCheckpointStorage::new(store, "p");
+        let large = vec![42u8; 1024 * 1024]; // 1 MB
+        storage
+            .write_bytes_async_inner("large.bin", &large)
+            .await
+            .unwrap();
+        let data = storage
+            .read_bytes_async_inner("large.bin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, large);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_multiple_prefixes_independent() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let s1 = ObjectStoreCheckpointStorage::new(store.clone(), "prefix-a");
+        let s2 = ObjectStoreCheckpointStorage::new(store.clone(), "prefix-b");
+        use crate::CheckpointStorage;
+        s1.write_bytes("file.bin", b"from-a").unwrap();
+        s2.write_bytes("file.bin", b"from-b").unwrap();
+        assert_eq!(s1.read_bytes("file.bin").unwrap(), Some(b"from-a".to_vec()));
+        assert_eq!(s2.read_bytes("file.bin").unwrap(), Some(b"from-b".to_vec()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_object_path_construction() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let s = ObjectStoreCheckpointStorage::new(store, "my-prefix");
+        // Verify the object_path function handles leading slashes
+        let path = s.object_path("/leading/slash.bin");
+        assert_eq!(path.as_ref(), "my-prefix/leading/slash.bin");
+        let path2 = s.object_path("no/slash.bin");
+        assert_eq!(path2.as_ref(), "my-prefix/no/slash.bin");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_store_prefix_trimming() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let s = ObjectStoreCheckpointStorage::new(store, "//trim//");
+        use crate::CheckpointStorage;
+        s.write_bytes("t.bin", b"d").unwrap();
+        let data = s.read_bytes("t.bin").unwrap().unwrap();
+        assert_eq!(data, b"d");
+    }
 }

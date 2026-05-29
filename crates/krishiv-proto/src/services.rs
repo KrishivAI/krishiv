@@ -57,5 +57,3 @@ pub trait ExecutorTaskService: Send + Sync + 'static {
         request: tonic::Request<TaskCancellationRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status>;
 }
-
-

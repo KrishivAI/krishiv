@@ -102,4 +102,103 @@ mod tests {
         let chunks = c.chunk(md);
         assert!(!chunks.is_empty());
     }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn no_headings_single_chunk() {
+        let c = MarkdownSectionChunker::new(2, None);
+        let md = "Just plain text without any headings.";
+        let chunks = c.chunk(md);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, md);
+    }
+
+    #[test]
+    fn empty_text() {
+        let c = MarkdownSectionChunker::new(2, None);
+        let chunks = c.chunk("");
+        assert_eq!(chunks.len(), 1); // empty fallback
+    }
+
+    #[test]
+    fn heading_level_detection() {
+        assert_eq!(MarkdownSectionChunker::heading_level("# H1"), Some(1));
+        assert_eq!(MarkdownSectionChunker::heading_level("## H2"), Some(2));
+        assert_eq!(MarkdownSectionChunker::heading_level("### H3"), Some(3));
+        assert_eq!(MarkdownSectionChunker::heading_level("#### H4"), Some(4));
+        assert_eq!(MarkdownSectionChunker::heading_level("##### H5"), Some(5));
+        assert_eq!(MarkdownSectionChunker::heading_level("###### H6"), Some(6));
+    }
+
+    #[test]
+    fn not_a_heading() {
+        assert_eq!(MarkdownSectionChunker::heading_level("not a heading"), None);
+        assert_eq!(MarkdownSectionChunker::heading_level("##no_space"), None);
+        assert_eq!(MarkdownSectionChunker::heading_level("## "), None);
+        assert_eq!(MarkdownSectionChunker::heading_level(""), None);
+    }
+
+    #[test]
+    fn min_heading_level_filters() {
+        let c = MarkdownSectionChunker::new(3, None);
+        let md = "# Top\n\n## Middle\n\n### Detail";
+        let chunks = c.chunk(md);
+        // Only ### should split
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn multiple_headings() {
+        let c = MarkdownSectionChunker::new(2, None);
+        let md = "## A\n\ncontent a\n\n## B\n\ncontent b\n\n## C\n\ncontent c";
+        let chunks = c.chunk(md);
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn heading_level_clamp() {
+        let c = MarkdownSectionChunker::new(0, None);
+        assert_eq!(c.min_heading_level, 1);
+        let c2 = MarkdownSectionChunker::new(10, None);
+        assert_eq!(c2.min_heading_level, 6);
+    }
+
+    #[test]
+    fn chunk_indices_sequential() {
+        let c = MarkdownSectionChunker::new(2, None);
+        let md = "## A\n\n## B\n\n## C";
+        let chunks = c.chunk(md);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i);
+        }
+    }
+
+    #[test]
+    fn with_max_chunk_size_sub_chunks() {
+        let c = MarkdownSectionChunker::new(2, Some(20));
+        let md = "## Section\n\nThis is a long section that should be split into smaller sub-chunks by the recursive chunker.";
+        let chunks = c.chunk(md);
+        assert!(chunks.len() >= 1);
+        // All sub-chunks should respect the size limit approximately
+        for chunk in &chunks {
+            assert!(!chunk.text.is_empty());
+        }
+    }
+
+    #[test]
+    fn nested_headings() {
+        let c = MarkdownSectionChunker::new(1, None);
+        let md = "# Title\n\n## Sub1\n\n### SubSub\n\n## Sub2";
+        let chunks = c.chunk(md);
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn heading_without_content() {
+        let c = MarkdownSectionChunker::new(2, None);
+        let md = "## Empty Section\n\n## Another";
+        let chunks = c.chunk(md);
+        assert!(chunks.len() >= 1);
+    }
 }

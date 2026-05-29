@@ -356,8 +356,7 @@ impl Sink for KafkaSink {
         for row in 0..batch.num_rows() {
             let json = Self::row_to_json(&batch, row);
             let payload = json.to_string();
-            let record: FutureRecord<'_, str, str> =
-                FutureRecord::to(&topic).payload(&payload);
+            let record: FutureRecord<'_, str, str> = FutureRecord::to(&topic).payload(&payload);
             self.producer
                 .send(record, Duration::from_secs(5))
                 .await
@@ -672,10 +671,7 @@ impl Source for RdkafkaKafkaSource {
                 let consumer = self.consumer.clone();
                 let topic = self.topic.clone();
                 let partition = self.partition;
-                let next_offset = self
-                    .last_offset
-                    .map(|(_, o)| o + 1)
-                    .unwrap_or(0);
+                let next_offset = self.last_offset.map(|(_, o)| o + 1).unwrap_or(0);
 
                 let at_eof = tokio::task::spawn_blocking(move || {
                     use rdkafka::consumer::Consumer;

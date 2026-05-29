@@ -133,9 +133,10 @@ fn sql_type_to_arrow(type_str: &str) -> Result<DataType, String> {
         "TEXT" | "VARCHAR" | "STRING" | "CHARACTER VARYING" => Ok(DataType::Utf8),
         "BYTEA" | "BYTES" | "BINARY" | "BLOB" => Ok(DataType::Binary),
         "DATE" => Ok(DataType::Date32),
-        "TIMESTAMP" | "DATETIME" => {
-            Ok(DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None))
-        }
+        "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
         _ => Err(format!(
             "unsupported SQL type '{type_str}' in CREATE FUNCTION DDL"
         )),

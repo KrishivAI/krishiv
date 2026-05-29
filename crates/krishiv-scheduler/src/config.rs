@@ -60,8 +60,14 @@ impl CoordinatorConfig {
     /// Panics if `requests_per_minute` or `tokens_per_minute` is zero.
     #[must_use]
     pub fn with_llm_quota(mut self, requests_per_minute: u32, tokens_per_minute: u64) -> Self {
-        assert!(requests_per_minute > 0, "llm_quota_requests_per_minute must be > 0");
-        assert!(tokens_per_minute > 0, "llm_quota_tokens_per_minute must be > 0");
+        assert!(
+            requests_per_minute > 0,
+            "llm_quota_requests_per_minute must be > 0"
+        );
+        assert!(
+            tokens_per_minute > 0,
+            "llm_quota_tokens_per_minute must be > 0"
+        );
         self.llm_quota_requests_per_minute = requests_per_minute;
         self.llm_quota_tokens_per_minute = tokens_per_minute;
         self

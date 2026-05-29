@@ -179,9 +179,11 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
         if part.is_empty() {
             continue;
         }
-        let (k, v) = part
-            .split_once('=')
-            .ok_or_else(|| PlanError::Parse(format!("streaming fragment field must be k=v; got '{part}'")))?;
+        let (k, v) = part.split_once('=').ok_or_else(|| {
+            PlanError::Parse(format!(
+                "streaming fragment field must be k=v; got '{part}'"
+            ))
+        })?;
         match k.trim() {
             "key" => key_col = Some(v.trim().to_owned()),
             "time" => time_col = Some(v.trim().to_owned()),
@@ -200,11 +202,10 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
                 );
             }
             "slide" => {
-                slide_ms = Some(
-                    v.trim()
-                        .parse::<u64>()
-                        .map_err(|e| PlanError::Parse(format!("invalid slide value '{v}': {e}")))?,
-                );
+                slide_ms =
+                    Some(v.trim().parse::<u64>().map_err(|e| {
+                        PlanError::Parse(format!("invalid slide value '{v}': {e}"))
+                    })?);
             }
             "gap" => {
                 session_gap_ms = Some(
@@ -231,28 +232,36 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
         Some("sum") => WindowAgg {
             kind: WindowAggKind::Sum,
             input_column: agg_col.clone().ok_or_else(|| {
-                PlanError::Parse(String::from("stream fragment with agg=sum requires col=<column>"))
+                PlanError::Parse(String::from(
+                    "stream fragment with agg=sum requires col=<column>",
+                ))
             })?,
             output_column: format!("sum_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("min") => WindowAgg {
             kind: WindowAggKind::Min,
             input_column: agg_col.clone().ok_or_else(|| {
-                PlanError::Parse(String::from("stream fragment with agg=min requires col=<column>"))
+                PlanError::Parse(String::from(
+                    "stream fragment with agg=min requires col=<column>",
+                ))
             })?,
             output_column: format!("min_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("max") => WindowAgg {
             kind: WindowAggKind::Max,
             input_column: agg_col.clone().ok_or_else(|| {
-                PlanError::Parse(String::from("stream fragment with agg=max requires col=<column>"))
+                PlanError::Parse(String::from(
+                    "stream fragment with agg=max requires col=<column>",
+                ))
             })?,
             output_column: format!("max_{}", agg_col.as_deref().unwrap_or("val")),
         },
         Some("avg") => WindowAgg {
             kind: WindowAggKind::Avg,
             input_column: agg_col.clone().ok_or_else(|| {
-                PlanError::Parse(String::from("stream fragment with agg=avg requires col=<column>"))
+                PlanError::Parse(String::from(
+                    "stream fragment with agg=avg requires col=<column>",
+                ))
             })?,
             output_column: format!("avg_{}", agg_col.as_deref().unwrap_or("val")),
         },
@@ -265,9 +274,12 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
 
     Ok(ParsedStreamFragment {
         window_kind,
-        key_col: key_col.ok_or_else(|| PlanError::Parse(String::from("stream fragment missing key=<col>")))?,
-        time_col: time_col.ok_or_else(|| PlanError::Parse(String::from("stream fragment missing time=<col>")))?,
-        window_ms: window_ms.ok_or_else(|| PlanError::Parse(String::from("stream fragment missing win=<ms>")))?,
+        key_col: key_col
+            .ok_or_else(|| PlanError::Parse(String::from("stream fragment missing key=<col>")))?,
+        time_col: time_col
+            .ok_or_else(|| PlanError::Parse(String::from("stream fragment missing time=<col>")))?,
+        window_ms: window_ms
+            .ok_or_else(|| PlanError::Parse(String::from("stream fragment missing win=<ms>")))?,
         lag_ms: lag_ms.unwrap_or(0),
         slide_ms,
         session_gap_ms,

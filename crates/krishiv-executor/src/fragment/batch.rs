@@ -1,12 +1,10 @@
 //! Batch fragment execution: `execute_batch_fragment` and its helpers.
 
-use std::sync::Arc;
 #[cfg(feature = "kafka")]
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use krishiv_proto::{
-    ExecutorTaskAssignment, TaskRuntimeStats,
-};
+use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
 use krishiv_sql::SqlEngine;
@@ -17,11 +15,12 @@ use super::common::{
     write_object_parquet_sink,
 };
 use crate::runner::{
-    ExecutorTaskOutput, ExecutorTaskRunner,
-    OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
+    ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
 };
 #[cfg(feature = "kafka")]
-use crate::runner::{MEMORY_KAFKA_PARTITION_PREFIX, PARQUET_SINK_PREFIX, KAFKA_TO_PARQUET_FRAGMENT};
+use crate::runner::{
+    KAFKA_TO_PARQUET_FRAGMENT, MEMORY_KAFKA_PARTITION_PREFIX, PARQUET_SINK_PREFIX,
+};
 use crate::{ExecutorError, ExecutorResult};
 
 /// Execute a batch (terminal) stage fragment.

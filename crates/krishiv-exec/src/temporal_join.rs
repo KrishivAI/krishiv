@@ -94,4 +94,121 @@ mod tests {
         );
         assert!(state.lookup_as_of(500).is_none());
     }
+
+    #[test]
+    fn upsert_evicts_old_versions_beyond_lookback() {
+        let mut state = VersionedTableState::new(5000);
+        state.upsert_version(1000, version_batch(1));
+        state.upsert_version(2000, version_batch(2));
+        state.upsert_version(7000, version_batch(3));
+        // lookback=5000, version 7000: min_version=2000
+        // version 1000 < 2000 → evicted
+        assert!(state.lookup_as_of(1000).is_none());
+        assert!(state.lookup_as_of(2000).is_some());
+        assert!(state.lookup_as_of(7000).is_some());
+    }
+
+    #[test]
+    fn upsert_exact_lookback_boundary() {
+        let mut state = VersionedTableState::new(1000);
+        state.upsert_version(1000, version_batch(1));
+        state.upsert_version(2000, version_batch(2));
+        // min_version = 2000 - 1000 = 1000
+        // version 1000 is NOT < 1000 → not evicted
+        assert!(state.lookup_as_of(1000).is_some());
+    }
+
+    #[test]
+    fn lookup_as_of_exact_version_match() {
+        let mut state = VersionedTableState::new(10_000);
+        state.upsert_version(5000, version_batch(42));
+        assert_eq!(
+            state
+                .lookup_as_of(5000)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+    }
+
+    #[test]
+    fn lookup_as_of_between_versions_returns_previous() {
+        let mut state = VersionedTableState::new(10_000);
+        state.upsert_version(1000, version_batch(10));
+        state.upsert_version(3000, version_batch(30));
+        // query at 2000 → should return version at 1000
+        assert_eq!(
+            state
+                .lookup_as_of(2000)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    #[test]
+    fn lookup_as_of_empty_state_returns_none() {
+        let state = VersionedTableState::new(10_000);
+        assert!(state.lookup_as_of(1000).is_none());
+    }
+
+    #[test]
+    fn upsert_replaces_same_version() {
+        let mut state = VersionedTableState::new(10_000);
+        state.upsert_version(1000, version_batch(1));
+        state.upsert_version(1000, version_batch(99));
+        let val = state
+            .lookup_as_of(1000)
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(val, 99);
+    }
+
+    #[test]
+    fn large_lookback_keeps_all_versions() {
+        let mut state = VersionedTableState::new(i64::MAX as u64 as i64);
+        state.upsert_version(0, version_batch(0));
+        state.upsert_version(1000, version_batch(1));
+        state.upsert_version(100_000, version_batch(2));
+        assert!(state.lookup_as_of(0).is_some());
+        assert!(state.lookup_as_of(1000).is_some());
+        assert!(state.lookup_as_of(100_000).is_some());
+    }
+
+    #[test]
+    fn zero_lookback_evicts_all_except_latest() {
+        let mut state = VersionedTableState::new(0);
+        state.upsert_version(1000, version_batch(1));
+        state.upsert_version(2000, version_batch(2));
+        // min_version = 2000 - 0 = 2000
+        // version 1000 < 2000 → evicted
+        assert!(state.lookup_as_of(1000).is_none());
+        assert!(state.lookup_as_of(2000).is_some());
+    }
+
+    #[test]
+    fn temporal_join_spec_fields() {
+        let spec = TemporalJoinSpec {
+            stream_time_col: "event_ts".into(),
+            table_version_col: "version".into(),
+            join_keys: vec!["id".into()],
+            inner_join: true,
+        };
+        assert_eq!(spec.stream_time_col, "event_ts");
+        assert_eq!(spec.table_version_col, "version");
+        assert_eq!(spec.join_keys, vec!["id"]);
+        assert!(spec.inner_join);
+    }
 }

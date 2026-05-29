@@ -292,7 +292,9 @@ fn parse_tumbling_state_key(bytes: &[u8]) -> Option<(String, i64)> {
     let rest = &bytes[PREFIX.len()..];
     // Read 4-byte little-endian key length.
     let key_len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
-    let key = std::str::from_utf8(rest.get(4..4 + key_len)?).ok()?.to_string();
+    let key = std::str::from_utf8(rest.get(4..4 + key_len)?)
+        .ok()?
+        .to_string();
     let win_start_offset = 4 + key_len;
     let win_bytes: [u8; 8] = rest
         .get(win_start_offset..win_start_offset + 8)?

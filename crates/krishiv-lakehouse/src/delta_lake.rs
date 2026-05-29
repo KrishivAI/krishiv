@@ -434,4 +434,161 @@ mod tests {
         assert_eq!(stripped.schema().field(0).name(), "a");
         assert_eq!(stripped.schema().field(1).name(), "c");
     }
+
+    // ------------------------------------------------------------------
+    // DeltaWriteMode tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn delta_write_mode_variants_are_distinct() {
+        let a = DeltaWriteMode::Append;
+        let b = DeltaWriteMode::Overwrite;
+        let c = DeltaWriteMode::Merge;
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn delta_write_mode_clone_eq() {
+        let mode = DeltaWriteMode::Append;
+        let cloned = mode;
+        assert_eq!(mode, cloned);
+    }
+
+    #[test]
+    fn delta_write_mode_debug_format() {
+        assert_eq!(format!("{:?}", DeltaWriteMode::Append), "Append");
+        assert_eq!(format!("{:?}", DeltaWriteMode::Overwrite), "Overwrite");
+        assert_eq!(format!("{:?}", DeltaWriteMode::Merge), "Merge");
+    }
+
+    // ------------------------------------------------------------------
+    // DeltaTableHandle tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn delta_table_handle_accessors() {
+        let handle = DeltaTableHandle {
+            path: "/data/my_table".to_string(),
+            version: Some(7),
+        };
+        assert_eq!(handle.path(), "/data/my_table");
+        assert_eq!(handle.version(), Some(7));
+    }
+
+    #[test]
+    fn delta_table_handle_none_version() {
+        let handle = DeltaTableHandle {
+            path: "/tmp/tbl".to_string(),
+            version: None,
+        };
+        assert_eq!(handle.version(), None);
+    }
+
+    #[test]
+    fn delta_table_handle_clone() {
+        let handle = DeltaTableHandle {
+            path: "/data/t".to_string(),
+            version: Some(3),
+        };
+        let cloned = handle.clone();
+        assert_eq!(cloned.path(), "/data/t");
+        assert_eq!(cloned.version(), Some(3));
+    }
+
+    #[test]
+    fn merge_delta_result_default() {
+        let r = MergeDeltaResult::default();
+        assert_eq!(r.rows_inserted, 0);
+        assert_eq!(r.rows_updated, 0);
+        assert_eq!(r.rows_deleted, 0);
+    }
+
+    #[test]
+    fn merge_delta_result_eq() {
+        let a = MergeDeltaResult {
+            rows_inserted: 1,
+            rows_updated: 2,
+            rows_deleted: 3,
+        };
+        let b = MergeDeltaResult {
+            rows_inserted: 1,
+            rows_updated: 2,
+            rows_deleted: 3,
+        };
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn write_delta_empty_batches_is_noop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_delta(&path, vec![], DeltaWriteMode::Append, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delta_write_mode_overwrite_replaces_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let batch1 = sample_batch(&[1, 2, 3], &["a", "b", "c"]);
+        write_delta(&path, vec![batch1], DeltaWriteMode::Overwrite, false)
+            .await
+            .unwrap();
+        let batch2 = sample_batch(&[10], &["x"]);
+        write_delta(&path, vec![batch2], DeltaWriteMode::Overwrite, false)
+            .await
+            .unwrap();
+        let handle = DeltaTableHandle::open(&path, None).await.unwrap();
+        let read = handle.scan_batches().await.unwrap();
+        let rows: usize = read.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn delta_write_mode_append_adds_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_delta(
+            &path,
+            vec![sample_batch(&[1], &["a"])],
+            DeltaWriteMode::Append,
+            false,
+        )
+        .await
+        .unwrap();
+        write_delta(
+            &path,
+            vec![sample_batch(&[2], &["b"])],
+            DeltaWriteMode::Append,
+            false,
+        )
+        .await
+        .unwrap();
+        let handle = DeltaTableHandle::open(&path, None).await.unwrap();
+        let read = handle.scan_batches().await.unwrap();
+        let rows: usize = read.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2);
+    }
+
+    #[tokio::test]
+    async fn delta_table_handle_with_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_delta(
+            &path,
+            vec![sample_batch(&[1, 2], &["a", "b"])],
+            DeltaWriteMode::Overwrite,
+            false,
+        )
+        .await
+        .unwrap();
+        let handle = DeltaTableHandle::open(&path, None).await.unwrap();
+        let v0 = handle.clone();
+        let v1 = handle.with_version(0).await.unwrap();
+        assert_eq!(v1.version(), Some(0));
+        assert_eq!(v1.path(), v0.path());
+    }
 }

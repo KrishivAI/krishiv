@@ -53,3 +53,92 @@ impl From<String> for ExecutorError {
         Self::LocalExecution { message }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_display_invalid_executor_id() {
+        let err = ExecutorError::InvalidExecutorId {
+            message: "bad id".into(),
+        };
+        assert_eq!(err.to_string(), "invalid executor id: bad id");
+    }
+
+    #[test]
+    fn error_display_invalid_slots() {
+        let err = ExecutorError::InvalidSlots;
+        assert_eq!(err.to_string(), "task slots must be greater than zero");
+    }
+
+    #[test]
+    fn error_display_empty_coordinator_endpoint() {
+        let err = ExecutorError::EmptyCoordinatorEndpoint;
+        assert_eq!(err.to_string(), "coordinator endpoint cannot be empty");
+    }
+
+    #[test]
+    fn error_display_assignment_inbox_poisoned() {
+        let err = ExecutorError::AssignmentInboxPoisoned;
+        assert_eq!(err.to_string(), "executor assignment inbox is poisoned");
+    }
+
+    #[test]
+    fn error_display_invalid_assignment() {
+        let err = ExecutorError::InvalidAssignment {
+            message: "bad task".into(),
+        };
+        assert_eq!(err.to_string(), "invalid task assignment: bad task");
+    }
+
+    #[test]
+    fn error_display_local_execution() {
+        let err = ExecutorError::LocalExecution {
+            message: "query failed".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "local stage fragment execution failed: query failed"
+        );
+    }
+
+    #[test]
+    fn error_display_streaming_not_implemented() {
+        let err = ExecutorError::StreamingNotImplemented;
+        assert!(err.to_string().contains("streaming task runner"));
+        assert!(err.to_string().contains("R5"));
+    }
+
+    #[test]
+    fn error_is_std_error() {
+        let err: Box<dyn Error> = Box::new(ExecutorError::InvalidSlots);
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn error_from_string() {
+        let err: ExecutorError = "something failed".to_string().into();
+        assert!(matches!(err, ExecutorError::LocalExecution { .. }));
+        assert_eq!(
+            err.to_string(),
+            "local stage fragment execution failed: something failed"
+        );
+    }
+
+    #[test]
+    fn error_clone() {
+        let err = ExecutorError::InvalidAssignment {
+            message: "test".into(),
+        };
+        let cloned = err.clone();
+        assert_eq!(err, cloned);
+    }
+
+    #[test]
+    fn error_debug_format() {
+        let err = ExecutorError::InvalidSlots;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("InvalidSlots"));
+    }
+}

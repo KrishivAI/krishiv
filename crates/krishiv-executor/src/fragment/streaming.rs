@@ -7,9 +7,7 @@ use krishiv_exec::ContinuousWindowExecutor;
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_exec::execute_bounded_window;
-use krishiv_plan::window::{
-    WindowAggKind, WindowExecutionSpec, WindowKind, parse_stream_fragment,
-};
+use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, WindowKind, parse_stream_fragment};
 use krishiv_proto::ExecutorTaskAssignment;
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
@@ -203,34 +201,39 @@ fn execute_loop_fragment(
     }
 
     // Fetch or create the stateful executor for this job.
-    let executor_entry = runner.loop_executors.entry(job_id.to_owned()).or_try_insert_with(|| {
-        let parsed = parse_stream_fragment(window_spec_str).map_err(|e| {
-            ExecutorError::InvalidAssignment {
-                message: format!("stream:loop invalid window spec '{window_spec_str}': {e}"),
-            }
+    let executor_entry = runner
+        .loop_executors
+        .entry(job_id.to_owned())
+        .or_try_insert_with(|| {
+            let parsed = parse_stream_fragment(window_spec_str).map_err(|e| {
+                ExecutorError::InvalidAssignment {
+                    message: format!("stream:loop invalid window spec '{window_spec_str}': {e}"),
+                }
+            })?;
+            let mut plan_spec = parsed_to_plan_spec(parsed);
+            // Normalise column names for Kafka-style data (same as bounded path).
+            plan_spec.key_column = String::from("key");
+            plan_spec.event_time_column = String::from("ts");
+            let exec = ContinuousWindowExecutor::new(plan_spec).map_err(|e| {
+                ExecutorError::InvalidAssignment {
+                    message: format!("stream:loop failed to create window executor: {e}"),
+                }
+            })?;
+            Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
         })?;
-        let mut plan_spec = parsed_to_plan_spec(parsed);
-        // Normalise column names for Kafka-style data (same as bounded path).
-        plan_spec.key_column = String::from("key");
-        plan_spec.event_time_column = String::from("ts");
-        let exec = ContinuousWindowExecutor::new(plan_spec).map_err(|e| {
-            ExecutorError::InvalidAssignment {
-                message: format!("stream:loop failed to create window executor: {e}"),
-            }
-        })?;
-        Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
-    })?;
     let executor_arc = executor_entry.value().clone();
     drop(executor_entry); // release dashmap lock
 
     // Get new input batches from the drainer.
-    let drainer = runner.continuous_drainer.as_ref().ok_or_else(|| {
-        ExecutorError::InvalidAssignment {
-            message: String::from(
-                "stream:loop fragment requires a continuous_drainer on the executor runner",
-            ),
-        }
-    })?;
+    let drainer =
+        runner
+            .continuous_drainer
+            .as_ref()
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: String::from(
+                    "stream:loop fragment requires a continuous_drainer on the executor runner",
+                ),
+            })?;
     let input_batches = drainer
         .drain_job(job_id)
         .map_err(|message| ExecutorError::LocalExecution { message })?;
@@ -305,8 +308,9 @@ pub(crate) async fn execute_streaming_fragment(
         ));
     }
 
-    let parsed = parse_stream_fragment(fragment)
-        .map_err(|e| ExecutorError::InvalidAssignment { message: e.to_string() })?;
+    let parsed = parse_stream_fragment(fragment).map_err(|e| ExecutorError::InvalidAssignment {
+        message: e.to_string(),
+    })?;
     let mut plan_spec = parsed_to_plan_spec(parsed);
 
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
@@ -367,10 +371,7 @@ fn compute_input_watermark(
 
     let mut max_ts: Option<i64> = None;
     for batch in batches {
-        let col_idx = batch
-            .schema()
-            .index_of(&spec.event_time_column)
-            .ok()?;
+        let col_idx = batch.schema().index_of(&spec.event_time_column).ok()?;
         let col = batch
             .column(col_idx)
             .as_any()

@@ -128,7 +128,9 @@ impl HashPartitioner {
             }
             other => {
                 return Err(ShuffleError::TypeMismatch {
-                    expected: format!("supported partition key type (Int32, Int64, Utf8, Utf8View, LargeUtf8), got {other}"),
+                    expected: format!(
+                        "supported partition key type (Int32, Int64, Utf8, Utf8View, LargeUtf8), got {other}"
+                    ),
                 });
             }
         }

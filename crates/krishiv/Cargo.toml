@@ -58,5 +58,7 @@ parquet = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }
+krishiv-runtime = { path = "../krishiv-runtime" }
+krishiv-udf = { path = "../krishiv-udf" }
 parquet = { workspace = true }
 tempfile = { workspace = true }

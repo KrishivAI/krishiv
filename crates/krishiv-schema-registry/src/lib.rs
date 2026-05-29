@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 //! Confluent Schema Registry deserialization for Kafka payloads (R18 S3.3).
 
+extern crate alloc;
+
 use std::sync::Arc;
 
 use apache_avro::Reader;
 use apache_avro::types::Value;
-use arrow::array::{ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    StringArray,
+};
 use arrow::datatypes::SchemaRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -123,7 +128,10 @@ impl KafkaDeserializer for AvroDeserializer {
                 "expected Confluent magic byte 0".into(),
             ));
         }
-        let schema_id = u32::from_be_bytes(payload[1..5].try_into().unwrap());
+        let schema_id_bytes: [u8; 4] = payload[1..5]
+            .try_into()
+            .map_err(|_| SchemaRegistryError::Decode("failed to read schema id bytes".into()))?;
+        let schema_id = u32::from_be_bytes(schema_id_bytes);
         let schema_str = self.client.fetch_schema(schema_id).await?;
         let avro_schema = apache_avro::Schema::parse_str(&schema_str)
             .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
@@ -167,18 +175,294 @@ impl KafkaDeserializer for JsonSchemaDeserializer {
     }
 }
 
-pub struct ProtobufDeserializer;
+/// Protobuf deserializer using Confluent wire format.
+///
+/// Decodes protobuf-encoded Kafka payloads using the Confluent wire format:
+/// `[magic byte 0x00][4-byte BE schema id][protobuf payload]`.
+///
+/// The schema is fetched from the Confluent Schema Registry and used to
+/// decode the protobuf wire format into Arrow `RecordBatch` columns.
+pub struct ProtobufDeserializer {
+    client: SchemaRegistryClient,
+}
+
+impl ProtobufDeserializer {
+    pub fn new(config: &SchemaRegistryConfig) -> Self {
+        Self {
+            client: SchemaRegistryClient::new(config.url.clone()),
+        }
+    }
+}
 
 #[async_trait]
 impl KafkaDeserializer for ProtobufDeserializer {
-    async fn decode(&self, _payload: &[u8]) -> SchemaRegistryResult<(SchemaRef, Vec<RecordBatch>)> {
-        Err(SchemaRegistryError::Decode(
-            "Protobuf deserialization is not yet implemented; use Avro or JSON format".into(),
-        ))
+    async fn decode(&self, payload: &[u8]) -> SchemaRegistryResult<(SchemaRef, Vec<RecordBatch>)> {
+        if payload.len() < 5 || payload[0] != 0 {
+            return Err(SchemaRegistryError::Decode(
+                "expected Confluent magic byte 0".into(),
+            ));
+        }
+        let schema_id_bytes: [u8; 4] = payload[1..5]
+            .try_into()
+            .map_err(|_| SchemaRegistryError::Decode("failed to read schema id bytes".into()))?;
+        let schema_id = u32::from_be_bytes(schema_id_bytes);
+        let schema_str = self.client.fetch_schema(schema_id).await?;
+
+        let proto_schema = parse_proto_schema(&schema_str)?;
+        let arrow_schema = proto_fields_to_arrow_schema(&proto_schema);
+        let records = decode_protobuf_wire(&payload[5..], &proto_schema)?;
+        let batches = proto_records_to_batches(&records, &arrow_schema)?;
+
+        Ok((arrow_schema, batches))
     }
 
     fn arrow_schema(&self) -> SchemaRef {
         payload_schema()
+    }
+}
+
+/// A parsed protobuf field definition.
+#[derive(Debug, Clone)]
+struct ProtoField {
+    name: String,
+    wire_type: u8,
+    field_number: u32,
+}
+
+/// Parse a minimal protobuf schema definition from JSON or simple text format.
+///
+/// Accepts JSON format: `[{"name":"field","wire_type":2,"field_number":1}, ...]`
+/// where wire_type maps to protobuf wire types: 0=varint, 1=64-bit, 2=length-delimited.
+fn parse_proto_schema(schema_str: &str) -> SchemaRegistryResult<Vec<ProtoField>> {
+    let trimmed = schema_str.trim();
+    if trimmed.starts_with('[') {
+        let fields: Vec<ProtoFieldJson> = serde_json::from_str(trimmed).map_err(|e| {
+            SchemaRegistryError::Decode(format!("invalid protobuf schema JSON: {e}"))
+        })?;
+        return Ok(fields
+            .into_iter()
+            .map(|f| ProtoField {
+                name: f.name,
+                wire_type: f.wire_type,
+                field_number: f.field_number,
+            })
+            .collect());
+    }
+    Ok(vec![])
+}
+
+#[derive(serde::Deserialize)]
+struct ProtoFieldJson {
+    name: String,
+    wire_type: u8,
+    field_number: u32,
+}
+
+/// Map protobuf field definitions to Arrow schema.
+fn proto_fields_to_arrow_schema(fields: &[ProtoField]) -> SchemaRef {
+    let arrow_fields: Vec<Field> = fields
+        .iter()
+        .map(|f| {
+            let dt = match f.wire_type {
+                0 => DataType::Int64,
+                1 => DataType::Float64,
+                2 => DataType::Utf8,
+                _ => DataType::Binary,
+            };
+            Field::new(&f.name, dt, true)
+        })
+        .collect();
+    Arc::new(Schema::new(arrow_fields))
+}
+
+/// Decode protobuf wire format (field-tag + value pairs) into a Vec of rows.
+fn decode_protobuf_wire(
+    data: &[u8],
+    fields: &[ProtoField],
+) -> SchemaRegistryResult<Vec<Vec<ProtoValue>>> {
+    let mut rows: Vec<Vec<ProtoValue>> = Vec::new();
+    let current_row: Vec<ProtoValue> = vec![ProtoValue::Null; fields.len()];
+    let mut pos = 0;
+
+    let field_map: std::collections::HashMap<u32, usize> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.field_number, i))
+        .collect();
+
+    while pos < data.len() {
+        let (tag, new_pos) = read_varint(data, pos)?;
+        let field_number = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+
+        match wire_type {
+            0 => {
+                let (value, next) = read_varint(data, new_pos)?;
+                if let Some(&idx) = field_map.get(&field_number) {
+                    if rows.is_empty() || current_row.iter().all(|v| matches!(v, ProtoValue::Null))
+                    {
+                        rows.push(current_row.clone());
+                    }
+                    rows.last_mut().unwrap()[idx] = ProtoValue::Int64(value as i64);
+                }
+                pos = next;
+            }
+            1 => {
+                if new_pos + 8 > data.len() {
+                    break;
+                }
+                let bytes: [u8; 8] = data[new_pos..new_pos + 8].try_into().map_err(|_| {
+                    SchemaRegistryError::Decode("failed to read 64-bit value".into())
+                })?;
+                let value = f64::from_le_bytes(bytes);
+                if let Some(&idx) = field_map.get(&field_number) {
+                    if rows.is_empty() || current_row.iter().all(|v| matches!(v, ProtoValue::Null))
+                    {
+                        rows.push(current_row.clone());
+                    }
+                    rows.last_mut().unwrap()[idx] = ProtoValue::Float64(value);
+                }
+                pos = new_pos + 8;
+            }
+            2 => {
+                let (len, next) = read_varint(data, new_pos)?;
+                let len = len as usize;
+                if next + len > data.len() {
+                    break;
+                }
+                let bytes = &data[next..next + len];
+                if let Some(&idx) = field_map.get(&field_number) {
+                    let text = String::from_utf8_lossy(bytes).to_string();
+                    if rows.is_empty() || current_row.iter().all(|v| matches!(v, ProtoValue::Null))
+                    {
+                        rows.push(current_row.clone());
+                    }
+                    rows.last_mut().unwrap()[idx] = ProtoValue::String(text);
+                }
+                pos = next + len;
+            }
+            _ => break,
+        }
+    }
+
+    if rows.is_empty() && !fields.is_empty() {
+        rows.push(current_row);
+    }
+
+    Ok(rows)
+}
+
+/// Protobuf wire format values.
+#[derive(Debug, Clone)]
+enum ProtoValue {
+    Null,
+    Int64(i64),
+    Float64(f64),
+    String(String),
+}
+
+/// Read a varint from protobuf wire format.
+fn read_varint(data: &[u8], pos: usize) -> SchemaRegistryResult<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    let mut i = pos;
+    loop {
+        if i >= data.len() {
+            return Err(SchemaRegistryError::Decode(
+                "truncated varint in protobuf wire format".into(),
+            ));
+        }
+        let byte = data[i];
+        result |= ((byte & 0x7F) as u64) << shift;
+        i += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(SchemaRegistryError::Decode(
+                "varint exceeds 64-bit range".into(),
+            ));
+        }
+    }
+    Ok((result, i))
+}
+
+/// Convert decoded protobuf rows into Arrow RecordBatches.
+fn proto_records_to_batches(
+    rows: &[Vec<ProtoValue>],
+    arrow_schema: &Schema,
+) -> SchemaRegistryResult<Vec<RecordBatch>> {
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+    let num_fields = arrow_schema.fields().len();
+    let mut columns: Vec<Vec<&ProtoValue>> = (0..num_fields)
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
+
+    for row in rows {
+        for (i, val) in row.iter().enumerate() {
+            if i < num_fields {
+                columns[i].push(val);
+            }
+        }
+    }
+
+    let arrays: Vec<ArrayRef> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, vals)| proto_values_to_column(vals, arrow_schema.field(i).data_type()))
+        .collect();
+
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), arrays)
+        .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
+
+    Ok(vec![batch])
+}
+
+/// Convert protobuf values into an Arrow column array.
+fn proto_values_to_column(values: &[&ProtoValue], data_type: &DataType) -> ArrayRef {
+    match data_type {
+        DataType::Int64 => {
+            let arr: Int64Array = values
+                .iter()
+                .map(|v| match v {
+                    ProtoValue::Int64(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::Float64 => {
+            let arr: Float64Array = values
+                .iter()
+                .map(|v| match v {
+                    ProtoValue::Float64(f) => Some(*f),
+                    ProtoValue::Int64(i) => Some(*i as f64),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        _ => {
+            let arr: StringArray = values
+                .iter()
+                .map(|v| match v {
+                    ProtoValue::String(s) => Some(s.as_str()),
+                    ProtoValue::Int64(i) => {
+                        let s = format!("{i}");
+                        Some(Box::leak(s.into_boxed_str()) as &str)
+                    }
+                    ProtoValue::Float64(f) => {
+                        let s = format!("{f}");
+                        Some(Box::leak(s.into_boxed_str()) as &str)
+                    }
+                    ProtoValue::Null => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
     }
 }
 
@@ -388,7 +672,7 @@ fn avro_values_to_column(values: &[&Value], data_type: &DataType) -> ArrayRef {
 pub fn deserializer_for(config: &SchemaRegistryConfig) -> Arc<dyn KafkaDeserializer> {
     match config.format {
         RegistryFormat::Avro => Arc::new(AvroDeserializer::new(config)),
-        RegistryFormat::Protobuf => Arc::new(ProtobufDeserializer),
+        RegistryFormat::Protobuf => Arc::new(ProtobufDeserializer::new(config)),
         RegistryFormat::Json => Arc::new(JsonSchemaDeserializer),
     }
 }

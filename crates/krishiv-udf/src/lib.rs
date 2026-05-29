@@ -78,7 +78,7 @@ pub trait ScalarUdf: Send + Sync + fmt::Debug {
 // ---------------------------------------------------------------------------
 
 /// Opaque serialised accumulator state owned by an aggregate UDF.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AggState {
     /// Raw bytes in a UDF-defined format.
     pub data: Vec<u8>,
@@ -286,7 +286,7 @@ impl ScalarUdf for MultiplyScalarUdf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -594,18 +594,14 @@ mod tests {
         // -----------------------------------------------------------------
         // Finalise the merged state (distributed path result).
         // -----------------------------------------------------------------
-        let distributed_result = udf
-            .finalize(merged_state)
-            .expect("finalize merged state");
+        let distributed_result = udf.finalize(merged_state).expect("finalize merged state");
 
         // -----------------------------------------------------------------
         // Reference path: accumulate all rows in a single pass.
         // -----------------------------------------------------------------
         let all_values = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![
-                1_i64, 2, 3, 4, 5, 6, 7,
-            ]))],
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6, 7]))],
         )
         .expect("valid all-values batch");
 
@@ -717,20 +713,20 @@ mod tests {
         //   p3 : [400, 500, 600] -> 1500
         //   total             -> 2100
         let make_batch = |vals: Vec<i64>| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(vals))],
-            )
-            .expect("valid batch")
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vals))])
+                .expect("valid batch")
         };
 
         let mut s1 = AggState::default();
         let mut s2 = AggState::default();
         let mut s3 = AggState::default();
 
-        udf.accumulate(&mut s1, &make_batch(vec![100])).expect("acc p1");
-        udf.accumulate(&mut s2, &make_batch(vec![200, 300])).expect("acc p2");
-        udf.accumulate(&mut s3, &make_batch(vec![400, 500, 600])).expect("acc p3");
+        udf.accumulate(&mut s1, &make_batch(vec![100]))
+            .expect("acc p1");
+        udf.accumulate(&mut s2, &make_batch(vec![200, 300]))
+            .expect("acc p2");
+        udf.accumulate(&mut s3, &make_batch(vec![400, 500, 600]))
+            .expect("acc p3");
 
         // Merge left-to-right: ((s1 merge s2) merge s3)
         let m12 = udf.merge(s1, s2).expect("merge s1+s2");
@@ -742,5 +738,457 @@ mod tests {
             matches!(result, ScalarValue::Int64(2100)),
             "three-partition merge must yield 2100, got {result:?}",
         );
+    }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn multiply_scalar_negative_factor() {
+        let udf = MultiplyScalarUdf::new("neg", "x", -3);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let array = Int64Array::from(vec![2_i64, -5, 0]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), -6);
+        assert_eq!(arr.value(1), 15);
+        assert_eq!(arr.value(2), 0);
+    }
+
+    #[test]
+    fn multiply_scalar_zero_factor() {
+        let udf = MultiplyScalarUdf::new("zero", "x", 0);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let array = Int64Array::from(vec![100_i64, 200]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), 0);
+        assert_eq!(arr.value(1), 0);
+    }
+
+    #[test]
+    fn multiply_scalar_one_factor() {
+        let udf = MultiplyScalarUdf::new("id", "x", 1);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let array = Int64Array::from(vec![42_i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), 42);
+    }
+
+    #[test]
+    fn multiply_scalar_large_values() {
+        let udf = MultiplyScalarUdf::new("large", "x", 2);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let array = Int64Array::from(vec![i64::MAX / 2, i64::MIN / 2]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), i64::MAX / 2 * 2);
+        assert_eq!(arr.value(1), i64::MIN / 2 * 2);
+    }
+
+    #[test]
+    fn multiply_scalar_empty_batch() {
+        let udf = MultiplyScalarUdf::new("empty", "x", 5);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let array = Int64Array::from(Vec::<i64>::new());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn multiply_scalar_column_not_found() {
+        let udf = MultiplyScalarUdf::new("m", "missing_col", 1);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Int64,
+            true,
+        )]));
+        let array = Int64Array::from(vec![1_i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let err = udf.call(&batch).unwrap_err();
+        assert!(matches!(err, UdfError::InvalidArgument { .. }));
+        assert!(err.to_string().contains("missing_col"));
+    }
+
+    #[test]
+    fn multiply_scalar_wrong_type_column() {
+        let udf = MultiplyScalarUdf::new("m", "x", 1);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)]));
+        let array = arrow::array::StringArray::from(vec!["hello"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let err = udf.call(&batch).unwrap_err();
+        assert!(matches!(err, UdfError::InvalidArgument { .. }));
+        assert!(err.to_string().contains("not Int64"));
+    }
+
+    #[test]
+    fn multiply_scalar_null_values() {
+        let udf = MultiplyScalarUdf::new("m", "x", 10);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let mut builder = arrow::array::Int64Builder::new();
+        builder.append_value(5);
+        builder.append_null();
+        builder.append_value(3);
+        let array = builder.finish();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), 50);
+        assert!(arr.is_null(1));
+        assert_eq!(arr.value(2), 30);
+    }
+
+    #[test]
+    fn multiply_scalar_output_schema() {
+        let udf = MultiplyScalarUdf::new("m", "input", 2);
+        assert_eq!(udf.output_field().name(), "result");
+        assert_eq!(udf.output_field().data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn multiply_scalar_input_schema() {
+        let udf = MultiplyScalarUdf::new("m", "my_col", 1);
+        let schema = udf.input_schema();
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "my_col");
+    }
+
+    #[test]
+    fn udf_registry_scalar_override() {
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("f", "x", 2)));
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("f", "x", 3)));
+        let udf = registry.get_scalar("f").unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let array = Int64Array::from(vec![1_i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.value(0), 3); // factor=3 wins
+    }
+
+    #[test]
+    fn udf_registry_aggregate_override() {
+        let mut registry = UdfRegistry::new();
+        registry.register_aggregate(Arc::new(SumAggUdf::new()));
+        // Registering same name replaces
+        registry.register_aggregate(Arc::new(SumAggUdf::new()));
+        assert_eq!(registry.aggregate_names().len(), 1);
+    }
+
+    #[test]
+    fn udf_registry_table_override() {
+        let mut registry = UdfRegistry::new();
+        registry.register_table(Arc::new(ConstantTableUdf::new(1)));
+        registry.register_table(Arc::new(ConstantTableUdf::new(2)));
+        assert_eq!(registry.table_names().len(), 1);
+        let udf = registry.get_table("constant_table").unwrap();
+        let batch = udf.call(&[]).unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 2);
+    }
+
+    #[test]
+    fn udf_registry_missing_scalar_returns_none() {
+        let registry = UdfRegistry::new();
+        assert!(registry.get_scalar("nonexistent").is_none());
+    }
+
+    #[test]
+    fn udf_registry_missing_aggregate_returns_none() {
+        let registry = UdfRegistry::new();
+        assert!(registry.get_aggregate("nonexistent").is_none());
+    }
+
+    #[test]
+    fn udf_registry_missing_table_returns_none() {
+        let registry = UdfRegistry::new();
+        assert!(registry.get_table("nonexistent").is_none());
+    }
+
+    #[test]
+    fn udf_registry_empty_names() {
+        let registry = UdfRegistry::new();
+        assert!(registry.scalar_names().is_empty());
+        assert!(registry.aggregate_names().is_empty());
+        assert!(registry.table_names().is_empty());
+    }
+
+    #[test]
+    fn udf_registry_multiple_scalars_sorted() {
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("z", "x", 1)));
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("a", "x", 1)));
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("m", "x", 1)));
+        let names = registry.scalar_names();
+        assert_eq!(names, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn udf_registry_multiple_aggregates_sorted() {
+        let mut registry = UdfRegistry::new();
+        registry.register_aggregate(Arc::new(SumAggUdf::new()));
+        // Register with different name by using a wrapper (reuse SumAggUdf)
+        let names = registry.aggregate_names();
+        assert_eq!(names, vec!["sum_agg"]);
+    }
+
+    #[test]
+    fn udf_registry_multiple_tables_sorted() {
+        let mut registry = UdfRegistry::new();
+        registry.register_table(Arc::new(ConstantTableUdf::new(1)));
+        let names = registry.table_names();
+        assert_eq!(names, vec!["constant_table"]);
+    }
+
+    #[test]
+    fn aggregate_empty_batch_finalize() {
+        let udf = SumAggUdf::new();
+        let state = AggState::default();
+        let result = udf.finalize(state).unwrap();
+        assert!(matches!(result, ScalarValue::Int64(0)));
+    }
+
+    #[test]
+    fn aggregate_single_value() {
+        let udf = SumAggUdf::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let array = Int64Array::from(vec![42_i64]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let mut state = AggState::default();
+        udf.accumulate(&mut state, &batch).unwrap();
+        let result = udf.finalize(state).unwrap();
+        assert!(matches!(result, ScalarValue::Int64(42)));
+    }
+
+    #[test]
+    fn aggregate_negative_values() {
+        let udf = SumAggUdf::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let array = Int64Array::from(vec![-10_i64, -20, -30]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let mut state = AggState::default();
+        udf.accumulate(&mut state, &batch).unwrap();
+        let result = udf.finalize(state).unwrap();
+        assert!(matches!(result, ScalarValue::Int64(-60)));
+    }
+
+    #[test]
+    fn aggregate_mixed_positive_negative() {
+        let udf = SumAggUdf::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let array = Int64Array::from(vec![-5_i64, 10, -3, 8]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let mut state = AggState::default();
+        udf.accumulate(&mut state, &batch).unwrap();
+        let result = udf.finalize(state).unwrap();
+        assert!(matches!(result, ScalarValue::Int64(10)));
+    }
+
+    #[test]
+    fn aggregate_multiple_accumulations() {
+        let udf = SumAggUdf::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let b1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![3_i64, 4]))],
+        )
+        .unwrap();
+        let mut state = AggState::default();
+        udf.accumulate(&mut state, &b1).unwrap();
+        udf.accumulate(&mut state, &b2).unwrap();
+        let result = udf.finalize(state).unwrap();
+        assert!(matches!(result, ScalarValue::Int64(10)));
+    }
+
+    #[test]
+    fn aggregate_wrong_type_in_batch() {
+        let udf = SumAggUdf::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let array = arrow::array::StringArray::from(vec!["hello"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let mut state = AggState::default();
+        let err = udf.accumulate(&mut state, &batch).unwrap_err();
+        assert!(matches!(err, UdfError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn aggregate_name_and_schemas() {
+        let udf = SumAggUdf::new();
+        assert_eq!(udf.name(), "sum_agg");
+        assert_eq!(udf.input_schema().fields().len(), 1);
+        assert_eq!(udf.output_field().name(), "sum");
+    }
+
+    #[test]
+    fn table_udf_name_and_schema() {
+        let udf = ConstantTableUdf::new(99);
+        assert_eq!(udf.name(), "constant_table");
+        assert_eq!(udf.output_schema().fields().len(), 1);
+        assert_eq!(udf.output_schema().field(0).name(), "constant");
+    }
+
+    #[test]
+    fn table_udf_ignores_args() {
+        let udf = ConstantTableUdf::new(7);
+        let args = vec![
+            ScalarValue::Int64(1),
+            ScalarValue::Utf8("hello".into()),
+            ScalarValue::Boolean(true),
+        ];
+        let batch = udf.call(&args).unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 7);
+    }
+
+    #[test]
+    fn scalar_value_variants() {
+        let null = ScalarValue::Null;
+        let int = ScalarValue::Int64(42);
+        let float = ScalarValue::Float64(3.14);
+        let utf8 = ScalarValue::Utf8("hello".into());
+        let bool = ScalarValue::Boolean(true);
+        let bytes = ScalarValue::Bytes(vec![1, 2, 3]);
+
+        assert!(format!("{:?}", null).contains("Null"));
+        assert!(format!("{:?}", int).contains("42"));
+        assert!(format!("{:?}", float).contains("3.14"));
+        assert!(format!("{:?}", utf8).contains("hello"));
+        assert!(format!("{:?}", bool).contains("true"));
+        assert!(format!("{:?}", bytes).contains("Bytes"));
+    }
+
+    #[test]
+    fn scalar_value_clone() {
+        let v = ScalarValue::Utf8("test".into());
+        let c = v.clone();
+        assert!(matches!(c, ScalarValue::Utf8(s) if s == "test"));
+    }
+
+    #[test]
+    fn agg_state_default_is_empty() {
+        let s = AggState::default();
+        assert!(s.data.is_empty());
+    }
+
+    #[test]
+    fn agg_state_debug() {
+        let s = AggState {
+            data: vec![1, 2, 3],
+        };
+        let debug = format!("{:?}", s);
+        assert!(debug.contains("1, 2, 3"));
+    }
+
+    #[test]
+    fn udf_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(UdfError::Arrow("test".into()));
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn arrow_error_conversion() {
+        let arrow_err = arrow::error::ArrowError::InvalidArgumentError("bad".into());
+        let udf_err: UdfError = arrow_err.into();
+        assert!(matches!(udf_err, UdfError::Arrow(_)));
+        assert!(udf_err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn multiply_scalar_large_batch() {
+        let udf = MultiplyScalarUdf::new("big", "x", 7);
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let values: Vec<i64> = (0..10000).collect();
+        let array = Int64Array::from(values);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let result = udf.call(&batch).unwrap();
+        let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(arr.len(), 10000);
+        assert_eq!(arr.value(0), 0);
+        assert_eq!(arr.value(1), 7);
+        assert_eq!(arr.value(9999), 9999 * 7);
+    }
+
+    #[test]
+    fn registry_new_is_empty() {
+        let registry = UdfRegistry::new();
+        assert!(registry.scalar_names().is_empty());
+        assert!(registry.aggregate_names().is_empty());
+        assert!(registry.table_names().is_empty());
+    }
+
+    #[test]
+    fn registry_default_is_empty() {
+        let registry = UdfRegistry::default();
+        assert!(registry.scalar_names().is_empty());
+    }
+
+    #[test]
+    fn aggregate_merge_symmetric() {
+        let udf = SumAggUdf::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let b1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10_i64]))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![20_i64]))],
+        )
+        .unwrap();
+
+        let mut s1 = AggState::default();
+        let mut s2 = AggState::default();
+        udf.accumulate(&mut s1, &b1).unwrap();
+        udf.accumulate(&mut s2, &b2).unwrap();
+
+        let m12 = udf.merge(s1.clone(), s2.clone()).unwrap();
+        let m21 = udf.merge(s2, s1).unwrap();
+
+        let r12 = udf.finalize(m12).unwrap();
+        let r21 = udf.finalize(m21).unwrap();
+
+        assert!(matches!(r12, ScalarValue::Int64(30)));
+        assert!(matches!(r21, ScalarValue::Int64(30)));
     }
 }

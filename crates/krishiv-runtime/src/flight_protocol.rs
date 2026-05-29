@@ -73,12 +73,17 @@ pub fn encode_batch_sql(query: &str, tables: &[BatchSqlTable]) -> String {
 }
 
 /// Encode remote continuous job registration.
-pub fn encode_continuous_register(job_id: &str, spec: &LocalWindowExecutionSpec) -> RuntimeResult<String> {
+pub fn encode_continuous_register(
+    job_id: &str,
+    spec: &LocalWindowExecutionSpec,
+) -> RuntimeResult<String> {
     let plan_spec = spec.to_plan_spec();
     let json = serde_json::to_string(&plan_spec)
         .map_err(|e| RuntimeError::transport(format!("window spec serialization: {e}")))?;
     let encoded = BASE64.encode(json.as_bytes());
-    Ok(format!("/* {CONTINUOUS_REGISTER}:{job_id}:{encoded} */ SELECT 1 AS registered"))
+    Ok(format!(
+        "/* {CONTINUOUS_REGISTER}:{job_id}:{encoded} */ SELECT 1 AS registered"
+    ))
 }
 
 /// Encode remote continuous input push.
@@ -321,8 +326,27 @@ pub fn has_control_directive(directives: &[FlightDirective]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
     use krishiv_plan::window::WindowExecutionSpec;
+
+    fn test_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])) as _,
+                Arc::new(Int64Array::from(vec![1_000, 5_000])) as _,
+            ],
+        )
+        .unwrap()
+    }
 
     #[test]
     fn encode_and_parse_register_parquet() {
@@ -346,6 +370,45 @@ mod tests {
     }
 
     #[test]
+    fn encode_and_parse_register_parquet_multiple() {
+        let sql = encode_batch_sql(
+            "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id",
+            &[
+                BatchSqlTable {
+                    table_name: "t1".into(),
+                    path: PathBuf::from("/data/t1.parquet"),
+                },
+                BatchSqlTable {
+                    table_name: "t2".into(),
+                    path: PathBuf::from("/data/t2.parquet"),
+                },
+            ],
+        );
+        let (directives, query) = parse_sql(&sql);
+        assert_eq!(query, "SELECT * FROM t1 JOIN t2 ON t1.id = t2.id");
+        assert_eq!(directives.len(), 2);
+    }
+
+    #[test]
+    fn register_parquet_preserves_path_with_spaces() {
+        let sql = encode_batch_sql(
+            "SELECT 1",
+            &[BatchSqlTable {
+                table_name: "t".into(),
+                path: PathBuf::from("/my data/my table.parquet"),
+            }],
+        );
+        let (directives, _) = parse_sql(&sql);
+        assert_eq!(
+            directives[0],
+            FlightDirective::RegisterParquet {
+                table: "t".into(),
+                path: PathBuf::from("/my data/my table.parquet"),
+            }
+        );
+    }
+
+    #[test]
     fn continuous_drain_round_trip() {
         let sql = encode_continuous_drain("job-1");
         let (directives, _) = parse_sql(&sql);
@@ -358,11 +421,91 @@ mod tests {
     }
 
     #[test]
+    fn continuous_drain_with_hyphenated_job_id() {
+        let sql = encode_continuous_drain("my-job-123");
+        let (directives, _) = parse_sql(&sql);
+        assert_eq!(
+            directives[0],
+            FlightDirective::ContinuousDrain {
+                job_id: "my-job-123".into()
+            }
+        );
+    }
+
+    #[test]
     fn explain_directive_parsed() {
         let sql = encode_explain_sql("SELECT 1");
         let (directives, query) = parse_sql(&sql);
         assert_eq!(directives, vec![FlightDirective::Explain]);
         assert_eq!(query, "SELECT 1");
+    }
+
+    #[test]
+    fn explain_with_complex_query() {
+        let sql = encode_explain_sql("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 10");
+        let (directives, query) = parse_sql(&sql);
+        assert_eq!(directives, vec![FlightDirective::Explain]);
+        assert_eq!(
+            query,
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 10"
+        );
+    }
+
+    #[test]
+    fn continuous_register_round_trip() {
+        let local = LocalWindowExecutionSpec {
+            key_column: "user_id".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: crate::local_streaming::LocalWindowKind::Tumbling,
+            window_size_ms: 10_000,
+            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        };
+        let sql = encode_continuous_register("job-abc", &local).unwrap();
+        let (directives, _) = parse_sql(&sql);
+        match &directives[0] {
+            FlightDirective::ContinuousRegister {
+                job_id,
+                spec: decoded,
+            } => {
+                assert_eq!(job_id, "job-abc");
+                assert_eq!(decoded.key_column, "user_id");
+                assert_eq!(decoded.event_time_column, "ts");
+                assert_eq!(decoded.window_size_ms, 10_000);
+            }
+            other => panic!("expected ContinuousRegister, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continuous_push_round_trip_with_batches() {
+        let batch = test_batch();
+        let sql = encode_continuous_push("job-xyz", &[batch]).unwrap();
+        let (directives, _) = parse_sql(&sql);
+        match &directives[0] {
+            FlightDirective::ContinuousPush { job_id, batches } => {
+                assert_eq!(job_id, "job-xyz");
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].num_rows(), 2);
+            }
+            other => panic!("expected ContinuousPush, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continuous_push_empty_batches() {
+        let sql = encode_continuous_push("job-empty", &[]).unwrap();
+        let (directives, _) = parse_sql(&sql);
+        match &directives[0] {
+            FlightDirective::ContinuousPush { job_id, batches } => {
+                assert_eq!(job_id, "job-empty");
+                assert!(batches.is_empty());
+            }
+            other => panic!("expected ContinuousPush, got {other:?}"),
+        }
     }
 
     #[test]
@@ -379,18 +522,116 @@ mod tests {
     }
 
     #[test]
+    fn bounded_window_with_input_batches() {
+        let local = LocalWindowExecutionSpec {
+            key_column: "user_id".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: crate::local_streaming::LocalWindowKind::Tumbling,
+            window_size_ms: 10_000,
+            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        };
+        let batch = test_batch();
+        let sql = encode_bounded_window("events", &local, &[batch]).unwrap();
+        let (directives, _) = parse_sql(&sql);
+        match &directives[0] {
+            FlightDirective::BoundedWindow {
+                topic,
+                input_batches,
+                ..
+            } => {
+                assert_eq!(topic, "events");
+                assert_eq!(input_batches.len(), 1);
+                assert_eq!(input_batches[0].num_rows(), 2);
+            }
+            other => panic!("expected BoundedWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_directives_in_one_sql() {
+        let drain_sql = encode_continuous_drain("job-1");
+        let sql = format!("{drain_sql}; SELECT * FROM t");
+        let (directives, query) = parse_sql(&sql);
+        assert_eq!(directives.len(), 1);
+        assert!(matches!(
+            &directives[0],
+            FlightDirective::ContinuousDrain { .. }
+        ));
+        assert!(query.contains("SELECT * FROM t"));
+    }
+
+    #[test]
+    fn plain_sql_no_directives() {
+        let (directives, query) = parse_sql("SELECT 1 AS n");
+        assert!(directives.is_empty());
+        assert_eq!(query, "SELECT 1 AS n");
+    }
+
+    #[test]
+    fn unclosed_comment_does_not_panic() {
+        let (directives, query) = parse_sql("SELECT 1 /* unclosed");
+        assert!(directives.is_empty());
+        assert!(query.contains("/* unclosed"));
+    }
+
+    #[test]
+    fn non_krishiv_comment_preserved() {
+        let sql = "/* ordinary comment */ SELECT 1";
+        let (directives, query) = parse_sql(sql);
+        assert!(directives.is_empty());
+        assert_eq!(query, "/* ordinary comment */ SELECT 1");
+    }
+
+    #[test]
+    fn apply_register_directives_populates_catalog() {
+        let mut catalog = std::collections::HashMap::new();
+        let directives = vec![
+            FlightDirective::RegisterParquet {
+                table: "t1".into(),
+                path: PathBuf::from("/data/t1.parquet"),
+            },
+            FlightDirective::RegisterParquet {
+                table: "t2".into(),
+                path: PathBuf::from("/data/t2.parquet"),
+            },
+        ];
+        apply_register_directives(&mut catalog, &directives);
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog["t1"], PathBuf::from("/data/t1.parquet"));
+        assert_eq!(catalog["t2"], PathBuf::from("/data/t2.parquet"));
+    }
+
+    #[test]
+    fn catalog_to_batch_tables_roundtrip() {
+        let mut catalog = std::collections::HashMap::new();
+        catalog.insert("t".into(), PathBuf::from("/data/t.parquet"));
+        let tables = catalog_to_batch_tables(&catalog);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].table_name, "t");
+        assert_eq!(tables[0].path, PathBuf::from("/data/t.parquet"));
+    }
+
+    #[test]
+    fn has_control_directive_true_for_explain() {
+        let d = vec![FlightDirective::Explain];
+        assert!(has_control_directive(&d));
+    }
+
+    #[test]
+    fn has_control_directive_false_for_register_parquet() {
+        let d = vec![FlightDirective::RegisterParquet {
+            table: "t".into(),
+            path: PathBuf::from("/t.parquet"),
+        }];
+        assert!(!has_control_directive(&d));
+    }
+
+    #[test]
     fn comment_parser_strips_injection_attempt_without_leaking_payload() {
-        // B3: a malicious caller embeds a `*/` mid-comment, hoping the
-        // remaining tail (`SELECT 1; DROP TABLE users;`) gets executed as SQL.
-        //
-        // parse_sql DOES detect the early `*/` and extracts the (truncated)
-        // directive — but the residual SQL is delivered as a separate
-        // `query` string and our caller (`FlightExecutionHost::execute_sql`)
-        // short-circuits on control directives via `has_control_directive`
-        // BEFORE executing any SQL.  Below we assert both halves of the
-        // contract: the comment yields a parsed directive (so it doesn't fall
-        // through and execute the malicious tail), AND `has_control_directive`
-        // reports true.
         let evil = "evil*/SELECT 1; DROP TABLE users; /*";
         let comment = format!("/* {CONTINUOUS_DRAIN}:{evil} */");
         let (directives, _query) = parse_sql(&comment);
@@ -411,9 +652,6 @@ mod tests {
 
     #[test]
     fn comment_parser_rejects_directive_with_unsafe_field_chars() {
-        // Spaces / shell metacharacters in identifiers cause the directive
-        // to be silently dropped (parsed as None), so the caller does NOT
-        // mistake a malformed comment for a valid control plane request.
         let comment = "/* krishiv-continuous-drain:foo bar; rm -rf / */ SELECT 1".to_string();
         let (directives, _query) = parse_sql(&comment);
         assert!(directives.is_empty(), "unsafe identifier must be rejected");
@@ -421,10 +659,274 @@ mod tests {
 
     #[test]
     fn comment_parser_rejects_unsafe_base64_field() {
-        // Insert a `*` character into what looks like base64 (the standard
-        // alphabet doesn't contain `*`): rejected.
         let comment = format!("/* {BOUNDED_WINDOW}:events:abc*defgh:ipc */ SELECT 1");
         let (directives, _query) = parse_sql(&comment);
         assert!(directives.is_empty(), "unsafe base64 must be rejected");
+    }
+
+    #[test]
+    fn comment_parser_rejects_unsafe_path_chars() {
+        let comment = "/* krishiv-register-parquet:t:/data/t.parquet; rm -rf / */ SELECT 1";
+        let (directives, _) = parse_sql(comment);
+        assert!(directives.is_empty(), "unsafe path must be rejected");
+    }
+
+    #[test]
+    fn parse_sql_empty_string() {
+        let (directives, query) = parse_sql("");
+        assert!(directives.is_empty());
+        assert_eq!(query, "");
+    }
+
+    #[test]
+    fn parse_sql_only_whitespace() {
+        let (directives, query) = parse_sql("   ");
+        assert!(directives.is_empty());
+        assert_eq!(query, "");
+    }
+
+    #[test]
+    fn parse_sql_multiple_directives_in_sequence() {
+        let d1 = encode_continuous_drain("j1");
+        let d2 = encode_continuous_drain("j2");
+        let sql = format!("{d1}; {d2}; SELECT 1");
+        let (directives, _) = parse_sql(&sql);
+        assert_eq!(directives.len(), 2);
+    }
+
+    #[test]
+    fn is_safe_identifier_rejects_empty() {
+        assert!(!is_safe_identifier(""));
+    }
+
+    #[test]
+    fn is_safe_identifier_rejects_spaces() {
+        assert!(!is_safe_identifier("has space"));
+    }
+
+    #[test]
+    fn is_safe_identifier_rejects_slash() {
+        assert!(!is_safe_identifier("has/slash"));
+    }
+
+    #[test]
+    fn is_safe_identifier_rejects_semicolon() {
+        assert!(!is_safe_identifier("has;semicolon"));
+    }
+
+    #[test]
+    fn is_safe_identifier_accepts_alphanumeric() {
+        assert!(is_safe_identifier("abc123"));
+    }
+
+    #[test]
+    fn is_safe_identifier_accepts_underscores() {
+        assert!(is_safe_identifier("abc_123_def"));
+    }
+
+    #[test]
+    fn is_safe_identifier_accepts_hyphens() {
+        assert!(is_safe_identifier("job-123"));
+    }
+
+    #[test]
+    fn is_safe_identifier_accepts_dots() {
+        assert!(is_safe_identifier("table.v1"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_empty() {
+        assert!(!is_safe_path(""));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_semicolons() {
+        assert!(!is_safe_path("/data;rm -rf /"));
+    }
+
+    #[test]
+    fn is_safe_path_rejects_asterisk() {
+        assert!(!is_safe_path("/data/*.parquet"));
+    }
+
+    #[test]
+    fn is_safe_path_accepts_spaces() {
+        assert!(is_safe_path("/my data/file.parquet"));
+    }
+
+    #[test]
+    fn is_safe_base64_rejects_empty() {
+        assert!(!is_safe_base64(""));
+    }
+
+    #[test]
+    fn is_safe_base64_rejects_spaces() {
+        assert!(!is_safe_base64("abc 123"));
+    }
+
+    #[test]
+    fn is_safe_base64_rejects_asterisk() {
+        assert!(!is_safe_base64("abc*def"));
+    }
+
+    #[test]
+    fn is_safe_base64_accepts_standard() {
+        assert!(is_safe_base64("SGVsbG8="));
+        assert!(is_safe_base64("abc123+/="));
+    }
+
+    #[test]
+    fn has_control_directive_false_for_empty() {
+        assert!(!has_control_directive(&[]));
+    }
+
+    #[test]
+    fn has_control_directive_true_for_continuous_register() {
+        let d = vec![FlightDirective::ContinuousRegister {
+            job_id: "j".into(),
+            spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
+        }];
+        assert!(has_control_directive(&d));
+    }
+
+    #[test]
+    fn has_control_directive_true_for_continuous_push() {
+        let d = vec![FlightDirective::ContinuousPush {
+            job_id: "j".into(),
+            batches: vec![],
+        }];
+        assert!(has_control_directive(&d));
+    }
+
+    #[test]
+    fn has_control_directive_true_for_continuous_drain() {
+        let d = vec![FlightDirective::ContinuousDrain { job_id: "j".into() }];
+        assert!(has_control_directive(&d));
+    }
+
+    #[test]
+    fn has_control_directive_true_for_bounded_window() {
+        let d = vec![FlightDirective::BoundedWindow {
+            topic: "t".into(),
+            spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
+            input_batches: vec![],
+        }];
+        assert!(has_control_directive(&d));
+    }
+
+    #[test]
+    fn has_control_directive_false_for_drain_unknown() {
+        // Unknown directives don't match any known variant
+        let d = vec![FlightDirective::Explain];
+        assert!(has_control_directive(&d));
+    }
+
+    #[test]
+    fn apply_register_directives_empty_catalog() {
+        let mut catalog = std::collections::HashMap::new();
+        apply_register_directives(&mut catalog, &[]);
+        assert!(catalog.is_empty());
+    }
+
+    #[test]
+    fn apply_register_directives_overwrites_same_table() {
+        let mut catalog = std::collections::HashMap::new();
+        let directives = vec![
+            FlightDirective::RegisterParquet {
+                table: "t".into(),
+                path: PathBuf::from("/old.parquet"),
+            },
+            FlightDirective::RegisterParquet {
+                table: "t".into(),
+                path: PathBuf::from("/new.parquet"),
+            },
+        ];
+        apply_register_directives(&mut catalog, &directives);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog["t"], PathBuf::from("/new.parquet"));
+    }
+
+    #[test]
+    fn catalog_to_batch_tables_empty() {
+        let catalog = std::collections::HashMap::new();
+        let tables = catalog_to_batch_tables(&catalog);
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn catalog_to_batch_tables_multiple() {
+        let mut catalog = std::collections::HashMap::new();
+        catalog.insert("a".into(), PathBuf::from("/a.parquet"));
+        catalog.insert("b".into(), PathBuf::from("/b.parquet"));
+        let tables = catalog_to_batch_tables(&catalog);
+        assert_eq!(tables.len(), 2);
+    }
+
+    #[test]
+    fn encode_explain_sql_preserves_query() {
+        let sql = encode_explain_sql("SELECT * FROM users");
+        assert_eq!(sql, "/* krishiv-explain */ SELECT * FROM users");
+    }
+
+    #[test]
+    fn parse_sql_mixed_krishiv_and_normal_comment() {
+        let drain = encode_continuous_drain("j1");
+        let sql = format!("{drain} /* ordinary */ SELECT 1");
+        let (directives, query) = parse_sql(&sql);
+        assert_eq!(directives.len(), 1);
+        assert!(query.contains("/* ordinary */"));
+        assert!(query.contains("SELECT 1"));
+    }
+
+    #[test]
+    fn bounded_window_empty_ipc() {
+        let local = LocalWindowExecutionSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: crate::local_streaming::LocalWindowKind::Tumbling,
+            window_size_ms: 10_000,
+            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        };
+        let sql = encode_bounded_window("topic", &local, &[]).unwrap();
+        let (directives, _) = parse_sql(&sql);
+        match &directives[0] {
+            FlightDirective::BoundedWindow { input_batches, .. } => {
+                assert!(input_batches.is_empty());
+            }
+            other => panic!("expected BoundedWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continuous_push_multiple_batches() {
+        let b1 = test_batch();
+        let schema = b1.schema();
+        let b2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x"])) as _,
+                Arc::new(Int64Array::from(vec![999])) as _,
+            ],
+        )
+        .unwrap();
+        let sql = encode_continuous_push("job-multi", &[b1, b2]).unwrap();
+        let (directives, _) = parse_sql(&sql);
+        match &directives[0] {
+            FlightDirective::ContinuousPush { batches, .. } => {
+                assert_eq!(batches.len(), 2);
+            }
+            other => panic!("expected ContinuousPush, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comment_with_only_prefix_ignored() {
+        let sql = "/* krishiv-continuous-drain */ SELECT 1";
+        let (directives, _) = parse_sql(sql);
+        assert!(directives.is_empty());
     }
 }

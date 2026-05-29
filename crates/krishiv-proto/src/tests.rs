@@ -361,7 +361,10 @@ mod proto_tests {
         }]);
         let wire = executor_heartbeat_response_to_wire(response_with_limit.clone());
         let rt = executor_heartbeat_response_from_wire(wire).unwrap();
-        assert_eq!(rt.throttle_commands(), response_with_limit.throttle_commands());
+        assert_eq!(
+            rt.throttle_commands(),
+            response_with_limit.throttle_commands()
+        );
 
         // Cleared throttle: rows_per_second = None.
         let response_clear = ExecutorHeartbeatResponse::new(
@@ -522,5 +525,177 @@ mod proto_tests {
 
         assert_eq!(assignment.shuffle_write().unwrap().num_partitions, 3);
         assert!(assignment.shuffle_read().is_none());
+    }
+
+    // ── ID validation: try_new success and failure ───────────────────────────
+
+    #[test]
+    fn job_id_try_new_success() {
+        let id = JobId::try_new("job-42").unwrap();
+        assert_eq!(id.as_str(), "job-42");
+    }
+
+    #[test]
+    fn job_id_try_new_rejects_empty() {
+        assert!(JobId::try_new("").is_err());
+    }
+
+    #[test]
+    fn job_id_try_new_rejects_whitespace() {
+        assert!(JobId::try_new("   ").is_err());
+    }
+
+    #[test]
+    fn task_id_try_new_success() {
+        let id = TaskId::try_new("task-abc").unwrap();
+        assert_eq!(id.as_str(), "task-abc");
+    }
+
+    #[test]
+    fn task_id_try_new_rejects_empty() {
+        assert!(TaskId::try_new("").is_err());
+    }
+
+    #[test]
+    fn task_id_try_new_rejects_whitespace_only() {
+        assert!(TaskId::try_new("  \t\n  ").is_err());
+    }
+
+    #[test]
+    fn executor_id_try_new_success() {
+        let id = ExecutorId::try_new("exec-7").unwrap();
+        assert_eq!(id.as_str(), "exec-7");
+    }
+
+    #[test]
+    fn executor_id_try_new_rejects_empty() {
+        assert!(ExecutorId::try_new("").is_err());
+    }
+
+    #[test]
+    fn stage_id_try_new_success() {
+        let id = StageId::try_new("stage-x").unwrap();
+        assert_eq!(id.as_str(), "stage-x");
+    }
+
+    #[test]
+    fn stage_id_try_new_rejects_empty() {
+        assert!(StageId::try_new("").is_err());
+    }
+
+    #[test]
+    fn coordinator_id_try_new_success() {
+        let id = CoordinatorId::try_new("coord-1").unwrap();
+        assert_eq!(id.as_str(), "coord-1");
+    }
+
+    #[test]
+    fn coordinator_id_try_new_rejects_empty() {
+        assert!(CoordinatorId::try_new("").is_err());
+    }
+
+    #[test]
+    fn id_error_display_format() {
+        let err = JobId::try_new("").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("job id"));
+        assert!(msg.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn id_error_kind_and_reason_accessors() {
+        let err = TaskId::try_new("").unwrap_err();
+        assert_eq!(err.kind(), "task id");
+        assert_eq!(err.reason(), "cannot be empty");
+    }
+
+    #[test]
+    fn attempt_id_try_new_zero_fails() {
+        assert!(AttemptId::try_new(0).is_err());
+    }
+
+    #[test]
+    fn attempt_id_try_new_positive_succeeds() {
+        let id = AttemptId::try_new(5).unwrap();
+        assert_eq!(id.as_u32(), 5);
+    }
+
+    #[test]
+    fn lease_generation_try_new_zero_fails() {
+        assert!(LeaseGeneration::try_new(0).is_err());
+    }
+
+    #[test]
+    fn lease_generation_try_new_positive_succeeds() {
+        let id = LeaseGeneration::try_new(99).unwrap();
+        assert_eq!(id.as_u64(), 99);
+    }
+
+    #[test]
+    fn fencing_token_try_new_zero_fails() {
+        assert!(FencingToken::try_new(0).is_err());
+    }
+
+    #[test]
+    fn fencing_token_try_new_positive_succeeds() {
+        let id = FencingToken::try_new(42).unwrap();
+        assert_eq!(id.as_u64(), 42);
+    }
+
+    // ── JobId, TaskId, ExecutorId Display ────────────────────────────────────
+
+    #[test]
+    fn job_id_display() {
+        let id = JobId::try_new("job-display-test").unwrap();
+        assert_eq!(format!("{id}"), "job-display-test");
+    }
+
+    #[test]
+    fn task_id_display() {
+        let id = TaskId::try_new("task-display-test").unwrap();
+        assert_eq!(format!("{id}"), "task-display-test");
+    }
+
+    #[test]
+    fn executor_id_display() {
+        let id = ExecutorId::try_new("exec-display-test").unwrap();
+        assert_eq!(format!("{id}"), "exec-display-test");
+    }
+
+    #[test]
+    fn stage_id_display() {
+        let id = StageId::try_new("stage-display-test").unwrap();
+        assert_eq!(format!("{id}"), "stage-display-test");
+    }
+
+    #[test]
+    fn coordinator_id_display() {
+        let id = CoordinatorId::try_new("coord-display-test").unwrap();
+        assert_eq!(format!("{id}"), "coord-display-test");
+    }
+
+    #[test]
+    fn attempt_id_display() {
+        let id = AttemptId::try_new(3).unwrap();
+        assert_eq!(format!("{id}"), "3");
+    }
+
+    #[test]
+    fn lease_generation_display() {
+        let id = LeaseGeneration::try_new(12).unwrap();
+        assert_eq!(format!("{id}"), "12");
+    }
+
+    #[test]
+    fn fencing_token_display() {
+        let id = FencingToken::try_new(7).unwrap();
+        assert_eq!(format!("{id}"), "7");
+    }
+
+    #[test]
+    fn ids_with_special_characters_preserved() {
+        let id = JobId::try_new("job/with:special@chars").unwrap();
+        assert_eq!(id.as_str(), "job/with:special@chars");
+        assert_eq!(format!("{id}"), "job/with:special@chars");
     }
 }

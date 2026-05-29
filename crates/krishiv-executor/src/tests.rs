@@ -1657,7 +1657,10 @@ mod executor_tests {
     }
 
     impl crate::ContinuousJobDrainer for OneShotDrainer {
-        fn drain_job(&self, _job_id: &str) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+        fn drain_job(
+            &self,
+            _job_id: &str,
+        ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
             let mut guard = self.batches.lock().unwrap();
             Ok(guard.take().unwrap_or_default())
         }
@@ -1974,12 +1977,7 @@ mod executor_tests {
         );
         assert!(inbox.is_empty().unwrap());
 
-        let state = shared
-            .read()
-            .await
-            .job_snapshot(&job_id)
-            .unwrap()
-            .state();
+        let state = shared.read().await.job_snapshot(&job_id).unwrap().state();
         assert_eq!(
             state,
             JobState::Running,
@@ -2043,11 +2041,7 @@ mod executor_tests {
                     reported_watermark_ms,
                     reported_offset.clone(),
                 )]);
-            shared
-                .write()
-                .await
-                .executor_heartbeat(heartbeat)
-                .unwrap();
+            shared.write().await.executor_heartbeat(heartbeat).unwrap();
         }
 
         let coordinator = shared.read().await;
@@ -2648,17 +2642,15 @@ mod executor_tests {
             inner: std::sync::Mutex<std::collections::VecDeque<Vec<RecordBatch>>>,
         }
         impl crate::ContinuousJobDrainer for SeqDrainer {
-            fn drain_job(
-                &self,
-                _job_id: &str,
-            ) -> Result<Vec<RecordBatch>, String> {
+            fn drain_job(&self, _job_id: &str) -> Result<Vec<RecordBatch>, String> {
                 Ok(self.inner.lock().unwrap().pop_front().unwrap_or_default())
             }
         }
         let drainer = Arc::new(SeqDrainer {
-            inner: std::sync::Mutex::new(
-                std::collections::VecDeque::from(vec![vec![batch1], vec![batch2]]),
-            ),
+            inner: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                vec![batch1],
+                vec![batch2],
+            ])),
         });
 
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
@@ -2721,13 +2713,24 @@ mod executor_tests {
             },
         ];
         for tc in &cmds {
-            runner.source_throttle_limits.apply(&tc.source_id, tc.rows_per_second);
+            runner
+                .source_throttle_limits
+                .apply(&tc.source_id, tc.rows_per_second);
         }
 
         // Reads through the clone (task runner side) must observe the updates.
-        assert_eq!(clone.source_throttle_limits.active_limit("src-kafka-0"), Some(1000));
-        assert_eq!(clone.source_throttle_limits.active_limit("src-kafka-1"), None);
-        assert_eq!(clone.source_throttle_limits.active_limit("src-kafka-99"), None);
+        assert_eq!(
+            clone.source_throttle_limits.active_limit("src-kafka-0"),
+            Some(1000)
+        );
+        assert_eq!(
+            clone.source_throttle_limits.active_limit("src-kafka-1"),
+            None
+        );
+        assert_eq!(
+            clone.source_throttle_limits.active_limit("src-kafka-99"),
+            None
+        );
 
         // check_and_log should not panic regardless of whether a limit is active.
         clone.source_throttle_limits.check_and_log("src-kafka-0");

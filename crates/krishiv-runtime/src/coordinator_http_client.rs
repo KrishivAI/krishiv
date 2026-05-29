@@ -75,3 +75,68 @@ pub async fn execute_coordinator_batch_sql(
     let _job_id = payload.job_id;
     decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_http_base;
+
+    #[test]
+    fn normalize_http_base_empty_fails() {
+        let err = normalize_http_base("").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn normalize_http_base_whitespace_only_fails() {
+        let err = normalize_http_base("   ").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn normalize_http_base_http_unchanged() {
+        let result = normalize_http_base("http://localhost:8080").unwrap();
+        assert_eq!(result, "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalize_http_base_https_unchanged() {
+        let result = normalize_http_base("https://cluster.example.com").unwrap();
+        assert_eq!(result, "https://cluster.example.com");
+    }
+
+    #[test]
+    fn normalize_http_base_bare_adds_http() {
+        let result = normalize_http_base("localhost:8080").unwrap();
+        assert_eq!(result, "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalize_http_base_strips_trailing_slash() {
+        let result = normalize_http_base("http://localhost:8080/").unwrap();
+        assert_eq!(result, "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalize_http_base_strips_trailing_slashes() {
+        let result = normalize_http_base("http://localhost:8080///").unwrap();
+        assert_eq!(result, "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalize_http_base_trims_whitespace() {
+        let result = normalize_http_base("  http://localhost:8080  ").unwrap();
+        assert_eq!(result, "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalize_http_base_bare_trailing_slash() {
+        let result = normalize_http_base("localhost:8080/").unwrap();
+        assert_eq!(result, "http://localhost:8080");
+    }
+
+    #[test]
+    fn normalize_http_base_preserves_path() {
+        let result = normalize_http_base("http://host:8080/api/v1").unwrap();
+        assert_eq!(result, "http://host:8080/api/v1");
+    }
+}

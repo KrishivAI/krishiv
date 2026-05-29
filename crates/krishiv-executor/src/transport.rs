@@ -298,14 +298,13 @@ impl ExecutorRuntime {
             >,
         >,
     > {
-        let channel = tonic::transport::Endpoint::from_shared(
-            self.config.coordinator_endpoint.clone(),
-        )
-        .map_err(|e| ExecutorTransportError::Transport {
-            message: e.to_string(),
-        })?
-        .connect()
-        .await?;
+        let channel =
+            tonic::transport::Endpoint::from_shared(self.config.coordinator_endpoint.clone())
+                .map_err(|e| ExecutorTransportError::Transport {
+                    message: e.to_string(),
+                })?
+                .connect()
+                .await?;
         Ok(
             wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
                 channel,

@@ -122,4 +122,116 @@ mod tests {
         state.push_left(1000, batch(1));
         assert!(state.push_right(2000, batch(2)).is_empty());
     }
+
+    #[test]
+    fn evict_before_removes_old_events() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        state.push_left(1000, batch(1));
+        state.push_left(2000, batch(2));
+        state.push_right(1500, batch(3));
+        // evict before watermark 2100: horizon = 2100 - 100 = 2000
+        // left: keep 2000, remove 1000; right: keep 1500
+        state.evict_before(2100);
+        // left has 1 event (2000), right has 1 event (1500)
+        // Push a new left at 2100 → should match right at 1500 (delta=600, within [-100,100]? No)
+        let matches = state.push_left(2100, batch(4));
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn multiple_right_events_match_single_left() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        state.push_right(1000, batch(1));
+        state.push_right(1050, batch(2));
+        state.push_right(1100, batch(3));
+        let matches = state.push_left(1050, batch(4));
+        assert_eq!(matches.len(), 3); // all three right events match
+    }
+
+    #[test]
+    fn symmetric_bounds_match_both_directions() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -50,
+            upper_bound_ms: 50,
+        });
+        // left at t=1000, right at t=1030 → delta=30, within [-50,50]
+        state.push_left(1000, batch(1));
+        let matches = state.push_right(1030, batch(2));
+        assert_eq!(matches.len(), 1);
+
+        // left at t=2000, right at t=1970 → delta=-30, within [-50,50]
+        state.push_left(2000, batch(3));
+        let matches = state.push_right(1970, batch(4));
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn zero_bounds_exact_timestamp_match() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 0,
+        });
+        state.push_left(1000, batch(1));
+        // Exact match at same timestamp
+        let matches = state.push_right(1000, batch(2));
+        assert_eq!(matches.len(), 1);
+
+        // Off by 1 ms — no match
+        let matches = state.push_right(1001, batch(3));
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn evict_before_empty_state_no_panic() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        state.evict_before(5000);
+        // No panic, state remains empty
+        assert!(state.left.is_empty());
+        assert!(state.right.is_empty());
+    }
+
+    #[test]
+    fn push_left_with_no_right_buffer_returns_empty() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        let matches = state.push_left(1000, batch(1));
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn push_right_with_no_left_buffer_returns_empty() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        let matches = state.push_right(1000, batch(1));
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn large_asymmetric_bounds() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -1000,
+            upper_bound_ms: 100,
+        });
+        state.push_left(1000, batch(1));
+        // Right at 100: delta = -900, within [-1000,100] → match
+        let matches = state.push_right(100, batch(2));
+        assert_eq!(matches.len(), 1);
+
+        // Right at 2100: delta = 1100, > 100 → no match
+        let matches = state.push_right(2100, batch(3));
+        assert!(matches.is_empty());
+    }
 }

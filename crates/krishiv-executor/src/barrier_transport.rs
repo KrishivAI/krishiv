@@ -50,11 +50,17 @@ impl SharedBarrierInjector {
     }
 
     pub fn enqueue(&self, barrier: CheckpointBarrier) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).enqueue(barrier);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enqueue(barrier);
     }
 
     pub fn next_barrier(&self) -> Option<CheckpointBarrier> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).next_barrier()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_barrier()
     }
 }
 
@@ -81,6 +87,95 @@ mod tests {
         assert_eq!(inj.next_barrier().unwrap().epoch, 1);
         assert!(inj.next_barrier().is_none());
         inj.enqueue(make_checkpoint_barrier("job", 2, "cp-2"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 2);
+    }
+
+    #[test]
+    fn barrier_injector_new_is_empty() {
+        let mut inj = BarrierInjector::new();
+        assert!(inj.next_barrier().is_none());
+    }
+
+    #[test]
+    fn barrier_injector_enqueue_multiple_epochs() {
+        let mut inj = BarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1"));
+        inj.enqueue(make_checkpoint_barrier("job", 2, "cp-2"));
+        inj.enqueue(make_checkpoint_barrier("job", 3, "cp-3"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 1);
+        assert_eq!(inj.next_barrier().unwrap().epoch, 2);
+        assert_eq!(inj.next_barrier().unwrap().epoch, 3);
+        assert!(inj.next_barrier().is_none());
+    }
+
+    #[test]
+    fn barrier_injector_rejects_stale_epoch() {
+        let mut inj = BarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 5, "cp-5"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 5);
+        // Epoch 3 is before 5, should be rejected
+        inj.enqueue(make_checkpoint_barrier("job", 3, "cp-3"));
+        assert!(inj.next_barrier().is_none());
+    }
+
+    #[test]
+    fn barrier_injector_rejects_equal_epoch() {
+        let mut inj = BarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 5, "cp-5"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 5);
+        // Same epoch 5 should be rejected (epoch <= last_injected_epoch)
+        inj.enqueue(make_checkpoint_barrier("job", 5, "cp-5-dup"));
+        assert!(inj.next_barrier().is_none());
+    }
+
+    #[test]
+    fn make_checkpoint_barrier_fields() {
+        let barrier = make_checkpoint_barrier("job-1", 42, "cp-42");
+        assert_eq!(barrier.epoch, 42);
+        assert_eq!(barrier.job_id, "job-1");
+        assert_eq!(barrier.checkpoint_id, "cp-42");
+        assert_eq!(barrier.barrier_kind, BarrierKind::Checkpoint as i32);
+        assert!(barrier.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn operator_epoch_returns_barrier_epoch() {
+        let barrier = make_checkpoint_barrier("job", 7, "cp-7");
+        assert_eq!(BarrierInjector::operator_epoch(&barrier), 7);
+    }
+
+    #[test]
+    fn shared_barrier_injector_new_is_empty() {
+        let inj = SharedBarrierInjector::new();
+        assert!(inj.next_barrier().is_none());
+    }
+
+    #[test]
+    fn shared_barrier_injector_enqueue_and_dequeue() {
+        let inj = SharedBarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1"));
+        let barrier = inj.next_barrier().unwrap();
+        assert_eq!(barrier.epoch, 1);
+        assert!(inj.next_barrier().is_none());
+    }
+
+    #[test]
+    fn shared_barrier_injector_is_clone() {
+        let inj1 = SharedBarrierInjector::new();
+        let inj2 = inj1.clone();
+        inj1.enqueue(make_checkpoint_barrier("job", 1, "cp-1"));
+        let barrier = inj2.next_barrier().unwrap();
+        assert_eq!(barrier.epoch, 1);
+    }
+
+    #[test]
+    fn shared_barrier_injector_monotonic() {
+        let inj = SharedBarrierInjector::new();
+        inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1"));
+        inj.enqueue(make_checkpoint_barrier("job", 1, "cp-1-dup"));
+        inj.enqueue(make_checkpoint_barrier("job", 2, "cp-2"));
+        assert_eq!(inj.next_barrier().unwrap().epoch, 1);
+        assert!(inj.next_barrier().is_none());
         assert_eq!(inj.next_barrier().unwrap().epoch, 2);
     }
 }

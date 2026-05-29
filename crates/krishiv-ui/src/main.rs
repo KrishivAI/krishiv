@@ -53,7 +53,9 @@ impl ServerConfig {
                 }
                 "--demo" => demo = true,
                 "--help" | "-h" => help = true,
-                unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help()).into()),
+                unknown => {
+                    return Err(format!("unknown option: {unknown}\n\n{}", Self::help()).into());
+                }
             }
         }
 

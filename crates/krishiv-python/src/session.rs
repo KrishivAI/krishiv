@@ -343,12 +343,7 @@ impl PySession {
 
     /// Create an unbounded streaming DataFrame backed by a named source.
     pub fn from_source(&self, name: String) -> PyResult<PyRelation> {
-        let mut pipeline = StreamPipeline::new(
-            self.inner.clone(),
-            name,
-            String::new(),
-            0,
-        );
+        let mut pipeline = StreamPipeline::new(self.inner.clone(), name, String::new(), 0);
         pipeline.bounded = false;
         Ok(PyRelation::from_pipeline(pipeline))
     }
@@ -372,7 +367,10 @@ impl PySession {
             .map(|(seq, b)| StreamBatch::new(seq as u64, b))
             .collect();
         self.inner
-            .register_memory_stream(name.clone(), stream_batches.iter().map(|sb| sb.batch().clone()).collect())
+            .register_memory_stream(
+                name.clone(),
+                stream_batches.iter().map(|sb| sb.batch().clone()).collect(),
+            )
             .map_err(map_krishiv_error)?;
         let pipeline = StreamPipeline {
             session: self.inner.clone(),

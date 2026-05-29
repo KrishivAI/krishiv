@@ -307,11 +307,7 @@ impl MemoryLakehouseTable {
     /// Return a snapshot of the currently active partition fields.
     #[doc = "**Beta API**: may change between minor releases."]
     pub async fn active_partition_fields(&self) -> Vec<PartitionField> {
-        self.partition_spec
-            .lock()
-            .await
-            .active_fields()
-            .to_vec()
+        self.partition_spec.lock().await.active_fields().to_vec()
     }
 
     /// Atomically verify the guard's expected snapshot and append batches.

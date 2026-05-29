@@ -13,11 +13,11 @@ use crate::ids::{
 };
 use crate::lifecycle::{ExecutorState, TaskState};
 use crate::task::{
-    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment,
-    InputPartition, InputPartitionDescriptor, MemoryKafkaRecord,
-    OutputContract, OutputContractDescriptor, OutputContractKind, PlanFragment,
-    RegisterExecutorRequest, RegisterExecutorResponse, TaskAttemptRef, TaskCancellationRequest,
-    TaskStatusRequest, TaskStatusResponse, TransportDisposition,
+    ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorTaskAssignment, InputPartition,
+    InputPartitionDescriptor, MemoryKafkaRecord, OutputContract, OutputContractDescriptor,
+    OutputContractKind, PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse,
+    TaskAttemptRef, TaskCancellationRequest, TaskStatusRequest, TaskStatusResponse,
+    TransportDisposition,
 };
 
 pub mod v1 {
@@ -1164,11 +1164,9 @@ pub fn checkpoint_ack_response_from_wire(
             current_epoch: s.current_epoch,
         }),
         Some(WireVariant::JobNotFound(_)) => Ok(CheckpointAckResponse::JobNotFound),
-        Some(WireVariant::StaleFencingToken(s)) => {
-            Ok(CheckpointAckResponse::StaleFencingToken {
-                current_token: s.current_token,
-            })
-        }
+        Some(WireVariant::StaleFencingToken(s)) => Ok(CheckpointAckResponse::StaleFencingToken {
+            current_token: s.current_token,
+        }),
         None => Err(WireError::new(
             "missing required field `checkpoint_ack_response.result`",
         )),

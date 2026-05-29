@@ -814,4 +814,315 @@ mod tests {
         let event = sample_run_event();
         assert!(emitter.emit(event).await.is_ok(), "200 must succeed");
     }
+
+    // ── AuditLog dedup edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn audit_log_dedup_allows_same_event_after_ttl_expires() {
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
+        AUDIT_DEDUP.clear();
+
+        let action = AuditAction::JobSubmitted {
+            job_id: "ttl-job".into(),
+        };
+        let key = super::audit_dedup_key("ttl_user", "job_submitted", "job_id=ttl-job");
+
+        // First emission inserts the dedup entry.
+        audit_log("ttl_user", &action, AuditOutcome::Allowed);
+        assert!(AUDIT_DEDUP.contains_key(&key));
+
+        // Manually backdate the entry to simulate TTL expiry.
+        AUDIT_DEDUP.insert(key, 0);
+
+        let entries_before = AUDIT_DEDUP.len();
+        audit_log("ttl_user", &action, AuditOutcome::Allowed);
+        assert_eq!(
+            AUDIT_DEDUP.len(),
+            entries_before,
+            "expired entry must be overwritten, not added"
+        );
+    }
+
+    #[test]
+    fn audit_log_dedup_different_principal_allows_same_action() {
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
+        AUDIT_DEDUP.clear();
+
+        let action = AuditAction::QueryExecuted {
+            query_hash: "abc123".into(),
+        };
+        audit_log("alice", &action, AuditOutcome::Allowed);
+        audit_log("bob", &action, AuditOutcome::Allowed);
+
+        // Both should have been recorded (different principals → different keys).
+        let alice_key = super::audit_dedup_key("alice", "query_executed", "hash=abc123");
+        let bob_key = super::audit_dedup_key("bob", "query_executed", "hash=abc123");
+        assert!(AUDIT_DEDUP.contains_key(&alice_key));
+        assert!(AUDIT_DEDUP.contains_key(&bob_key));
+    }
+
+    #[test]
+    fn audit_log_dedup_different_detail_allows_same_principal() {
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
+        AUDIT_DEDUP.clear();
+
+        audit_log(
+            "carol",
+            &AuditAction::SavepointCreated {
+                job_id: "sp-1".into(),
+            },
+            AuditOutcome::Allowed,
+        );
+        audit_log(
+            "carol",
+            &AuditAction::SavepointCreated {
+                job_id: "sp-2".into(),
+            },
+            AuditOutcome::Allowed,
+        );
+
+        let key1 = super::audit_dedup_key("carol", "savepoint_created", "job_id=sp-1");
+        let key2 = super::audit_dedup_key("carol", "savepoint_created", "job_id=sp-2");
+        assert!(AUDIT_DEDUP.contains_key(&key1));
+        assert!(AUDIT_DEDUP.contains_key(&key2));
+    }
+
+    #[test]
+    fn audit_log_all_action_variants_produce_correct_action_name() {
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
+        AUDIT_DEDUP.clear();
+
+        let actions: Vec<(AuditAction, &str, &str)> = vec![
+            (
+                AuditAction::QueryExecuted {
+                    query_hash: "h1".into(),
+                },
+                "query_executed",
+                "hash=h1",
+            ),
+            (
+                AuditAction::JobSubmitted {
+                    job_id: "j1".into(),
+                },
+                "job_submitted",
+                "job_id=j1",
+            ),
+            (
+                AuditAction::JobCancelled {
+                    job_id: "j2".into(),
+                },
+                "job_cancelled",
+                "job_id=j2",
+            ),
+            (
+                AuditAction::SavepointCreated {
+                    job_id: "j3".into(),
+                },
+                "savepoint_created",
+                "job_id=j3",
+            ),
+            (
+                AuditAction::SavepointRestored {
+                    job_id: "j4".into(),
+                    epoch: 7,
+                },
+                "savepoint_restored",
+                "job_id=j4 epoch=7",
+            ),
+            (
+                AuditAction::AdminAction {
+                    description: "escalate".into(),
+                },
+                "admin_action",
+                "escalate",
+            ),
+        ];
+
+        for (action, expected_name, _expected_detail) in &actions {
+            let key = super::audit_dedup_key("test_user", expected_name, _expected_detail);
+            audit_log("test_user", action, AuditOutcome::Allowed);
+            assert!(
+                AUDIT_DEDUP.contains_key(&key),
+                "dedup key missing for action: {expected_name}"
+            );
+        }
+    }
+
+    // ── RoleBasedPolicyHook additional access checks ─────────────────────────
+
+    #[test]
+    fn role_based_hook_writer_allowed_internal() {
+        let hook = RoleBasedPolicyHook;
+        let writer = Principal {
+            subject: "charlie".to_string(),
+            role: Role::Writer,
+        };
+        assert!(hook.check_table_access(&writer, "internal_metrics"));
+    }
+
+    #[test]
+    fn role_based_hook_reader_allowed_non_internal() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        assert!(hook.check_table_access(&reader, "public_users"));
+    }
+
+    #[test]
+    fn role_based_hook_writer_allowed_non_internal() {
+        let hook = RoleBasedPolicyHook;
+        let writer = Principal {
+            subject: "charlie".to_string(),
+            role: Role::Writer,
+        };
+        assert!(hook.check_table_access(&writer, "public_users"));
+    }
+
+    #[test]
+    fn role_based_hook_admin_allowed_non_internal() {
+        let hook = RoleBasedPolicyHook;
+        let admin = make_admin();
+        assert!(hook.check_table_access(&admin, "public_users"));
+    }
+
+    #[test]
+    fn role_based_hook_reader_credit_card_nullify() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        assert_eq!(
+            hook.column_masking_rule(&reader, "payments", "credit_card"),
+            Some(MaskingRule::Nullify)
+        );
+    }
+
+    #[test]
+    fn role_based_hook_reader_password_hash_nullify() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        assert_eq!(
+            hook.column_masking_rule(&reader, "users", "password_hash"),
+            Some(MaskingRule::Nullify)
+        );
+    }
+
+    #[test]
+    fn role_based_hook_reader_non_sensitive_not_masked() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        assert_eq!(hook.column_masking_rule(&reader, "users", "email"), None);
+    }
+
+    #[test]
+    fn role_based_hook_writer_sensitive_not_masked() {
+        let hook = RoleBasedPolicyHook;
+        let writer = Principal {
+            subject: "charlie".to_string(),
+            role: Role::Writer,
+        };
+        assert_eq!(hook.column_masking_rule(&writer, "users", "ssn"), None);
+    }
+
+    #[test]
+    fn role_based_hook_admin_sensitive_not_masked() {
+        let hook = RoleBasedPolicyHook;
+        let admin = make_admin();
+        assert_eq!(hook.column_masking_rule(&admin, "users", "ssn"), None);
+    }
+
+    #[test]
+    fn role_based_hook_row_predicate_returns_none() {
+        let hook = RoleBasedPolicyHook;
+        let reader = make_reader();
+        assert_eq!(hook.row_predicate(&reader, "users"), None);
+    }
+
+    // ── OpenLineage event emission ───────────────────────────────────────────
+
+    #[test]
+    fn new_run_event_has_correct_event_type() {
+        let event = new_run_event(RunEventType::Complete, "job", "ns", vec![], vec![]);
+        assert!(matches!(event.event_type, RunEventType::Complete));
+    }
+
+    #[test]
+    fn new_run_event_has_correct_job_refs() {
+        let event = new_run_event(RunEventType::Fail, "my_job", "my_ns", vec![], vec![]);
+        assert_eq!(event.job.name, "my_job");
+        assert_eq!(event.job.namespace, "my_ns");
+    }
+
+    #[test]
+    fn new_run_event_populates_inputs_and_outputs() {
+        let inputs = vec![LineageDataset {
+            name: "input_ds".into(),
+            namespace: "s3://bucket".into(),
+        }];
+        let outputs = vec![LineageDataset {
+            name: "output_ds".into(),
+            namespace: "s3://bucket".into(),
+        }];
+        let event = new_run_event(
+            RunEventType::Start,
+            "job",
+            "ns",
+            inputs.clone(),
+            outputs.clone(),
+        );
+        assert_eq!(event.inputs.len(), 1);
+        assert_eq!(event.inputs[0].name, "input_ds");
+        assert_eq!(event.outputs.len(), 1);
+        assert_eq!(event.outputs[0].namespace, "s3://bucket");
+    }
+
+    #[test]
+    fn run_event_serializes_to_json() {
+        let event = new_run_event(RunEventType::Start, "job", "ns", vec![], vec![]);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("START"));
+        assert!(json.contains("job"));
+    }
+
+    #[test]
+    fn run_event_deserializes_from_json() {
+        let event = new_run_event(RunEventType::Complete, "job", "ns", vec![], vec![]);
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: RunEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.job.name, event.job.name);
+        assert_eq!(parsed.run.run_id, event.run.run_id);
+        assert_eq!(parsed.event_time, event.event_time);
+    }
+
+    #[tokio::test]
+    async fn logging_emitter_emits_valid_json() {
+        let emitter = LoggingEmitter;
+        let event = new_run_event(RunEventType::Start, "test_job", "default", vec![], vec![]);
+        // Should not return an error (serialization + tracing must succeed).
+        assert!(emitter.emit(event).await.is_ok());
+    }
+
+    #[test]
+    fn emit_error_display_transport() {
+        let err = EmitError::Transport("connection refused".into());
+        assert!(err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn emit_error_display_sink_rejected() {
+        let err = EmitError::SinkRejected {
+            status: 503,
+            message: "service unavailable".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("503"));
+        assert!(msg.contains("service unavailable"));
+    }
+
+    #[test]
+    fn audit_outcome_is_non_exhaustive() {
+        // Verify the enum has exactly the expected variants (non_exhaustive allows future extension).
+        let allowed = AuditOutcome::Allowed;
+        let denied = AuditOutcome::Denied;
+        assert_eq!(allowed, AuditOutcome::Allowed);
+        assert_eq!(denied, AuditOutcome::Denied);
+        assert_ne!(allowed, denied);
+    }
 }

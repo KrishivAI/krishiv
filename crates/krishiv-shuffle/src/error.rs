@@ -89,10 +89,7 @@ pub fn shuffle_read_lock<T>(
 /// Create a [`ShuffleError::Io`] from a string message by wrapping it in a
 /// custom `std::io::Error`.
 pub fn io_err(msg: impl Into<String>) -> ShuffleError {
-    ShuffleError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        msg.into(),
-    ))
+    ShuffleError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg.into()))
 }
 
 /// Maximum shuffle ticket line length (P3-3).

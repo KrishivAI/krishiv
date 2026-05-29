@@ -73,18 +73,15 @@ mod tests {
 
     #[test]
     fn chunk_operator_produces_rows_per_chunk() {
-        let chunker: Arc<dyn krishiv_ai::TextChunker> =
-            Arc::new(RecursiveTextChunker::new(20, 0));
+        let chunker: Arc<dyn krishiv_ai::TextChunker> = Arc::new(RecursiveTextChunker::new(20, 0));
         let op = ChunkOperator::new(chunker, "text");
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "text",
-            DataType::Utf8,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(StringArray::from(vec!["hello world this is a test"]))],
+            vec![Arc::new(StringArray::from(vec![
+                "hello world this is a test",
+            ]))],
         )
         .unwrap();
 
@@ -97,20 +94,12 @@ mod tests {
 
     #[test]
     fn chunk_operator_missing_column_returns_error() {
-        let chunker: Arc<dyn krishiv_ai::TextChunker> =
-            Arc::new(RecursiveTextChunker::new(20, 0));
+        let chunker: Arc<dyn krishiv_ai::TextChunker> = Arc::new(RecursiveTextChunker::new(20, 0));
         let op = ChunkOperator::new(chunker, "missing_col");
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "text",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["hello"]))],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
 
         let result = op.execute(&batch);
         assert!(result.is_err(), "missing column must return error");

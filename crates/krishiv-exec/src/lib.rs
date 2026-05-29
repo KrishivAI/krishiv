@@ -140,9 +140,9 @@ pub mod queue;
 pub mod schema_normalize;
 pub mod side_output;
 pub mod temporal_join;
-pub mod watermark_util;
 #[cfg(test)]
 pub mod watermark_e2e;
+pub mod watermark_util;
 pub mod window;
 
 pub use chunk::ChunkOperator;
@@ -556,9 +556,20 @@ mod tests {
         ];
         let state = AggState::new(&exprs);
         // No updates → empty group.
-        assert_eq!(state.finalized_value(0, &exprs[0]), i64::MAX, "Min on empty group should be i64::MAX");
-        assert_eq!(state.finalized_value(1, &exprs[1]), i64::MIN, "Max on empty group should be i64::MIN");
-        assert!(state.finalized_avg(2).is_nan(), "Avg on empty group should be NaN");
+        assert_eq!(
+            state.finalized_value(0, &exprs[0]),
+            i64::MAX,
+            "Min on empty group should be i64::MAX"
+        );
+        assert_eq!(
+            state.finalized_value(1, &exprs[1]),
+            i64::MIN,
+            "Max on empty group should be i64::MIN"
+        );
+        assert!(
+            state.finalized_avg(2).is_nan(),
+            "Avg on empty group should be NaN"
+        );
     }
 
     #[test]
@@ -771,7 +782,10 @@ mod tests {
             .downcast_ref::<arrow::array::Float64Array>()
             .unwrap()
             .value(0);
-        assert!((avg - 20.0).abs() < 1e-9, "avg of 10,20,30 should be 20, got {avg}");
+        assert!(
+            (avg - 20.0).abs() < 1e-9,
+            "avg of 10,20,30 should be 20, got {avg}"
+        );
         assert_eq!(
             output[0].schema().field(3).data_type(),
             &DataType::Float64,
@@ -1073,8 +1087,16 @@ mod tests {
                 &DataType::Float64,
                 "Avg output column must be Float64"
             );
-            let avg = b.column(3).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap().value(0);
-            assert!((avg - 20.0).abs() < 1e-9, "avg of 10,30 should be 20, got {avg}");
+            let avg = b
+                .column(3)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .value(0);
+            assert!(
+                (avg - 20.0).abs() < 1e-9,
+                "avg of 10,30 should be 20, got {avg}"
+            );
         }
     }
 
@@ -1525,5 +1547,194 @@ mod tests {
             rows_per_second: None,
         };
         assert!(clear.rows_per_second.is_none());
+    }
+
+    // ── IntervalJoinState tests ──────────────────────────────────────────────
+
+    use super::interval_join::{IntervalJoinSpec, IntervalJoinState};
+
+    fn make_interval_batch(col_name: &str, values: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            col_name,
+            DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+    }
+
+    #[test]
+    fn interval_join_basic_match() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        // left event at t=1000
+        let left = make_interval_batch("lv", vec![1]);
+        state.push_left(1000, left.clone());
+
+        // right event at t=1050 → delta=50, within [-100,100]
+        let right = make_interval_batch("rv", vec![2]);
+        let matches = state.push_right(1050, right);
+        assert_eq!(matches.len(), 1);
+        // left batch in match should equal the original left
+        assert_eq!(matches[0].0.schema(), left.schema());
+        assert_eq!(matches[0].0.num_rows(), 1);
+    }
+
+    #[test]
+    fn interval_join_empty_right_produces_no_match() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        // push left with no right events buffered
+        let left = make_interval_batch("lv", vec![1]);
+        let matches = state.push_left(1000, left);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn interval_join_empty_left_produces_no_match() {
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -100,
+            upper_bound_ms: 100,
+        });
+        let right = make_interval_batch("rv", vec![1]);
+        let matches = state.push_right(1000, right);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn interval_join_schema_mismatch_still_joins() {
+        // Left and right have different schemas — interval join is on event time,
+        // not column names, so both RecordBatches pass through untouched.
+        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+            lower_bound_ms: -50,
+            upper_bound_ms: 50,
+        });
+
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, false),
+        ]));
+        let left = RecordBatch::try_new(
+            left_schema.clone(),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["hello"])),
+            ],
+        )
+        .unwrap();
+        state.push_left(1000, left.clone());
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("score", DataType::Float64, false),
+        ]));
+        let right = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1000_i64])),
+                Arc::new(arrow::array::Float64Array::from(vec![3.14])),
+            ],
+        )
+        .unwrap();
+        let matches = state.push_right(1020, right);
+
+        assert_eq!(matches.len(), 1);
+        // Verify schemas are preserved from each side
+        assert_eq!(matches[0].0.schema(), left_schema);
+        assert_eq!(matches[0].1.schema(), right_schema);
+    }
+
+    // ── SchemaNormalizeOperator tests (in lib.rs) ───────────────────────────
+
+    use super::schema_normalize::SchemaNormalizeOperator;
+
+    #[test]
+    fn schema_normalize_add_column() {
+        let src = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(src, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+
+        let target = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let out = SchemaNormalizeOperator::new(target)
+            .normalize(&batch)
+            .unwrap();
+
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.schema().field(1).name(), "name");
+        // New column should be all nulls
+        assert_eq!(out.column(1).null_count(), 3);
+    }
+
+    #[test]
+    fn schema_normalize_remove_column() {
+        let src = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            src,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![3])),
+            ],
+        )
+        .unwrap();
+
+        // Target keeps only "a" and "c", drops "b"
+        let target = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]));
+        let out = SchemaNormalizeOperator::new(target)
+            .normalize(&batch)
+            .unwrap();
+
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.schema().field(0).name(), "a");
+        assert_eq!(out.schema().field(1).name(), "c");
+        let a_col = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a_col.value(0), 1);
+        let c_col = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(c_col.value(0), 3);
+    }
+
+    #[test]
+    fn schema_normalize_reorder_columns() {
+        let src = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            src,
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![20])),
+            ],
+        )
+        .unwrap();
+
+        // Target reverses the column order: y before x
+        let target = Arc::new(Schema::new(vec![
+            Field::new("y", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+        ]));
+        let out = SchemaNormalizeOperator::new(target)
+            .normalize(&batch)
+            .unwrap();
+
+        assert_eq!(out.schema().field(0).name(), "y");
+        assert_eq!(out.schema().field(1).name(), "x");
+        let y_col = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(y_col.value(0), 20);
+        let x_col = out.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(x_col.value(0), 10);
     }
 }

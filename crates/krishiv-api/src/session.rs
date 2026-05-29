@@ -749,7 +749,11 @@ impl Session {
     }
 
     /// Create a bounded local memory stream.
-    pub fn memory_stream(&self, name: impl Into<String>, batches: Vec<StreamBatch>) -> Result<Stream> {
+    pub fn memory_stream(
+        &self,
+        name: impl Into<String>,
+        batches: Vec<StreamBatch>,
+    ) -> Result<Stream> {
         let name = name.into();
         let record_batches: Vec<RecordBatch> = batches.iter().map(|b| b.batch().clone()).collect();
         self.register_memory_stream(name.clone(), record_batches)?;

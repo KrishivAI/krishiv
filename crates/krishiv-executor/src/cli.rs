@@ -16,8 +16,8 @@ use axum::Router;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use dashmap::DashMap;
+use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
 use krishiv_state::RedbStateBackend;
@@ -258,7 +258,7 @@ async fn heartbeat_loop(
         // Start the shuffle Flight server on a kernel-chosen port and advertise it.
         let bind: SocketAddr = "0.0.0.0:0"
             .parse()
-            .expect("0.0.0.0:0 is a valid socket address");
+            .map_err(|e| format!("failed to parse shuffle bind address: {e}"))?;
         let (local_addr, _server_handle) = krishiv_shuffle::flight::serve(bind, Arc::clone(&disk))
             .await
             .map_err(|e| format!("shuffle flight server: {e}"))?;
@@ -563,9 +563,11 @@ impl ExecutorCliConfig {
                     config.checkpoint_uri = next_arg(&mut args, "--checkpoint-uri")?;
                 }
                 "--help" | "-h" => config.help = true,
-                unknown => return Err(crate::ExecutorError::LocalExecution {
-                    message: format!("unknown option: {unknown}\n\n{}", Self::help()),
-                }),
+                unknown => {
+                    return Err(crate::ExecutorError::LocalExecution {
+                        message: format!("unknown option: {unknown}\n\n{}", Self::help()),
+                    });
+                }
             }
         }
 
@@ -596,9 +598,7 @@ impl ExecutorCliConfig {
     fn set_mode(&mut self, mode: ExecutorMode) -> crate::ExecutorResult<()> {
         if self.mode != ExecutorMode::DryRun && self.mode != mode {
             return Err(crate::ExecutorError::LocalExecution {
-                message: String::from(
-                    "--register-once and --connect are mutually exclusive",
-                ),
+                message: String::from("--register-once and --connect are mutually exclusive"),
             });
         }
         self.mode = mode;
@@ -687,5 +687,201 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn parses_help_flag() {
+        let config = ExecutorCliConfig::parse([String::from("--help")]).unwrap();
+        assert!(config.help);
+    }
+
+    #[test]
+    fn parses_short_help_flag() {
+        let config = ExecutorCliConfig::parse([String::from("-h")]).unwrap();
+        assert!(config.help);
+    }
+
+    #[test]
+    fn default_config_from_empty_args() {
+        let config = ExecutorCliConfig::parse(std::iter::empty::<String>()).unwrap();
+        assert_eq!(config.executor_id, "exec-local");
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.slots, 1);
+        assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:8080");
+        assert_eq!(config.mode, ExecutorMode::DryRun);
+        assert_eq!(config.heartbeat_interval_secs, 10);
+        assert!(!config.help);
+    }
+
+    #[test]
+    fn parses_custom_slots() {
+        let config =
+            ExecutorCliConfig::parse([String::from("--slots"), String::from("8")]).unwrap();
+        assert_eq!(config.slots, 8);
+    }
+
+    #[test]
+    fn rejects_non_numeric_slots() {
+        let err =
+            ExecutorCliConfig::parse([String::from("--slots"), String::from("abc")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--slots must be a positive integer")
+        );
+    }
+
+    #[test]
+    fn parses_http_addr() {
+        let config =
+            ExecutorCliConfig::parse([String::from("--http-addr"), String::from("127.0.0.1:9090")])
+                .unwrap();
+        assert_eq!(config.http_addr, Some("127.0.0.1:9090".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_invalid_http_addr() {
+        let err =
+            ExecutorCliConfig::parse([String::from("--http-addr"), String::from("not-a-port")])
+                .unwrap_err();
+        assert!(err.to_string().contains("invalid socket address"));
+    }
+
+    #[test]
+    fn parses_task_grpc_addr() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--task-grpc-addr"),
+            String::from("0.0.0.0:50099"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.task_grpc_addr,
+            Some("0.0.0.0:50099".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn task_grpc_addr_off_disables() {
+        let config =
+            ExecutorCliConfig::parse([String::from("--task-grpc-addr"), String::from("off")])
+                .unwrap();
+        assert!(config.task_grpc_addr.is_none());
+    }
+
+    #[test]
+    fn parses_barrier_grpc_addr() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--barrier-grpc-addr"),
+            String::from("0.0.0.0:50098"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.barrier_grpc_addr,
+            Some("0.0.0.0:50098".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn barrier_grpc_addr_off_disables() {
+        let config =
+            ExecutorCliConfig::parse([String::from("--barrier-grpc-addr"), String::from("off")])
+                .unwrap();
+        assert!(config.barrier_grpc_addr.is_none());
+    }
+
+    #[test]
+    fn parses_heartbeat_interval() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--heartbeat-interval-secs"),
+            String::from("5"),
+        ])
+        .unwrap();
+        assert_eq!(config.heartbeat_interval_secs, 5);
+    }
+
+    #[test]
+    fn rejects_zero_heartbeat_interval() {
+        let err = ExecutorCliConfig::parse([
+            String::from("--heartbeat-interval-secs"),
+            String::from("0"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--heartbeat-interval-secs must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_heartbeat_interval() {
+        let err = ExecutorCliConfig::parse([
+            String::from("--heartbeat-interval-secs"),
+            String::from("xyz"),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--heartbeat-interval-secs must be a positive integer")
+        );
+    }
+
+    #[test]
+    fn parses_shuffle_dir() {
+        let config =
+            ExecutorCliConfig::parse([String::from("--shuffle-dir"), String::from("/tmp/shuffle")])
+                .unwrap();
+        assert_eq!(
+            config.shuffle_dir,
+            Some(std::path::PathBuf::from("/tmp/shuffle"))
+        );
+    }
+
+    #[test]
+    fn shuffle_dir_empty_string_errors() {
+        // Empty string after --shuffle-dir is treated as missing value
+        let err = ExecutorCliConfig::parse([String::from("--shuffle-dir"), String::from("")])
+            .unwrap_err();
+        assert!(err.to_string().contains("missing value for --shuffle-dir"));
+    }
+
+    #[test]
+    fn parses_checkpoint_uri() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--checkpoint-uri"),
+            String::from("s3://bucket/prefix"),
+        ])
+        .unwrap();
+        assert_eq!(config.checkpoint_uri, "s3://bucket/prefix");
+    }
+
+    #[test]
+    fn default_checkpoint_uri() {
+        let config = ExecutorCliConfig::parse(std::iter::empty::<String>()).unwrap();
+        assert_eq!(config.checkpoint_uri, "file:///tmp/krishiv-checkpoints");
+    }
+
+    #[test]
+    fn executor_cli_help_is_nonempty() {
+        let help = ExecutorCliConfig::help();
+        assert!(!help.is_empty());
+        assert!(help.contains("--executor-id"));
+        assert!(help.contains("--slots"));
+        assert!(help.contains("--connect"));
+    }
+
+    #[test]
+    fn rejects_missing_value_for_flag() {
+        let err = ExecutorCliConfig::parse([String::from("--executor-id")]).unwrap_err();
+        assert!(err.to_string().contains("missing value for"));
+    }
+
+    #[test]
+    fn rejects_extra_positional_argument() {
+        let err = ExecutorCliConfig::parse([
+            String::from("--executor-id"),
+            String::from("e1"),
+            String::from("extra-positional"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown option"));
     }
 }

@@ -292,15 +292,19 @@ pub(crate) async fn read_shuffle_flight_partitions(
                 Some(_) | None => continue,
             };
 
-        let batches =
-            FlightShuffleClient::fetch(&flight_endpoint, job_id.as_str(), upstream_stage_id.as_str(), partition_id)
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: format!(
-                        "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
+        let batches = FlightShuffleClient::fetch(
+            &flight_endpoint,
+            job_id.as_str(),
+            upstream_stage_id.as_str(),
+            partition_id,
+        )
+        .await
+        .map_err(|e| ExecutorError::LocalExecution {
+            message: format!(
+                "shuffle-flight fetch failed (endpoint={flight_endpoint} job={job_id} \
                  stage={upstream_stage_id} partition={partition_id}): {e}"
-                    ),
-                })?;
+            ),
+        })?;
         table_batches.entry(table_name).or_default().extend(batches);
     }
 

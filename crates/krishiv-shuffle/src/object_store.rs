@@ -128,8 +128,9 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             .map_err(|e| crate::error::io_err(e.to_string()))?;
 
         let mut buf = Vec::new();
-        let mut writer = StreamWriter::try_new_with_options(&mut buf, &partition.schema, write_options)
-            .map_err(|e| crate::error::io_err(e.to_string()))?;
+        let mut writer =
+            StreamWriter::try_new_with_options(&mut buf, &partition.schema, write_options)
+                .map_err(|e| crate::error::io_err(e.to_string()))?;
         for batch in &partition.batches {
             writer
                 .write(batch)

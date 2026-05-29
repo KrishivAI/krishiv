@@ -123,7 +123,9 @@ impl RedbStateBackend {
     }
 }
 
-fn db_err(e: impl std::fmt::Display + std::fmt::Debug + Send + Sync + std::error::Error + 'static) -> StateError {
+fn db_err(
+    e: impl std::fmt::Display + std::fmt::Debug + Send + Sync + std::error::Error + 'static,
+) -> StateError {
     StateError::BackendUnavailable {
         message: e.to_string(),
         source: Some(Box::new(e)),

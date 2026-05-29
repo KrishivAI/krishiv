@@ -77,8 +77,10 @@ impl PyRelation {
             RelationKind::Batch(df) => df.collect().map_err(map_krishiv_error),
             RelationKind::Stream(pipeline) => {
                 let py_batches = execute_pipeline(pipeline)?;
-                let batches: Vec<arrow::record_batch::RecordBatch> =
-                    py_batches.into_iter().map(|b| b.record_batch().clone()).collect();
+                let batches: Vec<arrow::record_batch::RecordBatch> = py_batches
+                    .into_iter()
+                    .map(|b| b.record_batch().clone())
+                    .collect();
                 Ok(krishiv_api::QueryResult::new(batches))
             }
         }
@@ -118,7 +120,9 @@ impl PyRelation {
                 p.source_id,
                 p.key_columns,
                 p.max_lateness_ms,
-                p.window.as_ref().map(|w| format!("{:?}({} ms)", w.kind, w.size_ms)),
+                p.window
+                    .as_ref()
+                    .map(|w| format!("{:?}({} ms)", w.kind, w.size_ms)),
             )),
         }
     }
@@ -128,7 +132,9 @@ impl PyRelation {
     /// Set the watermark column and allowed lateness in milliseconds.
     /// Returns a new streaming DataFrame.
     pub fn watermark(&self, column: String, max_lateness_ms: u64) -> PyResult<PyRelation> {
-        let pipeline = self.ensure_stream("watermark")?.with_watermark(column, max_lateness_ms);
+        let pipeline = self
+            .ensure_stream("watermark")?
+            .with_watermark(column, max_lateness_ms);
         Ok(PyRelation::from_pipeline(pipeline))
     }
 
@@ -171,7 +177,7 @@ impl PyRelation {
             other => {
                 return Err(PyRuntimeError::new_err(format!(
                     "Unknown window kind '{other}'. Use 'tumbling', 'sliding', or 'session'."
-                )))
+                )));
             }
         };
         let mut pipeline = p.clone();
@@ -211,11 +217,7 @@ impl PyRelation {
     ///
     /// Call once per source before `.collect()`. Each source uses its own lag;
     /// the effective watermark is the minimum across all registered sources.
-    pub fn with_source_watermark(
-        &self,
-        source_id: String,
-        lag_ms: u64,
-    ) -> PyResult<PyRelation> {
+    pub fn with_source_watermark(&self, source_id: String, lag_ms: u64) -> PyResult<PyRelation> {
         let p = self.ensure_stream("with_source_watermark")?;
         let pipeline = p.with_source_watermark(source_id, lag_ms);
         Ok(PyRelation::from_pipeline(pipeline))
@@ -225,9 +227,7 @@ impl PyRelation {
 
     /// Collect results into a `QueryResult`.
     pub fn collect(&self, py: Python<'_>) -> PyResult<PyQueryResult> {
-        py.detach(|| {
-            self.collect_internal().map(PyQueryResult::new)
-        })
+        py.detach(|| self.collect_internal().map(PyQueryResult::new))
     }
 
     /// Print up to `n` rows as an ASCII table.

@@ -300,11 +300,7 @@ impl CheckpointCoordinator {
         // write_epoch_hint is safe: the next call to `latest_valid_epoch` falls
         // back to `list_valid_epochs`, which will find the sealed epoch via its
         // manifest file.
-        write_epoch_hint(
-            self.storage.as_ref(),
-            self.job_id.as_str(),
-            epoch,
-        )?;
+        write_epoch_hint(self.storage.as_ref(), self.job_id.as_str(), epoch)?;
 
         self.state = CheckpointCoordinatorState::Committed { epoch };
         self.pending_is_savepoint = false;

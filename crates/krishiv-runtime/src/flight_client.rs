@@ -288,6 +288,11 @@ pub(crate) async fn do_action(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+
     use super::*;
 
     #[test]
@@ -308,5 +313,155 @@ mod tests {
         let sql = plan_to_sql(&plan);
         assert!(sql.contains("krishiv-stream"));
         assert!(sql.contains("streaming_accepted"));
+    }
+
+    #[test]
+    fn plan_to_sql_uses_from_verbatim() {
+        let plan = PhysicalPlan::new("FROM users SELECT *", ExecutionKind::Batch);
+        assert_eq!(plan_to_sql(&plan), "FROM users SELECT *");
+    }
+
+    #[test]
+    fn plan_to_sql_uppercase_select() {
+        let plan = PhysicalPlan::new("SELECT 1", ExecutionKind::Batch);
+        assert_eq!(plan_to_sql(&plan), "SELECT 1");
+    }
+
+    #[test]
+    fn plan_to_sql_batch_with_from_keyword_case_insensitive() {
+        let plan = PhysicalPlan::new("from table1 select *", ExecutionKind::Batch);
+        assert_eq!(plan_to_sql(&plan), "from table1 select *");
+    }
+
+    #[test]
+    fn plan_to_sql_streaming_escapes_single_quotes() {
+        let plan = PhysicalPlan::new("it's a stream", ExecutionKind::Streaming);
+        let sql = plan_to_sql(&plan);
+        assert!(sql.contains("it''s a stream"));
+    }
+
+    #[test]
+    fn plan_to_sql_streaming_escapes_comment_close() {
+        let plan = PhysicalPlan::new("bad*/name", ExecutionKind::Streaming);
+        let sql = plan_to_sql(&plan);
+        assert!(sql.contains("* /"));
+        assert!(!sql.contains("*/name"));
+    }
+
+    #[test]
+    fn plan_to_sql_empty_batch_name() {
+        let plan = PhysicalPlan::new("", ExecutionKind::Batch);
+        let sql = plan_to_sql(&plan);
+        assert!(sql.contains("SELECT '' AS plan_name"));
+    }
+
+    #[test]
+    fn normalize_flight_endpoint_empty_fails() {
+        let err = normalize_flight_endpoint("").unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn normalize_flight_endpoint_whitespace_only_fails() {
+        let err = normalize_flight_endpoint("   ").unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn normalize_flight_endpoint_http_unchanged() {
+        let result = normalize_flight_endpoint("http://localhost:50051").unwrap();
+        assert_eq!(result, "http://localhost:50051");
+    }
+
+    #[test]
+    fn normalize_flight_endpoint_https_unchanged() {
+        let result = normalize_flight_endpoint("https://cluster.example.com").unwrap();
+        assert_eq!(result, "https://cluster.example.com");
+    }
+
+    #[test]
+    fn normalize_flight_endpoint_bare_adds_http() {
+        let result = normalize_flight_endpoint("localhost:50051").unwrap();
+        assert_eq!(result, "http://localhost:50051");
+    }
+
+    #[test]
+    fn normalize_flight_endpoint_trims_whitespace() {
+        let result = normalize_flight_endpoint("  http://localhost:50051  ").unwrap();
+        assert_eq!(result, "http://localhost:50051");
+    }
+
+    #[test]
+    fn flight_explain_from_batches_extracts_strings() {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "plan",
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                "SeqScan(users)",
+                "Filter(x > 5)",
+            ])) as _],
+        )
+        .unwrap();
+        let result = flight_explain_from_batches(&[batch]);
+        assert_eq!(result, "SeqScan(users)\nFilter(x > 5)");
+    }
+
+    #[test]
+    fn flight_explain_from_batches_empty_returns_placeholder() {
+        let result = flight_explain_from_batches(&[]);
+        assert_eq!(result, "(no explain output)");
+    }
+
+    #[test]
+    fn flight_explain_from_batches_all_null() {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "plan",
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )]));
+        let arr = arrow::array::StringArray::from(vec![None::<&str>]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr) as _]).unwrap();
+        let result = flight_explain_from_batches(&[batch]);
+        assert_eq!(result, "(no explain output)");
+    }
+
+    #[test]
+    fn decode_ipc_response_empty_returns_empty() {
+        let result = decode_ipc_response(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_ipc_response_invalid_data() {
+        let err = decode_ipc_response(b"not ipc data").unwrap_err();
+        assert!(matches!(err, RuntimeError::Transport { .. }));
+    }
+
+    #[test]
+    fn is_unimplemented_matches_unimplemented() {
+        let err = RuntimeError::transport("Unimplemented: method not found");
+        assert!(is_unimplemented(&err));
+    }
+
+    #[test]
+    fn is_unimplemented_matches_invalid() {
+        let err = RuntimeError::transport("invalid argument");
+        assert!(is_unimplemented(&err));
+    }
+
+    #[test]
+    fn is_unimplemented_rejects_other_transport() {
+        let err = RuntimeError::transport("connection refused");
+        assert!(!is_unimplemented(&err));
+    }
+
+    #[test]
+    fn is_unimplemented_rejects_non_transport() {
+        let err = RuntimeError::unsupported("test");
+        assert!(!is_unimplemented(&err));
     }
 }

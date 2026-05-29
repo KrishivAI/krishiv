@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_api::{KrishivError, LocalWindowExecutionSpec, LocalWindowKind, QueryResult, StreamBatch};
+use krishiv_api::{
+    KrishivError, LocalWindowExecutionSpec, LocalWindowKind, QueryResult, StreamBatch,
+};
 
 // ── Window specification ──────────────────────────────────────────────────────
 
@@ -67,7 +69,9 @@ impl StreamingChain {
         let (window_kind, window_size_ms) = match window {
             WindowSpec::Tumbling { size_ms } => (LocalWindowKind::Tumbling, *size_ms),
             WindowSpec::Sliding { size_ms, slide_ms } => (
-                LocalWindowKind::Sliding { slide_ms: *slide_ms },
+                LocalWindowKind::Sliding {
+                    slide_ms: *slide_ms,
+                },
                 *size_ms,
             ),
             WindowSpec::Session { gap_ms } => {
@@ -75,10 +79,7 @@ impl StreamingChain {
             }
         };
 
-        let state_ttl_ms = self
-            .session
-            .state_ttl()
-            .map(|c| c.ttl_ms());
+        let state_ttl_ms = self.session.state_ttl().map(|c| c.ttl_ms());
 
         Ok(LocalWindowExecutionSpec {
             key_column,
@@ -102,8 +103,8 @@ impl StreamingChain {
         let input: Vec<RecordBatch> = self.batches.iter().map(|b| b.batch().clone()).collect();
         // Use execute_windowed_stream so the plan is also registered via accept_plan
         // (matching the behaviour of the older WindowedStream::collect_with_aggs path).
-        let output = krishiv_api::execute_windowed_stream(input, &spec)
-            .map_err(KrishivError::from)?;
+        let output =
+            krishiv_api::execute_windowed_stream(input, &spec).map_err(KrishivError::from)?;
         Ok(output
             .into_iter()
             .enumerate()
@@ -159,7 +160,11 @@ impl Relation {
                     }
                     None => "no-window".to_string(),
                 };
-                let bounded_label = if chain.bounded { "bounded" } else { "unbounded" };
+                let bounded_label = if chain.bounded {
+                    "bounded"
+                } else {
+                    "unbounded"
+                };
                 Ok(format!(
                     "Stream[{bounded_label}] source={} key={} event_time={} watermark={}ms window={} emit={:?}",
                     chain.source_name,
@@ -322,11 +327,11 @@ impl Relation {
                     let stream_batches = chain.execute_bounded()?;
                     krishiv_async_util::block_on(async {
                         for sb in stream_batches {
-                            sink.write_batch_dyn(sb.into_batch())
-                                .await
-                                .map_err(|e| KrishivError::Runtime {
+                            sink.write_batch_dyn(sb.into_batch()).await.map_err(|e| {
+                                KrishivError::Runtime {
                                     message: e.to_string(),
-                                })?;
+                                }
+                            })?;
                         }
                         sink.flush_dyn().await.map_err(|e| KrishivError::Runtime {
                             message: e.to_string(),
@@ -336,9 +341,7 @@ impl Relation {
                 } else {
                     // Unbounded: submit continuous streaming job.
                     let spec = chain.build_exec_spec()?;
-                    let job_id = chain
-                        .session
-                        .submit_stream_job(&chain.source_name, spec)?;
+                    let job_id = chain.session.submit_stream_job(&chain.source_name, spec)?;
                     let handle = crate::StreamHandle::new(job_id.clone(), chain.session.clone());
                     let cancelled_flag = handle.cancelled_flag();
                     let session_clone = chain.session.clone();
@@ -346,7 +349,8 @@ impl Relation {
 
                     // Propagate runtime-creation failure back to the caller via a
                     // sync channel before we return the handle.
-                    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+                    let (ready_tx, ready_rx) =
+                        std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
                     std::thread::spawn(move || {
                         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -434,14 +438,22 @@ mod tests {
     #[test]
     fn batch_relation_collect() {
         let session = make_session();
-        let result = session.relation("SELECT 1 AS n").unwrap().collect().unwrap();
+        let result = session
+            .relation("SELECT 1 AS n")
+            .unwrap()
+            .collect()
+            .unwrap();
         assert_eq!(result.row_count(), 1);
     }
 
     #[test]
     fn batch_relation_into_batches() {
         let session = make_session();
-        let result = session.relation("SELECT 1 AS n").unwrap().collect().unwrap();
+        let result = session
+            .relation("SELECT 1 AS n")
+            .unwrap()
+            .collect()
+            .unwrap();
         let batches = result.into_batches();
         assert_eq!(batches.len(), 1);
     }
@@ -470,7 +482,9 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec!["alice", "alice", "bob"])) as _,
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "alice", "alice", "bob",
+                ])) as _,
                 Arc::new(Int64Array::from(vec![1_000i64, 5_000, 2_000])) as _,
                 Arc::new(Int64Array::from(vec![10i64, 20, 30])) as _,
             ],
@@ -505,7 +519,11 @@ mod tests {
     #[test]
     fn query_result_into_iterator() {
         let session = make_session();
-        let result = session.relation("SELECT 1 AS n").unwrap().collect().unwrap();
+        let result = session
+            .relation("SELECT 1 AS n")
+            .unwrap()
+            .collect()
+            .unwrap();
         let count = result.into_iter().count();
         assert_eq!(count, 1);
     }

@@ -1,5 +1,5 @@
-use crate::{CompressionCodec, ShuffleCompression, ShuffleError, ShufflePath, ShuffleResult};
 use crate::error::io_err;
+use crate::{CompressionCodec, ShuffleCompression, ShuffleError, ShufflePath, ShuffleResult};
 use std::path::PathBuf;
 
 /// Local-disk shuffle store.

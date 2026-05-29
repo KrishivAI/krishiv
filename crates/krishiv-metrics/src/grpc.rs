@@ -37,9 +37,7 @@ pub fn inject_trace_context(
 /// W3C trace context.
 ///
 /// When the header is absent or malformed the request is forwarded unchanged.
-pub fn extract_trace_context(
-    req: tonic::Request<()>,
-) -> Result<tonic::Request<()>, tonic::Status> {
+pub fn extract_trace_context(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
     if let Some(val) = req
         .metadata()
         .get("traceparent")
@@ -48,4 +46,63 @@ pub fn extract_trace_context(
         tracing::Span::current().record("traceparent", val);
     }
     Ok(req)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_trace_context_with_no_span_passes_through() {
+        let req = tonic::Request::new(());
+        let result = inject_trace_context(req);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extract_trace_context_with_no_header_passes_through() {
+        let req = tonic::Request::new(());
+        let result = extract_trace_context(req);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extract_trace_context_with_valid_header() {
+        let mut req = tonic::Request::new(());
+        req.metadata_mut().insert(
+            "traceparent",
+            tonic::metadata::MetadataValue::from_static("00-abc123-def456-01"),
+        );
+        let result = extract_trace_context(req);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extract_trace_context_with_empty_header() {
+        let mut req = tonic::Request::new(());
+        req.metadata_mut().insert(
+            "traceparent",
+            tonic::metadata::MetadataValue::from_static(""),
+        );
+        let result = extract_trace_context(req);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn inject_trace_context_preserves_request() {
+        let req = tonic::Request::new(());
+        let result = inject_trace_context(req);
+        assert!(result.is_ok());
+        // Verify request can be consumed
+        let _req = result.unwrap();
+    }
+
+    #[test]
+    fn extract_trace_context_preserves_request() {
+        let req = tonic::Request::new(());
+        let result = extract_trace_context(req);
+        assert!(result.is_ok());
+        // Verify request can be consumed
+        let _req = result.unwrap();
+    }
 }

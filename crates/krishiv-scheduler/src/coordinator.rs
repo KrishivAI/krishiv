@@ -525,8 +525,8 @@ impl Coordinator {
 
             if applied {
                 // Throttle the source proportional to its heat score.
-                let reduced_rate = ((1.0 - report.heat_score) * BASE_ROWS_PER_SECOND as f64)
-                    .max(1.0) as u64;
+                let reduced_rate =
+                    ((1.0 - report.heat_score) * BASE_ROWS_PER_SECOND as f64).max(1.0) as u64;
                 throttles.push(crate::adaptive::ThrottleDecision {
                     source_id: report.source_id.clone(),
                     rows_per_second: Some(reduced_rate),
@@ -665,10 +665,10 @@ impl Coordinator {
             //   - barrier_dispatch_sent retains (job_id, epoch); again the epoch is
             //     unique so the entry is harmless for correctness but wastes memory.
             if let Some(aborted_epoch) = pre_tick_awaiting {
-                let was_aborted =
-                    self.checkpoint_coordinators.get(&job_id).is_some_and(|c| {
-                        matches!(c.state, CheckpointCoordinatorState::Failed { .. })
-                    });
+                let was_aborted = self
+                    .checkpoint_coordinators
+                    .get(&job_id)
+                    .is_some_and(|c| matches!(c.state, CheckpointCoordinatorState::Failed { .. }));
                 if was_aborted {
                     self.checkpoint_notify_sent
                         .retain(|(jid, _, e)| jid != &job_id || *e != aborted_epoch);
@@ -1402,11 +1402,12 @@ impl Coordinator {
             let channels = Arc::clone(&channels);
             futures.push(async move {
                 let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
-                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
-                    channel,
-                    krishiv_metrics::grpc::inject_trace_context
-                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-                );
+                let mut client =
+                    wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                        channel,
+                        krishiv_metrics::grpc::inject_trace_context
+                            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                    );
                 let response = client
                     .assign_task(wire::executor_task_assignment_to_wire(assignment.clone()))
                     .await
@@ -1456,13 +1457,14 @@ impl Coordinator {
         // Callers that hold a `SharedCoordinator.write()` guard should prefer the
         // `JobCoordinator` pattern (acquire lock → collect targets → drop lock → deliver).
         let channels = self.executor_channels.clone();
-        let responses = match Self::deliver_assignment_targets_with_channels(channels, targets).await {
-            Ok(responses) => responses,
-            Err(error) => {
-                self.clear_launch_in_flight_for_job(job_id);
-                return Err(error);
-            }
-        };
+        let responses =
+            match Self::deliver_assignment_targets_with_channels(channels, targets).await {
+                Ok(responses) => responses,
+                Err(error) => {
+                    self.clear_launch_in_flight_for_job(job_id);
+                    return Err(error);
+                }
+            };
         self.apply_assignment_dispatch_responses(job_id, &responses);
         Ok(responses
             .into_iter()

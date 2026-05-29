@@ -28,6 +28,8 @@ base64 = "0.22"
 [dev-dependencies]
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
 tokio = { workspace = true }
+parquet = { workspace = true }
+tempfile = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

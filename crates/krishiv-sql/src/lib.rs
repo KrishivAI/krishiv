@@ -167,13 +167,17 @@ impl SqlEngine {
 
     /// Returns `true` if any table referenced in `sql` is a registered streaming source.
     pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool> {
-        let sources = self.streaming_sources.read().unwrap_or_else(|e| e.into_inner());
+        let sources = self
+            .streaming_sources
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         if sources.is_empty() {
             return Ok(false);
         }
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, sql)
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        let statements = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
         for stmt in &statements {
             let mut is_streaming = false;
             let _ = visit_relations(stmt, |relation| {
@@ -406,8 +410,7 @@ impl SqlEngine {
                 let mut tmp_registry = krishiv_udf::UdfRegistry::new();
                 let stub = create_function_ddl::StubTableUdf::from_ddl(&ddl);
                 tmp_registry.register_table(std::sync::Arc::new(stub));
-                udf::sync_table_udfs(&self.context, &tmp_registry)
-                    .map_err(SqlError::from)?;
+                udf::sync_table_udfs(&self.context, &tmp_registry).map_err(SqlError::from)?;
                 ddl
             };
             // If a shared registry is attached, sync the new UDTF into DataFusion.
@@ -1239,7 +1242,10 @@ mod udtf_ddl_tests {
 
         let guard = registry.read().unwrap();
         let found = guard.get_table("counts_udtf");
-        assert!(found.is_some(), "UDTF must be present in the UdfRegistry after DDL");
+        assert!(
+            found.is_some(),
+            "UDTF must be present in the UdfRegistry after DDL"
+        );
         let schema = found.unwrap().output_schema();
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");

@@ -36,13 +36,18 @@ impl StreamHandle {
 
     /// Signal the background thread to stop processing.
     pub fn cancel(&self) -> crate::Result<()> {
-        *self.cancelled.lock().unwrap() = true;
+        *self
+            .cancelled
+            .lock()
+            .map_err(|e| crate::KrishivError::Runtime {
+                message: format!("cancel lock poisoned: {e}"),
+            })? = true;
         Ok(())
     }
 
     /// Returns `true` if [`cancel`] has been called.
     pub fn is_cancelled(&self) -> bool {
-        *self.cancelled.lock().unwrap()
+        self.cancelled.lock().map(|guard| *guard).unwrap_or(false)
     }
 
     /// Drain newly emitted output batches from a continuous streaming job.
@@ -53,8 +58,7 @@ impl StreamHandle {
         if self.job_id == "completed" {
             return Ok(vec![]);
         }
-        krishiv_async_util::block_on(self.session.poll_stream_job(&self.job_id))
-            .map_err(Into::into)
+        krishiv_async_util::block_on(self.session.poll_stream_job(&self.job_id)).map_err(Into::into)
     }
 
     /// Expose the cancel flag `Arc` so it can be shared with background threads.

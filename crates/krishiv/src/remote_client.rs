@@ -71,7 +71,9 @@ impl RemoteCoordinatorClient {
             let channel = endpoint.connect_lazy();
             self.client = Some(CoordinatorManagementClient::new(channel));
         }
-        Ok(self.client.as_mut().unwrap())
+        self.client
+            .as_mut()
+            .ok_or_else(|| RemoteClientError("failed to initialize gRPC client".into()))
     }
 
     /// Trigger a savepoint for the given job on the remote coordinator.

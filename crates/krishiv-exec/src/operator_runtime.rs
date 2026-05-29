@@ -4,8 +4,8 @@ use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
 use krishiv_state::{RedbStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
-use crate::window::MultiSourceWatermarkState;
 use crate::watermark_util::advance_effective_watermark;
+use crate::window::MultiSourceWatermarkState;
 use crate::{
     AggExpr, AggFunction, ExecError, ExecResult, SessionWindowSpec, SlidingWindowSpec,
     StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,

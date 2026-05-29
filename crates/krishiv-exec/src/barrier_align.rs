@@ -3,25 +3,39 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Error when barrier alignment times out.
+/// Errors from barrier alignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckpointAlignmentTimeout {
-    pub epoch: u64,
-    pub waited_inputs: usize,
-    pub expected_inputs: usize,
+pub enum BarrierAlignError {
+    /// Input count must be greater than zero.
+    ZeroInputCount,
+    /// Barrier alignment timed out.
+    CheckpointAlignmentTimeout {
+        epoch: u64,
+        waited_inputs: usize,
+        expected_inputs: usize,
+    },
 }
 
-impl std::fmt::Display for CheckpointAlignmentTimeout {
+impl std::fmt::Display for BarrierAlignError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "checkpoint alignment timeout for epoch {}: received barriers on {}/{} inputs",
-            self.epoch, self.waited_inputs, self.expected_inputs
-        )
+        match self {
+            Self::ZeroInputCount => write!(f, "input_count must be greater than zero"),
+            Self::CheckpointAlignmentTimeout {
+                epoch,
+                waited_inputs,
+                expected_inputs,
+            } => write!(
+                f,
+                "checkpoint alignment timeout for epoch {epoch}: received barriers on {waited_inputs}/{expected_inputs} inputs",
+            ),
+        }
     }
 }
 
-impl std::error::Error for CheckpointAlignmentTimeout {}
+impl std::error::Error for BarrierAlignError {}
+
+/// Error when barrier alignment times out (backward-compat alias).
+pub type CheckpointAlignmentTimeout = BarrierAlignError;
 
 /// Buffers records on faster inputs until all inputs have seen the barrier epoch.
 #[derive(Debug)]
@@ -38,9 +52,9 @@ pub struct BarrierAligner {
 }
 
 impl BarrierAligner {
-    pub fn new(input_count: usize, alignment_timeout: Duration) -> Result<Self, String> {
+    pub fn new(input_count: usize, alignment_timeout: Duration) -> Result<Self, BarrierAlignError> {
         if input_count == 0 {
-            return Err("input_count must be greater than zero".into());
+            return Err(BarrierAlignError::ZeroInputCount);
         }
         Ok(Self {
             input_count,
@@ -69,7 +83,7 @@ impl BarrierAligner {
         &mut self,
         input_index: usize,
         epoch: u64,
-    ) -> Result<bool, CheckpointAlignmentTimeout> {
+    ) -> Result<bool, BarrierAlignError> {
         if self.current_epoch.is_none() {
             self.current_epoch = Some(epoch);
             self.barrier_inputs_seen.clear();
@@ -93,7 +107,7 @@ impl BarrierAligner {
         if let Some(deadline) = self.alignment_deadline
             && Instant::now() > deadline
         {
-            return Err(CheckpointAlignmentTimeout {
+            return Err(BarrierAlignError::CheckpointAlignmentTimeout {
                 epoch,
                 waited_inputs: self.barrier_inputs_seen.len(),
                 expected_inputs: self.input_count,
@@ -141,5 +155,119 @@ mod tests {
     fn barrier_align_zero_input_count_returns_error() {
         let result = BarrierAligner::new(0, Duration::from_secs(5));
         assert!(result.is_err(), "input_count=0 must return Err");
+    }
+
+    #[test]
+    fn barrier_align_single_input_immediately_aligned() {
+        let mut aligner = BarrierAligner::new(1, Duration::from_secs(5)).unwrap();
+        aligner.buffer_data(0, batch(10));
+        assert!(aligner.on_barrier(0, 1).unwrap());
+        let released = aligner.drain_buffer(0);
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            released[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    #[test]
+    fn barrier_align_duplicate_input_ignored() {
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
+        assert!(!aligner.on_barrier(0, 1).unwrap());
+        // Duplicate from input 0 — should be ignored
+        assert!(!aligner.on_barrier(0, 1).unwrap());
+        // Now input 1 — should trigger alignment
+        assert!(aligner.on_barrier(1, 1).unwrap());
+    }
+
+    #[test]
+    fn barrier_align_different_epoch_ignored() {
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
+        assert!(!aligner.on_barrier(0, 1).unwrap());
+        // Wrong epoch — ignored
+        assert!(!aligner.on_barrier(1, 2).unwrap());
+        // Correct epoch
+        assert!(aligner.on_barrier(1, 1).unwrap());
+    }
+
+    #[test]
+    fn barrier_align_drain_multiple_inputs() {
+        let mut aligner = BarrierAligner::new(3, Duration::from_secs(5)).unwrap();
+        aligner.buffer_data(0, batch(1));
+        aligner.buffer_data(1, batch(2));
+        aligner.buffer_data(2, batch(3));
+        aligner.on_barrier(0, 1).unwrap();
+        aligner.on_barrier(1, 1).unwrap();
+        assert!(aligner.on_barrier(2, 1).unwrap());
+        let r0 = aligner.drain_buffer(0);
+        let r1 = aligner.drain_buffer(1);
+        let r2 = aligner.drain_buffer(2);
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r2.len(), 1);
+    }
+
+    #[test]
+    fn barrier_align_out_of_range_input_index_ignored() {
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
+        // input_index >= input_count is silently ignored (no panic, no alignment)
+        assert!(!aligner.on_barrier(99, 1).unwrap());
+        // Still need input 0 and 1
+        assert!(!aligner.on_barrier(0, 1).unwrap());
+        assert!(aligner.on_barrier(1, 1).unwrap());
+    }
+
+    #[test]
+    fn barrier_align_epoch_resets_after_alignment() {
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
+        aligner.on_barrier(0, 1).unwrap();
+        aligner.on_barrier(1, 1).unwrap();
+        // After alignment completes, a new epoch can start
+        assert!(!aligner.on_barrier(0, 2).unwrap());
+        assert!(aligner.on_barrier(1, 2).unwrap());
+    }
+
+    #[test]
+    fn barrier_align_drain_empty_buffer() {
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
+        let released = aligner.drain_buffer(0);
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn barrier_align_invalid_input_index_buffer_data_ignored() {
+        let mut aligner = BarrierAligner::new(2, Duration::from_secs(5)).unwrap();
+        // buffer_data on out-of-range index should not panic
+        aligner.buffer_data(99, batch(1));
+        // Alignment should still work normally
+        aligner.on_barrier(0, 1).unwrap();
+        assert!(aligner.on_barrier(1, 1).unwrap());
+    }
+
+    #[test]
+    fn barrier_align_display_trait() {
+        let err = BarrierAlignError::ZeroInputCount;
+        assert_eq!(format!("{err}"), "input_count must be greater than zero");
+
+        let err = BarrierAlignError::CheckpointAlignmentTimeout {
+            epoch: 42,
+            waited_inputs: 1,
+            expected_inputs: 3,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("42"));
+        assert!(msg.contains("1/3"));
+    }
+
+    #[test]
+    fn barrier_align_error_trait() {
+        let err = BarrierAlignError::ZeroInputCount;
+        let e: &dyn std::error::Error = &err;
+        assert!(!e.source().is_some());
     }
 }

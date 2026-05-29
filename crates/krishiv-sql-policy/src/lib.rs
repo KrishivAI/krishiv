@@ -212,9 +212,7 @@ fn apply_row_predicates(
     // Handle CTEs: wrap the whole WITH query as a subquery.
     let trimmed = query.trim_start();
     if trimmed.to_uppercase().starts_with("WITH ") {
-        return format!(
-            "SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}"
-        );
+        return format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}");
     }
 
     format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")

@@ -511,9 +511,8 @@ impl krishiv_exec::continuous::StreamQualityHook for ConnectorQualityHook {
     ) -> krishiv_exec::ExecResult<(arrow::record_batch::RecordBatch, usize)> {
         use arrow::array::BooleanArray;
 
-        let result = check_batch_compiled(&batch, &self.config).map_err(|e| {
-            krishiv_exec::ExecError::Arrow(format!("quality check failed: {e}"))
-        })?;
+        let result = check_batch_compiled(&batch, &self.config)
+            .map_err(|e| krishiv_exec::ExecError::Arrow(format!("quality check failed: {e}")))?;
 
         if result.failed {
             return Err(krishiv_exec::ExecError::Arrow(
@@ -528,18 +527,17 @@ impl krishiv_exec::continuous::StreamQualityHook for ConnectorQualityHook {
             .map(|i| Some(result.accepted_indices.contains(&i)))
             .collect();
 
-        let accepted =
-            arrow::compute::filter_record_batch(&batch, &keep_mask).map_err(|e| {
-                krishiv_exec::ExecError::Arrow(format!("filter_record_batch failed: {e}"))
-            })?;
+        let accepted = arrow::compute::filter_record_batch(&batch, &keep_mask).map_err(|e| {
+            krishiv_exec::ExecError::Arrow(format!("filter_record_batch failed: {e}"))
+        })?;
 
         // Buffer rejected rows for async forwarding.
         if rejected_count > 0 {
             let reject_mask: BooleanArray = (0..batch.num_rows())
                 .map(|i| Some(!result.accepted_indices.contains(&i)))
                 .collect();
-            let rejected_batch =
-                arrow::compute::filter_record_batch(&batch, &reject_mask).map_err(|e| {
+            let rejected_batch = arrow::compute::filter_record_batch(&batch, &reject_mask)
+                .map_err(|e| {
                     krishiv_exec::ExecError::Arrow(format!(
                         "filter_record_batch (rejected) failed: {e}"
                     ))

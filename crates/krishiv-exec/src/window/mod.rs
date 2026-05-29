@@ -189,8 +189,7 @@ mod watermark_tests {
     /// before any data arrives, producing silent data loss.
     #[test]
     fn idle_source_policy_does_not_advance_watermark_for_never_seen_source() {
-        let mut state = MultiSourceWatermarkState::new()
-            .with_idle_source_policy(0, 99_999_999);
+        let mut state = MultiSourceWatermarkState::new().with_idle_source_policy(0, 99_999_999);
 
         // Register source-a with one real event so it appears in last_update_ms.
         // Intentionally set last_update_ms to 0 so the idle timeout always fires.
@@ -212,8 +211,7 @@ mod watermark_tests {
     #[test]
     fn idle_source_policy_advances_watermark_for_idle_source_with_events() {
         let idle_wm = 50_000i64;
-        let mut state = MultiSourceWatermarkState::new()
-            .with_idle_source_policy(0, idle_wm);
+        let mut state = MultiSourceWatermarkState::new().with_idle_source_policy(0, idle_wm);
 
         // Register source-a with a real event at t=1000; watermark = 1000.
         state.update("source-a", 1_000);

@@ -67,3 +67,63 @@ impl std::error::Error for LlmError {}
 pub trait LlmUdf: Send + Sync {
     async fn call_batch(&self, prompts: &[String]) -> Result<Vec<LlmResponse>, LlmError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_udf_config_debug() {
+        let config = LlmUdfConfig {
+            model: "gpt-4o".into(),
+            max_tokens: 256,
+            temperature: 0.7,
+            cache: true,
+            rate_limit: RateLimitConfig::default(),
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("gpt-4o"));
+        assert!(debug.contains("256"));
+    }
+
+    #[test]
+    fn llm_udf_config_clone() {
+        let config = LlmUdfConfig {
+            model: "gpt-4".into(),
+            max_tokens: 128,
+            temperature: 0.0,
+            cache: false,
+            rate_limit: RateLimitConfig {
+                requests_per_minute: 30,
+                tokens_per_minute: 40_000,
+            },
+        };
+        let cloned = config.clone();
+        assert_eq!(cloned.model, "gpt-4");
+        assert_eq!(cloned.max_tokens, 128);
+        assert!(!cloned.cache);
+        assert_eq!(cloned.rate_limit.requests_per_minute, 30);
+    }
+
+    #[test]
+    fn llm_response_variants() {
+        let r = LlmResponse {
+            text: String::new(),
+            finish_reason: String::new(),
+            tokens_used: 0,
+        };
+        assert!(r.text.is_empty());
+        assert!(r.finish_reason.is_empty());
+        assert_eq!(r.tokens_used, 0);
+    }
+
+    #[test]
+    fn rate_limit_config_all_fields() {
+        let config = RateLimitConfig {
+            requests_per_minute: 200,
+            tokens_per_minute: 200_000,
+        };
+        assert_eq!(config.requests_per_minute, 200);
+        assert_eq!(config.tokens_per_minute, 200_000);
+    }
+}

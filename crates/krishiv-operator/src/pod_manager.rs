@@ -18,12 +18,10 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{
-    Container, EnvVar, Pod, PodSpec, PodTemplateSpec,
-};
+use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Api, DeleteParams, ObjectMeta as KubeObjectMeta, PostParams};
 use kube::Client;
+use kube::api::{Api, DeleteParams, ObjectMeta as KubeObjectMeta, PostParams};
 use tracing::{info, warn};
 
 use crate::constants::{API_GROUP, API_VERSION, EXECUTOR_ID_LABEL, KIND};
@@ -79,13 +77,7 @@ impl PodLifecycleManager {
             let pod_name = format!("{job_name}-exec-{idx}");
             let job_id = resource.metadata.scheduler_job_id();
 
-            let pod = self.build_pod(
-                resource,
-                &pod_name,
-                &executor_id,
-                idx,
-                &job_id,
-            );
+            let pod = self.build_pod(resource, &pod_name, &executor_id, idx, &job_id);
 
             match pods.create(&PostParams::default(), &pod).await {
                 Ok(_) => {
@@ -122,10 +114,7 @@ impl PodLifecycleManager {
     ///
     /// Pods are selected by the `krishiv.io/job` label.  Missing pods (`404`)
     /// are ignored — this method is idempotent.
-    pub async fn delete_executor_pods(
-        &self,
-        resource: &KrishivJobResource,
-    ) -> OperatorResult<()> {
+    pub async fn delete_executor_pods(&self, resource: &KrishivJobResource) -> OperatorResult<()> {
         let namespace = resource.metadata.namespace_or_default();
         let job_name = &resource.metadata.name;
         let parallelism = resource.spec.effective_parallelism();
@@ -133,10 +122,7 @@ impl PodLifecycleManager {
 
         for idx in 0..parallelism {
             let pod_name = format!("{job_name}-exec-{idx}");
-            match pods
-                .delete(&pod_name, &DeleteParams::default())
-                .await
-            {
+            match pods.delete(&pod_name, &DeleteParams::default()).await {
                 Ok(_) => {
                     info!(job = job_name, pod = pod_name, "deleted executor pod");
                 }

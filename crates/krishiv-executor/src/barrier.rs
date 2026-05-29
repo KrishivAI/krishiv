@@ -79,3 +79,112 @@ impl BarrierSimulator {
         self.last_committed_epoch
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn barrier_simulator_new_is_empty() {
+        let sim = BarrierSimulator::new();
+        assert_eq!(sim.last_committed_epoch(), 0);
+        assert!(sim.snapshots().is_empty());
+    }
+
+    #[test]
+    fn process_barrier_first_epoch() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(1, 1000, 2).unwrap();
+        assert_eq!(sim.last_committed_epoch(), 1);
+        assert_eq!(sim.snapshots().len(), 1);
+        assert_eq!(sim.snapshots()[0].epoch, 1);
+        assert_eq!(sim.snapshots()[0].watermark_ms, 1000);
+        assert_eq!(sim.snapshots()[0].open_windows, 2);
+    }
+
+    #[test]
+    fn process_barrier_monotonic_epochs() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(1, 100, 0).unwrap();
+        sim.process_barrier(2, 200, 1).unwrap();
+        sim.process_barrier(3, 300, 2).unwrap();
+        assert_eq!(sim.last_committed_epoch(), 3);
+        assert_eq!(sim.snapshots().len(), 3);
+    }
+
+    #[test]
+    fn process_barrier_rejects_stale_epoch() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(5, 100, 0).unwrap();
+        let err = sim.process_barrier(3, 200, 0).unwrap_err();
+        assert!(err.to_string().contains("stale barrier epoch 3"));
+        assert_eq!(sim.last_committed_epoch(), 5);
+    }
+
+    #[test]
+    fn process_barrier_rejects_equal_epoch() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(5, 100, 0).unwrap();
+        let err = sim.process_barrier(5, 200, 0).unwrap_err();
+        assert!(err.to_string().contains("stale barrier epoch 5"));
+    }
+
+    #[test]
+    fn process_barrier_with_zero_watermark() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(1, 0, 0).unwrap();
+        assert_eq!(sim.snapshots()[0].watermark_ms, 0);
+    }
+
+    #[test]
+    fn process_barrier_with_zero_open_windows() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(1, 100, 0).unwrap();
+        assert_eq!(sim.snapshots()[0].open_windows, 0);
+    }
+
+    #[test]
+    fn process_barrier_with_large_watermark() {
+        let mut sim = BarrierSimulator::new();
+        sim.process_barrier(1, i64::MAX, 100).unwrap();
+        assert_eq!(sim.snapshots()[0].watermark_ms, i64::MAX);
+    }
+
+    #[test]
+    fn barrier_snapshot_equality() {
+        let s1 = BarrierSnapshot {
+            epoch: 1,
+            watermark_ms: 100,
+            open_windows: 2,
+        };
+        let s2 = BarrierSnapshot {
+            epoch: 1,
+            watermark_ms: 100,
+            open_windows: 2,
+        };
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn barrier_snapshot_clone() {
+        let s1 = BarrierSnapshot {
+            epoch: 1,
+            watermark_ms: 100,
+            open_windows: 2,
+        };
+        let s2 = s1.clone();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn barrier_snapshot_debug() {
+        let s = BarrierSnapshot {
+            epoch: 1,
+            watermark_ms: 100,
+            open_windows: 2,
+        };
+        let debug = format!("{:?}", s);
+        assert!(debug.contains("epoch: 1"));
+        assert!(debug.contains("watermark_ms: 100"));
+    }
+}

@@ -95,4 +95,107 @@ mod tests {
         let chunks = c.chunk("Hello world. Second sentence! Third?");
         assert!(!chunks.is_empty());
     }
+
+    // ── Additional deep-coverage tests ─────────────────────────────────
+
+    #[test]
+    fn empty_text() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn single_sentence() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("Just one sentence.");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Just one sentence.");
+    }
+
+    #[test]
+    fn two_sentences_max_one() {
+        let c = SentenceChunker::new(1, 0);
+        let chunks = c.chunk("First. Second.");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "First.");
+        assert_eq!(chunks[1].text, "Second.");
+    }
+
+    #[test]
+    fn two_sentences_max_two() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("First. Second.");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("First"));
+        assert!(chunks[0].text.contains("Second"));
+    }
+
+    #[test]
+    fn sentences_with_exclamation() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("Hello! World!");
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn sentences_with_question() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("Who? What?");
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn mixed_punctuation() {
+        let c = SentenceChunker::new(3, 0);
+        let chunks = c.chunk("One. Two! Three? Four.");
+        assert_eq!(chunks.len(), 2); // 4 sentences / 2 per chunk = 2 chunks
+    }
+
+    #[test]
+    fn chunk_indices_sequential() {
+        let c = SentenceChunker::new(1, 0);
+        let chunks = c.chunk("A. B. C. D.");
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i);
+        }
+    }
+
+    #[test]
+    fn no_overlap_step_is_max_sentences() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("A. B. C. D. E. F.");
+        // step = 2 - 0 = 2
+        assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn overlap_reduces_step() {
+        let c = SentenceChunker::new(3, 1);
+        let chunks = c.chunk("A. B. C. D. E. F. G. H.");
+        // step = 3 - 1 = 2
+        assert!(chunks.len() >= 3);
+    }
+
+    #[test]
+    fn new_enforces_min_one() {
+        let c = SentenceChunker::new(0, 0);
+        assert_eq!(c.max_sentences_per_chunk, 1);
+    }
+
+    #[test]
+    fn text_without_sentence_endings() {
+        let c = SentenceChunker::new(2, 0);
+        let chunks = c.chunk("no punctuation here");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "no punctuation here");
+    }
+
+    #[test]
+    fn sentence_boundaries_preserved() {
+        let c = SentenceChunker::new(1, 0);
+        let chunks = c.chunk("Hello world. Goodbye world.");
+        assert_eq!(chunks[0].text, "Hello world.");
+        assert_eq!(chunks[1].text, "Goodbye world.");
+    }
 }
