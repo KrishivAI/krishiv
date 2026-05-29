@@ -253,43 +253,47 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        // `rename` is atomic on POSIX: the final path becomes visible only when
-        // the rename succeeds.  If the staging file is missing and the final path
-        // already exists, the commit was completed by a prior attempt (idempotent).
-        use std::io::ErrorKind;
-        match std::fs::rename(&handle.staging_path, &handle.final_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                // Staging file is gone — either already committed (final exists)
-                // or an unexpected race.  Accept if the final target exists.
-                if handle.final_path.exists() {
-                    Ok(())
-                } else {
-                    Err(ConnectorError::IoStr {
-                        message: format!(
-                            "parquet 2pc commit: rename {:?} to {:?}: staging missing and final absent: {e}",
-                            handle.staging_path, handle.final_path
-                        ),
-                    })
+        tokio::task::block_in_place(move || {
+            // `rename` is atomic on POSIX: the final path becomes visible only when
+            // the rename succeeds.  If the staging file is missing and the final path
+            // already exists, the commit was completed by a prior attempt (idempotent).
+            use std::io::ErrorKind;
+            match std::fs::rename(&handle.staging_path, &handle.final_path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    // Staging file is gone — either already committed (final exists)
+                    // or an unexpected race.  Accept if the final target exists.
+                    if handle.final_path.exists() {
+                        Ok(())
+                    } else {
+                        Err(ConnectorError::IoStr {
+                            message: format!(
+                                "parquet 2pc commit: rename {:?} to {:?}: staging missing and final absent: {e}",
+                                handle.staging_path, handle.final_path
+                            ),
+                        })
+                    }
                 }
+                Err(e) => Err(ConnectorError::IoStr {
+                    message: format!(
+                        "parquet 2pc commit: rename {:?} to {:?}: {e}",
+                        handle.staging_path, handle.final_path
+                    ),
+                }),
             }
-            Err(e) => Err(ConnectorError::IoStr {
-                message: format!(
-                    "parquet 2pc commit: rename {:?} to {:?}: {e}",
-                    handle.staging_path, handle.final_path
-                ),
-            }),
-        }
+        })
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        use std::io::ErrorKind;
-        match std::fs::remove_file(&handle.staging_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(ConnectorError::IoStr {
-                message: format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
-            }),
-        }
+        tokio::task::block_in_place(move || {
+            use std::io::ErrorKind;
+            match std::fs::remove_file(&handle.staging_path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(ConnectorError::IoStr {
+                    message: format!("parquet 2pc abort: remove {:?}: {e}", handle.staging_path),
+                }),
+            }
+        })
     }
 }

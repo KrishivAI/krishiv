@@ -1389,6 +1389,32 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
+    async fn in_memory_misconfiguration_fails_closed() {
+        let store = InMemoryShuffleStore::new().with_max_bytes(1024);
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let partition = ShufflePartition {
+            id: PartitionId {
+                job_id: "misconfig".to_owned(),
+                stage_id: "s0".to_owned(),
+                partition: 0,
+            },
+            schema,
+            batches: vec![batch],
+        };
+        // This must fail because max_bytes is set but no spill_store is attached.
+        let result = store.write_partition(partition, 1).await;
+        assert!(result.is_err());
+        let err_str = result.err().unwrap().to_string();
+        assert!(err_str.contains("misconfigured"));
+        assert!(err_str.contains("no spill_store"));
+    }
+
+    #[tokio::test]
     async fn in_memory_delete_job_removes_all_data() {
         let store = InMemoryShuffleStore::new();
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));

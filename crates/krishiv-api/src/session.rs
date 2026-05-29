@@ -705,23 +705,30 @@ impl Session {
         dataframe: &DataFrame,
     ) -> Result<krishiv_lakehouse::HudiWriteResult> {
         let batches = dataframe.collect_async().await?.into_batches();
-        let writer = krishiv_lakehouse::HudiCowWriter::open(path);
-        let mut total = krishiv_lakehouse::HudiWriteResult {
-            instant: String::new(),
-            rows_inserted: 0,
-            rows_updated: 0,
-            snapshot_rows: 0,
-        };
-        for batch in batches {
-            let result = writer.append(batch).map_err(|e| KrishivError::Runtime {
-                message: e.to_string(),
-            })?;
-            total.instant = result.instant;
-            total.rows_inserted += result.rows_inserted;
-            total.rows_updated += result.rows_updated;
-            total.snapshot_rows += result.snapshot_rows;
-        }
-        Ok(total)
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let writer = krishiv_lakehouse::HudiCowWriter::open(&path);
+            let mut total = krishiv_lakehouse::HudiWriteResult {
+                instant: String::new(),
+                rows_inserted: 0,
+                rows_updated: 0,
+                snapshot_rows: 0,
+            };
+            for batch in batches {
+                let result = writer.append(batch).map_err(|e| KrishivError::Runtime {
+                    message: e.to_string(),
+                })?;
+                total.instant = result.instant;
+                total.rows_inserted += result.rows_inserted;
+                total.rows_updated += result.rows_updated;
+                total.snapshot_rows += result.snapshot_rows;
+            }
+            Ok(total)
+        })
+        .await
+        .map_err(|e| KrishivError::Runtime {
+            message: format!("spawn_blocking join error: {e}"),
+        })?
     }
 
     /// Upsert a DataFrame into a local Hudi Copy-On-Write table by key column.
@@ -736,25 +743,33 @@ impl Session {
         dataframe: &DataFrame,
     ) -> Result<krishiv_lakehouse::HudiWriteResult> {
         let batches = dataframe.collect_async().await?.into_batches();
-        let writer = krishiv_lakehouse::HudiCowWriter::open(path);
-        let mut total = krishiv_lakehouse::HudiWriteResult {
-            instant: String::new(),
-            rows_inserted: 0,
-            rows_updated: 0,
-            snapshot_rows: 0,
-        };
-        for batch in batches {
-            let result = writer
-                .upsert(key_column, batch)
-                .map_err(|e| KrishivError::Runtime {
-                    message: e.to_string(),
-                })?;
-            total.instant = result.instant;
-            total.rows_inserted += result.rows_inserted;
-            total.rows_updated += result.rows_updated;
-            total.snapshot_rows += result.snapshot_rows;
-        }
-        Ok(total)
+        let path = path.as_ref().to_path_buf();
+        let key_column_str = key_column.to_string();
+        tokio::task::spawn_blocking(move || {
+            let writer = krishiv_lakehouse::HudiCowWriter::open(&path);
+            let mut total = krishiv_lakehouse::HudiWriteResult {
+                instant: String::new(),
+                rows_inserted: 0,
+                rows_updated: 0,
+                snapshot_rows: 0,
+            };
+            for batch in batches {
+                let result = writer
+                    .upsert(&key_column_str, batch)
+                    .map_err(|e| KrishivError::Runtime {
+                        message: e.to_string(),
+                    })?;
+                total.instant = result.instant;
+                total.rows_inserted += result.rows_inserted;
+                total.rows_updated += result.rows_updated;
+                total.snapshot_rows += result.snapshot_rows;
+            }
+            Ok(total)
+        })
+        .await
+        .map_err(|e| KrishivError::Runtime {
+            message: format!("spawn_blocking join error: {e}"),
+        })?
     }
 
     /// Asynchronously create a DataFrame by reading a local Parquet path directly.

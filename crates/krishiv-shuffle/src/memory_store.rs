@@ -182,6 +182,13 @@ impl ShuffleStore for InMemoryShuffleStore {
             }
         }
 
+        if self.max_bytes.is_some() && self.spill_store.is_none() {
+            return Err(crate::error::io_err(format!(
+                "in-memory shuffle store misconfigured: max_bytes of {} is set but no spill_store is attached",
+                self.max_bytes.unwrap()
+            )));
+        }
+
         let new_size = partition_memory_bytes(&partition);
 
         let _spill_guard = if self.max_bytes.is_some() && self.spill_store.is_some() {

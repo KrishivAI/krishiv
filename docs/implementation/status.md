@@ -4,6 +4,39 @@
 
 **R12-R18 API Stability, Local-Only Boundaries, & Observability Sprint (2026-05-30).**
 
+### Crate Stability Resolution Plan Implementation (2026-05-29)
+
+Per `docs/implementation/crate-stability-resolution-plan.md`, implemented the priority P0-P2 fixes:
+
+**P0 — Security & Data-Integrity (S1-S8):**
+- S1 (governance case-sensitive masking): Already fixed — verified case-insensitive matching in `RoleBasedPolicyHook`.
+- S2 (vector-sinks SQL/GraphQL injection): `validate_identifier()` already existed in both pgvector and weaviate constructors.
+- S3 (executor fail-open): Already fixed — unsupported batch fragment returns `Err(ExecutorError::InvalidAssignment)`.
+- S4 (shuffle path traversal + fsync): Implemented `validate_safe_id()` in `lib.rs` called from `disk_store`, `local_store`, `object_store` id ingress points. Added `sync_all()` (via `into_inner`) before rename and parent-dir fsync after rename in `disk_store.rs`.
+- S5 (connectors SASL creds in Debug): Replaced `#[derive(Debug)]` with manual `Debug` impl on `KafkaCdcConfig` redacting `sasl_username` and `sasl_password`.
+- S6 (lakehouse Delta overwrite): Modified `write_table` to collect removed file names and emit `remove` actions alongside `add` in commit log. Added fsync via `into_inner`.
+- S7 (operator lease empty resourceVersion): Changed `k8s_try_acquire` and `k8s_renew` to fail when `resourceVersion` is `None` or empty.
+- S8 (schema-registry Box::leak): Already fixed — `proto_values_to_column` builds owned `String`s with `StringArray::from`.
+
+**P1 — Streaming Correctness (C1-C4, C9, C11):**
+- C1 (StateBacked always): `build_operator` now always creates StateBacked variants with ephemeral `InMemoryStateBackend` default.
+- C2 (idle-source policy): `WatermarkTracker` configured with `with_idle_source_policy(300_000)`; `apply_idle_source_policy()` called each drain cycle.
+- C3 (continuous checkpoint): Added `checkpoint()` method to `ContinuousWindowExecutor` delegating to operator `persist_to_state`.
+- C4 (interval join orientation): Fixed delta computation for correct left/right orientation; eviction uses `max(abs(lower), abs(upper))`.
+- C9 (TTL watermark-aware): Already fixed — `TtlStateBackend::put` uses `self.now_ms()` (watermark-aware).
+- C11 (savepoint create/restore): Implemented `create_savepoint`, `restore_savepoint`, `list_savepoints`, `delete_savepoint` functions.
+
+**P2 — Query Correctness (C5, C8):**
+- C5 (optimizer predicate pushdown): Replaced naive `" AND "` split with sqlparser-based `split_predicate_conjuncts` using `collect_binary_conjuncts`. Column matching now respects table qualification via starts-with matching.
+- C8 (sql-policy RLS): Added `inject_rls_predicate` that splices predicate into WHERE clause using sqlparser-aware injection, with subquery-wrap fallback.
+
+**status.md Accuracy Corrections Applied:**
+- L282 (validate_safe_id): Now implemented (S4).
+- L311 (sync_all): Now implemented (S4).
+- L595-623 (RLS): Updated to "partial — string-wrap with sqlparser-based WHERE injection".
+- redb `Arc<Mutex<Database>>` bottleneck: Code uses bare `Database` (redb MVCC) — marked stale.
+- Federation "ignores spec_json / runs SELECT 1": Fixed at `federation_http.rs:84-103` — marked closed.
+
 ### API Stability Resolution & Observability Audit (2026-05-30)
 
 - **API Stability, Boundaries, and Correctness Gaps (41 Items)**:
@@ -16,9 +49,15 @@
 - **Telemetry & Engine Hardening (Best Architectural Decisions)**:
   - Implemented `AsyncHttpEmitter` in `krishiv-governance` to decouple critical scheduler transitions from blocking HTTP OpenLineage delivery using a Tokio bounded channel and background task worker.
   - Fixed a pre-existing Hudi Copy-on-Write duplicate-counting bug in `HudiSnapshotReader::parquet_files_for_commits` where snapshot queries double-counted initial batches written with both base and change files. Prioritized `base_file` and fell back to `change_file`, enabling all 99 `krishiv-lakehouse` tests to pass cleanly.
+- **Architectural Stability & Starvation Mitigation (Implement All)**:
+  - **AI Concurrency & Retry Hardening**: Wrapped `OpenAiLlmUdf` in a process-wide concurrency semaphore capping active OpenAI API calls to 16. Replaced the aggressive 429 linear sleep with exponential backoff and randomized epoch-nano-based jitter to prevent rate-limit loops.
+  - **Shuffle Fail-Closed Capacity**: Hardened `InMemoryShuffleStore` to reject writes with an explicit configuration error if a memory cap (`max_bytes`) is specified but `spill_store` is omitted, preventing silent memory accumulation and OOMs.
+  - **Async Thread Blocking Isolation**: Wrapped synchronous filesystem operations in two-phase commit sinks (`two_phase.rs` and `two_phase_parquet_s3.rs`) inside `tokio::task::block_in_place` blocks. Wrapped Hudi table writes inside `Session` (`session.rs`) inside `tokio::task::spawn_blocking` to prevent stalling active Tokio threads.
 
 Validation:
 - Added `async_http_emitter_delivers_in_background` integration test; all 48 tests in `krishiv-governance` pass cleanly.
+- Added `in_memory_misconfiguration_fails_closed` unit test; all 88 tests in `krishiv-shuffle` pass cleanly.
+- Verified all 147 tests in `krishiv-ai` and all 61 tests in `krishiv-connectors` pass cleanly.
 - Resolved Hudi CoW append and upsert row failures; all 99 tests in `krishiv-lakehouse` pass cleanly.
 - Successfully staged, verified, and committed all modified files across the workspace.
 
@@ -494,7 +533,7 @@ All fixes verified with `cargo check --workspace`; crate-specific tests continue
 
 | Item | Crate | Fix |
 |------|-------|-----|
-| 1.1 Path traversal | shuffle | Added `validate_safe_id()` (alphanumeric+`_-` only) in `store.rs`, applied to `disk_store`, `object_store`, `local_store`, `path.rs` |
+| 1.1 Path traversal | shuffle | Added `validate_safe_id()` in `lib.rs`, applied to all `disk_store`, `object_store`, `local_store` id ingress points and path constructors (S4 fix, 2026-05-29). |
 | 1.2 Path traversal | lakehouse | Added `safe_data_path()` and `safe_path_under()` with `canonicalize()` escape detection in `iceberg_fs.rs` and `hudi.rs` |
 | 1.3 SQL injection | vector-sinks | Added `validate_table_name()` in pgvector, `validate_class_name()` in weaviate |
 | 1.4 SQL injection | python | Added `validate_identifier()` in live_table DDL, sanitized path-derived table names in sources |
@@ -523,7 +562,7 @@ All fixes verified with `cargo check --workspace`; crate-specific tests continue
 | 3.19 Tracing subscriber | executor binary | Add `krishiv_metrics::init()` with `KRISHIV_LOG`/`OTEL_*` env var support | 
 | 3.20 Metrics counters | state, shuffle, connectors, governance | Added tracing instrumentation (lightweight alternative to dedicated metrics counters for this pass) |
 | 3.21 KafkaSink | connectors | Stub remains (full implementation deferred to dedicated Kafka sprint) |
-| 3.22 Fsync on disk writes | shuffle | Added data file `sync_all()` after Parquet write completion in disk_store |
+| 3.22 Fsync on disk writes | shuffle | Added data file `sync_all()` after Parquet write via `ArrowWriter::into_inner()`, plus parent-dir fsync after rename. Implemented 2026-05-29. |
 
 ### Phase 4 — Feature Completion (8/8 items)
 
@@ -1378,7 +1417,7 @@ Next: implement R12 — fix all 21 P0 audit items, wire rdkafka, enable remote c
 - **krishiv-governance**: `HttpEmitter::new` uses `reqwest::Client::builder().timeout(30s)`.
 
 ### 4. Data file fsync on disk shuffle writes
-- **krishiv-shuffle/disk_store.rs**: Added `file.sync_all()` on the data file inside `spawn_blocking` after `ArrowWriter::close()`, plus a post-write fsync that re-opens the file for an additional `sync_all()`.
+- **krishiv-shuffle/disk_store.rs**: Added `file.sync_all()` via `ArrowWriter::into_inner()` and parent-dir fsync after rename (S4 fix, 2026-05-29); also added `validate_safe_id()` at all id ingress points.
 
 ### Validation
 ```

@@ -104,25 +104,29 @@ impl TwoPhaseCommitSink for TwoPhaseParquetSink {
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        std::fs::create_dir_all(self.final_dir()).map_err(|e| io_err("create final dir", e))?;
-        let name = handle
-            .path
-            .file_name()
-            .ok_or_else(|| ConnectorError::IoStr {
-                message: "invalid staged path".into(),
-            })?;
-        let dest = self.final_dir().join(name);
-        // rename is atomic on POSIX — single metadata operation.
-        std::fs::rename(&handle.path, &dest).map_err(|e| io_err("commit staged parquet", e))?;
-        self.staged_paths.remove(&handle.id);
-        Ok(())
+        tokio::task::block_in_place(move || {
+            std::fs::create_dir_all(self.final_dir()).map_err(|e| io_err("create final dir", e))?;
+            let name = handle
+                .path
+                .file_name()
+                .ok_or_else(|| ConnectorError::IoStr {
+                    message: "invalid staged path".into(),
+                })?;
+            let dest = self.final_dir().join(name);
+            // rename is atomic on POSIX — single metadata operation.
+            std::fs::rename(&handle.path, &dest).map_err(|e| io_err("commit staged parquet", e))?;
+            self.staged_paths.remove(&handle.id);
+            Ok(())
+        })
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        std::fs::remove_file(&handle.path)
-            .map_err(|e| io_err("remove staging file on abort", e))?;
-        self.staged_paths.remove(&handle.id);
-        Ok(())
+        tokio::task::block_in_place(move || {
+            std::fs::remove_file(&handle.path)
+                .map_err(|e| io_err("remove staging file on abort", e))?;
+            self.staged_paths.remove(&handle.id);
+            Ok(())
+        })
     }
 }
 

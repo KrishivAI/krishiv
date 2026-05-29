@@ -18,6 +18,7 @@ pub struct OpenAiLlmUdf {
     rate_limiter: Arc<tokio::sync::Mutex<LlmRateLimiter>>,
     cache: Arc<DashMap<u64, LlmResponse>>,
     client: Client,
+    concurrency_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl OpenAiLlmUdf {
@@ -30,6 +31,7 @@ impl OpenAiLlmUdf {
             rate_limiter,
             cache: Arc::new(DashMap::new()),
             client: Client::new(),
+            concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         }
     }
 
@@ -40,6 +42,12 @@ impl OpenAiLlmUdf {
     }
 
     async fn call_one(&self, prompt: String) -> Result<LlmResponse, LlmError> {
+        let _permit = self
+            .concurrency_semaphore
+            .acquire()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+
         let cache_key = Self::cache_key(&prompt);
         if self.config.cache
             && let Some(hit) = self.cache.get(&cache_key)
@@ -74,8 +82,16 @@ impl OpenAiLlmUdf {
                 if attempt > 4 {
                     return Err(LlmError::RateLimit("429 retries exhausted".into()));
                 }
-                let jitter = 100 + (attempt * 37);
-                tokio::time::sleep(std::time::Duration::from_millis(jitter as u64)).await;
+                // Exponential backoff: base_ms * 2^(attempt-1) + randomized jitter
+                let base = 500u64;
+                let exponential = base * (1 << (attempt - 1));
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                let jitter = (now_nanos ^ (attempt as u64)) % 100;
+                let sleep_duration = std::time::Duration::from_millis(exponential + jitter);
+                tokio::time::sleep(sleep_duration).await;
                 continue;
             }
             if !resp.status().is_success() {
