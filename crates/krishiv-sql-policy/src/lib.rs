@@ -6,7 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -169,6 +169,7 @@ impl PolicyEnforcingSqlEngine {
 }
 
 fn is_select_query(query: &str) -> bool {
+    use sqlparser::ast::{Query, SetExpr, Statement};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     let dialect = GenericDialect {};
@@ -179,7 +180,33 @@ fn is_select_query(query: &str) -> bool {
     if statements.is_empty() {
         return false;
     }
-    matches!(statements[0], sqlparser::ast::Statement::Query(_))
+
+    fn is_query_select(q: &Query) -> bool {
+        match q.body.as_ref() {
+            SetExpr::Select(_) => true,
+            SetExpr::Query(nested) => is_query_select(nested),
+            SetExpr::SetOperation { left, right, .. } => {
+                is_set_expr_select(left) || is_set_expr_select(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_set_expr_select(e: &SetExpr) -> bool {
+        match e {
+            SetExpr::Select(_) => true,
+            SetExpr::Query(nested) => is_query_select(nested),
+            SetExpr::SetOperation { left, right, .. } => {
+                is_set_expr_select(left) || is_set_expr_select(right)
+            }
+            _ => false,
+        }
+    }
+
+    match &statements[0] {
+        Statement::Query(q) => is_query_select(q),
+        _ => false,
+    }
 }
 
 fn apply_row_predicates(
@@ -437,6 +464,7 @@ fn masking_rule_for_field(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use arrow::array::Array;
     use krishiv_governance::{MaskingRule, Principal, Role, StaticApiKeyAuthProvider};
     use krishiv_sql::{SqlEngine, SqlError};
     use std::sync::Arc;
@@ -600,7 +628,7 @@ mod policy_tests {
             column: "id".into(),
         }));
         let p = engine.authenticate("key1").unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
         engine
@@ -665,8 +693,11 @@ mod policy_tests {
             "non-SELECT must not be wrapped"
         );
 
-        // SELECT must get wrapped.
+        // SELECT must get RLS predicate injected.
         let result = apply_row_predicates("SELECT * FROM t", &p, &["t".into()], &TestPolicy);
-        assert!(result.contains("__krishiv_rls"), "SELECT must be wrapped");
+        assert!(
+            result.contains("deleted = false"),
+            "SELECT must have predicate injected"
+        );
     }
 }

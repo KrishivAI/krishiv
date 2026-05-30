@@ -60,7 +60,8 @@ mod tests {
 
         let mut coordinator = crate::Coordinator::new_active(Some(
             crate::CoordinatorConfig::new(3, 10).with_llm_quota(100, 10_000),
-        ));
+        ))
+        .unwrap();
         let executor_id = ExecutorId::try_new("exec-llm").unwrap();
         coordinator
             .register_executor(

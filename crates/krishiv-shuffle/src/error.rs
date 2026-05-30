@@ -1,76 +1,49 @@
 /// Errors that can occur in shuffle operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ShuffleError {
     /// I/O failure, wrapping the original error.
-    Io(std::io::Error),
-    /// The requested partition path does not exist on disk.
-    PartitionNotFound {
-        /// String representation of the path.
-        path: String,
-    },
-    /// The partition exists in the metadata registry but is not yet available.
-    PartitionNotAvailable {
-        /// String representation of the path.
-        path: String,
-    },
-    /// A stale lease token was used; the write was rejected.
-    StaleLeaseToken {
-        /// The expected (current) lease token.
-        expected: u64,
-        /// The token actually presented by the caller.
-        actual: u64,
-    },
-    /// An object-store or generic path was not found.
-    ///
-    /// Used as the `StoreError::PartitionNotFound` alias when the partition key
-    /// has already been formatted into a path string.
-    NotFound {
-        /// String representation of the missing path.
-        path: String,
-    },
-    /// The shuffle partition cap was exceeded; no new partitions may be registered.
-    TooManyPartitions {
-        /// The configured partition limit.
-        limit: usize,
-    },
-    /// An internal `RwLock` was poisoned.
-    LockPoisoned,
-    /// Arrow column type does not match the expected downcast target.
-    TypeMismatch { expected: String },
-    /// The requested partition count was zero.
-    InvalidPartitionCount { buckets: u32 },
-}
+    #[error("shuffle I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
-impl std::fmt::Display for ShuffleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "shuffle I/O error: {e}"),
-            Self::PartitionNotFound { path } => {
-                write!(f, "shuffle partition not found: {path}")
-            }
-            Self::PartitionNotAvailable { path } => {
-                write!(f, "shuffle partition not available: {path}")
-            }
-            Self::StaleLeaseToken { expected, actual } => write!(
-                f,
-                "stale shuffle lease token: expected {expected}, actual {actual}"
-            ),
-            Self::NotFound { path } => write!(f, "shuffle path not found: {path}"),
-            Self::TooManyPartitions { limit } => {
-                write!(
-                    f,
-                    "shuffle partition limit exceeded: max {limit} partitions"
-                )
-            }
-            Self::LockPoisoned => f.write_str("shuffle lock poisoned"),
-            Self::TypeMismatch { expected } => {
-                write!(f, "shuffle type mismatch: expected {expected}")
-            }
-            Self::InvalidPartitionCount { buckets } => {
-                write!(f, "invalid shuffle partition count: {buckets}")
-            }
-        }
-    }
+    /// The requested partition path does not exist on disk.
+    #[error("shuffle partition not found: {path}")]
+    PartitionNotFound { path: String },
+
+    /// The partition exists in the metadata registry but is not yet available.
+    #[error("shuffle partition not available: {path}")]
+    PartitionNotAvailable { path: String },
+
+    /// A stale lease token was used; the write was rejected.
+    #[error("stale shuffle lease token: expected {expected}, actual {actual}")]
+    StaleLeaseToken { expected: u64, actual: u64 },
+
+    /// An object-store or generic path was not found.
+    #[error("shuffle path not found: {path}")]
+    NotFound { path: String },
+
+    /// The shuffle partition cap was exceeded; no new partitions may be registered.
+    #[error("shuffle partition limit exceeded: max {limit} partitions")]
+    TooManyPartitions { limit: usize },
+
+    /// An internal `RwLock` was poisoned.
+    #[error("shuffle lock poisoned")]
+    LockPoisoned,
+
+    /// Arrow column type does not match the expected downcast target.
+    #[error("shuffle type mismatch: expected {expected}")]
+    TypeMismatch { expected: String },
+
+    /// The requested partition count was zero.
+    #[error("invalid shuffle partition count: {buckets}")]
+    InvalidPartitionCount { buckets: u32 },
+
+    /// Content hash mismatch on read (strict determinism enforcement).
+    #[error("shuffle content hash mismatch for {partition}")]
+    ContentHashMismatch {
+        partition: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Acquire a write lock, mapping poison to [`ShuffleError::LockPoisoned`].
@@ -89,26 +62,11 @@ pub fn shuffle_read_lock<T>(
 /// Create a [`ShuffleError::Io`] from a string message by wrapping it in a
 /// custom `std::io::Error`.
 pub fn io_err(msg: impl Into<String>) -> ShuffleError {
-    ShuffleError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg.into()))
+    ShuffleError::Io(std::io::Error::other(msg.into()))
 }
 
 /// Maximum shuffle ticket line length (P3-3).
 pub const MAX_SHUFFLE_TICKET_LEN: usize = 65_536;
-
-impl std::error::Error for ShuffleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for ShuffleError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
-}
 
 /// Convenience alias for `Result<T, ShuffleError>`.
 pub type ShuffleResult<T> = Result<T, ShuffleError>;

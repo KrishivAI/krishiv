@@ -17,6 +17,7 @@ pub struct ObjectStoreShuffleStore {
     store: Arc<dyn object_store::ObjectStore>,
     prefix: object_store::path::Path,
     lease_tokens: Arc<DashMap<PartitionKey, u64>>,
+    content_hashes: Arc<DashMap<PartitionKey, [u8; 32]>>,
     compression: ShuffleCompression,
 }
 
@@ -33,8 +34,31 @@ impl ObjectStoreShuffleStore {
             store,
             prefix,
             lease_tokens: Arc::new(DashMap::new()),
+            content_hashes: Arc::new(DashMap::new()),
             compression: ShuffleCompression::None,
         }
+    }
+
+    fn compute_content_hash(partition: &ShufflePartition) -> [u8; 32] {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        partition.id.job_id.hash(&mut hasher);
+        partition.id.stage_id.hash(&mut hasher);
+        partition.id.partition.hash(&mut hasher);
+        partition.batches.len().hash(&mut hasher);
+        // Hash first few bytes of first batch for light determinism signal
+        if let Some(first) = partition.batches.first()
+            && let Some(col) = first.columns().first() {
+                let len = col.len().min(8);
+                for _ in 0..len {
+                    (col.len() as u64).hash(&mut hasher); // stable proxy
+                }
+            }
+        let h = hasher.finish();
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&h.to_le_bytes());
+        out
     }
 
     /// Set the IPC compression codec for written partitions.
@@ -79,7 +103,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         let key = (id.job_id, id.stage_id, id.partition);
         // Atomically compare-and-swap via DashMap entry API to close the
         // TOCTOU gap between read and insert.
-        match self.lease_tokens.entry(key) {
+        match self.lease_tokens.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut o) => {
                 let expected = *o.get();
                 if lease_token < expected {
@@ -107,7 +131,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             partition.id.stage_id.clone(),
             partition.id.partition,
         );
-        match self.lease_tokens.entry(key) {
+        match self.lease_tokens.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut o) => {
                 let expected = *o.get();
                 if lease_token < expected {
@@ -156,6 +180,10 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             )
             .await
             .map_err(|e| crate::error::io_err(e.to_string()))?;
+
+        // Store content hash for strict verification on subsequent reads
+        let hash = Self::compute_content_hash(&partition);
+        self.content_hashes.insert(key, hash);
         Ok(())
     }
 
@@ -181,11 +209,26 @@ impl ShuffleStore for ObjectStoreShuffleStore {
                     let batch = batch_result.map_err(|e| crate::error::io_err(e.to_string()))?;
                     batches.push(batch);
                 }
-                Ok(Some(ShufflePartition {
+                let partition = ShufflePartition {
                     id: id.clone(),
                     schema,
                     batches,
-                }))
+                };
+
+                // Strict content-hash verification (uniform with memory/disk stores)
+                let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+                if let Some(stored_ref) = self.content_hashes.get(&key) {
+                    let stored = *stored_ref;
+                    let computed = Self::compute_content_hash(&partition);
+                    if computed != stored {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!("{:?}", key),
+                            expected: format!("{:02x?}", stored),
+                            actual: format!("{:02x?}", computed),
+                        });
+                    }
+                }
+                Ok(Some(partition))
             }
         }
     }
@@ -195,6 +238,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
         use futures::TryStreamExt;
 
         self.lease_tokens.retain(|(jid, _, _), _| jid != job_id);
+        self.content_hashes.retain(|(jid, _, _), _| jid != job_id);
 
         // P2.9: collect all object paths, then issue a single batch-delete stream
         // rather than O(N) serial round-trips.

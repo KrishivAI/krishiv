@@ -63,7 +63,9 @@ pub async fn execute_batch_sql_coordinated(
             });
         }
 
-        let _ = coordinator.drive_pending_task_launches().await;
+        if let Err(e) = coordinator.drive_pending_task_launches().await {
+            eprintln!("drive_pending_task_launches failed: {:?}", e);
+        }
 
         let state = {
             let coord = coordinator.read().await;

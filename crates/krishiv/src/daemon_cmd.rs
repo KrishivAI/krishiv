@@ -25,7 +25,10 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
         "job-coordinator" => run_job_coordinator(&rest),
         "flight-server" => run_flight_server(&rest),
         "shuffle-svc" => run_shuffle_svc(&rest),
-        _ => unreachable!(),
+        other => {
+            tracing::error!(subcommand = %other, "unexpected daemon subcommand after validation");
+            2
+        }
     };
     Some(code)
 }

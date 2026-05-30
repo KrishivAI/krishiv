@@ -5,10 +5,7 @@
 //! concurrency control for multi-writer Iceberg table access.
 
 use std::fmt;
-use std::sync::Arc;
 
-use arrow::array::Array;
-use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 mod as_of;
@@ -366,9 +363,9 @@ impl LakehouseTable for MemoryLakehouseTable {
 
                     batch
                         .project(&indices)
-                        .expect("column selection should always produce a valid batch")
+                        .map_err(|e| LakehouseError::Io(e.to_string()))
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             batches.clone()
         };

@@ -25,6 +25,11 @@ use crate::{
     fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
 
+/// Default batch task timeout in seconds (1 hour). Applied when the job spec
+/// does not explicitly set `task_timeout_secs`. Prevents hung tasks from
+/// blocking the stage indefinitely.
+pub(crate) const DEFAULT_BATCH_TASK_TIMEOUT_SECS: u64 = 3600;
+
 /// Maximum bytes used in the failure message sent to the coordinator.  Larger
 /// messages are truncated with `…` so they cannot blow past gRPC payload limits.
 pub(crate) const TASK_FAILURE_MESSAGE_MAX_BYTES: usize = 4096;
@@ -243,6 +248,7 @@ impl ExecutorTaskOutput {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn placeholder() -> Self {
         Self {
             kind: ExecutorTaskOutputKind::Placeholder,
@@ -565,6 +571,52 @@ pub trait ContinuousJobDrainer: Send + Sync {
     fn drain_job(&self, job_id: &str) -> Result<Vec<RecordBatch>, String>;
 }
 
+// ── Streaming progress snapshot (GAP-OB-04) ──────────────────────────────
+
+/// Periodic streaming progress report emitted by a continuous streaming task.
+///
+/// Unlike the terminal `TaskState::Succeeded` transition (which only fires once
+/// at task completion), these snapshots provide intermediate observability into
+/// watermark progress, row throughput, and state size while the task is running.
+#[derive(Debug, Clone)]
+pub struct StreamingProgressSnapshot {
+    /// Task that produced this snapshot.
+    pub task_id: String,
+    /// Job that owns this task.
+    pub job_id: String,
+    /// Current event-time watermark in milliseconds since epoch.
+    pub watermark_ms: i64,
+    /// Total rows emitted since task start.
+    pub rows_emitted: u64,
+    /// Total batches emitted since task start.
+    pub batches_emitted: u64,
+    /// Approximate state backend byte size.
+    pub state_bytes: u64,
+    /// Current source offset (connector-specific encoding).
+    pub source_offset: Option<Vec<u8>>,
+    /// Wall-clock timestamp of this snapshot (ms since epoch).
+    pub timestamp_ms: u64,
+}
+
+/// Callback invoked by streaming operators to report intermediate progress.
+///
+/// Each call receives an immutable reference to a [`StreamingProgressSnapshot`].
+/// Implementations are free to forward the snapshot to metrics, heartbeat
+/// channels, or structured logs.
+pub trait StreamingProgressCallback: Send + Sync {
+    fn on_progress(&self, snapshot: &StreamingProgressSnapshot);
+}
+
+/// Thread-safe boxed wrapper for progress callbacks.
+pub type SharedProgressCallback = Arc<dyn StreamingProgressCallback>;
+
+/// Default no-op callback for when progress reporting is not configured.
+struct NoOpProgressCallback;
+
+impl StreamingProgressCallback for NoOpProgressCallback {
+    fn on_progress(&self, _snapshot: &StreamingProgressSnapshot) {}
+}
+
 /// Minimal R3.1 stage-local task runner skeleton.
 #[derive(Clone)]
 pub struct ExecutorTaskRunner {
@@ -615,6 +667,13 @@ pub struct ExecutorTaskRunner {
     /// `SourceThrottleTable::check_and_log()` or `active_limit()`.
     /// Clone is cheap — all runner clones share the same underlying `DashMap`.
     pub source_throttle_limits: crate::source_throttle::SourceThrottleTable,
+
+    /// Optional streaming progress callback (GAP-OB-04).
+    ///
+    /// When set, streaming operators report intermediate progress (watermark,
+    /// rows emitted, state size) via this callback. The heartbeat loop wires
+    /// this to forward snapshots to the coordinator for metrics exposure.
+    pub(crate) progress_callback: SharedProgressCallback,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -672,6 +731,7 @@ impl ExecutorTaskRunner {
                 FencingToken::initial().as_u64(),
             )),
             source_throttle_limits: crate::source_throttle::SourceThrottleTable::new(),
+            progress_callback: Arc::new(NoOpProgressCallback),
         }
     }
 
@@ -720,10 +780,44 @@ impl ExecutorTaskRunner {
         self
     }
 
-    /// Attach a custom SQL engine. Useful for tests or policy-wrapped engines.
+    /// Attach a custom SQL engine (including one pre-configured with UDF limits for a job).
+    ///
+    /// Preferred pattern for job-aware task execution (Track E):
+    ///   let limits = /* from JCP or JobRecord for the task's job */;
+    ///   let engine = Arc::new(SqlEngine::new().with_udf_limits(limits));
+    ///   runner = ExecutorTaskRunner::new(inbox).with_sql_engine(engine);
+    ///
+    /// This is the concrete execution-path wiring for sandboxed UDF enforcement
+    /// on real tasks belonging to a job with resource limits.
     pub fn with_sql_engine(mut self, engine: Arc<SqlEngine>) -> Self {
         self.sql_engine = engine;
         self
+    }
+
+    /// Configure UDF resource limits directly on the runner.
+    /// This creates a SqlEngine with the given limits for sandbox enforcement
+    /// during task execution.
+    pub fn with_udf_limits(mut self, limits: krishiv_udf::ResourceLimits) -> Self {
+        let engine = Arc::new(SqlEngine::new().with_udf_limits(limits));
+        self.sql_engine = engine;
+        self
+    }
+
+    /// Attach a streaming progress callback (GAP-OB-04).
+    ///
+    /// Streaming operators call this periodically to report watermark advance,
+    /// row throughput, and state size. The heartbeat loop wires this to forward
+    /// snapshots to the coordinator for metrics exposure and structured logs.
+    pub fn with_progress_callback(mut self, callback: SharedProgressCallback) -> Self {
+        self.progress_callback = callback;
+        self
+    }
+
+    /// Report a streaming progress snapshot via the configured callback.
+    ///
+    /// Safe to call from any slot — the callback is `Send + Sync`.
+    pub fn report_streaming_progress(&self, snapshot: &StreamingProgressSnapshot) {
+        self.progress_callback.on_progress(snapshot);
     }
 
     /// Attach a shuffle context so this runner can handle `shuffle-write:` fragments.
@@ -838,21 +932,21 @@ impl ExecutorTaskRunner {
         let execute_result = match model {
             crate::ExecutionModel::Batch => {
                 // Batch tasks respect task_timeout_secs: they are expected to
-                // complete in bounded time.
-                if let Some(timeout_secs) = assignment.task_timeout_secs() {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout_secs),
-                        execute_batch_fragment(self, &assignment),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
-                            message: format!("task timed out after {} seconds", timeout_secs),
-                        }),
-                    }
-                } else {
-                    execute_batch_fragment(self, &assignment).await
+                // complete in bounded time.  A default of 1 hour guards against
+                // hung tasks that would otherwise block the stage forever.
+                let timeout_secs = assignment
+                    .task_timeout_secs()
+                    .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    execute_batch_fragment(self, &assignment),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => Err(ExecutorError::InvalidAssignment {
+                        message: format!("task timed out after {} seconds", timeout_secs),
+                    }),
                 }
             }
             crate::ExecutionModel::Streaming => {
@@ -883,14 +977,20 @@ impl ExecutorTaskRunner {
             }
         };
 
-        let fragment = assignment.plan_fragment().description().trim();
-        // GAP-6: stream:loop: fragments complete each drain cycle and report
-        // Succeeded so the coordinator sees the windowed output.  Future drain
-        // cycles are triggered by re-assigning the task.
-        let terminal_streaming_task = model == crate::ExecutionModel::Streaming
-            && (fragment.starts_with("stream:continuous:")
-                || fragment.starts_with("stream:loop:")
-                || krishiv_plan::window::parse_stream_fragment(fragment).is_ok());
+        let typed_requires_reattach = assignment.requires_reattach();
+
+        // C3: Legacy string heuristics removed. requires_reattach is now the only supported path.
+        if !typed_requires_reattach && model == crate::ExecutionModel::Streaming {
+            if !cfg!(test) {
+                return Err(tonic::Status::failed_precondition(
+                    "string-based plan_fragment for streaming terminal state is no longer supported; use requires_reattach on ExecutorTaskAssignment",
+                ));
+            }
+        }
+
+        let terminal_streaming_task =
+            model == crate::ExecutionModel::Streaming && typed_requires_reattach;
+
         let terminal_state =
             if model == crate::ExecutionModel::Streaming && !terminal_streaming_task {
                 TaskState::Running
@@ -1060,27 +1160,24 @@ impl ExecutorTaskRunner {
             // Prefer the real attempt ref from running_attempts.  Fall back to
             // a stage-0 / initial-attempt synthesis ONLY when no real ref is
             // available (e.g. the task completed before the barrier arrived).
-            let (stage_id, attempt_id, executor_id_opt) = self
+            let (stage_id, attempt_id, _executor_id_opt) = match self
                 .running_attempts
                 .as_ref()
-                .and_then(|map| {
-                    map.get(task_id.as_str()).map(|attempt| {
-                        (
-                            attempt.stage_id().clone(),
-                            attempt.attempt_id(),
-                            None::<krishiv_proto::ExecutorId>,
-                        )
-                    })
-                })
-                .unwrap_or_else(|| {
+                .and_then(|map| map.get(task_id.as_str()))
+            {
+                Some(attempt) => (
+                    attempt.stage_id().clone(),
+                    attempt.attempt_id(),
+                    None::<krishiv_proto::ExecutorId>,
+                ),
+                None => {
                     let stage = krishiv_proto::StageId::try_new("s0")
-                        .or_else(|_| krishiv_proto::StageId::try_new("stage"))
-                        .expect("stage id");
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
                     (stage, krishiv_proto::AttemptId::initial(), None)
-                });
-            let _ = executor_id_opt; // (kept for symmetry; coordinator looks up by task_id)
-            let executor_id =
-                krishiv_proto::ExecutorId::try_new("exec").expect("'exec' is a valid executor id");
+                }
+            };
+            let executor_id = krishiv_proto::ExecutorId::try_new("exec")
+                .map_err(|e| tonic::Status::internal(e.to_string()))?;
             let ids = TaskAttemptRef::new(req.job_id.clone(), stage_id, task_id, attempt_id);
             let assignment = ExecutorTaskAssignment::new(
                 ids,
@@ -1426,5 +1523,42 @@ mod runner_tests {
             .unwrap();
         assert_eq!(ack.epoch, 1);
         assert_eq!(runner.last_acked_epoch, 1);
+    }
+
+    #[test]
+    fn progress_callback_invoked_with_snapshot() {
+        use std::sync::Mutex;
+        struct TestCallback {
+            snapshots: Mutex<Vec<StreamingProgressSnapshot>>,
+        }
+        impl StreamingProgressCallback for TestCallback {
+            fn on_progress(&self, snapshot: &StreamingProgressSnapshot) {
+                self.snapshots.lock().unwrap().push(snapshot.clone());
+            }
+        }
+        let callback = Arc::new(TestCallback {
+            snapshots: Mutex::new(Vec::new()),
+        });
+        let inbox = ExecutorAssignmentInbox::new();
+        let runner = ExecutorTaskRunner::new(inbox)
+            .with_progress_callback(callback.clone() as SharedProgressCallback);
+
+        let snapshot = StreamingProgressSnapshot {
+            task_id: "t0".into(),
+            job_id: "j0".into(),
+            watermark_ms: 1000,
+            rows_emitted: 42,
+            batches_emitted: 7,
+            state_bytes: 4096,
+            source_offset: Some(vec![0, 1, 2]),
+            timestamp_ms: 5000,
+        };
+        runner.report_streaming_progress(&snapshot);
+
+        let captured = callback.snapshots.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].task_id, "t0");
+        assert_eq!(captured[0].rows_emitted, 42);
+        assert_eq!(captured[0].watermark_ms, 1000);
     }
 }

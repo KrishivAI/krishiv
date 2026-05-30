@@ -55,6 +55,7 @@ tonic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parquet = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }

@@ -108,6 +108,13 @@ pub struct CheckpointMetadata {
     /// Restore paths must reject checkpoints whose `fencing_token` predates
     /// the current coordinator generation.
     pub fencing_token: u64,
+    /// Coordinator identity that committed this checkpoint.
+    ///
+    /// Added in metadata version 2.  `None` for version-1 metadata (R6 era).
+    /// Used for audit trails and incident debugging — operators can trace
+    /// which coordinator instance committed each epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_id: Option<String>,
     /// Wall-clock commit time in milliseconds since Unix epoch (informational).
     pub timestamp_ms: u64,
     /// Last processed source offset per partition at the barrier boundary.
@@ -207,7 +214,7 @@ impl IntegrityManifest {
         use std::fmt::Write;
         let mut out = String::new();
         for (path, hex) in &self.entries {
-            writeln!(out, "sha256:{hex}  {path}").unwrap();
+            let _ = writeln!(out, "sha256:{hex}  {path}");
         }
         out.into_bytes()
     }
@@ -598,14 +605,45 @@ fn read_latest_epoch_hint(
 
 /// Validate that `metadata.fencing_token` is not older than `current_token`.
 ///
-/// Call this before writing a new checkpoint epoch. A stale fencing token means
-/// the coordinator that built this metadata is no longer the active leader —
-/// committing would risk a split-brain write.
+/// Call this before writing a new checkpoint epoch or savepoint. Rejects metadata
+/// whose fencing token does not match the current coordinator's token — this
+/// prevents split-brain commits by stale coordinators.
+///
+/// **Important**: fencing tokens are per-coordinator-instance and are not
+/// comparable across different coordinator instances.  This function should be
+/// used only when the caller is the current active coordinator doing a write.
+/// For restore operations, use [`validate_fencing_token_for_restore`] instead.
 pub fn validate_fencing_token(
     metadata: &CheckpointMetadata,
     current_token: u64,
 ) -> CheckpointResult<()> {
-    if metadata.fencing_token < current_token {
+    if metadata.fencing_token != current_token {
+        return Err(CheckpointError::StaleFencingToken {
+            stored: metadata.fencing_token,
+            current: current_token,
+        });
+    }
+    Ok(())
+}
+
+/// Validate fencing token for a checkpoint restore operation.
+///
+/// Unlike [`validate_fencing_token`], this function accepts metadata written by
+/// a prior coordinator instance (whose fencing token may differ from the current
+/// leader's token because fencing tokens are per-coordinator-instance, not
+/// globally monotonic).  The restore path relies on the leader-election
+/// mechanism to guarantee that only one coordinator is actively mutating job
+/// state; the fencing token in the metadata is recorded for audit purposes.
+///
+/// The check rejects only the pathological case where the metadata token is
+/// strictly greater than the current token — which would indicate the metadata
+/// was written by a coordinator that came *after* this one in the leadership
+/// sequence, meaning this coordinator is stale.
+pub fn validate_fencing_token_for_restore(
+    metadata: &CheckpointMetadata,
+    current_token: u64,
+) -> CheckpointResult<()> {
+    if metadata.fencing_token > current_token {
         return Err(CheckpointError::StaleFencingToken {
             stored: metadata.fencing_token,
             current: current_token,
@@ -1009,6 +1047,7 @@ mod tests {
             epoch,
             job_id: "job-test".to_owned(),
             fencing_token: 1,
+            coordinator_id: None,
             timestamp_ms: 1_716_000_000_000,
             source_offsets: vec![SourceOffsetRecord {
                 partition_id: "partition-0".to_owned(),
@@ -1313,13 +1352,24 @@ mod tests {
     }
 
     #[test]
-    fn fencing_token_accepts_future_generation() {
+    fn fencing_token_rejects_mismatch() {
         let meta = sample_metadata(1);
         let mut meta2 = meta.clone();
         meta2.fencing_token = 5;
         assert!(
-            validate_fencing_token(&meta2, 2).is_ok(),
-            "metadata from a prior valid coordinator (higher token) must be accepted"
+            validate_fencing_token(&meta2, 2).is_err(),
+            "metadata from a different coordinator instance (token=5) must be rejected by current coordinator (token=2)"
+        );
+    }
+
+    #[test]
+    fn fencing_token_accepts_exact_match() {
+        let meta = sample_metadata(1);
+        let mut meta2 = meta.clone();
+        meta2.fencing_token = 3;
+        assert!(
+            validate_fencing_token(&meta2, 3).is_ok(),
+            "metadata with matching token must be accepted"
         );
     }
 
@@ -1528,6 +1578,7 @@ mod tests {
             epoch: 42,
             job_id: "job-full".to_owned(),
             fencing_token: 7,
+            coordinator_id: None,
             timestamp_ms: 1_716_100_000_000,
             source_offsets: vec![
                 SourceOffsetRecord {
@@ -2115,7 +2166,27 @@ mod tests {
         let mut meta = sample_metadata(1);
         meta.fencing_token = u64::MAX;
         assert!(validate_fencing_token(&meta, u64::MAX).is_ok());
-        assert!(validate_fencing_token(&meta, 0).is_ok());
+        // Mismatched token (0 vs u64::MAX) must be rejected.
+        assert!(validate_fencing_token(&meta, 0).is_err());
+    }
+
+    #[test]
+    fn validate_fencing_token_for_restore_accepts_lower_stored_token() {
+        let mut meta = sample_metadata(1);
+        meta.fencing_token = 3;
+        // Restoring metadata from a prior coordinator (token 3) with current
+        // coordinator having token 7 — allowed because metadata came from a
+        // past valid leader.
+        assert!(validate_fencing_token_for_restore(&meta, 7).is_ok());
+    }
+
+    #[test]
+    fn validate_fencing_token_for_restore_rejects_higher_stored_token() {
+        let mut meta = sample_metadata(1);
+        meta.fencing_token = 9;
+        // Metadata with a higher token than current coordinator suggests this
+        // coordinator is stale.
+        assert!(validate_fencing_token_for_restore(&meta, 5).is_err());
     }
 
     // ── ReplayBundle with savepoint fields ──────────────────────────────
@@ -2646,5 +2717,122 @@ mod tests {
         // validate_epoch reads files and computes hash; it should return false
         // because the stored hash doesn't match
         assert!(!validate_epoch(&s, "j", 1).unwrap());
+    }
+
+    #[test]
+    fn savepoint_and_later_checkpoints_coexist() {
+        let s = make_storage();
+        let state1 = b"state-epoch-1";
+        let state2 = b"state-epoch-2";
+        let state3 = b"state-epoch-3";
+
+        // Establish epochs 1, 2, 3
+        let meta1 = sample_metadata(1);
+        let meta2 = sample_metadata(2);
+        let meta3 = sample_metadata(3);
+        for epoch in &[1u64, 2, 3] {
+            let meta = if *epoch == 1 {
+                &meta1
+            } else if *epoch == 2 {
+                &meta2
+            } else {
+                &meta3
+            };
+            let state = if *epoch == 1 {
+                state1
+            } else if *epoch == 2 {
+                state2
+            } else {
+                state3
+            };
+            write_operator_snapshot(&s, "j-sp", *epoch, "op-0", "task-0", state).unwrap();
+            write_epoch_metadata(&s, "j-sp", *epoch, meta).unwrap();
+            let mut m = IntegrityManifest::new();
+            let meta_json = serde_json::to_vec_pretty(meta).unwrap();
+            m.insert_bytes("metadata.json", &meta_json);
+            m.insert_bytes("op-0/task-0/state.bin", state);
+            write_manifest(&s, "j-sp", *epoch, &m).unwrap();
+        }
+        assert_eq!(latest_valid_epoch(&s, "j-sp").unwrap(), 3);
+
+        // Create a savepoint from epoch 2
+        let (sp_epoch, sp_meta) = create_savepoint(&s, "j-sp", Some("test-savepoint")).unwrap();
+        assert_eq!(sp_epoch, 3); // latest_valid_epoch is 3
+
+        // Write epochs 4 and 5 after the savepoint
+        for epoch in &[4u64, 5] {
+            let meta = CheckpointMetadata {
+                version: CheckpointMetadata::VERSION,
+                epoch: *epoch,
+                job_id: "j-sp".into(),
+                fencing_token: 1,
+                coordinator_id: Some("coord-1".into()),
+                timestamp_ms: 1_716_000_000_000,
+                source_offsets: Vec::new(),
+                operator_snapshots: Vec::new(),
+                is_savepoint: false,
+                savepoint_label: None,
+                iceberg_snapshot_id: None,
+                kafka_offsets: None,
+            };
+            write_epoch_metadata(&s, "j-sp", *epoch, &meta).unwrap();
+            let mut m = IntegrityManifest::new();
+            let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+            m.insert_bytes("metadata.json", &meta_json);
+            write_manifest(&s, "j-sp", *epoch, &m).unwrap();
+            write_epoch_hint(&s, "j-sp", *epoch).unwrap();
+        }
+        assert_eq!(latest_valid_epoch(&s, "j-sp").unwrap(), 5);
+
+        // Savepoint still readable
+        let restored = restore_savepoint(&s, "j-sp", 3, 1).unwrap();
+        assert!(restored.is_savepoint);
+        assert_eq!(restored.savepoint_label.as_deref(), Some("test-savepoint"));
+
+        // Newer checkpoints still valid
+        assert!(validate_epoch(&s, "j-sp", 5).unwrap());
+        assert!(validate_epoch(&s, "j-sp", 4).unwrap());
+    }
+
+    #[test]
+    fn delete_savepoint_does_not_affect_checkpoint_epochs() {
+        let s = make_storage();
+        let state1 = b"state-epoch-1";
+        let meta1 = sample_metadata(1);
+        write_operator_snapshot(&s, "j-del", 1, "op-0", "task-0", state1).unwrap();
+        write_epoch_metadata(&s, "j-del", 1, &meta1).unwrap();
+        let mut m = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(&meta1).unwrap();
+        m.insert_bytes("metadata.json", &meta_json);
+        m.insert_bytes("op-0/task-0/state.bin", state1);
+        write_manifest(&s, "j-del", 1, &m).unwrap();
+
+        create_savepoint(&s, "j-del", Some("to-delete")).unwrap();
+
+        // Write a newer checkpoint with manifest
+        let meta2 = sample_metadata(2);
+        write_operator_snapshot(&s, "j-del", 2, "op-0", "task-0", b"state-epoch-2").unwrap();
+        write_epoch_metadata(&s, "j-del", 2, &meta2).unwrap();
+        let mut m2 = IntegrityManifest::new();
+        let meta2_json = serde_json::to_vec_pretty(&meta2).unwrap();
+        m2.insert_bytes("metadata.json", &meta2_json);
+        m2.insert_bytes("op-0/task-0/state.bin", b"state-epoch-2");
+        write_manifest(&s, "j-del", 2, &m2).unwrap();
+        write_epoch_hint(&s, "j-del", 2).unwrap();
+
+        // Delete the savepoint
+        let sp_dir = savepoint_epoch_dir("j-del", 1);
+        delete_savepoint(&s, "j-del", 1).unwrap();
+
+        // Savepoint metadata removed but checkpoint epochs remain intact
+        assert!(
+            s.read_bytes(&format!("{sp_dir}/metadata.json"))
+                .unwrap()
+                .is_none(),
+            "savepoint metadata should be deleted"
+        );
+        assert!(validate_epoch(&s, "j-del", 1).unwrap());
+        assert!(validate_epoch(&s, "j-del", 2).unwrap());
+        assert_eq!(latest_valid_epoch(&s, "j-del").unwrap(), 2);
     }
 }

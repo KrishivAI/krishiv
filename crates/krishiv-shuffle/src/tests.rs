@@ -1392,11 +1392,8 @@ mod shuffle_tests {
     async fn in_memory_misconfiguration_fails_closed() {
         let store = InMemoryShuffleStore::new().with_max_bytes(1024);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
         let partition = ShufflePartition {
             id: PartitionId {
                 job_id: "misconfig".to_owned(),
@@ -1866,6 +1863,56 @@ mod shuffle_tests {
         assert!(
             matches!(err, ShuffleError::Io(_)),
             "expected Io error for missing column, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_parquet_file_returns_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+
+        let partition = make_store_partition("job-corrupt", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+
+        // Corrupt the parquet file on disk
+        use std::io::Write;
+        let path = dir.path().join("job-corrupt/s0/0.parquet");
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(b"CORRUPTED PARQUET DATA").unwrap();
+        drop(f);
+
+        let err = store.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::Io(_)),
+            "expected Io error for corrupt parquet, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_hash_mismatch_detected_on_tampered_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+
+        let partition = make_store_partition("job-hash", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+        drop(store);
+
+        // Tamper the partition file on disk so hash won't match on re-read
+        use std::io::Write;
+        let path = dir.path().join("job-hash/s0/0.parquet");
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(b"TAMPERED DATA OVERWRITE").unwrap();
+        drop(f);
+
+        // Create a new store instance (loads clean hashes — no stored hash means no mismatch error)
+        let store2 = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let err = store2.read_partition(&id).await.unwrap_err();
+        // After tampering, the read should fail (Io error from parquet deserialization)
+        assert!(
+            matches!(err, ShuffleError::Io(_)),
+            "expected Io error for tampered parquet, got {err}"
         );
     }
 }

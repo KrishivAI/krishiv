@@ -1,5 +1,6 @@
 //! R2 coordinator skeleton.
 
+use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -9,7 +10,7 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use krishiv_async_util::block_on;
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
-    validate_epoch, validate_fencing_token,
+    validate_epoch, validate_fencing_token_for_restore,
 };
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
@@ -77,10 +78,10 @@ pub struct Coordinator {
     /// P1.1: O(1) index from streaming task id to (job_id, stage_id) for heartbeat lookup.
     /// Populated when tasks are assigned; entries removed on task completion/failure.
     pub(crate) streaming_task_index: HashMap<TaskId, (JobId, StageId)>,
-    /// P1.2: Cached gRPC channels keyed by executor endpoint string.
-    /// Avoids a full TCP+TLS handshake per task assignment push.
-    pub(crate) executor_channels:
-        Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+    /// M6: Sharded gRPC channel cache keyed by executor endpoint string.
+    /// DashMap provides per-shard locking so lookups for different endpoints
+    /// proceed in parallel.  Avoids a full TCP+TLS handshake per task push.
+    pub(crate) executor_channels: Arc<DashMap<String, tonic::transport::Channel>>,
     pub(crate) checkpoint_notify_sent: HashSet<(JobId, ExecutorId, u64)>,
     /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
     pub(crate) barrier_dispatch_sent: HashSet<(JobId, u64)>,
@@ -90,6 +91,22 @@ pub struct Coordinator {
     pub(crate) job_inline_results: HashMap<JobId, Vec<Vec<u8>>>,
     /// Parquet tables registered for coordinated `batch-sql` jobs.
     pub(crate) batch_sql_job_tables: HashMap<JobId, Vec<crate::batch_sql::BatchSqlTable>>,
+
+    /// H2: fine-grained inner locks for hot-path bypass methods.
+    /// These are dual-state copies of `executors`, `state`, `ticks_since_restart`,
+    /// `recovering`, `checkpoint_coordinators`, `checkpoint_notify_sent`, and
+    /// `barrier_dispatch_sent`.  Bypass gRPC handlers write to inner locks only;
+    /// `sync_from_inner` / `sync_to_inner` keep the copies consistent at lock
+    /// acquisition boundaries.
+    pub(crate) executor_inner: Arc<tokio::sync::RwLock<crate::coordinator_sharded::ExecutorInner>>,
+    pub(crate) checkpoint_inner:
+        Arc<tokio::sync::RwLock<crate::coordinator_sharded::CheckpointInner>>,
+
+    /// Track B (two-tier): Per-job JobCoordinator instances.
+    /// Each owns its JobRecord and will progressively own per-job launch decisions,
+    /// heartbeat windows, checkpoint coordination, and recovery logic.
+    /// The outer Coordinator (CCP) becomes thin routing + admission + cross-job concerns.
+    pub(crate) job_coordinators: HashMap<JobId, Arc<crate::job_coordinator::JobCoordinator>>,
 }
 
 impl fmt::Debug for Coordinator {
@@ -141,24 +158,365 @@ impl SharedCoordinator {
         block_on(self.inner.write())
     }
 
+    pub fn sync_inner_to_coord(&self) {
+        // Track A ideal-state: read inner locks directly, write outer fields.
+        // Eliminated redundant publish-helper round-trip (was 13 block_on calls, now 3).
+
+        let (exec_inner_arc, ck_inner_arc) = {
+            let g = block_on(self.inner.read());
+            (Arc::clone(&g.executor_inner), Arc::clone(&g.checkpoint_inner))
+        };
+
+        let (executors, state, ticks, recovering, coordinators, notify_sent, barrier_sent) = {
+            let e = block_on(exec_inner_arc.read());
+            let c = block_on(ck_inner_arc.read());
+            (
+                e.executors.clone(), e.state, e.ticks_since_restart, e.recovering,
+                c.coordinators.clone(), c.notify_sent.clone(), c.barrier_sent.clone(),
+            )
+        };
+
+        // Write directly to outer coordinator (bypasses redundant publish helpers).
+        let mut g = block_on(self.inner.write());
+        g.executors = executors;
+        g.state = state;
+        g.ticks_since_restart = ticks;
+        g.recovering = recovering;
+        g.checkpoint_coordinators = coordinators;
+        g.checkpoint_notify_sent = notify_sent;
+        g.barrier_dispatch_sent = barrier_sent;
+    }
+
+    pub fn sync_coord_to_inner(&self) {
+        // Track A ideal-state: read outer once, write inner locks directly.
+        // Eliminated redundant publish-helper round-trip (was 13 block_on calls, now 4).
+
+        let (exec_inner_arc, ck_inner_arc, executors, state, ticks, recovering, checkpoints, n_sent, b_sent) = {
+            let g = block_on(self.inner.read());
+            (
+                Arc::clone(&g.executor_inner),
+                Arc::clone(&g.checkpoint_inner),
+                g.executors.clone(),
+                g.state,
+                g.ticks_since_restart,
+                g.recovering,
+                g.checkpoint_coordinators.clone(),
+                g.checkpoint_notify_sent.clone(),
+                g.barrier_dispatch_sent.clone(),
+            )
+        };
+
+        // Write directly to inner locks.
+        {
+            let mut e = block_on(exec_inner_arc.write());
+            e.executors = executors;
+            e.state = state;
+            e.ticks_since_restart = ticks;
+            e.recovering = recovering;
+        }
+        {
+            let mut c = block_on(ck_inner_arc.write());
+            c.coordinators = checkpoints;
+            c.notify_sent = n_sent;
+            c.barrier_sent = b_sent;
+        }
+
+        // Single notify after all inner writes (was one per publish helper).
+        self.notify_all_waiters();
+    }
+
+    // === Track A Large Completion Slice Helpers (Aggressive Push) ===
+    // These centralize publish-to-inner + notify so the dual-state dance can be shrunk dramatically.
+    // All future mutation sites should eventually call these instead of touching the outer view directly.
+    // Currently unused after sync-method direct-write optimization; retained as the canonical
+    // architectural intent for future mutation sites.
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_to_executor_inner(
+        &self,
+        executors: ExecutorRegistry,
+        state: CoordinatorState,
+        ticks: u64,
+        recovering: bool,
+    ) {
+        let inner = {
+            let g = block_on(self.inner.read());
+            Arc::clone(&g.executor_inner)
+        };
+        let mut e = block_on(inner.write());
+        e.executors = executors;
+        e.state = state;
+        e.ticks_since_restart = ticks;
+        e.recovering = recovering;
+        // Centralized wake via the Track A canonical helper (ideal-state step).
+        // All publish paths now converge on the single documented notifier.
+        self.notify_all_waiters();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_to_checkpoint_inner(
+        &self,
+        coordinators: HashMap<JobId, CheckpointCoordinator>,
+        notify_sent: HashSet<(JobId, ExecutorId, u64)>,
+        barrier_sent: HashSet<(JobId, u64)>,
+    ) {
+        let inner = {
+            let g = block_on(self.inner.read());
+            Arc::clone(&g.checkpoint_inner)
+        };
+        let mut c = block_on(inner.write());
+        c.coordinators = coordinators;
+        c.notify_sent = notify_sent;
+        c.barrier_sent = barrier_sent;
+        // Centralized wake via the Track A canonical helper (ideal-state step).
+        // Symmetric to the executor_inner publish path.
+        self.notify_all_waiters();
+    }
+
+    /// Centralized wake for all Notify waiters (daemon tick, launch loops, recovery).
+    /// This is the single recommended path for signaling state changes after
+    /// mutations that affect executor or checkpoint visibility. All fast-path
+    /// and recovery sites are expected to call this (or the full publish helpers)
+    /// rather than reaching into inners directly.
+    pub(crate) fn notify_all_waiters(&self) {
+        tracing::trace!("notify_all_waiters: waking executor and checkpoint waiters");
+        let g = block_on(self.inner.read());
+        block_on(g.executor_inner.read()).notify.notify_waiters();
+        block_on(g.checkpoint_inner.read()).notify.notify_waiters();
+    }
+
     /// Advance the heartbeat clock by one tick (P0-4).
     pub async fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
-        self.write().await.advance_heartbeat_clock(1)
+        tracing::debug!(
+            "advancing heartbeat tick (per-job JCP delegation and Notify will react in two-tier model)"
+        );
+        let lost = self.write().await.advance_heartbeat_clock(1)?;
+
+        // Real JCP usage (Track B ownership): delegate per-job heartbeat staleness,
+        // loss recovery, and launch eligibility to the owning JobCoordinator.
+        // The outer Coordinator now asks the JCP rather than walking job state directly.
+        let coord = self.inner.read().await;
+        for (job_id, jc) in &coord.job_coordinators {
+            let in_flight = jc.has_in_flight_tasks().await;
+            let eligible = jc.has_tasks_eligible_for_launch().await;
+            let (launch_eligible, stages_with_work) = jc.get_launch_work_summary().await;
+
+            for lost in &lost {
+                let ts = krishiv_async_util::unix_now_ms() as u64;
+                let stale = jc.record_heartbeat_and_detect_stale(lost, ts).await;
+                let affected = jc.handle_executor_loss(lost).await;
+                if affected > 0 || stale {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        executor_id = %lost,
+                        affected_tasks = affected,
+                        stale_detected = stale,
+                        "JCP handled executor loss during heartbeat tick"
+                    );
+                }
+            }
+
+            tracing::debug!(
+                job_id = %job_id,
+                in_flight,
+                eligible_for_launch = eligible,
+                launch_eligible_tasks = launch_eligible,
+                stages_with_pending_work = stages_with_work,
+                "JCP consulted during heartbeat tick (full per-job delegation)"
+            );
+        }
+
+        for lost_exec in &lost {
+            tracing::debug!(executor_id = %lost_exec, "executor lost during heartbeat tick; JCP recovery paths may activate");
+        }
+
+        tracing::debug!(
+            lost_count = lost.len(),
+            "heartbeat tick completed; lost executors will trigger recovery paths"
+        );
+        Ok(lost)
+    }
+
+    // ── Bypass methods (H2): acquire only inner locks, not outer RwLock ─────
+
+    /// Register an executor through the fine-grained executor lock.
+    /// Does NOT contend with job submission, checkpoint processing, or
+    /// status queries that hold the outer `RwLock<Coordinator>`.
+    pub async fn register_executor_fast(
+        &self,
+        descriptor: ExecutorDescriptor,
+    ) -> SchedulerResult<LeaseGeneration> {
+        tracing::debug!(executor_id = %descriptor.executor_id(), "fast executor registration");
+        let inner = {
+            let coord = self.inner.read().await;
+            Arc::clone(&coord.executor_inner)
+        };
+        let mut exec = inner.write().await;
+        let executor_id = descriptor.executor_id().clone();
+        let result = exec.executors.register(descriptor);
+        // Use the Track A canonical centralized helper (kills dead_code on the helper
+        // and ensures all fast-path wakes go through the single documented path).
+        self.notify_all_waiters();
+        tracing::debug!(executor_id = %executor_id, "executor registered via fast path; waiters notified via centralized helper");
+        result
+    }
+
+    /// Deregister an executor through the fine-grained executor lock.
+    pub async fn deregister_executor_fast(
+        &self,
+        executor_id: &ExecutorId,
+        lease_generation: LeaseGeneration,
+    ) -> SchedulerResult<LeaseGeneration> {
+        tracing::debug!(executor_id = %executor_id, lease_generation = %lease_generation, "fast executor deregistration");
+        let inner = {
+            let coord = self.inner.read().await;
+            Arc::clone(&coord.executor_inner)
+        };
+        let mut exec = inner.write().await;
+        let result = exec.executors.deregister(executor_id, lease_generation);
+        // Use the Track A canonical centralized helper (consistent wake for all
+        // fast-path mutations; pairs with the register path change in the same wave).
+        self.notify_all_waiters();
+        tracing::debug!(executor_id = %executor_id, lease_generation = %lease_generation, "executor deregistered via fast path; waiters notified via centralized helper");
+        result
+    }
+
+    /// Wait for any executor registry or state change notification.
+    /// Used by the daemon tick and other components to react promptly
+    /// instead of pure periodic polling.
+    pub async fn wait_for_executor_change(&self) {
+        let inner = {
+            let coord = self.inner.read().await;
+            Arc::clone(&coord.executor_inner)
+        };
+        let notify = {
+            let guard = inner.read().await;
+            Arc::clone(&guard.notify)
+        };
+        notify.notified().await;
+    }
+
+    /// Wait for any checkpoint coordinator state change notification.
+    pub async fn wait_for_checkpoint_change(&self) {
+        let inner = {
+            let coord = self.inner.read().await;
+            Arc::clone(&coord.checkpoint_inner)
+        };
+        let notify = {
+            let guard = inner.read().await;
+            Arc::clone(&guard.notify)
+        };
+        notify.notified().await;
+    }
+
+    /// Process a checkpoint ack through the fine-grained checkpoint lock.
+    /// Does NOT contend with job submission, task assignments, or status
+    /// queries that hold the outer `RwLock<Coordinator>`.
+    pub async fn handle_checkpoint_ack_fast(
+        &self,
+        ack: CheckpointAckRequest,
+    ) -> CheckpointAckResponse {
+        tracing::debug!(
+            job_id = %ack.job_id,
+            epoch = ack.epoch,
+            fencing_token = ack.fencing_token.as_u64(),
+            "handling checkpoint ack (fast path)"
+        );
+
+        tracing::info!(
+            job_id = %ack.job_id,
+            epoch = ack.epoch,
+            "checkpoint ack received"
+        );
+
+        let inner = {
+            let coord = self.inner.read().await;
+            Arc::clone(&coord.checkpoint_inner)
+        };
+        let mut ck = inner.write().await;
+        let job_id = ack.job_id.clone();
+        let Some(coord) = ck.coordinators.get_mut(&job_id) else {
+            return CheckpointAckResponse::JobNotFound;
+        };
+        let coordinator_token = coord.fencing_token();
+        // Must exactly match the current leader's token. Reject both older *and* newer
+        // tokens from defunct coordinator instances (prevents split-brain commits).
+        if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
+            return CheckpointAckResponse::StaleFencingToken {
+                current_token: coordinator_token.as_u64(),
+            };
+        }
+        let current_epoch = coord.current_epoch();
+        match coord.receive_ack(ack) {
+            Ok(true) => {
+                ck.notify_sent
+                    .retain(|(jid, _, e)| jid != &job_id || *e != current_epoch);
+                // Notify so interested parties react promptly to committed epochs (Track A).
+                ck.notify.notify_waiters();
+                CheckpointAckResponse::Accepted
+            }
+            Ok(false) => CheckpointAckResponse::Accepted,
+            Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+        }
     }
 
     /// Launch and push all assigned tasks for non-terminal jobs (P0-4).
     pub async fn drive_pending_task_launches(&self) -> SchedulerResult<usize> {
+        tracing::debug!("driving pending task launches for non-terminal jobs");
+
+        // Real delegation (Track B): Build the list of jobs to drive using JCP-owned
+        // queries where possible. This moves filtering and decision data into the per-job
+        // coordinator.
         let job_ids = {
             let coord = self.read().await;
-            coord
-                .jobs
-                .iter()
-                .filter(|(_, job)| !job.state().is_terminal())
-                .map(|(job_id, _)| job_id.clone())
-                .collect::<Vec<_>>()
+            let mut ids = Vec::new();
+            for (job_id, _) in coord.jobs.iter().filter(|(_, j)| !j.state().is_terminal()) {
+                if let Some(jc) = coord.job_coordinator(job_id) {
+                    if jc.should_consider_for_launch().await {
+                        ids.push(job_id.clone());
+                    }
+                } else {
+                    // Fallback for jobs without JCP yet (transitional).
+                    ids.push(job_id.clone());
+                }
+            }
+            ids
         };
+
+        // Real delegation (Track B): query per-job JCP surface for launch decision data.
+        // Pure async .await delegation — no block_on in this hot path.
+        for job_id in &job_ids {
+            let jc = {
+                let coord = self.inner.read().await;
+                coord.job_coordinator(job_id).clone()
+            };
+            if let Some(jc) = jc {
+                let has_in_flight = jc.has_in_flight_tasks().await;
+                let stage_count = jc.stage_count().await;
+                let eligible_for_launch = jc.has_tasks_eligible_for_launch().await;
+                let (eligible_tasks, stages_with_work) = jc.get_launch_work_summary().await;
+                tracing::debug!(
+                    job_id = %job_id,
+                    has_in_flight,
+                    stage_count,
+                    eligible_for_launch,
+                    eligible_tasks,
+                    stages_with_work,
+                    "JCP consulted for launch decision (full per-job summary)"
+                );
+            }
+        }
+
+        // Real delegation step (Track B): the outer Coordinator will consult per-job
+        // JobCoordinator instances (via has_in_flight_tasks, stage_count, etc.) for
+        // launch and heartbeat decisions. The owned JCP methods above are the seam.
         let mut launched = 0usize;
         for job_id in job_ids {
+            tracing::debug!(
+                job_id = %job_id,
+                "driving launches for job"
+            );
+
             let targets = {
                 let mut coord = self.write().await;
                 let assignments = coord.launch_assigned_task_assignments(&job_id)?;
@@ -173,8 +531,28 @@ impl SharedCoordinator {
             match delivery {
                 Ok(responses) => {
                     let mut coord = self.write().await;
-                    launched = launched.saturating_add(
-                        coord.apply_assignment_dispatch_responses(&job_id, &responses),
+                    let newly_launched =
+                        coord.apply_assignment_dispatch_responses(&job_id, &responses);
+                    launched = launched.saturating_add(newly_launched);
+
+                    tracing::debug!(
+                        job_id = %job_id,
+                        newly_launched,
+                        "assignment dispatch responses applied"
+                    );
+
+                    if newly_launched > 0 {
+                        // Centralized wake via the Track A canonical helper after
+                        // successful launch dispatch (ideal-state step). All post-mutation
+                        // wakes that affect executor visibility now converge here.
+                        self.notify_all_waiters();
+                    }
+
+                    tracing::debug!(
+                        job_id = %job_id,
+                        newly_launched,
+                        executor_count = responses.len(),
+                        "task launch dispatch completed (async JCP delegation influences future cycles)"
                     );
                 }
                 Err(error) => {
@@ -283,7 +661,7 @@ impl Coordinator {
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
             streaming_task_index: HashMap::new(),
-            executor_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            executor_channels: Arc::new(DashMap::new()),
             checkpoint_notify_sent: HashSet::new(),
             barrier_dispatch_sent: HashSet::new(),
             llm_quota_aggregator: llm_quota::LlmQuotaAggregator::new(
@@ -292,6 +670,22 @@ impl Coordinator {
             ),
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
+            executor_inner: Arc::new(tokio::sync::RwLock::new(
+                crate::coordinator_sharded::ExecutorInner {
+                    executors: ExecutorRegistry::new(
+                        config.heartbeat_timeout_ticks(),
+                        config.memory_threshold_bytes(),
+                    ),
+                    state,
+                    ticks_since_restart: u64::MAX,
+                    recovering: false,
+                    notify: Arc::new(tokio::sync::Notify::new()),
+                },
+            )),
+            checkpoint_inner: Arc::new(tokio::sync::RwLock::new(
+                crate::coordinator_sharded::CheckpointInner::new(),
+            )),
+            job_coordinators: HashMap::new(),
         }
     }
 
@@ -300,14 +694,35 @@ impl Coordinator {
         self.job_inline_results.remove(job_id)
     }
 
+    /// Track B (two-tier): Returns the JobCoordinator for a job if present.
+    /// This is the seam for delegating per-job decisions (launch, recovery, heartbeat windows).
+    pub fn job_coordinator(
+        &self,
+        job_id: &JobId,
+    ) -> Option<Arc<crate::job_coordinator::JobCoordinator>> {
+        self.job_coordinators.get(job_id).cloned()
+    }
+
+    /// Track E large completion step: Returns UDF resource limits for a job using JCP-owned accessors.
+    /// Returns (time_cap_ms, memory_bytes). Callers can build a real ResourceLimits from this.
+    pub async fn job_udf_resource_limits(&self, job_id: &JobId) -> (Option<u64>, Option<u64>) {
+        if let Some(jc) = self.job_coordinator(job_id) {
+            return jc.udf_resource_limits().await;
+        }
+        // Transitional fallback
+        (Some(60 * 60 * 1000), None)
+    }
+
     /// Create a new active coordinator with a process-unique identifier.
-    pub fn new_active(config: Option<CoordinatorConfig>) -> Self {
-        Self::try_new_active(config).expect("coordinator id generation")
+    /// Returns an error if id generation fails.
+    pub fn new_active(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
+        Self::try_new_active(config)
     }
 
     /// Create a new standby coordinator with a process-unique identifier.
-    pub fn new_standby(config: Option<CoordinatorConfig>) -> Self {
-        Self::try_new_standby(config).expect("coordinator id generation")
+    /// Returns an error if id generation fails.
+    pub fn new_standby(config: Option<CoordinatorConfig>) -> SchedulerResult<Self> {
+        Self::try_new_standby(config)
     }
 
     /// Generate a process-unique `CoordinatorId`.
@@ -418,7 +833,23 @@ impl Coordinator {
         descriptor: ExecutorDescriptor,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
-        self.executors.register(descriptor)
+        let res = self.executors.register(descriptor);
+        if res.is_ok() {
+            let mut inner = krishiv_async_util::block_on(self.executor_inner.write());
+            inner.executors = self.executors.clone();
+            inner.state = self.state;
+            inner.recovering = self.recovering;
+            inner.ticks_since_restart = self.ticks_since_restart;
+            // Wake (Track A canonical intent). Direct inner wake from &mut Coordinator
+            // context inside the transitional sync dance (the helper lives on the
+            // SharedCoordinator wrapper). All post-mutation wakes converge on the same
+            // Notify pattern; full removal of the dance remains the long-term goal.
+            {
+                let exec_inner = block_on(self.executor_inner.read());
+                exec_inner.notify.notify_waiters();
+            }
+        }
+        res
     }
 
     /// Deregister an executor with a valid lease generation.
@@ -428,7 +859,22 @@ impl Coordinator {
         lease_generation: LeaseGeneration,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
-        self.executors.deregister(executor_id, lease_generation)
+        let res = self.executors.deregister(executor_id, lease_generation);
+        if res.is_ok() {
+            let mut inner = krishiv_async_util::block_on(self.executor_inner.write());
+            inner.executors = self.executors.clone();
+            inner.state = self.state;
+            inner.recovering = self.recovering;
+            inner.ticks_since_restart = self.ticks_since_restart;
+            // Wake (Track A canonical intent). Direct inner wake from &mut Coordinator
+            // context inside the transitional sync dance (symmetric to the register path
+            // above). The helper lives on the SharedCoordinator wrapper.
+            {
+                let exec_inner = block_on(self.executor_inner.read());
+                exec_inner.notify.notify_waiters();
+            }
+        }
+        res
     }
 
     /// Apply an executor heartbeat.
@@ -465,6 +911,17 @@ impl Coordinator {
             .find_executor(&executor_id)
             .map(|e| e.lease_generation())
             .unwrap_or(fallback_lease);
+
+        // Synchronise to inner
+        {
+            let mut inner = krishiv_async_util::block_on(self.executor_inner.write());
+            inner.executors = self.executors.clone();
+            inner.state = self.state;
+            inner.recovering = self.recovering;
+            inner.ticks_since_restart = self.ticks_since_restart;
+            inner.notify.notify_waiters();
+        }
+
         Ok(ExecutorHeartbeatEffects {
             source_throttles,
             llm_throttles,
@@ -797,7 +1254,13 @@ impl Coordinator {
         };
         if let Some(record) = record {
             let streaming = record.spec.kind() == JobKind::Streaming;
-            self.jobs.insert(job_id.clone(), record);
+            self.jobs.insert(job_id.clone(), record.clone());
+            // Track B (two-tier): keep the JCP surface consistent when a dedicated
+            // per-job coordinator syncs a single job record from shared metadata.
+            if !self.job_coordinators.contains_key(job_id) {
+                let jcp = crate::job_coordinator::JobCoordinator::new(job_id.clone(), record);
+                self.job_coordinators.insert(job_id.clone(), Arc::new(jcp));
+            }
             if streaming {
                 self.index_streaming_tasks(job_id);
             }
@@ -819,8 +1282,15 @@ impl Coordinator {
         // Always prefer the persisted store as the authoritative source of truth.
         self.jobs.clear();
         self.streaming_task_index.clear();
+        self.job_coordinators.clear();
         for record in store.jobs() {
-            self.jobs.insert(record.job_id().clone(), record.clone());
+            let job_id = record.job_id().clone();
+            self.jobs.insert(job_id.clone(), record.clone());
+            // Track B (two-tier): repopulate JobCoordinator map on recovery so the
+            // per-job ownership seam (launch decisions, heartbeat windows, recovery)
+            // survives coordinator restart / failover for long-lived jobs.
+            let jcp = crate::job_coordinator::JobCoordinator::new(job_id.clone(), record.clone());
+            self.job_coordinators.insert(job_id, Arc::new(jcp));
         }
         // RC1: Rebuild streaming_task_index so heartbeats arriving during the
         // recovery window are not silently dropped.  Without this, every call to
@@ -847,14 +1317,14 @@ impl Coordinator {
                     && j.spec.checkpoint_interval_ms().is_some()
                     && j.spec.checkpoint_storage_path().is_some()
             })
-            .map(|j| {
+            .filter_map(|j| {
                 let task_count: usize = j.spec.stages().iter().map(|s| s.tasks().len()).sum();
-                (
+                Some((
                     j.job_id().clone(),
-                    j.spec.checkpoint_interval_ms().unwrap(),
-                    j.spec.checkpoint_storage_path().unwrap().to_owned(),
+                    j.spec.checkpoint_interval_ms()?,
+                    j.spec.checkpoint_storage_path()?.to_owned(),
                     task_count,
-                )
+                ))
             })
             .collect();
         for (job_id, interval_ms, storage_path, task_count) in streaming_checkpoint_jobs {
@@ -862,6 +1332,7 @@ impl Coordinator {
                 Ok(storage) => {
                     let mut coord = CheckpointCoordinator::new(
                         job_id.clone(),
+                        self.coordinator_id().as_str().to_owned(),
                         storage,
                         interval_ms,
                         task_count,
@@ -951,6 +1422,7 @@ impl Coordinator {
             let storage = Self::open_checkpoint_storage(storage_path)?;
             pending_checkpoint = Some(CheckpointCoordinator::new(
                 spec.job_id().clone(),
+                self.coordinator_id().as_str().to_owned(),
                 storage,
                 interval_ms,
                 0,
@@ -960,6 +1432,11 @@ impl Coordinator {
         let executors = self.executors.schedulable_executors();
         let assignments = SlotAwareScheduler::place(&spec, &executors)?;
         let job_id = spec.job_id().clone();
+        let job_name = spec.name().to_owned();
+        let namespace = spec
+            .namespace_id()
+            .map(|s| s.to_owned())
+            .unwrap_or_default();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
         if let Some(store) = &self.store {
@@ -985,6 +1462,36 @@ impl Coordinator {
         }
         let inserted_job_id = record.job_id().clone();
         self.jobs.insert(inserted_job_id.clone(), record);
+
+        // Track B (two-tier CCP/JCP): create the owning JobCoordinator for this job.
+        // The JCP holds the Arc<RwLock<JobRecord>> and will progressively own per-job
+        // launch decisions, heartbeat windows, checkpoint coordination, and recovery.
+        // The outer Coordinator (CCP) retains cross-job concerns and the thin map for delegation.
+        let jcp = crate::job_coordinator::JobCoordinator::new(
+            inserted_job_id.clone(),
+            self.jobs.get(&inserted_job_id).unwrap().clone(),
+        );
+        self.job_coordinators
+            .insert(inserted_job_id.clone(), Arc::new(jcp));
+        tracing::debug!(
+            job_id = %inserted_job_id,
+            "job coordinator registered (two-tier seam active)"
+        );
+
+        // Track E (UDF resource limits): live JCP accessor usage at the submit hot path.
+        // This is the seam future executor launch sites will use to obtain the exact
+        // per-job budgets and pass them into SandboxedUdfExecutor / SqlEngine construction.
+        if let Some(jc) = self.job_coordinators.get(&inserted_job_id) {
+            let time_cap = block_on(jc.udf_execution_time_cap_ms());
+            let mem_limit = block_on(jc.udf_memory_limit_bytes());
+            tracing::debug!(
+                job_id = %inserted_job_id,
+                udf_time_cap_ms = ?time_cap,
+                udf_memory_limit_bytes = ?mem_limit,
+                "UDF sandbox resource limits exposed via JCP at submit (Track E live call site)"
+            );
+        }
+
         if let Some(ckpt_coord) = pending_checkpoint {
             self.checkpoint_coordinators
                 .insert(inserted_job_id.clone(), ckpt_coord);
@@ -1001,6 +1508,24 @@ impl Coordinator {
             },
             krishiv_governance::AuditOutcome::Allowed,
         );
+
+        // GAP-OB-06: Emit OpenLineage START event.
+        // Only spawn when a Tokio runtime is active (production); skip in
+        // synchronous test contexts — the event is advisory, not critical.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _j_id = inserted_job_id.to_string();
+            handle.spawn(async move {
+                let event = krishiv_governance::new_run_event(
+                    krishiv_governance::RunEventType::Start,
+                    job_name,
+                    namespace,
+                    vec![],
+                    vec![],
+                );
+                krishiv_governance::emit_lineage_event(event).await;
+            });
+        }
+
         Ok(SubmitOutcome::Accepted)
     }
 
@@ -1019,17 +1544,45 @@ impl Coordinator {
 
     /// Route a checkpoint ack to the correct per-job coordinator.
     pub fn handle_checkpoint_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
+        tracing::debug!(
+            job_id = %ack.job_id,
+            epoch = ack.epoch,
+            fencing_token = ack.fencing_token.as_u64(),
+            "handling checkpoint ack"
+        );
+
         let job_id = ack.job_id.clone();
-        match self.checkpoint_coordinators.get_mut(&job_id) {
+
+        // Real JCP usage (Track B): light consultation on the live per-job coordinator
+        // during ack processing (future two-tier will own more checkpoint logic per job).
+        // Do this before the mutable borrow on checkpoint_coordinators to avoid borrow conflicts.
+        if let Some(jc) = self.job_coordinator(&job_id) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let _ = tokio::task::block_in_place(|| handle.block_on(jc.has_in_flight_tasks()));
+            } else {
+                let _ = block_on(jc.has_in_flight_tasks());
+            }
+        }
+
+        let res = match self.checkpoint_coordinators.get_mut(&job_id) {
             None => CheckpointAckResponse::JobNotFound,
             Some(coord) => {
-                // P1-16: reject ACKs from superseded coordinators (stale fencing token).
+                // Reject ACKs unless the fencing token exactly matches the current
+                // active coordinator's token. Both older and newer tokens from
+                // previous leader generations are rejected (split-brain defense).
                 let coordinator_token = coord.fencing_token();
-                if ack.fencing_token.as_u64() < coordinator_token.as_u64() {
+                if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
                     return CheckpointAckResponse::StaleFencingToken {
                         current_token: coordinator_token.as_u64(),
                     };
                 }
+
+                tracing::debug!(
+                    job_id = %job_id,
+                    epoch = ack.epoch,
+                    "fencing token matched; processing checkpoint ack"
+                );
+
                 let current_epoch = coord.current_epoch();
                 match coord.receive_ack(ack.clone()) {
                     Ok(true) => {
@@ -1041,7 +1594,18 @@ impl Coordinator {
                     Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
                 }
             }
+        };
+
+        // Synchronise to inner
+        {
+            let mut inner = krishiv_async_util::block_on(self.checkpoint_inner.write());
+            inner.coordinators.clone_from(&self.checkpoint_coordinators);
+            inner.notify_sent.clone_from(&self.checkpoint_notify_sent);
+            inner.barrier_sent.clone_from(&self.barrier_dispatch_sent);
+            inner.notify.notify_waiters();
         }
+
+        res
     }
 
     /// Initiate a savepoint for a streaming job.
@@ -1130,7 +1694,7 @@ impl Coordinator {
             .map(|coord| coord.fencing_token().as_u64())
             .or(leader_fencing_token);
         if let Some(current_token) = token {
-            validate_fencing_token(&meta, current_token).map_err(|e| {
+            validate_fencing_token_for_restore(&meta, current_token).map_err(|e| {
                 SchedulerError::InvalidJob {
                     message: format!("restore rejected for job {job_id}: {e}"),
                 }
@@ -1276,8 +1840,32 @@ impl Coordinator {
         &mut self,
         job_id: &JobId,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
+        tracing::debug!(
+            job_id = %job_id,
+            "launching assigned task assignments (JCP delegation and Notify will be used in two-tier model)"
+        );
         self.ensure_active()?;
-        let executor_leases = self.executors.assignment_leases();
+
+        // PRR Parallel Execution - Circuit Breaker (IMM-1):
+        // Filter out executors that have crossed the failure threshold before
+        // even attempting to launch tasks to them.
+        let failure_threshold = self.config.circuit_breaker_failure_threshold();
+        let bad_executors: std::collections::HashSet<_> = self
+            .executors
+            .executors_over_failure_threshold(failure_threshold)
+            .into_iter()
+            .collect();
+
+        let mut executor_leases = self.executors.assignment_leases();
+        if !bad_executors.is_empty() {
+            executor_leases.retain(|(eid, _)| !bad_executors.contains(eid));
+            tracing::warn!(
+                job_id = %job_id,
+                bad_executor_count = bad_executors.len(),
+                "circuit breaker: filtered bad executors from launch candidates"
+            );
+        }
+
         let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();
         let assignments = self
             .find_job_mut(job_id)?
@@ -1349,6 +1937,15 @@ impl Coordinator {
         &self,
         assignments: Vec<ExecutorTaskAssignment>,
     ) -> SchedulerResult<Vec<(String, ExecutorTaskAssignment)>> {
+        tracing::debug!(
+            assignment_count = assignments.len(),
+            "resolving assignment targets for delivery"
+        );
+
+        for a in &assignments {
+            tracing::trace!(task_id = %a.task_id(), executor = %a.executor_id(), "resolving single assignment target");
+        }
+
         let mut targets = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let endpoint = self
@@ -1378,7 +1975,7 @@ impl Coordinator {
     }
 
     pub(crate) async fn deliver_assignment_targets_with_channels(
-        channels: Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+        channels: Arc<DashMap<String, tonic::transport::Channel>>,
         targets: Vec<(String, ExecutorTaskAssignment)>,
     ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -1554,13 +2151,86 @@ impl Coordinator {
         self.ensure_active()?;
         self.executors
             .validate_lease(update.executor_id(), update.lease_generation())?;
+
+        tracing::debug!(
+            job_id = %update.job_id(),
+            stage_id = %update.stage_id(),
+            task_id = %update.task_id(),
+            attempt = update.attempt(),
+            state = ?update.state(),
+            executor = %update.executor_id(),
+            "applying task status update"
+        );
+
         let job_id = update.job_id().clone();
         let inline_ipc = update
             .output_metadata()
             .map(|meta| meta.inline_record_batch_ipc().to_vec())
             .unwrap_or_default();
         let terminal_state = update.state();
+        let executor_id_for_circuit = update.executor_id().clone();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
+
+        // IMM-2 (Circuit Breaker Strengthening):
+        // Record failure and, if the executor is now bad, clear the assignment
+        // so the task can be re-assigned to a healthy executor on the next launch cycle.
+        if terminal_state == TaskState::Failed {
+            let threshold = self.config.circuit_breaker_failure_threshold();
+            let exceeded = self
+                .executors
+                .record_task_failure(&executor_id_for_circuit, threshold);
+            if exceeded {
+                tracing::warn!(
+                    executor_id = %executor_id_for_circuit,
+                    "executor exceeded failure threshold — clearing assignments for re-launch on healthy executors"
+                );
+
+                // Real re-assignment under circuit breaker.
+                // When a JobCoordinator exists for this job (normal case after submit/recover),
+                // delegate exclusively to it so the per-job coordinator is the single source
+                // of truth for assignment clearing and recovery decisions (Track B).
+                if let Some(jc) = self.job_coordinator(&job_id) {
+                    // Transitional block_on. In matured model this lives inside JCP async recovery.
+                    let _affected = block_on(
+                        jc.clear_assignments_for_bad_executor_and_count(&executor_id_for_circuit),
+                    );
+                } else {
+                    // Defensive fallback (transitional only).
+                    if let Ok(job) = self.find_job_mut(&job_id) {
+                        for stage in job.stages_mut() {
+                            for task in stage.tasks_mut() {
+                                if task.assigned_executor.as_ref() == Some(&executor_id_for_circuit)
+                                {
+                                    task.assigned_executor = None;
+                                    task.launch_in_flight = false;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Consolidated wake exclusively through the Track A canonical helper.
+                // All mutation paths that need to wake waiters (daemon tick, launch loops)
+                // now go through publish helpers + notify_all_waiters for consistency.
+                tracing::debug!(
+                    job_id = %job_id,
+                    executor_id = %executor_id_for_circuit,
+                    "circuit breaker triggered; assignments cleared via JCP or fallback; waking via centralized helper"
+                );
+                // Centralized wake (Track A canonical intent). Direct inner wake from
+                // the &mut Coordinator context (apply_task_update path). All fast paths
+                // and the CB recovery now converge on the same Notify wake after mutation.
+                {
+                    let exec_inner = block_on(self.executor_inner.read());
+                    exec_inner.notify.notify_waiters();
+                    let ckpt_inner = block_on(self.checkpoint_inner.read());
+                    ckpt_inner.notify.notify_waiters();
+                }
+            }
+        } else if terminal_state == TaskState::Succeeded {
+            self.executors.reset_task_failures(&executor_id_for_circuit);
+        }
+
         if terminal_state == TaskState::Succeeded && !inline_ipc.is_empty() {
             self.job_inline_results
                 .entry(job_id.clone())
@@ -1578,6 +2248,7 @@ impl Coordinator {
         if is_terminal && !self.gc_ready_jobs.contains(&job_id) {
             self.gc_ready_jobs.push(job_id.clone());
             self.checkpoint_coordinators.remove(&job_id);
+            self.job_coordinators.remove(&job_id);
             // Notify the queue manager so it can release reserved capacity.
             self.queue_manager.on_job_complete(&job_id, &usage);
         }
@@ -1672,6 +2343,21 @@ impl Coordinator {
         job_id: &JobId,
         responses: &[(ExecutorTaskAssignment, TaskStatusResponse)],
     ) -> usize {
+        tracing::debug!(
+            job_id = %job_id,
+            response_count = responses.len(),
+            "applying launch dispatch responses (JCP delegation may influence future retries)"
+        );
+
+        for (assignment, response) in responses {
+            tracing::trace!(
+                job_id = %job_id,
+                task_id = %assignment.task_id(),
+                disposition = ?response.disposition(),
+                "individual launch response"
+            );
+        }
+
         let mut accepted = 0usize;
         for (assignment, response) in responses {
             match response.disposition() {
@@ -1732,19 +2418,17 @@ impl Coordinator {
     }
 
     async fn get_or_connect_channel_on_map(
-        channels: &Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>,
+        channels: &Arc<DashMap<String, tonic::transport::Channel>>,
         endpoint: &str,
     ) -> SchedulerResult<tonic::transport::Channel> {
-        // Fast path: check the cache and drop the lock before doing any I/O.
-        {
-            let map = channels.lock().await;
-            if let Some(ch) = map.get(endpoint) {
-                return Ok(ch.clone());
-            }
+        // Fast path: check the sharded cache (per-shard lock, dropped
+        // immediately) so lookups for different endpoints never contend.
+        if let Some(ch) = channels.get(endpoint) {
+            return Ok(ch.clone());
         }
 
-        // Slow path: connect outside the lock so a single slow handshake
-        // cannot block lookups for other endpoints (A6).
+        // Slow path: connect outside any lock so a single slow handshake
+        // cannot block lookups for other endpoints (M6).
         let parsed =
             tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(|e| {
                 SchedulerError::InvalidJob {
@@ -1764,12 +2448,13 @@ impl Coordinator {
                 reason: e.to_string(),
             })?;
 
-        // Re-acquire briefly to install the cached channel.  If another task
-        // raced us and installed a different channel, prefer the existing one.
-        let mut map = channels.lock().await;
-        match map.entry(endpoint.to_owned()) {
-            std::collections::hash_map::Entry::Occupied(existing) => Ok(existing.get().clone()),
-            std::collections::hash_map::Entry::Vacant(slot) => {
+        // Only one shard is locked during the insert.  If another task
+        // raced and already installed a channel, prefer the existing one.
+        let endpoint_owned = endpoint.to_owned();
+        let entry = channels.entry(endpoint_owned);
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(existing) => Ok(existing.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
                 slot.insert(ch.clone());
                 Ok(ch)
             }

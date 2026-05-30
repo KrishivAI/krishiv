@@ -162,6 +162,8 @@ pub async fn dispatch_barrier_plan(
     plan: &BarrierDispatchPlan,
     timeout: Duration,
 ) -> Result<Vec<(TaskId, krishiv_proto::wire::v1::BarrierAck)>, String> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
     let expected: HashSet<String> = plan
         .targets
         .iter()
@@ -174,24 +176,38 @@ pub async fn dispatch_barrier_plan(
         timeout,
     );
 
-    let mut acks: Vec<(TaskId, krishiv_proto::wire::v1::BarrierAck)> = Vec::new();
+    let mut futures = FuturesUnordered::new();
     for target in &plan.targets {
         let checkpoint_id = format!("task:{}/cp-{}", target.task_id.as_str(), plan.epoch);
-        let channel = get_or_connect_barrier_channel(&target.barrier_endpoint).await?;
-        let mut client =
-            krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient::with_interceptor(
-                channel,
-                krishiv_metrics::grpc::inject_trace_context
-                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-            );
+        let endpoint = target.barrier_endpoint.clone();
         let barrier = CheckpointBarrier {
             epoch: plan.epoch,
             job_id: plan.job_id.as_str().to_owned(),
-            checkpoint_id: checkpoint_id.clone(),
+            checkpoint_id,
             barrier_kind: BarrierKind::Checkpoint as i32,
             timestamp_ms: 0,
         };
-        inject_barrier(&mut client, barrier, &mut tracker, timeout).await?;
+        futures.push(async move {
+            let channel = get_or_connect_barrier_channel(&endpoint).await?;
+            let mut client =
+                krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient::with_interceptor(
+                    channel,
+                    krishiv_metrics::grpc::inject_trace_context
+                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+                );
+            let ack = inject_barrier(&mut client, barrier, timeout).await?;
+            Ok::<_, String>(ack)
+        });
+    }
+
+    while let Some(result) = futures.next().await {
+        let ack = result?;
+        if !tracker.record_ack(&ack) {
+            return Err(format!(
+                "unexpected ack for job {} epoch {}",
+                ack.job_id, ack.epoch
+            ));
+        }
     }
 
     if !tracker.is_complete() {
@@ -202,6 +218,7 @@ pub async fn dispatch_barrier_plan(
             tracker.missing_tasks()
         ));
     }
+    let mut acks: Vec<(TaskId, krishiv_proto::wire::v1::BarrierAck)> = Vec::new();
     for ack in tracker.collected_acks() {
         acks.push((
             TaskId::try_new(ack.task_id.clone()).map_err(|e| e.to_string())?,

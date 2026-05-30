@@ -113,6 +113,9 @@ pub struct SqlEngine {
     /// Table names registered as unbounded streaming sources.
     /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
     streaming_sources: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Optional UDF resource limits to apply when syncing UDFs for this engine.
+    /// Set for job-specific engines so sandbox enforcement uses the job's budgets.
+    udf_limits: Option<krishiv_udf::ResourceLimits>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -141,6 +144,7 @@ impl SqlEngine {
             view_registry: None,
             udf_registry: None,
             streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            udf_limits: None,
         }
     }
 
@@ -159,6 +163,7 @@ impl SqlEngine {
             view_registry: None,
             udf_registry: None,
             streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            udf_limits: None,
         })
     }
 
@@ -172,6 +177,14 @@ impl SqlEngine {
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string());
         Ok(())
+    }
+
+    /// Configure this engine with explicit UDF resource limits (Track E).
+    /// When set, calls to `sql()` and direct UDF syncs will use these budgets
+    /// instead of unlimited defaults. Intended for job-specific engines.
+    pub fn with_udf_limits(mut self, limits: krishiv_udf::ResourceLimits) -> Self {
+        self.udf_limits = Some(limits);
+        self
     }
 
     /// Returns `true` if any table referenced in `sql` is a registered streaming source.
@@ -223,6 +236,7 @@ impl SqlEngine {
     }
 
     /// Register all scalar UDFs from the attached registry with DataFusion.
+    /// Uses unlimited defaults (backward compat).
     pub async fn sync_scalar_udfs(&self) -> SqlResult<()> {
         let Some(registry) = &self.udf_registry else {
             return Ok(());
@@ -230,8 +244,32 @@ impl SqlEngine {
         let guard = registry.read().map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
         })?;
-        udf::sync_scalar_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
+        let limits = self.udf_limits.clone().unwrap_or_default();
+        udf::sync_scalar_udfs_with_limits(&self.context, &guard, limits).map_err(|e| {
+            SqlError::DataFusion {
+                message: e.to_string(),
+            }
+        })
+    }
+
+    /// Register scalar UDFs with explicit ResourceLimits for sandbox enforcement.
+    /// Callers that have a job context (scheduler, runner, api session for a job)
+    /// should use this and pass limits derived from the JobSpec (memory + time cap).
+    /// This is the concrete Track E seam from job limits to UDF execution.
+    pub async fn sync_scalar_udfs_with_limits(
+        &self,
+        limits: krishiv_udf::ResourceLimits,
+    ) -> SqlResult<()> {
+        let Some(registry) = &self.udf_registry else {
+            return Ok(());
+        };
+        let guard = registry.read().map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
+        })?;
+        udf::sync_scalar_udfs_with_limits(&self.context, &guard, limits).map_err(|e| {
+            SqlError::DataFusion {
+                message: e.to_string(),
+            }
         })
     }
 
@@ -259,6 +297,14 @@ impl SqlEngine {
         udf::sync_table_udfs(&self.context, &guard).map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
         })
+    }
+
+    /// Sync all UDF categories, respecting any limits configured on this engine (Track E).
+    pub async fn sync_all_udfs(&self) -> SqlResult<()> {
+        self.sync_scalar_udfs().await?;
+        self.sync_aggregate_udfs().await?;
+        self.sync_table_udfs().await?;
+        Ok(())
     }
 
     /// Attach a [`MaterializedViewRegistry`] so the engine tracks view staleness.
@@ -395,9 +441,7 @@ impl SqlEngine {
             return Err(SqlError::EmptyQuery);
         }
 
-        self.sync_scalar_udfs().await?;
-        self.sync_aggregate_udfs().await?;
-        self.sync_table_udfs().await?;
+        self.sync_all_udfs().await?;
 
         // ── Intercept CREATE FUNCTION … RETURNS TABLE ────────────────────────
         // DataFusion does not understand this extended DDL syntax.  Parse it

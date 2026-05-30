@@ -79,7 +79,7 @@ impl GenericRestCatalog {
         let mut url = url::Url::parse(&base).expect("invalid base URL");
         url.path_segments_mut()
             .expect("cannot be a cannot-be-a-base URL")
-            .push(path.trim_start_matches('/'));
+            .extend(path.trim_start_matches('/').split('/'));
         url.to_string()
     }
 

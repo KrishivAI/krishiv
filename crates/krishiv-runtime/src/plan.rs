@@ -4,14 +4,13 @@ use krishiv_plan::{ExecutionKind, PhysicalPlan};
 
 /// Returns true when the plan must run through the single-node streaming runtime
 /// rather than DataFusion batch execution.
+///
+/// Classification is based on the plan's [`ExecutionKind`] — not on string
+/// prefix matching.  Prior versions used name-based heuristics which could
+/// misclassify user SQL containing the literal text "stream:" or "krishiv-stream".
+/// ADR-12.5 established that `ExecutionKind::Streaming` is the sole discriminant.
 pub fn is_streaming_plan(plan: &PhysicalPlan) -> bool {
-    if plan.kind() == ExecutionKind::Streaming {
-        return true;
-    }
-    let name = plan.name();
-    name.starts_with("stream:")
-        || name.contains("krishiv-stream")
-        || name.starts_with("stream-kafka:")
+    plan.kind() == ExecutionKind::Streaming
 }
 
 #[cfg(test)]
@@ -27,9 +26,9 @@ mod tests {
     }
 
     #[test]
-    fn batch_kind_with_stream_prefix_is_streaming_plan() {
+    fn batch_kind_with_stream_prefix_is_not_streaming() {
         let plan = PhysicalPlan::new("stream:tw:key=u", ExecutionKind::Batch);
-        assert!(is_streaming_plan(&plan));
+        assert!(!is_streaming_plan(&plan));
     }
 
     #[test]
@@ -39,15 +38,15 @@ mod tests {
     }
 
     #[test]
-    fn batch_with_krishiv_stream_in_name() {
+    fn batch_with_stream_in_name_is_not_streaming() {
         let plan = PhysicalPlan::new("krishiv-stream:events", ExecutionKind::Batch);
-        assert!(is_streaming_plan(&plan));
+        assert!(!is_streaming_plan(&plan));
     }
 
     #[test]
-    fn batch_with_stream_kafka_prefix() {
+    fn batch_with_stream_kafka_is_not_streaming() {
         let plan = PhysicalPlan::new("stream-kafka:topic:0:0:records", ExecutionKind::Batch);
-        assert!(is_streaming_plan(&plan));
+        assert!(!is_streaming_plan(&plan));
     }
 
     #[test]
@@ -69,14 +68,14 @@ mod tests {
     }
 
     #[test]
-    fn batch_name_starting_with_stream_colon() {
+    fn batch_name_stream_colon_is_not_streaming() {
         let plan = PhysicalPlan::new("stream:", ExecutionKind::Batch);
-        assert!(is_streaming_plan(&plan));
+        assert!(!is_streaming_plan(&plan));
     }
 
     #[test]
-    fn batch_name_contains_krishiv_stream_anywhere() {
+    fn batch_name_krishiv_stream_is_not_streaming() {
         let plan = PhysicalPlan::new("prefix-krishiv-stream-suffix", ExecutionKind::Batch);
-        assert!(is_streaming_plan(&plan));
+        assert!(!is_streaming_plan(&plan));
     }
 }

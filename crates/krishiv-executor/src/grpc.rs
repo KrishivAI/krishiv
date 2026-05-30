@@ -5,7 +5,7 @@ use krishiv_proto::{
     TransportDisposition, TransportVersion, wire,
 };
 
-use crate::ExecutorAssignmentInbox;
+use crate::{ExecutorAssignmentInbox, ExecutorError};
 
 /// Executor-side task assignment service backed by an in-memory inbox.
 #[derive(Debug, Clone)]
@@ -40,12 +40,18 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             )));
         }
 
-        self.inbox
-            .push(assignment)
-            .map_err(|error| tonic::Status::internal(error.to_string()))?;
-        Ok(tonic::Response::new(TaskStatusResponse::new(
-            TransportDisposition::Accepted,
-        )))
+        match self.inbox.push(assignment) {
+            Ok(()) => Ok(tonic::Response::new(TaskStatusResponse::new(
+                TransportDisposition::Accepted,
+            ))),
+            Err(ExecutorError::AssignmentQueueFull { current, max }) => {
+                // Proper backpressure signal to the coordinator.
+                Err(tonic::Status::resource_exhausted(format!(
+                    "executor assignment queue full (current={current}, max={max})"
+                )))
+            }
+            Err(other) => Err(tonic::Status::internal(other.to_string())),
+        }
     }
 
     async fn cancel_task(

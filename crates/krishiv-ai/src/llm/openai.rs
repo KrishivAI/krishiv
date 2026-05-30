@@ -143,7 +143,7 @@ impl LlmUdf for OpenAiLlmUdf {
         use futures::stream::{FuturesOrdered, StreamExt};
         let mut futures = FuturesOrdered::new();
         for prompt in prompts {
-            futures.push(self.call_one(prompt.clone()));
+            futures.push_back(self.call_one(prompt.clone()));
         }
         let mut out = Vec::with_capacity(prompts.len());
         while let Some(result) = futures.next().await {

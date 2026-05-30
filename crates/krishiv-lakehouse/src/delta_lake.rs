@@ -101,10 +101,10 @@ pub async fn merge_delta(
     // Build a set of typed keys from source rows so we can classify each
     // target row as matched or unmatched.  Keys are type-prefixed to prevent
     // cross-type false matches (e.g. Int64(1) must not match String("1")).
-    let source_keys: HashSet<String> = keys_set(source_col.as_ref());
+    let source_keys: HashSet<String> = keys_set(source_col.as_ref())?;
 
     // Keep target rows whose key does NOT appear in source.
-    let keep_indices: Vec<u32> = target_keys_indices(target_col.as_ref(), &source_keys);
+    let keep_indices: Vec<u32> = target_keys_indices(target_col.as_ref(), &source_keys)?;
 
     let mut merged_batches = Vec::new();
     if !keep_indices.is_empty() {
@@ -113,10 +113,12 @@ pub async fn merge_delta(
 
     // Split source rows into updates (key matched target) and inserts (key
     // did not match target).  Build the target-key set once for O(1) checks.
-    let target_key_set: HashSet<String> = keys_set(target_col.as_ref());
+    let target_key_set: HashSet<String> = keys_set(target_col.as_ref())?;
     let (update_indices, insert_indices): (Vec<u32>, Vec<u32>) =
         (0..source.num_rows()).map(|i| i as u32).partition(|&i| {
-            typed_key(source_col.as_ref(), i as usize).is_some_and(|k| target_key_set.contains(&k))
+            typed_key(source_col.as_ref(), i as usize)
+                .unwrap_or(None)
+                .is_some_and(|k| target_key_set.contains(&k))
         });
 
     let rows_updated = if when_matched_update && !update_indices.is_empty() {
@@ -182,32 +184,33 @@ fn take_rows(batch: &RecordBatch, indices: &[u32]) -> LakehouseResult<RecordBatc
 
 /// Build a set of typed key strings for a column, using type-prefixed
 /// formatting so that Int64(1) and String("1") do not collide.
-fn keys_set(array: &dyn Array) -> std::collections::HashSet<String> {
+fn keys_set(array: &dyn Array) -> LakehouseResult<std::collections::HashSet<String>> {
     (0..array.len())
-        .filter_map(|row| typed_key(array, row))
-        .collect()
+        .filter_map(|row| typed_key(array, row).transpose())
+        .collect::<LakehouseResult<std::collections::HashSet<_>>>()
 }
 
 /// Return target-row indices whose typed key is NOT in the source key set.
 fn target_keys_indices(
     array: &dyn Array,
     source_keys: &std::collections::HashSet<String>,
-) -> Vec<u32> {
-    (0..array.len())
-        .filter(|&i| {
-            let k = typed_key(array, i);
-            k.is_none() || !source_keys.contains(&k.unwrap())
-        })
-        .map(|i| i as u32)
-        .collect()
+) -> LakehouseResult<Vec<u32>> {
+    let mut result = Vec::new();
+    for i in 0..array.len() {
+        let k = typed_key(array, i)?;
+        if k.map_or(true, |key| !source_keys.contains(&key)) {
+            result.push(i as u32);
+        }
+    }
+    Ok(result)
 }
 
 /// Format a single cell as a type-prefixed string key for hash-join.
 /// The prefix prevents cross-type collisions (e.g. Int32 1 vs String "1").
-fn typed_key(array: &dyn Array, row: usize) -> Option<String> {
+fn typed_key(array: &dyn Array, row: usize) -> Result<Option<String>, LakehouseError> {
     use arrow::datatypes::DataType;
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     let prefix = match array.data_type() {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "I",
@@ -216,15 +219,25 @@ fn typed_key(array: &dyn Array, row: usize) -> Option<String> {
         DataType::Utf8 | DataType::LargeUtf8 => "S",
         DataType::Boolean => "B",
         DataType::Date32 | DataType::Date64 => "D",
-        dt => return Some(format!("O:{}:{}", dt, format_value_as_string(array, row))),
+        dt => {
+            return Ok(Some(format!(
+                "O:{}:{}",
+                dt,
+                format_value_as_string(array, row)?
+            )));
+        }
     };
-    Some(format!("{}:{}", prefix, format_value_as_string(array, row)))
+    Ok(Some(format!(
+        "{}:{}",
+        prefix,
+        format_value_as_string(array, row)?
+    )))
 }
 
-fn format_value_as_string(array: &dyn Array, row: usize) -> String {
+fn format_value_as_string(array: &dyn Array, row: usize) -> LakehouseResult<String> {
     let formatter = ArrayFormatter::try_new(array, &FormatOptions::default())
-        .expect("ArrayFormatter creation should succeed for valid arrays");
-    formatter.value(row).to_string()
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    Ok(formatter.value(row).to_string())
 }
 
 /// Remove a column by name from a RecordBatch.
@@ -297,54 +310,58 @@ mod tests {
     // typed_key type expansion tests
     // ------------------------------------------------------------------
 
+    fn tk(array: &dyn Array, row: usize) -> Option<String> {
+        typed_key(array, row).unwrap()
+    }
+
     #[test]
     fn typed_key_int32() {
         let arr = Int32Array::from(vec![42, -1]);
-        assert_eq!(typed_key(&arr, 0), Some("I:42".into()));
-        assert_eq!(typed_key(&arr, 1), Some("I:-1".into()));
+        assert_eq!(tk(&arr, 0), Some("I:42".into()));
+        assert_eq!(tk(&arr, 1), Some("I:-1".into()));
     }
 
     #[test]
     fn typed_key_float64() {
         let arr = Float64Array::from(vec![3.14, -2.5]);
-        assert_eq!(typed_key(&arr, 0), Some("F:3.14".into()));
-        assert_eq!(typed_key(&arr, 1), Some("F:-2.5".into()));
+        assert_eq!(tk(&arr, 0), Some("F:3.14".into()));
+        assert_eq!(tk(&arr, 1), Some("F:-2.5".into()));
     }
 
     #[test]
     fn typed_key_bool() {
         let arr = BooleanArray::from(vec![true, false]);
-        assert_eq!(typed_key(&arr, 0), Some("B:true".into()));
-        assert_eq!(typed_key(&arr, 1), Some("B:false".into()));
+        assert_eq!(tk(&arr, 0), Some("B:true".into()));
+        assert_eq!(tk(&arr, 1), Some("B:false".into()));
     }
 
     #[test]
     fn typed_key_date32() {
         use arrow::array::Date32Array;
         let arr = Date32Array::from(vec![0, 1]); // epoch, 1970-01-02
-        assert_eq!(typed_key(&arr, 0), Some("D:1970-01-01".into()));
-        assert_eq!(typed_key(&arr, 1), Some("D:1970-01-02".into()));
+        assert_eq!(tk(&arr, 0), Some("D:1970-01-01".into()));
+        assert_eq!(tk(&arr, 1), Some("D:1970-01-02".into()));
     }
 
     #[test]
     fn typed_key_utf8() {
         let arr = StringArray::from(vec!["hello", "world"]);
-        assert_eq!(typed_key(&arr, 0), Some("S:hello".into()));
-        assert_eq!(typed_key(&arr, 1), Some("S:world".into()));
+        assert_eq!(tk(&arr, 0), Some("S:hello".into()));
+        assert_eq!(tk(&arr, 1), Some("S:world".into()));
     }
 
     #[test]
     fn typed_key_int64() {
         let arr = Int64Array::from(vec![1, 2]);
-        assert_eq!(typed_key(&arr, 0), Some("I:1".into()));
-        assert_eq!(typed_key(&arr, 1), Some("I:2".into()));
+        assert_eq!(tk(&arr, 0), Some("I:1".into()));
+        assert_eq!(tk(&arr, 1), Some("I:2".into()));
     }
 
     #[test]
     fn typed_key_null() {
         let arr = Int64Array::from(vec![Some(1), None]);
-        assert_eq!(typed_key(&arr, 0), Some("I:1".into()));
-        assert!(typed_key(&arr, 1).is_none());
+        assert_eq!(tk(&arr, 0), Some("I:1".into()));
+        assert!(tk(&arr, 1).is_none());
     }
 
     /// Cross-type collision test: same numeric value in different types must
@@ -356,10 +373,10 @@ mod tests {
         let f64_arr = Float64Array::from(vec![1.0]);
         let s_arr = StringArray::from(vec!["1"]);
 
-        let i32_key = typed_key(&i32_arr, 0).unwrap();
-        let i64_key = typed_key(&i64_arr, 0).unwrap();
-        let f64_key = typed_key(&f64_arr, 0).unwrap();
-        let s_key = typed_key(&s_arr, 0).unwrap();
+        let i32_key = tk(&i32_arr, 0).unwrap();
+        let i64_key = tk(&i64_arr, 0).unwrap();
+        let f64_key = tk(&f64_arr, 0).unwrap();
+        let s_key = tk(&s_arr, 0).unwrap();
 
         assert_eq!(i32_key, i64_key, "I:1 == I:1"); // same prefix family
         assert_ne!(i32_key, f64_key, "I:1 != F:1");
@@ -371,8 +388,8 @@ mod tests {
     fn typed_key_unsigned() {
         use arrow::array::UInt32Array;
         let arr = UInt32Array::from(vec![100u32, 200u32]);
-        assert_eq!(typed_key(&arr, 0), Some("U:100".into()));
-        assert_eq!(typed_key(&arr, 1), Some("U:200".into()));
+        assert_eq!(tk(&arr, 0), Some("U:100".into()));
+        assert_eq!(tk(&arr, 1), Some("U:200".into()));
     }
 
     // ------------------------------------------------------------------

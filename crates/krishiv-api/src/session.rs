@@ -439,7 +439,13 @@ impl Session {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .register_scalar(udf);
-        let _ = block_on(self.sql_engine.sync_scalar_udfs());
+        // Track E: use the limits-aware path so job-aware callers can supply
+        // concrete ResourceLimits derived from the JobSpec (via scheduler/JCP
+        // raw accessors). Default is unlimited for backward compatibility.
+        let _ = block_on(
+            self.sql_engine
+                .sync_scalar_udfs_with_limits(krishiv_udf::ResourceLimits::default()),
+        );
     }
 
     /// Names of scalar UDFs registered on this session.
@@ -754,11 +760,12 @@ impl Session {
                 snapshot_rows: 0,
             };
             for batch in batches {
-                let result = writer
-                    .upsert(&key_column_str, batch)
-                    .map_err(|e| KrishivError::Runtime {
-                        message: e.to_string(),
-                    })?;
+                let result =
+                    writer
+                        .upsert(&key_column_str, batch)
+                        .map_err(|e| KrishivError::Runtime {
+                            message: e.to_string(),
+                        })?;
                 total.instant = result.instant;
                 total.rows_inserted += result.rows_inserted;
                 total.rows_updated += result.rows_updated;

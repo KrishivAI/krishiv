@@ -634,6 +634,15 @@ pub fn coordinator_management_grpc_server(
     )
 }
 
+/// Chained gRPC interceptor that extracts distributed tracing context and
+/// validates client authentication on every incoming request.
+fn trace_and_auth_interceptor(
+    req: tonic::Request<()>,
+) -> Result<tonic::Request<()>, tonic::Status> {
+    let req = krishiv_metrics::grpc::extract_trace_context(req)?;
+    crate::auth::auth_interceptor(req)
+}
+
 /// Serve the coordinator/executor gRPC API on a socket address.
 #[allow(dead_code)]
 pub async fn serve_coordinator_executor_grpc(
@@ -644,11 +653,11 @@ pub async fn serve_coordinator_executor_grpc(
     tonic::transport::Server::builder()
         .add_service(tonic::service::interceptor::InterceptedService::new(
             coordinator_executor_grpc_server(coordinator),
-            krishiv_metrics::grpc::extract_trace_context,
+            trace_and_auth_interceptor,
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
             coordinator_management_grpc_server(coordinator_for_management),
-            krishiv_metrics::grpc::extract_trace_context,
+            trace_and_auth_interceptor,
         ))
         .serve(addr)
         .await
@@ -663,11 +672,11 @@ pub async fn serve_coordinator_executor_grpc_with_listener(
     tonic::transport::Server::builder()
         .add_service(tonic::service::interceptor::InterceptedService::new(
             coordinator_executor_grpc_server(coordinator),
-            krishiv_metrics::grpc::extract_trace_context,
+            trace_and_auth_interceptor,
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
             coordinator_management_grpc_server(coordinator_for_management),
-            krishiv_metrics::grpc::extract_trace_context,
+            trace_and_auth_interceptor,
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await

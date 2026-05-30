@@ -4,7 +4,8 @@ use std::fmt;
 
 use crate::executor::{
     ExecutorDescriptor, HeartbeatHotKeyReport, HeartbeatThrottleCommand, LlmQuotaReport,
-    LlmThrottleCommand, StreamingTaskState, TaskOutputMetadata, TraceContext,
+    LlmThrottleCommand, StreamingProgressReport, StreamingTaskState, TaskOutputMetadata,
+    TraceContext,
 };
 use crate::ids::*;
 use crate::io::*;
@@ -391,6 +392,8 @@ pub struct ExecutorHeartbeatRequest {
     llm_quota_reports: Vec<LlmQuotaReport>,
     /// W3C trace context for distributed tracing (R8 wiring).
     trace_context: Option<TraceContext>,
+    /// Streaming progress snapshots (GAP-OB-04).
+    streaming_progress: Vec<StreamingProgressReport>,
 }
 
 impl ExecutorHeartbeatRequest {
@@ -416,6 +419,7 @@ impl ExecutorHeartbeatRequest {
             hot_key_reports: Vec::new(),
             llm_quota_reports: Vec::new(),
             trace_context: None,
+            streaming_progress: Vec::new(),
         }
     }
 
@@ -459,6 +463,18 @@ impl ExecutorHeartbeatRequest {
     /// LLM quota reports in this request.
     pub fn llm_quota_reports(&self) -> &[LlmQuotaReport] {
         &self.llm_quota_reports
+    }
+
+    /// Attach streaming progress snapshots (GAP-OB-04).
+    #[must_use]
+    pub fn with_streaming_progress(mut self, reports: Vec<StreamingProgressReport>) -> Self {
+        self.streaming_progress = reports;
+        self
+    }
+
+    /// Periodic streaming progress snapshots in this request.
+    pub fn streaming_progress(&self) -> &[StreamingProgressReport] {
+        &self.streaming_progress
     }
 
     /// Attach running attempts.
@@ -1011,6 +1027,12 @@ pub struct ExecutorTaskAssignment {
     shuffle_write: Option<ShuffleWriteConfig>,
     shuffle_read: Option<ShuffleReadConfig>,
     key_group_range: KeyGroupRange,
+
+    /// PRR Parallel (SHORT-2 + MED-1): Explicit signal whether this streaming
+    /// task should report Succeeded (one-shot) or stay Running (continuous).
+    /// This is the typed replacement for the old string heuristics
+    /// ("stream:loop:", "stream:continuous:", etc.).
+    requires_reattach: bool,
 }
 
 impl ExecutorTaskAssignment {
@@ -1038,7 +1060,21 @@ impl ExecutorTaskAssignment {
             shuffle_write: None,
             shuffle_read: None,
             key_group_range: KeyGroupRange::full(),
+            requires_reattach: false,
         }
+    }
+
+    /// Mark that this streaming task should stay in Running state and be
+    /// re-attached on the next drain (typed replacement for old string heuristics).
+    #[must_use]
+    pub fn with_requires_reattach(mut self, reattach: bool) -> Self {
+        self.requires_reattach = reattach;
+        self
+    }
+
+    /// Whether the task needs re-attachment (continuous streaming).
+    pub fn requires_reattach(&self) -> bool {
+        self.requires_reattach
     }
 
     /// Attach a per-task execution timeout.

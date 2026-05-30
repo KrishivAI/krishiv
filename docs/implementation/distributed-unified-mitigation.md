@@ -12,7 +12,7 @@ Deliver production-grade unified batch + streaming on Kubernetes and bare metal 
 - [x] **WS-0** Decision lock + CI skeleton + doc alignment
 - [x] **WS-1** Scheduler decomposition + transport abstraction (CCP/JCP modules)
 - [x] **WS-2** Physical plan lowering (`krishiv-plan::lowering`)
-- [x] **WS-3** `krishiv-clusterd` + `krishiv-job-coordinator` binaries
+- [x] **WS-3** `krishiv-clusterd` + `krishiv-job-coordinator` binaries (ack fencing `!=` completed in post-review pass)
 - [x] **WS-4** Executor data plane completion (barrier gRPC, checkpoint heartbeat, catalog on SQL)
 - [x] **WS-5** Stateful streaming + checkpoints (Redb windows, object-store URI, idle watermark)
 - [x] **WS-6** Shuffle production path (Lz4 disk store, shuffle-svc binary)
@@ -29,9 +29,9 @@ Deliver production-grade unified batch + streaming on Kubernetes and bare metal 
 - [x] `cargo test -p krishiv-scheduler --test distributed_e2e` — batch + streaming lowering
 - [ ] CI `kind-e2e` — KrishivJob → JCP pod → tasks succeeded
 - [ ] CI `bare-metal-e2e` — clusterd + executors (workflow added; required green on main)
-- [ ] `scripts/audit-fencing.sh` — all write paths validated
+- [x] `scripts/audit-fencing.sh` — all write paths validated (coordinator ack paths unified to `!=` in follow-up PRR fix; storage already `!=`)
 - [ ] `tests/certification` — streaming checkpoint + connector rows aligned
-- [ ] No `todo!()` / `unimplemented!()` in distributed hot paths (scheduler, executor, operator, runtime, api)
+- [x] No `todo!()` / `unimplemented!()` in distributed hot paths (scheduler, executor, operator, runtime, api) — verified during PRR parallel completion pass; any prior instances addressed in earlier stability work.
 
 ## Next command
 

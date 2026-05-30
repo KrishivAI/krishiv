@@ -65,7 +65,7 @@ impl From<wire::WireError> for ExecutorTransportError {
 }
 
 /// R3.1 executor startup configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     executor_id: ExecutorId,
     host: String,
@@ -74,6 +74,11 @@ pub struct ExecutorConfig {
     lease_generation: LeaseGeneration,
     task_endpoint: Option<String>,
     barrier_endpoint: Option<String>,
+    /// Optional shared progress buffer for streaming tasks (GAP-OB-04).
+    /// The heartbeat loop sets this; Runner tasks write streaming progress
+    /// snapshots into it, and heartbeat_request() drains and reports them.
+    pub(crate) progress_buffer:
+        Option<Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>>,
 }
 
 impl ExecutorConfig {
@@ -106,6 +111,7 @@ impl ExecutorConfig {
             lease_generation: LeaseGeneration::initial(),
             task_endpoint: None,
             barrier_endpoint: None,
+            progress_buffer: None,
         })
     }
 
@@ -124,6 +130,16 @@ impl ExecutorConfig {
         if !endpoint.trim().is_empty() {
             self.barrier_endpoint = Some(endpoint);
         }
+        self
+    }
+
+    /// Attach a shared streaming progress buffer (GAP-OB-04).
+    #[must_use]
+    pub fn with_progress_buffer(
+        mut self,
+        buffer: Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>,
+    ) -> Self {
+        self.progress_buffer = Some(buffer);
         self
     }
 
@@ -176,6 +192,7 @@ impl ExecutorConfig {
 pub struct ExecutorRuntime {
     config: ExecutorConfig,
     running_attempts: Option<Arc<DashMap<String, TaskAttemptRef>>>,
+    pool: Arc<tokio::sync::OnceCell<crate::grpc_client::CoordinatorGrpcPool>>,
 }
 
 impl ExecutorRuntime {
@@ -184,6 +201,7 @@ impl ExecutorRuntime {
         Self {
             config,
             running_attempts: None,
+            pool: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -195,6 +213,11 @@ impl ExecutorRuntime {
     /// Runtime configuration.
     pub fn config(&self) -> &ExecutorConfig {
         &self.config
+    }
+
+    /// Mutable access to runtime configuration.
+    pub fn config_mut(&mut self) -> &mut ExecutorConfig {
+        &mut self.config
     }
 
     /// Apply coordinator-issued lease generation from register/heartbeat responses.
@@ -265,12 +288,24 @@ impl ExecutorRuntime {
             .as_ref()
             .map(|map| map.iter().map(|entry| entry.value().clone()).collect())
             .unwrap_or_default();
+
+        // Drain streaming progress snapshots (GAP-OB-04). Runner tasks write
+        // into the buffer; we drain here so each heartbeat reports the latest
+        // progress for every actively-streaming task.
+        let progress: Vec<krishiv_proto::StreamingProgressReport> =
+            if let Some(buf) = &self.config.progress_buffer {
+                buf.iter().map(|e| e.value().clone()).collect()
+            } else {
+                Vec::new()
+            };
+
         ExecutorHeartbeatRequest::new(
             self.config.executor_id.clone(),
             self.config.lease_generation,
             ExecutorState::Healthy,
         )
         .with_running_attempts(attempts)
+        .with_streaming_progress(progress)
     }
 
     /// Send a heartbeat through a tonic-shaped coordinator service.
@@ -287,7 +322,7 @@ impl ExecutorRuntime {
             .map(tonic::Response::into_inner)
     }
 
-    /// Build an intercepted coordinator gRPC client for one-shot requests.
+    /// Build an intercepted coordinator gRPC client from the pooled client connection.
     async fn connect_coordinator_client(
         &self,
     ) -> ExecutorTransportResult<
@@ -298,20 +333,24 @@ impl ExecutorRuntime {
             >,
         >,
     > {
-        let channel =
-            tonic::transport::Endpoint::from_shared(self.config.coordinator_endpoint.clone())
-                .map_err(|e| ExecutorTransportError::Transport {
-                    message: e.to_string(),
-                })?
-                .connect()
-                .await?;
-        Ok(
-            wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
-                channel,
-                krishiv_metrics::grpc::inject_trace_context
-                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-            ),
-        )
+        let pool = self
+            .pool
+            .get_or_init(|| async {
+                crate::grpc_client::CoordinatorGrpcPool::new(
+                    self.config.coordinator_endpoint.clone(),
+                    self.config.lease_generation,
+                )
+            })
+            .await;
+
+        // Propagate current lease generation to the pool
+        pool.set_lease_generation(self.config.lease_generation);
+
+        pool.client()
+            .await
+            .map_err(|e| ExecutorTransportError::Transport {
+                message: e.to_string(),
+            })
     }
 
     /// Register this executor through a networked coordinator gRPC endpoint.

@@ -16,6 +16,7 @@ mod tests {
             epoch: 42,
             job_id: "job-1".into(),
             fencing_token: 7,
+            coordinator_id: None,
             timestamp_ms: 1_700_000_000_000,
             source_offsets: vec![],
             operator_snapshots: vec![],

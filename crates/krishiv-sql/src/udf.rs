@@ -11,11 +11,26 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::function::AccumulatorFactoryFunction;
 use datafusion::logical_expr::{Accumulator, ColumnarValue, Volatility, create_udaf, create_udf};
 
+use krishiv_udf::{DefaultSandboxedExecutor, ResourceLimits, SandboxedUdfExecutor};
+
 /// Register every scalar UDF in `registry` with the DataFusion session context.
+/// Uses unlimited (default) ResourceLimits for backward compatibility.
 pub fn sync_scalar_udfs(
     ctx: &datafusion::prelude::SessionContext,
     registry: &krishiv_udf::UdfRegistry,
 ) -> Result<(), DataFusionError> {
+    sync_scalar_udfs_with_limits(ctx, registry, ResourceLimits::default())
+}
+
+/// Register scalar UDFs with explicit ResourceLimits.
+/// Higher layers (JobSpec / scheduler / executor runner) supply real budgets
+/// from the job; DefaultSandboxedExecutor will enforce them at execution time.
+pub fn sync_scalar_udfs_with_limits(
+    ctx: &datafusion::prelude::SessionContext,
+    registry: &krishiv_udf::UdfRegistry,
+    limits: ResourceLimits,
+) -> Result<(), DataFusionError> {
+    let limits = Arc::new(limits);
     for name in registry.scalar_names() {
         let Some(udf) = registry.get_scalar(name) else {
             continue;
@@ -30,6 +45,7 @@ pub fn sync_scalar_udfs(
             .collect();
         let return_type = udf.output_field().data_type().clone();
         let input_schema = udf.input_schema().clone();
+        let limits = Arc::clone(&limits);
 
         let df_udf = create_udf(
             &udf_name,
@@ -38,8 +54,11 @@ pub fn sync_scalar_udfs(
             Volatility::Immutable,
             Arc::new(move |args: &[ColumnarValue]| {
                 let batch = columnar_values_to_record_batch(&input_schema, args)?;
-                let array = udf
-                    .call(&batch)
+                // Sandboxed execution with caller-supplied ResourceLimits (Track E).
+                // Enforcement (time + memory) happens inside DefaultSandboxedExecutor.
+                let executor = DefaultSandboxedExecutor;
+                let array = executor
+                    .execute_with_limits(udf.as_ref(), &batch, &limits)
                     .map_err(|e| DataFusionError::External(e.to_string().into()))?;
                 Ok(ColumnarValue::Array(array))
             }),
@@ -320,4 +339,31 @@ fn columnar_values_to_record_batch(
         &RecordBatchOptions::new().with_row_count(Some(num_rows)),
     )
     .map_err(DataFusionError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::SessionContext;
+    use krishiv_udf::{ResourceLimits, UdfRegistry};
+
+    #[test]
+    fn sync_scalar_udfs_with_limits_accepts_non_default_budget() {
+        // Track E wiring test: the new limits-aware registration path must accept
+        // a real ResourceLimits from a higher layer (JobSpec / scheduler) without
+        // panicking or falling back to the unlimited default internally.
+        let ctx = SessionContext::new();
+        let registry = UdfRegistry::new();
+
+        let limits = ResourceLimits {
+            max_execution_time_ms: Some(5_000),
+            max_memory_bytes: Some(64 * 1024 * 1024),
+            ..ResourceLimits::default()
+        };
+
+        // Should succeed and register the (empty) set of UDFs with the supplied limits
+        // captured in the closure. Real enforcement is proven in krishiv-udf tests.
+        let res = sync_scalar_udfs_with_limits(&ctx, &registry, limits);
+        assert!(res.is_ok(), "limits-aware UDF sync must succeed");
+    }
 }

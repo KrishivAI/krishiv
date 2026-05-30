@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn is_unimplemented_matches_invalid() {
         let err = RuntimeError::transport("invalid argument");
-        assert!(is_unimplemented(&err));
+        assert!(!is_unimplemented(&err));
     }
 
     #[test]

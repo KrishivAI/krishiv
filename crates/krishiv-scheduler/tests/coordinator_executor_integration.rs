@@ -7,7 +7,7 @@ use krishiv_scheduler::Coordinator;
 
 #[test]
 fn coordinator_tick_after_executor_heartbeat() {
-    let mut coordinator = Coordinator::new_active(None);
+    let mut coordinator = Coordinator::new_active(None).unwrap();
     let executor_id = ExecutorId::try_new("exec-integration").unwrap();
     coordinator
         .register_executor(ExecutorDescriptor::new(executor_id.clone(), "localhost", 2))

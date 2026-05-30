@@ -220,7 +220,9 @@ impl RedbDeltaStore {
             let (k, _) = item.map_err(|e| LakehouseError::Io(e.to_string()))?;
             let k = k.value();
             if k.len() >= prefix.len() + 8 && k.starts_with(prefix) {
-                let seq_bytes: [u8; 8] = k[k.len() - 8..].try_into().unwrap();
+                let seq_bytes: [u8; 8] = k[k.len() - 8..]
+                    .try_into()
+                    .map_err(|_| LakehouseError::Io("failed to parse sequence bytes".into()))?;
                 max = max.max(u64::from_le_bytes(seq_bytes));
             }
         }
@@ -395,7 +397,7 @@ mod kafka_delta {
         }
 
         fn next_key(&self) -> Vec<u8> {
-            let mut seq = self.seq.lock().unwrap();
+            let mut seq = self.seq.lock().unwrap_or_else(|e| e.into_inner());
             *seq += 1;
             seq.to_le_bytes().to_vec()
         }

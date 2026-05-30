@@ -358,6 +358,22 @@ impl StateBackend for RedbStateBackend {
         }
         Ok(results)
     }
+
+    fn delete_batch(&mut self, entries: &[(&Namespace, &[u8])]) -> StateResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let wtxn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = wtxn.open_table(STATE_TABLE).map_err(db_err)?;
+            for (ns, key) in entries {
+                let rk = Self::redb_key(ns, key);
+                table.remove(rk.as_slice()).map_err(db_err)?;
+            }
+        }
+        wtxn.commit().map_err(db_err)?;
+        Ok(())
+    }
 }
 
 impl RedbStateBackend {

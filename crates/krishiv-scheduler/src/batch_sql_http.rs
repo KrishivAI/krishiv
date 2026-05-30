@@ -46,7 +46,10 @@ pub async fn api_batch_sql(
         .collect();
     let outcome = execute_batch_sql_coordinated(&coordinator, &body.query, &tables)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            eprintln!("execute_batch_sql_coordinated failed: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(Json(BatchSqlResponse {
         job_id: outcome.job_id.as_str().to_owned(),
         inline_record_batch_ipc: outcome.inline_record_batch_ipc,

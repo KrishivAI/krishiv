@@ -172,7 +172,8 @@ async fn serve_status(
     _listener: tokio::net::TcpListener,
     _coordinator: SharedCoordinator,
 ) -> std::io::Result<()> {
-    unreachable!("serve_status is only reachable when feature `ui` is enabled")
+    tracing::warn!("serve_status requires the 'ui' feature; the status HTTP endpoint is disabled");
+    Ok(())
 }
 
 #[cfg(feature = "k8s")]

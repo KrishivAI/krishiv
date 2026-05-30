@@ -108,7 +108,7 @@ impl ContinuousStreamRegistry {
 
     /// List all registered job ids.
     pub fn list_jobs(&self) -> Vec<String> {
-        let jobs = self.jobs.lock().expect("continuous registry lock poisoned");
+        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
         jobs.keys().cloned().collect()
     }
 }

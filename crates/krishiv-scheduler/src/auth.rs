@@ -1,29 +1,53 @@
 //! gRPC auth enforcement.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
 
 static GRPC_AUTH_PROVIDER: std::sync::OnceLock<Arc<dyn krishiv_governance::AuthProvider>> =
     std::sync::OnceLock::new();
 
+/// Deny-by-default: gRPC handlers reject anonymous requests when no auth
+/// provider has been installed.  Set this to `true` for dev / test.
+static ALLOW_ANONYMOUS: AtomicBool = AtomicBool::new(false);
+
+// PRR Long-term (P-LONG-1): Future home for UDF sandboxing, per-job CPU/memory
+// quotas, and stronger resource limit enforcement beyond current auth.
+
 /// Install a process-wide auth provider for coordinator gRPC (optional).
 pub fn set_grpc_auth_provider(provider: Arc<dyn krishiv_governance::AuthProvider>) {
     let _ = GRPC_AUTH_PROVIDER.set(provider);
 }
 
-/// Validate `auth` when a provider is configured; otherwise allow anonymous access.
+/// Allow anonymous gRPC access when no auth provider is configured.
+///
+/// Call this once during startup for development / test binaries.
+pub fn set_allow_anonymous() {
+    ALLOW_ANONYMOUS.store(true, Ordering::Release);
+}
+
+/// Validate `auth` against the configured provider.
 ///
 /// # Security
 ///
 /// Auth is **mandatory for mutating RPCs**.  Every mutating gRPC handler
 /// must either use the [`auth_interceptor`] middleware or call this function
 /// directly (wrapped by the [`require_auth!`] macro) before acting on the
-/// request.  Anonymous traffic is only permitted when no auth provider is
-/// configured.
+/// request.
+///
+/// When no auth provider has been installed the default behaviour is to
+/// **deny** every request (deny-by-default).  Call [`set_allow_anonymous`]
+/// during startup to tolerate anonymous traffic in development.
 pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
     let Some(provider) = GRPC_AUTH_PROVIDER.get() else {
-        return Ok(());
+        if ALLOW_ANONYMOUS.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        return Err(tonic::Status::unauthenticated(
+            "gRPC auth: no provider configured and anonymous access is denied by default; \
+             set KRISHIV_ALLOW_ANONYMOUS or deploy an auth provider",
+        ));
     };
     match auth {
         AuthContext::Bearer { subject } => {
@@ -47,7 +71,7 @@ pub fn validate_grpc_auth(auth: &AuthContext) -> Result<(), tonic::Status> {
 /// changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthContext {
-    /// No credential presented; accepted in development / internal-only deployments.
+    /// No credential presented; denied by default unless [`set_allow_anonymous`] was called.
     Anonymous,
     /// A validated bearer token (R8.1 wiring placeholder).
     Bearer { subject: String },
@@ -70,7 +94,8 @@ impl AuthContext {
 
 /// Tonic interceptor that enforces auth on every incoming request.
 ///
-/// When no auth provider is configured all requests pass through.  Otherwise
+/// When no auth provider is configured requests are **denied by default**
+/// (call [`set_allow_anonymous`] for dev mode).  When a provider is installed
 /// the request must carry a valid bearer token in the `authorization`
 /// metadata header.
 pub fn auth_interceptor(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {

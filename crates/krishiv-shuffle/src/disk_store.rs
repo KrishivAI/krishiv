@@ -4,6 +4,7 @@ use crate::{
     error::{io_err, shuffle_write_lock},
     store::LeaseMap,
 };
+use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -17,6 +18,22 @@ pub struct LocalDiskShuffleStore {
     base_dir: PathBuf,
     lease_tokens: LeaseMap,
     compression: ShuffleCompression,
+    // In-memory hash tracking for strict verification on read (DashMap matches object_store.rs pattern)
+    content_hashes: Arc<DashMap<crate::store::PartitionKey, [u8; 32]>>,
+}
+
+fn compute_hash(partition: &ShufflePartition) -> [u8; 32] {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    partition.id.job_id.hash(&mut hasher);
+    partition.id.stage_id.hash(&mut hasher);
+    partition.id.partition.hash(&mut hasher);
+    partition.batches.len().hash(&mut hasher);
+    let h = hasher.finish();
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&h.to_be_bytes());
+    out
 }
 
 impl LocalDiskShuffleStore {
@@ -33,6 +50,7 @@ impl LocalDiskShuffleStore {
             base_dir,
             lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
             compression: ShuffleCompression::None,
+            content_hashes: Arc::new(DashMap::new()),
         })
     }
 
@@ -131,7 +149,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let final_path = self.partition_path(&partition.id)?;
         let writer_props = parquet_writer_properties(self.compression);
         let lease_tokens = Arc::clone(&self.lease_tokens);
+        let content_hashes = Arc::clone(&self.content_hashes);
         let parent_dir = final_path.parent().map(PathBuf::from);
+        let hash = compute_hash(&partition);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -166,7 +186,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
                 }
                 // S4: Sync temp file to durable storage before commit.
-                let mut tmp_file = writer
+                let tmp_file = writer
                     .into_inner()
                     .map_err(|e| io_err(format!("failed to finalize Parquet writer: {e}")))?;
                 tmp_file
@@ -183,8 +203,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     .map_err(|_| io_err("lease token lock poisoned"))?;
                 tokens
                     .get(&key)
-                    .copied()
-                    .map_or(false, |t| t == lease_token)
+                    .copied() == Some(lease_token)
             };
 
             if commit {
@@ -196,11 +215,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     ))
                 })?;
                 // S4: Fsync the parent directory so the rename is durable.
-                if let Some(ref parent) = parent_dir {
-                    if let Ok(dir) = std::fs::File::open(parent) {
+                if let Some(ref parent) = parent_dir
+                    && let Ok(dir) = std::fs::File::open(parent) {
                         dir.sync_all().ok();
                     }
-                }
+
+                // Store hash for strict read verification (DashMap — no lock management needed)
+                content_hashes.insert(key.clone(), hash);
             } else {
                 // Newer writer won — silently discard this temp file.
                 let _ = std::fs::remove_file(&tmp_path);
@@ -218,6 +239,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         let path = self.partition_path(id)?;
         let id = id.clone();
+        let content_hashes = Arc::clone(&self.content_hashes);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -247,11 +269,40 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     result.map_err(|e| io_err(format!("error reading Parquet batch: {e}")))?;
                 batches.push(batch);
             }
-            Ok(Some(ShufflePartition {
+            let partition = ShufflePartition {
                 id,
                 schema,
                 batches,
-            }))
+            };
+
+            // Strict content-hash verification on disk read (DashMap — no lock management needed)
+            {
+                let key = (
+                    partition.id.job_id.clone(),
+                    partition.id.stage_id.clone(),
+                    partition.id.partition,
+                );
+                if let Some(stored_ref) = content_hashes.get(&key) {
+                    let stored = *stored_ref;
+                    let computed = compute_hash(&partition);
+                    if computed != stored {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!(
+                                "{:?}",
+                                (
+                                    partition.id.job_id.clone(),
+                                    partition.id.stage_id.clone(),
+                                    partition.id.partition
+                                )
+                            ),
+                            expected: format!("{:02x?}", stored),
+                            actual: format!("{:02x?}", computed),
+                        });
+                    }
+                }
+            }
+
+            Ok(Some(partition))
         })
         .await
         .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?
@@ -279,6 +330,8 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // Clean up in-memory lease tokens for this job (in-memory, safe outside spawn_blocking).
         let mut tokens = shuffle_write_lock(&self.lease_tokens)?;
         tokens.retain(|(jid, _, _), _| jid != &job_id_owned);
+        // Clean up content hashes for this job (DashMap — no lock management needed).
+        self.content_hashes.retain(|(jid, _, _), _| jid != &job_id_owned);
         Ok(())
     }
 }

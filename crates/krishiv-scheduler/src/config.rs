@@ -36,6 +36,10 @@ pub struct CoordinatorConfig {
     llm_quota_requests_per_minute: u32,
     /// Job-level LLM token quota per minute (R17).
     llm_quota_tokens_per_minute: u64,
+
+    /// Consecutive task failures after which an executor is avoided by the
+    /// basic circuit breaker (PRR Immediate + Short term).
+    circuit_breaker_failure_threshold: u32,
 }
 
 impl CoordinatorConfig {
@@ -50,6 +54,7 @@ impl CoordinatorConfig {
             checkpoint_ack_timeout_ms: 30_000,
             llm_quota_requests_per_minute: 100,
             llm_quota_tokens_per_minute: 10_000,
+            circuit_breaker_failure_threshold: 5,
         }
     }
 
@@ -137,6 +142,11 @@ impl CoordinatorConfig {
     /// Job-level LLM token quota per minute (R17).
     pub fn llm_quota_tokens_per_minute(&self) -> u64 {
         self.llm_quota_tokens_per_minute
+    }
+
+    /// Consecutive failures threshold for the basic circuit breaker.
+    pub fn circuit_breaker_failure_threshold(&self) -> u32 {
+        self.circuit_breaker_failure_threshold
     }
 }
 

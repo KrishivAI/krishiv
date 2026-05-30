@@ -242,6 +242,8 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         let now_ms = self.now_ms();
         let namespaces = self.inner.list_namespaces()?;
         let mut evicted = 0usize;
+        let mut keys_to_delete = Vec::new();
+
         for ns in &namespaces {
             let keys = self.inner.list_keys(ns)?;
             for key in &keys {
@@ -250,13 +252,22 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
                         let expires_at_ms =
                             i64::from_le_bytes(encoded[..8].try_into().unwrap_or([0u8; 8]));
                         if now_ms >= expires_at_ms {
-                            self.inner.delete(ns, key)?;
-                            evicted += 1;
+                            keys_to_delete.push((ns.clone(), key.clone()));
                         }
                     }
                 }
             }
         }
+
+        if !keys_to_delete.is_empty() {
+            let entries: Vec<(&Namespace, &[u8])> = keys_to_delete
+                .iter()
+                .map(|(ns, key)| (ns, key.as_slice()))
+                .collect();
+            self.inner.delete_batch(&entries)?;
+            evicted = entries.len();
+        }
+
         Ok(evicted)
     }
 

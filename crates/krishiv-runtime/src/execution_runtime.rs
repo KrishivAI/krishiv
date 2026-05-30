@@ -157,19 +157,21 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        match self.mode {
-            RuntimeMode::Embedded => {
-                let backend = EmbeddedBackend::default();
-                backend.execute(plan)
+        krishiv_async_util::block_on(async {
+            match self.mode {
+                RuntimeMode::Embedded => {
+                    let backend = EmbeddedBackend::default();
+                    backend.execute(plan).await
+                }
+                RuntimeMode::SingleNode => {
+                    let sn = SingleNodeBackend;
+                    sn.execute(plan).await
+                }
+                RuntimeMode::Distributed => Err(RuntimeError::unsupported(
+                    "in-process runtime does not serve distributed mode",
+                )),
             }
-            RuntimeMode::SingleNode => {
-                let sn = SingleNodeBackend;
-                sn.execute(plan)
-            }
-            RuntimeMode::Distributed => Err(RuntimeError::unsupported(
-                "in-process runtime does not serve distributed mode",
-            )),
-        }
+        })
     }
 
     fn collect_bounded_window(
@@ -271,8 +273,10 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         if self.local_fallback.is_some() {
             return self.local_accept_plan(plan);
         }
-        let backend = DistributedBackend::new(self.flight_url.clone());
-        backend.execute(plan)
+        krishiv_async_util::block_on(async {
+            let backend = DistributedBackend::new(self.flight_url.clone());
+            backend.execute(plan).await
+        })
     }
 
     fn collect_bounded_window(

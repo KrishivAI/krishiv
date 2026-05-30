@@ -310,13 +310,14 @@ impl ExecutionReport {
 }
 
 /// Runtime backend contract shared by embedded, single-node, and distributed modes.
+#[async_trait::async_trait]
 pub trait ExecutionBackend {
     /// Backend name.
     fn backend_name(&self) -> &str;
 
     /// Accept or execute a physical plan. Batch plans are accepted without
     /// re-running SQL; execution happens in the session `SqlEngine`.
-    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
+    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
 }
 
 /// Minimal task executor contract for future scheduler integration.
@@ -341,12 +342,13 @@ fn accept_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<Execut
 #[derive(Debug, Default)]
 pub struct SingleNodeBackend;
 
+#[async_trait::async_trait]
 impl ExecutionBackend for SingleNodeBackend {
     fn backend_name(&self) -> &str {
         "single-node"
     }
 
-    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         debug!(
             backend = "single-node",
             plan = %plan.name(),
@@ -365,19 +367,20 @@ pub struct EmbeddedBackend {
     single_node: SingleNodeBackend,
 }
 
+#[async_trait::async_trait]
 impl ExecutionBackend for EmbeddedBackend {
     fn backend_name(&self) -> &str {
         "embedded"
     }
 
-    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         if is_streaming_plan(plan) {
             debug!(
                 backend = "embedded",
                 plan = %plan.name(),
                 "EmbeddedBackend: redirecting streaming plan to SingleNodeBackend"
             );
-            return self.single_node.execute(plan);
+            return self.single_node.execute(plan).await;
         }
         debug!(
             backend = "embedded",
@@ -408,12 +411,13 @@ impl DistributedBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl ExecutionBackend for DistributedBackend {
     fn backend_name(&self) -> &str {
         "distributed"
     }
 
-    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         use krishiv_async_util::block_on;
 
         debug!(
@@ -463,7 +467,7 @@ mod distributed_flight_tests {
         let url = format!("http://{addr}");
         let backend = DistributedBackend::new(url);
         let plan = PhysicalPlan::new("SELECT 1 AS n", ExecutionKind::Batch);
-        let report = backend.execute(&plan).expect("execute");
+        let report = backend.execute(&plan).await.expect("execute");
         assert!(report.accepted());
         server.abort();
     }
@@ -479,32 +483,32 @@ mod tests {
         accept_local_plan, is_streaming_plan,
     };
 
-    #[test]
-    fn embedded_backend_accepts_bootstrap_plan() {
+    #[tokio::test]
+    async fn embedded_backend_accepts_bootstrap_plan() {
         let plan = PhysicalPlan::new("bootstrap", ExecutionKind::Batch);
         let backend = EmbeddedBackend::default();
 
-        let report = backend.execute(&plan).expect("execute");
+        let report = backend.execute(&plan).await.expect("execute");
 
         assert_eq!(report.backend(), "embedded");
         assert_eq!(report.plan_name(), "bootstrap");
         assert!(report.accepted());
     }
 
-    #[test]
-    fn embedded_redirects_streaming_kind_to_single_node() {
+    #[tokio::test]
+    async fn embedded_redirects_streaming_kind_to_single_node() {
         let plan = PhysicalPlan::new("events", ExecutionKind::Streaming);
         assert!(is_streaming_plan(&plan));
         let backend = EmbeddedBackend::default();
-        let report = backend.execute(&plan).expect("execute");
+        let report = backend.execute(&plan).await.expect("execute");
         assert_eq!(report.backend(), "single-node");
     }
 
-    #[test]
-    fn single_node_accepts_streaming_plan() {
+    #[tokio::test]
+    async fn single_node_accepts_streaming_plan() {
         let plan = PhysicalPlan::new("stream:tw:key=u", ExecutionKind::Batch);
         let backend = SingleNodeBackend;
-        let report = backend.execute(&plan).expect("execute");
+        let report = backend.execute(&plan).await.expect("execute");
         assert_eq!(report.backend(), "single-node");
         assert!(report.accepted());
     }
@@ -748,11 +752,11 @@ mod tests {
         assert_eq!(b.backend_name(), "embedded");
     }
 
-    #[test]
-    fn single_node_accepts_batch_plan() {
+    #[tokio::test]
+    async fn single_node_accepts_batch_plan() {
         let plan = PhysicalPlan::new("SELECT 1", ExecutionKind::Batch);
         let b = SingleNodeBackend;
-        let report = b.execute(&plan).unwrap();
+        let report = b.execute(&plan).await.unwrap();
         assert!(report.accepted());
     }
 }

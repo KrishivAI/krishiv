@@ -261,6 +261,9 @@ pub struct ExecutorRecord {
     pub(crate) running_tasks: Vec<TaskId>,
     pub(crate) last_heartbeat_tick: u64,
     pub(crate) health_snapshot: Option<ExecutorHealthSnapshot>,
+    /// Simple consecutive task failure counter. Used as foundation for
+    /// Phase 3 circuit breaker (executor-level load shedding).
+    pub(crate) consecutive_task_failures: u32,
 }
 
 impl ExecutorRecord {
@@ -276,6 +279,7 @@ impl ExecutorRecord {
             running_tasks: Vec::new(),
             last_heartbeat_tick,
             health_snapshot: None,
+            consecutive_task_failures: 0,
         }
     }
 
@@ -312,6 +316,56 @@ impl ExecutorRecord {
     /// Most recent health snapshot from the executor heartbeat, if any.
     pub fn health_snapshot(&self) -> Option<&ExecutorHealthSnapshot> {
         self.health_snapshot.as_ref()
+    }
+
+    /// Increment failure counter (called on task failure reports from this executor).
+    /// Returns true if the executor has now exceeded the given threshold (circuit break candidate).
+    pub fn record_task_failure(&mut self, threshold: u32) -> bool {
+        self.consecutive_task_failures = self.consecutive_task_failures.saturating_add(1);
+        self.consecutive_task_failures >= threshold
+    }
+
+    /// Reset failure counter (called on successful task or healthy heartbeat).
+    pub fn reset_task_failures(&mut self) {
+        self.consecutive_task_failures = 0;
+    }
+}
+
+/// Extension on ExecutorRegistry for circuit breaker logic.
+impl ExecutorRegistry {
+    /// Record a task failure for a specific executor.
+    /// Returns true if this executor has now crossed the given threshold
+    /// and should be temporarily avoided for new assignments.
+    pub fn record_task_failure(&mut self, executor_id: &ExecutorId, threshold: u32) -> bool {
+        if let Some(record) = self
+            .executors
+            .iter_mut()
+            .find(|e| e.executor_id() == executor_id)
+        {
+            record.record_task_failure(threshold)
+        } else {
+            false
+        }
+    }
+
+    /// Reset failure count for an executor (e.g. after it reports healthy progress).
+    pub fn reset_task_failures(&mut self, executor_id: &ExecutorId) {
+        if let Some(record) = self
+            .executors
+            .iter_mut()
+            .find(|e| e.executor_id() == executor_id)
+        {
+            record.reset_task_failures();
+        }
+    }
+
+    /// Return list of executors that currently exceed the failure threshold.
+    pub fn executors_over_failure_threshold(&self, threshold: u32) -> Vec<ExecutorId> {
+        self.executors
+            .iter()
+            .filter(|e| e.consecutive_task_failures >= threshold)
+            .map(|e| e.executor_id().clone())
+            .collect()
     }
 }
 

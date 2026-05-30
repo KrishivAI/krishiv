@@ -21,6 +21,7 @@ use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
 use krishiv_state::RedbStateBackend;
+use krishiv_udf;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::Server;
@@ -278,7 +279,12 @@ async fn heartbeat_loop(
         .with_live_lease(shared_lease.clone())
         .with_barrier_injector(barrier_injector)
         .with_key_group_ranges(key_group_ranges)
-        .with_running_attempts(running_attempts);
+        .with_running_attempts(running_attempts)
+        // Track E: Apply default limits for now. In full job execution, this will
+        // be populated from the job's JCP / JobRecord using the raw accessors
+        // (udf_execution_time_cap_ms + udf_memory_limit_bytes) or a full
+        // ResourceLimits built from the JobSpec.
+        .with_udf_limits(krishiv_udf::ResourceLimits::default());
     if let Some(dir) = &shuffle_dir {
         let disk = Arc::new(
             LocalDiskShuffleStore::new(dir)
@@ -300,6 +306,20 @@ async fn heartbeat_loop(
     }
     let inmem_shuffle = Arc::new(InMemoryShuffleStore::new());
     runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
+
+    // Streaming progress buffer (GAP-OB-04): shared between runner tasks
+    // (writers) and the heartbeat loop (reader).  Keyed by "job_id:task_id".
+    let progress_buffer: Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>> =
+        Arc::new(dashmap::DashMap::new());
+    let progress_cb: std::sync::Arc<dyn crate::runner::StreamingProgressCallback> =
+        std::sync::Arc::new(ProgressBufferCallback {
+            buffer: Arc::clone(&progress_buffer),
+        });
+    runner_builder = runner_builder.with_progress_callback(progress_cb);
+
+    // Wire the progress buffer into the executor transport config so
+    // heartbeat_request() drains and reports snapshots to the coordinator.
+    runtime.config_mut().progress_buffer = Some(Arc::clone(&progress_buffer));
 
     let runner = Arc::new(runner_builder);
 
@@ -964,5 +984,29 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("unknown option"));
+    }
+}
+
+// ── Progress buffer callback (GAP-OB-04) ────────────────────────────────────
+
+/// Bridges streaming progress snapshots from runner tasks to the heartbeat loop
+/// via a shared DashMap. Runner tasks write progress; the heartbeat loop drains
+/// and attaches reports to the next `ExecutorHeartbeat`.
+struct ProgressBufferCallback {
+    buffer: Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>,
+}
+
+impl crate::runner::StreamingProgressCallback for ProgressBufferCallback {
+    fn on_progress(&self, snapshot: &crate::runner::StreamingProgressSnapshot) {
+        let key = format!("{}:{}", snapshot.job_id, snapshot.task_id);
+        let report =
+            krishiv_proto::StreamingProgressReport::new(&snapshot.job_id, &snapshot.task_id)
+                .with_watermark_ms(snapshot.watermark_ms)
+                .with_rows_emitted(snapshot.rows_emitted)
+                .with_batches_emitted(snapshot.batches_emitted)
+                .with_state_bytes(snapshot.state_bytes)
+                .with_source_offset(snapshot.source_offset.clone().unwrap_or_default())
+                .with_timestamp_ms(snapshot.timestamp_ms);
+        self.buffer.insert(key, report);
     }
 }

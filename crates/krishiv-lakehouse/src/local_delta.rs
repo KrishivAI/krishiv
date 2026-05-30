@@ -123,7 +123,7 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
     }
     // S6: Use into_inner + fsync for atomic commit semantics.
-    let mut file = writer
+    let file = writer
         .into_inner()
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
     file.sync_all()

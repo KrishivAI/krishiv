@@ -23,6 +23,7 @@ fn sample_metadata(job_id: &str, epoch: u64) -> CheckpointMetadata {
         epoch,
         job_id: job_id.to_owned(),
         fencing_token: 1,
+        coordinator_id: None,
         timestamp_ms: 1_716_000_000_000,
         source_offsets: vec![SourceOffsetRecord {
             partition_id: "partition-0".to_owned(),
@@ -289,6 +290,7 @@ fn integration_metadata_roundtrip_all_fields() {
         epoch,
         job_id: job_id.to_owned(),
         fencing_token: 7,
+        coordinator_id: None,
         timestamp_ms: 1_716_100_000_000,
         source_offsets: vec![
             SourceOffsetRecord {
@@ -371,10 +373,15 @@ fn integration_fencing_token_write_verify_reject_stale() {
         other => panic!("expected StaleFencingToken, got: {other}"),
     }
 
-    // Future token (token=5) against current_token=2 must be accepted
+    // Fencing tokens are per-coordinator-instance. Metadata with a DIFFERENT
+    // token (5) vs the current coordinator's token (2) must be REJECTED because
+    // it was written by a different coordinator instance.
     let mut future_meta = sample_metadata(job_id, 3);
     future_meta.fencing_token = 5;
-    assert!(validate_fencing_token(&future_meta, 2).is_ok());
+    assert!(
+        validate_fencing_token(&future_meta, 2).is_err(),
+        "mismatched fencing token (5 != 2) — metadata from a different coordinator must be rejected"
+    );
 }
 
 // ── 8. Ephemeral checkpoint: write → verify cleanup on drop ────────────────

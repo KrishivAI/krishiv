@@ -2,6 +2,7 @@
 mod executor_tests {
     use std::fs::File;
     use std::sync::Arc;
+    use std::sync::Once;
 
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -24,8 +25,21 @@ mod executor_tests {
     use crate::execution_model::ExecutionModel;
     use krishiv_scheduler::{
         Coordinator, CoordinatorExecutorTonicService, InMemoryMetadataStore, SharedCoordinator,
-        serve_coordinator_executor_grpc_with_listener,
+        serve_coordinator_executor_grpc_with_listener as real_serve, set_allow_anonymous,
     };
+
+    fn allow_anonymous_for_tests() {
+        static AUTH_INIT: Once = Once::new();
+        AUTH_INIT.call_once(set_allow_anonymous);
+    }
+
+    async fn serve_coordinator_executor_grpc_with_listener(
+        listener: tokio::net::TcpListener,
+        coordinator: SharedCoordinator,
+    ) -> Result<(), tonic::transport::Error> {
+        allow_anonymous_for_tests();
+        real_serve(listener, coordinator).await
+    }
 
     use crate::{
         ExecutorAssignmentInbox, ExecutorConfig, ExecutorError, ExecutorRuntime,
@@ -289,6 +303,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn deregister_via_grpc_endpoint_transitions_executor_to_removed() {
+        allow_anonymous_for_tests();
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-dereg-exec").unwrap(),
         ));
@@ -431,6 +446,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn task_runner_reports_running_and_success_to_scheduler() {
+        allow_anonymous_for_tests();
         let executor_id = ExecutorId::try_new("exec-runner-1").unwrap();
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
@@ -568,6 +584,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn task_runner_executes_local_parquet_partition_sql() {
+        allow_anonymous_for_tests();
         let temp = tempdir().unwrap();
         let parquet_path = temp.path().join("people.parquet");
         write_people_parquet(&parquet_path);
@@ -623,6 +640,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn select_one_assignment_flows_over_grpc_and_reports_output_metadata() {
+        allow_anonymous_for_tests();
         let executor_id = ExecutorId::try_new("exec-network-runner-1").unwrap();
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-network-runner-1").unwrap(),
@@ -740,6 +758,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn local_parquet_assignment_flows_over_grpc_and_reports_output_metadata() {
+        allow_anonymous_for_tests();
         let temp = tempdir().unwrap();
         let parquet_path = temp.path().join("people.parquet");
         write_people_parquet(&parquet_path);
@@ -946,6 +965,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn executor_runs_parquet_task_via_connector_source() {
+        allow_anonymous_for_tests();
         let temp = tempdir().unwrap();
         let parquet_path = temp.path().join("people.parquet");
         write_people_parquet(&parquet_path);
@@ -1020,6 +1040,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn executor_reads_object_parquet_source_and_writes_object_sink() {
+        allow_anonymous_for_tests();
         use krishiv_connectors::Source;
         use krishiv_connectors::parquet::ParquetSource;
 
@@ -1309,6 +1330,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn tpch_q1_style_shuffle_pipeline_produces_correct_aggregation() {
+        allow_anonymous_for_tests();
         use std::net::SocketAddr;
 
         use arrow::array::{Int64Array, StringArray};
@@ -1903,6 +1925,7 @@ mod executor_tests {
 
     #[tokio::test]
     async fn streaming_e2e_full_stack_job_stays_running() {
+        allow_anonymous_for_tests();
         let executor_id = ExecutorId::try_new("exec-e2e-fs").unwrap();
         let job_id = JobId::try_new("job-e2e-fs-1").unwrap();
         let shared = SharedCoordinator::new(Coordinator::active(

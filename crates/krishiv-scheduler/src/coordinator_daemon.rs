@@ -232,11 +232,23 @@ pub async fn spawn_coordinator_sidecars(
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(tick_period_ms));
         loop {
-            ticker.tick().await;
-            let mut coord = tick_coordinator.write().await;
-            if let Err(e) = coord.coordinator_tick() {
-                tracing::warn!(error = %e, "coordinator tick failed");
+            // Real Notify-driven wake + periodic fallback.
+            // This allows the coordinator to react promptly to executor
+            // and checkpoint state changes instead of only on fixed ticks.
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = tick_coordinator.wait_for_executor_change() => {}
+                _ = tick_coordinator.wait_for_checkpoint_change() => {}
             }
+
+            tick_coordinator.sync_inner_to_coord();
+            {
+                let mut coord = tick_coordinator.write().await;
+                if let Err(e) = coord.coordinator_tick() {
+                    tracing::warn!(error = %e, "coordinator tick failed");
+                }
+            }
+            tick_coordinator.sync_coord_to_inner();
         }
     });
 
@@ -632,6 +644,12 @@ pub fn coordinator_daemon_help() -> &'static str {
 pub async fn run_standalone_coordinator(
     config: CoordinatorDaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
+    if env::var("KRISHIV_ALLOW_ANONYMOUS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        crate::auth::set_allow_anonymous();
+    }
     let coordinator = build_shared_coordinator(&config)?;
     spawn_coordinator_sidecars(&coordinator, &config).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
@@ -646,6 +664,12 @@ pub async fn run_standalone_coordinator(
 
 /// Cluster control plane daemon (`krishiv-clusterd`).
 pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
+    if env::var("KRISHIV_ALLOW_ANONYMOUS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        crate::auth::set_allow_anonymous();
+    }
     let shared = build_shared_coordinator(&config)?;
     let leader = build_leader_election(&config).await?;
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)

@@ -1001,6 +1001,7 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 }
 
 /// Serialize coordinator metadata for etcd or other blob stores.
+#[allow(dead_code)]
 pub(crate) fn encode_metadata_snapshot(
     events: &[EventLogEvent],
     jobs: &[JobRecord],
@@ -1017,6 +1018,7 @@ pub(crate) fn encode_metadata_snapshot(
 }
 
 /// Restore coordinator metadata from a serialized snapshot blob.
+#[allow(dead_code)]
 pub(crate) fn decode_metadata_snapshot(
     bytes: &[u8],
 ) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {

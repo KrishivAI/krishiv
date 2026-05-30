@@ -23,7 +23,8 @@ pub use checkpoint::{
 pub use executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor, ExecutorHeartbeat,
     HeartbeatHotKeyReport, HeartbeatThrottleCommand, LlmQuotaReport, LlmThrottleCommand,
-    ShufflePartitionOutput, StreamingTaskState, TaskOutputMetadata, TaskRuntimeStats, TraceContext,
+    ShufflePartitionOutput, StreamingProgressReport, StreamingTaskState, TaskOutputMetadata,
+    TaskRuntimeStats, TraceContext,
 };
 pub use ids::{
     AttemptId, CoordinatorId, ExecutorId, FencingToken, IdError, JobId, LeaseGeneration,

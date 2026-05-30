@@ -354,10 +354,14 @@ impl HudiCowWriter {
         }
         fs::create_dir_all(&commit_dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
 
-        let base_rel = base_batch.map(|_| format!("{instant}/base-0.parquet"));
         let change_rel = format!("{instant}/changes-0.parquet");
+        let base_rel = base_batch
+            .as_ref()
+            .map(|_| format!("{instant}/base-0.parquet"));
         if let Some(base) = base_batch {
-            write_parquet_batch(&self.table_path.join(base_rel.as_ref().unwrap()), base)?;
+            if let Some(ref base_rel_str) = base_rel {
+                write_parquet_batch(&self.table_path.join(base_rel_str), base)?;
+            }
         }
         write_parquet_batch(&self.table_path.join(&change_rel), change_batch)?;
 

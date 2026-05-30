@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-executor = { path = "../krishiv-executor" }

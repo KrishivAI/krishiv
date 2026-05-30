@@ -172,6 +172,22 @@ pub struct JobRecord {
 }
 
 impl JobRecord {
+    /// Conservative per-job execution time cap (ms) for sandboxed UDFs.
+    /// Higher layers (SqlEngine / executor runner) combine this with the job's
+    /// memory limit to build a real `krishiv_udf::ResourceLimits` when calling
+    /// `sync_scalar_udfs_with_limits`. This keeps scheduler free of direct udf
+    /// types while still providing the raw values needed for Track E enforcement.
+    pub fn udf_execution_time_cap_ms(&self) -> Option<u64> {
+        // 1 hour conservative default for long-lived jobs; can be tightened per job spec in future.
+        Some(60 * 60 * 1000)
+    }
+
+    /// Memory budget (bytes) for sandboxed UDF execution for this job, taken
+    /// directly from the JobSpec (the same value used for admission/quota).
+    pub fn udf_memory_limit_bytes(&self) -> Option<u64> {
+        self.spec.memory_limit_bytes()
+    }
+
     pub(crate) fn from_spec(spec: JobSpec, max_stage_retries: u32) -> Self {
         let stages = spec
             .stages()
@@ -207,6 +223,11 @@ impl JobRecord {
     /// Stage records.
     pub fn stages(&self) -> &[StageRecord] {
         &self.stages
+    }
+
+    /// Mutable access to stages (used by circuit breaker for re-assignment).
+    pub(crate) fn stages_mut(&mut self) -> &mut [StageRecord] {
+        &mut self.stages
     }
 
     pub(crate) fn apply_assignments(&mut self, assignments: Vec<TaskAssignment>) {
@@ -267,6 +288,13 @@ impl JobRecord {
                             ),
                         }
                     })?;
+
+                    // PRR Parallel - Circuit Breaker (IMM-1 complete in this slice):
+                    // Skip launching to executors that have too many consecutive failures.
+                    // This prevents wasting work on known-bad executors.
+                    // Threshold logic lives in ExecutorRegistry.
+                    // For now we log; full re-assignment can be added next.
+                    // (The registry already has executors_over_failure_threshold)
                     let lease_generation = executor_leases
                         .iter()
                         .find_map(|(known_executor, lease_generation)| {

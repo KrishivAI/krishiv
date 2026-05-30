@@ -463,6 +463,7 @@ async fn distributed_backend_end_to_end() {
     let plan = PhysicalPlan::new("SELECT 100 AS result", ExecutionKind::Batch);
     let report = backend
         .execute(&plan)
+        .await
         .expect("execute via distributed backend");
     assert!(report.accepted());
     assert_eq!(report.backend(), "distributed");

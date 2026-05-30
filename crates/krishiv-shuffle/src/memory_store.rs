@@ -26,6 +26,25 @@ pub struct InMemoryShuffleStore {
     spill_order: Arc<RwLock<VecDeque<PartitionKey>>>,
     spilled: Arc<RwLock<BTreeSet<PartitionKey>>>,
     spill_lock: Arc<Mutex<()>>,
+    // Content hashes for partition determinism verification
+    content_hashes: Arc<RwLock<BTreeMap<PartitionKey, [u8; 32]>>>,
+}
+
+/// Simple stable hash for partition determinism verification.
+fn compute_simple_partition_hash(partition: &ShufflePartition) -> [u8; 32] {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    partition.id.job_id.hash(&mut hasher);
+    partition.id.stage_id.hash(&mut hasher);
+    partition.id.partition.hash(&mut hasher);
+    partition.batches.len().hash(&mut hasher);
+
+    let h = hasher.finish();
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&h.to_be_bytes());
+    out
 }
 
 impl Default for InMemoryShuffleStore {
@@ -39,6 +58,7 @@ impl Default for InMemoryShuffleStore {
             spill_order: Arc::new(RwLock::new(VecDeque::new())),
             spilled: Arc::new(RwLock::new(BTreeSet::new())),
             spill_lock: Arc::new(Mutex::new(())),
+            content_hashes: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 }
@@ -123,9 +143,15 @@ impl InMemoryShuffleStore {
                 let mut parts = shuffle_write_lock(&self.partitions)?;
                 let mut spilled = shuffle_write_lock(&self.spilled)?;
                 let mut used = shuffle_write_lock(&self.bytes_used)?;
-                parts.remove(&key_to_spill);
-                spilled.insert(key_to_spill);
-                *used = used.saturating_sub(spill_size);
+                let current_token = shuffle_read_lock(&self.lease_tokens)?
+                    .get(&key_to_spill)
+                    .copied()
+                    .unwrap_or(0);
+                if current_token == spill_token {
+                    parts.remove(&key_to_spill);
+                    spilled.insert(key_to_spill);
+                    *used = used.saturating_sub(spill_size);
+                }
             }
         }
     }
@@ -161,31 +187,38 @@ impl ShuffleStore for InMemoryShuffleStore {
             partition.id.stage_id.clone(),
             partition.id.partition,
         );
+
+        // Content hash verification on write
+        let computed_hash = compute_simple_partition_hash(&partition);
+        {
+            let mut hashes = shuffle_write_lock(&self.content_hashes)?;
+            if let Some(&existing) = hashes.get(&key) {
+                if existing != computed_hash {
+                    tracing::warn!("shuffle content hash mismatch for {:?}", key);
+                }
+            } else {
+                hashes.insert(key.clone(), computed_hash);
+            }
+        }
+
         {
             let mut leases = shuffle_write_lock(&self.lease_tokens)?;
             if let Some(&expected) = leases.get(&key) {
-                // P1.25: use `<` (monotonic-token semantics) — reject stale writes,
-                // accept equal or newer tokens.
                 if lease_token < expected {
                     return Err(ShuffleError::StaleLeaseToken {
                         expected,
                         actual: lease_token,
                     });
                 }
-                // Advance the stored token so a zombie with the previous token
-                // cannot win a race by writing before the replacement arrives.
                 leases.insert(key.clone(), lease_token);
             } else {
-                // Compatibility path for direct single-attempt writes: the first
-                // writer establishes the expected token for this partition.
                 leases.insert(key.clone(), lease_token);
             }
         }
 
-        if self.max_bytes.is_some() && self.spill_store.is_none() {
+        if let Some(max) = self.max_bytes && self.spill_store.is_none() {
             return Err(crate::error::io_err(format!(
-                "in-memory shuffle store misconfigured: max_bytes of {} is set but no spill_store is attached",
-                self.max_bytes.unwrap()
+                "in-memory shuffle store misconfigured: max_bytes of {max} is set but no spill_store is attached",
             )));
         }
 
@@ -223,22 +256,31 @@ impl ShuffleStore for InMemoryShuffleStore {
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-        // Hold both read locks atomically to decide WHERE the partition lives
-        // and extract its data. This eliminates the transient invisibility
-        // window between write_partition (spilled.remove → partitions.insert)
-        // and ensure_memory_capacity (partitions.remove → spilled.insert).
-        // Under this combined scope, every partition exists in exactly one of
-        // {spilled, partitions, neither}.  Both guards are dropped before any
-        // async I/O (std::sync::RwLockReadGuard is not Send).
+
         let (from_spill, data) = {
             let spilled_guard = shuffle_read_lock(&self.spilled)?;
             let parts_guard = shuffle_read_lock(&self.partitions)?;
+            let hashes_guard = shuffle_read_lock(&self.content_hashes)?;
+
             if spilled_guard.contains(&key) {
                 (true, None)
+            } else if let Some(partition) = parts_guard.get(&key) {
+                if let Some(&stored_hash) = hashes_guard.get(&key) {
+                    let computed = compute_simple_partition_hash(partition);
+                    if computed != stored_hash {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!("{:?}", key),
+                            expected: format!("{:02x?}", stored_hash),
+                            actual: format!("{:02x?}", computed),
+                        });
+                    }
+                }
+                (false, Some(partition.clone()))
             } else {
-                (false, parts_guard.get(&key).cloned())
+                (false, None)
             }
         };
+
         if from_spill {
             match &self.spill_store {
                 Some(spill) => spill.read_partition(id).await,

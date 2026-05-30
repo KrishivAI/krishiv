@@ -31,6 +31,7 @@ pub enum CheckpointCoordinatorState {
 #[derive(Clone)]
 pub struct CheckpointCoordinator {
     pub(crate) job_id: JobId,
+    pub(crate) coordinator_id: String,
     pub(crate) storage: Arc<dyn CheckpointStorage>,
     pub(crate) interval_ms: u64,
     pub(crate) current_epoch: u64,
@@ -66,12 +67,14 @@ impl CheckpointCoordinator {
     /// Create a new checkpoint coordinator for `job_id`.
     pub fn new(
         job_id: JobId,
+        coordinator_id: String,
         storage: Arc<dyn CheckpointStorage>,
         interval_ms: u64,
         expected_task_count: usize,
     ) -> Self {
         Self {
             job_id,
+            coordinator_id,
             storage,
             interval_ms,
             current_epoch: 0,
@@ -84,6 +87,23 @@ impl CheckpointCoordinator {
             elapsed_ms: 0,
             awaiting_elapsed_ms: 0,
         }
+    }
+
+    /// **Test-only**: create a checkpoint coordinator with a default coordinator id.
+    #[doc(hidden)]
+    pub fn new_for_test(
+        job_id: JobId,
+        storage: Arc<dyn CheckpointStorage>,
+        interval_ms: u64,
+        expected_task_count: usize,
+    ) -> Self {
+        Self::new(
+            job_id,
+            "test-coordinator".to_owned(),
+            storage,
+            interval_ms,
+            expected_task_count,
+        )
     }
 
     /// Update quorum size to match currently running tasks (SCH-3).
@@ -173,10 +193,12 @@ impl CheckpointCoordinator {
                 self.job_id, ack.epoch
             ));
         }
-        // Fencing token check: reject acks from coordinators with a stale token.
-        if ack.fencing_token < self.fencing_token {
+        // Fencing token check: must exactly match the current leader's token.
+        // Reject both older and newer tokens (prevents split-brain from stale or
+        // future-generation coordinators after failover / network partition).
+        if ack.fencing_token != self.fencing_token {
             return Err(format!(
-                "stale fencing token in ack for job {}: expected >= {}, got {}",
+                "stale fencing token in ack for job {}: expected {}, got {}",
                 self.job_id,
                 self.fencing_token.as_u64(),
                 ack.fencing_token.as_u64()
@@ -242,6 +264,7 @@ impl CheckpointCoordinator {
             epoch,
             job_id: self.job_id.as_str().to_owned(),
             fencing_token: self.fencing_token.as_u64(),
+            coordinator_id: Some(self.coordinator_id.clone()),
             timestamp_ms: epoch * self.interval_ms,
             source_offsets,
             operator_snapshots,
@@ -408,7 +431,7 @@ mod tests {
         let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-timeout-zero").unwrap();
-        let mut coord = CheckpointCoordinator::new(job_id, storage, 1_000, 0);
+        let mut coord = CheckpointCoordinator::new_for_test(job_id, storage, 1_000, 0);
 
         // Start an epoch with 0 expected tasks.
         assert_eq!(coord.initiate().unwrap(), 1);
@@ -432,7 +455,8 @@ mod tests {
         let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-fence").unwrap();
-        let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 1000, 1);
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
 
         // Simulate a coordinator failover: bump fencing token.
         coord.fencing_token = FencingToken::try_new(2).unwrap();
@@ -472,7 +496,8 @@ mod tests {
         let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
             Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
         let job_id = JobId::try_new("job-fence-bad").unwrap();
-        let mut coord = CheckpointCoordinator::new(job_id.clone(), storage.clone(), 1000, 1);
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
 
         // Set a token of 3 on the coordinator.
         coord.fencing_token = FencingToken::try_new(3).unwrap();
@@ -486,13 +511,59 @@ mod tests {
         // Mutate token after building ack — simulate a race that changes coordinator token.
         coord.fencing_token = FencingToken::try_new(4).unwrap();
         // The ack carries token=3, but the coordinator is now at 4.
-        // receive_ack checks ack.fencing_token >= self.fencing_token, so this would fail
-        // the ack-level check. The validate_fencing_token guard in commit_epoch provides
-        // an additional defense when tokens in metadata don't match the coordinator.
+        // receive_ack now requires exact match (!=), so this is rejected.
+        // The validate_fencing_token guard in commit_epoch provides an additional
+        // defense at storage time.
         let result = coord.receive_ack(ack);
         assert!(
             result.is_err(),
             "ack with stale fencing token must be rejected"
+        );
+    }
+
+    #[test]
+    fn receive_ack_rejects_higher_fencing_token() {
+        // Critical split-brain defense: a token *higher* than the current leader's
+        // token must be rejected (the old `<` check would have accepted it).
+        // This test would have passed with the buggy `<` logic.
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-higher-token").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+
+        // Current leader has token 5.
+        coord.fencing_token = FencingToken::try_new(5).unwrap();
+        let _epoch = coord.initiate().unwrap();
+
+        // Ack carrying a *future* token (e.g. from a coordinator that became leader later
+        // and then crashed, or from a split-brain instance) must be rejected.
+        let future_ack = make_ack(&job_id, "task-1", 1, FencingToken::try_new(7).unwrap());
+        let res_future = coord.receive_ack(future_ack);
+        assert!(
+            res_future.is_err(),
+            "ack with higher fencing token (7 > 5) must be rejected to prevent split-brain"
+        );
+        assert!(res_future.unwrap_err().contains("stale fencing token"));
+
+        // Same token is accepted.
+        let good_ack = make_ack(&job_id, "task-1", 1, FencingToken::try_new(5).unwrap());
+        let done = coord
+            .receive_ack(good_ack)
+            .expect("current token must be accepted");
+        assert!(done, "quorum reached");
+
+        // Lower token is also rejected.
+        // (We create a fresh coord because previous quorum committed the epoch.)
+        let mut coord2 =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord2.fencing_token = FencingToken::try_new(5).unwrap();
+        let _ = coord2.initiate().unwrap();
+        let old_ack = make_ack(&job_id, "task-1", 1, FencingToken::try_new(3).unwrap());
+        let res_old = coord2.receive_ack(old_ack);
+        assert!(
+            res_old.is_err(),
+            "ack with lower fencing token must be rejected"
         );
     }
 }

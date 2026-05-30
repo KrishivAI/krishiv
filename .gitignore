@@ -16,3 +16,12 @@ crates/krishiv-python/dist/
 
 .krishiv/local/*.json
 .antigravitycli/
+
+# Root-level log artifacts from daemon / test runs.
+# Prevents accidental inclusion during autonomous git add -A waves.
+# These are never committed source of truth.
+*.log
+coordinator.log
+executor.log
+flight.log
+scheduler.log

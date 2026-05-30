@@ -3851,6 +3851,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic 0.14.6",
+ "tracing",
 ]
 
 [[package]]
@@ -3883,6 +3884,7 @@ name = "krishiv-api"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "krishiv-async-util",
  "krishiv-exec",
  "krishiv-flight-sql",
@@ -4024,10 +4026,12 @@ dependencies = [
  "krishiv-shuffle",
  "krishiv-sql",
  "krishiv-state",
+ "krishiv-udf",
  "object_store",
  "parquet 58.3.0",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tonic 0.14.6",
@@ -4097,10 +4101,14 @@ dependencies = [
 name = "krishiv-metrics"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "dashmap",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic 0.14.6",
  "tracing",
@@ -4189,6 +4197,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "async-trait",
  "base64 0.22.1",
  "futures",
  "krishiv-async-util",
@@ -4217,6 +4226,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "axum 0.8.9",
+ "dashmap",
  "etcd-client",
  "futures",
  "krishiv-async-util",
@@ -4232,6 +4242,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -4270,6 +4281,7 @@ dependencies = [
  "object_store",
  "parquet 58.3.0",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tonic 0.14.6",

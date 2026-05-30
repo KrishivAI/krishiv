@@ -1,4 +1,4 @@
-//! tonic interceptors for W3C `traceparent` propagation.
+//! tonic interceptors for W3C `traceparent` and `tracestate` propagation.
 //!
 //! # Client side
 //!
@@ -21,8 +21,9 @@ use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Tonic client interceptor: reads `current_traceparent()` and inserts it as
-/// the `"traceparent"` metadata key on every outgoing request.
+/// Tonic client interceptor: reads `current_traceparent()` and `current_tracestate()`
+/// and inserts them as `"traceparent"` and `"tracestate"` metadata keys on every
+/// outgoing request.
 ///
 /// When no span is active the request is forwarded unchanged.
 pub fn inject_trace_context(
@@ -31,6 +32,11 @@ pub fn inject_trace_context(
     if let Some(value) = crate::current_traceparent() {
         if let Ok(meta_val) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
             req.metadata_mut().insert("traceparent", meta_val);
+        }
+    }
+    if let Some(value) = crate::current_tracestate() {
+        if let Ok(meta_val) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
+            req.metadata_mut().insert("tracestate", meta_val);
         }
     }
     Ok(req)
@@ -54,11 +60,11 @@ impl<'a> Extractor for MetadataExtractor<'a> {
     }
 }
 
-/// Tonic server interceptor: reads `"traceparent"` from request metadata and
-/// sets it as the parent span context so downstream spans inherit the W3C trace
-/// context.
+/// Tonic server interceptor: reads `"traceparent"` and `"tracestate"` from request
+/// metadata and sets them as the parent span context so downstream spans inherit
+/// the full W3C trace context.
 ///
-/// When the header is absent or malformed the request is forwarded unchanged.
+/// When the headers are absent or malformed the request is forwarded unchanged.
 pub fn extract_trace_context(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
     let propagator = TraceContextPropagator::new();
     let parent_ctx = propagator.extract(&MetadataExtractor(req.metadata()));

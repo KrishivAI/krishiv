@@ -177,7 +177,11 @@ impl ClusterControlPlane {
     }
 
     pub fn job_coordinator(&self, job_id: JobId) -> JobCoordinator {
-        JobCoordinator::new(job_id, self.shared.clone())
+        // Two-tier seam: JCP owns its JobRecord. For early callers we construct
+        // a minimal placeholder record (real attachment happens at submit_job time).
+        let spec = JobSpec::new(job_id.clone(), "jcp-seam", krishiv_proto::JobKind::Batch);
+        let record = crate::job::JobRecord::from_spec(spec, 3);
+        JobCoordinator::new(job_id, record)
     }
 
     /// Spawn orchestration loops only when we currently hold leadership.
@@ -255,9 +259,7 @@ mod tests {
         let spec = JobSpec::new(job_id.clone(), "demo", JobKind::Batch).with_stage(stage);
         ccp.submit_job(spec).unwrap();
         let jcp = ccp.job_coordinator(job_id);
-        assert_eq!(
-            jcp.job_snapshot().unwrap().job_id(),
-            &JobId::try_new("job-1").unwrap()
-        );
+        // JCP exposes job_id directly; full snapshot is async and owned by the record.
+        assert_eq!(jcp.job_id(), &JobId::try_new("job-1").unwrap());
     }
 }

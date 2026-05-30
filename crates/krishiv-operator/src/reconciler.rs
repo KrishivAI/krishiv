@@ -8,7 +8,7 @@ use krishiv_proto::{
     JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
 use krishiv_scheduler::{
-    Coordinator, JobCoordinator, JobSnapshot, SchedulerError, SharedCoordinator,
+    Coordinator, JobSnapshot, SchedulerError, SharedCoordinator,
 };
 
 use crate::constants::{API_GROUP, API_VERSION, KIND};
@@ -119,7 +119,11 @@ impl KrishivJobReconciler {
             return;
         }
         drop(guard);
-        JobCoordinator::new(job_id.clone(), cluster.clone()).spawn_job_orchestration_loops();
+        // Per-job JCP loops are now integrated into the main coordinator tick
+        // via advance_heartbeat_tick and drive_pending_task_launches (Track B
+        // two-tier model). The operator's SharedCoordinator handle is already
+        // wired to the same Coordinators; no dedicated spawn needed here.
+        let _ = cluster;
     }
 
     /// Active coordinator id used in status patches.

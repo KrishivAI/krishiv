@@ -163,6 +163,38 @@ pub enum AuditAction {
     SavepointRestored { job_id: String, epoch: u64 },
     /// A privileged administrative action was performed.
     AdminAction { description: String },
+    /// A task was assigned to an executor.
+    TaskAssigned {
+        job_id: String,
+        stage_id: String,
+        task_id: String,
+        executor_id: String,
+    },
+    /// A task attempt failed permanently (after retries exhausted).
+    TaskFailed {
+        job_id: String,
+        stage_id: String,
+        task_id: String,
+        attempt_id: u32,
+    },
+    /// A checkpoint epoch was committed.
+    CheckpointCommitted {
+        job_id: String,
+        epoch: u64,
+        fencing_token: u64,
+    },
+    /// A checkpoint epoch was aborted (timeout, coordinator failover, etc.).
+    CheckpointAborted {
+        job_id: String,
+        epoch: u64,
+        reason: Option<String>,
+    },
+    /// A sink writer completed its commit for a checkpoint epoch.
+    SinkCommitCompleted {
+        job_id: String,
+        sink_id: String,
+        epoch: u64,
+    },
 }
 
 /// A structured audit event for external SIEM/audit-log forwarding.
@@ -282,6 +314,55 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
             format!("job_id={job_id} epoch={epoch}"),
         ),
         AuditAction::AdminAction { description } => ("admin_action", description.clone()),
+        AuditAction::TaskAssigned {
+            job_id,
+            stage_id,
+            task_id,
+            executor_id,
+        } => (
+            "task_assigned",
+            format!(
+                "job_id={job_id} stage_id={stage_id} task_id={task_id} executor_id={executor_id}"
+            ),
+        ),
+        AuditAction::TaskFailed {
+            job_id,
+            stage_id,
+            task_id,
+            attempt_id,
+        } => (
+            "task_failed",
+            format!(
+                "job_id={job_id} stage_id={stage_id} task_id={task_id} attempt_id={attempt_id}"
+            ),
+        ),
+        AuditAction::CheckpointCommitted {
+            job_id,
+            epoch,
+            fencing_token,
+        } => (
+            "checkpoint_committed",
+            format!("job_id={job_id} epoch={epoch} fencing_token={fencing_token}"),
+        ),
+        AuditAction::CheckpointAborted {
+            job_id,
+            epoch,
+            reason,
+        } => {
+            let reason_str = reason.as_deref().unwrap_or("unspecified");
+            (
+                "checkpoint_aborted",
+                format!("job_id={job_id} epoch={epoch} reason={reason_str}"),
+            )
+        }
+        AuditAction::SinkCommitCompleted {
+            job_id,
+            sink_id,
+            epoch,
+        } => (
+            "sink_commit_completed",
+            format!("job_id={job_id} sink_id={sink_id} epoch={epoch}"),
+        ),
     };
 
     let key = audit_dedup_key(principal, action_name, &detail);
@@ -317,13 +398,6 @@ pub fn audit_log(principal: &str, action: &AuditAction, outcome: AuditOutcome) {
         outcome,
     };
     get_audit_sink().record(&event);
-    tracing::info!(
-        target: "krishiv::audit",
-        principal = principal,
-        action = action_name,
-        detail = detail.as_str(),
-        "audit event",
-    );
 }
 
 // ─── OpenLineage ──────────────────────────────────────────────────────────────
@@ -500,11 +574,7 @@ impl AsyncHttpEmitter {
 
         tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                let response = client
-                    .post(&endpoint_str)
-                    .json(&event)
-                    .send()
-                    .await;
+                let response = client.post(&endpoint_str).json(&event).send().await;
                 match response {
                     Ok(resp) => {
                         if let Err(e) = resp.error_for_status() {
@@ -605,6 +675,34 @@ pub fn new_run_event(
     }
 }
 
+// ── Global OpenLineage emitter (GAP-OB-06) ──────────────────────────────────
+
+/// Process-global OpenLineage emitter. Defaults to `LoggingEmitter`; callers
+/// can override with `set_lineage_emitter()` to route events to an HTTP collector.
+static GLOBAL_LINEAGE_EMITTER: std::sync::OnceLock<Box<dyn OpenLineageEmitter + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Install a custom [`OpenLineageEmitter`] for the lifetime of the process.
+pub fn set_lineage_emitter(emitter: Box<dyn OpenLineageEmitter + Send + Sync>) {
+    GLOBAL_LINEAGE_EMITTER.set(emitter).ok();
+}
+
+fn get_lineage_emitter() -> &'static (dyn OpenLineageEmitter + Send + Sync) {
+    GLOBAL_LINEAGE_EMITTER
+        .get_or_init(|| Box::new(LoggingEmitter))
+        .as_ref()
+}
+
+/// Emit an OpenLineage run event asynchronously via the process-global emitter.
+///
+/// Failures are logged at `warn` level via `tracing` — lineage emission is
+/// best-effort and must never block the scheduler.
+pub async fn emit_lineage_event(event: RunEvent) {
+    if let Err(e) = get_lineage_emitter().emit(event).await {
+        tracing::warn!(error = %e, "failed to emit lineage event");
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -682,6 +780,7 @@ mod tests {
 
     #[test]
     fn audit_log_does_not_panic() {
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
         audit_log(
             "alice",
             &AuditAction::JobSubmitted {
@@ -693,6 +792,7 @@ mod tests {
 
     #[test]
     fn audit_log_denied_does_not_panic() {
+        let _guard = AUDIT_DEDUP_TEST_LOCK.lock().unwrap();
         audit_log(
             "eve",
             &AuditAction::AdminAction {
@@ -911,7 +1011,10 @@ mod tests {
                 break;
             }
         }
-        assert!(success, "Async emitter failed to deliver event to mock server in background");
+        assert!(
+            success,
+            "Async emitter failed to deliver event to mock server in background"
+        );
     }
 
     // ── AuditLog dedup edge cases ───────────────────────────────────────────

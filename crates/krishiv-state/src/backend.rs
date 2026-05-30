@@ -44,6 +44,18 @@ pub trait StateBackend: Send + Sync {
         Ok(())
     }
 
+    /// Delete multiple `(namespace, key)` entries at once.
+    ///
+    /// The default implementation calls `delete` for each entry individually.
+    /// Backends that support batch deletes should override this for efficiency —
+    /// `RedbStateBackend` overrides this to open a single write transaction for all entries.
+    fn delete_batch(&mut self, entries: &[(&Namespace, &[u8])]) -> StateResult<()> {
+        for (ns, key) in entries {
+            self.delete(ns, key)?;
+        }
+        Ok(())
+    }
+
     /// Retrieve multiple values for `(namespace_op_id, namespace_state_name, key)` triples.
     ///
     /// The default implementation calls `get` for each entry individually.

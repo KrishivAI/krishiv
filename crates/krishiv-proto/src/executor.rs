@@ -461,6 +461,82 @@ impl StreamingTaskState {
     }
 }
 
+/// Periodic streaming progress report (GAP-OB-04).
+///
+/// Emitted by continuous streaming operators on the executor and forwarded to
+/// the coordinator via the heartbeat. Used to populate per-job/task metrics
+/// and detect silent hangs where the task is `Running` but making zero progress.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamingProgressReport {
+    /// Job that owns the streaming task.
+    pub job_id: String,
+    /// Task that produced this snapshot.
+    pub task_id: String,
+    /// Current event-time watermark in milliseconds since epoch.
+    pub watermark_ms: i64,
+    /// Total rows emitted since task start (cumulative).
+    pub rows_emitted: u64,
+    /// Total batches emitted since task start (cumulative).
+    pub batches_emitted: u64,
+    /// Approximate state backend byte size.
+    pub state_bytes: u64,
+    /// Current source offset (connector-specific encoding).
+    pub source_offset: Vec<u8>,
+    /// Wall-clock timestamp of this snapshot in milliseconds since epoch.
+    pub timestamp_ms: u64,
+}
+
+impl StreamingProgressReport {
+    pub fn new(job_id: impl Into<String>, task_id: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            task_id: task_id.into(),
+            watermark_ms: 0,
+            rows_emitted: 0,
+            batches_emitted: 0,
+            state_bytes: 0,
+            source_offset: Vec::new(),
+            timestamp_ms: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn with_watermark_ms(mut self, ms: i64) -> Self {
+        self.watermark_ms = ms;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rows_emitted(mut self, rows: u64) -> Self {
+        self.rows_emitted = rows;
+        self
+    }
+
+    #[must_use]
+    pub fn with_batches_emitted(mut self, batches: u64) -> Self {
+        self.batches_emitted = batches;
+        self
+    }
+
+    #[must_use]
+    pub fn with_state_bytes(mut self, bytes: u64) -> Self {
+        self.state_bytes = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_offset(mut self, offset: Vec<u8>) -> Self {
+        self.source_offset = offset;
+        self
+    }
+
+    #[must_use]
+    pub fn with_timestamp_ms(mut self, ms: u64) -> Self {
+        self.timestamp_ms = ms;
+        self
+    }
+}
+
 /// Executor heartbeat contract.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorHeartbeat {
@@ -478,6 +554,13 @@ pub struct ExecutorHeartbeat {
     hot_key_reports: Vec<HeartbeatHotKeyReport>,
     /// LLM quota usage reports (R17).
     llm_quota_reports: Vec<LlmQuotaReport>,
+    /// Periodic streaming progress snapshots (GAP-OB-04).
+    ///
+    /// Each entry is a mid-execution progress report from a continuous streaming
+    /// task. Unlike `streaming_task_states` (which reports re-attach state),
+    /// these snapshots are emitted periodically while the task is actively
+    /// running and carry watermark, row throughput, and state-size information.
+    streaming_progress: Vec<StreamingProgressReport>,
 }
 
 impl ExecutorHeartbeat {
@@ -494,6 +577,7 @@ impl ExecutorHeartbeat {
             streaming_task_states: Vec::new(),
             hot_key_reports: Vec::new(),
             llm_quota_reports: Vec::new(),
+            streaming_progress: Vec::new(),
         }
     }
 
@@ -601,5 +685,17 @@ impl ExecutorHeartbeat {
     /// LLM quota reports in this heartbeat.
     pub fn llm_quota_reports(&self) -> &[LlmQuotaReport] {
         &self.llm_quota_reports
+    }
+
+    /// Attach streaming progress snapshots (GAP-OB-04).
+    #[must_use]
+    pub fn with_streaming_progress(mut self, reports: Vec<StreamingProgressReport>) -> Self {
+        self.streaming_progress = reports;
+        self
+    }
+
+    /// Periodic streaming progress snapshots in this heartbeat.
+    pub fn streaming_progress(&self) -> &[StreamingProgressReport] {
+        &self.streaming_progress
     }
 }

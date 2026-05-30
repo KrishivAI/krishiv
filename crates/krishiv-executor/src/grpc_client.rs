@@ -49,7 +49,7 @@ type InterceptedCoordinatorClient =
 
 /// Reuses one coordinator gRPC channel across RPCs and stamps the live lease
 /// onto every outgoing executor-originated request.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CoordinatorGrpcPool {
     endpoint: String,
     client: Arc<Mutex<Option<InterceptedCoordinatorClient>>>,

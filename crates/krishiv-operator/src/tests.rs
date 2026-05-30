@@ -705,6 +705,7 @@ mod operator_tests {
             epoch: 1,
             job_id: "job-failover".to_owned(),
             fencing_token: coord_a.fencing_token(), // 1
+            coordinator_id: None,
             timestamp_ms: 0,
             source_offsets: vec![],
             operator_snapshots: vec![],

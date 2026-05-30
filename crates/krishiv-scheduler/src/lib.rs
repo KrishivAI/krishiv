@@ -11,6 +11,7 @@ pub mod admission;
 pub mod auth;
 pub mod config;
 pub mod coordinator;
+pub mod coordinator_sharded;
 pub mod error;
 #[cfg(feature = "etcd")]
 pub mod etcd_lease;
@@ -45,7 +46,10 @@ pub use adaptive::{
 pub use admission::{
     ConfigFileQueueManager, InMemoryQueueManager, QueueManager, QuotaPolicy, QuotaQueueManager,
 };
-pub use auth::{AuthContext, extract_auth_context, set_grpc_auth_provider, validate_grpc_auth};
+pub use auth::{
+    AuthContext, extract_auth_context, set_allow_anonymous, set_grpc_auth_provider,
+    validate_grpc_auth,
+};
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
@@ -97,5 +101,6 @@ mod tests;
 
 pub(crate) use grpc::status_from_scheduler_error;
 
-#[cfg(test)]
-pub(crate) use krishiv_proto::{ExecutorDescriptor, ExecutorId};
+// #[cfg(test)]
+// pub(crate) use krishiv_proto::{ExecutorDescriptor, ExecutorId};
+// (removed to resolve duplicate re-export during test profile build; tests qualify via krishiv_proto directly)

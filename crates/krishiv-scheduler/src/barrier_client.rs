@@ -2,19 +2,16 @@
 
 use std::time::Duration;
 
-use krishiv_proto::wire::v1::CheckpointBarrier;
+use krishiv_proto::wire::v1::{BarrierAck, CheckpointBarrier};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::barrier_tracker::CheckpointBarrierTracker;
-
-/// Send a checkpoint barrier to an executor and record the returned ack.
+/// Send a checkpoint barrier to an executor and return the returned ack.
 pub async fn inject_barrier<T>(
     client: &mut krishiv_proto::wire::v1::barrier_service_client::BarrierServiceClient<T>,
     barrier: CheckpointBarrier,
-    tracker: &mut CheckpointBarrierTracker,
     timeout: Duration,
-) -> Result<(), String>
+) -> Result<BarrierAck, String>
 where
     T: tonic::client::GrpcService<tonic::body::Body>,
     T::Error: Into<tonic::codegen::StdError>,
@@ -31,27 +28,14 @@ where
         .await
         .map_err(|e| e.to_string())?
         .into_inner();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("barrier ack timeout".into());
-        }
-        match tokio::time::timeout(remaining, responses.message()).await {
-            Ok(Ok(Some(ack))) => {
-                if !tracker.record_ack(&ack) {
-                    return Err(format!(
-                        "unexpected ack for job {} epoch {}",
-                        ack.job_id, ack.epoch
-                    ));
-                }
-                if tracker.is_complete() {
-                    return Ok(());
-                }
-            }
-            Ok(Ok(None)) => return Err("barrier stream closed".into()),
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => return Err("barrier ack timeout".into()),
-        }
+    let remaining = timeout.saturating_sub(tokio::time::Instant::now().elapsed());
+    if remaining.is_zero() {
+        return Err("barrier ack timeout".into());
+    }
+    match tokio::time::timeout(remaining, responses.message()).await {
+        Ok(Ok(Some(ack))) => Ok(ack),
+        Ok(Ok(None)) => Err("barrier stream closed".into()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("barrier ack timeout".into()),
     }
 }

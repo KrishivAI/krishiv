@@ -5,24 +5,68 @@ use crate::{ExecutorError, ExecutorResult};
 use krishiv_proto::ExecutorTaskAssignment;
 
 /// In-memory receiver queue for task assignments delivered to an executor.
-#[derive(Debug, Clone, Default)]
+///
+/// Supports bounded capacity for backpressure (PRR Phase 1/2).
+/// When capacity is reached, `push` returns `ExecutorError::AssignmentQueueFull`.
+#[derive(Debug, Clone)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
     cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
+    /// None = unbounded (legacy / test default). Some(n) = hard limit.
+    max_capacity: Option<usize>,
+}
+
+impl Default for ExecutorAssignmentInbox {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExecutorAssignmentInbox {
-    /// Create an empty assignment inbox.
+    /// Create an unbounded assignment inbox (legacy behavior, convenient for tests).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            assignments: Arc::new(RwLock::new(VecDeque::new())),
+            cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
+            max_capacity: None,
+        }
+    }
+
+    /// Create a bounded inbox with the given maximum number of queued assignments.
+    /// Pushes beyond this limit will fail with `ExecutorError::AssignmentQueueFull`.
+    pub fn with_capacity(max: usize) -> Self {
+        Self {
+            assignments: Arc::new(RwLock::new(VecDeque::new())),
+            cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
+            max_capacity: Some(max),
+        }
+    }
+
+    /// Current configured capacity (None = unbounded).
+    pub fn capacity(&self) -> Option<usize> {
+        self.max_capacity
     }
 
     /// Store one received assignment.
+    ///
+    /// Returns `Err(AssignmentQueueFull)` when at capacity — this is the
+    /// backpressure signal to the coordinator / caller.
     pub fn push(&self, assignment: ExecutorTaskAssignment) -> ExecutorResult<()> {
-        self.assignments
+        let mut q = self
+            .assignments
             .write()
-            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
-            .push_back(assignment);
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+
+        if let Some(max) = self.max_capacity {
+            if q.len() >= max {
+                return Err(ExecutorError::AssignmentQueueFull {
+                    current: q.len(),
+                    max,
+                });
+            }
+        }
+
+        q.push_back(assignment);
         Ok(())
     }
 
@@ -102,6 +146,7 @@ impl ExecutorAssignmentInbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExecutorError;
     use krishiv_proto::{
         AttemptId, ExecutorId, ExecutorTaskAssignment, JobId, LeaseGeneration, OutputContract,
         OutputContractKind, PlanFragment, StageId, TaskAttemptRef, TaskId,
@@ -233,6 +278,39 @@ mod tests {
         let inbox2 = inbox1.clone();
         inbox1.push(make_assignment("task-1")).unwrap();
         assert_eq!(inbox2.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn bounded_inbox_rejects_when_full() {
+        let inbox = ExecutorAssignmentInbox::with_capacity(2);
+        assert_eq!(inbox.capacity(), Some(2));
+
+        inbox.push(make_assignment("t1")).unwrap();
+        inbox.push(make_assignment("t2")).unwrap();
+
+        let err = inbox.push(make_assignment("t3")).unwrap_err();
+        match err {
+            ExecutorError::AssignmentQueueFull { current, max } => {
+                assert_eq!(current, 2);
+                assert_eq!(max, 2);
+            }
+            other => panic!("expected AssignmentQueueFull, got {:?}", other),
+        }
+
+        // After pop, we should be able to push again
+        let _ = inbox.pop_next().unwrap();
+        inbox.push(make_assignment("t3")).unwrap();
+        assert_eq!(inbox.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn unbounded_inbox_never_rejects() {
+        let inbox = ExecutorAssignmentInbox::new(); // unbounded
+        assert!(inbox.capacity().is_none());
+        for i in 0..5000 {
+            inbox.push(make_assignment(&format!("t{}", i))).unwrap();
+        }
+        assert_eq!(inbox.len().unwrap(), 5000);
     }
 
     #[test]
