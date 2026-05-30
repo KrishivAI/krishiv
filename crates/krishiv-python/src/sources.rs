@@ -40,7 +40,7 @@ pub fn read_parquet(
             Python::attach(|py| -> PyResult<()> {
                 let bound = schema_cls.bind(py);
                 for batch in result.batches() {
-                    validate_batch_against_schema_class(&bound, batch)?;
+                    validate_batch_against_schema_class(bound, batch)?;
                 }
                 Ok(())
             })?;
@@ -71,9 +71,9 @@ pub fn read_kafka(
     #[cfg(not(feature = "kafka"))]
     {
         let _ = (session, &topic, &bootstrap_servers);
-        return Err(ConnectorError::new_err(
+        Err(ConnectorError::new_err(
             "Kafka support requires building with the `kafka` feature (pip install krishiv[kafka])",
-        ));
+        ))
     }
     #[cfg(feature = "kafka")]
     {
@@ -105,9 +105,9 @@ pub fn read_iceberg(
     #[cfg(not(feature = "iceberg"))]
     {
         let _ = (session, &catalog_uri, &table_name);
-        return Err(ConnectorError::new_err(
+        Err(ConnectorError::new_err(
             "Iceberg support requires the `iceberg` feature (pip install krishiv[iceberg])",
-        ));
+        ))
     }
     #[cfg(feature = "iceberg")]
     {

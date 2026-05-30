@@ -15,6 +15,7 @@ use krishiv_udf::{DefaultSandboxedExecutor, ResourceLimits, SandboxedUdfExecutor
 
 /// Register every scalar UDF in `registry` with the DataFusion session context.
 /// Uses unlimited (default) ResourceLimits for backward compatibility.
+#[allow(dead_code)]
 pub fn sync_scalar_udfs(
     ctx: &datafusion::prelude::SessionContext,
     registry: &krishiv_udf::UdfRegistry,

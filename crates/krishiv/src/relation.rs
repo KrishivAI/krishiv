@@ -119,6 +119,7 @@ impl StreamingChain {
 // ── RelationKind ──────────────────────────────────────────────────────────────
 
 /// Internal variant that distinguishes batch from streaming relations.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RelationKind {
     Batch(krishiv_api::DataFrame),
     Stream(StreamingChain),

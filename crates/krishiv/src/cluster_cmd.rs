@@ -224,19 +224,6 @@ fn cluster_start(args: &[&str]) -> CliResponse {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::executor_bind_addrs;
-
-    #[test]
-    fn executor_barrier_addr_uses_loopback_host() {
-        let (task_addr, barrier_addr) = executor_bind_addrs(0);
-
-        assert_eq!(task_addr, "127.0.0.1:50055");
-        assert_eq!(barrier_addr, "127.0.0.1:50056");
-    }
-}
-
 fn cluster_stop(args: &[&str]) -> CliResponse {
     let (data_dir, _) = match parse_data_dir(args) {
         Ok(v) => v,
@@ -300,4 +287,17 @@ fn cluster_verify_network(args: &[&str]) -> CliResponse {
         "Network check (bind probe on localhost):\n{}\n",
         lines.join("\n")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executor_bind_addrs;
+
+    #[test]
+    fn executor_barrier_addr_uses_loopback_host() {
+        let (task_addr, barrier_addr) = executor_bind_addrs(0);
+
+        assert_eq!(task_addr, "127.0.0.1:50055");
+        assert_eq!(barrier_addr, "127.0.0.1:50056");
+    }
 }

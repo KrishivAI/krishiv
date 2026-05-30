@@ -323,8 +323,8 @@ mod tests {
 
     #[test]
     fn typed_key_float64() {
-        let arr = Float64Array::from(vec![3.14, -2.5]);
-        assert_eq!(tk(&arr, 0), Some("F:3.14".into()));
+        let arr = Float64Array::from(vec![3.15, -2.5]);
+        assert_eq!(tk(&arr, 0), Some("F:3.15".into()));
         assert_eq!(tk(&arr, 1), Some("F:-2.5".into()));
     }
 

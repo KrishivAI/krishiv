@@ -46,12 +46,34 @@ impl LocalDiskShuffleStore {
                 base_dir.display()
             ))
         })?;
+        Self::cleanup_temp_files(&base_dir)?;
         Ok(Self {
             base_dir,
             lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
             compression: ShuffleCompression::None,
             content_hashes: Arc::new(DashMap::new()),
         })
+    }
+
+    fn cleanup_temp_files(dir: &Path) -> ShuffleResult<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir).map_err(|e| io_err(e.to_string()))? {
+            let entry = entry.map_err(|e| io_err(e.to_string()))?;
+            let ft = entry.file_type().map_err(|e| io_err(e.to_string()))?;
+            let path = entry.path();
+            if ft.is_dir() {
+                Self::cleanup_temp_files(&path)?;
+            } else if ft.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.contains(".tmp.") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Set the Parquet compression codec for partition writes.

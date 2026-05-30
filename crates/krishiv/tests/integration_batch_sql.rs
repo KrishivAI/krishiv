@@ -522,13 +522,14 @@ async fn sql_with_udf_registration() {
     assert_eq!(s.scalar_udf_names(), vec!["double".to_string()]);
 
     // Verify UDF is in the registry
-    let registry = s.udf_registry();
-    let guard = registry.read().unwrap();
-    let loaded = guard
-        .get_scalar("double")
-        .expect("udf should be registered");
-    assert_eq!(loaded.name(), "double");
-    drop(guard);
+    {
+        let registry = s.udf_registry();
+        let guard = registry.read().unwrap();
+        let loaded = guard
+            .get_scalar("double")
+            .expect("udf should be registered");
+        assert_eq!(loaded.name(), "double");
+    }
 
     // Standard SQL still works after UDF registration
     s.register_parquet("measurements", &path).unwrap();

@@ -16,7 +16,7 @@ mod executor_tests {
         ExecutorHeartbeatRequest, ExecutorHeartbeatResponse, ExecutorId, ExecutorState,
         ExecutorTaskAssignment, ExecutorTaskService, FencingToken, InputPartition,
         InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, LeaseGeneration,
-        MemoryKafkaRecord, OutputContract, OutputContractDescriptor, OutputContractKind,
+        OutputContract, OutputContractDescriptor, OutputContractKind,
         PlanFragment, RegisterExecutorRequest, RegisterExecutorResponse, StageId, StageSpec,
         StreamingTaskState, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskSpec,
         TaskStatusRequest, TaskStatusResponse, TransportDisposition, TransportVersion, wire,

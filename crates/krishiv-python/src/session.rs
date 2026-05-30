@@ -275,7 +275,7 @@ impl PySession {
             py,
             name,
             callable,
-            &input_types_bound,
+            input_types_bound,
             &output_type,
             output_name,
         )?;

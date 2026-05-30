@@ -13,8 +13,9 @@ use axum::routing::get;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
-struct ShuffleSvcState {
-    store: Arc<LocalDiskShuffleStore>,
+pub(crate) struct ShuffleSvcState {
+    pub(crate) store: Arc<LocalDiskShuffleStore>,
+    pub(crate) token: Option<String>,
 }
 
 /// Run the shuffle HTTP service (env `KRISHIV_SHUFFLE_DIR`, `KRISHIV_SHUFFLE_ADDR`).
@@ -35,7 +36,8 @@ pub async fn run_shuffle_svc(
     let store = Arc::new(
         LocalDiskShuffleStore::new(base_dir.as_ref())?.with_compression(ShuffleCompression::Lz4),
     );
-    let state = ShuffleSvcState { store };
+    let token = std::env::var("KRISHIV_SHUFFLE_TOKEN").ok();
+    let state = ShuffleSvcState { store, token };
     let app = Router::new()
         .route(
             "/shuffle/{job_id}/{stage_id}/{partition}",
@@ -53,10 +55,22 @@ pub async fn run_shuffle_svc(
     Ok(())
 }
 
-async fn read_partition(
+pub(crate) async fn read_partition(
+    headers: axum::http::HeaderMap,
     State(state): State<ShuffleSvcState>,
     AxumPath((job_id, stage_id, partition)): AxumPath<(String, String, u32)>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    if let Some(token) = &state.token {
+        let auth_header = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let expected = format!("Bearer {token}");
+        if auth_header != expected {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
     let id = PartitionId {
         job_id,
         stage_id,

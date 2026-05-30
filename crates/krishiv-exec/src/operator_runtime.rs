@@ -215,20 +215,7 @@ mod tests {
 
     use super::*;
 
-    fn events_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
-                Arc::new(Int64Array::from(vec![1_000, 5_000, 2_000])) as _,
-            ],
-        )
-        .unwrap()
-    }
+
 
     #[test]
     fn multi_source_watermark_min_across_sources() {

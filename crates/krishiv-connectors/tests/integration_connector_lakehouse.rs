@@ -1,18 +1,16 @@
-use std::any::Any;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_connectors::{
-    ConnectorCapabilities, ConnectorError, ConnectorResult, DataQualityConfig, DataQualityRule,
+    ConnectorCapabilities, ConnectorResult, DataQualityConfig, DataQualityRule,
     DeadLetterSink, LocalParquetTwoPhaseCommitSink, QualityAction, Sink, Source,
     TwoPhaseCommitSink,
     parquet::{ParquetSink, ParquetSource},
 };
 use krishiv_lakehouse::{
-    IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, MemoryLakehouseTable,
+    IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable,
     MultiWriterGuard, SchemaField, SchemaVersion,
 };
 
@@ -59,6 +57,7 @@ fn make_int64_batch(values: Vec<i64>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
 }
 
+#[allow(dead_code)]
 fn make_float64_batch_with_nulls(values: Vec<Option<f64>>) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
     RecordBatch::try_new(
@@ -95,6 +94,7 @@ impl RecordingSink {
         }
     }
 
+    #[allow(dead_code)]
     fn total_rows(&self) -> usize {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }

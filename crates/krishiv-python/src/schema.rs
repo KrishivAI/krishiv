@@ -21,6 +21,7 @@ pub struct PySchema {
 }
 
 impl PySchema {
+    #[allow(clippy::collapsible_if)]
     fn fields_from_class<'py>(cls: &Bound<'py, PyType>) -> PyResult<Vec<(String, DataType)>> {
         if let Ok(attr) = cls.getattr(FIELDS_ATTR) {
             if let Ok(dict) = attr.cast::<PyDict>() {
@@ -117,7 +118,7 @@ impl PySchema {
 
     #[classmethod]
     fn _repr_html_(cls: &Bound<'_, PyType>) -> PyResult<String> {
-        let fields = PySchema::fields_from_class(&cls)?;
+        let fields = PySchema::fields_from_class(cls)?;
         let mut html = String::from(
             "<table><thead><tr><th>Column</th><th>Arrow type</th></tr></thead><tbody>",
         );
@@ -132,7 +133,7 @@ impl PySchema {
 
     #[classmethod]
     fn __repr__(cls: &Bound<'_, PyType>) -> PyResult<String> {
-        let names: Vec<String> = PySchema::fields_from_class(&cls)?
+        let names: Vec<String> = PySchema::fields_from_class(cls)?
             .into_iter()
             .map(|(n, dt)| format!("{n}: {dt}"))
             .collect();
@@ -156,7 +157,6 @@ fn python_annotation_to_arrow(py: Python<'_>, ann: Bound<'_, PyAny>) -> PyResult
             let non_none: Vec<Bound<'_, PyAny>> = args
                 .iter()
                 .filter(|a| !a.is_none())
-                .map(|a| a.clone())
                 .collect();
             if non_none.len() == 1 {
                 return python_annotation_to_arrow(py, non_none[0].clone());

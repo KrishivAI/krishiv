@@ -1635,7 +1635,7 @@ mod tests {
             right_schema.clone(),
             vec![
                 Arc::new(Int64Array::from(vec![1000_i64])),
-                Arc::new(arrow::array::Float64Array::from(vec![3.14])),
+                Arc::new(arrow::array::Float64Array::from(vec![3.15])),
             ],
         )
         .unwrap();

@@ -191,6 +191,58 @@ pub fn current_traceparent() -> Option<String> {
 
 // ── Process metrics (Prometheus text) ─────────────────────────────────────────
 
+const LATENCY_BUCKETS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
+/// Thread-safe OpenTelemetry-aligned latency histogram.
+#[derive(Debug)]
+pub struct KrishivHistogram {
+    buckets: &'static [f64],
+    counts: Vec<AtomicU64>,
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Default for KrishivHistogram {
+    fn default() -> Self {
+        let counts = (0..=LATENCY_BUCKETS.len()).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            buckets: LATENCY_BUCKETS,
+            counts,
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl KrishivHistogram {
+    /// Record a duration observation.
+    pub fn observe(&self, value_secs: f64) {
+        let micros = (value_secs * 1_000_000.0) as u64;
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+
+        let mut bucket_idx = self.buckets.len();
+        for (i, &bucket) in self.buckets.iter().enumerate() {
+            if value_secs <= bucket {
+                bucket_idx = i;
+                break;
+            }
+        }
+        self.counts[bucket_idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot the current count, sum, counts per bucket, and number of buckets.
+    pub fn snapshot(&self) -> (u64, f64, Vec<u64>, u64) {
+        let count = self.count.load(Ordering::Relaxed);
+        let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let mut counts = Vec::with_capacity(self.counts.len());
+        for c in &self.counts {
+            counts.push(c.load(Ordering::Relaxed));
+        }
+        (count, sum, counts, self.buckets.len() as u64)
+    }
+}
+
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -224,6 +276,10 @@ pub struct KrishivMetrics {
     state_bytes: dashmap::DashMap<String, AtomicU64>,
     /// Shuffle partitions per (job_id, stage_id) — pending/available/failed.
     shuffle_partitions: dashmap::DashMap<String, ShufflePartitionCounters>,
+    /// Latency histogram for gRPC call durations (labeled by path/method).
+    grpc_call_duration: dashmap::DashMap<String, KrishivHistogram>,
+    /// Latency histogram for checkpoint commit phases (labeled by phase).
+    checkpoint_commit_duration: dashmap::DashMap<String, KrishivHistogram>,
 }
 
 use std::sync::atomic::AtomicI64;
@@ -478,6 +534,24 @@ impl KrishivMetrics {
         self.state_bytes.remove(job_id);
         self.remove_task_attempt_counters(job_id);
         self.remove_shuffle_partition_counters(job_id);
+    }
+
+    // ── Duration observation histograms ────────────────────────────────────
+
+    /// Record a gRPC call duration in seconds.
+    pub fn observe_grpc_duration(&self, path: &str, duration_secs: f64) {
+        self.grpc_call_duration
+            .entry(path.to_string())
+            .or_default()
+            .observe(duration_secs);
+    }
+
+    /// Record a checkpoint commit duration in seconds.
+    pub fn observe_checkpoint_commit_duration(&self, phase: &str, duration_secs: f64) {
+        self.checkpoint_commit_duration
+            .entry(phase.to_string())
+            .or_default()
+            .observe(duration_secs);
     }
 
     // ── Prometheus rendering ──────────────────────────────────────────────
@@ -757,6 +831,82 @@ impl KrishivMetrics {
                 ));
                 out.push_str(&format!(
                     "krishiv_shuffle_partitions{{job_id=\"{job_id}\",stage_id=\"{stage_id}\",state=\"failed\"}} {failed_sp}\n"
+                ));
+            }
+        }
+
+        // ── Latency histogram for gRPC call durations ────────────────────
+
+        let mut grpc_entries = BTreeMap::new();
+        for entry in self.grpc_call_duration.iter() {
+            let path = entry.key().clone();
+            let (count, sum, counts, _) = entry.value().snapshot();
+            grpc_entries.insert(path, (count, sum, counts));
+        }
+
+        if !grpc_entries.is_empty() {
+            out.push_str("# HELP krishiv_grpc_call_duration_seconds gRPC call duration in seconds\n");
+            out.push_str("# TYPE krishiv_grpc_call_duration_seconds histogram\n");
+            for (path, (count, sum, counts)) in &grpc_entries {
+                out.push_str(&format!(
+                    "krishiv_grpc_call_duration_seconds_sum{{path=\"{path}\"}} {:.6}\n",
+                    sum
+                ));
+                out.push_str(&format!(
+                    "krishiv_grpc_call_duration_seconds_count{{path=\"{path}\"}} {}\n",
+                    count
+                ));
+
+                let mut cumulative = 0;
+                for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
+                    cumulative += counts.get(i).copied().unwrap_or(0);
+                    out.push_str(&format!(
+                        "krishiv_grpc_call_duration_seconds_bucket{{path=\"{path}\",le=\"{}\"}} {}\n",
+                        bucket, cumulative
+                    ));
+                }
+                cumulative += counts.get(LATENCY_BUCKETS.len()).copied().unwrap_or(0);
+                out.push_str(&format!(
+                    "krishiv_grpc_call_duration_seconds_bucket{{path=\"{path}\",le=\"+Inf\"}} {}\n",
+                    cumulative
+                ));
+            }
+        }
+
+        // ── Latency histogram for checkpoint commit phases ───────────────
+
+        let mut cp_latency_entries = BTreeMap::new();
+        for entry in self.checkpoint_commit_duration.iter() {
+            let phase = entry.key().clone();
+            let (count, sum, counts, _) = entry.value().snapshot();
+            cp_latency_entries.insert(phase, (count, sum, counts));
+        }
+
+        if !cp_latency_entries.is_empty() {
+            out.push_str("# HELP krishiv_checkpoint_commit_duration_seconds Checkpoint commit duration per phase in seconds\n");
+            out.push_str("# TYPE krishiv_checkpoint_commit_duration_seconds histogram\n");
+            for (phase, (count, sum, counts)) in &cp_latency_entries {
+                out.push_str(&format!(
+                    "krishiv_checkpoint_commit_duration_seconds_sum{{phase=\"{phase}\"}} {:.6}\n",
+                    sum
+                ));
+                out.push_str(&format!(
+                    "krishiv_checkpoint_commit_duration_seconds_count{{phase=\"{phase}\"}} {}\n",
+                    count
+                ));
+
+                let mut cumulative = 0;
+                for (i, &bucket) in LATENCY_BUCKETS.iter().enumerate() {
+                    cumulative += counts.get(i).copied().unwrap_or(0);
+                    out.push_str(&format!(
+                        "krishiv_checkpoint_commit_duration_seconds_bucket{{phase=\"{phase}\",le=\"{}\"}} {}\n",
+                        bucket, cumulative
+                    ));
+                }
+                cumulative += counts.get(LATENCY_BUCKETS.len()).copied().unwrap_or(0);
+                out.push_str(&format!(
+                    "krishiv_checkpoint_commit_duration_seconds_bucket{{phase=\"{phase}\",le=\"+Inf\"}} {}\n",
+                    cumulative
                 ));
             }
         }
@@ -1064,6 +1214,34 @@ mod tests {
         m.set_watermark_ms("stream-job", 1620000000000);
         let body = m.render_prometheus();
         assert!(body.contains("krishiv_watermark_ms{job_id=\"stream-job\"} 1620000000000"));
+    }
+
+    #[test]
+    fn labeled_latency_histograms() {
+        let m = KrishivMetrics::default();
+        m.observe_grpc_duration("/krishiv.ExecutorTaskService/LaunchTask", 0.15);
+        m.observe_grpc_duration("/krishiv.ExecutorTaskService/LaunchTask", 0.002);
+
+        m.observe_checkpoint_commit_duration("write_manifest", 0.035);
+        m.observe_checkpoint_commit_duration("fsync", 1.2);
+
+        let body = m.render_prometheus();
+
+        // Verify gRPC call duration histogram
+        assert!(body.contains("krishiv_grpc_call_duration_seconds_count{path=\"/krishiv.ExecutorTaskService/LaunchTask\"} 2"));
+        assert!(body.contains("krishiv_grpc_call_duration_seconds_sum{path=\"/krishiv.ExecutorTaskService/LaunchTask\"} 0.152"));
+        assert!(body.contains("krishiv_grpc_call_duration_seconds_bucket{path=\"/krishiv.ExecutorTaskService/LaunchTask\",le=\"0.005\"} 1"));
+        assert!(body.contains("krishiv_grpc_call_duration_seconds_bucket{path=\"/krishiv.ExecutorTaskService/LaunchTask\",le=\"0.25\"} 2"));
+        assert!(body.contains("krishiv_grpc_call_duration_seconds_bucket{path=\"/krishiv.ExecutorTaskService/LaunchTask\",le=\"+Inf\"} 2"));
+
+        // Verify checkpoint commit duration histogram
+        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_count{phase=\"write_manifest\"} 1"));
+        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_sum{phase=\"write_manifest\"} 0.035"));
+        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_bucket{phase=\"write_manifest\",le=\"0.05\"} 1"));
+
+        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_count{phase=\"fsync\"} 1"));
+        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_sum{phase=\"fsync\"} 1.200"));
+        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_bucket{phase=\"fsync\",le=\"2.5\"} 1"));
     }
 
     #[test]

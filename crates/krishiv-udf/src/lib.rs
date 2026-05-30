@@ -1101,14 +1101,14 @@ mod tests {
     fn scalar_value_variants() {
         let null = ScalarValue::Null;
         let int = ScalarValue::Int64(42);
-        let float = ScalarValue::Float64(3.14);
+        let float = ScalarValue::Float64(3.15);
         let utf8 = ScalarValue::Utf8("hello".into());
         let bool = ScalarValue::Boolean(true);
         let bytes = ScalarValue::Bytes(vec![1, 2, 3]);
 
         assert!(format!("{:?}", null).contains("Null"));
         assert!(format!("{:?}", int).contains("42"));
-        assert!(format!("{:?}", float).contains("3.14"));
+        assert!(format!("{:?}", float).contains("3.15"));
         assert!(format!("{:?}", utf8).contains("hello"));
         assert!(format!("{:?}", bool).contains("true"));
         assert!(format!("{:?}", bytes).contains("Bytes"));

@@ -2756,7 +2756,7 @@ mod tests {
         assert_eq!(latest_valid_epoch(&s, "j-sp").unwrap(), 3);
 
         // Create a savepoint from epoch 2
-        let (sp_epoch, sp_meta) = create_savepoint(&s, "j-sp", Some("test-savepoint")).unwrap();
+        let (sp_epoch, _sp_meta) = create_savepoint(&s, "j-sp", Some("test-savepoint")).unwrap();
         assert_eq!(sp_epoch, 3); // latest_valid_epoch is 3
 
         // Write epochs 4 and 5 after the savepoint

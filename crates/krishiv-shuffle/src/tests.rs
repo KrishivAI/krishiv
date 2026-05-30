@@ -1152,6 +1152,31 @@ mod shuffle_tests {
         assert!(store.read_partition(&id).await.unwrap().is_some());
     }
 
+    #[tokio::test]
+    async fn disk_store_cleanup_temp_files_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let job_dir = dir.path().join("job1").join("s0");
+        std::fs::create_dir_all(&job_dir).unwrap();
+
+        let valid_file = job_dir.join("0.parquet");
+        let temp_file1 = job_dir.join("0.tmp.1");
+        let temp_file2 = job_dir.join("1.tmp.99");
+
+        std::fs::write(&valid_file, b"parquet data").unwrap();
+        std::fs::write(&temp_file1, b"temp data 1").unwrap();
+        std::fs::write(&temp_file2, b"temp data 2").unwrap();
+
+        assert!(valid_file.exists());
+        assert!(temp_file1.exists());
+        assert!(temp_file2.exists());
+
+        let _store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+
+        assert!(valid_file.exists());
+        assert!(!temp_file1.exists());
+        assert!(!temp_file2.exists());
+    }
+
     // ── LocalDiskShuffleStore: data integrity ────────────────────────────
 
     #[tokio::test]
@@ -1914,5 +1939,50 @@ mod shuffle_tests {
             matches!(err, ShuffleError::Io(_)),
             "expected Io error for tampered parquet, got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn http_shuffle_svc_token_auth_enforced() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Bind TcpListener on dynamic port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn shuffle service with configured token in state
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).unwrap());
+        let state = crate::shuffle_svc::ShuffleSvcState {
+            store,
+            token: Some("secure-api-key".to_owned()),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/shuffle/{job_id}/{stage_id}/{partition}",
+                axum::routing::get(crate::shuffle_svc::read_partition),
+            )
+            .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // 1. Request without token should return 401 Unauthorized
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = "GET /shuffle/job1/stage1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("HTTP/1.1 401 Unauthorized"), "expected 401, got: {}", resp);
+
+        // 2. Request with invalid token should return 401 Unauthorized
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = "GET /shuffle/job1/stage1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer bad-token\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.contains("HTTP/1.1 401 Unauthorized"), "expected 401, got: {}", resp);
     }
 }

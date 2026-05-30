@@ -83,11 +83,11 @@ mod tests {
     fn payload_value_variants() {
         let s = PayloadValue::String("hello".into());
         let i = PayloadValue::Int(42);
-        let f = PayloadValue::Float(3.14);
+        let f = PayloadValue::Float(3.15);
         let b = PayloadValue::Bool(true);
         assert_eq!(s.to_json(), serde_json::json!("hello"));
         assert_eq!(i.to_json(), serde_json::json!(42));
-        assert_eq!(f.to_json(), serde_json::json!(3.14));
+        assert_eq!(f.to_json(), serde_json::json!(3.15));
         assert_eq!(b.to_json(), serde_json::json!(true));
     }
 
@@ -376,8 +376,8 @@ mod tests {
 
     #[test]
     fn payload_value_float_negative() {
-        let v = PayloadValue::Float(-3.14);
-        assert_eq!(v.to_json(), serde_json::json!(-3.14));
+        let v = PayloadValue::Float(-3.15);
+        assert_eq!(v.to_json(), serde_json::json!(-3.15));
     }
 
     #[test]

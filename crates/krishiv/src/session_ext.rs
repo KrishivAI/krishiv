@@ -9,6 +9,7 @@ use crate::relation::{EmitMode, Relation, RelationKind, StreamingChain};
 ///
 /// Import this trait to call `.relation()`, `.from_parquet()`, `.from_source()`,
 /// and `.from_bounded_stream()` on a `Session`.
+#[allow(clippy::wrong_self_convention)]
 pub trait SessionExt {
     /// Create a batch [`Relation`] from an arbitrary SQL query.
     fn relation(&self, query: impl AsRef<str>) -> Result<Relation>;

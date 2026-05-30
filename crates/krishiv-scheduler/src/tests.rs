@@ -5626,7 +5626,7 @@ mod scheduler_tests {
         // During partition + delayed heartbeat + message loss:
         let _eligible = jc.has_tasks_eligible_for_launch();
         let _summary = jc.get_launch_work_summary().await;
-        let affected = jc.handle_executor_loss(&bad).await;
+        let _affected = jc.handle_executor_loss(&bad).await;
 
         // After loss recovery:
         h.simulate_partition_and_recovery(bad.clone());
@@ -5640,5 +5640,69 @@ mod scheduler_tests {
         let _post_eligible = jc.has_tasks_eligible_for_launch();
         let _post_summary = jc.get_launch_work_summary().await;
         assert!(h.current_tick() > 10);
+    }
+
+    #[test]
+    fn chaos_speculative_execution_stale_lease_rejected() {
+        let executor_id = ExecutorId::try_new("exec-speculative").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-speculative").unwrap());
+
+        // 1. First registration: executor joins the cluster, receives LeaseGeneration (e.g. G1)
+        let lease_g1 = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = StageId::try_new("stage-1").unwrap();
+        let task_id = TaskId::try_new("task-1").unwrap();
+
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        // 2. Simulated crash/slow network recovery: Executor re-registers, advancing its lease generation to G2.
+        let lease_g2 = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+
+        assert!(lease_g2.as_u64() > lease_g1.as_u64(), "Lease generation must bump upon re-registration");
+
+        // 3. Stale commit attempt: The slow/stale executor attempt from the first lease generation (G1)
+        // attempts to report task success. It uses lease_g1.
+        let stale_update = TaskStatusUpdate::new(
+            job_id.clone(),
+            stage_id.clone(),
+            task_id.clone(),
+            executor_id.clone(),
+            TaskState::Succeeded,
+            1,
+        ).with_lease_generation(lease_g1);
+
+        // This update MUST be rejected by the coordinator because of the stale lease generation!
+        let outcome = coordinator.apply_task_update(stale_update);
+        assert!(
+            outcome.is_err(),
+            "Stale update from G1 must be rejected after re-registration to G2"
+        );
+
+        let err = outcome.unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::StaleExecutorLease { .. }),
+            "Expected StaleExecutorLease error, got: {:?}",
+            err
+        );
+
+        // 4. Valid commit attempt: The executor under the new lease generation G2 commits successfully.
+        let valid_update = TaskStatusUpdate::new(
+            job_id.clone(),
+            stage_id,
+            task_id,
+            executor_id,
+            TaskState::Succeeded,
+            1,
+        ).with_lease_generation(lease_g2);
+
+        let valid_outcome = coordinator.apply_task_update(valid_update).unwrap();
+        assert_eq!(valid_outcome, TaskUpdateOutcome::Applied);
     }
 }
