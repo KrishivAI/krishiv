@@ -303,14 +303,14 @@ pub async fn reconcile_dynamic_object_with_runtime(
         ReconcileAction::FinalizerRemoved => {
             // Clean up executor Pods after the scheduler job is cancelled so
             // orphaned pods don't linger in the namespace.
-            if let Some(pod_manager) = runtime.pod_manager() {
-                if let Err(err) = pod_manager.delete_executor_pods(&resource).await {
-                    tracing::warn!(
-                        job = resource.metadata.name,
-                        error = %err,
-                        "executor pod deletion failed (best-effort)"
-                    );
-                }
+            if let Some(pod_manager) = runtime.pod_manager()
+                && let Err(err) = pod_manager.delete_executor_pods(&resource).await
+            {
+                tracing::warn!(
+                    job = resource.metadata.name,
+                    error = %err,
+                    "executor pod deletion failed (best-effort)"
+                );
             }
         }
         _ => {}

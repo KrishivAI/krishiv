@@ -137,15 +137,14 @@ where
         let result = entry
             .0
             .process_event(&mut entry.1, stage_name, batch, event_time_ms);
-        if self.states.len() > self.max_partitions {
-            if let Some(stalest) = self
+        if self.states.len() > self.max_partitions
+            && let Some(stalest) = self
                 .states
                 .iter()
                 .min_by_key(|(_, (_, state))| state.last_event_ms)
                 .map(|(k, _)| k.clone())
-            {
-                self.states.remove(&stalest);
-            }
+        {
+            self.states.remove(&stalest);
         }
         result
     }

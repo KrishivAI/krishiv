@@ -58,7 +58,7 @@ pub use batch_sql::{
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};
 pub use config::{CoordinatorConfig, JobSubmitter, TlsConfig};
-pub use coordinator::{Coordinator, SharedCoordinator};
+pub use coordinator::{Coordinator, OrchestratorHandles, SharedCoordinator};
 pub use coordinator_daemon::{
     CoordinatorDaemonConfig, JobCoordinatorDaemonConfig, build_leader_election,
     build_shared_coordinator, coordinator_daemon_help, coordinator_http_router,
@@ -93,7 +93,10 @@ pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
 #[cfg(feature = "sqlite")]
 pub use store::SqliteMetadataStore;
-pub use store::{EventLogEvent, InMemoryMetadataStore, JsonFileMetadataStore, MetadataStore};
+pub use store::{
+    EventLogEvent, InMemoryMetadataStore, JsonFileMetadataStore, MetadataStore,
+    NonBlockingStoreHandle,
+};
 pub use transport::CoordinatorExecutorTransport;
 
 #[cfg(test)]

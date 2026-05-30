@@ -234,12 +234,7 @@ fn apply_row_predicates(
     match inject_rls_predicate(query, &predicate) {
         Ok(rewritten) => rewritten,
         Err(_) => {
-            let trimmed = query.trim_start();
-            if trimmed.to_uppercase().starts_with("WITH ") {
-                format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
-            } else {
-                format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
-            }
+            format!("SELECT * FROM ({query}) AS __krishiv_rls WHERE {predicate}")
         }
     }
 }

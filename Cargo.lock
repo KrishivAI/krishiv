@@ -4274,6 +4274,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "axum 0.8.9",
+ "blake3",
  "bytes",
  "dashmap",
  "futures",

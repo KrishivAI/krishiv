@@ -384,16 +384,9 @@ fn normalize_etcd_endpoint(endpoint: &str) -> String {
 #[async_trait]
 impl LeaderElection for EtcdLeaseElection {
     fn is_leader(&self) -> bool {
-        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if s.is_leader {
-            let expired = s
-                .last_renewed_at
-                .is_none_or(|t| t.elapsed().as_secs() > self.lease_duration_s.saturating_mul(2));
-            if expired {
-                s.is_leader = false;
-            }
-        }
-        s.is_leader
+        // No grace period: leadership is only valid when renew() actively keeps it alive.
+        // If renew() has failed, is_leader was already cleared by clear_leader().
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader
     }
 
     async fn try_acquire(&self) -> bool {

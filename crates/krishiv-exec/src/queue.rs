@@ -72,42 +72,41 @@ pub struct OperatorQueueReceiver {
     pub(crate) data_rx: tokio::sync::mpsc::Receiver<arrow::record_batch::RecordBatch>,
     pub(crate) barrier_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
     pub(crate) capacity: usize,
-    /// P0.5: a barrier epoch that was deferred because a data item arrived
-    /// at the same time.  This is drained before the next data receive.
-    pub(crate) pending_barrier: Option<u64>,
+    /// P0.5: deferred barrier epochs that arrived while we were waiting for data.
+    /// Uses VecDeque for O(1) front-pop (vs Vec::remove(0) which is O(n)).
+    /// Multiple barriers can be queued when the epoch advances faster than
+    /// data items are produced (e.g. rapid savepoint requests).
+    pub(crate) pending_barriers: std::collections::VecDeque<u64>,
 }
 
 impl OperatorQueueReceiver {
     /// Receive the next message.
     ///
     /// Priority order:
-    /// 1. A barrier epoch stored in `pending_barrier` (deferred from a
-    ///    previous call where data and a barrier arrived simultaneously).
-    /// 2. A barrier available right now on `barrier_rx`.
+    /// 1. Barrier epochs stored in `pending_barriers` (deferred from previous
+    ///    calls where data and barriers arrived simultaneously), drained FIFO.
+    /// 2. All barriers currently available on `barrier_rx` (drained before blocking).
     /// 3. The next data batch from `data_rx` (async wait).
-    ///    If a barrier also arrives after the data batch is dequeued, the
-    ///    epoch is saved to `pending_barrier` and returned on the *next* call.
+    ///    Any barriers that arrive while waiting are queued in `pending_barriers`
+    ///    and returned on subsequent calls — before the next data item.
     pub async fn recv(&mut self) -> Option<OperatorMessage> {
-        // 1. Drain any previously deferred barrier first.
-        if let Some(epoch) = self.pending_barrier.take() {
+        // 1. Drain any previously deferred barriers first (FIFO order).
+        if let Some(epoch) = self.pending_barriers.pop_front() {
             return Some(OperatorMessage::Barrier { epoch });
         }
 
-        // 2. Drain any barrier that is already in the channel before blocking.
-        match self.barrier_rx.try_recv() {
-            Ok(epoch) => return Some(OperatorMessage::Barrier { epoch }),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
+        // 2. Check if a barrier is available right now before blocking on data.
+        if let Ok(epoch) = self.barrier_rx.try_recv() {
+            return Some(OperatorMessage::Barrier { epoch });
         }
 
         // 3. Wait for the next data item.
         let batch = self.data_rx.recv().await?;
 
-        // 4. If a barrier arrived simultaneously (between the try_recv above
-        //    and the data recv), save it so it is delivered on the next call
-        //    — before the subsequent data item, preserving ordering.
-        if let Ok(epoch) = self.barrier_rx.try_recv() {
-            self.pending_barrier = Some(epoch);
+        // 4. Collect all barriers that arrived while waiting for data
+        //    and queue them for delivery before the next data item.
+        while let Ok(epoch) = self.barrier_rx.try_recv() {
+            self.pending_barriers.push_back(epoch);
         }
 
         Some(OperatorMessage::Data(batch))
@@ -118,8 +117,7 @@ impl OperatorQueueReceiver {
         OperatorQueueMetrics {
             len: self.capacity - self.data_rx.capacity(),
             capacity: self.capacity,
-            pending_barriers: self.barrier_rx.len()
-                + if self.pending_barrier.is_some() { 1 } else { 0 },
+            pending_barriers: self.barrier_rx.len() + self.pending_barriers.len(),
         }
     }
 }
@@ -153,7 +151,7 @@ pub fn operator_queue(capacity: usize) -> (OperatorQueueSender, OperatorQueueRec
         data_rx,
         barrier_rx,
         capacity: capacity.max(1),
-        pending_barrier: None,
+        pending_barriers: std::collections::VecDeque::new(),
     };
     (sender, receiver)
 }

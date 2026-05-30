@@ -22,18 +22,9 @@ pub struct LocalDiskShuffleStore {
     content_hashes: Arc<DashMap<crate::store::PartitionKey, [u8; 32]>>,
 }
 
-fn compute_hash(partition: &ShufflePartition) -> [u8; 32] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    partition.id.job_id.hash(&mut hasher);
-    partition.id.stage_id.hash(&mut hasher);
-    partition.id.partition.hash(&mut hasher);
-    partition.batches.len().hash(&mut hasher);
-    let h = hasher.finish();
-    let mut out = [0u8; 32];
-    out[0..8].copy_from_slice(&h.to_be_bytes());
-    out
+/// Compute BLAKE3 hash over raw bytes (Parquet file content or similar).
+fn compute_hash_bytes(data: &[u8]) -> [u8; 32] {
+    *blake3::hash(data).as_bytes()
 }
 
 impl LocalDiskShuffleStore {
@@ -65,12 +56,11 @@ impl LocalDiskShuffleStore {
             let path = entry.path();
             if ft.is_dir() {
                 Self::cleanup_temp_files(&path)?;
-            } else if ft.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.contains(".tmp.") {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
+            } else if ft.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.contains(".tmp.")
+            {
+                let _ = std::fs::remove_file(&path);
             }
         }
         Ok(())
@@ -173,7 +163,6 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let lease_tokens = Arc::clone(&self.lease_tokens);
         let content_hashes = Arc::clone(&self.content_hashes);
         let parent_dir = final_path.parent().map(PathBuf::from);
-        let hash = compute_hash(&partition);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -215,6 +204,12 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     .sync_all()
                     .map_err(|e| io_err(format!("failed to fsync temp file: {e}")))?;
             }
+
+            // Compute BLAKE3 hash over the written Parquet bytes so write-time
+            // and read-time hashes use the same encoding.
+            let parquet_bytes = std::fs::read(&tmp_path)
+                .map_err(|e| io_err(format!("failed to read temp file for hashing: {e}")))?;
+            let hash = compute_hash_bytes(&parquet_bytes);
 
             // Phase 2: Re-acquire the lock and commit via rename only if our token
             // is still the current winner.  If a newer writer advanced the token
@@ -267,19 +262,44 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // async executor thread is never stalled by synchronous disk calls.
         tokio::task::spawn_blocking(move || {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-            use std::fs::File;
 
-            let file = match File::open(&path) {
-                Ok(f) => f,
+            // Read raw Parquet bytes for hash verification before decoding.
+            let raw_bytes = match std::fs::read(&path) {
+                Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => {
                     return Err(io_err(format!(
-                        "failed to open partition file '{}': {e}",
+                        "failed to read partition file '{}': {e}",
                         path.display()
                     )));
                 }
             };
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+
+            // Strict content-hash verification on disk read: compare against
+            // the BLAKE3 hash of the Parquet bytes stored at write time.
+            {
+                let key = (
+                    id.job_id.clone(),
+                    id.stage_id.clone(),
+                    id.partition,
+                );
+                if let Some(stored_ref) = content_hashes.get(&key) {
+                    let stored = *stored_ref;
+                    let computed = compute_hash_bytes(&raw_bytes);
+                    if computed != stored {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!("{:?}", key),
+                            expected: format!("{:02x?}", stored),
+                            actual: format!("{:02x?}", computed),
+                        });
+                    }
+                }
+            }
+
+            // Decode the Parquet bytes into Arrow record batches.
+            // Use `bytes::Bytes` which implements `ChunkReader` for parquet.
+            let parquet_bytes_frozen = bytes::Bytes::from(raw_bytes);
+            let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes_frozen)
                 .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
             let schema = builder.schema().clone();
             let reader = builder
@@ -296,33 +316,6 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 schema,
                 batches,
             };
-
-            // Strict content-hash verification on disk read (DashMap — no lock management needed)
-            {
-                let key = (
-                    partition.id.job_id.clone(),
-                    partition.id.stage_id.clone(),
-                    partition.id.partition,
-                );
-                if let Some(stored_ref) = content_hashes.get(&key) {
-                    let stored = *stored_ref;
-                    let computed = compute_hash(&partition);
-                    if computed != stored {
-                        return Err(ShuffleError::ContentHashMismatch {
-                            partition: format!(
-                                "{:?}",
-                                (
-                                    partition.id.job_id.clone(),
-                                    partition.id.stage_id.clone(),
-                                    partition.id.partition
-                                )
-                            ),
-                            expected: format!("{:02x?}", stored),
-                            actual: format!("{:02x?}", computed),
-                        });
-                    }
-                }
-            }
 
             Ok(Some(partition))
         })

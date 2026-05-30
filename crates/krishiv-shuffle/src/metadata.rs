@@ -92,4 +92,13 @@ impl ShuffleMetadata {
     pub fn total_count(&self) -> usize {
         self.states.len()
     }
+
+    /// Return all paths in the `Available` state.
+    pub fn available_paths(&self) -> Vec<&ShufflePath> {
+        self.states
+            .iter()
+            .filter(|(_, s)| **s == PartitionState::Available)
+            .map(|(path, _)| path)
+            .collect()
+    }
 }

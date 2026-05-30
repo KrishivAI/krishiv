@@ -47,8 +47,7 @@ impl RedbStateBackend {
                 if !is_corrupt {
                     return Err(StateError::BackendUnavailable {
                         message: format!("redb open failed (not corruption): {e}"),
-                        source: Some(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        source: Some(Box::new(std::io::Error::other(
                             e.to_string(),
                         ))),
                     });
@@ -139,9 +138,7 @@ impl RedbStateBackend {
     }
 }
 
-fn db_err(
-    e: impl std::fmt::Display + std::fmt::Debug + Send + Sync + std::error::Error + 'static,
-) -> StateError {
+fn db_err(e: impl std::error::Error + Send + Sync + 'static) -> StateError {
     StateError::BackendUnavailable {
         message: e.to_string(),
         source: Some(Box::new(e)),

@@ -28,15 +28,15 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 pub fn inject_trace_context(
     mut req: tonic::Request<()>,
 ) -> Result<tonic::Request<()>, tonic::Status> {
-    if let Some(value) = crate::current_traceparent() {
-        if let Ok(meta_val) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
-            req.metadata_mut().insert("traceparent", meta_val);
-        }
+    if let Some(value) = crate::current_traceparent()
+        && let Ok(meta_val) = tonic::metadata::MetadataValue::try_from(value.as_str())
+    {
+        req.metadata_mut().insert("traceparent", meta_val);
     }
-    if let Some(value) = crate::current_tracestate() {
-        if let Ok(meta_val) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
-            req.metadata_mut().insert("tracestate", meta_val);
-        }
+    if let Some(value) = crate::current_tracestate()
+        && let Ok(meta_val) = tonic::metadata::MetadataValue::try_from(value.as_str())
+    {
+        req.metadata_mut().insert("tracestate", meta_val);
     }
     Ok(req)
 }

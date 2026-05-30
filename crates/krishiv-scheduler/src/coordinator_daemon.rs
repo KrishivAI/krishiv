@@ -173,15 +173,42 @@ pub async fn run_cluster_control_plane(
     ccp: Arc<ClusterControlPlane>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn Error>> {
-    ccp.spawn_orchestration_loops();
+    // Store handles so the orchestration loops live until this function returns.
+    let _orchestrator_handles = ccp.spawn_orchestration_loops();
     let leader = Arc::clone(ccp.leader());
     let ccp_loop = Arc::clone(&ccp);
     tokio::spawn(async move {
         ccp_loop.run_leader_loop().await;
     });
     let _ = leader;
-    serve_coordinator_executor_grpc_with_listener(listener, ccp.shared_coordinator().clone())
-        .await?;
+
+    let coordinator = ccp.shared_coordinator().clone();
+    let grpc_serve = serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
+
+    tokio::select! {
+        result = grpc_serve => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received; initiating coordinator graceful shutdown");
+        }
+        _ = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => { sig.recv().await; }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        } => {
+            tracing::info!("SIGTERM received; initiating coordinator graceful shutdown");
+        }
+    }
+
+    // Demote coordinator and release leadership.
+    {
+        let mut coord = coordinator.write().await;
+        coord.demote_to_standby();
+        tracing::info!("coordinator demoted to standby on shutdown");
+    }
+
     Ok(())
 }
 
@@ -654,7 +681,33 @@ pub async fn run_standalone_coordinator(
         config.coordinator_id,
         listener.local_addr()?
     );
-    serve_coordinator_executor_grpc_with_listener(listener, coordinator).await?;
+
+    let grpc_serve =
+        serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
+
+    tokio::select! {
+        result = grpc_serve => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received; initiating standalone coordinator graceful shutdown");
+        }
+        _ = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => { sig.recv().await; }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        } => {
+            tracing::info!("SIGTERM received; initiating standalone coordinator graceful shutdown");
+        }
+    }
+
+    {
+        let mut coord = coordinator.write().await;
+        coord.demote_to_standby();
+        tracing::info!("standalone coordinator demoted to standby on shutdown");
+    }
+
     Ok(())
 }
 

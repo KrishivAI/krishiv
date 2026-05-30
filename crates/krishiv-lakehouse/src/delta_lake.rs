@@ -198,7 +198,7 @@ fn target_keys_indices(
     let mut result = Vec::new();
     for i in 0..array.len() {
         let k = typed_key(array, i)?;
-        if k.map_or(true, |key| !source_keys.contains(&key)) {
+        if k.is_none_or(|key| !source_keys.contains(&key)) {
             result.push(i as u32);
         }
     }

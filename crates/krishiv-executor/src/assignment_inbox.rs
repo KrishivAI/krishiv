@@ -57,13 +57,13 @@ impl ExecutorAssignmentInbox {
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
 
-        if let Some(max) = self.max_capacity {
-            if q.len() >= max {
-                return Err(ExecutorError::AssignmentQueueFull {
-                    current: q.len(),
-                    max,
-                });
-            }
+        if let Some(max) = self.max_capacity
+            && q.len() >= max
+        {
+            return Err(ExecutorError::AssignmentQueueFull {
+                current: q.len(),
+                max,
+            });
         }
 
         q.push_back(assignment);

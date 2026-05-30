@@ -756,7 +756,7 @@ pub fn create_savepoint(
     // Copy manifest.
     let manifest_bytes = storage
         .read_bytes(&manifest_path(job_id, epoch))?
-        .ok_or_else(|| CheckpointError::NoValidEpoch)?;
+        .ok_or(CheckpointError::NoValidEpoch)?;
     storage.write_bytes(&format!("{savepoint_dir}/manifest.sha256"), &manifest_bytes)?;
 
     Ok((epoch, metadata))

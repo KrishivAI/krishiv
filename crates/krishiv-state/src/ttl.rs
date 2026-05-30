@@ -247,13 +247,13 @@ impl<B: StateBackend> StateBackend for TtlStateBackend<B> {
         for ns in &namespaces {
             let keys = self.inner.list_keys(ns)?;
             for key in &keys {
-                if let Some(encoded) = self.inner.get(ns, key)? {
-                    if encoded.len() >= 8 {
-                        let expires_at_ms =
-                            i64::from_le_bytes(encoded[..8].try_into().unwrap_or([0u8; 8]));
-                        if now_ms >= expires_at_ms {
-                            keys_to_delete.push((ns.clone(), key.clone()));
-                        }
+                if let Some(encoded) = self.inner.get(ns, key)?
+                    && encoded.len() >= 8
+                {
+                    let expires_at_ms =
+                        i64::from_le_bytes(encoded[..8].try_into().unwrap_or([0u8; 8]));
+                    if now_ms >= expires_at_ms {
+                        keys_to_delete.push((ns.clone(), key.clone()));
                     }
                 }
             }

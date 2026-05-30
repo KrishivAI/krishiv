@@ -1908,9 +1908,12 @@ mod shuffle_tests {
         drop(f);
 
         let err = store.read_partition(&id).await.unwrap_err();
+        // With BLAKE3 hash verification, file corruption is caught as
+        // ContentHashMismatch before the Parquet decoder even runs.
+        // Both Io and ContentHashMismatch indicate detected corruption.
         assert!(
-            matches!(err, ShuffleError::Io(_)),
-            "expected Io error for corrupt parquet, got {err}"
+            matches!(err, ShuffleError::Io(_) | ShuffleError::ContentHashMismatch { .. }),
+            "expected Io or ContentHashMismatch error for corrupt parquet, got {err}"
         );
     }
 

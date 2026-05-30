@@ -149,20 +149,20 @@ impl InMemoryShuffleStore {
                     .get(&key_to_spill)
                     .copied()
                     .unwrap_or(0);
-                if current_token == spill_token {
-                    if let Some(current_part) = parts.get(&key_to_spill) {
-                        let current_hash = compute_simple_partition_hash(current_part);
-                        if current_hash == spill_hash {
-                            parts.remove(&key_to_spill);
-                            hashes.remove(&key_to_spill);
-                            spilled.insert(key_to_spill);
-                            *used = used.saturating_sub(spill_size);
-                        } else {
-                            tracing::info!(
-                                "spill-to-disk cleanup skipped for {:?}: partition was modified during write",
-                                key_to_spill
-                            );
-                        }
+                if current_token == spill_token
+                    && let Some(current_part) = parts.get(&key_to_spill)
+                {
+                    let current_hash = compute_simple_partition_hash(current_part);
+                    if current_hash == spill_hash {
+                        parts.remove(&key_to_spill);
+                        hashes.remove(&key_to_spill);
+                        spilled.insert(key_to_spill);
+                        *used = used.saturating_sub(spill_size);
+                    } else {
+                        tracing::info!(
+                            "spill-to-disk cleanup skipped for {:?}: partition was modified during write",
+                            key_to_spill
+                        );
                     }
                 }
             }

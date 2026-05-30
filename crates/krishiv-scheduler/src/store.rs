@@ -8,6 +8,8 @@ use krishiv_proto::{
 };
 use serde::{Deserialize, Serialize};
 
+use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
+
 use crate::{JobRecord, ResourceUsage, SchedulerError, SchedulerResult, StageRecord, TaskRecord};
 
 /// Events written to the durable job event log.
@@ -99,6 +101,15 @@ impl MetadataStore for InMemoryMetadataStore {
 const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
 
 /// JSON-file metadata store for durable local coordinator recovery.
+///
+/// Uses two files:
+/// - `{path}` — full snapshot (jobs + events), written on `save_job` and `open`.
+/// - `{path}.events.ndjson` — append-only newline-delimited JSON event log.
+///
+/// On `append_event`, the event is appended to the `.events.ndjson` log (fast,
+/// no full rewrite).  On `save_job`, the full snapshot is rewritten and the
+/// `.events.ndjson` log is truncated (it's now captured in the snapshot).
+/// On `open`, both files are read and events are merged.
 #[derive(Debug)]
 pub struct JsonFileMetadataStore {
     path: PathBuf,
@@ -107,6 +118,72 @@ pub struct JsonFileMetadataStore {
 }
 
 impl JsonFileMetadataStore {
+    fn events_log_path(&self) -> PathBuf {
+        let mut p = self.path.as_os_str().to_owned();
+        p.push(".events.ndjson");
+        PathBuf::from(p)
+    }
+
+    /// Append a single event to the events NDJSON log (fast, no full rewrite).
+    fn append_event_to_log(&self, event: &EventLogEvent) -> SchedulerResult<()> {
+        let log_path = self.events_log_path();
+        let persisted = PersistedEvent::from(event);
+        let line = serde_json::to_string(&persisted).map_err(|e| SchedulerError::Transport {
+            message: format!("failed to serialize event: {e}"),
+        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| SchedulerError::Transport {
+                message: format!(
+                    "failed to open event log '{}': {e}",
+                    log_path.display()
+                ),
+            })?;
+        use std::io::Write as IoWrite;
+        writeln!(file, "{}", line).map_err(|e| SchedulerError::Transport {
+            message: format!("failed to write event log: {e}"),
+        })?;
+        file.sync_all().map_err(|e| SchedulerError::Transport {
+            message: format!("failed to fsync event log: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Truncate the events NDJSON log (called after a full snapshot rewrite).
+    fn truncate_events_log(&self) -> SchedulerResult<()> {
+        let log_path = self.events_log_path();
+        if log_path.exists() {
+            std::fs::write(&log_path, b"").map_err(|e| SchedulerError::Transport {
+                message: format!("failed to truncate event log '{}': {e}", log_path.display()),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Load events from the NDJSON log file (called during `open`).
+    fn load_events_from_log(path: &Path) -> Vec<EventLogEvent> {
+        let log_path = {
+            let mut p = path.as_os_str().to_owned();
+            p.push(".events.ndjson");
+            PathBuf::from(p)
+        };
+        if !log_path.exists() {
+            return Vec::new();
+        }
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<PersistedEvent>(l).ok())
+            .filter_map(|pe| EventLogEvent::try_from(pe).ok())
+            .collect()
+    }
+
     /// Open or create a JSON-file metadata store at `path`.
     pub fn open(path: impl AsRef<Path>) -> SchedulerResult<Self> {
         let path = path.as_ref().to_path_buf();
@@ -143,13 +220,17 @@ impl JsonFileMetadataStore {
                 ),
             })?;
         persisted.validate_schema_version()?;
+        // Load snapshot events then merge any extra events from the NDJSON log.
+        let mut events: Vec<EventLogEvent> = persisted
+            .events
+            .into_iter()
+            .map(EventLogEvent::try_from)
+            .collect::<SchedulerResult<Vec<_>>>()?;
+        let extra_events = Self::load_events_from_log(&path);
+        events.extend(extra_events);
         Ok(Self {
             path,
-            events: persisted
-                .events
-                .into_iter()
-                .map(EventLogEvent::try_from)
-                .collect::<SchedulerResult<Vec<_>>>()?,
+            events,
             jobs: persisted
                 .jobs
                 .into_iter()
@@ -223,8 +304,10 @@ impl JsonFileMetadataStore {
 
 impl MetadataStore for JsonFileMetadataStore {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        // Append-only: write just this event to the NDJSON log (no full rewrite).
+        self.append_event_to_log(&event)?;
         self.events.push(event);
-        self.persist()
+        Ok(())
     }
 
     fn events(&self) -> &[EventLogEvent] {
@@ -237,7 +320,11 @@ impl MetadataStore for JsonFileMetadataStore {
         } else {
             self.jobs.push(record.clone());
         }
-        self.persist()
+        // Full snapshot rewrite on save_job (less frequent than append_event).
+        self.persist()?;
+        // After snapshot, the events log is captured; truncate it.
+        self.truncate_events_log()?;
+        Ok(())
     }
 
     fn jobs(&self) -> &[JobRecord] {
@@ -605,6 +692,13 @@ pub(crate) fn invalid_metadata_id(error: krishiv_proto::IdError) -> SchedulerErr
     }
 }
 
+/// Persisted shuffle partition availability entry.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedShufflePartition {
+    pub(crate) stage_id: String,
+    pub(crate) partition_id: u32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedJobRecord {
     pub(crate) spec: PersistedJobSpec,
@@ -614,6 +708,9 @@ pub(crate) struct PersistedJobRecord {
     /// Accumulated resource consumption. `None` in records written before R7.1.
     #[serde(default)]
     pub(crate) resource_usage: Option<ResourceUsage>,
+    /// Available shuffle partitions by stage.  Absent in records before this field was added.
+    #[serde(default)]
+    pub(crate) shuffle_output: Vec<PersistedShufflePartition>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -636,6 +733,10 @@ pub(crate) struct PersistedTaskRecord {
     /// Defaults to 0 for records written before this field was added (backward compatible).
     #[serde(default)]
     pub(crate) failure_count: u32,
+    /// Number of times this task's executor was lost and the task rescheduled.
+    /// Defaults to 0 for records written before this field was added.
+    #[serde(default)]
+    pub(crate) executor_loss_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -690,6 +791,20 @@ pub(crate) struct PersistedTaskOutputMetadata {
 
 impl From<&JobRecord> for PersistedJobRecord {
     fn from(value: &JobRecord) -> Self {
+        // Serialize only Available partitions (Pending/Failed are transient).
+        let shuffle_output: Vec<PersistedShufflePartition> = value
+            .shuffle_output
+            .iter()
+            .flat_map(|(stage_id, meta)| {
+                meta.available_paths()
+                    .into_iter()
+                    .map(|path| PersistedShufflePartition {
+                        stage_id: stage_id.to_string(),
+                        partition_id: path.partition_id,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Self {
             spec: PersistedJobSpec::from(&value.spec),
             state: value.state.to_string(),
@@ -700,6 +815,7 @@ impl From<&JobRecord> for PersistedJobRecord {
                 .map(PersistedStageRecord::from)
                 .collect(),
             resource_usage: Some(value.resource_usage.clone()),
+            shuffle_output,
         }
     }
 }
@@ -708,6 +824,20 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
     type Error = SchedulerError;
 
     fn try_from(value: PersistedJobRecord) -> SchedulerResult<Self> {
+        // Rebuild shuffle_output from persisted Available partitions.
+        let job_id = value.spec.job_id.clone();
+        let mut shuffle_output: HashMap<krishiv_proto::StageId, ShuffleMetadata> = HashMap::new();
+        for p in value.shuffle_output {
+            let stage_id = krishiv_proto::StageId::try_new(p.stage_id.clone())
+                .map_err(invalid_metadata_id)?;
+            let meta = shuffle_output.entry(stage_id).or_default();
+            let path = ShufflePath {
+                job_id: job_id.clone(),
+                stage_id: p.stage_id,
+                partition_id: p.partition_id,
+            };
+            meta.mark_available(&path);
+        }
         Ok(Self {
             spec: JobSpec::try_from(value.spec)?,
             state: parse_job_state(&value.state)?,
@@ -717,9 +847,7 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
                 .into_iter()
                 .map(StageRecord::try_from)
                 .collect::<SchedulerResult<Vec<_>>>()?,
-            // Shuffle output metadata is not persisted; it is rebuilt from
-            // executor task status updates after coordinator restart.
-            shuffle_output: HashMap::new(),
+            shuffle_output,
             resource_usage: value.resource_usage.unwrap_or_default(),
         })
     }
@@ -766,6 +894,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
                 .map(PersistedTaskOutputMetadata::from),
             last_failure_reason: value.last_failure_reason.clone(),
             failure_count: value.failure_count,
+            executor_loss_count: value.executor_loss_count,
         }
     }
 }
@@ -787,6 +916,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             output_metadata: value.output_metadata.map(TaskOutputMetadata::from),
             last_failure_reason: value.last_failure_reason,
             failure_count: value.failure_count,
+            executor_loss_count: value.executor_loss_count,
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.
             last_watermark_ms: None,
             last_source_offset: None,
@@ -1020,6 +1150,134 @@ pub(crate) fn encode_metadata_snapshot(
     serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
         message: format!("failed to encode metadata snapshot: {error}"),
     })
+}
+
+/// Commands sent from the coordinator to the background store writer.
+#[derive(Debug)]
+enum StoreCommand {
+    AppendEvent(EventLogEvent),
+    SaveJob(Box<JobRecord>),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Non-blocking handle to a [`MetadataStore`].
+///
+/// When a Tokio runtime is available, writes are enqueued to a background task
+/// so the coordinator lock is released immediately.  In synchronous contexts
+/// (unit tests, startup), writes happen inline on the calling thread.
+///
+/// Use [`NonBlockingStoreHandle::flush`] to wait for all pending async writes
+/// (useful on graceful shutdown).
+/// Use [`NonBlockingStoreHandle::inner`] for reads (takes the mutex directly).
+#[derive(Clone)]
+pub struct NonBlockingStoreHandle {
+    inner: std::sync::Arc<std::sync::Mutex<dyn MetadataStore + 'static>>,
+    /// Async sender; `None` when no Tokio runtime was available at construction.
+    tx: Option<tokio::sync::mpsc::UnboundedSender<StoreCommand>>,
+}
+
+impl std::fmt::Debug for NonBlockingStoreHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NonBlockingStoreHandle")
+            .field("async_mode", &self.tx.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NonBlockingStoreHandle {
+    /// Create a handle backed by `store`.
+    ///
+    /// If a Tokio runtime is running, a background drain task is spawned and
+    /// writes become non-blocking.  Otherwise writes happen synchronously in
+    /// the calling thread (safe for unit tests and startup code).
+    pub fn new(store: impl MetadataStore + 'static) -> Self {
+        let inner: std::sync::Arc<std::sync::Mutex<dyn MetadataStore + 'static>> =
+            std::sync::Arc::new(std::sync::Mutex::new(store));
+
+        // Only spawn the background task when a Tokio runtime is available.
+        let tx = if tokio::runtime::Handle::try_current().is_ok() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StoreCommand>();
+            let bg_store = std::sync::Arc::clone(&inner);
+            tokio::spawn(async move {
+                while let Some(cmd) = rx.recv().await {
+                    match cmd {
+                        StoreCommand::AppendEvent(event) => {
+                            let bg = std::sync::Arc::clone(&bg_store);
+                            tokio::task::block_in_place(|| {
+                                let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Err(e) = guard.append_event(event) {
+                                    tracing::error!(
+                                        error = %e,
+                                        "NonBlockingStoreHandle: append_event failed"
+                                    );
+                                }
+                            });
+                        }
+                        StoreCommand::SaveJob(record) => {
+                            let bg = std::sync::Arc::clone(&bg_store);
+                            tokio::task::block_in_place(|| {
+                                let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Err(e) = guard.save_job(&record) {
+                                    tracing::error!(
+                                        error = %e,
+                                        "NonBlockingStoreHandle: save_job failed"
+                                    );
+                                }
+                            });
+                        }
+                        StoreCommand::Flush(reply) => {
+                            let _ = reply.send(());
+                        }
+                    }
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
+
+        Self { inner, tx }
+    }
+
+    /// Access the underlying store for reads (blocks on mutex).
+    pub fn inner(&self) -> std::sync::MutexGuard<'_, dyn MetadataStore + 'static> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Enqueue an event write (non-blocking when async; synchronous otherwise).
+    pub fn append_event(&self, event: EventLogEvent) {
+        if let Some(ref tx) = self.tx {
+            let _ = tx.send(StoreCommand::AppendEvent(event));
+        } else {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = guard.append_event(event) {
+                tracing::error!(error = %e, "NonBlockingStoreHandle: append_event failed (sync)");
+            }
+        }
+    }
+
+    /// Enqueue a job save (non-blocking when async; synchronous otherwise).
+    pub fn save_job(&self, record: &JobRecord) {
+        if let Some(ref tx) = self.tx {
+            let _ = tx.send(StoreCommand::SaveJob(Box::new(record.clone())));
+        } else {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = guard.save_job(record) {
+                tracing::error!(error = %e, "NonBlockingStoreHandle: save_job failed (sync)");
+            }
+        }
+    }
+
+    /// Wait until all previously enqueued async writes have been processed.
+    ///
+    /// No-op in synchronous mode (writes already landed synchronously).
+    pub async fn flush(&self) {
+        if let Some(ref tx) = self.tx {
+            let (reply_tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(StoreCommand::Flush(reply_tx));
+            let _ = rx.await;
+        }
+    }
 }
 
 /// Restore coordinator metadata from a serialized snapshot blob.

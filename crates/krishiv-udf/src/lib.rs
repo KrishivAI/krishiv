@@ -1249,12 +1249,12 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
         // Explicit time enforcement wrapper.
         let result = udf.call(batch)?;
 
-        if let Some(max_ms) = limits.max_execution_time_ms {
-            if start.elapsed().as_millis() as u64 > max_ms {
-                return Err(UdfError::Execution {
-                    message: format!("UDF exceeded time limit of {} ms", max_ms),
-                });
-            }
+        if let Some(max_ms) = limits.max_execution_time_ms
+            && start.elapsed().as_millis() as u64 > max_ms
+        {
+            return Err(UdfError::Execution {
+                message: format!("UDF exceeded time limit of {} ms", max_ms),
+            });
         }
 
         // Real memory enforcement (conservative proxy using input batch size in bytes).

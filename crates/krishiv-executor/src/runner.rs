@@ -1095,10 +1095,16 @@ impl ExecutorTaskRunner {
     where
         S: CoordinatorExecutorService,
     {
-        let mut checkpoint_runner = self
+        // Take ownership of the TaskRunner out of the DashMap so we don't hold
+        // a shard lock across blocking file I/O (snapshot + write_bytes).
+        let task_id = assignment.task_id().clone();
+        let mut task_runner = self
             .checkpoint_runners
-            .entry(assignment.task_id().clone())
-            .or_insert_with(|| TaskRunner::new(assignment.task_id().clone()));
+            .remove(&task_id)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| TaskRunner::new(task_id.clone()));
+        // DashMap shard lock is now fully released.
+
         let ack = match tokio::runtime::Handle::try_current() {
             Ok(handle)
                 if matches!(
@@ -1107,13 +1113,16 @@ impl ExecutorTaskRunner {
                 ) =>
             {
                 tokio::task::block_in_place(|| {
-                    checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage)
+                    task_runner.handle_initiate_checkpoint(req, state_backend, storage)
                 })
             }
-            _ => checkpoint_runner.handle_initiate_checkpoint(req, state_backend, storage),
+            _ => task_runner.handle_initiate_checkpoint(req, state_backend, storage),
         }
         .map_err(|error| tonic::Status::internal(error.to_string()))?;
-        drop(checkpoint_runner);
+
+        // Re-insert the updated runner (last_acked_epoch was updated).
+        self.checkpoint_runners.insert(task_id, task_runner);
+
         coordinator
             .checkpoint_ack(tonic::Request::new(ack))
             .await

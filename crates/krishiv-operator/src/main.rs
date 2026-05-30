@@ -188,9 +188,9 @@ fn spawn_coordinator_leader_election(
         K8sLeaseElection::new(&coordinator_id, &ns, &coordinator_id).with_kube_client(client),
     );
 
-    // E3: orchestration loops are tied to leadership.  We hold the abort
-    // handles in this task so we can stop them on demotion.
-    let mut orchestration_abort: Option<Vec<tokio::task::AbortHandle>> = None;
+    // E3: orchestration loops are tied to leadership.  We hold the handles
+    // in this task so we can stop them on demotion.
+    let mut orchestration_handles: Option<krishiv_scheduler::OrchestratorHandles> = None;
 
     tokio::spawn(async move {
         // Try to acquire synchronously before starting the periodic loop so
@@ -198,7 +198,7 @@ fn spawn_coordinator_leader_election(
         if election.try_acquire().await {
             let mut c = coordinator.write().await;
             c.promote_to_active();
-            orchestration_abort = Some(coordinator.spawn_orchestration_loops_with_handles());
+            orchestration_handles = Some(coordinator.spawn_orchestration_loops());
         }
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -209,18 +209,15 @@ fn spawn_coordinator_leader_election(
             let acquired = election.try_acquire().await;
             if acquired {
                 coordinator.write().await.promote_to_active();
-                if orchestration_abort.is_none() {
-                    orchestration_abort =
-                        Some(coordinator.spawn_orchestration_loops_with_handles());
+                if orchestration_handles.is_none() {
+                    orchestration_handles = Some(coordinator.spawn_orchestration_loops());
                 }
             } else if was_leader {
                 let renewed = election.renew().await;
                 if !renewed {
                     coordinator.write().await.demote_to_standby();
-                    if let Some(handles) = orchestration_abort.take() {
-                        for h in handles {
-                            h.abort();
-                        }
+                    if let Some(handles) = orchestration_handles.take() {
+                        handles.shutdown();
                     }
                 }
             }

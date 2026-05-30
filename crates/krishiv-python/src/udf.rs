@@ -249,13 +249,16 @@ pub(crate) fn build_python_scalar_udf(
     }))
 }
 
+/// Return type for [`resolve_register_udf_args`].
+type UdfArgs = (String, pyo3::Py<pyo3::PyAny>, pyo3::Py<pyo3::types::PyDict>, String, Option<String>);
+
 pub(crate) fn resolve_register_udf_args(
     name_or_callable: Bound<'_, PyAny>,
     callable: Option<Bound<'_, PyAny>>,
     input_types: Option<Bound<'_, PyDict>>,
     output_type: Option<String>,
     output_name: Option<String>,
-) -> PyResult<(String, Py<PyAny>, Py<PyDict>, String, Option<String>)> {
+) -> PyResult<UdfArgs> {
     if let Some(fn_obj) = callable {
         let input_types = input_types.ok_or_else(|| {
             SchemaError::new_err("register_udf() requires input_types= when name is given")

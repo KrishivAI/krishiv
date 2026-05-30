@@ -747,6 +747,10 @@ pub struct TaskRecord {
     /// GAP-3: How many times this specific task has failed.  Used by
     /// `apply_task_update` to decide whether to retry the task or fail it.
     pub(crate) failure_count: u32,
+    /// Number of times this task's executor was lost (marked Lost/timeout).
+    /// Incremented each time `reset_running_tasks_for_lost_executor` rescheduled
+    /// this task; distinct from `failure_count` (which tracks task-reported failures).
+    pub(crate) executor_loss_count: u32,
     /// Last event-time watermark reported by the executor for this streaming task.
     /// `None` for batch tasks or streaming tasks that have not yet heartbeated.
     pub(crate) last_watermark_ms: Option<i64>,
@@ -766,6 +770,7 @@ impl TaskRecord {
             output_metadata: None,
             last_failure_reason: None,
             failure_count: 0,
+            executor_loss_count: 0,
             last_watermark_ms: None,
             last_source_offset: None,
         }

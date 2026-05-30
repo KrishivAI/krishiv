@@ -185,9 +185,9 @@ impl ClusterControlPlane {
     }
 
     /// Spawn orchestration loops only when we currently hold leadership.
-    /// Returns the abort handles so callers can stop the loops on demotion.
-    pub fn spawn_orchestration_loops(&self) -> Vec<tokio::task::AbortHandle> {
-        self.shared.spawn_orchestration_loops_with_handles()
+    /// Returns [`OrchestratorHandles`] so callers can stop the loops on demotion.
+    pub fn spawn_orchestration_loops(&self) -> crate::OrchestratorHandles {
+        self.shared.spawn_orchestration_loops()
     }
 
     /// Run the leader election loop.  Eagerly attempts acquisition before the
@@ -196,7 +196,7 @@ impl ClusterControlPlane {
     /// Promotion installs orchestration loops; demotion aborts them (E3).
     /// The loop runs forever until the task is aborted.
     pub async fn run_leader_loop(self: Arc<Self>) {
-        let mut orchestration_handles: Option<Vec<tokio::task::AbortHandle>> = None;
+        let mut orchestration_handles: Option<crate::OrchestratorHandles> = None;
 
         if self.leader.try_acquire().await {
             let _ = self.promote_to_active().await;
@@ -216,17 +216,13 @@ impl ClusterControlPlane {
                 if !self.leader.renew().await {
                     let _ = self.demote_to_standby().await;
                     if let Some(handles) = orchestration_handles.take() {
-                        for h in handles {
-                            h.abort();
-                        }
+                        handles.shutdown();
                     }
                 }
             } else {
                 let _ = self.demote_to_standby().await;
                 if let Some(handles) = orchestration_handles.take() {
-                    for h in handles {
-                        h.abort();
-                    }
+                    handles.shutdown();
                 }
             }
         }

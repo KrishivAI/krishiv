@@ -324,6 +324,7 @@ impl HudiCowWriter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_commit(
         &self,
         instant: &str,
@@ -358,10 +359,10 @@ impl HudiCowWriter {
         let base_rel = base_batch
             .as_ref()
             .map(|_| format!("{instant}/base-0.parquet"));
-        if let Some(base) = base_batch {
-            if let Some(ref base_rel_str) = base_rel {
-                write_parquet_batch(&self.table_path.join(base_rel_str), base)?;
-            }
+        if let Some(base) = base_batch
+            && let Some(ref base_rel_str) = base_rel
+        {
+            write_parquet_batch(&self.table_path.join(base_rel_str), base)?;
         }
         write_parquet_batch(&self.table_path.join(&change_rel), change_batch)?;
 

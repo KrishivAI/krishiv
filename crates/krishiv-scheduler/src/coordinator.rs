@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
@@ -37,18 +37,36 @@ use crate::job::{
 };
 use crate::llm_quota;
 use crate::metrics::{CHECKPOINT_EPOCHS_TOTAL, JOBS_SUBMITTED_TOTAL, TASKS_ASSIGNED_TOTAL};
-use crate::store::{EventLogEvent, MetadataStore};
+use crate::store::{EventLogEvent, MetadataStore, NonBlockingStoreHandle};
 
 static COORDINATOR_NEXT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Generate a cluster-unique coordinator identifier using PID + tick.
-/// Collision-resistant across coordinator restarts and multi-process deployments
-/// on the same host. For cross-host uniqueness, deployments should set
+/// Generate a cluster-unique coordinator identifier using hostname + PID + tick.
+/// Collision-resistant across coordinator restarts, multi-process deployments,
+/// and cross-host scenarios. For deterministic IDs deployments should set
 /// `--coordinator-id` explicitly or use kubernetes StatefulSet naming.
 fn generate_coordinator_id() -> SchedulerResult<CoordinatorId> {
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| {
+            // Fall back to reading /etc/hostname when HOSTNAME env var is not set.
+            std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_owned())
+        })
+        .unwrap_or_else(|_| format!("host-{}", std::process::id()));
     let pid = std::process::id();
     let tick = COORDINATOR_NEXT_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    CoordinatorId::try_new(format!("coord-{pid}-{tick}")).map_err(|e| {
+    // Sanitize hostname: replace chars invalid in IDs with '-'
+    let safe_hostname: String = hostname
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect();
+    CoordinatorId::try_new(format!("coord-{safe_hostname}-{pid}-{tick}")).map_err(|e| {
         SchedulerError::InvalidJob {
             message: format!("generated coordinator id invalid: {e}"),
         }
@@ -69,7 +87,7 @@ pub struct Coordinator {
     pub(crate) executors: ExecutorRegistry,
     /// O(1) job lookup by id.  Replaces Vec<JobRecord> linear scan.
     pub(crate) jobs: HashMap<JobId, JobRecord>,
-    pub(crate) store: Option<Arc<Mutex<dyn MetadataStore + 'static>>>,
+    pub(crate) store: Option<NonBlockingStoreHandle>,
     /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
     pub(crate) checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
     /// Controls admission of new jobs.  Defaults to `InMemoryQueueManager`
@@ -87,7 +105,8 @@ pub struct Coordinator {
     pub(crate) recovering: bool,
     /// Append-only log of adaptive decisions (hot-key split, repartition,
     /// throttle, slow-sink).  Keyed by job id.  R7.2 Group H.
-    pub(crate) adaptive_decision_log: HashMap<JobId, Vec<AdaptiveDecisionLog>>,
+    /// Uses VecDeque for O(1) front-pop when evicting oldest entries.
+    pub(crate) adaptive_decision_log: HashMap<JobId, std::collections::VecDeque<AdaptiveDecisionLog>>,
     /// Manual override config for adaptive behaviors.
     pub(crate) adaptive_override: AdaptiveOverrideConfig,
     /// P1.1: O(1) index from streaming task id to (job_id, stage_id) for heartbeat lookup.
@@ -308,78 +327,125 @@ impl SharedCoordinator {
                     );
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "task launch delivery failed for job; clearing in-flight and continuing"
+                    );
                     let mut coord = self.write().await;
                     coord.clear_launch_in_flight_for_job(&job_id);
-                    return Err(error);
+                    // Do NOT return — continue with remaining jobs
                 }
             }
         }
         Ok(launched)
     }
 
-    /// Spawn background heartbeat and task-launch loops for standalone deployments (P0-4).
-    pub fn spawn_orchestration_loops(&self) {
-        // Drop the handles — same behaviour as before for callers that don't
-        // need to coordinate shutdown.
-        let _ = self.spawn_orchestration_loops_with_handles();
+    /// Spawn background heartbeat and task-launch loops.
+    ///
+    /// The returned [`OrchestratorHandles`] **must be stored**; dropping it
+    /// immediately aborts all loops. Call [`OrchestratorHandles::shutdown`]
+    /// before dropping on graceful coordinator shutdown or demotion.
+    #[must_use = "dropping OrchestratorHandles immediately aborts all background loops"]
+    pub fn spawn_orchestration_loops(&self) -> OrchestratorHandles {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut abort_handles = Vec::with_capacity(3);
+
+        // Heartbeat loop
+        {
+            let coord = self.clone();
+            let mut rx = shutdown_rx.clone();
+            let task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = rx.changed() => { if *rx.borrow() { return; } }
+                    }
+                    if let Err(error) = coord.advance_heartbeat_tick().await {
+                        let text = error.to_string();
+                        if !text.contains("InactiveCoordinator") {
+                            tracing::warn!(error = %text, "coordinator heartbeat tick failed");
+                        }
+                    }
+                }
+            });
+            abort_handles.push(task.abort_handle());
+        }
+
+        // Task launch loop
+        {
+            let coord = self.clone();
+            let mut rx = shutdown_rx.clone();
+            let task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = rx.changed() => { if *rx.borrow() { return; } }
+                    }
+                    if let Err(error) = coord.drive_pending_task_launches().await {
+                        let text = error.to_string();
+                        if !text.contains("InactiveCoordinator") {
+                            tracing::warn!(error = %text, "coordinator task launch tick failed");
+                        }
+                    }
+                }
+            });
+            abort_handles.push(task.abort_handle());
+        }
+
+        // Barrier dispatch loop
+        {
+            let coord = self.clone();
+            let mut rx = shutdown_rx.clone();
+            let task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = rx.changed() => { if *rx.borrow() { return; } }
+                    }
+                    if let Err(error) =
+                        drive_barrier_dispatches(&coord, std::time::Duration::from_secs(30)).await
+                    {
+                        tracing::warn!(error = %error, "coordinator barrier dispatch failed");
+                    }
+                }
+            });
+            abort_handles.push(task.abort_handle());
+        }
+
+        OrchestratorHandles { abort_handles, shutdown_tx }
     }
+}
 
-    /// Same as `spawn_orchestration_loops` but returns the [`AbortHandle`]s so
-    /// callers can deterministically stop the loops on demotion / shutdown (A5, E3).
-    #[must_use]
-    pub fn spawn_orchestration_loops_with_handles(&self) -> Vec<tokio::task::AbortHandle> {
-        let mut handles = Vec::with_capacity(3);
+/// Handles for the background orchestration tasks spawned by
+/// [`SharedCoordinator::spawn_orchestration_loops`].
+///
+/// **Must be kept alive** for the loops to run. Call [`OrchestratorHandles::shutdown`]
+/// for graceful termination, or drop to abort immediately.
+pub struct OrchestratorHandles {
+    abort_handles: Vec<tokio::task::AbortHandle>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
 
-        let heartbeat = self.clone();
-        let hb_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(error) = heartbeat.advance_heartbeat_tick().await {
-                    // Inactive coordinator is expected during failover; demote
-                    // logs further down handle the case.  Other errors get warned.
-                    let text = error.to_string();
-                    if !text.contains("InactiveCoordinator") {
-                        tracing::warn!(error = %text, "coordinator heartbeat tick failed");
-                    }
-                }
-            }
-        });
-        handles.push(hb_task.abort_handle());
+impl OrchestratorHandles {
+    /// Signal all loops to stop and wait for them to exit.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        for h in &self.abort_handles {
+            h.abort();
+        }
+    }
+}
 
-        let launch = self.clone();
-        let launch_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(error) = launch.drive_pending_task_launches().await {
-                    let text = error.to_string();
-                    if !text.contains("InactiveCoordinator") {
-                        tracing::warn!(error = %text, "coordinator task launch tick failed");
-                    }
-                }
-            }
-        });
-        handles.push(launch_task.abort_handle());
-
-        let barriers = self.clone();
-        let barriers_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                if let Err(error) =
-                    drive_barrier_dispatches(&barriers, std::time::Duration::from_secs(30)).await
-                {
-                    tracing::warn!(error = %error, "coordinator barrier dispatch failed");
-                }
-            }
-        });
-        handles.push(barriers_task.abort_handle());
-
-        handles
+impl Drop for OrchestratorHandles {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -488,7 +554,7 @@ impl Coordinator {
     /// Attach a metadata store to this coordinator (builder).
     #[must_use]
     pub fn with_store(mut self, store: impl MetadataStore + 'static) -> Self {
-        self.store = Some(Arc::new(Mutex::new(store)));
+        self.store = Some(NonBlockingStoreHandle::new(store));
         self
     }
 
@@ -508,13 +574,13 @@ impl Coordinator {
         self
     }
 
-    /// Return the adaptive decision log for a job, or an empty slice if there
+    /// Return the adaptive decision log for a job, or an empty vec if there
     /// are no decisions for this job.  R7.2 Group H.
-    pub fn adaptive_decision_log(&self, job_id: &JobId) -> &[AdaptiveDecisionLog] {
+    pub fn adaptive_decision_log(&self, job_id: &JobId) -> Vec<&AdaptiveDecisionLog> {
         self.adaptive_decision_log
             .get(job_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .map(|v| v.iter().collect())
+            .unwrap_or_default()
     }
 
     /// Create a standby R2 coordinator.
@@ -576,10 +642,10 @@ impl Coordinator {
         if res.is_ok() {
             // Evict the executor's gRPC channel so stale TCP connections
             // do not leak (Phase 1.3).
-            if let Ok(record) = self.executors.find_executor(executor_id) {
-                if let Some(endpoint) = record.descriptor().task_endpoint() {
-                    self.executor_channels.remove(endpoint);
-                }
+            if let Ok(record) = self.executors.find_executor(executor_id)
+                && let Some(endpoint) = record.descriptor().task_endpoint()
+            {
+                self.executor_channels.remove(endpoint);
             }
             self.notify.notify_waiters();
         }
@@ -668,7 +734,14 @@ impl Coordinator {
             }
             let job_id = match JobId::try_new(report.job_id.clone()) {
                 Ok(id) => id,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        raw_job_id = %report.job_id,
+                        error = %e,
+                        "ignoring hot-key report with invalid job_id from executor"
+                    );
+                    continue;
+                }
             };
             let is_hot = report.heat_score >= HOT_KEY_HEAT_THRESHOLD;
             let applied = is_hot && !self.adaptive_override.disable_hot_key_splitting;
@@ -688,9 +761,9 @@ impl Coordinator {
                 .or_default();
             const MAX_LOG_PER_JOB: usize = 100;
             if log_bucket.len() >= MAX_LOG_PER_JOB {
-                log_bucket.remove(0);
+                log_bucket.pop_front(); // O(1) with VecDeque
             }
-            log_bucket.push(log);
+            log_bucket.push_back(log);
 
             if applied {
                 // Throttle the source proportional to its heat score.
@@ -937,6 +1010,9 @@ impl Coordinator {
     fn clear_checkpoint_notify_for_epoch(&mut self, job_id: &JobId, epoch: u64) {
         self.checkpoint_notify_sent
             .retain(|(jid, _, e)| jid != job_id || *e != epoch);
+        // Also clean up barrier dispatch tracking for the committed epoch.
+        self.barrier_dispatch_sent
+            .retain(|(jid, e)| jid != job_id || *e != epoch);
     }
 
     fn executor_has_running_task_in_job(&self, executor_id: &ExecutorId, job_id: &JobId) -> bool {
@@ -985,9 +1061,7 @@ impl Coordinator {
                 message: "coordinator has no metadata store".to_string(),
             })?;
         let record = {
-            let guard = store.lock().map_err(|_| SchedulerError::Transport {
-                message: "metadata store lock poisoned".to_string(),
-            })?;
+            let guard = store.inner();
             guard.jobs().iter().find(|j| j.job_id() == job_id).cloned()
         };
         if let Some(record) = record {
@@ -1178,25 +1252,12 @@ impl Coordinator {
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
         if let Some(store) = &self.store {
-            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            // GAP-CP-05: Fail-closed on persist errors — a submission that cannot
-            // be durably recorded must not be accepted, to prevent phantom jobs
-            // surviving coordinator restart.
-            s.save_job(&record).map_err(|e| SchedulerError::Transport {
-                message: format!(
-                    "failed to persist job {} to metadata store: {e}",
-                    record.job_id()
-                ),
-            })?;
-            if let Err(e) = s.append_event(EventLogEvent::JobSubmitted {
+            // Non-blocking fire-and-forget: enqueue writes to background task.
+            // The coordinator lock is released immediately after enqueueing.
+            store.save_job(&record);
+            store.append_event(EventLogEvent::JobSubmitted {
                 job_id: job_id.clone(),
-            }) {
-                tracing::warn!(
-                    error = %e,
-                    job_id = %job_id,
-                    "failed to append JobSubmitted event to store (non-fatal)"
-                );
-            }
+            });
         }
         let inserted_job_id = record.job_id().clone();
         self.jobs.insert(inserted_job_id.clone(), record);
@@ -1325,7 +1386,7 @@ impl Coordinator {
             }
         };
 
-        if let Ok(_) = &res {
+        if res.is_ok() {
             krishiv_governance::audit_log(
                 "scheduler",
                 &krishiv_governance::AuditAction::SavepointCreated {
@@ -1998,7 +2059,7 @@ impl Coordinator {
                 (
                     r.state().is_terminal(),
                     r.resource_usage.clone(),
-                    r.state().clone(),
+                    r.state(),
                     r.spec.name().to_owned(),
                     r.spec
                         .namespace_id()
@@ -2045,13 +2106,8 @@ impl Coordinator {
         if let Some(record) = self.jobs.get(&job_id)
             && let Some(store) = &self.store
         {
-            let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-            s.save_job(record).map_err(|e| SchedulerError::Transport {
-                message: format!(
-                    "failed to persist job {} to metadata store after task update: {e}",
-                    record.job_id()
-                ),
-            })?;
+            // Non-blocking fire-and-forget: enqueue the save to background task.
+            store.save_job(record);
         }
         // P1.1: Remove streaming task index entries when job reaches a terminal state.
         let is_terminal = self
@@ -2162,6 +2218,8 @@ impl Coordinator {
     }
 
     fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
+        const MAX_EXECUTOR_LOSSES_BEFORE_FAIL: u32 = 5;
+
         let mut jobs_to_reassign = Vec::new();
         for (job_id, job) in &mut self.jobs {
             let mut job_affected = false;
@@ -2172,9 +2230,23 @@ impl Coordinator {
                         && (task.state == TaskState::Running
                             || (task.state == TaskState::Assigned && task.launch_in_flight()))
                     {
-                        task.state = TaskState::Pending;
+                        task.executor_loss_count = task.executor_loss_count.saturating_add(1);
                         task.assigned_executor = None;
                         task.clear_launch_in_flight();
+                        if task.executor_loss_count >= MAX_EXECUTOR_LOSSES_BEFORE_FAIL {
+                            task.state = TaskState::Failed;
+                            task.last_failure_reason = Some(format!(
+                                "executor lost {} consecutive times (max {}); task permanently failed",
+                                task.executor_loss_count, MAX_EXECUTOR_LOSSES_BEFORE_FAIL
+                            ));
+                            tracing::warn!(
+                                task_id = %task.task_id(),
+                                executor_loss_count = task.executor_loss_count,
+                                "task failed after too many executor losses"
+                            );
+                        } else {
+                            task.state = TaskState::Pending;
+                        }
                         stage_affected = true;
                         job_affected = true;
                     }
