@@ -933,7 +933,7 @@ mod tests {
             CoordinatorId::try_new("coord-runtime").unwrap(),
         ));
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             let executor_id = ExecutorId::try_new("exec-runtime-1").unwrap();
             coordinator
                 .register_executor(ExecutorDescriptor::new(

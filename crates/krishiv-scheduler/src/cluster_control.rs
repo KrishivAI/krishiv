@@ -151,29 +151,29 @@ impl ClusterControlPlane {
         self.leader.is_leader()
     }
 
-    pub fn is_active(&self) -> bool {
-        self.shared.blocking_read().state() == krishiv_proto::CoordinatorState::Active
+    pub async fn is_active(&self) -> bool {
+        self.shared.read().await.state() == krishiv_proto::CoordinatorState::Active
     }
 
-    pub fn promote_to_active(&self) -> SchedulerResult<()> {
-        self.shared.blocking_write().promote_to_active();
+    pub async fn promote_to_active(&self) -> SchedulerResult<()> {
+        self.shared.write().await.promote_to_active();
         Ok(())
     }
 
-    pub fn demote_to_standby(&self) -> SchedulerResult<()> {
-        self.shared.blocking_write().demote_to_standby();
+    pub async fn demote_to_standby(&self) -> SchedulerResult<()> {
+        self.shared.write().await.demote_to_standby();
         Ok(())
     }
 
-    pub fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
+    pub async fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         if !self.leader.is_leader() {
-            let state = self.shared.blocking_read().state();
+            let state = self.shared.read().await.state();
             return Err(SchedulerError::InactiveCoordinator {
                 coordinator_id: self.coordinator_id.clone(),
                 state,
             });
         }
-        self.shared.blocking_write().submit_job(spec)
+        self.shared.write().await.submit_job(spec)
     }
 
     pub fn job_coordinator(&self, job_id: JobId) -> JobCoordinator {
@@ -198,10 +198,8 @@ impl ClusterControlPlane {
     pub async fn run_leader_loop(self: Arc<Self>) {
         let mut orchestration_handles: Option<Vec<tokio::task::AbortHandle>> = None;
 
-        // First-try acquisition is synchronous from the loop's point of view
-        // so we never start orchestration while still nominally Standby.
         if self.leader.try_acquire().await {
-            let _ = self.promote_to_active();
+            let _ = self.promote_to_active().await;
             orchestration_handles = Some(self.spawn_orchestration_loops());
         }
 
@@ -210,13 +208,13 @@ impl ClusterControlPlane {
         loop {
             interval.tick().await;
             if self.leader.try_acquire().await {
-                let _ = self.promote_to_active();
+                let _ = self.promote_to_active().await;
                 if orchestration_handles.is_none() {
                     orchestration_handles = Some(self.spawn_orchestration_loops());
                 }
             } else if self.leader.is_leader() {
                 if !self.leader.renew().await {
-                    let _ = self.demote_to_standby();
+                    let _ = self.demote_to_standby().await;
                     if let Some(handles) = orchestration_handles.take() {
                         for h in handles {
                             h.abort();
@@ -224,7 +222,7 @@ impl ClusterControlPlane {
                     }
                 }
             } else {
-                let _ = self.demote_to_standby();
+                let _ = self.demote_to_standby().await;
                 if let Some(handles) = orchestration_handles.take() {
                     for h in handles {
                         h.abort();
@@ -236,6 +234,7 @@ impl ClusterControlPlane {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec, StageId, StageSpec,
@@ -244,8 +243,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn ccp_submit_and_job_coordinator_scope() {
+    #[tokio::test]
+    async fn ccp_submit_and_job_coordinator_scope() {
         let id = CoordinatorId::try_new("ccp").unwrap();
         let mut coord = Coordinator::active(id);
         let exec_id = ExecutorId::try_new("exec-1").unwrap();
@@ -257,9 +256,8 @@ mod tests {
         let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage")
             .with_task(TaskSpec::new(TaskId::try_new("t1").unwrap(), "task"));
         let spec = JobSpec::new(job_id.clone(), "demo", JobKind::Batch).with_stage(stage);
-        ccp.submit_job(spec).unwrap();
+        ccp.submit_job(spec).await.unwrap();
         let jcp = ccp.job_coordinator(job_id);
-        // JCP exposes job_id directly; full snapshot is async and owned by the record.
         assert_eq!(jcp.job_id(), &JobId::try_new("job-1").unwrap());
     }
 }

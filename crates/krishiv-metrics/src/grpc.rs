@@ -19,7 +19,6 @@
 
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Tonic client interceptor: reads `current_traceparent()` and `current_tracestate()`
 /// and inserts them as `"traceparent"` and `"tracestate"` metadata keys on every
@@ -61,14 +60,27 @@ impl<'a> Extractor for MetadataExtractor<'a> {
 }
 
 /// Tonic server interceptor: reads `"traceparent"` and `"tracestate"` from request
-/// metadata and sets them as the parent span context so downstream spans inherit
-/// the full W3C trace context.
+/// metadata and attaches them as the remote OTel parent context via
+/// [`Context::attach`](opentelemetry::Context::attach) so the
+/// `tracing-opentelemetry` layer picks them up when new spans are created.
+///
+/// Previously used `tracing::Span::current().set_parent()` which silently
+/// dropped the context when no `tracing` span was active (the common case at
+/// interceptor time).
+///
+/// # Thread-local caveat
+///
+/// The [`ContextGuard`](opentelemetry::ContextGuard) returned by `attach()` is
+/// `!Send`, so it cannot be stored in request extensions.  The context flows
+/// correctly on the handling thread for the synchronous portion of request
+/// processing.  Across `tokio::spawn` boundaries the parent context should be
+/// re-extracted via a stored `opentelemetry::Context` in request extensions.
 ///
 /// When the headers are absent or malformed the request is forwarded unchanged.
 pub fn extract_trace_context(req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
     let propagator = TraceContextPropagator::new();
-    let parent_ctx = propagator.extract(&MetadataExtractor(req.metadata()));
-    let _ = tracing::Span::current().set_parent(parent_ctx);
+    let parent_cx = propagator.extract(&MetadataExtractor(req.metadata()));
+    parent_cx.attach();
     Ok(req)
 }
 

@@ -979,20 +979,9 @@ impl ExecutorTaskRunner {
 
         let typed_requires_reattach = assignment.requires_reattach();
 
-        // C3: Legacy string heuristics removed. requires_reattach is now the only supported path.
-        if !typed_requires_reattach && model == crate::ExecutionModel::Streaming {
-            if !cfg!(test) {
-                return Err(tonic::Status::failed_precondition(
-                    "string-based plan_fragment for streaming terminal state is no longer supported; use requires_reattach on ExecutorTaskAssignment",
-                ));
-            }
-        }
-
-        let terminal_streaming_task =
-            model == crate::ExecutionModel::Streaming && typed_requires_reattach;
-
+        // Terminal state: requires_reattach=true → Running (continuous), false → Succeeded (one-shot)
         let terminal_state =
-            if model == crate::ExecutionModel::Streaming && !terminal_streaming_task {
+            if model == crate::ExecutionModel::Streaming && typed_requires_reattach {
                 TaskState::Running
             } else {
                 TaskState::Succeeded

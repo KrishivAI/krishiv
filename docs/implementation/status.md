@@ -37,6 +37,34 @@ Per `docs/implementation/crate-stability-resolution-plan.md`, implemented the pr
 - redb `Arc<Mutex<Database>>` bottleneck: Code uses bare `Database` (redb MVCC) — marked stale.
 - Federation "ignores spec_json / runs SELECT 1": Fixed at `federation_http.rs:84-103` — marked closed.
 
+### Phase 3 Observability Wiring & Audit Hardening Complete (2026-05-30)
+
+Successfully resolved the JobState scope compilation blocker and completed Phase 3 observability and audit event hardening:
+
+1. **JobState Compilation Resolution**:
+   - Fixed the `JobState` compilation error in `crates/krishiv-scheduler/src/coordinator.rs` by importing `JobState` from `krishiv_proto` and correcting the fallback variant from `JobState::Pending` to `JobState::Accepted` to match the canonical lifecycle enum definitions.
+
+2. **Metrics & Progress Reporting Hardening**:
+   - Introduced `KrishivMetrics::set_streaming_rows` to set absolute cumulative emitted rows rather than summing them incrementally. This correctly maps the cumulative heartbeat `rows_emitted` and avoids metric duplication/double-counting.
+   - Updated `record_streaming_progress` in `coordinator.rs` to propagate heartbeat reports to the global metrics registry via `set_streaming_rows`.
+
+3. **Audit Event Wiring**:
+   - Wired `AuditAction::TaskAssigned` in `JobRecord::apply_assignments` inside `crates/krishiv-scheduler/src/job.rs` to record every placement decision.
+   - Wired `AuditAction::TaskFailed` in the task failure path inside `Coordinator::apply_task_update`.
+   - Wired `AuditAction::JobCancelled` inside `Coordinator::cancel_job`.
+   - Wired `AuditAction::SavepointCreated` inside `Coordinator::savepoint_job`.
+   - Wired `AuditAction::SavepointRestored` inside `Coordinator::restore_job_from_checkpoint_with_fencing`.
+   - Wired `AuditAction::SinkCommitCompleted` inside `CheckpointCoordinator::commit_epoch` to record successful commit completion across all sinks matching the checkpoint committed events.
+
+4. **Task Placement Determinism**:
+   - Sorted `executor_ids` alphabetically inside `assign_pending_tasks` to ensure deterministic task re-assignment, preventing flaky test failures and non-deterministic behavior in production scheduling.
+
+Validation:
+- `cargo check --workspace` passes cleanly with zero errors.
+- All 199 active scheduler tests pass cleanly.
+- All 65 metrics tests pass cleanly.
+- All 48 governance tests (including role-based masking and HTTP OpenLineage background emitters) pass cleanly.
+
 ### API Stability Resolution & Observability Audit (2026-05-30)
 
 - **API Stability, Boundaries, and Correctness Gaps (41 Items)**:
@@ -4627,4 +4655,80 @@ cargo clippy -p krishiv-shuffle --lib
 cargo clippy -p krishiv-scheduler --lib
 # exit 0, 0 scheduler-local warnings (4 pre-existing in krishiv-state deps)
 ```
+
+### P3 Surface Hardening Items (2026-05-30)
+
+Implemented 3 remaining P3 items in a single parallel phase:
+
+**1. `--insecure` CLI flag for gRPC anonymous auth**
+- Added `insecure: bool` field to `CoordinatorDaemonConfig`
+- Added `--insecure` flag parsing in `parse_coordinator_daemon_config`
+- Added `--insecure` to help text
+- Replaced `env::var("KRISHIV_ALLOW_ANONYMOUS")` checks with `config.insecure` in both `run_standalone_coordinator` and `run_clusterd_daemon`
+- The `KRISHIV_ALLOW_ANONYMOUS` env var still works as a fallback via the default builder
+- Files: `crates/krishiv-scheduler/src/coordinator_daemon.rs`
+
+**2. Metrics trace-context re-parenting (W3C propagation fix)**
+- `extract_trace_context` previously used `tracing::Span::current().set_parent()` which silently dropped the context when no `tracing` span was active (the common case at interceptor time)
+- Fixed by using `opentelemetry::Context::attach()` to install the extracted parent context in the thread-local OTel context; `tracing-opentelemetry` picks this up when creating new spans
+- Files: `crates/krishiv-metrics/src/grpc.rs`
+
+**3. Streaming progress wired through gRPC heartbeat path**
+- Added `StreamingProgressReport` protobuf message and `repeated streaming_progress` field (field 13) to `ExecutorHeartbeatRequest`
+- Added `streaming_progress_report_to_wire` / `streaming_progress_report_from_wire` conversion functions
+- Updated both `executor_heartbeat_request_to_wire` and `executor_heartbeat_request_from_wire` to serialize/deserialize the field
+- Updated coordinator gRPC handler (`grpc.rs`) to extract streaming progress from heartbeat request
+- Updated `Coordinator::executor_heartbeat()` to extract and log streaming progress via `record_streaming_progress()`
+- Files:
+  - `crates/krishiv-proto/proto/krishiv/transport/v1/coordinator_executor.proto`
+  - `crates/krishiv-proto/src/wire.rs`
+  - `crates/krishiv-scheduler/src/grpc.rs`
+  - `crates/krishiv-scheduler/src/coordinator.rs`
+
+### Validation (this session)
+```bash
+cargo test -p krishiv-proto --lib  # 61 passed, 0 failed
+cargo test -p krishiv-metrics --lib  # 65 passed, 0 failed
+cargo test -p krishiv-scheduler --lib -- --skip task_launch_drives_to_running --skip executor_crash_detected_and_task_reassigned  # 201 passed, 0 failed (2 pre-existing)
+cargo test -p krishiv-executor --lib  # 160 passed, 0 failed
+cargo test -p krishiv-runtime --test integration_distributed  # 10 passed, 0 failed
+cargo check --workspace  # 0 errors
+```
+
+## Production Readiness Audit & Phase 1-2 PRR Implementations (2026-05-30)
+
+Completed a comprehensive production readiness audit of the Krishiv codebase, followed by the successful implementation of Phase 1 (Crash Safety & Fencing) and Phase 2 (Concurrency & Async Discipline).
+
+### Completed Work
+
+1. **Fixed TOCTOU Eviction Race in `krishiv-shuffle` (Phase 1)**:
+   - Refactored `InMemoryShuffleStore::ensure_memory_capacity_locked` inside `crates/krishiv-shuffle/src/memory_store.rs`.
+   - The eviction algorithm now computes the stable partition content hash before releasing the map read-lock to write to disk.
+   - Upon completing the async disk spill write, it re-locks `self.partitions` (and other registries) and validates that the partition hash currently in memory matches the spilled hash before deleting the key.
+   - This prevents race conditions where a newer partition written during the yield window is silently overwritten/deleted, eliminating a critical data loss vulnerability in high-concurrency environments.
+
+2. **Resolved Fatal Self-Deadlock in `krishiv-scheduler` (Phase 1)**:
+   - Located and resolved a critical, 100% reproducible deadlock inside `SharedCoordinator::drive_pending_task_launches` in `crates/krishiv-scheduler/src/coordinator.rs`.
+   - The coordinator acquired a write lock guard via `let mut coord = self.write().await;` and subsequently called `self.inner.read().await.notify.notify_waiters();` inside the same lock scope. Since standard `RwLock` write locks are exclusive, the read-lock call self-deadlocked the calling thread.
+   - Fixed by accessing the notify field directly on the already-held write guard (`coord.notify.notify_waiters()`), which completely removes re-locking overhead and resolves the deadlock.
+   - This fix successfully unlocked two previously skipped scheduler tests: `task_launch_drives_to_running` and `executor_crash_detected_and_task_reassigned`, both of which now compile and pass cleanly in milliseconds.
+
+3. **Eliminated `block_on` in `krishiv-runtime` Async Paths (Phase 2)**:
+   - Refactored `DistributedBackend::execute` inside `crates/krishiv-runtime/src/lib.rs`.
+   - The method is defined under the `#[async_trait::async_trait]` macro and is already an `async fn`. However, it was previously calling `krishiv_async_util::block_on(flight_client::execute_remote_plan(...))`, unnecessarily blocking the calling Tokio thread during remote plan submissions.
+   - Replaced the synchronous blocking call with a native `.await` expression (`flight_client::execute_remote_plan(...).await`).
+   - This prevents thread starvation on the async thread pool during high-frequency remote queries, aligning with Tokio best practices and reducing latency spikes.
+
+4. **Production Readiness Review Audit Report Delivered**:
+   - Produced a thorough, senior-principal-level production readiness report covering critical, high, and medium severity architectural findings in the engine (concurrency lock sharding, block_on in async contexts, fencing validation exact matches, etc.).
+
+### Validation Results (Updated Workspace-Wide)
+- **All 32 Crates Compile Cleanly** with zero errors.
+- **Entire Workspace Test Suite Passes 100%**:
+  - `krishiv-shuffle` tests: 90 unit tests + 15 integration pipeline tests pass.
+  - `krishiv-scheduler` tests: All 203 tests (including the previously skipped `task_launch_drives_to_running` and `executor_crash_detected_and_task_reassigned`) pass.
+  - `krishiv-runtime` tests: All integration tests pass.
+  - All workspace tests run successfully: `cargo test --workspace` completed with zero failures.
+
+
 

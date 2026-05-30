@@ -11,7 +11,7 @@ pub mod admission;
 pub mod auth;
 pub mod config;
 pub mod coordinator;
-pub mod coordinator_sharded;
+
 pub mod error;
 #[cfg(feature = "etcd")]
 pub mod etcd_lease;

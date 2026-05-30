@@ -232,8 +232,10 @@ impl JobRecord {
 
     pub(crate) fn apply_assignments(&mut self, assignments: Vec<TaskAssignment>) {
         self.state = JobState::Running;
+        let job_id_str = self.job_id().to_string();
         for stage in &mut self.stages {
             stage.state = StageState::Scheduling;
+            let stage_id_str = stage.stage_id().to_string();
             for task in &mut stage.tasks {
                 if let Some(assignment) = assignments
                     .iter()
@@ -241,6 +243,17 @@ impl JobRecord {
                 {
                     task.assigned_executor = Some(assignment.executor_id().clone());
                     task.state = TaskState::Assigned;
+
+                    krishiv_governance::audit_log(
+                        "scheduler",
+                        &krishiv_governance::AuditAction::TaskAssigned {
+                            job_id: job_id_str.clone(),
+                            stage_id: stage_id_str.clone(),
+                            task_id: task.task_id().to_string(),
+                            executor_id: assignment.executor_id().to_string(),
+                        },
+                        krishiv_governance::AuditOutcome::Allowed,
+                    );
                 }
             }
         }
@@ -348,6 +361,11 @@ impl JobRecord {
                     )
                     .with_input_partitions(input_partitions)
                     .with_key_group_range(key_group_range_for_task(task_index, stage_parallelism));
+                    if task_description.starts_with("stream:continuous:")
+                        || task_description.starts_with("stream:loop:")
+                    {
+                        assignment = assignment.with_requires_reattach(true);
+                    }
                     if let Some(secs) = task_timeout_secs {
                         assignment = assignment.with_task_timeout_secs(secs);
                     }

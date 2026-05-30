@@ -187,6 +187,11 @@ pub fn executor_heartbeat_request_to_wire(
             .iter()
             .map(llm_quota_report_to_wire)
             .collect(),
+        streaming_progress: value
+            .streaming_progress()
+            .iter()
+            .map(streaming_progress_report_to_wire)
+            .collect(),
     }
 }
 
@@ -235,6 +240,15 @@ pub fn executor_heartbeat_request_from_wire(
                 .llm_quota_reports
                 .into_iter()
                 .map(llm_quota_report_from_wire)
+                .collect(),
+        );
+    }
+    if !value.streaming_progress.is_empty() {
+        req = req.with_streaming_progress(
+            value
+                .streaming_progress
+                .into_iter()
+                .map(streaming_progress_report_from_wire)
                 .collect(),
         );
     }
@@ -340,6 +354,32 @@ fn llm_quota_report_from_wire(value: v1::LlmQuotaReport) -> crate::LlmQuotaRepor
         requests_used: value.requests_used,
         tokens_used: value.tokens_used,
         period_ms: value.period_ms,
+    }
+}
+
+fn streaming_progress_report_to_wire(value: &crate::StreamingProgressReport) -> v1::StreamingProgressReport {
+    v1::StreamingProgressReport {
+        job_id: value.job_id.clone(),
+        task_id: value.task_id.clone(),
+        watermark_ms: value.watermark_ms,
+        rows_emitted: value.rows_emitted,
+        batches_emitted: value.batches_emitted,
+        state_bytes: value.state_bytes,
+        source_offset: value.source_offset.clone(),
+        timestamp_ms: value.timestamp_ms,
+    }
+}
+
+fn streaming_progress_report_from_wire(value: v1::StreamingProgressReport) -> crate::StreamingProgressReport {
+    crate::StreamingProgressReport {
+        job_id: value.job_id,
+        task_id: value.task_id,
+        watermark_ms: value.watermark_ms,
+        rows_emitted: value.rows_emitted,
+        batches_emitted: value.batches_emitted,
+        state_bytes: value.state_bytes,
+        source_offset: value.source_offset,
+        timestamp_ms: value.timestamp_ms,
     }
 }
 

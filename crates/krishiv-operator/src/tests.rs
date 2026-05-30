@@ -224,15 +224,15 @@ mod operator_tests {
         assert_eq!(all.coordinator_id().as_str(), "coord-1");
     }
 
-    #[test]
-    fn controller_runtime_shares_bootstrap_coordinator_state() {
+    #[tokio::test]
+    async fn controller_runtime_shares_bootstrap_coordinator_state() {
         let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
         let config = KubernetesControllerConfig::namespaced("krishiv-system", coordinator_id)
             .with_bootstrap_executor(BootstrapExecutor::new("exec-1", "executor", 2));
 
         let runtime = KubernetesControllerRuntime::new(&config).unwrap();
         let shared = runtime.coordinator();
-        let coordinator = shared.blocking_read();
+        let coordinator = shared.read().await;
 
         assert_eq!(coordinator.coordinator_id().as_str(), "coord-1");
         assert_eq!(coordinator.executor_snapshots().len(), 1);

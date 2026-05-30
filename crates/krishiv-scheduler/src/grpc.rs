@@ -151,6 +151,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         if !request.llm_quota_reports().is_empty() {
             heartbeat = heartbeat.with_llm_quota_reports(request.llm_quota_reports().to_vec());
         }
+        if !request.streaming_progress().is_empty() {
+            heartbeat = heartbeat.with_streaming_progress(request.streaming_progress().to_vec());
+        }
         let mut coordinator = self.coordinator.write().await;
 
         let response = match coordinator.executor_heartbeat(heartbeat) {

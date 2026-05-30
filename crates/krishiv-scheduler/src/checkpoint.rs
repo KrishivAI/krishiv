@@ -325,6 +325,26 @@ impl CheckpointCoordinator {
         // manifest file.
         write_epoch_hint(self.storage.as_ref(), self.job_id.as_str(), epoch)?;
 
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::CheckpointCommitted {
+                job_id: self.job_id.to_string(),
+                epoch,
+                fencing_token: self.fencing_token.as_u64(),
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
+
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::SinkCommitCompleted {
+                job_id: self.job_id.to_string(),
+                sink_id: "global".to_string(),
+                epoch,
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
+
         self.state = CheckpointCoordinatorState::Committed { epoch };
         self.pending_is_savepoint = false;
         self.awaiting_elapsed_ms = 0;
@@ -346,6 +366,16 @@ impl CheckpointCoordinator {
             epoch,
             reason: reason.to_owned(),
         };
+
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::CheckpointAborted {
+                job_id: self.job_id.to_string(),
+                epoch,
+                reason: Some(reason.to_owned()),
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
     }
 
     /// Load the latest valid epoch from storage on coordinator restart.

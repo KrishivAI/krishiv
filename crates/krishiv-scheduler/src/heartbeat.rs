@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use krishiv_proto::{
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, LeaseGeneration, TaskId,
 };
@@ -15,10 +17,10 @@ pub struct ExecutorHealthSnapshot {
     pub active_task_count: Option<u32>,
 }
 
-/// Executor registry skeleton.
+/// Executor registry backed by `HashMap` for O(1) lookup on the hot heartbeat path.
 #[derive(Debug, Clone)]
 pub struct ExecutorRegistry {
-    pub(crate) executors: Vec<ExecutorRecord>,
+    pub(crate) executors: HashMap<ExecutorId, ExecutorRecord>,
     pub(crate) current_tick: u64,
     pub(crate) heartbeat_timeout_ticks: u64,
     pub(crate) memory_threshold_bytes: Option<u64>,
@@ -34,7 +36,7 @@ impl ExecutorRegistry {
     /// Create an executor registry with deterministic heartbeat timeout ticks.
     pub fn new(heartbeat_timeout_ticks: u64, memory_threshold_bytes: Option<u64>) -> Self {
         Self {
-            executors: Vec::new(),
+            executors: HashMap::new(),
             current_tick: 0,
             heartbeat_timeout_ticks: heartbeat_timeout_ticks.max(1),
             memory_threshold_bytes,
@@ -43,21 +45,10 @@ impl ExecutorRegistry {
 
     /// Register an executor.
     ///
-    /// GAP-CP-07: Idempotent re-registration with lease bump.  When an executor
-    /// re-registers (e.g. after a coordinator restart where state is in memory,
-    /// or after a network partition), the lease generation is bumped so all
-    /// in-flight heartbeats with the old generation are rejected.  This prevents
-    /// zombie executors from submitting stale task updates.
+    /// GAP-CP-07: Idempotent re-registration with lease bump.
     pub fn register(&mut self, descriptor: ExecutorDescriptor) -> SchedulerResult<LeaseGeneration> {
-        if let Some(executor) = self
-            .executors
-            .iter_mut()
-            .find(|e| e.executor_id() == descriptor.executor_id())
-        {
-            // Idempotent re-registration: bump lease only when the executor was
-            // still in a healthy state.  mark_lost / deregister already bump the
-            // lease, so re-registering from Lost/Removed keeps the current
-            // generation rather than incrementing it a second time.
+        let executor_id = descriptor.executor_id().clone();
+        if let Some(executor) = self.executors.get_mut(&executor_id) {
             let was_alive = executor.state.can_accept_work()
                 || matches!(executor.state, ExecutorState::Draining);
             let new_lease = if was_alive {
@@ -75,11 +66,10 @@ impl ExecutorRegistry {
         }
 
         let lease_generation = LeaseGeneration::initial();
-        self.executors.push(ExecutorRecord::new(
-            descriptor,
-            self.current_tick,
-            lease_generation,
-        ));
+        self.executors.insert(
+            executor_id.clone(),
+            ExecutorRecord::new(descriptor, self.current_tick, lease_generation),
+        );
         Ok(lease_generation)
     }
 
@@ -133,7 +123,7 @@ impl ExecutorRegistry {
         self.current_tick = self.current_tick.saturating_add(ticks);
         let mut lost = Vec::new();
 
-        for executor in &mut self.executors {
+        for executor in self.executors.values_mut() {
             if executor.state().can_accept_work()
                 && self
                     .current_tick
@@ -150,9 +140,9 @@ impl ExecutorRegistry {
         lost
     }
 
-    /// List registered executors.
-    pub fn list(&self) -> &[ExecutorRecord] {
-        &self.executors
+    /// List registered executors as a cloned Vec.
+    pub fn list(&self) -> Vec<ExecutorRecord> {
+        self.executors.values().cloned().collect()
     }
 
     /// Current deterministic heartbeat tick.
@@ -174,13 +164,13 @@ impl ExecutorRegistry {
     pub(crate) fn assignment_leases(&self) -> Vec<(ExecutorId, LeaseGeneration)> {
         self.executors
             .iter()
-            .map(|executor| (executor.executor_id().clone(), executor.lease_generation()))
+            .map(|(id, executor)| (id.clone(), executor.lease_generation()))
             .collect()
     }
 
     pub(crate) fn heartbeat_ages(&self) -> Vec<ExecutorHeartbeatAge> {
         self.executors
-            .iter()
+            .values()
             .map(|executor| ExecutorHeartbeatAge {
                 executor_id: executor.executor_id().clone(),
                 age_ticks: self
@@ -190,10 +180,9 @@ impl ExecutorRegistry {
             .collect()
     }
 
-    /// P2.5: Return borrowed references instead of cloning every descriptor.
     pub(crate) fn schedulable_executors(&self) -> Vec<&ExecutorDescriptor> {
         self.executors
-            .iter()
+            .values()
             .filter(|executor| {
                 if !executor.state().can_accept_work() || executor.descriptor().slots() == 0 {
                     return false;
@@ -215,24 +204,22 @@ impl ExecutorRegistry {
         &self,
         executor_id: &ExecutorId,
     ) -> SchedulerResult<&ExecutorRecord> {
-        self.executors
-            .iter()
-            .find(|executor| executor.executor_id() == executor_id)
-            .ok_or_else(|| SchedulerError::UnknownExecutor {
+        self.executors.get(executor_id).ok_or_else(|| {
+            SchedulerError::UnknownExecutor {
                 executor_id: executor_id.clone(),
-            })
+            }
+        })
     }
 
     pub(crate) fn find_executor_mut(
         &mut self,
         executor_id: &ExecutorId,
     ) -> SchedulerResult<&mut ExecutorRecord> {
-        self.executors
-            .iter_mut()
-            .find(|executor| executor.executor_id() == executor_id)
-            .ok_or_else(|| SchedulerError::UnknownExecutor {
+        self.executors.get_mut(executor_id).ok_or_else(|| {
+            SchedulerError::UnknownExecutor {
                 executor_id: executor_id.clone(),
-            })
+            }
+        })
     }
 }
 
@@ -337,24 +324,14 @@ impl ExecutorRegistry {
     /// Returns true if this executor has now crossed the given threshold
     /// and should be temporarily avoided for new assignments.
     pub fn record_task_failure(&mut self, executor_id: &ExecutorId, threshold: u32) -> bool {
-        if let Some(record) = self
-            .executors
-            .iter_mut()
-            .find(|e| e.executor_id() == executor_id)
-        {
-            record.record_task_failure(threshold)
-        } else {
-            false
-        }
+        self.executors
+            .get_mut(executor_id)
+            .is_some_and(|record| record.record_task_failure(threshold))
     }
 
     /// Reset failure count for an executor (e.g. after it reports healthy progress).
     pub fn reset_task_failures(&mut self, executor_id: &ExecutorId) {
-        if let Some(record) = self
-            .executors
-            .iter_mut()
-            .find(|e| e.executor_id() == executor_id)
-        {
+        if let Some(record) = self.executors.get_mut(executor_id) {
             record.reset_task_failures();
         }
     }
@@ -362,7 +339,7 @@ impl ExecutorRegistry {
     /// Return list of executors that currently exceed the failure threshold.
     pub fn executors_over_failure_threshold(&self, threshold: u32) -> Vec<ExecutorId> {
         self.executors
-            .iter()
+            .values()
             .filter(|e| e.consecutive_task_failures >= threshold)
             .map(|e| e.executor_id().clone())
             .collect()

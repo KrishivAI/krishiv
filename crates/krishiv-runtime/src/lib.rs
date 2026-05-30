@@ -418,8 +418,6 @@ impl ExecutionBackend for DistributedBackend {
     }
 
     async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        use krishiv_async_util::block_on;
-
         debug!(
             backend = "distributed",
             coordinator = %self.flight_url,
@@ -428,7 +426,7 @@ impl ExecutionBackend for DistributedBackend {
             sql = %flight_client::plan_to_sql(plan),
             "DistributedBackend: submitting plan via Flight SQL"
         );
-        block_on(flight_client::execute_remote_plan(&self.flight_url, plan))?;
+        flight_client::execute_remote_plan(&self.flight_url, plan).await?;
         Ok(ExecutionReport::new(
             self.backend_name(),
             plan.name(),

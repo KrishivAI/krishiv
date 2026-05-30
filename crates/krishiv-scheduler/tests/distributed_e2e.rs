@@ -5,10 +5,10 @@ use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec, StageId, StageSpec,
     TaskId, TaskSpec,
 };
-use krishiv_scheduler::{Coordinator, JobCoordinator, SharedCoordinator};
+use krishiv_scheduler::{Coordinator, SharedCoordinator};
 
-#[test]
-fn in_process_batch_job_submits_with_plan_op_lowering() {
+#[tokio::test]
+async fn in_process_batch_job_submits_with_plan_op_lowering() {
     let coord_id = CoordinatorId::try_new("e2e-coord").unwrap();
     let mut coord = Coordinator::active(coord_id);
     let exec_id = ExecutorId::try_new("e2e-exec").unwrap();
@@ -30,9 +30,11 @@ fn in_process_batch_job_submits_with_plan_op_lowering() {
     let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage")
         .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), fragment));
     let spec = JobSpec::new(job_id.clone(), "e2e", JobKind::Batch).with_stage(stage);
-    let jcp = JobCoordinator::new(job_id.clone(), shared);
-    jcp.submit_job(spec).unwrap();
-    assert_eq!(jcp.job_snapshot().unwrap().job_id(), &job_id);
+    shared.write().await.submit_job(spec).unwrap();
+    assert_eq!(
+        shared.read().await.job_snapshot(&job_id).unwrap().job_id(),
+        &job_id
+    );
 }
 
 #[test]

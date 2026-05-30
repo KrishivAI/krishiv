@@ -417,6 +417,15 @@ impl KrishivMetrics {
             .fetch_add(rows, Ordering::Relaxed);
     }
 
+    /// Set absolute cumulative rows emitted by a streaming task.
+    pub fn set_streaming_rows(&self, job_id: &str, task_id: &str, rows: u64) {
+        let key = format!("{job_id}:{task_id}");
+        self.streaming_rows
+            .entry(key)
+            .or_default()
+            .store(rows, Ordering::Relaxed);
+    }
+
     // ── State backend gauges ──────────────────────────────────────────────
 
     /// Set the key count for a state backend.

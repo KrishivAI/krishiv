@@ -299,8 +299,8 @@ mod scheduler_tests {
         );
     }
 
-    #[test]
-    fn shared_coordinator_exposes_same_scheduler_state_to_clones() {
+    #[tokio::test]
+    async fn shared_coordinator_exposes_same_scheduler_state_to_clones() {
         let shared = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-1").unwrap(),
         ));
@@ -308,7 +308,7 @@ mod scheduler_tests {
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
 
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
                 .unwrap();
@@ -317,7 +317,7 @@ mod scheduler_tests {
                 .unwrap();
         }
 
-        let coordinator = observer.blocking_read();
+        let coordinator = observer.read().await;
         assert_eq!(coordinator.executor_snapshots().len(), 1);
         assert_eq!(
             coordinator.executor_snapshots()[0].state(),
@@ -370,7 +370,7 @@ mod scheduler_tests {
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
         assert_eq!(response.lease_generation(), LeaseGeneration::initial());
-        let coordinator = shared.blocking_read();
+        let coordinator = shared.read().await;
         assert_eq!(coordinator.executor_snapshots().len(), 1);
         assert_eq!(
             coordinator.executor_snapshots()[0].executor_id(),
@@ -413,7 +413,7 @@ mod scheduler_tests {
             .into_inner();
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
-        let coordinator = shared.blocking_read();
+        let coordinator = shared.read().await;
         let executor = &coordinator.executor_snapshots()[0];
         assert_eq!(executor.state(), ExecutorState::Healthy);
         assert_eq!(executor.running_tasks(), &[task_id]);
@@ -453,7 +453,7 @@ mod scheduler_tests {
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
 
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
                 .unwrap();
@@ -525,7 +525,7 @@ mod scheduler_tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn task_launch_drives_to_running() {
         let service = RecordingExecutorTaskService::default();
         let recorded = service.task_ids.clone();
@@ -629,7 +629,7 @@ mod scheduler_tests {
 
         assert_eq!(heartbeat.disposition(), TransportDisposition::Accepted);
         {
-            let coordinator = shared.blocking_read();
+            let coordinator = shared.read().await;
             assert_eq!(coordinator.executor_snapshots().len(), 1);
             assert_eq!(
                 coordinator.executor_snapshots()[0].state(),
@@ -642,7 +642,7 @@ mod scheduler_tests {
         let stage_id = job.stages()[0].stage_id().clone();
         let task_id = job.stages()[0].tasks()[0].task_id().clone();
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             coordinator.submit_job(job).unwrap();
             coordinator.launch_assigned_tasks(&job_id).unwrap();
         }
@@ -709,7 +709,7 @@ mod scheduler_tests {
         assert_eq!(register_resp.disposition(), TransportDisposition::Accepted);
 
         let lease_generation = {
-            let coordinator = shared.blocking_read();
+            let coordinator = shared.read().await;
             coordinator
                 .executor_snapshots()
                 .into_iter()
@@ -729,7 +729,7 @@ mod scheduler_tests {
         assert_eq!(dereg_resp.disposition(), TransportDisposition::Accepted);
 
         {
-            let coordinator = shared.blocking_read();
+            let coordinator = shared.read().await;
             let snapshot = coordinator
                 .executor_snapshots()
                 .into_iter()
@@ -756,7 +756,7 @@ mod scheduler_tests {
         let task_id = job.stages()[0].tasks()[0].task_id().clone();
 
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
                 .unwrap();
@@ -779,7 +779,8 @@ mod scheduler_tests {
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
         assert_eq!(
             shared
-                .blocking_read()
+                .read()
+                .await
                 .job_snapshot(&job_id)
                 .unwrap()
                 .state(),
@@ -807,7 +808,7 @@ mod scheduler_tests {
         );
 
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
                 .unwrap();
@@ -855,7 +856,7 @@ mod scheduler_tests {
         let task_id = job.stages()[0].tasks()[0].task_id().clone();
 
         {
-            let mut coordinator = shared.blocking_write();
+            let mut coordinator = shared.write().await;
             coordinator
                 .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
                 .unwrap();
@@ -4281,10 +4282,9 @@ mod scheduler_tests {
     async fn notify_wakes_on_executor_registration_and_deregistration() {
         use std::time::Duration;
 
-        // Exercises the real Notify producer (register/deregister fast paths)
-        // + consumer helpers added for Track A async safety work.
-        // This is the signaling foundation needed to reduce reliance on
-        // periodic block_on-based sync_inner_to_coord.
+        // Exercises the real Notify producer (register/deregister paths through
+        // SharedCoordinator's RwLock) + consumer helpers added for Track A async
+        // safety work.
         let coord = Coordinator::active(CoordinatorId::try_new("notify-coord").unwrap());
         let coordinator = SharedCoordinator::new(coord);
 
@@ -4293,19 +4293,23 @@ mod scheduler_tests {
 
         // Registration should have notified
         let lease = coordinator
-            .register_executor_fast(desc)
+            .write()
             .await
+            .register_executor(desc)
             .expect("register should succeed");
 
         // The wait helper should return promptly because a notification was already sent.
         // We use a short timeout to prove it doesn't block forever.
-        let wait = coordinator.wait_for_executor_change();
+        let wait = coordinator.wait_for_change();
         let _ = tokio::time::timeout(Duration::from_millis(100), wait).await;
 
         // Deregistration should also notify
-        let _ = coordinator.deregister_executor_fast(&exec_id, lease).await;
+        let _ = coordinator
+            .write()
+            .await
+            .deregister_executor(&exec_id, lease);
 
-        let wait2 = coordinator.wait_for_executor_change();
+        let wait2 = coordinator.wait_for_change();
         let _ = tokio::time::timeout(Duration::from_millis(100), wait2).await;
     }
 
@@ -4369,7 +4373,7 @@ mod scheduler_tests {
         h.partition(exec.clone());
         h.simulate_partition_and_recovery(exec.clone());
 
-        // The harness models the timing; in real system the wait_for_executor_change would wake the daemon.
+        // The harness models the timing; in real system the wait_for_change would wake the daemon.
         assert!(!h.is_partitioned(&exec));
     }
 

@@ -632,6 +632,10 @@ pub(crate) struct PersistedTaskRecord {
     pub(crate) attempt: u32,
     pub(crate) output_metadata: Option<PersistedTaskOutputMetadata>,
     pub(crate) last_failure_reason: Option<String>,
+    /// Track consecutive failures so retry budgets survive coordinator restart.
+    /// Defaults to 0 for records written before this field was added (backward compatible).
+    #[serde(default)]
+    pub(crate) failure_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -761,6 +765,7 @@ impl From<&TaskRecord> for PersistedTaskRecord {
                 .as_ref()
                 .map(PersistedTaskOutputMetadata::from),
             last_failure_reason: value.last_failure_reason.clone(),
+            failure_count: value.failure_count,
         }
     }
 }
@@ -781,7 +786,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             launch_in_flight: false,
             output_metadata: value.output_metadata.map(TaskOutputMetadata::from),
             last_failure_reason: value.last_failure_reason,
-            failure_count: 0,
+            failure_count: value.failure_count,
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.
             last_watermark_ms: None,
             last_source_offset: None,

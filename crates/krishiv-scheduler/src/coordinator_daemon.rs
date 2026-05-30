@@ -45,6 +45,8 @@ pub struct CoordinatorDaemonConfig {
     pub etcd_lease_key: String,
     /// etcd lease TTL in seconds (default 15).
     pub leader_lease_duration_s: u64,
+    /// Allow anonymous gRPC (dev only; default: false).
+    pub insecure: bool,
     pub help: bool,
 }
 
@@ -232,23 +234,15 @@ pub async fn spawn_coordinator_sidecars(
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_millis(tick_period_ms));
         loop {
-            // Real Notify-driven wake + periodic fallback.
-            // This allows the coordinator to react promptly to executor
-            // and checkpoint state changes instead of only on fixed ticks.
             tokio::select! {
                 _ = ticker.tick() => {}
-                _ = tick_coordinator.wait_for_executor_change() => {}
-                _ = tick_coordinator.wait_for_checkpoint_change() => {}
+                _ = tick_coordinator.wait_for_change() => {}
             }
 
-            tick_coordinator.sync_inner_to_coord();
-            {
-                let mut coord = tick_coordinator.write().await;
-                if let Err(e) = coord.coordinator_tick() {
-                    tracing::warn!(error = %e, "coordinator tick failed");
-                }
+            let mut coord = tick_coordinator.write().await;
+            if let Err(e) = coord.coordinator_tick() {
+                tracing::warn!(error = %e, "coordinator tick failed");
             }
-            tick_coordinator.sync_coord_to_inner();
         }
     });
 
@@ -439,12 +433,12 @@ async fn readyz(
 async fn metrics(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        render_metrics_body(&coordinator),
+        render_metrics_body(&coordinator).await,
     )
 }
 
-fn render_metrics_body(coordinator: &SharedCoordinator) -> String {
-    let m = coordinator.blocking_read().stability_metrics();
+async fn render_metrics_body(coordinator: &SharedCoordinator) -> String {
+    let m = coordinator.read().await.stability_metrics();
     let max_hb_age = m
         .heartbeat_ages()
         .iter()
@@ -521,6 +515,9 @@ pub fn parse_coordinator_daemon_config(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(15),
+        insecure: env::var("KRISHIV_ALLOW_ANONYMOUS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
         help: false,
     };
     let mut args = args.into_iter();
@@ -572,6 +569,7 @@ pub fn parse_coordinator_daemon_config(
                     .parse()
                     .map_err(|_| format!("invalid integer for --leader-lease-secs: {value}"))?;
             }
+            "--insecure" => config.insecure = true,
             "--help" | "-h" => config.help = true,
             unknown => {
                 return Err(
@@ -635,19 +633,17 @@ pub fn coordinator_daemon_help() -> &'static str {
        --metadata-path <PATH>      Durable metadata path (required for json/sqlite)\n\
        --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
        --etcd-endpoints <HOSTS>    Comma-separated etcd URLs (KRISHIV_ETCD_ENDPOINTS)\n\
-       --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
-       --leader-lease-secs <N>     etcd lease TTL seconds (default 15)\n\
-       -h, --help                  Show help\n"
+        --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
+        --leader-lease-secs <N>     etcd lease TTL seconds (default 15)\n\
+        --insecure                  Allow anonymous gRPC (dev only; default: false)\n\
+        -h, --help                  Show help\n"
 }
 
 /// Standalone active coordinator (bare metal / VM).
 pub async fn run_standalone_coordinator(
     config: CoordinatorDaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
-    if env::var("KRISHIV_ALLOW_ANONYMOUS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
+    if config.insecure {
         crate::auth::set_allow_anonymous();
     }
     let coordinator = build_shared_coordinator(&config)?;
@@ -664,10 +660,7 @@ pub async fn run_standalone_coordinator(
 
 /// Cluster control plane daemon (`krishiv-clusterd`).
 pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
-    if env::var("KRISHIV_ALLOW_ANONYMOUS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
+    if config.insecure {
         crate::auth::set_allow_anonymous();
     }
     let shared = build_shared_coordinator(&config)?;
@@ -910,12 +903,12 @@ mod parse_tests {
         assert!(err.to_string().contains("etcd-endpoints"));
     }
 
-    #[test]
-    fn metrics_body_includes_scheduler_counters() {
+    #[tokio::test]
+    async fn metrics_body_includes_scheduler_counters() {
         let coordinator = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-metrics").unwrap(),
         ));
-        let body = render_metrics_body(&coordinator);
+        let body = render_metrics_body(&coordinator).await;
         assert!(body.contains("krishiv_scheduler_jobs_submitted_total"));
         assert!(body.contains("krishiv_scheduler_checkpoint_epochs_total"));
         assert!(body.contains("krishiv_scheduler_tasks_assigned_total"));

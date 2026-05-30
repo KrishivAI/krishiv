@@ -16,7 +16,7 @@ use krishiv_runtime::in_process::BatchSqlTable;
 use krishiv_runtime::in_process_cluster::InProcessCluster;
 use krishiv_runtime::local_streaming::{LocalWindowExecutionSpec, LocalWindowKind};
 use krishiv_runtime::{DistributedBackend, ExecutionBackend};
-use krishiv_scheduler::{Coordinator, JobCoordinator, SharedCoordinator};
+use krishiv_scheduler::Coordinator;
 use tonic::transport::Server;
 
 // ---------------------------------------------------------------------------
@@ -405,15 +405,13 @@ async fn coordinator_executor_lifecycle() {
         .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), fragment));
     let spec = JobSpec::new(job_id.clone(), "lifecycle", JobKind::Batch).with_stage(stage);
 
-    let shared = SharedCoordinator::new(coordinator);
-    let jcp = JobCoordinator::new(job_id.clone(), shared);
-    jcp.submit_job(spec).unwrap();
+    coordinator.submit_job(spec).unwrap();
 
     // Tick to process.
-    jcp.coordinator_tick().unwrap();
+    coordinator.coordinator_tick().unwrap();
 
     // Verify job exists.
-    let snap = jcp.job_snapshot().unwrap();
+    let snap = coordinator.job_snapshot(&job_id).unwrap();
     assert_eq!(snap.job_id(), &job_id);
 }
 

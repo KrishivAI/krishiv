@@ -290,11 +290,15 @@ impl ExecutorRuntime {
             .unwrap_or_default();
 
         // Drain streaming progress snapshots (GAP-OB-04). Runner tasks write
-        // into the buffer; we drain here so each heartbeat reports the latest
-        // progress for every actively-streaming task.
+        // into the buffer via ProgressBufferCallback; we drain here so each
+        // heartbeat reports the latest progress for every actively-streaming
+        // task.  The buffer is cleared after reading so stale entries from
+        // completed tasks do not accumulate.
         let progress: Vec<krishiv_proto::StreamingProgressReport> =
             if let Some(buf) = &self.config.progress_buffer {
-                buf.iter().map(|e| e.value().clone()).collect()
+                let reports: Vec<_> = buf.iter().map(|e| e.value().clone()).collect();
+                buf.clear();
+                reports
             } else {
                 Vec::new()
             };

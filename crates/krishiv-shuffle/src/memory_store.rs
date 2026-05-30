@@ -118,7 +118,7 @@ impl InMemoryShuffleStore {
             // Read partition data under lock (clone is cheap — Arc bumps).
             // Do NOT remove from partitions yet; only remove after the spill
             // write succeeds, so a spill failure doesn't lose data.
-            let (spill_partition, spill_size, spill_token) = {
+            let (spill_partition, spill_size, spill_token, spill_hash) = {
                 let parts = shuffle_read_lock(&self.partitions)?;
                 let Some(partition) = parts.get(&key_to_spill).cloned() else {
                     continue;
@@ -128,7 +128,8 @@ impl InMemoryShuffleStore {
                     .get(&key_to_spill)
                     .copied()
                     .unwrap_or(0);
-                (partition, spill_size, spill_token)
+                let spill_hash = compute_simple_partition_hash(&partition);
+                (partition, spill_size, spill_token, spill_hash)
             };
 
             // Spill to disk. If this fails, the partition stays in memory
@@ -143,14 +144,26 @@ impl InMemoryShuffleStore {
                 let mut parts = shuffle_write_lock(&self.partitions)?;
                 let mut spilled = shuffle_write_lock(&self.spilled)?;
                 let mut used = shuffle_write_lock(&self.bytes_used)?;
+                let mut hashes = shuffle_write_lock(&self.content_hashes)?;
                 let current_token = shuffle_read_lock(&self.lease_tokens)?
                     .get(&key_to_spill)
                     .copied()
                     .unwrap_or(0);
                 if current_token == spill_token {
-                    parts.remove(&key_to_spill);
-                    spilled.insert(key_to_spill);
-                    *used = used.saturating_sub(spill_size);
+                    if let Some(current_part) = parts.get(&key_to_spill) {
+                        let current_hash = compute_simple_partition_hash(current_part);
+                        if current_hash == spill_hash {
+                            parts.remove(&key_to_spill);
+                            hashes.remove(&key_to_spill);
+                            spilled.insert(key_to_spill);
+                            *used = used.saturating_sub(spill_size);
+                        } else {
+                            tracing::info!(
+                                "spill-to-disk cleanup skipped for {:?}: partition was modified during write",
+                                key_to_spill
+                            );
+                        }
+                    }
                 }
             }
         }
