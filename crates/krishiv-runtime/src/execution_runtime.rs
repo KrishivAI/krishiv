@@ -241,7 +241,7 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
 
 /// Runtime that routes all data-plane work to a Flight/gRPC endpoint.
 pub struct RemoteExecutionRuntime {
-    flight_url: String,
+    pool: crate::flight_client::FlightClientPool,
     coordinator_grpc_url: Option<String>,
     session_mode: RuntimeMode,
     placement: ExecutionPlacement,
@@ -255,7 +255,7 @@ impl RemoteExecutionRuntime {
         placement: ExecutionPlacement,
     ) -> Self {
         Self {
-            flight_url: flight_url.into(),
+            pool: crate::flight_client::FlightClientPool::new(flight_url),
             coordinator_grpc_url,
             session_mode,
             placement,
@@ -357,18 +357,28 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
 }
 
 /// Build the appropriate runtime for a session configuration.
+///
+/// `in_process_cluster` is required for Embedded and SingleNode with
+/// `LocalInProcess` placement. It is ignored (but can be `None`) for
+/// SingleNodeDaemon and Distributed placements.
 pub fn build_execution_runtime(
     mode: RuntimeMode,
-    cluster: Arc<InProcessCluster>,
+    in_process_cluster: Option<Arc<InProcessCluster>>,
     coordinator_flight_url: Option<String>,
     coordinator_grpc_url: Option<String>,
     placement: ExecutionPlacement,
 ) -> RuntimeResult<Arc<dyn ExecutionRuntime>> {
     match (mode, placement) {
-        (RuntimeMode::Embedded, ExecutionPlacement::LocalInProcess) => Ok(Arc::new(
-            InProcessExecutionRuntime::embedded(Arc::clone(&cluster)),
-        )),
+        (RuntimeMode::Embedded, ExecutionPlacement::LocalInProcess) => {
+            let cluster = in_process_cluster
+                .clone()
+                .ok_or_else(|| RuntimeError::unsupported("Embedded mode requires an InProcessCluster"))?;
+            Ok(Arc::new(InProcessExecutionRuntime::embedded(cluster)))
+        }
         (RuntimeMode::SingleNode, ExecutionPlacement::LocalInProcess) => {
+            let cluster = in_process_cluster.ok_or_else(|| {
+                RuntimeError::unsupported("SingleNode LocalInProcess requires an InProcessCluster")
+            })?;
             Ok(Arc::new(InProcessExecutionRuntime::single_node(cluster)))
         }
         (RuntimeMode::SingleNode, ExecutionPlacement::SingleNodeDaemon) => {

@@ -164,7 +164,10 @@ impl DataFrame {
             return Ok(QueryResult::new(batches.clone()));
         }
 
-        let result = if let Some(query) = self.sql_query.as_deref() {
+        let uses_remote = self.runtime.uses_remote_execution();
+
+        let result = if uses_remote && self.sql_query.is_some() {
+            let query = self.sql_query.as_deref().unwrap();
             let tables = self
                 .registered_parquet
                 .read()
@@ -175,6 +178,18 @@ impl DataFrame {
             crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables)
                 .await
                 .map(QueryResult::new)
+        } else if let Some(dataframe) = &self.sql_dataframe {
+            self.runtime
+                .accept_plan(&PhysicalPlan::new(
+                    self.logical_plan.name(),
+                    self.logical_plan.kind(),
+                ))
+                .map_err(KrishivError::from)?;
+            dataframe
+                .collect()
+                .await
+                .map(QueryResult::new)
+                .map_err(Into::into)
         } else {
             self.runtime
                 .accept_plan(&PhysicalPlan::new(
@@ -182,16 +197,9 @@ impl DataFrame {
                     self.logical_plan.kind(),
                 ))
                 .map_err(KrishivError::from)?;
-            match &self.sql_dataframe {
-                Some(dataframe) => dataframe
-                    .collect()
-                    .await
-                    .map(QueryResult::new)
-                    .map_err(Into::into),
-                None => Err(KrishivError::unsupported(
-                    "logical-only DataFrame cannot be collected",
-                )),
-            }
+            Err(KrishivError::unsupported(
+                "logical-only DataFrame cannot be collected",
+            ))
         };
 
         match &result {

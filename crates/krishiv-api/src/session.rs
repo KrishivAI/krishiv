@@ -111,7 +111,7 @@ pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
     let cluster = Arc::new(InProcessCluster::new().expect("orphan embedded in-process cluster"));
     build_execution_runtime(
         RuntimeMode::Embedded,
-        cluster,
+        Some(cluster),
         None,
         None,
         ExecutionPlacement::LocalInProcess,
@@ -259,7 +259,7 @@ impl SessionBuilder {
 
         let runtime = build_execution_runtime(
             execution_mode_to_runtime_mode(self.mode),
-            Arc::clone(&local_cluster),
+            Some(Arc::clone(&local_cluster)),
             self.coordinator_url.clone(),
             self.local_cluster_grpc.clone(),
             placement,

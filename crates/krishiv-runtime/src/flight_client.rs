@@ -4,6 +4,8 @@ use arrow_flight::Ticket;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
+use std::sync::Arc;
+use std::sync::OnceLock;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::flight_protocol::{
@@ -55,6 +57,46 @@ async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlService
         .await
         .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;
     Ok(FlightSqlServiceClient::new(channel))
+}
+
+async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
+    Endpoint::from_shared(endpoint.to_string())
+        .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))
+}
+
+/// Lazily-connected gRPC channel reused across remote Flight calls.
+///
+/// Each remote operation previously created a new `tonic::Channel` per
+/// invocation. This pool reuses a single persistent channel to reduce
+/// connection handshakes and TLS negotiations.
+#[derive(Clone)]
+pub struct FlightClientPool {
+    endpoint: String,
+    channel: Arc<tokio::sync::OnceCell<Channel>>,
+}
+
+impl FlightClientPool {
+    pub fn new(flight_url: impl Into<String>) -> Self {
+        Self {
+            endpoint: normalize_flight_endpoint(&flight_url.into())
+                .unwrap_or_else(|_| String::new()),
+            channel: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    pub fn flight_url(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub async fn get_channel(&self) -> RuntimeResult<Channel> {
+        let cell = self.channel.get_or_try_init(|| async {
+            connect_flight_channel(&self.endpoint).await
+        });
+        cell.await.as_ref().map(Channel::clone).map_err(|e| e.clone())
+    }
 }
 
 /// Submit `plan` to the remote Flight endpoint.
