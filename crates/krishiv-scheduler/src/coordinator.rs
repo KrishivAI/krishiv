@@ -54,6 +54,11 @@ fn generate_coordinator_id() -> SchedulerResult<CoordinatorId> {
         .unwrap_or_else(|_| format!("host-{}", std::process::id()));
     let pid = std::process::id();
     let tick = COORDINATOR_NEXT_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Include a timestamp to ensure uniqueness across PID reuse (L1: prevents collisions).
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() % 1_000_000) as u32) // last 6 digits of unix timestamp
+        .unwrap_or(0);
     // Sanitize hostname: replace chars invalid in IDs with '-'
     let safe_hostname: String = hostname
         .chars()
@@ -66,7 +71,7 @@ fn generate_coordinator_id() -> SchedulerResult<CoordinatorId> {
         })
         .take(40)
         .collect();
-    CoordinatorId::try_new(format!("coord-{safe_hostname}-{pid}-{tick}")).map_err(|e| {
+    CoordinatorId::try_new(format!("coord-{safe_hostname}-{pid}-{ts}-{tick}")).map_err(|e| {
         SchedulerError::InvalidJob {
             message: format!("generated coordinator id invalid: {e}"),
         }
@@ -112,6 +117,9 @@ pub struct Coordinator {
     /// P1.1: O(1) index from streaming task id to (job_id, stage_id) for heartbeat lookup.
     /// Populated when tasks are assigned; entries removed on task completion/failure.
     pub(crate) streaming_task_index: HashMap<TaskId, (JobId, StageId)>,
+    /// Reverse index from job_id to task_ids for O(tasks_per_job) cleanup.
+    /// Built in `index_streaming_tasks`, used in `remove_streaming_task_index`.
+    pub(crate) streaming_job_task_index: HashMap<JobId, Vec<TaskId>>,
     /// M6: Sharded gRPC channel cache keyed by executor endpoint string.
     /// DashMap provides per-shard locking so lookups for different endpoints
     /// proceed in parallel.  Avoids a full TCP+TLS handshake per task push.
@@ -479,6 +487,7 @@ impl Coordinator {
             adaptive_decision_log: HashMap::new(),
             adaptive_override: AdaptiveOverrideConfig::default(),
             streaming_task_index: HashMap::new(),
+            streaming_job_task_index: HashMap::new(),
             executor_channels: Arc::new(DashMap::new()),
             checkpoint_notify_sent: HashSet::new(),
             barrier_dispatch_sent: HashSet::new(),
@@ -766,9 +775,11 @@ impl Coordinator {
             log_bucket.push_back(log);
 
             if applied {
+                // Clamp heat_score to [0, 1] to prevent invalid calculations from NaN or out-of-range values.
+                let heat = report.heat_score.clamp(0.0_f64, 1.0_f64);
                 // Throttle the source proportional to its heat score.
                 let reduced_rate =
-                    ((1.0 - report.heat_score) * BASE_ROWS_PER_SECOND as f64).max(1.0) as u64;
+                    ((1.0 - heat) * BASE_ROWS_PER_SECOND as f64).max(1.0) as u64;
                 throttles.push(crate::adaptive::ThrottleDecision {
                     source_id: report.source_id.clone(),
                     rows_per_second: Some(reduced_rate),
@@ -833,30 +844,34 @@ impl Coordinator {
     /// Populate `streaming_task_index` for all tasks in a job after assignment.
     ///
     /// Called after `apply_assignments` so that streaming heartbeats can use the O(1) index.
+    /// Also populates the reverse index for O(tasks_per_job) cleanup.
     fn index_streaming_tasks(&mut self, job_id: &JobId) {
         let job = match self.jobs.get(job_id) {
             Some(j) => j,
             None => return,
         };
+        let mut job_task_ids = Vec::new();
         for stage in &job.stages {
             let stage_id = stage.stage_id().clone();
             for task in stage.tasks() {
+                let task_id = task.task_id().clone();
                 self.streaming_task_index
-                    .insert(task.task_id().clone(), (job_id.clone(), stage_id.clone()));
+                    .insert(task_id.clone(), (job_id.clone(), stage_id.clone()));
+                job_task_ids.push(task_id);
             }
+        }
+        if !job_task_ids.is_empty() {
+            self.streaming_job_task_index.insert(job_id.clone(), job_task_ids);
         }
     }
 
     /// Remove `streaming_task_index` entries for a completed/failed/cancelled job.
+    /// Uses the reverse index for O(tasks_per_job) lookup instead of O(total_tasks) scan.
     fn remove_streaming_task_index(&mut self, job_id: &JobId) {
-        let task_ids: Vec<TaskId> = self
-            .streaming_task_index
-            .iter()
-            .filter(|(_, (jid, _))| jid == job_id)
-            .map(|(tid, _)| tid.clone())
-            .collect();
-        for tid in task_ids {
-            self.streaming_task_index.remove(&tid);
+        if let Some(task_ids) = self.streaming_job_task_index.remove(job_id) {
+            for tid in task_ids {
+                self.streaming_task_index.remove(&tid);
+            }
         }
     }
 
@@ -1260,7 +1275,7 @@ impl Coordinator {
             });
         }
         let inserted_job_id = record.job_id().clone();
-        self.jobs.insert(inserted_job_id.clone(), record);
+        self.jobs.insert(inserted_job_id.clone(), record.clone());
 
         // Track B (two-tier CCP/JCP): create the owning JobCoordinator for this job.
         // The JCP holds the Arc<RwLock<JobRecord>> and will progressively own per-job
@@ -1268,7 +1283,7 @@ impl Coordinator {
         // The outer Coordinator (CCP) retains cross-job concerns and the thin map for delegation.
         let jcp = crate::job_coordinator::JobCoordinator::new(
             inserted_job_id.clone(),
-            self.jobs.get(&inserted_job_id).unwrap().clone(),
+            record.clone(),
         );
         self.job_coordinators
             .insert(inserted_job_id.clone(), Arc::new(jcp));
@@ -1817,13 +1832,18 @@ impl Coordinator {
                         krishiv_metrics::grpc::inject_trace_context
                             as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
                     );
-                let response = client
-                    .assign_task(wire::executor_task_assignment_to_wire(assignment.clone()))
-                    .await
-                    .map_err(|error| SchedulerError::Transport {
-                        message: format!("assign_task to {endpoint}: {error}"),
-                    })?
-                    .into_inner();
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    client.assign_task(wire::executor_task_assignment_to_wire(assignment.clone())),
+                )
+                .await
+                .map_err(|_| SchedulerError::Transport {
+                    message: format!("assign_task to {endpoint} timed out after 30s"),
+                })?
+                .map_err(|error| SchedulerError::Transport {
+                    message: format!("assign_task to {endpoint}: {error}"),
+                })?
+                .into_inner();
                 wire::task_status_response_from_wire(response)
                     .map(|decoded| (assignment, decoded))
                     .map_err(|error| SchedulerError::Transport {

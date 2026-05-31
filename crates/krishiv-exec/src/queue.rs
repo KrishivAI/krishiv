@@ -44,7 +44,7 @@ impl OperatorQueueMetrics {
 /// Barrier messages are always sent without blocking.
 pub struct OperatorQueueSender {
     pub(crate) data_tx: tokio::sync::mpsc::Sender<arrow::record_batch::RecordBatch>,
-    pub(crate) barrier_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    pub(crate) barrier_tx: tokio::sync::mpsc::Sender<u64>,
 }
 
 impl OperatorQueueSender {
@@ -59,18 +59,29 @@ impl OperatorQueueSender {
             .map_err(|_| OperatorQueueError::Closed)
     }
 
-    /// Send a barrier.  Never blocks — barriers bypass backpressure.
-    pub fn send_barrier(&self, epoch: u64) -> Result<(), OperatorQueueError> {
-        self.barrier_tx
-            .send(epoch)
-            .map_err(|_| OperatorQueueError::Closed)
+    /// Send a barrier. Blocks if the barrier queue is full.
+    /// If full, logs a warning and drops the barrier; the coordinator will retry via try_tick.
+    pub async fn send_barrier(&self, epoch: u64) -> Result<(), OperatorQueueError> {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            self.barrier_tx.send(epoch),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(OperatorQueueError::Closed),
+            Err(_) => {
+                tracing::warn!(epoch = epoch, "barrier queue full; dropping barrier");
+                Ok(())
+            }
+        }
     }
 }
 
 /// Receiving half of an `OperatorQueue`.
 pub struct OperatorQueueReceiver {
     pub(crate) data_rx: tokio::sync::mpsc::Receiver<arrow::record_batch::RecordBatch>,
-    pub(crate) barrier_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
+    pub(crate) barrier_rx: tokio::sync::mpsc::Receiver<u64>,
     pub(crate) capacity: usize,
     /// P0.5: deferred barrier epochs that arrived while we were waiting for data.
     /// Uses VecDeque for O(1) front-pop (vs Vec::remove(0) which is O(n)).
@@ -139,10 +150,12 @@ impl std::error::Error for OperatorQueueError {}
 
 /// Create a bounded operator queue with `capacity` data slots.
 ///
-/// Barriers bypass the bounded channel and are never subject to backpressure.
+/// Barriers also use a bounded channel (M2: cap=64) to prevent unbounded memory growth
+/// from rapid checkpoint storms. Dropping barriers is safe because they are idempotent
+/// and the coordinator will retry via try_tick on the next interval.
 pub fn operator_queue(capacity: usize) -> (OperatorQueueSender, OperatorQueueReceiver) {
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(capacity.max(1));
-    let (barrier_tx, barrier_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (barrier_tx, barrier_rx) = tokio::sync::mpsc::channel(64);
     let sender = OperatorQueueSender {
         data_tx,
         barrier_tx,

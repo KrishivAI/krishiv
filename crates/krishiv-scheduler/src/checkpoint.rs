@@ -126,8 +126,9 @@ impl CheckpointCoordinator {
         self.elapsed_ms = 0;
         self.awaiting_elapsed_ms = 0;
         self.pending_acks.clear();
-        // Wall-clock approximation using a monotonic epoch counter for determinism.
-        let initiated_at_ms = self.current_epoch * self.interval_ms;
+        // Use real wall-clock time (not a deterministic counter) for initiated_at_ms
+        // so observability tooling can compute accurate checkpoint latencies.
+        let initiated_at_ms = u64::try_from(krishiv_async_util::unix_now_ms()).unwrap_or(0);
         self.state = CheckpointCoordinatorState::AwaitingAcks {
             epoch: self.current_epoch,
             initiated_at_ms,
