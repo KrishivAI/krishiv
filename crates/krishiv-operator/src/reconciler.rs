@@ -7,9 +7,7 @@ use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
     JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
-use krishiv_scheduler::{
-    Coordinator, JobSnapshot, SchedulerError, SharedCoordinator,
-};
+use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError, SharedCoordinator};
 
 use crate::constants::{API_GROUP, API_VERSION, KIND};
 use crate::crd::job::{

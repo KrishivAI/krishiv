@@ -980,12 +980,12 @@ impl ExecutorTaskRunner {
         let typed_requires_reattach = assignment.requires_reattach();
 
         // Terminal state: requires_reattach=true → Running (continuous), false → Succeeded (one-shot)
-        let terminal_state =
-            if model == crate::ExecutionModel::Streaming && typed_requires_reattach {
-                TaskState::Running
-            } else {
-                TaskState::Succeeded
-            };
+        let terminal_state = if model == crate::ExecutionModel::Streaming && typed_requires_reattach
+        {
+            TaskState::Running
+        } else {
+            TaskState::Succeeded
+        };
         let terminal_message = if terminal_state == TaskState::Running {
             "streaming operator active"
         } else {
@@ -1068,10 +1068,31 @@ impl ExecutorTaskRunner {
             request = request.with_output_metadata(output_metadata);
         }
 
-        coordinator
-            .task_status(tonic::Request::new(request))
-            .await
-            .map(tonic::Response::into_inner)
+        const MAX_RETRIES: u8 = 3;
+        let mut attempt = 0;
+        loop {
+            let result = coordinator
+                .task_status(tonic::Request::new(request.clone()))
+                .await
+                .map(tonic::Response::into_inner);
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    let is_retryable = matches!(
+                        e.code(),
+                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                    );
+                    if is_retryable && attempt < MAX_RETRIES - 1 {
+                        attempt += 1;
+                        let backoff_ms = 100u64 * (1u64 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 
     fn clear_running_attempt(&self, assignment: &ExecutorTaskAssignment) {
@@ -1155,25 +1176,22 @@ impl ExecutorTaskRunner {
             .store(req.fencing_token.as_u64(), Ordering::SeqCst);
         for entry in self.checkpoint_runners.iter() {
             let task_id = entry.key().clone();
-            // Prefer the real attempt ref from running_attempts.  Fall back to
-            // a stage-0 / initial-attempt synthesis ONLY when no real ref is
-            // available (e.g. the task completed before the barrier arrived).
-            let (stage_id, attempt_id, _executor_id_opt) = match self
+            // Skip tasks that are no longer running; they don't contribute to
+            // the checkpoint quorum and cannot be validated by the coordinator.
+            let attempt = match self
                 .running_attempts
                 .as_ref()
                 .and_then(|map| map.get(task_id.as_str()))
             {
-                Some(attempt) => (
-                    attempt.stage_id().clone(),
-                    attempt.attempt_id(),
-                    None::<krishiv_proto::ExecutorId>,
-                ),
+                Some(a) => a.clone(),
                 None => {
-                    let stage = krishiv_proto::StageId::try_new("s0")
-                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
-                    (stage, krishiv_proto::AttemptId::initial(), None)
+                    tracing::debug!(task_id = %task_id, "task not running; skipping checkpoint ack");
+                    continue;
                 }
             };
+            let stage_id = attempt.stage_id().clone();
+            let attempt_id = attempt.attempt_id();
+            // Get the real executor ID from a synthesised assignment for the ack path.
             let executor_id = krishiv_proto::ExecutorId::try_new("exec")
                 .map_err(|e| tonic::Status::internal(e.to_string()))?;
             let ids = TaskAttemptRef::new(req.job_id.clone(), stage_id, task_id, attempt_id);

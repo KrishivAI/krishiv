@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["time"] }
 [dev-dependencies]
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-operator = { path = "../krishiv-operator" }

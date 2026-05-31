@@ -1218,6 +1218,16 @@ mod tests {
 // UDF Resource Limiting + Sandbox Hooks
 // ============================================================================
 
+/// Resource limits for UDF execution.
+///
+/// **Memory limits (M6 limitation):** The memory check uses a conservative proxy
+/// of input and output batch size in bytes. This is not a true heap limit and does
+/// not catch UDFs that allocate large intermediate structures during execution.
+/// A production implementation would use a custom allocator or cgroup limits.
+///
+/// **Time limits:** Currently checked post-hoc after the UDF returns. A preemptive
+/// timeout using `tokio::time::timeout` or `std::thread` with a join timeout is
+/// planned for R9+ to prevent resource exhaustion from hung UDFs.
 #[derive(Clone, Debug, Default)]
 pub struct ResourceLimits {
     pub max_memory_bytes: Option<u64>,
@@ -1271,6 +1281,17 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
                     message: format!(
                         "UDF input exceeded memory limit of {} bytes (approx {} bytes)",
                         max_bytes, approx_bytes
+                    ),
+                });
+            }
+
+            // Also check output size: UDFs can materialize large intermediate structures.
+            let output_size: usize = result.get_array_memory_size();
+            if output_size as u64 > max_bytes {
+                return Err(UdfError::Execution {
+                    message: format!(
+                        "UDF output exceeded memory limit of {} bytes (approx {} bytes)",
+                        max_bytes, output_size
                     ),
                 });
             }

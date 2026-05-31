@@ -23,6 +23,7 @@ pub mod metrics;
 
 pub mod barrier_client;
 pub mod barrier_dispatch;
+pub(crate) mod coordinator_sharded;
 pub mod barrier_tracker;
 pub mod batch_sql;
 pub mod batch_sql_http;

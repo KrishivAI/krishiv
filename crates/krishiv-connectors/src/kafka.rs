@@ -1000,4 +1000,44 @@ mod tests {
             assert!(err.contains("Kafka sink flush requires the `kafka` feature"));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Property-based tests (Sprint 4)
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Property test: KafkaOffset round-trip encode/decode
+        /// Ensures arbitrary offsets can be serialized and deserialized without loss.
+        proptest! {
+            #[test]
+            fn kafka_offset_roundtrip(
+                topic in "[a-z]{1,64}",
+                partition: i32,
+                offset: i64,
+            ) {
+                let original = KafkaOffset { topic, partition, offset };
+                let encoded = original.encode();
+                let decoded = KafkaOffset::decode(&encoded).expect("decode");
+                prop_assert_eq!(original, decoded);
+            }
+
+            /// Property test: KafkaOffset encode is stable
+            /// Same offset always produces the same bytes.
+            #[test]
+            fn kafka_offset_encode_stable(
+                topic in "[a-z]{1,32}",
+                partition: i32,
+                offset: i64,
+            ) {
+                let off = KafkaOffset { topic, partition, offset };
+                let enc1 = off.encode();
+                let enc2 = off.encode();
+                prop_assert_eq!(enc1, enc2);
+            }
+        }
+    }
 }

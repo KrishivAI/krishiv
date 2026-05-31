@@ -191,7 +191,9 @@ pub fn current_traceparent() -> Option<String> {
 
 // ── Process metrics (Prometheus text) ─────────────────────────────────────────
 
-const LATENCY_BUCKETS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Thread-safe OpenTelemetry-aligned latency histogram.
 #[derive(Debug)]
@@ -204,7 +206,9 @@ pub struct KrishivHistogram {
 
 impl Default for KrishivHistogram {
     fn default() -> Self {
-        let counts = (0..=LATENCY_BUCKETS.len()).map(|_| AtomicU64::new(0)).collect();
+        let counts = (0..=LATENCY_BUCKETS.len())
+            .map(|_| AtomicU64::new(0))
+            .collect();
         Self {
             buckets: LATENCY_BUCKETS,
             counts,
@@ -845,7 +849,9 @@ impl KrishivMetrics {
         }
 
         if !grpc_entries.is_empty() {
-            out.push_str("# HELP krishiv_grpc_call_duration_seconds gRPC call duration in seconds\n");
+            out.push_str(
+                "# HELP krishiv_grpc_call_duration_seconds gRPC call duration in seconds\n",
+            );
             out.push_str("# TYPE krishiv_grpc_call_duration_seconds histogram\n");
             for (path, (count, sum, counts)) in &grpc_entries {
                 out.push_str(&format!(
@@ -1235,13 +1241,23 @@ mod tests {
         assert!(body.contains("krishiv_grpc_call_duration_seconds_bucket{path=\"/krishiv.ExecutorTaskService/LaunchTask\",le=\"+Inf\"} 2"));
 
         // Verify checkpoint commit duration histogram
-        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_count{phase=\"write_manifest\"} 1"));
-        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_sum{phase=\"write_manifest\"} 0.035"));
+        assert!(body.contains(
+            "krishiv_checkpoint_commit_duration_seconds_count{phase=\"write_manifest\"} 1"
+        ));
+        assert!(body.contains(
+            "krishiv_checkpoint_commit_duration_seconds_sum{phase=\"write_manifest\"} 0.035"
+        ));
         assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_bucket{phase=\"write_manifest\",le=\"0.05\"} 1"));
 
-        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_count{phase=\"fsync\"} 1"));
-        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_sum{phase=\"fsync\"} 1.200"));
-        assert!(body.contains("krishiv_checkpoint_commit_duration_seconds_bucket{phase=\"fsync\",le=\"2.5\"} 1"));
+        assert!(
+            body.contains("krishiv_checkpoint_commit_duration_seconds_count{phase=\"fsync\"} 1")
+        );
+        assert!(
+            body.contains("krishiv_checkpoint_commit_duration_seconds_sum{phase=\"fsync\"} 1.200")
+        );
+        assert!(body.contains(
+            "krishiv_checkpoint_commit_duration_seconds_bucket{phase=\"fsync\",le=\"2.5\"} 1"
+        ));
     }
 
     #[test]

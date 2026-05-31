@@ -199,7 +199,9 @@ impl ClusterControlPlane {
         let mut orchestration_handles: Option<crate::OrchestratorHandles> = None;
 
         if self.leader.try_acquire().await {
-            let _ = self.promote_to_active().await;
+            if let Err(e) = self.promote_to_active().await {
+                tracing::error!(error = %e, "failed to promote to active");
+            }
             orchestration_handles = Some(self.spawn_orchestration_loops());
         }
 
@@ -208,19 +210,25 @@ impl ClusterControlPlane {
         loop {
             interval.tick().await;
             if self.leader.try_acquire().await {
-                let _ = self.promote_to_active().await;
+                if let Err(e) = self.promote_to_active().await {
+                    tracing::error!(error = %e, "failed to promote to active");
+                }
                 if orchestration_handles.is_none() {
                     orchestration_handles = Some(self.spawn_orchestration_loops());
                 }
             } else if self.leader.is_leader() {
                 if !self.leader.renew().await {
-                    let _ = self.demote_to_standby().await;
+                    if let Err(e) = self.demote_to_standby().await {
+                        tracing::error!(error = %e, "failed to demote to standby");
+                    }
                     if let Some(handles) = orchestration_handles.take() {
                         handles.shutdown();
                     }
                 }
             } else {
-                let _ = self.demote_to_standby().await;
+                if let Err(e) = self.demote_to_standby().await {
+                    tracing::error!(error = %e, "failed to demote to standby");
+                }
                 if let Some(handles) = orchestration_handles.take() {
                     handles.shutdown();
                 }

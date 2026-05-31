@@ -386,7 +386,10 @@ impl LeaderElection for EtcdLeaseElection {
     fn is_leader(&self) -> bool {
         // No grace period: leadership is only valid when renew() actively keeps it alive.
         // If renew() has failed, is_leader was already cleared by clear_leader().
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).is_leader
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_leader
     }
 
     async fn try_acquire(&self) -> bool {

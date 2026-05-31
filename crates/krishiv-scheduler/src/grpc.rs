@@ -43,8 +43,10 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         // GAP-CP-08: Extract auth context for every handler.
+        // NOTE: The server-level `trace_and_auth_interceptor` already validated auth before
+        // this handler runs. The per-handler call below is defense-in-depth only.
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_auth(&auth)?; // defense-in-depth: redundant when interceptor is active
         tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -77,6 +79,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+        // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "deregister_executor");
@@ -117,6 +120,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+        // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
@@ -200,6 +204,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<TaskStatusRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+        // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "task_status");
@@ -262,6 +267,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+        // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");

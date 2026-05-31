@@ -47,9 +47,7 @@ impl RedbStateBackend {
                 if !is_corrupt {
                     return Err(StateError::BackendUnavailable {
                         message: format!("redb open failed (not corruption): {e}"),
-                        source: Some(Box::new(std::io::Error::other(
-                            e.to_string(),
-                        ))),
+                        source: Some(Box::new(std::io::Error::other(e.to_string()))),
                     });
                 }
                 let ts = unix_now_ms();

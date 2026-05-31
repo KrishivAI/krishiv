@@ -136,10 +136,7 @@ impl JsonFileMetadataStore {
             .append(true)
             .open(&log_path)
             .map_err(|e| SchedulerError::Transport {
-                message: format!(
-                    "failed to open event log '{}': {e}",
-                    log_path.display()
-                ),
+                message: format!("failed to open event log '{}': {e}", log_path.display()),
             })?;
         use std::io::Write as IoWrite;
         writeln!(file, "{}", line).map_err(|e| SchedulerError::Transport {
@@ -828,8 +825,8 @@ impl TryFrom<PersistedJobRecord> for JobRecord {
         let job_id = value.spec.job_id.clone();
         let mut shuffle_output: HashMap<krishiv_proto::StageId, ShuffleMetadata> = HashMap::new();
         for p in value.shuffle_output {
-            let stage_id = krishiv_proto::StageId::try_new(p.stage_id.clone())
-                .map_err(invalid_metadata_id)?;
+            let stage_id =
+                krishiv_proto::StageId::try_new(p.stage_id.clone()).map_err(invalid_metadata_id)?;
             let meta = shuffle_output.entry(stage_id).or_default();
             let path = ShufflePath {
                 job_id: job_id.clone(),
