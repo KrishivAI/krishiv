@@ -8,13 +8,17 @@ use krishiv_proto::ExecutorTaskAssignment;
 ///
 /// Supports bounded capacity for backpressure (PRR Phase 1/2).
 /// When capacity is reached, `push` returns `ExecutorError::AssignmentQueueFull`.
-/// Default backpressure capacity for new inboxes.
+/// Deduplicates assignments by (TaskId, AttemptId) — duplicate pushes return
+/// Ok(()) without enqueuing to prevent redundant execution.
 const DEFAULT_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
     cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
+    /// Tracks (task_id, attempt_id) pairs already received to prevent
+    /// duplicate execution from at-least-once delivery retries.
+    seen: Arc<RwLock<BTreeSet<(krishiv_proto::TaskId, krishiv_proto::AttemptId)>>>,
     /// None = unbounded (legacy / test default). Some(n) = hard limit.
     max_capacity: Option<usize>,
 }
@@ -36,6 +40,7 @@ impl ExecutorAssignmentInbox {
         Self {
             assignments: Arc::new(RwLock::new(VecDeque::new())),
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
+            seen: Arc::new(RwLock::new(BTreeSet::new())),
             max_capacity: None,
         }
     }
@@ -46,6 +51,7 @@ impl ExecutorAssignmentInbox {
         Self {
             assignments: Arc::new(RwLock::new(VecDeque::new())),
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
+            seen: Arc::new(RwLock::new(BTreeSet::new())),
             max_capacity: Some(max),
         }
     }
@@ -57,9 +63,21 @@ impl ExecutorAssignmentInbox {
 
     /// Store one received assignment.
     ///
-    /// Returns `Err(AssignmentQueueFull)` when at capacity — this is the
-    /// backpressure signal to the coordinator / caller.
+    /// Deduplicates by (TaskId, AttemptId) — returns `Ok(())` silently if
+    /// this assignment was already received. Returns `Err(AssignmentQueueFull)`
+    /// when at capacity — the backpressure signal to the coordinator.
     pub fn push(&self, assignment: ExecutorTaskAssignment) -> ExecutorResult<()> {
+        let key = (assignment.task_id().clone(), assignment.attempt_id());
+        {
+            let mut seen = self
+                .seen
+                .write()
+                .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+            if !seen.insert(key.clone()) {
+                return Ok(()); // Duplicate assignment — already received
+            }
+        }
+
         let mut q = self
             .assignments
             .write()
@@ -68,6 +86,12 @@ impl ExecutorAssignmentInbox {
         if let Some(max) = self.max_capacity
             && q.len() >= max
         {
+            // Remove from seen set on rejection so coordinator can retry.
+            let mut seen = self
+                .seen
+                .write()
+                .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+            seen.remove(&key);
             return Err(ExecutorError::AssignmentQueueFull {
                 current: q.len(),
                 max,

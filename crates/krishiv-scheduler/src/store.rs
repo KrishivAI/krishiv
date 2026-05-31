@@ -1249,50 +1249,35 @@ impl NonBlockingStoreHandle {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Enqueue an event write (sync, uses `try_send` with sync fallback).
+    /// Enqueue an event write (sync, uses `try_send`).
     ///
-    /// When the bounded channel is full the write falls back to a synchronous
-    /// write on the calling thread (best-effort backpressure).
+    /// When the bounded channel is full, the event is dropped and a warning is
+    /// logged. Async callers should prefer [`Self::append_event_async`].
     pub fn append_event(&self, event: EventLogEvent) {
         if let Some(ref tx) = self.tx {
-            if tx
-                .try_send(StoreCommand::AppendEvent(event.clone()))
-                .is_err()
-            {
-                // Channel full — fall back to sync write.
-                let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(e) = guard.append_event(event) {
-                    tracing::error!(error = %e, "NonBlockingStoreHandle: append_event fallback failed");
-                }
-            }
-        } else {
-            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = guard.append_event(event) {
-                tracing::error!(error = %e, "NonBlockingStoreHandle: append_event failed (sync)");
+            if tx.try_send(StoreCommand::AppendEvent(event)).is_err() {
+                tracing::warn!(
+                    "NonBlockingStoreHandle: append_event dropped (channel full, {} pending)",
+                    tx.max_capacity()
+                );
             }
         }
     }
 
-    /// Enqueue a job save (sync, uses `try_send` with sync fallback).
+    /// Enqueue a job save (sync, uses `try_send`).
     ///
-    /// When the bounded channel is full the write falls back to a synchronous
-    /// write on the calling thread (best-effort backpressure).
+    /// When the bounded channel is full, the save is dropped and a warning is
+    /// logged. Async callers should prefer [`Self::save_job_async`].
     pub fn save_job(&self, record: &JobRecord) {
         if let Some(ref tx) = self.tx {
             if tx
                 .try_send(StoreCommand::SaveJob(Box::new(record.clone())))
                 .is_err()
             {
-                // Channel full — fall back to sync write.
-                let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(e) = guard.save_job(&record) {
-                    tracing::error!(error = %e, "NonBlockingStoreHandle: save_job fallback failed");
-                }
-            }
-        } else {
-            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = guard.save_job(record) {
-                tracing::error!(error = %e, "NonBlockingStoreHandle: save_job failed (sync)");
+                tracing::warn!(
+                    "NonBlockingStoreHandle: save_job dropped (channel full, {} pending)",
+                    tx.max_capacity()
+                );
             }
         }
     }

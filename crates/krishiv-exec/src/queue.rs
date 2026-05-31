@@ -59,22 +59,9 @@ impl OperatorQueueSender {
             .map_err(|_| OperatorQueueError::Closed)
     }
 
-    /// Send a barrier. Blocks if the barrier queue is full.
-    /// If full, logs a warning and drops the barrier; the coordinator will retry via try_tick.
+    /// Send a barrier. Blocks until space is available in the barrier queue.
     pub async fn send_barrier(&self, epoch: u64) -> Result<(), OperatorQueueError> {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            self.barrier_tx.send(epoch),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(OperatorQueueError::Closed),
-            Err(_) => {
-                tracing::warn!(epoch = epoch, "barrier queue full; dropping barrier");
-                Ok(())
-            }
-        }
+        self.barrier_tx.send(epoch).await.map_err(|_| OperatorQueueError::Closed)
     }
 }
 

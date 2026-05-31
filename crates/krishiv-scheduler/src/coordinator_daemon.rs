@@ -253,25 +253,9 @@ pub async fn spawn_coordinator_sidecars(
         });
     }
 
-    let tick_coordinator = coordinator.clone();
-    let tick_period_ms = {
-        let coord = tick_coordinator.read().await;
-        coord.config().tick_period_ms()
-    };
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_millis(tick_period_ms));
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = tick_coordinator.wait_for_change() => {}
-            }
-
-            let mut coord = tick_coordinator.write().await;
-            if let Err(e) = coord.coordinator_tick() {
-                tracing::warn!(error = %e, "coordinator tick failed");
-            }
-        }
-    });
+    // Orchestration loops (heartbeat, task launch, barrier dispatch) are now spawned
+    // by run_standalone_coordinator / run_cluster_control_plane via
+    // spawn_orchestration_loops(). No separate coordinator_tick loop here.
 
     Ok(())
 }
