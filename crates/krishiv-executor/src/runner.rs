@@ -980,12 +980,12 @@ impl ExecutorTaskRunner {
         let typed_requires_reattach = assignment.requires_reattach();
 
         // Terminal state: requires_reattach=true → Running (continuous), false → Succeeded (one-shot)
-        let terminal_state =
-            if model == crate::ExecutionModel::Streaming && typed_requires_reattach {
-                TaskState::Running
-            } else {
-                TaskState::Succeeded
-            };
+        let terminal_state = if model == crate::ExecutionModel::Streaming && typed_requires_reattach
+        {
+            TaskState::Running
+        } else {
+            TaskState::Succeeded
+        };
         let terminal_message = if terminal_state == TaskState::Running {
             "streaming operator active"
         } else {

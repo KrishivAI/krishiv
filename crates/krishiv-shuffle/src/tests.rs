@@ -1912,7 +1912,10 @@ mod shuffle_tests {
         // ContentHashMismatch before the Parquet decoder even runs.
         // Both Io and ContentHashMismatch indicate detected corruption.
         assert!(
-            matches!(err, ShuffleError::Io(_) | ShuffleError::ContentHashMismatch { .. }),
+            matches!(
+                err,
+                ShuffleError::Io(_) | ShuffleError::ContentHashMismatch { .. }
+            ),
             "expected Io or ContentHashMismatch error for corrupt parquet, got {err}"
         );
     }
@@ -1974,11 +1977,16 @@ mod shuffle_tests {
 
         // 1. Request without token should return 401 Unauthorized
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = "GET /shuffle/job1/stage1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        let req =
+            "GET /shuffle/job1/stage1/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut resp = String::new();
         stream.read_to_string(&mut resp).await.unwrap();
-        assert!(resp.contains("HTTP/1.1 401 Unauthorized"), "expected 401, got: {}", resp);
+        assert!(
+            resp.contains("HTTP/1.1 401 Unauthorized"),
+            "expected 401, got: {}",
+            resp
+        );
 
         // 2. Request with invalid token should return 401 Unauthorized
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -1986,6 +1994,10 @@ mod shuffle_tests {
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut resp = String::new();
         stream.read_to_string(&mut resp).await.unwrap();
-        assert!(resp.contains("HTTP/1.1 401 Unauthorized"), "expected 401, got: {}", resp);
+        assert!(
+            resp.contains("HTTP/1.1 401 Unauthorized"),
+            "expected 401, got: {}",
+            resp
+        );
     }
 }

@@ -1,11 +1,6 @@
 //! R2 coordinator skeleton.
 
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::atomic::{Ordering as AtomicOrdering};
-use std::sync::Arc;
-use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
     validate_epoch, validate_fencing_token_for_restore,
@@ -15,10 +10,15 @@ use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
     ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorTaskAssignment,
     HeartbeatHotKeyReport, InitiateCheckpointCommand, InitiateCheckpointRequest, JobId, JobKind,
-    JobSpec, JobState, LeaseGeneration, StageId, StreamingProgressReport, StreamingTaskState, TaskAssignment,
-    TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
+    JobSpec, JobState, LeaseGeneration, StageId, StreamingProgressReport, StreamingTaskState,
+    TaskAssignment, TaskAttemptRef, TaskCancellationRequest, TaskId, TaskState, TaskStatusResponse,
     TaskStatusUpdate, wire,
 };
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
@@ -36,7 +36,9 @@ use crate::job::{
     job_spec_from_physical_plan, validate_job,
 };
 use crate::llm_quota;
-use crate::metrics::{CHECKPOINT_EPOCHS_TOTAL, JOBS_SUBMITTED_TOTAL, TASKS_ASSIGNED_TOTAL};
+use crate::metrics::{
+    CHECKPOINT_EPOCHS_TOTAL, JOBS_SUBMITTED_TOTAL, TASKS_ASSIGNED_TOTAL, record_checkpoint_epoch,
+};
 use crate::store::{EventLogEvent, MetadataStore, NonBlockingStoreHandle};
 
 static COORDINATOR_NEXT_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -111,7 +113,8 @@ pub struct Coordinator {
     /// Append-only log of adaptive decisions (hot-key split, repartition,
     /// throttle, slow-sink).  Keyed by job id.  R7.2 Group H.
     /// Uses VecDeque for O(1) front-pop when evicting oldest entries.
-    pub(crate) adaptive_decision_log: HashMap<JobId, std::collections::VecDeque<AdaptiveDecisionLog>>,
+    pub(crate) adaptive_decision_log:
+        HashMap<JobId, std::collections::VecDeque<AdaptiveDecisionLog>>,
     /// Manual override config for adaptive behaviors.
     pub(crate) adaptive_override: AdaptiveOverrideConfig,
     /// P1.1: O(1) index from streaming task id to (job_id, stage_id) for heartbeat lookup.
@@ -427,7 +430,10 @@ impl SharedCoordinator {
             abort_handles.push(task.abort_handle());
         }
 
-        OrchestratorHandles { abort_handles, shutdown_tx }
+        OrchestratorHandles {
+            abort_handles,
+            shutdown_tx,
+        }
     }
 }
 
@@ -764,10 +770,7 @@ impl Coordinator {
                 ),
                 applied,
             };
-            let log_bucket = self
-                .adaptive_decision_log
-                .entry(job_id)
-                .or_default();
+            let log_bucket = self.adaptive_decision_log.entry(job_id).or_default();
             const MAX_LOG_PER_JOB: usize = 100;
             if log_bucket.len() >= MAX_LOG_PER_JOB {
                 log_bucket.pop_front(); // O(1) with VecDeque
@@ -1368,6 +1371,7 @@ impl Coordinator {
                     Ok(true) => {
                         self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
                         CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        record_checkpoint_epoch(job_id.as_str(), ack.epoch);
                         CheckpointAckResponse::Accepted
                     }
                     Ok(false) => CheckpointAckResponse::Accepted,
@@ -1683,7 +1687,8 @@ impl Coordinator {
         );
 
         let job_name = job.spec.name().to_owned();
-        let namespace = job.spec
+        let namespace = job
+            .spec
             .namespace_id()
             .map(|s| s.to_owned())
             .unwrap_or_default();
@@ -2035,9 +2040,7 @@ impl Coordinator {
                     let jc = jc.clone();
                     let eid = executor_id_for_circuit.clone();
                     tokio::spawn(async move {
-                        let _ = jc
-                            .clear_assignments_for_bad_executor_and_count(&eid)
-                            .await;
+                        let _ = jc.clear_assignments_for_bad_executor_and_count(&eid).await;
                     });
                 } else {
                     if let Ok(job) = self.find_job_mut(&job_id) {

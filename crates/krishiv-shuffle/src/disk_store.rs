@@ -218,9 +218,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 let tokens = lease_tokens
                     .read()
                     .map_err(|_| io_err("lease token lock poisoned"))?;
-                tokens
-                    .get(&key)
-                    .copied() == Some(lease_token)
+                tokens.get(&key).copied() == Some(lease_token)
             };
 
             if commit {
@@ -233,9 +231,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
                 })?;
                 // S4: Fsync the parent directory so the rename is durable.
                 if let Some(ref parent) = parent_dir
-                    && let Ok(dir) = std::fs::File::open(parent) {
-                        dir.sync_all().ok();
-                    }
+                    && let Ok(dir) = std::fs::File::open(parent)
+                {
+                    dir.sync_all().ok();
+                }
 
                 // Store hash for strict read verification (DashMap — no lock management needed)
                 content_hashes.insert(key.clone(), hash);
@@ -278,11 +277,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             // Strict content-hash verification on disk read: compare against
             // the BLAKE3 hash of the Parquet bytes stored at write time.
             {
-                let key = (
-                    id.job_id.clone(),
-                    id.stage_id.clone(),
-                    id.partition,
-                );
+                let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
                 if let Some(stored_ref) = content_hashes.get(&key) {
                     let stored = *stored_ref;
                     let computed = compute_hash_bytes(&raw_bytes);
@@ -346,7 +341,8 @@ impl ShuffleStore for LocalDiskShuffleStore {
         let mut tokens = shuffle_write_lock(&self.lease_tokens)?;
         tokens.retain(|(jid, _, _), _| jid != &job_id_owned);
         // Clean up content hashes for this job (DashMap — no lock management needed).
-        self.content_hashes.retain(|(jid, _, _), _| jid != &job_id_owned);
+        self.content_hashes
+            .retain(|(jid, _, _), _| jid != &job_id_owned);
         Ok(())
     }
 }

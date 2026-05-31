@@ -357,7 +357,9 @@ fn llm_quota_report_from_wire(value: v1::LlmQuotaReport) -> crate::LlmQuotaRepor
     }
 }
 
-fn streaming_progress_report_to_wire(value: &crate::StreamingProgressReport) -> v1::StreamingProgressReport {
+fn streaming_progress_report_to_wire(
+    value: &crate::StreamingProgressReport,
+) -> v1::StreamingProgressReport {
     v1::StreamingProgressReport {
         job_id: value.job_id.clone(),
         task_id: value.task_id.clone(),
@@ -370,7 +372,9 @@ fn streaming_progress_report_to_wire(value: &crate::StreamingProgressReport) -> 
     }
 }
 
-fn streaming_progress_report_from_wire(value: v1::StreamingProgressReport) -> crate::StreamingProgressReport {
+fn streaming_progress_report_from_wire(
+    value: v1::StreamingProgressReport,
+) -> crate::StreamingProgressReport {
     crate::StreamingProgressReport {
         job_id: value.job_id,
         task_id: value.task_id,

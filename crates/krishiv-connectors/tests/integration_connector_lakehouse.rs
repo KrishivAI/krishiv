@@ -4,14 +4,13 @@ use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_connectors::{
-    ConnectorCapabilities, ConnectorResult, DataQualityConfig, DataQualityRule,
-    DeadLetterSink, LocalParquetTwoPhaseCommitSink, QualityAction, Sink, Source,
-    TwoPhaseCommitSink,
+    ConnectorCapabilities, ConnectorResult, DataQualityConfig, DataQualityRule, DeadLetterSink,
+    LocalParquetTwoPhaseCommitSink, QualityAction, Sink, Source, TwoPhaseCommitSink,
     parquet::{ParquetSink, ParquetSource},
 };
 use krishiv_lakehouse::{
-    IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable,
-    MultiWriterGuard, SchemaField, SchemaVersion,
+    IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, MultiWriterGuard,
+    SchemaField, SchemaVersion,
 };
 
 fn schema_v1() -> Arc<Schema> {

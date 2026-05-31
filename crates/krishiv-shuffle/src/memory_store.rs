@@ -229,7 +229,9 @@ impl ShuffleStore for InMemoryShuffleStore {
             }
         }
 
-        if let Some(max) = self.max_bytes && self.spill_store.is_none() {
+        if let Some(max) = self.max_bytes
+            && self.spill_store.is_none()
+        {
             return Err(crate::error::io_err(format!(
                 "in-memory shuffle store misconfigured: max_bytes of {max} is set but no spill_store is attached",
             )));

@@ -682,8 +682,7 @@ pub async fn run_standalone_coordinator(
         listener.local_addr()?
     );
 
-    let grpc_serve =
-        serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
+    let grpc_serve = serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
 
     tokio::select! {
         result = grpc_serve => {

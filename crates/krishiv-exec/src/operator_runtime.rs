@@ -215,8 +215,6 @@ mod tests {
 
     use super::*;
 
-
-
     #[test]
     fn multi_source_watermark_min_across_sources() {
         use std::collections::HashMap;

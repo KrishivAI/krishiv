@@ -49,12 +49,13 @@ impl ObjectStoreShuffleStore {
         partition.batches.len().hash(&mut hasher);
         // Hash first few bytes of first batch for light determinism signal
         if let Some(first) = partition.batches.first()
-            && let Some(col) = first.columns().first() {
-                let len = col.len().min(8);
-                for _ in 0..len {
-                    (col.len() as u64).hash(&mut hasher); // stable proxy
-                }
+            && let Some(col) = first.columns().first()
+        {
+            let len = col.len().min(8);
+            for _ in 0..len {
+                (col.len() as u64).hash(&mut hasher); // stable proxy
             }
+        }
         let h = hasher.finish();
         let mut out = [0u8; 32];
         out[..8].copy_from_slice(&h.to_le_bytes());

@@ -778,12 +778,7 @@ mod scheduler_tests {
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
         assert_eq!(
-            shared
-                .read()
-                .await
-                .job_snapshot(&job_id)
-                .unwrap()
-                .state(),
+            shared.read().await.job_snapshot(&job_id).unwrap().state(),
             JobState::Running
         );
     }
@@ -5607,8 +5602,7 @@ mod scheduler_tests {
         let bad = ExecutorId::try_new("ideal-limits-bad").unwrap();
 
         let job_id = JobId::try_new("ideal-limits-job").unwrap();
-        let spec = single_task_job(job_id.clone())
-            .with_memory_limit_bytes(256 * 1024 * 1024); // 256 MB non-default limit
+        let spec = single_task_job(job_id.clone()).with_memory_limit_bytes(256 * 1024 * 1024); // 256 MB non-default limit
         let job = crate::job::JobRecord::from_spec(spec, 0);
         let jc = crate::job_coordinator::JobCoordinator::new(job_id.clone(), job);
 
@@ -5645,7 +5639,8 @@ mod scheduler_tests {
     #[test]
     fn chaos_speculative_execution_stale_lease_rejected() {
         let executor_id = ExecutorId::try_new("exec-speculative").unwrap();
-        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-speculative").unwrap());
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-speculative").unwrap());
 
         // 1. First registration: executor joins the cluster, receives LeaseGeneration (e.g. G1)
         let lease_g1 = coordinator
@@ -5665,7 +5660,10 @@ mod scheduler_tests {
             .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
             .unwrap();
 
-        assert!(lease_g2.as_u64() > lease_g1.as_u64(), "Lease generation must bump upon re-registration");
+        assert!(
+            lease_g2.as_u64() > lease_g1.as_u64(),
+            "Lease generation must bump upon re-registration"
+        );
 
         // 3. Stale commit attempt: The slow/stale executor attempt from the first lease generation (G1)
         // attempts to report task success. It uses lease_g1.
@@ -5676,7 +5674,8 @@ mod scheduler_tests {
             executor_id.clone(),
             TaskState::Succeeded,
             1,
-        ).with_lease_generation(lease_g1);
+        )
+        .with_lease_generation(lease_g1);
 
         // This update MUST be rejected by the coordinator because of the stale lease generation!
         let outcome = coordinator.apply_task_update(stale_update);
@@ -5700,7 +5699,8 @@ mod scheduler_tests {
             executor_id,
             TaskState::Succeeded,
             1,
-        ).with_lease_generation(lease_g2);
+        )
+        .with_lease_generation(lease_g2);
 
         let valid_outcome = coordinator.apply_task_update(valid_update).unwrap();
         assert_eq!(valid_outcome, TaskUpdateOutcome::Applied);

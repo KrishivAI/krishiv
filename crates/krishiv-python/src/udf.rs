@@ -250,7 +250,13 @@ pub(crate) fn build_python_scalar_udf(
 }
 
 /// Return type for [`resolve_register_udf_args`].
-type UdfArgs = (String, pyo3::Py<pyo3::PyAny>, pyo3::Py<pyo3::types::PyDict>, String, Option<String>);
+type UdfArgs = (
+    String,
+    pyo3::Py<pyo3::PyAny>,
+    pyo3::Py<pyo3::types::PyDict>,
+    String,
+    Option<String>,
+);
 
 pub(crate) fn resolve_register_udf_args(
     name_or_callable: Bound<'_, PyAny>,

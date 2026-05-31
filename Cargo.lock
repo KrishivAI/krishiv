@@ -3966,6 +3966,7 @@ dependencies = [
  "krishiv-connectors",
  "krishiv-governance",
  "krishiv-operator",
+ "krishiv-proto",
  "krishiv-scheduler",
  "tokio",
 ]

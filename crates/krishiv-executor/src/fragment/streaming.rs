@@ -177,9 +177,14 @@ fn execute_loop_fragment(
     runner: &ExecutorTaskRunner,
     fragment: &str,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    let payload = fragment
-        .strip_prefix(STREAM_LOOP_PREFIX)
-        .expect("called with wrong prefix");
+    let payload = fragment.strip_prefix(STREAM_LOOP_PREFIX).ok_or_else(|| {
+        ExecutorError::InvalidAssignment {
+            message: format!(
+                "execute_loop_fragment called with wrong prefix; expected '{}', got: {fragment}",
+                STREAM_LOOP_PREFIX
+            ),
+        }
+    })?;
 
     // Format: <job_id>|<window_fragment>
     let (job_id, window_spec_str) =

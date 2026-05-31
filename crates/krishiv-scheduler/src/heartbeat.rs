@@ -204,22 +204,22 @@ impl ExecutorRegistry {
         &self,
         executor_id: &ExecutorId,
     ) -> SchedulerResult<&ExecutorRecord> {
-        self.executors.get(executor_id).ok_or_else(|| {
-            SchedulerError::UnknownExecutor {
+        self.executors
+            .get(executor_id)
+            .ok_or_else(|| SchedulerError::UnknownExecutor {
                 executor_id: executor_id.clone(),
-            }
-        })
+            })
     }
 
     pub(crate) fn find_executor_mut(
         &mut self,
         executor_id: &ExecutorId,
     ) -> SchedulerResult<&mut ExecutorRecord> {
-        self.executors.get_mut(executor_id).ok_or_else(|| {
-            SchedulerError::UnknownExecutor {
+        self.executors
+            .get_mut(executor_id)
+            .ok_or_else(|| SchedulerError::UnknownExecutor {
                 executor_id: executor_id.clone(),
-            }
-        })
+            })
     }
 }
 
