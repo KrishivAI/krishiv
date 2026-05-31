@@ -1286,10 +1286,7 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
             }
 
             // Also check output size: UDFs can materialize large intermediate structures.
-            let output_size: usize = result
-                .as_ref()
-                .map(|arr| arr.get_array_memory_size())
-                .unwrap_or(0);
+            let output_size: usize = result.get_array_memory_size();
             if output_size as u64 > max_bytes {
                 return Err(UdfError::Execution {
                     message: format!(

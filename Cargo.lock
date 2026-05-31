@@ -4021,6 +4021,7 @@ dependencies = [
  "krishiv-state",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
