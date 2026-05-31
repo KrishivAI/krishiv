@@ -1519,7 +1519,14 @@ mod scheduler_tests {
         // P1.23: the store must contain the streaming job so recovery can restore it.
         let mut store = InMemoryMetadataStore::default();
         store
-            .save_job(&coordinator.job_coordinators.values().map(|jc| jc.read_record()).next().unwrap())
+            .save_job(
+                &coordinator
+                    .job_coordinators
+                    .values()
+                    .map(|jc| jc.read_record())
+                    .next()
+                    .unwrap(),
+            )
             .unwrap();
         coordinator.recover_from_store(&store).unwrap();
 
@@ -1643,7 +1650,14 @@ mod scheduler_tests {
         // would have been written before the coordinator process exited).
         let mut store = InMemoryMetadataStore::default();
         store
-            .save_job(&coordinator.job_coordinators.values().map(|jc| jc.read_record()).next().unwrap())
+            .save_job(
+                &coordinator
+                    .job_coordinators
+                    .values()
+                    .map(|jc| jc.read_record())
+                    .next()
+                    .unwrap(),
+            )
             .unwrap();
         coordinator.recover_from_store(&store).unwrap();
 
@@ -1863,14 +1877,26 @@ mod scheduler_tests {
             ))
             .unwrap();
         coordinator.submit_job(demo_job()).unwrap();
-        let record = coordinator.job_coordinators.values().map(|jc| jc.read_record()).next().unwrap();
+        let record = coordinator
+            .job_coordinators
+            .values()
+            .map(|jc| jc.read_record())
+            .next()
+            .unwrap();
         store.save_job(&record).unwrap();
         assert_eq!(store.jobs().len(), 1);
         assert_eq!(store.jobs()[0].job_id(), &job_id);
 
         // Overwrite with the same record is idempotent.
         store
-            .save_job(&coordinator.job_coordinators.values().map(|jc| jc.read_record()).next().unwrap())
+            .save_job(
+                &coordinator
+                    .job_coordinators
+                    .values()
+                    .map(|jc| jc.read_record())
+                    .next()
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(store.jobs().len(), 1);
     }
@@ -1895,7 +1921,9 @@ mod scheduler_tests {
         ))
         .unwrap();
         prev.submit_job(demo_job()).unwrap();
-        store.save_job(&prev.job_coordinators.values().next().unwrap().read_record()).unwrap();
+        store
+            .save_job(&prev.job_coordinators.values().next().unwrap().read_record())
+            .unwrap();
 
         let mut coordinator = Coordinator::active(coord_id);
         coordinator.recover_from_store(&store).unwrap();
@@ -1946,7 +1974,9 @@ mod scheduler_tests {
                 .with_task(TaskSpec::new(TaskId::try_new("task-s1").unwrap(), "ts1")),
         );
         prev.submit_job(stored_spec).unwrap();
-        store.save_job(&prev.job_coordinators.values().next().unwrap().read_record()).unwrap();
+        store
+            .save_job(&prev.job_coordinators.values().next().unwrap().read_record())
+            .unwrap();
 
         // Recovery must discard the stale in-memory job and load only the stored one.
         coordinator.recover_from_store(&store).unwrap();

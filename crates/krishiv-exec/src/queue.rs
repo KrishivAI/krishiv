@@ -61,7 +61,10 @@ impl OperatorQueueSender {
 
     /// Send a barrier. Blocks until space is available in the barrier queue.
     pub async fn send_barrier(&self, epoch: u64) -> Result<(), OperatorQueueError> {
-        self.barrier_tx.send(epoch).await.map_err(|_| OperatorQueueError::Closed)
+        self.barrier_tx
+            .send(epoch)
+            .await
+            .map_err(|_| OperatorQueueError::Closed)
     }
 }
 

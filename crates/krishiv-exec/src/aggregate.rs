@@ -412,7 +412,8 @@ impl LocalAggregator {
             update_agg_state_pre(state, &self.agg_exprs, &pre_agg_cols, row);
         }
 
-        let mut sorted_entries: Vec<(SmallVec<[AggKey; 4]>, AggState)> = groups.into_iter().collect();
+        let mut sorted_entries: Vec<(SmallVec<[AggKey; 4]>, AggState)> =
+            groups.into_iter().collect();
         sorted_entries.sort_by(|(a, _), (b, _)| {
             a.iter()
                 .zip(b.iter())
@@ -421,8 +422,7 @@ impl LocalAggregator {
                 .unwrap_or_else(|| a.len().cmp(&b.len()))
         });
 
-        let mut fields: Vec<Field> =
-            Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
+        let mut fields: Vec<Field> = Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
         for col_name in &self.group_by {
             let schema = batch.schema();
             let f = schema
