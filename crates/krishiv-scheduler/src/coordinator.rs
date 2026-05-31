@@ -163,16 +163,45 @@ impl fmt::Debug for Coordinator {
 }
 
 /// Shared handle to the active coordinator owned by an R2 runtime process.
+///
+/// # Lock Sharding (H2 partial)
+///
+/// The outer `inner` lock guards the full `Coordinator` state. The dedicated
+/// `executor_inner` and `checkpoint_inner` locks provide finer-grained access
+/// to the hottest paths (heartbeat processing and checkpoint acks) without
+/// requiring the full coordinator write lock.
+///
+/// Migration path: hot gRPC handlers should prefer the dedicated inner locks;
+/// the outer lock is held only for operations that need full coordinator state.
 #[derive(Debug, Clone)]
 pub struct SharedCoordinator {
     inner: Arc<RwLock<Coordinator>>,
+    /// Dedicated lock for executor registry state — avoids serialising
+    /// heartbeat processing behind the full coordinator write lock.
+    pub(crate) executor_inner:
+        Arc<RwLock<crate::coordinator_sharded::ExecutorInner>>,
+    /// Dedicated lock for checkpoint coordinator state — avoids serialising
+    /// checkpoint ack processing behind the full coordinator write lock.
+    pub(crate) checkpoint_inner:
+        Arc<RwLock<crate::coordinator_sharded::CheckpointInner>>,
 }
 
 impl SharedCoordinator {
     /// Create a shared coordinator handle.
     pub fn new(coordinator: Coordinator) -> Self {
+        use crate::coordinator_sharded::{CheckpointInner, ExecutorInner};
+        let executor_inner = ExecutorInner {
+            executors: coordinator.executors.clone(),
+            state: coordinator.state,
+            ticks_since_restart: coordinator.ticks_since_restart,
+            recovering: coordinator.recovering,
+            notify: coordinator.notify.clone(),
+        };
+        let checkpoint_inner = CheckpointInner::new();
         Self {
             inner: Arc::new(RwLock::new(coordinator)),
+            executor_inner: Arc::new(RwLock::new(executor_inner)),
+            checkpoint_inner: Arc::new(RwLock::new(checkpoint_inner)),
         }
     }
 

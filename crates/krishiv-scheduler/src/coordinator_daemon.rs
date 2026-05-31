@@ -115,7 +115,7 @@ pub fn build_shared_coordinator_sync(
                         .into(),
                 );
             }
-            let store = futures::executor::block_on(EtcdMetadataStore::connect(
+            let store = krishiv_async_util::block_on(EtcdMetadataStore::connect(
                 config.etcd_endpoints.clone(),
             ))
             .map_err(|e| format!("etcd metadata store: {e}"))?;

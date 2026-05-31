@@ -3,6 +3,7 @@
 //! Coordinator maintains a snapshot view for convenience. The dual sync dance
 //! is transitional; hot paths should migrate to direct inner access + Notify
 //! signaling to eliminate block_on and reduce lock contention.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use krishiv_proto::{CoordinatorState, ExecutorId};
 use tokio::sync::Notify;
 
 /// Executor-facing state guarded by a dedicated `RwLock`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ExecutorInner {
     pub executors: ExecutorRegistry,
     pub state: CoordinatorState,
@@ -25,7 +26,7 @@ pub(crate) struct ExecutorInner {
 }
 
 /// Checkpoint-facing state guarded by a dedicated `RwLock`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct CheckpointInner {
     pub coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     pub notify_sent: HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
