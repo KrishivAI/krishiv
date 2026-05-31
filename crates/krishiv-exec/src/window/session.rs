@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
 
 use crate::aggregate::{AggExpr, AggFunction, AggState};
-use crate::join::format_key_value;
+use crate::join::extract_agg_key;
 use crate::{ExecError, ExecResult};
 
 /// Configuration for a session event-time window operator (R5.2).
@@ -198,7 +198,7 @@ impl SessionWindowOperator {
             if event_time_ms < late_threshold {
                 continue;
             }
-            let key = format_key_value(batch, key_idx, row)?;
+            let key = extract_agg_key(batch, key_idx, row)?.to_string();
             if let Some(existing) = self.sessions.get(&key)
                 && event_time_ms > existing.last_event_time_ms.saturating_add(gap)
                 && let Some(s) = self.sessions.remove(&key)

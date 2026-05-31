@@ -168,9 +168,18 @@ impl Coordinator {
     /// Mark an executor lost and release its running task assignments for retry.
     pub fn mark_executor_lost(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.ensure_active()?;
+        self.prune_executor_channel(executor_id);
         self.executors.mark_lost(executor_id)?;
         self.reset_running_tasks_for_lost_executor(executor_id);
         Ok(())
+    }
+
+    fn prune_executor_channel(&mut self, executor_id: &ExecutorId) {
+        if let Ok(record) = self.executors.find_executor(executor_id)
+            && let Some(endpoint) = record.descriptor().task_endpoint()
+        {
+            self.executor_channels.remove(endpoint);
+        }
     }
 
     /// Advance the deterministic heartbeat clock and mark timed-out executors lost.
@@ -199,6 +208,7 @@ impl Coordinator {
                 continue;
             }
             self.reset_running_tasks_for_lost_executor(lost_id);
+            self.prune_executor_channel(lost_id);
             evicted.push(lost_id.clone());
         }
 

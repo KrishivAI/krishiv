@@ -26,6 +26,7 @@ krishiv-udf = { path = "../krishiv-udf" }
 krishiv-vector-sinks = { path = "../krishiv-vector-sinks", optional = true }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
+dashmap = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 pyo3 = { workspace = true }

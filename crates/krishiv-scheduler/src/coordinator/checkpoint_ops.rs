@@ -49,7 +49,10 @@ impl Coordinator {
     pub async fn handle_checkpoint_ack_async(
         &mut self,
         ack: CheckpointAckRequest,
-    ) -> (CheckpointAckResponse, Option<crate::checkpoint::PendingCommit>) {
+    ) -> (
+        CheckpointAckResponse,
+        Option<crate::checkpoint::PendingCommit>,
+    ) {
         tracing::debug!(
             job_id = %ack.job_id,
             epoch = ack.epoch,

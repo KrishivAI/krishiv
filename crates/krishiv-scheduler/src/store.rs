@@ -1197,8 +1197,7 @@ impl NonBlockingStoreHandle {
 
         // Only spawn the background task when a Tokio runtime is available.
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
-            let (tx, mut rx) =
-                tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
@@ -1256,7 +1255,10 @@ impl NonBlockingStoreHandle {
     /// write on the calling thread (best-effort backpressure).
     pub fn append_event(&self, event: EventLogEvent) {
         if let Some(ref tx) = self.tx {
-            if tx.try_send(StoreCommand::AppendEvent(event.clone())).is_err() {
+            if tx
+                .try_send(StoreCommand::AppendEvent(event.clone()))
+                .is_err()
+            {
                 // Channel full — fall back to sync write.
                 let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Err(e) = guard.append_event(event) {
@@ -1277,7 +1279,10 @@ impl NonBlockingStoreHandle {
     /// write on the calling thread (best-effort backpressure).
     pub fn save_job(&self, record: &JobRecord) {
         if let Some(ref tx) = self.tx {
-            if tx.try_send(StoreCommand::SaveJob(Box::new(record.clone()))).is_err() {
+            if tx
+                .try_send(StoreCommand::SaveJob(Box::new(record.clone())))
+                .is_err()
+            {
                 // Channel full — fall back to sync write.
                 let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if let Err(e) = guard.save_job(&record) {

@@ -234,9 +234,30 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
         let request = request.into_inner();
-        let response = {
+        let job_id = request.job_id.clone();
+        let ack_epoch = request.epoch;
+
+        // Phase 1: extract commit data under the lock (in-memory only, no I/O).
+        let (response, pending_commit, require_finalize) = {
             let mut inner = self.checkpoint_inner.write().await;
-            let response = inner.handle_ack(request);
+            let (response, commit) = inner.handle_ack(request).await;
+            let require_finalize = commit.is_some();
+            (response, commit, require_finalize)
+        };
+
+        // Phase 2: perform async storage I/O outside the lock.
+        if let Some(commit) = pending_commit {
+            crate::checkpoint::CheckpointCoordinator::commit_storage(commit)
+                .await
+                .map_err(|e| tonic::Status::internal(format!("checkpoint commit failed: {e}")))?;
+        }
+
+        // Phase 3: finalize and sync inner → outer coordinator.
+        {
+            let mut inner = self.checkpoint_inner.write().await;
+            if require_finalize {
+                inner.finalize_ack(&job_id, ack_epoch);
+            }
             // Sync inner → outer coordinator to avoid dual-state drift (G3).
             let mut coord = lock_coord(&self.coordinator)?;
             coord
@@ -244,8 +265,7 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 .clone_from(&inner.coordinators);
             coord.checkpoint_notify_sent.clone_from(&inner.notify_sent);
             coord.barrier_dispatch_sent.clone_from(&inner.barrier_sent);
-            response
-        };
+        }
         Ok(tonic::Response::new(response))
     }
 }

@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::aggregate::{AggExpr, AggFunction, AggState};
-use crate::join::format_key_value;
+use crate::join::extract_agg_key;
 use crate::{ExecError, ExecResult};
 
 // ── TumblingWindowSpec ────────────────────────────────────────────────────────
@@ -144,7 +144,7 @@ impl TumblingWindowOperator {
             if event_time_ms < late_threshold {
                 continue;
             }
-            let key = format_key_value(batch, key_idx, row)?;
+            let key = extract_agg_key(batch, key_idx, row)?.to_string();
             let win_start = Self::window_start(event_time_ms, self.spec.window_size_ms);
             let state = self
                 .accumulators

@@ -44,34 +44,42 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         request: tonic::Request<RegisterExecutorRequest>,
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         // GAP-CP-08: Extract auth context for every handler.
-        // NOTE: The server-level `trace_and_auth_interceptor` already validated auth before
-        // this handler runs. The per-handler call below is defense-in-depth only.
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?; // defense-in-depth: redundant when interceptor is active
+        validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
 
         let descriptor = request.descriptor().clone();
         let executor_id = descriptor.executor_id().clone();
-        let mut coordinator = self.coordinator.write().await;
 
-        let response = match coordinator.register_executor(descriptor) {
-            Ok(lease_generation) => RegisterExecutorResponse::new(
-                executor_id,
-                lease_generation,
-                TransportDisposition::Accepted,
-            ),
-            Err(SchedulerError::DuplicateExecutor { executor_id }) => {
-                RegisterExecutorResponse::new(
-                    executor_id,
-                    LeaseGeneration::initial(),
-                    TransportDisposition::Duplicate,
-                )
-                .with_message("executor is already registered")
+        // Phase 1: register under dedicated executor inner lock (H2 sharding).
+        let response = {
+            let mut executor_inner = self.coordinator.executor_inner.write().await;
+            match executor_inner.register_executor(descriptor) {
+                Ok(lease_generation) => RegisterExecutorResponse::new(
+                    executor_id.clone(),
+                    lease_generation,
+                    TransportDisposition::Accepted,
+                ),
+                Err(SchedulerError::DuplicateExecutor { executor_id }) => {
+                    RegisterExecutorResponse::new(
+                        executor_id,
+                        LeaseGeneration::initial(),
+                        TransportDisposition::Duplicate,
+                    )
+                    .with_message("executor is already registered")
+                }
+                Err(error) => return Err(status_from_scheduler_error(error)),
             }
-            Err(error) => return Err(status_from_scheduler_error(error)),
         };
+
+        // Phase 2: sync executor state from inner → outer coordinator.
+        {
+            let inner = self.coordinator.executor_inner.read().await;
+            let mut coordinator = self.coordinator.write().await;
+            coordinator.executors.clone_from(&inner.executors);
+        }
 
         Ok(tonic::Response::new(response))
     }
@@ -274,32 +282,42 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
         let job_id = ack.job_id.clone();
+        let ack_epoch = ack.epoch;
 
-        // Phase 1: in-memory ack processing under coordinator lock.
+        // Phase 1: in-memory ack processing under dedicated checkpoint inner lock (H2 sharding).
         let (response, pending) = {
-            let mut coordinator = self.coordinator.write().await;
-            coordinator.handle_checkpoint_ack_async(ack).await
+            let mut inner = self.coordinator.checkpoint_inner.write().await;
+            inner.handle_ack(ack).await
         };
 
-        // Phase 2: async storage I/O without coordinator lock.
+        // Phase 2: async storage I/O without any coordinator lock.
         if let Some(commit) = pending {
-            let epoch = commit.epoch;
             if let Err(e) = CheckpointCoordinator::commit_storage(commit).await {
                 // Storage write failed — abort the in-flight epoch so the
                 // coordinator does not hang on awaiting-acks timeout.
-                let mut coordinator = self.coordinator.write().await;
-                if let Some(coord) = coordinator.checkpoint_coordinators.get_mut(&job_id) {
+                let mut inner = self.coordinator.checkpoint_inner.write().await;
+                if let Some(coord) = inner.coordinators.get_mut(&job_id) {
                     coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
                 }
+                // Sync inner → outer coordinator after abort.
+                let mut coordinator = self.coordinator.write().await;
+                coordinator
+                    .checkpoint_coordinators
+                    .clone_from(&inner.coordinators);
                 return Err(tonic::Status::internal(format!(
                     "checkpoint commit failed: {e}"
                 )));
             }
 
-            // Phase 3: finalize commit under coordinator lock.
-            let mut coordinator = self.coordinator.write().await;
-            if let Some(coord) = coordinator.checkpoint_coordinators.get_mut(&job_id) {
-                coord.finalize_commit(epoch);
+            // Phase 3: finalize commit under checkpoint inner lock.
+            {
+                let mut inner = self.coordinator.checkpoint_inner.write().await;
+                inner.finalize_ack(&job_id, ack_epoch);
+                // Sync inner → outer coordinator.
+                let mut coordinator = self.coordinator.write().await;
+                coordinator
+                    .checkpoint_coordinators
+                    .clone_from(&inner.coordinators);
             }
         }
 

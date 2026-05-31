@@ -1,16 +1,15 @@
 //! Shared server-side execution host for the Krishiv Flight SQL service.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use krishiv_runtime::continuous_stream::ContinuousStreamRegistry;
 use krishiv_runtime::flight_protocol::{
-    FlightDirective, apply_register_directives, catalog_to_batch_tables, has_control_directive,
-    parse_sql,
+    FlightDirective, apply_register_directives, has_control_directive, parse_sql,
 };
 use krishiv_runtime::in_process::BatchSqlTable;
 use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
@@ -22,7 +21,7 @@ use tonic::Status;
 pub struct FlightExecutionHost {
     cluster: Arc<InProcessCluster>,
     continuous: Arc<ContinuousStreamRegistry>,
-    catalog: Arc<Mutex<HashMap<String, PathBuf>>>,
+    catalog: Arc<DashMap<String, PathBuf>>,
     /// When set, batch SQL is executed via the cluster control plane HTTP API
     /// (`POST /api/v1/batch-sql`) instead of an isolated in-process cluster.
     coordinator_http: Option<String>,
@@ -51,7 +50,7 @@ impl FlightExecutionHost {
         Ok(Self {
             cluster: Arc::new(cluster),
             continuous: Arc::new(ContinuousStreamRegistry::new()),
-            catalog: Arc::new(Mutex::new(HashMap::new())),
+            catalog: Arc::new(DashMap::new()),
             coordinator_http,
         })
     }
@@ -90,17 +89,23 @@ impl FlightExecutionHost {
     }
 
     fn apply_catalog_directives(&self, directives: &[FlightDirective]) -> Result<(), Status> {
-        let mut catalog = self
-            .catalog
-            .lock()
-            .map_err(|_| Status::internal("catalog lock poisoned"))?;
-        apply_register_directives(&mut catalog, directives);
+        // apply_register_directives expects &mut HashMap; build temp map.
+        let mut catalog_map = std::collections::HashMap::new();
+        apply_register_directives(&mut catalog_map, directives);
+        for (table, path) in catalog_map {
+            self.catalog.insert(table, path);
+        }
         Ok(())
     }
 
     fn catalog_tables(&self) -> Vec<BatchSqlTable> {
-        let catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
-        catalog_to_batch_tables(&catalog)
+        self.catalog
+            .iter()
+            .map(|entry| BatchSqlTable {
+                table_name: entry.key().clone(),
+                path: entry.value().clone(),
+            })
+            .collect()
     }
 
     async fn handle_control_directives(

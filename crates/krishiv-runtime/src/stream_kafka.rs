@@ -2,7 +2,7 @@
 
 use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
-use krishiv_exec::join::format_key_value;
+use krishiv_exec::join::extract_agg_key;
 
 use crate::RuntimeError;
 
@@ -35,8 +35,9 @@ pub fn encode_stream_kafka_partition(
 
     let mut records = Vec::new();
     for row in 0..batch.num_rows() {
-        let key = format_key_value(batch, key_idx, row)
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+        let key = extract_agg_key(batch, key_idx, row)
+            .map_err(|e| RuntimeError::transport(e.to_string()))?
+            .to_string();
         let time_arr = batch
             .column(time_idx)
             .as_any()
@@ -46,8 +47,9 @@ pub fn encode_stream_kafka_partition(
             })?;
         let ts = time_arr.value(row);
         let val = if let Some(vidx) = value_idx {
-            let raw = format_key_value(batch, vidx, row)
-                .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            let raw = extract_agg_key(batch, vidx, row)
+                .map_err(|e| RuntimeError::transport(e.to_string()))?
+                .to_string();
             raw.parse::<i64>()
                 .map_err(|e| RuntimeError::transport(format!("value column parse error: {e}")))?
         } else {

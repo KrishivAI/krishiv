@@ -8,6 +8,9 @@ use krishiv_proto::ExecutorTaskAssignment;
 ///
 /// Supports bounded capacity for backpressure (PRR Phase 1/2).
 /// When capacity is reached, `push` returns `ExecutorError::AssignmentQueueFull`.
+/// Default backpressure capacity for new inboxes.
+const DEFAULT_CAPACITY: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
@@ -23,8 +26,13 @@ impl Default for ExecutorAssignmentInbox {
 }
 
 impl ExecutorAssignmentInbox {
-    /// Create an unbounded assignment inbox (legacy behavior, convenient for tests).
+    /// Create a bounded assignment inbox with the default capacity.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
+
+    /// Create an unbounded inbox (no backpressure — tests and legacy paths).
+    pub fn new_unbounded() -> Self {
         Self {
             assignments: Arc::new(RwLock::new(VecDeque::new())),
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
@@ -305,7 +313,7 @@ mod tests {
 
     #[test]
     fn unbounded_inbox_never_rejects() {
-        let inbox = ExecutorAssignmentInbox::new(); // unbounded
+        let inbox = ExecutorAssignmentInbox::new_unbounded(); // unbounded
         assert!(inbox.capacity().is_none());
         for i in 0..5000 {
             inbox.push(make_assignment(&format!("t{}", i))).unwrap();

@@ -3903,6 +3903,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "dashmap",
  "krishiv-common",
  "krishiv-exec",
  "krishiv-flight-sql",
@@ -4076,6 +4077,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "bytes",
+ "dashmap",
  "futures",
  "krishiv-api",
  "krishiv-common",
@@ -4208,6 +4210,7 @@ name = "krishiv-python"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "dashmap",
  "krishiv-ai",
  "krishiv-api",
  "krishiv-catalog",
@@ -4238,6 +4241,7 @@ dependencies = [
  "arrow-flight",
  "async-trait",
  "base64 0.22.1",
+ "dashmap",
  "futures",
  "krishiv-common",
  "krishiv-exec",

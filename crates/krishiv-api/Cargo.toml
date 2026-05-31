@@ -18,6 +18,7 @@ krishiv-exec = { path = "../krishiv-exec" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-udf = { path = "../krishiv-udf" }
+dashmap = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

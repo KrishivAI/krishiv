@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, PrimitiveArray};
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -282,8 +282,10 @@ impl ScalarUdf for MultiplyScalarUdf {
         })?;
 
         let factor = self.factor;
-        let result: PrimitiveArray<Int64Type> =
-            int_array.iter().map(|v| v.map(|x| x * factor)).collect();
+        let result =
+            arrow::compute::kernels::arity::unary::<Int64Type, _, Int64Type>(int_array, |x| {
+                x * factor
+            });
 
         Ok(Arc::new(result))
     }

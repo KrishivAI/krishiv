@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array,
 };
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -10,15 +11,27 @@ use arrow::record_batch::RecordBatch;
 
 use crate::{ExecError, ExecResult};
 
-/// Typed group-by / aggregate key (P2-12).
+/// Typed group-by / join key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum AggKey {
+pub enum AggKey {
     Int32(i32),
     Int64(i64),
     /// `f64` stored as IEEE-754 bits for total-order hashing.
     Float64(u64),
     Utf8(String),
     Bool(bool),
+}
+
+impl fmt::Display for AggKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int32(v) => write!(f, "{v}"),
+            Self::Int64(v) => write!(f, "{v}"),
+            Self::Float64(bits) => write!(f, "{}", f64::from_bits(*bits)),
+            Self::Utf8(s) => f.write_str(s),
+            Self::Bool(v) => write!(f, "{v}"),
+        }
+    }
 }
 
 impl AggKey {
@@ -44,12 +57,11 @@ impl AggKey {
     }
 }
 
-/// Extract a typed key from one column at `row`.
-pub(crate) fn extract_agg_key(
-    batch: &RecordBatch,
-    col_idx: usize,
-    row: usize,
-) -> ExecResult<AggKey> {
+/// Extract a typed [`AggKey`] from one column at `row`.
+///
+/// Supported types: `Int32`, `Int64`, `Float64`, `Utf8`, `Bool`.
+/// Avoids heap allocation for integer and boolean keys.
+pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecResult<AggKey> {
     let col = batch.column(col_idx);
     match col.data_type() {
         DataType::Int32 => {
@@ -84,35 +96,6 @@ pub(crate) fn extract_agg_key(
         }
         other => Err(ExecError::UnsupportedType(format!(
             "unsupported group key type: {other}"
-        ))),
-    }
-}
-
-/// Serialize a single row value from the given column to a `String` for use as
-/// a hash-map key.  Supported types: `Int32`, `Int64`, `Utf8`.
-pub fn format_key_value(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecResult<String> {
-    let col = batch.column(col_idx);
-    match col.data_type() {
-        DataType::Int32 => {
-            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                ExecError::UnsupportedType("declared Int32 key failed downcast".into())
-            })?;
-            Ok(arr.value(row).to_string())
-        }
-        DataType::Int64 => {
-            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                ExecError::UnsupportedType("declared Int64 key failed downcast".into())
-            })?;
-            Ok(arr.value(row).to_string())
-        }
-        DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                ExecError::UnsupportedType("declared Utf8 key failed downcast".into())
-            })?;
-            Ok(arr.value(row).to_string())
-        }
-        other => Err(ExecError::UnsupportedType(format!(
-            "unsupported join key type: {other}"
         ))),
     }
 }
@@ -207,12 +190,11 @@ impl HashJoin {
             .index_of(&self.right_key)
             .map_err(|_| ExecError::ColumnNotFound(self.right_key.clone()))?;
 
-        // Build phase: hash map from serialized key → list of right row indices.
-        // Using String as the key avoids the extra Arc<str> allocation per row
-        // (format_key_value already returns a String).
-        let mut build_map: HashMap<String, Vec<u32>> = HashMap::with_capacity(right.num_rows());
+        // Build phase: hash map from typed key → list of right row indices.
+        // Uses AggKey which avoids String allocation for Int32/Int64 keys.
+        let mut build_map: HashMap<AggKey, Vec<u32>> = HashMap::with_capacity(right.num_rows());
         for row in 0..right.num_rows() {
-            let key = format_key_value(right, right_key_idx, row)?;
+            let key = extract_agg_key(right, right_key_idx, row)?;
             build_map.entry(key).or_default().push(row as u32);
         }
 
@@ -221,7 +203,7 @@ impl HashJoin {
         let mut right_indices: Vec<u32> = Vec::new();
 
         for row in 0..left.num_rows() {
-            let key = format_key_value(left, left_key_idx, row)?;
+            let key = extract_agg_key(left, left_key_idx, row)?;
             if let Some(right_rows) = build_map.get(&key) {
                 for &r in right_rows {
                     left_indices.push(row as u32);
@@ -267,9 +249,9 @@ impl BroadcastJoin {
             .index_of(&self.join_key)
             .map_err(|_| ExecError::ColumnNotFound(self.join_key.clone()))?;
 
-        let mut index: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut index: HashMap<AggKey, Vec<u32>> = HashMap::new();
         for row in 0..broadcast_batch.num_rows() {
-            let key = format_key_value(broadcast_batch, key_idx, row)?;
+            let key = extract_agg_key(broadcast_batch, key_idx, row)?;
             index.entry(key).or_default().push(row as u32);
         }
 
@@ -285,8 +267,8 @@ impl BroadcastJoin {
 pub struct BuiltBroadcastJoin {
     join_key: String,
     broadcast: RecordBatch,
-    /// Pre-built hash map: serialized key → broadcast (right) row indices.
-    index: HashMap<String, Vec<u32>>,
+    /// Pre-built hash map: typed key → broadcast (right) row indices.
+    index: HashMap<AggKey, Vec<u32>>,
 }
 
 impl BuiltBroadcastJoin {
@@ -306,7 +288,7 @@ impl BuiltBroadcastJoin {
         let mut right_indices: Vec<u32> = Vec::new();
 
         for row in 0..probe.num_rows() {
-            let key = format_key_value(probe, probe_key_idx, row)?;
+            let key = extract_agg_key(probe, probe_key_idx, row)?;
             if let Some(broadcast_rows) = self.index.get(&key) {
                 for &r in broadcast_rows {
                     left_indices.push(row as u32);
@@ -343,7 +325,7 @@ pub struct StreamTableJoin {
     /// Column name present in both the stream batch and the table.
     join_key_column: String,
     /// Cached hash map for the table side, built lazily on first use.
-    cached_index: Option<Arc<HashMap<String, Vec<u32>>>>,
+    cached_index: Option<Arc<HashMap<AggKey, Vec<u32>>>>,
 }
 
 impl StreamTableJoin {
@@ -356,7 +338,7 @@ impl StreamTableJoin {
         }
     }
 
-    fn table_index(&mut self) -> ExecResult<Arc<HashMap<String, Vec<u32>>>> {
+    fn table_index(&mut self) -> ExecResult<Arc<HashMap<AggKey, Vec<u32>>>> {
         if let Some(ref cached) = self.cached_index {
             return Ok(Arc::clone(cached));
         }
@@ -365,9 +347,9 @@ impl StreamTableJoin {
             .schema()
             .index_of(&self.join_key_column)
             .map_err(|_| ExecError::ColumnNotFound(self.join_key_column.clone()))?;
-        let mut index: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut index: HashMap<AggKey, Vec<u32>> = HashMap::new();
         for row in 0..self.table.num_rows() {
-            let key = format_key_value(&self.table, table_key_idx, row)?;
+            let key = extract_agg_key(&self.table, table_key_idx, row)?;
             index.entry(key).or_default().push(row as u32);
         }
         let index = Arc::new(index);
@@ -397,7 +379,7 @@ impl StreamTableJoin {
         let mut stream_rows: Vec<u32> = Vec::new();
         let mut table_rows: Vec<u32> = Vec::new();
         for s_row in 0..stream_batch.num_rows() {
-            let key = format_key_value(stream_batch, stream_key_idx, s_row)?;
+            let key = extract_agg_key(stream_batch, stream_key_idx, s_row)?;
             if let Some(t_rows) = table_index.get(&key) {
                 for &t_row in t_rows {
                     stream_rows.push(s_row as u32);

@@ -17,6 +17,7 @@ krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-sql = { path = "../krishiv-sql" }
 
+dashmap = { workspace = true }
 lru = "0.12"
 sha2 = { workspace = true }
 tokio = { workspace = true }

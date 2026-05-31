@@ -1,8 +1,8 @@
 //! Python `krishiv.ai` submodule (R17).
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use krishiv_ai::{
     EmbeddingDevice, EmbeddingModelRegistry, HuggingFaceEmbeddingModel, MarkdownSectionChunker,
     ModelKey, RecursiveTextChunker, SentenceChunker, TokenAwareChunker,
@@ -12,8 +12,8 @@ use pyo3::prelude::*;
 
 use crate::RUNTIME;
 
-static RAG_VECTOR_SINKS: std::sync::LazyLock<RwLock<HashMap<String, Arc<dyn VectorSink>>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+static RAG_VECTOR_SINKS: std::sync::LazyLock<DashMap<String, Arc<dyn VectorSink>>> =
+    std::sync::LazyLock::new(DashMap::new);
 
 fn rag_model_key(model: &str) -> String {
     model.to_string()
@@ -161,10 +161,7 @@ fn rag_index(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let chunker = Arc::new(RecursiveTextChunker::new(512, 64));
     let sink: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
-    RAG_VECTOR_SINKS
-        .write()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
-        .insert(rag_model_key(model), sink.clone());
+    RAG_VECTOR_SINKS.insert(rag_model_key(model), sink.clone());
     let dir = std::env::temp_dir().join(format!("krishiv-rag-{}", std::process::id()));
     std::fs::create_dir_all(&dir)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -206,10 +203,8 @@ fn rag_query(query_text: &str, model: &str, top_k: usize) -> PyResult<Vec<(Strin
     })
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
     let sink = RAG_VECTOR_SINKS
-        .read()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
         .get(&rag_model_key(model))
-        .cloned()
+        .map(|v| v.clone())
         .ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "no RAG index for this model; call krishiv.ai.rag_index first",
@@ -229,12 +224,9 @@ mod tests {
     #[test]
     fn rag_index_then_query_returns_results() {
         let sink: Arc<dyn VectorSink> = Arc::new(InMemoryVectorSink::new());
-        RAG_VECTOR_SINKS
-            .write()
-            .unwrap()
-            .insert(rag_model_key("test-model"), sink);
+        RAG_VECTOR_SINKS.insert(rag_model_key("test-model"), sink);
         assert!(
-            RAG_VECTOR_SINKS.read().unwrap().contains_key("test-model"),
+            RAG_VECTOR_SINKS.contains_key("test-model"),
             "rag_index must register the shared sink for rag_query"
         );
     }

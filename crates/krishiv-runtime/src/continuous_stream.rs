@@ -1,9 +1,10 @@
 //! Shared continuous streaming job state between session and in-process executor.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use krishiv_exec::ContinuousWindowExecutor;
 use krishiv_plan::window::WindowExecutionSpec;
 
@@ -21,7 +22,7 @@ struct ContinuousJobEntry {
 /// Registry for long-running streaming jobs (session-scoped).
 #[derive(Debug, Default)]
 pub struct ContinuousStreamRegistry {
-    jobs: Mutex<HashMap<String, ContinuousJobEntry>>,
+    jobs: DashMap<String, Arc<Mutex<ContinuousJobEntry>>>,
 }
 
 impl ContinuousStreamRegistry {
@@ -37,79 +38,75 @@ impl ContinuousStreamRegistry {
     ) -> RuntimeResult<()> {
         let executor = ContinuousWindowExecutor::new(spec.clone())
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
-        let mut jobs = self
-            .jobs
-            .lock()
-            .map_err(|_| RuntimeError::transport("continuous registry lock poisoned"))?;
-        jobs.insert(
+        self.jobs.insert(
             job_id.into(),
-            ContinuousJobEntry {
+            Arc::new(Mutex::new(ContinuousJobEntry {
                 spec,
                 executor,
                 pending_input: VecDeque::new(),
                 pending_output: VecDeque::new(),
-            },
+            })),
         );
         Ok(())
     }
 
     /// Enqueue input batches for a continuous job.
     pub fn push_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> RuntimeResult<()> {
-        let mut jobs = self
+        let entry = self
             .jobs
-            .lock()
-            .map_err(|_| RuntimeError::transport("continuous registry lock poisoned"))?;
-        let entry = jobs
-            .get_mut(job_id)
+            .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
                 message: format!("unknown continuous stream job '{job_id}'"),
             })?;
-        entry.pending_input.extend(batches);
+        let mut guard = entry
+            .lock()
+            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
+        guard.pending_input.extend(batches);
         Ok(())
     }
 
     /// Drain pending input through the window operator and return newly emitted batches.
     pub fn drain_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        let mut jobs = self
+        let entry = self
             .jobs
-            .lock()
-            .map_err(|_| RuntimeError::transport("continuous registry lock poisoned"))?;
-        let entry = jobs
-            .get_mut(job_id)
+            .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
                 message: format!("unknown continuous stream job '{job_id}'"),
             })?;
-        let input: Vec<RecordBatch> = entry.pending_input.drain(..).collect();
+        let mut guard = entry
+            .lock()
+            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
+        let input: Vec<RecordBatch> = guard.pending_input.drain(..).collect();
         if input.is_empty() {
-            let output: Vec<RecordBatch> = entry.pending_output.drain(..).collect();
+            let output: Vec<RecordBatch> = guard.pending_output.drain(..).collect();
             return Ok(output);
         }
-        let emitted = entry
+        let emitted = guard
             .executor
             .drain(input)
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
-        entry.pending_output.extend(emitted.iter().cloned());
-        let output: Vec<RecordBatch> = entry.pending_output.drain(..).collect();
+        guard.pending_output.extend(emitted.iter().cloned());
+        let output: Vec<RecordBatch> = guard.pending_output.drain(..).collect();
         Ok(output)
     }
 
     /// Borrow the window spec for coordinator fragment encoding.
     pub fn job_spec(&self, job_id: &str) -> RuntimeResult<WindowExecutionSpec> {
-        let jobs = self
+        let entry = self
             .jobs
-            .lock()
-            .map_err(|_| RuntimeError::transport("continuous registry lock poisoned"))?;
-        jobs.get(job_id)
-            .map(|entry| entry.spec.clone())
+            .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
                 message: format!("unknown continuous stream job '{job_id}'"),
-            })
+            })?;
+        let guard = entry
+            .lock()
+            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
+        Ok(guard.spec.clone())
     }
 
     /// List all registered job ids.
     pub fn list_jobs(&self) -> Vec<String> {
-        let jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        jobs.keys().cloned().collect()
+        self.jobs.iter().map(|entry| entry.key().clone()).collect()
     }
 }
 

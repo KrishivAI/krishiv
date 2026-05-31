@@ -178,10 +178,10 @@ pub struct SharedCoordinator {
     inner: Arc<RwLock<Coordinator>>,
     /// Dedicated lock for executor registry state — avoids serialising
     /// heartbeat processing behind the full coordinator write lock.
-    pub(crate) executor_inner: Arc<RwLock<crate::coordinator_sharded::ExecutorInner>>,
+    pub executor_inner: Arc<RwLock<crate::coordinator_sharded::ExecutorInner>>,
     /// Dedicated lock for checkpoint coordinator state — avoids serialising
     /// checkpoint ack processing behind the full coordinator write lock.
-    pub(crate) checkpoint_inner: Arc<RwLock<crate::coordinator_sharded::CheckpointInner>>,
+    pub checkpoint_inner: Arc<RwLock<crate::coordinator_sharded::CheckpointInner>>,
 }
 
 impl SharedCoordinator {
@@ -344,57 +344,100 @@ impl SharedCoordinator {
         // Real delegation step (Track B): the outer Coordinator will consult per-job
         // JobCoordinator instances (via has_in_flight_tasks, stage_count, etc.) for
         // launch and heartbeat decisions. The owned JCP methods above are the seam.
-        let mut launched = 0usize;
-        for job_id in job_ids {
-            tracing::debug!(
-                job_id = %job_id,
-                "driving launches for job"
-            );
 
-            let targets = {
-                let mut coord = self.write().await;
-                let assignments = coord.launch_assigned_task_assignments(&job_id)?;
-                coord.resolve_assignment_targets(assignments)?
-            };
-            let channels = {
-                let coord = self.read().await;
-                coord.executor_channels.clone()
-            };
-            let delivery =
-                Coordinator::deliver_assignment_targets_with_channels(channels, targets).await;
-            match delivery {
-                Ok(responses) => {
-                    let mut coord = self.write().await;
-                    let newly_launched =
-                        coord.apply_assignment_dispatch_responses(&job_id, &responses);
-                    launched = launched.saturating_add(newly_launched);
+        // Phase 1: collect all assignment targets and channels under the lock.
+        struct JobLaunch {
+            job_id: JobId,
+            targets: Vec<(String, ExecutorTaskAssignment)>,
+        }
 
-                    tracing::debug!(
-                        job_id = %job_id,
-                        newly_launched,
-                        "assignment dispatch responses applied"
-                    );
+        let channels = {
+            let coord = self.read().await;
+            coord.executor_channels.clone()
+        };
 
-                    if newly_launched > 0 {
-                        coord.notify.notify_waiters();
+        let launches: Vec<JobLaunch> = {
+            let mut coord = self.write().await;
+            let mut launches = Vec::new();
+            for job_id in &job_ids {
+                match coord.launch_assigned_task_assignments(job_id) {
+                    Ok(assignments) => {
+                        let targets = coord
+                            .resolve_assignment_targets(assignments)
+                            .unwrap_or_default();
+                        if !targets.is_empty() {
+                            launches.push(JobLaunch {
+                                job_id: job_id.clone(),
+                                targets,
+                            });
+                        }
                     }
-
-                    tracing::debug!(
-                        job_id = %job_id,
-                        newly_launched,
-                        executor_count = responses.len(),
-                        "task launch dispatch completed (async JCP delegation influences future cycles)"
-                    );
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %e,
+                            "failed to launch assignments for job; skipping"
+                        );
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %error,
-                        "task launch delivery failed for job; clearing in-flight and continuing"
-                    );
-                    let mut coord = self.write().await;
-                    coord.clear_launch_in_flight_for_job(&job_id);
-                    // Do NOT return — continue with remaining jobs
+            }
+            launches
+        };
+
+        // Phase 2: deliver all assignments concurrently.
+        let channels = Arc::new(channels);
+        let delivery_futures: Vec<_> = launches
+            .iter()
+            .map(|jl| {
+                let channels = Arc::clone(&channels);
+                let job_id = jl.job_id.clone();
+                let targets = jl.targets.clone();
+                tokio::spawn(async move {
+                    let delivery = Coordinator::deliver_assignment_targets_with_channels(
+                        (*channels).clone(),
+                        targets,
+                    )
+                    .await;
+                    (job_id, delivery)
+                })
+            })
+            .collect();
+
+        let delivery_results = futures::future::join_all(delivery_futures)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok());
+
+        // Phase 3: apply all results under a single write lock.
+        let mut launched = 0usize;
+        {
+            let mut coord = self.write().await;
+            for (job_id, delivery) in delivery_results {
+                match delivery {
+                    Ok(responses) => {
+                        let newly_launched =
+                            coord.apply_assignment_dispatch_responses(&job_id, &responses);
+                        launched = launched.saturating_add(newly_launched);
+
+                        tracing::debug!(
+                            job_id = %job_id,
+                            newly_launched,
+                            executor_count = responses.len(),
+                            "task launch dispatch completed"
+                        );
+
+                        if newly_launched > 0 {
+                            coord.notify.notify_waiters();
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %error,
+                            "task launch delivery failed for job; clearing in-flight and continuing"
+                        );
+                        coord.clear_launch_in_flight_for_job(&job_id);
+                    }
                 }
             }
         }

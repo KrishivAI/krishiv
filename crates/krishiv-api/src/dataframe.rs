@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use krishiv_plan::{ExecutionKind, LogicalPlan, PhysicalPlan};
 use krishiv_runtime::{
     BatchTableRegistration, ExecutionRuntime, JobId, JobState, JobStatus, LocalJobRegistry,
@@ -29,7 +29,7 @@ pub struct DataFrame {
     #[allow(dead_code)]
     coordinator_url: Option<String>,
     runtime: Arc<dyn ExecutionRuntime>,
-    registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+    registered_parquet: Arc<DashMap<String, PathBuf>>,
 }
 
 impl fmt::Debug for DataFrame {
@@ -59,7 +59,7 @@ impl DataFrame {
             next_job_id: Arc::new(AtomicU64::new(1)),
             coordinator_url: None,
             runtime: crate::session::shared_embedded_runtime(),
-            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
+            registered_parquet: Arc::new(DashMap::new()),
         }
     }
 
@@ -72,7 +72,7 @@ impl DataFrame {
         next_job_id: Arc<AtomicU64>,
         coordinator_url: Option<String>,
         runtime: Arc<dyn ExecutionRuntime>,
-        registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+        registered_parquet: Arc<DashMap<String, PathBuf>>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
@@ -98,7 +98,7 @@ impl DataFrame {
         jobs: Arc<Mutex<LocalJobRegistry>>,
         next_job_id: Arc<AtomicU64>,
         runtime: Arc<dyn ExecutionRuntime>,
-        registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
+        registered_parquet: Arc<DashMap<String, PathBuf>>,
     ) -> Self {
         let logical_plan = LogicalPlan::new("policy-enforced-query", ExecutionKind::Batch);
         Self {
@@ -170,10 +170,10 @@ impl DataFrame {
             let query = self.sql_query.as_deref().unwrap();
             let tables = self
                 .registered_parquet
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+                .map(|entry| {
+                    BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
+                })
                 .collect::<Vec<_>>();
             crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables)
                 .await

@@ -1,8 +1,9 @@
 //! gRPC checkpoint barrier injection (R16 S1.2).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use krishiv_proto::KeyGroupRange;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
 
@@ -68,7 +69,7 @@ impl SharedBarrierInjector {
 /// Task-id keyed state-handle key-group ranges used by the barrier service.
 #[derive(Clone, Default)]
 pub struct SharedKeyGroupRanges {
-    inner: Arc<Mutex<HashMap<String, KeyGroupRange>>>,
+    inner: Arc<DashMap<String, KeyGroupRange>>,
 }
 
 impl SharedKeyGroupRanges {
@@ -77,25 +78,15 @@ impl SharedKeyGroupRanges {
     }
 
     pub fn set(&self, task_id: impl Into<String>, range: KeyGroupRange) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(task_id.into(), range);
+        self.inner.insert(task_id.into(), range);
     }
 
     pub fn get(&self, task_id: &str) -> Option<KeyGroupRange> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(task_id)
-            .copied()
+        self.inner.get(task_id).map(|r| *r)
     }
 
     pub fn remove(&self, task_id: &str) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(task_id);
+        self.inner.remove(task_id);
     }
 }
 

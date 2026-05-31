@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 
 /// Device selection for local embedding models.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -39,14 +39,14 @@ pub trait EmbeddingModel: Send + Sync {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
 }
 
-static REGISTRY: OnceLock<Mutex<HashMap<ModelKey, Arc<dyn EmbeddingModel>>>> = OnceLock::new();
+static REGISTRY: OnceLock<DashMap<ModelKey, Arc<dyn EmbeddingModel>>> = OnceLock::new();
 
 /// Process-level embedding model registry (ADR-R17.2).
 pub struct EmbeddingModelRegistry;
 
 impl EmbeddingModelRegistry {
-    fn map() -> &'static Mutex<HashMap<ModelKey, Arc<dyn EmbeddingModel>>> {
-        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    fn map() -> &'static DashMap<ModelKey, Arc<dyn EmbeddingModel>> {
+        REGISTRY.get_or_init(DashMap::new)
     }
 
     /// Get or insert a model singleton.
@@ -57,23 +57,16 @@ impl EmbeddingModelRegistry {
     where
         F: FnOnce() -> Result<Arc<dyn EmbeddingModel>, EmbeddingError>,
     {
-        let mut guard = Self::map()
-            .lock()
-            .map_err(|e| EmbeddingError::Load(e.to_string()))?;
-        if let Some(model) = guard.get(&key) {
-            return Ok(Arc::clone(model));
+        if let Some(model) = Self::map().get(&key) {
+            return Ok(Arc::clone(&model));
         }
         let model = loader()?;
-        guard.insert(key, Arc::clone(&model));
-        Ok(model)
+        Ok(Self::map().entry(key).or_insert(Arc::clone(&model)).clone())
     }
 
     /// Register a pre-built model (tests / Python bindings).
     pub fn register(key: ModelKey, model: Arc<dyn EmbeddingModel>) -> Result<(), EmbeddingError> {
-        let mut guard = Self::map()
-            .lock()
-            .map_err(|e| EmbeddingError::Load(e.to_string()))?;
-        guard.insert(key, model);
+        Self::map().insert(key, model);
         Ok(())
     }
 }

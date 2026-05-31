@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use krishiv_state::{Namespace, StateBackend, StateResult};
 
 use crate::aggregate::{AggExpr, AggState};
-use crate::join::format_key_value;
+use crate::join::extract_agg_key;
 use crate::window::tumbling::build_window_record_batch;
 use crate::{ExecError, ExecResult};
 
@@ -146,7 +146,7 @@ impl SlidingWindowOperator {
             if event_time_ms < late_threshold {
                 continue;
             }
-            let key = format_key_value(batch, key_idx, row)?;
+            let key = extract_agg_key(batch, key_idx, row)?.to_string();
             for win_start in
                 Self::window_starts(event_time_ms, self.spec.window_size_ms, self.spec.slide_ms)
             {

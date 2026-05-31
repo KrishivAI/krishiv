@@ -6,8 +6,84 @@ use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array,
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::join::{AggKey, extract_agg_key};
+use crate::join::AggKey;
 use crate::{ExecError, ExecResult};
+
+/// Pre-downcasted Arrow array reference for fast per-row value extraction.
+enum PreDowncastCol<'a> {
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    Float64(&'a Float64Array),
+    Utf8(&'a StringArray),
+    Bool(&'a BooleanArray),
+}
+
+impl<'a> PreDowncastCol<'a> {
+    fn downcast(col: &'a ArrayRef) -> ExecResult<Self> {
+        match col.data_type() {
+            DataType::Int32 => {
+                let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    ExecError::UnsupportedType("declared Int32 column failed downcast".into())
+                })?;
+                Ok(Self::Int32(arr))
+            }
+            DataType::Int64 => {
+                let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    ExecError::UnsupportedType("declared Int64 column failed downcast".into())
+                })?;
+                Ok(Self::Int64(arr))
+            }
+            DataType::Float64 => {
+                let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    ExecError::UnsupportedType("declared Float64 column failed downcast".into())
+                })?;
+                Ok(Self::Float64(arr))
+            }
+            DataType::Utf8 => {
+                let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    ExecError::UnsupportedType("declared Utf8 column failed downcast".into())
+                })?;
+                Ok(Self::Utf8(arr))
+            }
+            DataType::Boolean => {
+                let arr = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                    ExecError::UnsupportedType("declared Bool column failed downcast".into())
+                })?;
+                Ok(Self::Bool(arr))
+            }
+            other => Err(ExecError::UnsupportedType(format!(
+                "unsupported column type for pre-downcast: {other}"
+            ))),
+        }
+    }
+
+    fn extract_agg_key(&self, row: usize) -> AggKey {
+        match self {
+            Self::Int32(arr) => AggKey::Int32(arr.value(row)),
+            Self::Int64(arr) => AggKey::Int64(arr.value(row)),
+            Self::Float64(arr) => AggKey::Float64(arr.value(row).to_bits()),
+            Self::Utf8(arr) => AggKey::Utf8(arr.value(row).to_string()),
+            Self::Bool(arr) => AggKey::Bool(arr.value(row)),
+        }
+    }
+
+    fn int64_value(&self, row: usize) -> i64 {
+        match self {
+            Self::Int32(arr) => arr.value(row) as i64,
+            Self::Int64(arr) => arr.value(row),
+            _ => unreachable!("int64_value called on non-integer column"),
+        }
+    }
+
+    fn float64_value(&self, row: usize) -> f64 {
+        match self {
+            Self::Int32(arr) => arr.value(row) as f64,
+            Self::Int64(arr) => arr.value(row) as f64,
+            Self::Float64(arr) => arr.value(row),
+            _ => unreachable!("float64_value called on non-numeric column"),
+        }
+    }
+}
 
 // ── LocalAggregator ───────────────────────────────────────────────────────────
 
@@ -214,6 +290,58 @@ impl AggState {
     }
 }
 
+/// Fast per-row aggregate state update using pre-downcasted columns.
+///
+/// Avoids the per-row schema lookups and downcasts that `AggState::update`
+/// performs.  The caller must pre-downcast all aggregate input columns.
+fn update_agg_state_pre(
+    state: &mut AggState,
+    agg_exprs: &[AggExpr],
+    pre_cols: &[Option<PreDowncastCol>],
+    row: usize,
+) {
+    for (i, expr) in agg_exprs.iter().enumerate() {
+        match expr.function {
+            AggFunction::Count => {
+                state.values[i] += 1;
+                state.has_value[i] = true;
+            }
+            AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
+                let col = pre_cols[i]
+                    .as_ref()
+                    .expect("Sum/Min/Max must have input col");
+                let v = col.int64_value(row);
+                match expr.function {
+                    AggFunction::Sum => {
+                        state.values[i] += v;
+                        state.has_value[i] = true;
+                    }
+                    AggFunction::Min => {
+                        if !state.has_value[i] || v < state.values[i] {
+                            state.values[i] = v;
+                        }
+                        state.has_value[i] = true;
+                    }
+                    AggFunction::Max => {
+                        if !state.has_value[i] || v > state.values[i] {
+                            state.values[i] = v;
+                        }
+                        state.has_value[i] = true;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            AggFunction::Avg => {
+                let col = pre_cols[i].as_ref().expect("Avg must have input col");
+                let v = col.float64_value(row);
+                state.avg_sums[i] += v;
+                state.avg_counts[i] += 1;
+                state.has_value[i] = true;
+            }
+        }
+    }
+}
+
 /// Local pre-aggregation operator.
 ///
 /// Groups a `RecordBatch` by `group_by` columns and computes aggregates.
@@ -246,18 +374,40 @@ impl LocalAggregator {
             })
             .collect::<ExecResult<_>>()?;
 
+        // Pre-downcast group-by columns once.
+        let pre_gb: Vec<PreDowncastCol> = gb_indices
+            .iter()
+            .map(|&idx| PreDowncastCol::downcast(batch.column(idx)))
+            .collect::<ExecResult<_>>()?;
+
+        // Pre-resolve aggregate column indices and pre-downcast once.
+        let mut pre_agg_indices: Vec<usize> = Vec::with_capacity(self.agg_exprs.len());
+        let mut pre_agg_cols: Vec<Option<PreDowncastCol>> =
+            Vec::with_capacity(self.agg_exprs.len());
+        for expr in &self.agg_exprs {
+            if matches!(expr.function, AggFunction::Count) {
+                pre_agg_indices.push(0); // unused
+                pre_agg_cols.push(None);
+            } else {
+                let col_idx = batch
+                    .schema()
+                    .index_of(&expr.input_column)
+                    .map_err(|_| ExecError::ColumnNotFound(expr.input_column.clone()))?;
+                let col = PreDowncastCol::downcast(batch.column(col_idx))?;
+                pre_agg_indices.push(col_idx);
+                pre_agg_cols.push(Some(col));
+            }
+        }
+
         let mut groups: HashMap<Vec<AggKey>, AggState> = HashMap::new();
 
         for row in 0..batch.num_rows() {
-            let key: Vec<AggKey> = gb_indices
-                .iter()
-                .map(|&idx| extract_agg_key(batch, idx, row))
-                .collect::<ExecResult<_>>()?;
+            let key: Vec<AggKey> = pre_gb.iter().map(|col| col.extract_agg_key(row)).collect();
 
             let state = groups
                 .entry(key)
                 .or_insert_with(|| AggState::new(&self.agg_exprs));
-            state.update(&self.agg_exprs, batch, row)?;
+            update_agg_state_pre(state, &self.agg_exprs, &pre_agg_cols, row);
         }
 
         let mut sorted_entries: Vec<(Vec<AggKey>, AggState)> = groups.into_iter().collect();

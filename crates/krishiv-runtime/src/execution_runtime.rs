@@ -10,8 +10,8 @@ use crate::in_process::BatchSqlTable;
 use crate::in_process_cluster::InProcessCluster;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{
-    DistributedBackend, EmbeddedBackend, ExecutionBackend, ExecutionReport, RuntimeError,
-    RuntimeResult, SingleNodeBackend,
+    EmbeddedBackend, ExecutionBackend, ExecutionReport, RuntimeError, RuntimeResult,
+    SingleNodeBackend,
 };
 
 /// Local cluster connection endpoints for SingleNode / Distributed clients.
@@ -263,6 +263,10 @@ impl RemoteExecutionRuntime {
     }
 }
 
+fn is_unimplemented_err(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::Transport { message } if message.contains("Unimplemented"))
+}
+
 impl ExecutionRuntime for RemoteExecutionRuntime {
     fn mode(&self) -> RuntimeMode {
         self.session_mode
@@ -273,8 +277,25 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        let backend = DistributedBackend::new(self.flight_url.clone());
-        backend.execute(plan)
+        use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
+        use krishiv_common::async_util::block_on;
+        let body = ExecutePlanBody::from_plan(plan)?;
+        let action = KrishivFlightAction::ExecutePlan(body);
+        let result = block_on(self.pool.do_action(&action));
+        match result {
+            Ok(_) => {}
+            Err(ref e) if is_unimplemented_err(e) => {
+                let sql = crate::flight_client::plan_to_sql(plan);
+                let _ = block_on(self.pool.execute_sql(&sql))?;
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(ExecutionReport::new(
+            "distributed",
+            plan.name(),
+            plan.kind(),
+            true,
+        ))
     }
 
     fn collect_bounded_window(
@@ -283,13 +304,25 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         input_batches: Vec<RecordBatch>,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        use crate::flight_action::{BoundedWindowBody, KrishivFlightAction, encode_batches};
+        use crate::flight_client::decode_ipc_response;
+        use crate::flight_protocol::encode_bounded_window;
         use krishiv_common::async_util::block_on;
-        block_on(crate::flight_client::execute_remote_bounded_window(
-            &self.flight_url,
-            topic,
-            input_batches,
-            spec,
-        ))
+        let batches_b64 = encode_batches(&input_batches)?;
+        let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+            topic: topic.to_string(),
+            spec: spec.to_plan_spec(),
+            batches_b64,
+        });
+        let result = block_on(self.pool.do_action(&action));
+        match result {
+            Ok(body) => decode_ipc_response(&body),
+            Err(ref e) if is_unimplemented_err(e) => {
+                let sql = encode_bounded_window(topic, spec, &input_batches)?;
+                block_on(self.pool.execute_sql(&sql))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn collect_batch_sql(
@@ -297,20 +330,19 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         query: &str,
         tables: &[BatchTableRegistration],
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        use crate::flight_protocol::encode_batch_sql;
         use krishiv_common::async_util::block_on;
-        block_on(crate::flight_client::execute_remote_batch_sql(
-            &self.flight_url,
-            query,
-            &tables_to_batch_sql(tables),
-        ))
+        let sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
+        block_on(self.pool.execute_sql(&sql))
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
+        use crate::flight_client::flight_explain_from_batches;
+        use crate::flight_protocol::encode_explain_sql;
         use krishiv_common::async_util::block_on;
-        block_on(crate::flight_client::execute_remote_explain(
-            &self.flight_url,
-            query,
-        ))
+        let sql = encode_explain_sql(query);
+        let batches = block_on(self.pool.execute_sql(&sql))?;
+        Ok(flight_explain_from_batches(&batches))
     }
 
     fn register_continuous_stream(
@@ -318,12 +350,23 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<()> {
+        use crate::flight_action::{ContinuousRegisterBody, KrishivFlightAction};
+        use crate::flight_protocol::encode_continuous_register;
         use krishiv_common::async_util::block_on;
-        block_on(crate::flight_client::execute_remote_continuous_register(
-            &self.flight_url,
-            job_id,
-            spec,
-        ))
+        let action = KrishivFlightAction::ContinuousRegister(ContinuousRegisterBody {
+            job_id: job_id.to_string(),
+            spec: spec.to_plan_spec(),
+        });
+        let result = block_on(self.pool.do_action(&action));
+        match result {
+            Ok(_) => Ok(()),
+            Err(ref e) if is_unimplemented_err(e) => {
+                let sql = encode_continuous_register(job_id, spec)?;
+                let _ = block_on(self.pool.execute_sql(&sql))?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn push_continuous_stream_input(
@@ -331,24 +374,47 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         batches: Vec<RecordBatch>,
     ) -> RuntimeResult<()> {
+        use crate::flight_action::{ContinuousPushBody, KrishivFlightAction, encode_batches};
+        use crate::flight_protocol::encode_continuous_push;
         use krishiv_common::async_util::block_on;
-        block_on(crate::flight_client::execute_remote_continuous_push(
-            &self.flight_url,
-            job_id,
-            batches,
-        ))
+        let batches_b64 = encode_batches(&batches)?;
+        let action = KrishivFlightAction::ContinuousPush(ContinuousPushBody {
+            job_id: job_id.to_string(),
+            batches_b64,
+        });
+        let result = block_on(self.pool.do_action(&action));
+        match result {
+            Ok(_) => Ok(()),
+            Err(ref e) if is_unimplemented_err(e) => {
+                let sql = encode_continuous_push(job_id, &batches)?;
+                let _ = block_on(self.pool.execute_sql(&sql))?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        use crate::flight_action::{ContinuousDrainBody, KrishivFlightAction};
+        use crate::flight_client::decode_ipc_response;
+        use crate::flight_protocol::encode_continuous_drain;
         use krishiv_common::async_util::block_on;
-        block_on(crate::flight_client::execute_remote_continuous_drain(
-            &self.flight_url,
-            job_id,
-        ))
+        let action = KrishivFlightAction::ContinuousDrain(ContinuousDrainBody {
+            job_id: job_id.to_string(),
+        });
+        let result = block_on(self.pool.do_action(&action));
+        match result {
+            Ok(body) => decode_ipc_response(&body),
+            Err(ref e) if is_unimplemented_err(e) => {
+                let sql = encode_continuous_drain(job_id);
+                block_on(self.pool.execute_sql(&sql))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn flight_url(&self) -> Option<&str> {
-        Some(&self.flight_url)
+        Some(self.pool.flight_url())
     }
 
     fn coordinator_grpc_url(&self) -> Option<&str> {
@@ -370,9 +436,9 @@ pub fn build_execution_runtime(
 ) -> RuntimeResult<Arc<dyn ExecutionRuntime>> {
     match (mode, placement) {
         (RuntimeMode::Embedded, ExecutionPlacement::LocalInProcess) => {
-            let cluster = in_process_cluster
-                .clone()
-                .ok_or_else(|| RuntimeError::unsupported("Embedded mode requires an InProcessCluster"))?;
+            let cluster = in_process_cluster.clone().ok_or_else(|| {
+                RuntimeError::unsupported("Embedded mode requires an InProcessCluster")
+            })?;
             Ok(Arc::new(InProcessExecutionRuntime::embedded(cluster)))
         }
         (RuntimeMode::SingleNode, ExecutionPlacement::LocalInProcess) => {
@@ -440,10 +506,9 @@ mod tests {
 
     #[test]
     fn distributed_runtime_preserves_flight_and_grpc_urls() {
-        let cluster = Arc::new(InProcessCluster::new().expect("cluster"));
         let runtime = build_execution_runtime(
             RuntimeMode::Distributed,
-            cluster,
+            None,
             Some(String::from("http://127.0.0.1:50051")),
             Some(String::from("http://127.0.0.1:9090")),
             ExecutionPlacement::RemoteClusterRequired,
@@ -608,7 +673,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::Embedded,
-            cluster,
+            Some(cluster),
             None,
             None,
             ExecutionPlacement::LocalInProcess,
@@ -623,7 +688,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::SingleNode,
-            cluster,
+            Some(cluster),
             None,
             None,
             ExecutionPlacement::LocalInProcess,
@@ -639,7 +704,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let err = match build_execution_runtime(
             RuntimeMode::SingleNode,
-            cluster,
+            Some(cluster),
             None,
             None,
             ExecutionPlacement::SingleNodeDaemon,
@@ -660,7 +725,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::SingleNode,
-            cluster,
+            Some(cluster),
             Some("http://127.0.0.1:50051".into()),
             None,
             ExecutionPlacement::SingleNodeDaemon,
@@ -674,10 +739,9 @@ mod tests {
 
     #[test]
     fn build_runtime_distributed_requires_explicit_flight_url() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
         let err = match build_execution_runtime(
             RuntimeMode::Distributed,
-            cluster,
+            None,
             None,
             None,
             ExecutionPlacement::RemoteClusterRequired,
@@ -695,10 +759,9 @@ mod tests {
 
     #[test]
     fn build_runtime_distributed_with_custom_flight_url() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::Distributed,
-            cluster,
+            None,
             Some("http://remote:50051".into()),
             None,
             ExecutionPlacement::RemoteClusterRequired,
@@ -711,10 +774,9 @@ mod tests {
 
     #[test]
     fn build_runtime_distributed_remote_execution() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::Distributed,
-            cluster,
+            None,
             Some("http://remote:50051".into()),
             None,
             ExecutionPlacement::RemoteClusterRequired,
@@ -728,7 +790,7 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let err = match build_execution_runtime(
             RuntimeMode::Distributed,
-            cluster,
+            Some(cluster),
             Some("http://remote:50051".into()),
             None,
             ExecutionPlacement::LocalInProcess,
@@ -758,10 +820,9 @@ mod tests {
 
     #[test]
     fn distributed_runtime_flight_url_preserved() {
-        let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::Distributed,
-            cluster,
+            None,
             Some("http://custom:50051".into()),
             Some("http://custom:9090".into()),
             ExecutionPlacement::RemoteClusterRequired,

@@ -7,9 +7,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::checkpoint::CheckpointCoordinator;
+use crate::checkpoint::{CheckpointCoordinator, PendingCommit};
 use crate::heartbeat::ExecutorRegistry;
-use krishiv_proto::{CheckpointAckRequest, CheckpointAckResponse, CoordinatorState, ExecutorId};
+use krishiv_proto::{
+    CheckpointAckRequest, CheckpointAckResponse, CoordinatorState, ExecutorId, JobId,
+};
 use tokio::sync::Notify;
 
 /// Executor-facing state guarded by a dedicated `RwLock`.
@@ -25,6 +27,29 @@ pub struct ExecutorInner {
 }
 
 impl ExecutorInner {
+    pub fn register_executor(
+        &mut self,
+        descriptor: krishiv_proto::ExecutorDescriptor,
+    ) -> Result<krishiv_proto::LeaseGeneration, crate::SchedulerError> {
+        let res = self.executors.register(descriptor);
+        if res.is_ok() {
+            self.notify.notify_waiters();
+        }
+        res
+    }
+
+    pub fn deregister_executor(
+        &mut self,
+        executor_id: &ExecutorId,
+        lease_generation: krishiv_proto::LeaseGeneration,
+    ) -> Result<krishiv_proto::LeaseGeneration, crate::SchedulerError> {
+        let res = self.executors.deregister(executor_id, lease_generation);
+        if res.is_ok() {
+            self.notify.notify_waiters();
+        }
+        res
+    }
+
     /// Handle a heartbeat on the executor inner state — updates the registry
     /// and returns the new lease generation.
     pub fn handle_heartbeat(
@@ -64,33 +89,63 @@ impl CheckpointInner {
         }
     }
 
-    /// Handle a checkpoint ack directly on the inner state, bypassing the full
-    /// coordinator lock.
-    pub fn handle_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
+    /// Handle a checkpoint ack with the async 3-phase protocol.
+    ///
+    /// Phase 1 (under lock): extract commit data in-memory.
+    /// Phase 2 (outside lock): caller performs async storage I/O.
+    /// Phase 3 (under lock): caller calls [`Self::finalize_ack`].
+    ///
+    /// Returns `(response, Option<PendingCommit>)` — if `Some(commit)`,
+    /// the caller must write storage and then call `finalize_ack`.
+    pub async fn handle_ack(
+        &mut self,
+        ack: CheckpointAckRequest,
+    ) -> (CheckpointAckResponse, Option<PendingCommit>) {
         let job_id = ack.job_id.clone();
-        let res = match self.coordinators.get_mut(&job_id) {
-            None => CheckpointAckResponse::JobNotFound,
+        let ack_epoch = ack.epoch;
+
+        let result = match self.coordinators.get_mut(&job_id) {
+            None => (CheckpointAckResponse::JobNotFound, None),
             Some(coord) => {
-                let coordinator_token = coord.fencing_token();
-                if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
-                    return CheckpointAckResponse::StaleFencingToken {
-                        current_token: coordinator_token.as_u64(),
-                    };
+                if ack.fencing_token.as_u64() != coord.fencing_token().as_u64() {
+                    return (
+                        CheckpointAckResponse::StaleFencingToken {
+                            current_token: coord.fencing_token().as_u64(),
+                        },
+                        None,
+                    );
                 }
-                let current_epoch = coord.current_epoch();
-                match coord.receive_ack(ack.clone()) {
+                match coord.receive_ack_async(ack.clone()).await {
                     Ok(true) => {
-                        self.clear_notify_for_epoch(&job_id, ack.epoch);
-                        // Metrics: caller may track CHECKPOINT_EPOCHS_TOTAL externally
-                        CheckpointAckResponse::Accepted
+                        let commit = coord.take_pending_commit();
+                        (CheckpointAckResponse::Accepted, commit)
                     }
-                    Ok(false) => CheckpointAckResponse::Accepted,
-                    Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+                    Ok(false) => (CheckpointAckResponse::Accepted, None),
+                    Err(_) => {
+                        let current_epoch = coord.current_epoch();
+                        (CheckpointAckResponse::StaleEpoch { current_epoch }, None)
+                    }
                 }
             }
         };
+
+        if result.1.is_some() {
+            self.clear_notify_for_epoch(&job_id, ack_epoch);
+        }
         self.notify.notify_waiters();
-        res
+
+        (result.0, result.1)
+    }
+
+    /// Phase 3: finalize a commit after storage I/O completes.
+    /// Must be called under the same lock as `handle_ack`.
+    pub fn finalize_ack(&mut self, job_id: &JobId, epoch: u64) {
+        if let Some(coord) = self.coordinators.get_mut(job_id) {
+            if let crate::checkpoint::CheckpointCoordinatorState::Committing { .. } = &coord.state {
+                coord.finalize_commit(epoch);
+            }
+        }
+        self.notify.notify_waiters();
     }
 
     fn clear_notify_for_epoch(&mut self, job_id: &krishiv_proto::JobId, epoch: u64) {

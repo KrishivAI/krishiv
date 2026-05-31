@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::ExecutionKind;
@@ -276,12 +276,12 @@ impl SessionBuilder {
             coordinator_url: self.coordinator_url,
             coordinator_grpc_url: self.local_cluster_grpc,
             state_ttl: self.state_ttl,
-            memory_streams: Arc::new(RwLock::new(HashMap::new())),
+            memory_streams: Arc::new(DashMap::new()),
             udf_registry,
             local_cluster,
             runtime,
-            registered_parquet: Arc::new(RwLock::new(HashMap::new())),
-            stream_jobs: Arc::new(RwLock::new(HashMap::new())),
+            registered_parquet: Arc::new(DashMap::new()),
+            stream_jobs: Arc::new(DashMap::new()),
         })
     }
 }
@@ -297,12 +297,12 @@ pub struct Session {
     pub(crate) coordinator_url: Option<String>,
     coordinator_grpc_url: Option<String>,
     state_ttl: Option<StateTtlConfig>,
-    memory_streams: Arc<RwLock<HashMap<String, Vec<RecordBatch>>>>,
+    memory_streams: Arc<DashMap<String, Vec<RecordBatch>>>,
     udf_registry: Arc<RwLock<UdfRegistry>>,
     local_cluster: Arc<InProcessCluster>,
     runtime: Arc<dyn ExecutionRuntime>,
-    registered_parquet: Arc<RwLock<HashMap<String, PathBuf>>>,
-    stream_jobs: Arc<RwLock<HashMap<String, LocalWindowExecutionSpec>>>,
+    registered_parquet: Arc<DashMap<String, PathBuf>>,
+    stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
 }
 
 impl fmt::Debug for Session {
@@ -394,10 +394,7 @@ impl Session {
         self.runtime
             .register_continuous_stream(&name, &spec)
             .map_err(KrishivError::from)?;
-        self.stream_jobs
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.clone(), spec);
+        self.stream_jobs.insert(name.clone(), spec);
         Ok(name)
     }
 
@@ -421,20 +418,13 @@ impl Session {
         name: impl Into<String>,
         batches: Vec<RecordBatch>,
     ) -> Result<()> {
-        self.memory_streams
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.into(), batches);
+        self.memory_streams.insert(name.into(), batches);
         Ok(())
     }
 
     /// Resolve batches previously registered with [`register_memory_stream`].
     pub fn memory_stream_batches(&self, name: &str) -> Option<Vec<RecordBatch>> {
-        self.memory_streams
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .cloned()
+        self.memory_streams.get(name).map(|v| v.clone())
     }
 
     /// Known local jobs.
@@ -495,10 +485,7 @@ impl Session {
                 .await
                 .map_err(KrishivError::from)
         })?;
-        self.registered_parquet
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(table_name, path);
+        self.registered_parquet.insert(table_name.clone(), path);
         Ok(())
     }
 
@@ -540,10 +527,7 @@ impl Session {
             .register_parquet(&table_name, &path)
             .await
             .map_err(KrishivError::from)?;
-        self.registered_parquet
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(table_name, path);
+        self.registered_parquet.insert(table_name, path);
         Ok(())
     }
 
@@ -626,10 +610,8 @@ impl Session {
         let query = query.as_ref();
         let tables = self
             .registered_parquet
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
         let batches = runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables).await?;
         Ok(DataFrame::from_batches(
@@ -666,10 +648,8 @@ impl Session {
             .map_err(KrishivError::from)?;
         let tables = self
             .registered_parquet
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(table, path)| BatchTableRegistration::new(table.clone(), path.clone()))
+            .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
         let batches =
             runtime_collect_batch_sql(Arc::clone(&self.runtime), &effective_sql, &tables).await?;

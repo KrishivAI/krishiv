@@ -345,9 +345,7 @@ impl CheckpointCoordinator {
 
         // GAP-CP-03: Validate fencing token before committing to storage.
         krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
-            .map_err(|e| {
-                format!("fencing token mismatch for job {}: {e}", self.job_id)
-            })?;
+            .map_err(|e| format!("fencing token mismatch for job {}: {e}", self.job_id))?;
 
         Ok(PendingCommit {
             storage: Arc::clone(&self.storage),
@@ -373,13 +371,7 @@ impl CheckpointCoordinator {
         let job_id = &commit.job_id;
         let metadata = &commit.metadata;
 
-        write_epoch_metadata_async(
-            commit.storage.as_ref(),
-            job_id,
-            epoch,
-            metadata,
-        )
-        .await?;
+        write_epoch_metadata_async(commit.storage.as_ref(), job_id, epoch, metadata).await?;
 
         // Build manifest: hash metadata.json + each snapshot file.
         let mut manifest = IntegrityManifest::new();
@@ -587,9 +579,9 @@ impl CheckpointCoordinator {
     /// split: [`Self::extract_commit_data`] → [`Self::commit_storage`] →
     /// [`Self::finalize_commit`].
     pub async fn commit_epoch_async(&mut self) -> CheckpointResult<u64> {
-        let commit = self.extract_commit_data().map_err(|e| {
-            krishiv_checkpoint::CheckpointError::Storage { message: e }
-        })?;
+        let commit = self
+            .extract_commit_data()
+            .map_err(|e| krishiv_checkpoint::CheckpointError::Storage { message: e })?;
         let epoch = commit.epoch;
 
         Self::commit_storage(commit).await?;
@@ -822,9 +814,7 @@ mod tests {
 
         // Storage I/O and finalisation happen in separate steps.
         let commit = coord.take_pending_commit().expect("pending commit");
-        CheckpointCoordinator::commit_storage(commit)
-            .await
-            .unwrap();
+        CheckpointCoordinator::commit_storage(commit).await.unwrap();
         coord.finalize_commit(1);
 
         let meta =

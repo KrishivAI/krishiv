@@ -1,5 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
+use dashmap::DashMap;
+
 pub use crate::llm::RateLimitConfig;
 
 /// Dual token-bucket rate limiter for LLM requests and tokens.
@@ -11,9 +13,8 @@ pub struct LlmRateLimiter {
     last_refill_ms: Option<u64>,
 }
 
-static GLOBAL_LIMITERS: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<LlmRateLimiter>>>>,
-> = OnceLock::new();
+static GLOBAL_LIMITERS: OnceLock<DashMap<String, Arc<tokio::sync::Mutex<LlmRateLimiter>>>> =
+    OnceLock::new();
 
 impl LlmRateLimiter {
     /// Create a new limiter from config.
@@ -28,14 +29,8 @@ impl LlmRateLimiter {
 
     /// Process-wide singleton per model name.
     pub fn for_model(model: &str, config: RateLimitConfig) -> Arc<tokio::sync::Mutex<Self>> {
-        let map =
-            GLOBAL_LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut guard = map.lock().unwrap_or_else(|e| {
-            tracing::error!("LLM rate limiter map lock poisoned: {e}");
-            e.into_inner()
-        });
-        guard
-            .entry(model.to_string())
+        let map = GLOBAL_LIMITERS.get_or_init(DashMap::new);
+        map.entry(model.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(Self::new(config))))
             .clone()
     }

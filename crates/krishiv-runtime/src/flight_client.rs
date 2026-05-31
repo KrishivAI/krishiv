@@ -5,7 +5,6 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::flight_protocol::{
@@ -92,10 +91,76 @@ impl FlightClientPool {
     }
 
     pub async fn get_channel(&self) -> RuntimeResult<Channel> {
-        let cell = self.channel.get_or_try_init(|| async {
-            connect_flight_channel(&self.endpoint).await
-        });
-        cell.await.as_ref().map(Channel::clone).map_err(|e| e.clone())
+        let cell = self
+            .channel
+            .get_or_try_init(|| async { connect_flight_channel(&self.endpoint).await });
+        cell.await
+            .as_ref()
+            .map(|c| (*c).clone())
+            .map_err(|e| e.clone())
+    }
+
+    pub async fn do_action(
+        &self,
+        action: &crate::flight_action::KrishivFlightAction,
+    ) -> RuntimeResult<Vec<u8>> {
+        use futures::StreamExt;
+        let channel = self.get_channel().await?;
+        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+        let body = action.to_action_body()?;
+        let req = arrow_flight::Action {
+            r#type: action.action_type(),
+            body: body.into(),
+        };
+        let mut stream = client
+            .do_action(tonic::Request::new(req))
+            .await
+            .map_err(|e| RuntimeError::transport(format!("do_action: {e}")))?
+            .into_inner();
+
+        let mut buf = Vec::new();
+        while let Some(item) = stream.next().await {
+            let part =
+                item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
+            buf.extend_from_slice(&part.body);
+        }
+        Ok(buf)
+    }
+
+    pub async fn execute_sql(
+        &self,
+        sql: &str,
+    ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+        let channel = self.get_channel().await?;
+        let mut client = FlightSqlServiceClient::new(channel);
+
+        let flight_info = client
+            .execute(sql.to_string(), None)
+            .await
+            .map_err(|e| RuntimeError::transport(format!("flight execute failed: {e}")))?;
+
+        let ticket = flight_info
+            .endpoint
+            .first()
+            .and_then(|ep| ep.ticket.clone())
+            .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
+
+        let mut stream = client
+            .do_get(Ticket {
+                ticket: ticket.ticket,
+            })
+            .await
+            .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
+
+        let mut batches = Vec::new();
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
+        {
+            batches.push(batch);
+        }
+        Ok(batches)
     }
 }
 
@@ -173,7 +238,7 @@ pub async fn execute_remote_explain(flight_url: &str, query: &str) -> RuntimeRes
     Ok(flight_explain_from_batches(&batches))
 }
 
-fn flight_explain_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> String {
+pub fn flight_explain_from_batches(batches: &[arrow::record_batch::RecordBatch]) -> String {
     use arrow::array::Array;
     use arrow::array::StringArray;
 
@@ -293,7 +358,7 @@ fn is_unimplemented(e: &RuntimeError) -> bool {
     matches!(e, RuntimeError::Transport { message } if message.contains("Unimplemented"))
 }
 
-fn decode_ipc_response(body: &[u8]) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+pub fn decode_ipc_response(body: &[u8]) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     if body.is_empty() {
         return Ok(Vec::new());
     }

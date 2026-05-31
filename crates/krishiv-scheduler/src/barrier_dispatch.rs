@@ -1,10 +1,10 @@
 //! Coordinator-side checkpoint barrier dispatch over gRPC (WS-4 / ADR-R16.1).
 
-use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
 use krishiv_proto::{CheckpointAckRequest, ExecutorId, FencingToken, JobId, TaskId};
 
@@ -13,22 +13,17 @@ use crate::barrier_tracker::CheckpointBarrierTracker;
 use crate::heartbeat::ExecutorRecord;
 use crate::{Coordinator, SchedulerResult};
 
-fn barrier_channels() -> &'static Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>
-{
-    static CHANNELS: OnceLock<Arc<tokio::sync::Mutex<HashMap<String, tonic::transport::Channel>>>> =
-        OnceLock::new();
-    CHANNELS.get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+fn barrier_channels() -> &'static DashMap<String, tonic::transport::Channel> {
+    static CHANNELS: OnceLock<DashMap<String, tonic::transport::Channel>> = OnceLock::new();
+    CHANNELS.get_or_init(DashMap::new)
 }
 
 async fn get_or_connect_barrier_channel(
     endpoint: &str,
 ) -> Result<tonic::transport::Channel, String> {
     let channels = barrier_channels();
-    {
-        let guard = channels.lock().await;
-        if let Some(channel) = guard.get(endpoint) {
-            return Ok(channel.clone());
-        }
+    if let Some(channel) = channels.get(endpoint) {
+        return Ok(channel.clone());
     }
 
     let parsed = tonic::transport::Channel::from_shared(endpoint.to_owned())
@@ -38,10 +33,9 @@ async fn get_or_connect_barrier_channel(
         .await
         .map_err(|e| format!("barrier connect {endpoint}: {e}"))?;
 
-    let mut guard = channels.lock().await;
-    Ok(guard
+    Ok(channels
         .entry(endpoint.to_owned())
-        .or_insert_with(|| channel.clone())
+        .or_insert(channel.clone())
         .clone())
 }
 
