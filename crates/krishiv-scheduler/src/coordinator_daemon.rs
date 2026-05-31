@@ -675,6 +675,8 @@ pub async fn run_standalone_coordinator(
     }
     let coordinator = build_shared_coordinator(&config)?;
     spawn_coordinator_sidecars(&coordinator, &config).await?;
+    // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
+    let _handles = coordinator.spawn_orchestration_loops();
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
         "Krishiv coordinator {} gRPC listening on {}",

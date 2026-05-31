@@ -1,4 +1,5 @@
 use super::*;
+use crate::job_coordinator::JobCoordinator;
 
 impl Coordinator {
     /// Restore job state from a `MetadataStore` after coordinator restart.
@@ -13,12 +14,15 @@ impl Coordinator {
     pub fn recover_from_store(&mut self, store: &dyn MetadataStore) -> SchedulerResult<()> {
         // P1.23: Clear in-memory state first so stale phantom jobs cannot survive.
         // Always prefer the persisted store as the authoritative source of truth.
-        self.jobs.clear();
+        self.job_coordinators.clear();
         self.streaming_task_index.clear();
         self.job_coordinators.clear();
         for record in store.jobs() {
             let job_id = record.job_id().clone();
-            self.jobs.insert(job_id.clone(), record.clone());
+            self.job_coordinators.insert(
+                job_id.clone(),
+                Arc::new(JobCoordinator::new(job_id.clone(), record.clone())),
+            );
             // Track B (two-tier): repopulate JobCoordinator map on recovery so the
             // per-job ownership seam (launch decisions, heartbeat windows, recovery)
             // survives coordinator restart / failover for long-lived jobs.
@@ -29,10 +33,14 @@ impl Coordinator {
         // recovery window are not silently dropped.  Without this, every call to
         // apply_streaming_task_state returns early because the index is empty.
         let streaming_job_ids: Vec<JobId> = self
-            .jobs
+            .job_coordinators
             .values()
-            .filter(|j| j.spec.kind() == JobKind::Streaming)
-            .map(|j| j.job_id().clone())
+            .map(|jc| {
+                let j = jc.read_record();
+                (j.spec.kind() == JobKind::Streaming, j.job_id().clone())
+            })
+            .filter(|(is_streaming, _)| *is_streaming)
+            .map(|(_, id)| id)
             .collect();
         for job_id in streaming_job_ids {
             self.index_streaming_tasks(&job_id);
@@ -43,8 +51,9 @@ impl Coordinator {
         // a coordinator restart the map is empty so no checkpointing resumes.
         self.checkpoint_coordinators.clear();
         let streaming_checkpoint_jobs: Vec<(JobId, u64, String, usize)> = self
-            .jobs
+            .job_coordinators
             .values()
+            .map(|jc| jc.read_record())
             .filter(|j| {
                 j.spec.kind() == JobKind::Streaming
                     && j.spec.checkpoint_interval_ms().is_some()
@@ -105,7 +114,10 @@ impl Coordinator {
         };
         if let Some(record) = record {
             let streaming = record.spec.kind() == JobKind::Streaming;
-            self.jobs.insert(job_id.clone(), record.clone());
+            self.job_coordinators.insert(
+                job_id.clone(),
+                Arc::new(JobCoordinator::new(job_id.clone(), record.clone())),
+            );
             // Track B (two-tier): keep the JCP surface consistent when a dedicated
             // per-job coordinator syncs a single job record from shared metadata.
             if !self.job_coordinators.contains_key(job_id) {
@@ -123,8 +135,8 @@ impl Coordinator {
     /// `recover_from_store` call sees the current state.  Primarily useful in
     /// tests that simulate a coordinator restart without a real persistent store.
     pub fn persist_jobs_to_store(&self, store: &mut dyn MetadataStore) -> SchedulerResult<()> {
-        for record in self.jobs.values() {
-            store.save_job(record)?;
+        for record in self.job_coordinators.values().map(|jc| jc.read_record()) {
+            store.save_job(&record)?;
         }
         Ok(())
     }

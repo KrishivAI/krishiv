@@ -15,6 +15,7 @@ pgvector = ["dep:sqlx"]
 parquet = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
+dashmap = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use smallvec::SmallVec;
 
 use crate::join::AggKey;
 use crate::{ExecError, ExecResult};
@@ -399,10 +400,11 @@ impl LocalAggregator {
             }
         }
 
-        let mut groups: HashMap<Vec<AggKey>, AggState> = HashMap::new();
+        let mut groups: HashMap<SmallVec<[AggKey; 4]>, AggState> = HashMap::new();
 
         for row in 0..batch.num_rows() {
-            let key: Vec<AggKey> = pre_gb.iter().map(|col| col.extract_agg_key(row)).collect();
+            let key: SmallVec<[AggKey; 4]> =
+                pre_gb.iter().map(|col| col.extract_agg_key(row)).collect();
 
             let state = groups
                 .entry(key)
@@ -410,7 +412,7 @@ impl LocalAggregator {
             update_agg_state_pre(state, &self.agg_exprs, &pre_agg_cols, row);
         }
 
-        let mut sorted_entries: Vec<(Vec<AggKey>, AggState)> = groups.into_iter().collect();
+        let mut sorted_entries: Vec<(SmallVec<[AggKey; 4]>, AggState)> = groups.into_iter().collect();
         sorted_entries.sort_by(|(a, _), (b, _)| {
             a.iter()
                 .zip(b.iter())
@@ -419,7 +421,8 @@ impl LocalAggregator {
                 .unwrap_or_else(|| a.len().cmp(&b.len()))
         });
 
-        let mut fields: Vec<Field> = Vec::new();
+        let mut fields: Vec<Field> =
+            Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
         for col_name in &self.group_by {
             let schema = batch.schema();
             let f = schema
@@ -442,7 +445,8 @@ impl LocalAggregator {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(self.group_by.len() + self.agg_exprs.len());
 
         for (gb_pos, col_name) in self.group_by.iter().enumerate() {
             let col_idx = gb_indices[gb_pos];

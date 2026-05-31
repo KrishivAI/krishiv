@@ -1,8 +1,14 @@
 //! Inner locks (ExecutorInner, CheckpointInner) are the long-term primary source
-//! of truth for executor registry and checkpoint coordinator state. The outer
-//! Coordinator maintains a snapshot view for convenience. The dual sync dance
-//! is transitional; hot paths should migrate to direct inner access + Notify
-//! signaling to eliminate block_on and reduce lock contention.
+//! of truth for executor registry and checkpoint coordinator state.
+//!
+//! The outer Coordinator maintains a snapshot for synchronous tick paths
+//! (advance_heartbeat_tick). The sync dance copies state in both directions:
+//!   outer → inner: after sync tick mutations
+//!   inner → outer: after gRPC/in-process handler mutations
+//!
+//! Full elimination of the sync dance requires making all outer Coordinator
+//! methods that access executor/checkpoint state read from the inner locks
+//! directly — deferred to avoid a larger refactor.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

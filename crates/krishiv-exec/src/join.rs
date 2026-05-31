@@ -409,7 +409,8 @@ impl StreamTableJoin {
         }
         let schema = Arc::new(Schema::new(fields));
 
-        let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(stream_batch.columns().len() + self.table.columns().len());
         for col in stream_batch.columns() {
             columns.push(arrow::compute::take(col.as_ref(), &stream_indices, None)?);
         }

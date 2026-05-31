@@ -1,11 +1,12 @@
 //! Content-hash memoization cache (R14 S2.2).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
 
 use crate::ExecError;
 
@@ -13,7 +14,7 @@ use crate::ExecError;
 #[derive(Debug)]
 pub struct MemoCache {
     max_entries: usize,
-    map: Mutex<HashMap<[u8; 32], Vec<u8>>>,
+    map: DashMap<[u8; 32], Vec<u8>>,
     order: Mutex<VecDeque<[u8; 32]>>,
     hits: Mutex<u64>,
     misses: Mutex<u64>,
@@ -23,7 +24,7 @@ impl MemoCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             max_entries: max_entries.max(1),
-            map: Mutex::new(HashMap::new()),
+            map: DashMap::new(),
             order: Mutex::new(VecDeque::new()),
             hits: Mutex::new(0),
             misses: Mutex::new(0),
@@ -31,32 +32,27 @@ impl MemoCache {
     }
 
     pub fn lookup(&self, key: [u8; 32]) -> Option<RecordBatch> {
-        let map = self.map.lock().ok()?;
-        let bytes = map.get(&key)?;
+        let bytes = self.map.get(&key)?;
         *self.hits.lock().ok()? += 1;
-        decode_batch(bytes).ok()
+        decode_batch(&bytes).ok()
     }
 
     pub fn store(&self, key: [u8; 32], batch: RecordBatch) -> Result<(), ExecError> {
         let encoded = encode_batch(&batch)?;
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| ExecError::Arrow("memo cache lock poisoned".into()))?;
         let mut order = self
             .order
             .lock()
             .map_err(|_| ExecError::Arrow("memo cache lock poisoned".into()))?;
 
-        if map.contains_key(&key) {
+        if self.map.contains_key(&key) {
             order.retain(|k| k != &key);
         }
         order.push_back(key);
-        map.insert(key, encoded);
+        self.map.insert(key, encoded);
 
         while order.len() > self.max_entries {
             if let Some(evicted) = order.pop_front() {
-                map.remove(&evicted);
+                self.map.remove(&evicted);
             }
         }
         Ok(())
@@ -65,7 +61,7 @@ impl MemoCache {
     pub fn cache_info(&self) -> (u64, u64, usize) {
         let hits = self.hits.lock().map(|h| *h).unwrap_or(0);
         let misses = self.misses.lock().map(|m| *m).unwrap_or(0);
-        let size = self.map.lock().map(|m| m.len()).unwrap_or(0);
+        let size = self.map.len();
         (hits, misses, size)
     }
 
@@ -81,7 +77,7 @@ impl MemoCache {
 }
 
 fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ExecError> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(4096);
     {
         let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
             .map_err(|e| ExecError::Arrow(e.to_string()))?;

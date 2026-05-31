@@ -92,8 +92,6 @@ pub struct Coordinator {
     pub(crate) state: CoordinatorState,
     pub(crate) config: CoordinatorConfig,
     pub(crate) executors: ExecutorRegistry,
-    /// O(1) job lookup by id.  Replaces Vec<JobRecord> linear scan.
-    pub(crate) jobs: HashMap<JobId, JobRecord>,
     pub(crate) store: Option<NonBlockingStoreHandle>,
     /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
     pub(crate) checkpoint_coordinators: HashMap<JobId, CheckpointCoordinator>,
@@ -154,7 +152,7 @@ impl fmt::Debug for Coordinator {
             .field("state", &self.state)
             .field("config", &self.config)
             .field("executors", &self.executors)
-            .field("jobs", &self.jobs)
+            .field("job_coordinators_len", &self.job_coordinators.len())
             .field("store", &self.store.as_ref().map(|_| "<store>"))
             .field("streaming_task_index_len", &self.streaming_task_index.len())
             .field("job_inline_results_len", &self.job_inline_results.len())
@@ -245,8 +243,16 @@ impl SharedCoordinator {
         // Real JCP usage (Track B ownership): delegate per-job heartbeat staleness,
         // loss recovery, and launch eligibility to the owning JobCoordinator.
         // The outer Coordinator now asks the JCP rather than walking job state directly.
-        let coord = self.inner.read().await;
-        for (job_id, jc) in &coord.job_coordinators {
+        // Clone JCP Arcs outside the read guard so .await calls do not hold the lock.
+        let jc_snapshots: Vec<(JobId, Arc<crate::job_coordinator::JobCoordinator>)> = {
+            let coord = self.inner.read().await;
+            coord
+                .job_coordinators
+                .iter()
+                .map(|(job_id, jc)| (job_id.clone(), Arc::clone(jc)))
+                .collect()
+        };
+        for (job_id, jc) in jc_snapshots {
             let in_flight = jc.has_in_flight_tasks().await;
             let eligible = jc.has_tasks_eligible_for_launch().await;
             let (launch_eligible, stages_with_work) = jc.get_launch_work_summary().await;
@@ -304,8 +310,11 @@ impl SharedCoordinator {
         let job_ids = {
             let coord = self.read().await;
             let mut ids = Vec::new();
-            for (job_id, _) in coord.jobs.iter().filter(|(_, j)| !j.state().is_terminal()) {
-                if let Some(jc) = coord.job_coordinator(job_id) {
+            for (job_id, jc) in coord.job_coordinators.iter() {
+                if jc.read_record().state().is_terminal() {
+                    continue;
+                }
+                if let Some(_jc) = coord.job_coordinator(job_id) {
                     if jc.should_consider_for_launch().await {
                         ids.push(job_id.clone());
                     }
@@ -345,7 +354,7 @@ impl SharedCoordinator {
         // JobCoordinator instances (via has_in_flight_tasks, stage_count, etc.) for
         // launch and heartbeat decisions. The owned JCP methods above are the seam.
 
-        // Phase 1: collect all assignment targets and channels under the lock.
+        // Phase 1: collect all assignment targets and channels.
         struct JobLaunch {
             job_id: JobId,
             targets: Vec<(String, ExecutorTaskAssignment)>,
@@ -356,10 +365,14 @@ impl SharedCoordinator {
             coord.executor_channels.clone()
         };
 
-        let launches: Vec<JobLaunch> = {
+        // Process jobs in small batches under short-lived write locks so
+        // that readers (heartbeats, API queries) are not blocked while
+        // resolving assignments for many jobs.
+        let mut launches: Vec<JobLaunch> = Vec::new();
+        const LAUNCH_BATCH_SIZE: usize = 20;
+        for batch in job_ids.chunks(LAUNCH_BATCH_SIZE) {
             let mut coord = self.write().await;
-            let mut launches = Vec::new();
-            for job_id in &job_ids {
+            for job_id in batch {
                 match coord.launch_assigned_task_assignments(job_id) {
                     Ok(assignments) => {
                         let targets = coord
@@ -381,8 +394,7 @@ impl SharedCoordinator {
                     }
                 }
             }
-            launches
-        };
+        }
 
         // Phase 2: deliver all assignments concurrently.
         let channels = Arc::new(channels);
@@ -575,7 +587,6 @@ impl Coordinator {
                 config.heartbeat_timeout_ticks(),
                 config.memory_threshold_bytes(),
             ),
-            jobs: HashMap::new(),
             store: None,
             checkpoint_coordinators: HashMap::new(),
             queue_manager: Arc::new(InMemoryQueueManager),
@@ -714,8 +725,9 @@ impl Coordinator {
 
     pub fn coordinator_tick(&mut self) -> SchedulerResult<()> {
         self.advance_heartbeat_clock(1)?;
-        for job_id in self.jobs.keys().cloned().collect::<Vec<_>>() {
-            let _ = self.launch_assigned_task_assignments(&job_id)?;
+        let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();
+        for job_id in &job_ids {
+            let _ = self.launch_assigned_task_assignments(job_id)?;
         }
         Ok(())
     }
@@ -731,17 +743,25 @@ impl Coordinator {
         }
     }
 
-    fn find_job(&self, job_id: &JobId) -> SchedulerResult<&JobRecord> {
-        self.jobs
+    fn find_job(
+        &self,
+        job_id: &JobId,
+    ) -> SchedulerResult<std::sync::RwLockReadGuard<'_, JobRecord>> {
+        self.job_coordinators
             .get(job_id)
+            .map(|jc| jc.read_record())
             .ok_or_else(|| SchedulerError::UnknownJob {
                 job_id: job_id.clone(),
             })
     }
 
-    fn find_job_mut(&mut self, job_id: &JobId) -> SchedulerResult<&mut JobRecord> {
-        self.jobs
-            .get_mut(job_id)
+    fn find_job_mut(
+        &mut self,
+        job_id: &JobId,
+    ) -> SchedulerResult<std::sync::RwLockWriteGuard<'_, JobRecord>> {
+        self.job_coordinators
+            .get(job_id)
+            .map(|jc| jc.write_record())
             .ok_or_else(|| SchedulerError::UnknownJob {
                 job_id: job_id.clone(),
             })

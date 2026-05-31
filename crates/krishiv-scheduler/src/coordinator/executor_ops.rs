@@ -215,7 +215,7 @@ impl Coordinator {
         // Drive per-job checkpoint interval timers (SCH-3: quorum = running tasks).
         let elapsed_ms = ticks.saturating_mul(self.config.tick_period_ms());
         let job_ids: Vec<JobId> = self.checkpoint_coordinators.keys().cloned().collect();
-        for job_id in job_ids {
+        for job_id in &job_ids {
             let running = self.running_task_count_for_job(&job_id);
 
             // Capture the awaiting epoch BEFORE ticking so we can detect a
@@ -254,9 +254,9 @@ impl Coordinator {
                     .is_some_and(|c| matches!(c.state, CheckpointCoordinatorState::Failed { .. }));
                 if was_aborted {
                     self.checkpoint_notify_sent
-                        .retain(|(jid, _, e)| jid != &job_id || *e != aborted_epoch);
+                        .retain(|(jid, _, e)| jid != job_id || *e != aborted_epoch);
                     self.barrier_dispatch_sent
-                        .retain(|(jid, e)| jid != &job_id || *e != aborted_epoch);
+                        .retain(|(jid, e)| jid != job_id || *e != aborted_epoch);
                     tracing::warn!(
                         job_id = %job_id,
                         epoch = aborted_epoch,
@@ -278,13 +278,16 @@ impl Coordinator {
     /// to `Running` via heartbeat, the coordinator can re-tick to include it
     /// in the next epoch.
     pub(crate) fn running_task_count_for_job(&self, job_id: &JobId) -> usize {
-        self.jobs.get(job_id).map_or(0, |job| {
-            job.stages
-                .iter()
-                .flat_map(|stage| stage.tasks())
-                .filter(|task| matches!(task.state(), TaskState::Running))
-                .count()
-        })
+        self.job_coordinators
+            .get(job_id)
+            .map(|jc| jc.read_record())
+            .map_or(0, |job| {
+                job.stages
+                    .iter()
+                    .flat_map(|stage| stage.tasks())
+                    .filter(|task| matches!(task.state(), TaskState::Running))
+                    .count()
+            })
     }
 
     pub(crate) fn executor_has_running_task_in_job(
@@ -292,21 +295,25 @@ impl Coordinator {
         executor_id: &ExecutorId,
         job_id: &JobId,
     ) -> bool {
-        self.jobs.get(job_id).is_some_and(|job| {
-            job.stages.iter().any(|stage| {
-                stage.tasks().iter().any(|task| {
-                    task.state() == TaskState::Running
-                        && task.assigned_executor() == Some(executor_id)
+        self.job_coordinators
+            .get(job_id)
+            .map(|jc| jc.read_record())
+            .is_some_and(|job| {
+                job.stages.iter().any(|stage| {
+                    stage.tasks().iter().any(|task| {
+                        task.state() == TaskState::Running
+                            && task.assigned_executor() == Some(executor_id)
+                    })
                 })
             })
-        })
     }
 
     pub(crate) fn reset_running_tasks_for_lost_executor(&mut self, lost_id: &ExecutorId) {
         const MAX_EXECUTOR_LOSSES_BEFORE_FAIL: u32 = 5;
 
         let mut jobs_to_reassign = Vec::new();
-        for (job_id, job) in &mut self.jobs {
+        for (job_id, job_arc) in &self.job_coordinators {
+            let mut job = job_arc.write_record();
             let mut job_affected = false;
             for stage in &mut job.stages {
                 let mut stage_affected = false;

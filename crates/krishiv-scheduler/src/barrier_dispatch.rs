@@ -70,7 +70,7 @@ impl Coordinator {
                 continue;
             }
             let mut targets = Vec::new();
-            let Some(job) = self.jobs.get(job_id) else {
+            let Some(job) = self.job_coordinators.get(job_id).map(|jc| jc.read_record()) else {
                 continue;
             };
             for stage in &job.stages {

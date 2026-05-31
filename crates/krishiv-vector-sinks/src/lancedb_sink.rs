@@ -40,7 +40,13 @@ impl LanceDbSink {
         vector_dim: usize,
     ) -> VectorSinkResult<Self> {
         let uri = uri.as_ref().to_path_buf();
-        std::fs::create_dir_all(&uri).map_err(|e| VectorSinkError::Connection(e.to_string()))?;
+        tokio::task::spawn_blocking({
+            let uri = uri.clone();
+            move || std::fs::create_dir_all(&uri)
+        })
+        .await
+        .map_err(|e| VectorSinkError::Connection(e.to_string()))?
+        .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
         let mut sink = Self {
             uri: uri.clone(),
             table_name: table_name.to_string(),
@@ -55,26 +61,51 @@ impl LanceDbSink {
     /// Reload Parquet fragments written in prior runs (P2-9).
     async fn load_existing_fragments(&mut self) -> VectorSinkResult<()> {
         let table_dir = self.uri.join(&self.table_name);
-        if !table_dir.is_dir() {
+        let exists = tokio::task::spawn_blocking({
+            let dir = table_dir.clone();
+            move || dir.is_dir()
+        })
+        .await
+        .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
+        if !exists {
             return Ok(());
         }
-        for entry in
-            std::fs::read_dir(&table_dir).map_err(|e| VectorSinkError::Connection(e.to_string()))?
-        {
-            let entry = entry.map_err(|e| VectorSinkError::Connection(e.to_string()))?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("parquet") {
-                continue;
+        let entries: Vec<_> = tokio::task::spawn_blocking({
+            let dir = table_dir.clone();
+            move || -> VectorSinkResult<Vec<PathBuf>> {
+                std::fs::read_dir(&dir)
+                    .map_err(|e| VectorSinkError::Connection(e.to_string()))
+                    .map(|iter| {
+                        iter.filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+                            .collect()
+                    })
             }
-            let file =
-                std::fs::File::open(&path).map_err(|e| VectorSinkError::Query(e.to_string()))?;
-            let reader =
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                    .map_err(|e| VectorSinkError::Query(e.to_string()))?
-                    .build()
-                    .map_err(|e| VectorSinkError::Query(e.to_string()))?;
-            for batch in reader {
-                let batch = batch.map_err(|e| VectorSinkError::Query(e.to_string()))?;
+        })
+        .await
+        .map_err(|e| VectorSinkError::Connection(e.to_string()))??;
+        for path in entries {
+            let batch = tokio::task::spawn_blocking({
+                let path = path.clone();
+                move || -> VectorSinkResult<Vec<RecordBatch>> {
+                    let file = std::fs::File::open(&path)
+                        .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+                    let reader =
+                        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                            file,
+                        )
+                        .map_err(|e| VectorSinkError::Query(e.to_string()))?
+                        .build()
+                        .map_err(|e| VectorSinkError::Query(e.to_string()))?;
+                    reader
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| VectorSinkError::Query(e.to_string()))
+                }
+            })
+            .await
+            .map_err(|e| VectorSinkError::Query(e.to_string()))??;
+            for batch in batch {
                 let restored = Self::arrow_batch_to_embedding(&batch, self.vector_dim)?;
                 self.index.upsert_batch(&restored).await?;
                 if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
@@ -94,26 +125,35 @@ impl LanceDbSink {
             .join(format!("{id}.parquet"))
     }
 
-    fn write_fragment(&self, id: &str, batch: &RecordBatch) -> VectorSinkResult<()> {
+    async fn write_fragment(&self, id: &str, batch: &RecordBatch) -> VectorSinkResult<()> {
         let path = self.fragment_path(id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
-        }
-        let file =
-            std::fs::File::create(&path).map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
-        let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
-            .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
-        writer
-            .write(batch)
-            .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+        let batch = batch.clone();
+        let path2 = path.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || -> VectorSinkResult<()> {
+            if let Some(parent) = path2.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+            }
+            let file = std::fs::File::create(&path2)
+                .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+            let props = WriterProperties::builder().build();
+            let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
+                .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+            writer
+                .write(&batch)
+                .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+            writer
+                .close()
+                .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| VectorSinkError::Upsert(e.to_string()))??;
         self.manifest
             .write()
             .map_err(|e| VectorSinkError::Upsert(e.to_string()))?
-            .insert(id.to_string(), path);
+            .insert(id, path);
         Ok(())
     }
 
@@ -228,7 +268,7 @@ impl VectorSink for LanceDbSink {
         // Write the entire batch as a single Parquet fragment instead of one
         // file per row, which was catastrophic for filesystem overhead.
         let batch_id = point_id_from_doc_epoch("batch", batch.epoch);
-        self.write_fragment(&batch_id, &record)?;
+        self.write_fragment(&batch_id, &record).await?;
         Ok(())
     }
 

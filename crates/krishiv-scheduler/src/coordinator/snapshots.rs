@@ -3,17 +3,30 @@ use super::*;
 impl Coordinator {
     /// Snapshot one job.
     pub fn job_snapshot(&self, job_id: &JobId) -> SchedulerResult<JobSnapshot> {
-        self.find_job(job_id).map(JobRecord::snapshot)
+        self.job_coordinators
+            .get(job_id)
+            .map(|jc| jc.read_record().snapshot())
+            .ok_or_else(|| SchedulerError::UnknownJob {
+                job_id: job_id.clone(),
+            })
     }
 
     /// Snapshot one job with stage and task detail.
     pub fn job_detail_snapshot(&self, job_id: &JobId) -> SchedulerResult<JobDetailSnapshot> {
-        self.find_job(job_id).map(JobRecord::detail_snapshot)
+        self.job_coordinators
+            .get(job_id)
+            .map(|jc| jc.read_record().detail_snapshot())
+            .ok_or_else(|| SchedulerError::UnknownJob {
+                job_id: job_id.clone(),
+            })
     }
 
     /// Snapshot all known jobs.
     pub fn job_snapshots(&self) -> Vec<JobSnapshot> {
-        self.jobs.values().map(JobRecord::snapshot).collect()
+        self.job_coordinators
+            .values()
+            .map(|jc| jc.read_record().snapshot())
+            .collect()
     }
 
     /// Snapshot all known executors.
@@ -31,7 +44,7 @@ impl Coordinator {
         let mut shuffle_partitions_available: usize = 0;
         let mut shuffle_bytes_written: u64 = 0;
 
-        for job in self.jobs.values() {
+        for job in self.job_coordinators.values().map(|jc| jc.read_record()) {
             // Stage retry counts.
             for stage in job.stages() {
                 retry_count = retry_count.saturating_add(stage.retry_count() as usize);
@@ -78,7 +91,7 @@ impl Coordinator {
             namespace_id: namespace_id.map(str::to_owned),
             ..Default::default()
         };
-        for job in self.jobs.values() {
+        for job in self.job_coordinators.values().map(|jc| jc.read_record()) {
             if job.state().is_terminal() {
                 continue;
             }

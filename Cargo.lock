@@ -4028,12 +4028,14 @@ name = "krishiv-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "dashmap",
  "krishiv-ai",
  "krishiv-cep",
  "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-state",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -4406,6 +4408,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "dashmap",
  "futures",
  "hex",
  "krishiv-common",

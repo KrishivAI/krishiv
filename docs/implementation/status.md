@@ -22,53 +22,88 @@ as a session handoff note, not as a release-plan archive.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
-## Last Validation
+## Last Session: Coordinator Cleanup + Architecture Bottlenecks
 
-Typed task fragment slice:
+### Coordinator.jobs elimination (Track B completion)
 
-- Executor batch and streaming fragment execution now unwrap
-  `krishiv_plan::TypedTaskFragment` at the boundary and execute the typed
-  envelope body; legacy fragment strings still pass through unchanged.
-- This closes a real mismatch where the scheduler could emit typed
-  `krishiv-fragment:{...}` descriptions while executor fragment handlers still
-  matched on legacy prefixes like `sql:` and `stream:`.
-- Validation:
-  - `cargo test -p krishiv-executor --lib executor_runs_typed_batch_fragment_body`
-  - `cargo test -p krishiv-executor --lib executor_runs_typed_streaming_fragment_body`
+- Removed `Coordinator.jobs: HashMap<JobId, JobRecord>` — the transitional
+  dual-map that shadowed `job_coordinators: HashMap<JobId, Arc<JobCoordinator>>`.
+- All job access now routes through `JobCoordinator` using
+  `std::sync::RwLock<JobRecord>` for sync-safe access in both sync and async
+  contexts via `read_record()` / `write_record()`.
+- `find_job` / `find_job_mut` now return `RwLockReadGuard` / `RwLockWriteGuard`.
+- Terminal jobs no longer removed from `job_coordinators` on completion (was
+  breaking post-terminal queries like snapshots).
+- 30+ access sites migrated across coordinator/, tests.
 
-Checkpoint async I/O slice:
+### Architecture bottleneck fixes
 
-- Added async primitives to `CheckpointStorage` while keeping sync wrappers for
-  compatibility.
-- Added async checkpoint helper functions for metadata, snapshots, manifests,
-  epoch validation, and latest-epoch discovery.
-- Added `CheckpointCoordinator::{receive_ack_async, commit_epoch_async,
-  recover_from_storage_async}` and wired scheduler gRPC checkpoint acks through
-  `Coordinator::handle_checkpoint_ack_async` instead of `block_in_place`.
-- Remaining bottleneck: the gRPC path still holds the coordinator write guard
-  across checkpoint commit I/O. The next slice should split commit preparation
-  from durable storage writes so unrelated coordinator operations are not
-  serialized behind object-store latency.
-- Validation:
-  - `cargo test -p krishiv-checkpoint --lib object_store_checkpoint_roundtrip`
-  - `cargo test -p krishiv-scheduler --lib async_receive_ack_commits_epoch_without_blocking_wrapper`
-  - `cargo test -p krishiv-scheduler --lib checkpoint_coordinator_initiates_and_collects_acks`
+1. **FlightClientPool connection reuse** — `do_action()` and `execute_sql()`
+   added to `FlightClientPool` with lazy `OnceCell<Channel>`. RemoteExecutionRuntime
+   routes all RPCs through a single persistent channel.
+2. **ExecutorAssignmentInbox bounded default** — `new()` defaults to 256 capacity.
+   `new_unbounded()` preserved for tests.
+3. **gRPC channel cache pruning** — `prune_executor_channel()` called from
+   `mark_executor_lost` and `advance_heartbeat_clock`.
+4. **Parallel job launch** — `drive_pending_task_launches` uses `join_all` for
+   concurrent assignment delivery across jobs.
+5. **In-process checkpoint 3-phase** — `CheckpointInner::handle_ack` now async
+   with extract → I/O → finalize. In-process bridge no longer holds
+   `Mutex<Coordinator>` across filesystem writes.
+6. **Coordinator lock sharding** — gRPC `register_executor` and `checkpoint_ack`
+   handlers use dedicated `executor_inner` / `checkpoint_inner` locks instead of
+   the full coordinator `Arc<RwLock<Coordinator>>`.
 
-Execution placement slice:
+### Files touched
 
-- Added `ExecutionPlacement` to `krishiv-runtime` and wired `SessionBuilder`
-  placement selection through `krishiv-api`.
-- Removed implicit distributed local fallback; distributed mode now requires
-  `RemoteClusterRequired` plus an explicit Flight coordinator URL.
-- Single-node supports either `LocalInProcess` or `SingleNodeDaemon` placement.
-- Updated the Flight SQL custom action listing to include `execute_plan`, which
-  was already handled server-side and is required by typed remote plan submit.
-- Validation:
-  - `cargo test -p krishiv-runtime --lib execution_runtime::tests`
-  - `cargo test -p krishiv-api distributed_session_rejects_disabled_remote_execution`
-  - `cargo test -p krishiv-api embedded_read_parquet_collects_locally`
-  - `cargo test -p krishiv-api remote_execution_without_fallback_uses_flight_server`
-  - `cargo test -p krishiv-api with_coordinator`
+- `crates/krishiv-scheduler/src/coordinator/mod.rs` — jobs field removed,
+  constructor, find_job/find_job_mut, Debug, drive_pending_task_launches
+- `crates/krishiv-scheduler/src/coordinator/job_lifecycle.rs` — submit_job,
+  cancel_job, apply_task_update
+- `crates/krishiv-scheduler/src/coordinator/executor_ops.rs` — channel pruning,
+  reset_running_tasks_for_lost_executor
+- `crates/krishiv-scheduler/src/coordinator/recovery.rs` — recover_from_store,
+  persist_jobs_to_store
+- `crates/krishiv-scheduler/src/coordinator/task_assignment.rs` — guard paths
+- `crates/krishiv-scheduler/src/coordinator/streaming.rs` — guard paths
+- `crates/krishiv-scheduler/src/coordinator/snapshots.rs` — job_snapshot,
+  job_detail_snapshot, job_snapshots
+- `crates/krishiv-scheduler/src/coordinator/barrier_dispatch.rs` — guard path
+- `crates/krishiv-scheduler/src/checkpoint.rs` — receive_ack_async
+- `crates/krishiv-scheduler/src/coordinator_sharded.rs` — handle_ack async
+  3-phase, finalize_ack, ExecutorInner register/deregister
+- `crates/krishiv-scheduler/src/in_process.rs` — checkpoint_ack 3-phase
+- `crates/krishiv-scheduler/src/grpc.rs` — register_executor inner lock,
+  checkpoint_ack inner lock + 3-phase
+- `crates/krishiv-scheduler/src/job_coordinator.rs` — tokio→std RwLock,
+  read_record/write_record sync accessors
+- `crates/krishiv-scheduler/src/tests.rs` — jobs→job_coordinators migration
+- `crates/krishiv-runtime/src/execution_runtime.rs` — FlightClientPool usage,
+  RemoteExecutionRuntime pool-based RPCs
+- `crates/krishiv-runtime/src/flight_client.rs` — FlightClientPool with
+  do_action, execute_sql, OnceCell channel
+- `crates/krishiv-executor/src/assignment_inbox.rs` — bounded default
+- `crates/krishiv-api/src/dataframe.rs` — DashMap fix, collect routing
+- `crates/krishiv-api/src/session.rs` — InProcessCluster optional in
+  build_execution_runtime
+- `crates/krishiv-exec/src/join.rs` — pre-existing corruption fix
+- `crates/krishiv-vector-sinks/Cargo.toml` — added dashmap dep
+- `crates/krishiv-vector-sinks/src/lancedb_sink.rs` — missing .await fix
+
+### Validation
+
+```bash
+cargo test -p krishiv-scheduler --lib   # 205 passed
+cargo test -p krishiv-executor --lib    # 162 passed
+cargo test -p krishiv-runtime --lib     # 277 passed
+cargo test -p krishiv-api --lib         # 35 passed
+```
+
+### Pending
+
+- Sync dance (`sync_executor_to_inner` / `sync_checkpoint_to_inner`) still
+  transitional. Full elimination requires outer Coordinator methods to read
+  from inner locks directly.
 
 ## Next Useful Commands
 

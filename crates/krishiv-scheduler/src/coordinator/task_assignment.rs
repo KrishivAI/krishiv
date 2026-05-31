@@ -18,7 +18,7 @@ impl Coordinator {
         if executor_ids.is_empty() {
             return Err(SchedulerError::NoExecutors);
         }
-        let job = self.find_job_mut(job_id)?;
+        let mut job = self.find_job_mut(job_id)?;
         let pending_task_ids: Vec<TaskId> = job
             .stages
             .iter()
@@ -307,7 +307,11 @@ impl Coordinator {
     }
 
     pub(crate) fn clear_launch_in_flight_for_job(&mut self, job_id: &JobId) {
-        let Some(job) = self.jobs.get_mut(job_id) else {
+        let Some(mut job) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|jc| jc.write_record())
+        else {
             return;
         };
         for stage in &mut job.stages {
@@ -322,7 +326,11 @@ impl Coordinator {
     }
 
     fn clear_launch_in_flight_for_task(&mut self, job_id: &JobId, task_id: &TaskId) {
-        let Some(job) = self.jobs.get_mut(job_id) else {
+        let Some(mut job) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|jc| jc.write_record())
+        else {
             return;
         };
         for stage in &mut job.stages {

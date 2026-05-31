@@ -124,12 +124,12 @@ impl MultiSourceWatermarkState {
             return;
         };
         let now = wall_ms();
-        for (source_id, last) in &self.last_update_ms.clone() {
-            if now.saturating_sub(*last) >= timeout_ms {
-                let entry = self
-                    .source_watermarks
-                    .entry(source_id.clone())
-                    .or_insert(i64::MIN);
+        for source_id in self.last_update_ms.keys().cloned().collect::<Vec<_>>() {
+            let Some(&last) = self.last_update_ms.get(&source_id) else {
+                continue;
+            };
+            if now.saturating_sub(last) >= timeout_ms {
+                let entry = self.source_watermarks.entry(source_id).or_insert(i64::MIN);
                 // Guard: only advance watermark if the source has seen events.
                 // A watermark of i64::MIN means no real event has ever been
                 // observed from this source; advancing it here would cause

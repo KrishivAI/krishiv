@@ -9,7 +9,10 @@ impl Coordinator {
             Some(entry) => (entry.0.clone(), entry.1.clone()),
             None => return,
         };
-        if let Some(job) = self.jobs.get_mut(&job_id)
+        if let Some(mut job) = self
+            .job_coordinators
+            .get(&job_id)
+            .map(|jc| jc.write_record())
             && let Some(stage) = job.stages.iter_mut().find(|s| s.stage_id() == &stage_id)
         {
             for task in stage.tasks_mut() {
@@ -52,7 +55,7 @@ impl Coordinator {
     /// Called after `apply_assignments` so that streaming heartbeats can use the O(1) index.
     /// Also populates the reverse index for O(tasks_per_job) cleanup.
     pub(crate) fn index_streaming_tasks(&mut self, job_id: &JobId) {
-        let job = match self.jobs.get(job_id) {
+        let job = match self.job_coordinators.get(job_id).map(|jc| jc.read_record()) {
             Some(j) => j,
             None => return,
         };
@@ -84,14 +87,17 @@ impl Coordinator {
 
     /// Returns true if the executor owns at least one Running task in a streaming job.
     pub(crate) fn executor_has_streaming_running_tasks(&self, executor_id: &ExecutorId) -> bool {
-        self.jobs.values().any(|job| {
-            job.spec.kind() == JobKind::Streaming
-                && job.stages.iter().any(|stage| {
-                    stage.tasks().iter().any(|task| {
-                        task.state() == TaskState::Running
-                            && task.assigned_executor() == Some(executor_id)
+        self.job_coordinators
+            .values()
+            .map(|jc| jc.read_record())
+            .any(|job| {
+                job.spec.kind() == JobKind::Streaming
+                    && job.stages.iter().any(|stage| {
+                        stage.tasks().iter().any(|task| {
+                            task.state() == TaskState::Running
+                                && task.assigned_executor() == Some(executor_id)
+                        })
                     })
-                })
-        })
+            })
     }
 }

@@ -10,17 +10,17 @@ use crate::traits::{
 };
 
 #[derive(Debug, Clone)]
-struct StoredPoint {
-    doc_id: String,
-    vector: Vec<f32>,
-    payload: HashMap<String, PayloadValue>,
-    _epoch: u64,
+pub(crate) struct StoredPoint {
+    pub doc_id: String,
+    pub vector: Vec<f32>,
+    pub payload: HashMap<String, PayloadValue>,
+    pub _epoch: u64,
 }
 
 /// In-memory vector sink for tests and embedded RAG pipelines.
 #[derive(Debug, Default)]
 pub struct InMemoryVectorSink {
-    points: RwLock<HashMap<String, StoredPoint>>,
+    pub(crate) points: RwLock<HashMap<String, StoredPoint>>,
 }
 
 impl InMemoryVectorSink {

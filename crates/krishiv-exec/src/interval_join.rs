@@ -62,7 +62,7 @@ impl IntervalJoinState {
         } else {
             (&mut self.right, &mut self.left)
         };
-        let mut matches = Vec::new();
+        let mut matches = Vec::with_capacity(other_buf.len());
         for other in other_buf.iter() {
             // C4: Evaluate with fixed left/right orientation.
             // A left event at time L matches a right event at time R when

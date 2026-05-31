@@ -5,7 +5,7 @@ impl Coordinator {
         self.ensure_active()?;
         validate_job(&spec)?;
 
-        if self.jobs.contains_key(spec.job_id()) {
+        if self.job_coordinators.contains_key(spec.job_id()) {
             return Err(SchedulerError::DuplicateJob {
                 job_id: spec.job_id().clone(),
             });
@@ -62,7 +62,6 @@ impl Coordinator {
             })?;
         }
         let inserted_job_id = record.job_id().clone();
-        self.jobs.insert(inserted_job_id.clone(), record.clone());
 
         // Track B (two-tier CCP/JCP): create the owning JobCoordinator for this job.
         // The JCP holds the Arc<RwLock<JobRecord>> and will progressively own per-job
@@ -117,8 +116,20 @@ impl Coordinator {
     /// Cancel a job and mark non-terminal stages/tasks cancelled.
     pub fn cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
         self.ensure_active()?;
-        let job = self.find_job_mut(job_id)?;
-        job.cancel();
+        let (job_name, namespace) = {
+            let job = self.find_job(job_id)?;
+            let name = job.spec.name().to_owned();
+            let ns = job
+                .spec
+                .namespace_id()
+                .map(|s| s.to_owned())
+                .unwrap_or_default();
+            (name, ns)
+        };
+        {
+            let mut job = self.find_job_mut(job_id)?;
+            job.cancel();
+        }
 
         krishiv_governance::audit_log(
             "scheduler",
@@ -127,13 +138,6 @@ impl Coordinator {
             },
             krishiv_governance::AuditOutcome::Allowed,
         );
-
-        let job_name = job.spec.name().to_owned();
-        let namespace = job
-            .spec
-            .namespace_id()
-            .map(|s| s.to_owned())
-            .unwrap_or_default();
 
         if !self.gc_ready_jobs.contains(job_id) {
             const MAX_GC_JOBS: usize = 1000;
@@ -223,7 +227,7 @@ impl Coordinator {
                         let _ = jc.clear_assignments_for_bad_executor_and_count(&eid).await;
                     });
                 } else {
-                    if let Ok(job) = self.find_job_mut(&job_id) {
+                    if let Ok(mut job) = self.find_job_mut(&job_id) {
                         for stage in job.stages_mut() {
                             for task in stage.tasks_mut() {
                                 if task.assigned_executor.as_ref() == Some(&executor_id_for_circuit)
@@ -256,9 +260,10 @@ impl Coordinator {
 
         // Snapshot the job's current state and resource usage after the update.
         let (is_terminal, usage, state, job_name, namespace) = self
-            .jobs
+            .job_coordinators
             .get(&job_id)
-            .map(|r| {
+            .map(|jc| {
+                let r = jc.read_record();
                 (
                     r.state().is_terminal(),
                     r.resource_usage.clone(),
@@ -285,7 +290,6 @@ impl Coordinator {
             }
             self.gc_ready_jobs.push(job_id.clone());
             self.checkpoint_coordinators.remove(&job_id);
-            self.job_coordinators.remove(&job_id);
             self.queue_manager.on_job_complete(&job_id, &usage);
 
             // Emit OpenLineage COMPLETE/FAIL events (Phase 3 M5 / GAP-OB-06)
@@ -306,17 +310,20 @@ impl Coordinator {
                 });
             }
         }
-        if let Some(record) = self.jobs.get(&job_id)
+        if let Some(record) = self
+            .job_coordinators
+            .get(&job_id)
+            .map(|jc| jc.read_record())
             && let Some(store) = &self.store
         {
             // Non-blocking fire-and-forget: enqueue the save to background task.
-            store.save_job(record);
+            store.save_job(&record);
         }
         // P1.1: Remove streaming task index entries when job reaches a terminal state.
         let is_terminal = self
-            .jobs
+            .job_coordinators
             .get(&job_id)
-            .map(|r| r.state().is_terminal())
+            .map(|jc| jc.read_record().state().is_terminal())
             .unwrap_or(false);
         if is_terminal {
             self.remove_streaming_task_index(&job_id);
