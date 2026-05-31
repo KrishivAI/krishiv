@@ -12,7 +12,7 @@ def main():
         parquet_path = os.path.join(temp_dir, "app_logs.parquet")
         write_logs_parquet(parquet_path)
 
-        session = ks.Session.embedded()
+        session = ks.Session.from_env()
         session.register_parquet("app_logs", parquet_path)
 
         # Calculate request and error counts, and error percentage per service

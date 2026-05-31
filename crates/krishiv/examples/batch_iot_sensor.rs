@@ -18,10 +18,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let parquet_path = temp.path().join("sensors.parquet");
     write_sensor_parquet(&parquet_path)?;
 
-    // 2. Build the embedded session
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .build()?;
+    // 2. Build the session
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
 
     // 3. Register the local Parquet file as a table
     session.register_parquet("sensor_logs", &parquet_path)?;

@@ -26,6 +26,8 @@ pub mod barrier_dispatch;
 pub mod barrier_tracker;
 pub mod batch_sql;
 pub mod batch_sql_http;
+pub mod bounded_window;
+pub mod bounded_window_http;
 pub mod checkpoint;
 pub mod cluster_control;
 pub mod coordinator_daemon;

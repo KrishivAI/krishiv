@@ -14,7 +14,7 @@ def main():
         write_sensor_parquet(parquet_path)
 
         # 2. Build the embedded session
-        session = ks.Session.embedded()
+        session = ks.Session.from_env()
 
         # 3. Register the local Parquet file as a table
         session.register_parquet("sensor_logs", parquet_path)

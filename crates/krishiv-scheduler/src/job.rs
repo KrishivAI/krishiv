@@ -263,6 +263,7 @@ impl JobRecord {
         &mut self,
         executor_leases: &[(ExecutorId, LeaseGeneration)],
         batch_sql_tables: Option<&[crate::batch_sql::BatchSqlTable]>,
+        inline_partitions: Option<&[krishiv_proto::InputPartition]>,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
@@ -338,6 +339,8 @@ impl JobRecord {
                                     })
                             })
                             .collect()
+                    } else if let Some(parts) = inline_partitions {
+                        parts.to_vec()
                     } else {
                         vec![InputPartition::new(
                             task.task_id().as_str(),

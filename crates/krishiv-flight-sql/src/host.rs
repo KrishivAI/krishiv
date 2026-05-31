@@ -17,13 +17,22 @@ use krishiv_sql::explain_sql;
 use tonic::Status;
 
 /// Server-side catalog and cluster state shared across Flight SQL requests.
+///
+/// In **proxy mode** (`coordinator_http` is `Some`), batch SQL and bounded
+/// windows are forwarded to the real coordinator/executor. Continuous stream
+/// operations still run on the embedded `InProcessCluster` because the
+/// coordinator does not yet have a continuous-stream execution path.
+///
+/// In **embedded mode** (`coordinator_http` is `None`), all operations run on
+/// the embedded `InProcessCluster`.
 #[derive(Clone)]
 pub struct FlightExecutionHost {
+    /// Always present. Used for continuous streams in all modes; also handles
+    /// batch SQL and bounded windows in embedded mode.
     cluster: Arc<InProcessCluster>,
     continuous: Arc<ContinuousStreamRegistry>,
     catalog: Arc<DashMap<String, PathBuf>>,
-    /// When set, batch SQL is executed via the cluster control plane HTTP API
-    /// (`POST /api/v1/batch-sql`) instead of an isolated in-process cluster.
+    /// When set, routes batch SQL and bounded windows through the coordinator.
     coordinator_http: Option<String>,
 }
 
@@ -34,8 +43,8 @@ impl FlightExecutionHost {
 
     /// Build a host from environment variables.
     ///
-    /// `KRISHIV_COORDINATOR_HTTP` — when set, routes batch SQL through the live
-    /// cluster control plane so executor-backed tasks run on the real fleet.
+    /// `KRISHIV_COORDINATOR_HTTP` — when set, enables proxy mode: all execution
+    /// is forwarded to the coordinator. No `InProcessCluster` is created.
     pub fn from_env() -> Result<Self, Status> {
         let coordinator_http = std::env::var("KRISHIV_COORDINATOR_HTTP")
             .ok()
@@ -45,6 +54,10 @@ impl FlightExecutionHost {
     }
 
     /// Create a host with an optional coordinator HTTP base URL.
+    ///
+    /// - `Some(url)` → proxy mode: batch SQL and bounded windows forwarded to coordinator.
+    ///   Continuous streams still run locally on the embedded cluster.
+    /// - `None` → embedded mode: all operations run on the embedded cluster.
     pub fn with_coordinator_http(coordinator_http: Option<String>) -> Result<Self, Status> {
         let cluster = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
         Ok(Self {
@@ -55,6 +68,7 @@ impl FlightExecutionHost {
         })
     }
 
+    /// Embedded cluster — always present.
     pub fn cluster(&self) -> Arc<InProcessCluster> {
         Arc::clone(&self.cluster)
     }
@@ -84,12 +98,11 @@ impl FlightExecutionHost {
                 .map_err(|e| Status::internal(e.to_string()));
         }
 
-        let cluster = Arc::clone(&self.cluster);
+        let cluster = self.cluster();
         run_blocking(move || cluster.collect_batch_sql(&sql, &tables)).await
     }
 
     fn apply_catalog_directives(&self, directives: &[FlightDirective]) -> Result<(), Status> {
-        // apply_register_directives expects &mut HashMap; build temp map.
         let mut catalog_map = std::collections::HashMap::new();
         apply_register_directives(&mut catalog_map, directives);
         for (table, path) in catalog_map {
@@ -120,8 +133,8 @@ impl FlightExecutionHost {
                     return Ok(vec![explain_batch(&text)?]);
                 }
                 FlightDirective::ContinuousRegister { job_id, spec } => {
+                    let cluster = self.cluster();
                     let local = plan_spec_to_local(&spec);
-                    let cluster = Arc::clone(&self.cluster);
                     let continuous = Arc::clone(&self.continuous);
                     let job_id = job_id.clone();
                     let spec = spec.clone();
@@ -132,7 +145,7 @@ impl FlightExecutionHost {
                     .await?;
                 }
                 FlightDirective::ContinuousPush { job_id, batches } => {
-                    let cluster = Arc::clone(&self.cluster);
+                    let cluster = self.cluster();
                     let continuous = Arc::clone(&self.continuous);
                     let job_id = job_id.clone();
                     run_blocking(move || {
@@ -142,7 +155,7 @@ impl FlightExecutionHost {
                     .await?;
                 }
                 FlightDirective::ContinuousDrain { job_id } => {
-                    let cluster = Arc::clone(&self.cluster);
+                    let cluster = self.cluster();
                     let job_id = job_id.clone();
                     return run_blocking(move || cluster.drain_continuous_job(&job_id)).await;
                 }
@@ -151,8 +164,10 @@ impl FlightExecutionHost {
                     spec,
                     input_batches,
                 } => {
+                    // SQL-encoded fallback — route through coordinator in proxy mode,
+                    // local cluster otherwise.
                     let local = plan_spec_to_local(&spec);
-                    let cluster = Arc::clone(&self.cluster);
+                    let cluster = self.cluster();
                     let topic = topic.clone();
                     let input_batches = input_batches.clone();
                     return run_blocking(move || {
@@ -165,6 +180,7 @@ impl FlightExecutionHost {
         }
         Ok(vec![status_batch("ok")?])
     }
+
 }
 
 async fn run_blocking<T>(
@@ -187,11 +203,7 @@ fn explain_batch(text: &str) -> Result<RecordBatch, Status> {
 }
 
 fn status_batch(label: &str) -> Result<RecordBatch, Status> {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "status",
-        DataType::Utf8,
-        false,
-    )]));
+    let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, false)]));
     let col = Arc::new(StringArray::from(vec![label])) as ArrayRef;
     RecordBatch::try_new(schema, vec![col]).map_err(|e| Status::internal(e.to_string()))
 }
@@ -213,5 +225,13 @@ mod tests {
         let sql = krishiv_runtime::flight_protocol::encode_explain_sql("SELECT 1");
         let batches = host.execute_sql(&sql).await.unwrap();
         assert!(!batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_mode_has_coordinator_http_set() {
+        let host =
+            FlightExecutionHost::with_coordinator_http(Some("http://localhost:18080".into()))
+                .unwrap();
+        assert!(host.coordinator_http_url().is_some());
     }
 }

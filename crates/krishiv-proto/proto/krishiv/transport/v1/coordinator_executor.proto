@@ -159,6 +159,8 @@ message InputPartitionDescriptor {
   string shuffle_job_id = 11;
   string shuffle_upstream_stage_id = 12;
   uint32 shuffle_partition_id = 13;
+  // InlineIpc fields: Arrow IPC stream bytes delivered in-band with the task assignment.
+  bytes ipc_bytes = 14;
 }
 
 message MemoryKafkaRecord {
@@ -258,6 +260,8 @@ enum InputPartitionDescriptorKind {
   INPUT_PARTITION_DESCRIPTOR_KIND_MEMORY_KAFKA = 4;
   // Arrow Flight endpoint for reading upstream shuffle output.
   INPUT_PARTITION_DESCRIPTOR_KIND_SHUFFLE_FLIGHT = 5;
+  // Arrow IPC stream bytes delivered inline with the task assignment.
+  INPUT_PARTITION_DESCRIPTOR_KIND_INLINE_IPC = 6;
 }
 
 enum OutputContractDescriptorKind {

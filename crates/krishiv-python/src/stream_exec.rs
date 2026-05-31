@@ -103,7 +103,9 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             LocalWindowKind::Session { gap_ms: gap }
         }
     };
-    let state_ttl_ms = pipeline.session.state_ttl().map(|c| c.ttl_ms());
+    let state_ttl_ms = pipeline
+        .state_ttl_ms
+        .or_else(|| pipeline.session.state_ttl().map(|c| c.ttl_ms()));
     // G3: thread per-source watermark lags when set.
     let source_watermark_lags = pipeline.source_watermarks.clone();
     let source_id_column = if source_watermark_lags.is_empty() {

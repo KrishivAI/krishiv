@@ -756,6 +756,14 @@ pub enum InputPartitionDescriptor {
         /// Partition index.
         partition_id: u32,
     },
+    /// Arrow IPC stream bytes delivered inline with the task assignment.
+    ///
+    /// The executor decodes the bytes and registers them as `table_name` in
+    /// the local DataFusion context before executing the fragment SQL.
+    InlineIpc {
+        table_name: String,
+        ipc_bytes: Vec<u8>,
+    },
 }
 
 impl InputPartitionDescriptor {
@@ -794,6 +802,9 @@ impl InputPartitionDescriptor {
                 format!(
                     "shuffle-flight:{table_name}:{flight_endpoint}:{upstream_stage_id}:{partition_id}"
                 )
+            }
+            Self::InlineIpc { table_name, ipc_bytes } => {
+                format!("inline-ipc:{table_name}:{}b", ipc_bytes.len())
             }
         }
     }

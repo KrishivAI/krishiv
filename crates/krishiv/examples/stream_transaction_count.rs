@@ -14,10 +14,14 @@ use krishiv::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 1. Build an embedded in-process session
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .build()?;
+    // 1. Build session
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
 
     // 2. Prepare streaming mock transaction batches (timestamp, user_id)
     let schema = Arc::new(Schema::new(vec![

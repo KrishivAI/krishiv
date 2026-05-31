@@ -81,6 +81,13 @@ impl PyStream {
         }
     }
 
+    /// Set state TTL for stateful window operators on this stream (milliseconds).
+    pub fn with_state_ttl(&self, ttl_ms: u64) -> PyStream {
+        PyStream {
+            pipeline: self.pipeline.with_state_ttl(ttl_ms),
+        }
+    }
+
     /// Alias for `with_watermark` (R13 name).
     pub fn watermark(&self, column: String, max_lateness_ms: u64) -> PyStream {
         self.with_watermark(column, max_lateness_ms)

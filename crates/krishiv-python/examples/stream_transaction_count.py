@@ -5,8 +5,8 @@ import pyarrow as pa
 import krishiv as ks
 
 def main():
-    # 1. Build an embedded in-process session
-    session = ks.Session.embedded()
+    # 1. Build session
+    session = ks.Session.from_env()
 
     # 2. Prepare streaming mock transaction batches (timestamp, user_id)
     schema = pa.schema([

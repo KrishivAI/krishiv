@@ -95,3 +95,24 @@ __all__ = [
     "JobStatus",
     "sinks",
 ]
+
+# Wrap __anext__ of Rust-defined async iterators to return coroutines
+# as required by newer Python versions (Python 3.13+)
+try:
+    from .krishiv import WindowedStream
+    _orig_windowed_anext = WindowedStream.__anext__
+    async def _new_windowed_anext(self):
+        return _orig_windowed_anext(self)
+    WindowedStream.__anext__ = _new_windowed_anext
+except (ImportError, AttributeError):
+    pass
+
+try:
+    from .krishiv import LiveTable
+    _orig_live_anext = LiveTable.__anext__
+    async def _new_live_anext(self):
+        return _orig_live_anext(self)
+    LiveTable.__anext__ = _new_live_anext
+except (ImportError, AttributeError):
+    pass
+

@@ -14,9 +14,13 @@ use krishiv::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .build()?;
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
 
     // Alice has a 12-second gap between the third and fourth interactions (triggers session split)
     let schema = Arc::new(Schema::new(vec![

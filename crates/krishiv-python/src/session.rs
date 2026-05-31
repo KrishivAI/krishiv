@@ -102,7 +102,11 @@ impl PySession {
         let builder = if !mode.is_empty() {
             match mode.to_lowercase().as_str() {
                 "local" | "single-node" => {
-                    builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
+                    let mut b = builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode);
+                    if let Some(ref url) = coordinator_url {
+                        b = b.with_local_cluster(url.clone());
+                    }
+                    b
                 }
                 "distributed" => {
                     if let Some(url) = &coordinator_url {
@@ -115,7 +119,10 @@ impl PySession {
                 _ => builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode),
             }
         } else if let Some(url) = &coordinator_url {
-            builder.with_coordinator(url.clone())
+            // No explicit mode but a coordinator URL is present: use single-node
+            // local-cluster routing (same as `with_local_cluster`), matching the
+            // behaviour of the Rust examples.
+            builder.with_local_cluster(url.clone())
         } else {
             builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
         };
@@ -404,6 +411,7 @@ impl PySession {
             aggregations: Vec::new(),
             source_watermarks: std::collections::HashMap::new(),
             source_id_column: None,
+            state_ttl_ms: None,
         };
         Ok(PyRelation::from_pipeline(pipeline))
     }

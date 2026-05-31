@@ -11,8 +11,8 @@ use krishiv_sql::SqlEngine;
 
 use super::common::{
     parse_local_parquet_partitions, read_connector_parquet_partitions,
-    read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
-    task_fragment_body, write_object_parquet_sink,
+    read_inline_ipc_partitions, read_object_parquet_partitions, read_shuffle_flight_partitions,
+    sql_query_from_fragment, task_fragment_body, write_object_parquet_sink,
 };
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
@@ -22,6 +22,8 @@ use crate::runner::{
     KAFKA_TO_PARQUET_FRAGMENT, MEMORY_KAFKA_PARTITION_PREFIX, PARQUET_SINK_PREFIX,
 };
 use crate::{ExecutorError, ExecutorResult};
+
+const WINDOW_PREFIX: &str = "window:";
 
 /// Execute a batch (terminal) stage fragment.
 pub(crate) async fn execute_batch_fragment(
@@ -173,9 +175,66 @@ pub(crate) async fn execute_batch_fragment(
         );
     }
 
+    if let Some(rest) = fragment.strip_prefix(WINDOW_PREFIX) {
+        return execute_window_fragment(rest, assignment).await;
+    }
+
     Err(ExecutorError::InvalidAssignment {
         message: format!("unsupported batch fragment type: {}", fragment),
     })
+}
+
+/// Execute a `window:<topic>:<spec_b64>` fragment.
+///
+/// Input batches are delivered as `InlineIpc` input partitions on the task
+/// assignment — they never travel inside the fragment description string.
+/// Results are returned as inline IPC via `OutputContractKind::InlineRecordBatches`.
+async fn execute_window_fragment(
+    rest: &str,
+    assignment: &ExecutorTaskAssignment,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use base64::Engine as _;
+
+    // Format: <topic>:<spec_b64>
+    let mut parts = rest.splitn(2, ':');
+    let _topic = parts.next().ok_or_else(|| ExecutorError::InvalidAssignment {
+        message: format!("window fragment missing topic: {rest}"),
+    })?;
+    let spec_b64 = parts.next().ok_or_else(|| ExecutorError::InvalidAssignment {
+        message: format!("window fragment missing spec_b64: {rest}"),
+    })?;
+
+    let spec_json = base64::engine::general_purpose::STANDARD
+        .decode(spec_b64.as_bytes())
+        .map_err(|e| ExecutorError::InvalidAssignment {
+            message: format!("window spec b64 decode: {e}"),
+        })?;
+    let plan_spec: krishiv_plan::window::WindowExecutionSpec =
+        serde_json::from_slice(&spec_json).map_err(|e| ExecutorError::InvalidAssignment {
+            message: format!("window spec json decode: {e}"),
+        })?;
+
+    // Read input batches from InlineIpc partitions (not from the fragment string).
+    let inline_tables = read_inline_ipc_partitions(assignment.input_partitions())?;
+    let input_batches: Vec<_> = inline_tables.into_iter().flat_map(|(_, b)| b).collect();
+
+    let output_batches = tokio::task::spawn_blocking(move || {
+        krishiv_exec::execute_bounded_window(input_batches, &plan_spec)
+    })
+    .await
+    .map_err(|e| ExecutorError::LocalExecution {
+        message: format!("window blocking task: {e}"),
+    })?
+    .map_err(|e| ExecutorError::LocalExecution {
+        message: format!("window execution: {e}"),
+    })?;
+
+    let row_count = output_batches.iter().map(|b| b.num_rows()).sum();
+    let col_count = output_batches.first().map_or(0, |b| b.num_columns());
+    Ok(
+        ExecutorTaskOutput::sql(row_count, output_batches.len(), col_count)
+            .with_record_batches(output_batches),
+    )
 }
 
 /// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.

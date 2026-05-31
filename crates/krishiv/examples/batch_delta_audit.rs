@@ -51,10 +51,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
-    // 3. Build the embedded session
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .build()?;
+    // 3. Build the session
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
 
     // 4. Query the latest version (Version 1)
     println!("--- Current Version (Latest) ---");

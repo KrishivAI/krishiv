@@ -223,6 +223,13 @@ impl PyRelation {
         Ok(PyRelation::from_pipeline(pipeline))
     }
 
+    /// Set the column that identifies each source for multi-source watermark reconciliation.
+    pub fn with_source_id_column(&self, column: String) -> PyResult<PyRelation> {
+        let p = self.ensure_stream("with_source_id_column")?;
+        let pipeline = p.with_source_id_column(column);
+        Ok(PyRelation::from_pipeline(pipeline))
+    }
+
     // ── Terminal operations ───────────────────────────────────────────────────
 
     /// Collect results into a `QueryResult`.

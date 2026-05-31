@@ -13,9 +13,13 @@ use krishiv_runtime::LocalWindowExecutionSpec;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .build()?;
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
 
     // 1. Submit an unbounded streaming pipeline job with count aggregation
     let spec = LocalWindowExecutionSpec::new_test_tumbling("user_id", "timestamp", 10000);

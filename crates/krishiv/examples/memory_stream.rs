@@ -4,10 +4,16 @@ use std::error::Error;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
-use krishiv::{DataType, Field, QueryResult, RecordBatch, Schema, Session, StreamBatch};
+use krishiv::{DataType, ExecutionMode, Field, QueryResult, RecordBatch, Schema, Session, StreamBatch};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let session = Session::builder().build()?;
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
         DataType::Int64,

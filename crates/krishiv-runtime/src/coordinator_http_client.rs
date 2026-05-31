@@ -76,6 +76,52 @@ pub async fn execute_coordinator_batch_sql(
     decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
 }
 
+/// Execute a bounded window via `POST /api/v1/bounded-window` on the coordinator.
+pub async fn execute_coordinator_bounded_window(
+    coordinator_http: &str,
+    topic: &str,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+    input_batches: &[arrow::record_batch::RecordBatch],
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    use crate::flight_action::encode_batches;
+
+    #[derive(serde::Serialize)]
+    struct BoundedWindowRequest<'a> {
+        topic: &'a str,
+        spec: &'a krishiv_plan::window::WindowExecutionSpec,
+        input_batches_b64: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BoundedWindowResponse {
+        job_id: String,
+        inline_record_batch_ipc: Vec<Vec<u8>>,
+    }
+
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/bounded-window");
+    let input_batches_b64 = encode_batches(input_batches)?;
+    let body = BoundedWindowRequest { topic, spec, input_batches_b64 };
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("bounded-window HTTP request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "bounded-window HTTP {} from {url}",
+            response.status()
+        )));
+    }
+    let payload: BoundedWindowResponse = response.json().await.map_err(|e| {
+        RuntimeError::transport(format!("bounded-window HTTP response decode failed: {e}"))
+    })?;
+    let _ = payload.job_id;
+    decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_http_base;

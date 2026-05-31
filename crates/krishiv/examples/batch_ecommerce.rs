@@ -20,9 +20,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_orders_parquet(&orders_path)?;
     write_customers_parquet(&customers_path)?;
 
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .build()?;
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.build()?;
 
     session.register_parquet("orders", &orders_path)?;
     session.register_parquet("customers", &customers_path)?;

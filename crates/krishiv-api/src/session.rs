@@ -698,7 +698,7 @@ impl Session {
         version: Option<i64>,
     ) -> Result<DataFrame> {
         let sql_dataframe = self.sql_engine.read_delta(path, version).await?;
-        Ok(self.dataframe_from_sql(sql_dataframe))
+        Ok(self.dataframe_from_sql(sql_dataframe).with_force_local())
     }
 
     /// Read a Hudi table directory.
@@ -715,7 +715,7 @@ impl Session {
             .sql_engine
             .read_hudi(path, query_type, begin_instant)
             .await?;
-        Ok(self.dataframe_from_sql(sql_dataframe))
+        Ok(self.dataframe_from_sql(sql_dataframe).with_force_local())
     }
 
     /// Append a DataFrame into a local Hudi Copy-On-Write table.

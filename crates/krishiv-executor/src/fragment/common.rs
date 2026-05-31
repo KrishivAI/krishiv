@@ -317,3 +317,39 @@ pub(crate) async fn read_shuffle_flight_partitions(
 
     Ok(table_batches.into_iter().collect())
 }
+
+/// Decode `InlineIpc` partitions into (table_name, batches) pairs.
+///
+/// The IPC bytes are Arrow IPC stream format, delivered in-band with the task
+/// assignment to avoid any external data dependency.
+pub(crate) fn read_inline_ipc_partitions(
+    partitions: &[krishiv_proto::InputPartition],
+) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
+    use arrow::ipc::reader::StreamReader;
+
+    let mut result = Vec::new();
+    for partition in partitions {
+        let (table_name, ipc_bytes) = match partition.descriptor() {
+            Some(InputPartitionDescriptor::InlineIpc { table_name, ipc_bytes }) => {
+                (table_name.clone(), ipc_bytes.clone())
+            }
+            Some(_) | None => continue,
+        };
+        if ipc_bytes.is_empty() {
+            result.push((table_name, vec![]));
+            continue;
+        }
+        let reader = StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None).map_err(|e| {
+            ExecutorError::InvalidAssignment {
+                message: format!("inline-ipc decode failed for partition '{}': {e}", partition.partition_id()),
+            }
+        })?;
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ExecutorError::InvalidAssignment {
+                message: format!("inline-ipc read failed for partition '{}': {e}", partition.partition_id()),
+            })?;
+        result.push((table_name, batches));
+    }
+    Ok(result)
+}

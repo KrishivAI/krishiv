@@ -12,7 +12,7 @@ def main():
         parquet_path = os.path.join(temp_dir, "people.parquet")
         write_people_parquet(parquet_path)
 
-        session = ks.Session.embedded()
+        session = ks.Session.from_env()
         session.register_parquet("people", parquet_path)
 
         result = (

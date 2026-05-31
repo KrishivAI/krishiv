@@ -30,6 +30,11 @@ pub struct DataFrame {
     coordinator_url: Option<String>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
+    /// When true, always collect from the local DataFusion plan even in remote
+    /// mode. Set for lakehouse reads (Delta, Hudi) whose table registrations
+    /// live only in the local DataFusion context and cannot be forwarded to a
+    /// remote executor.
+    force_local: bool,
 }
 
 impl fmt::Debug for DataFrame {
@@ -60,7 +65,14 @@ impl DataFrame {
             coordinator_url: None,
             runtime: crate::session::shared_embedded_runtime(),
             registered_parquet: Arc::new(DashMap::new()),
+            force_local: false,
         }
+    }
+
+    /// Force collection from the local DataFusion plan regardless of runtime mode.
+    pub(crate) fn with_force_local(mut self) -> Self {
+        self.force_local = true;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -86,6 +98,7 @@ impl DataFrame {
             coordinator_url,
             runtime,
             registered_parquet,
+            force_local: false,
         }
     }
 
@@ -112,6 +125,7 @@ impl DataFrame {
             coordinator_url: None,
             runtime,
             registered_parquet,
+            force_local: false,
         }
     }
 
@@ -164,7 +178,7 @@ impl DataFrame {
             return Ok(QueryResult::new(batches.clone()));
         }
 
-        let uses_remote = self.runtime.uses_remote_execution();
+        let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;
 
         let result = if uses_remote && self.sql_query.is_some() {
             let query = self.sql_query.as_deref().unwrap();
@@ -179,12 +193,14 @@ impl DataFrame {
                 .await
                 .map(QueryResult::new)
         } else if let Some(dataframe) = &self.sql_dataframe {
-            self.runtime
-                .accept_plan(&PhysicalPlan::new(
-                    self.logical_plan.name(),
-                    self.logical_plan.kind(),
-                ))
-                .map_err(KrishivError::from)?;
+            if !self.force_local {
+                self.runtime
+                    .accept_plan(&PhysicalPlan::new(
+                        self.logical_plan.name(),
+                        self.logical_plan.kind(),
+                    ))
+                    .map_err(KrishivError::from)?;
+            }
             dataframe
                 .collect()
                 .await

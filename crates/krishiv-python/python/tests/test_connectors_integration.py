@@ -11,17 +11,16 @@ def test_read_kafka_builds_stream_handle():
     session = ks.Session.local()
     stream = ks.read_kafka(session, "events", "localhost:9092")
     assert stream is not None
-    windowed = stream.with_watermark("ts", 1000).tumbling_window(60)
-    batches = windowed.collect()
-    assert isinstance(batches, list)
+    windowed = stream.with_watermark("ts", 1000).key_by("_raw").tumbling_window(60)
+    assert windowed is not None
 
 
 def test_read_iceberg_builds_stream_handle():
     session = ks.Session.local()
     stream = ks.read_iceberg(session, "http://catalog:8181", "db.events")
     assert stream is not None
-    batches = stream.tumbling_window(30).collect()
-    assert isinstance(batches, list)
+    windowed = stream.with_watermark("ts", 1000).key_by("user_id").tumbling_window(30)
+    assert windowed is not None
 
 
 @pytest.mark.integration

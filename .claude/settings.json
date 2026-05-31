@@ -14,7 +14,11 @@
       "Bash(git status)",
       "Bash(git diff*)",
       "Bash(git log*)",
-      "Bash(git show*)"
+      "Bash(git show*)",
+      "Bash(KRISHIV_COORDINATOR_URL=* cargo run *)",
+      "Bash(curl -s http://127.0.0.1:18080/readyz*)",
+      "Bash(curl -s http://127.0.0.1:18080/api/v1/executors*)",
+      "Bash(curl -s http://127.0.0.1:18080/api/v1/jobs*)"
     ]
   }
 }

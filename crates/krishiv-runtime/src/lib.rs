@@ -23,7 +23,7 @@ mod plan;
 pub mod stream_kafka;
 
 pub use continuous_stream::ContinuousStreamRegistry;
-pub use coordinator_http_client::execute_coordinator_batch_sql;
+pub use coordinator_http_client::{execute_coordinator_batch_sql, execute_coordinator_bounded_window};
 pub use execution_runtime::{
     BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, ExecutionRuntime,
     InProcessExecutionRuntime, RemoteExecutionRuntime, RuntimeMode, build_execution_runtime,

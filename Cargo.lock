@@ -4047,6 +4047,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum 0.8.9",
+ "base64 0.22.1",
  "dashmap",
  "krishiv-ai",
  "krishiv-checkpoint",
@@ -4272,6 +4273,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "axum 0.8.9",
+ "base64 0.22.1",
  "dashmap",
  "etcd-client",
  "futures",

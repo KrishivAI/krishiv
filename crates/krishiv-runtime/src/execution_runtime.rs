@@ -277,6 +277,18 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        use krishiv_plan::ExecutionKind;
+        // Streaming plans are executed locally via collect_bounded_window on the
+        // flight server's embedded InProcessCluster. Routing them through the
+        // coordinator batch-sql path is wrong and causes HTTP 500 errors.
+        if plan.kind() == ExecutionKind::Streaming {
+            return Ok(ExecutionReport::new(
+                "distributed",
+                plan.name(),
+                plan.kind(),
+                true,
+            ));
+        }
         use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
         use krishiv_common::async_util::block_on;
         let body = ExecutePlanBody::from_plan(plan)?;

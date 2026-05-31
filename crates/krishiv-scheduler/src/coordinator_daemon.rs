@@ -279,6 +279,7 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/batch-sql", post(api_batch_sql))
+        .route("/api/v1/bounded-window", post(crate::bounded_window_http::api_bounded_window))
         .route("/federation/v1/jobs", post(federation_submit_job))
         .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
         .route(
@@ -320,6 +321,8 @@ struct LiveExecutorView {
     lease_generation: u64,
     running_task_count: usize,
     last_heartbeat_tick: u64,
+    /// Consecutive task failure count (circuit breaker input). Resets to 0 on success.
+    consecutive_task_failures: u32,
 }
 
 async fn api_jobs(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
@@ -360,6 +363,7 @@ async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl Int
                     lease_generation: record.lease_generation().as_u64(),
                     running_task_count: record.running_tasks().len(),
                     last_heartbeat_tick: record.last_heartbeat_tick(),
+                    consecutive_task_failures: record.consecutive_task_failures,
                 }
             })
             .collect::<Vec<_>>()

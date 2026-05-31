@@ -81,7 +81,7 @@ def main():
         write_delta(delta_path, table_v1, mode="append")
 
         # 3. Build the embedded session
-        session = ks.Session.embedded()
+        session = ks.Session.from_env()
 
         # 4. Query the latest version (Version 1)
         print("--- Current Version (Latest) ---")

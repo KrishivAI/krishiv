@@ -13,6 +13,7 @@ etcd = ["dep:etcd-client"]
 krishiv-common = { path = "../krishiv-common" }
 arrow = { workspace = true }
 axum = { workspace = true }
+base64 = "0.22"
 futures = { workspace = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-governance = { path = "../krishiv-governance" }

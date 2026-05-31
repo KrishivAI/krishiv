@@ -50,6 +50,15 @@ impl Coordinator {
         self.batch_sql_job_tables.insert(job_id, tables);
     }
 
+    /// Register inline input partitions for a bounded-window job.
+    pub fn register_window_partitions(
+        &mut self,
+        job_id: JobId,
+        partitions: Vec<krishiv_proto::InputPartition>,
+    ) {
+        self.window_job_partitions.insert(job_id, partitions);
+    }
+
     /// Launch all assigned tasks for a job and return executor transport assignments.
     pub fn launch_assigned_task_assignments(
         &mut self,
@@ -82,9 +91,14 @@ impl Coordinator {
         }
 
         let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();
+        let window_parts = self.window_job_partitions.get(job_id).cloned();
         let assignments = self
             .find_job_mut(job_id)?
-            .launch_assigned_task_assignments(&executor_leases, batch_tables.as_deref())?;
+            .launch_assigned_task_assignments(
+                &executor_leases,
+                batch_tables.as_deref(),
+                window_parts.as_deref(),
+            )?;
         // GAP-OB-01: Increment tasks_assigned counter.
         TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
         Ok(assignments)

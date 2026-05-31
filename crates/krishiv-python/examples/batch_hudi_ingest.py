@@ -10,7 +10,7 @@ def main():
         hudi_path = os.path.join(temp_dir, "my_hudi_table")
 
         # 1. Build the embedded session
-        session = ks.Session.embedded()
+        session = ks.Session.from_env()
 
         # 2. Prepare some mock users using SQL DataFrame projection
         df_source = session.sql(

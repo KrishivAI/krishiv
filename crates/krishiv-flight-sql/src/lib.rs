@@ -600,16 +600,30 @@ impl KrishivFlightSqlService {
             A::BoundedWindow(body) => {
                 let input_batches = krishiv_runtime::decode_batches(&body.batches_b64)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                let cluster = self.host.cluster();
-                let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
-                let topic = body.topic.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    cluster.collect_bounded_window(&topic, input_batches, &local)
-                })
-                .await
-                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
-                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                encode_batches_ipc(&result)
+                if let Some(http_base) = self.host.coordinator_http_url() {
+                    // Route through the real coordinator → executor for true single-node execution.
+                    let result = krishiv_runtime::execute_coordinator_bounded_window(
+                        http_base,
+                        &body.topic,
+                        &body.spec,
+                        &input_batches,
+                    )
+                    .await
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    encode_batches_ipc(&result)
+                } else {
+                    // Embedded mode: run on the local InProcessCluster (always present).
+                    let cluster = self.host.cluster();
+                    let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
+                    let topic = body.topic.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        cluster.collect_bounded_window(&topic, input_batches, &local)
+                    })
+                    .await
+                    .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    encode_batches_ipc(&result)
+                }
             }
             A::Explain(body) => {
                 let text = krishiv_sql::explain_sql(&body.sql)

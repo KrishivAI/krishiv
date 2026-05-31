@@ -17,11 +17,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 1. Configure state TTL of 5 seconds
     let ttl_config = StateTtlConfig::new(5000);
 
-    // 2. Build embedded session with the TTL config
-    let session = Session::builder()
-        .with_execution_mode(ExecutionMode::Embedded)
-        .with_state_ttl(ttl_config)
-        .build()?;
+    // 2. Build session with the TTL config
+    let mut builder = Session::builder();
+    if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
+        builder = builder.with_local_cluster(url);
+    } else {
+        builder = builder.with_execution_mode(ExecutionMode::Embedded);
+    }
+    let session = builder.with_state_ttl(ttl_config).build()?;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("timestamp", DataType::Int64, false),

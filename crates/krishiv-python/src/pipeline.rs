@@ -39,6 +39,8 @@ pub struct StreamPipeline {
     pub source_watermarks: HashMap<String, u64>,
     /// Column name that identifies the source for multi-source watermark reconciliation.
     pub source_id_column: Option<String>,
+    /// Optional state TTL override (ms). Overrides the session-level TTL when set.
+    pub state_ttl_ms: Option<u64>,
 }
 
 impl StreamPipeline {
@@ -60,6 +62,7 @@ impl StreamPipeline {
             aggregations: Vec::new(),
             source_watermarks: HashMap::new(),
             source_id_column: None,
+            state_ttl_ms: None,
         }
     }
 
@@ -88,6 +91,13 @@ impl StreamPipeline {
     pub fn with_aggregations(&self, aggs: Vec<AggDescriptor>) -> Self {
         let mut next = self.clone();
         next.aggregations = aggs;
+        next
+    }
+
+    /// Override state TTL for this stream (milliseconds).
+    pub fn with_state_ttl(&self, ttl_ms: u64) -> Self {
+        let mut next = self.clone();
+        next.state_ttl_ms = Some(ttl_ms);
         next
     }
 

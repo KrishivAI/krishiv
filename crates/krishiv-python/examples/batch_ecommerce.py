@@ -16,7 +16,7 @@ def main():
         write_customers_parquet(customers_path)
 
         # Build embedded session
-        session = ks.Session.embedded()
+        session = ks.Session.from_env()
 
         # Register tables
         session.register_parquet("orders", orders_path)

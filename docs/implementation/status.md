@@ -24,7 +24,203 @@ as a session handoff note, not as a release-plan archive.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
-## Current Session: Python API Binding Enhancements & Batch Examples Implementation
+## Current Session: All 7 Architectural Fixes
+
+All 7 bugs/gaps/bottlenecks identified in the session audit were implemented.
+
+### Changes
+
+1. **`InputPartitionDescriptor::InlineIpc`** — Added proto field (`ipc_bytes = 14`, kind `INLINE_IPC = 6`), Rust domain variant, wire encoding/decoding, executor `read_inline_ipc_partitions`, `register_window_partitions` on coordinator, `window_job_partitions` map in coordinator. Window jobs now pass Arrow IPC bytes as typed task input partitions instead of encoding them in the fragment description string.
+
+2. **Flight server proxy mode** — `FlightExecutionHost` keeps `InProcessCluster` always (needed for continuous streams), but batch SQL and bounded windows are forwarded to the real coordinator in proxy mode. The `coordinator_http` field now correctly separates "where to run batch/window" from "local cluster for continuous streams".
+
+3. **Python `from_env` alignment** — `Session.from_env()` now calls `with_local_cluster(url)` when `KRISHIV_COORDINATOR_URL` is set without `KRISHIV_MODE`, matching the Rust example behavior.
+
+4. **Remove `drive_pending_task_launches` from HTTP handlers** — Removed the inline `drive_pending_task_launches` polling loop from `execute_batch_sql_coordinated`. The background orchestration loop (every 500ms) handles task dispatch; the HTTP handler just submits and waits.
+
+5. **Python batch examples use cluster mode** — All 6 Python batch examples updated from `Session.embedded()` to `Session.from_env()`. When `KRISHIV_COORDINATOR_URL` is set they route through the real coordinator.
+
+6. **Missing Python streaming examples** — Added `memory_stream.py`, `stream_multi_source.py`, `stream_state_ttl.py`. Also added `with_state_ttl(ttl_ms)` on `PyStream` and `state_ttl_ms` field on `StreamPipeline`; added `with_source_id_column` on `PyRelation`.
+
+7. **Circuit breaker observability** — `GET /api/v1/executors` now includes `consecutive_task_failures` per executor so operators can see circuit breaker state without restarting the cluster.
+
+### Validation
+
+All 12 Rust examples and all 12 Python examples pass on a fresh single-node cluster.
+
+```bash
+cargo run -p krishiv -- local start --data-dir /tmp/krishiv-cluster
+# Rust (all 12): EXIT 0
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example <name>
+# Python (all 12): exit 0
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 python3 crates/krishiv-python/examples/<name>.py
+# Circuit breaker visible:
+curl http://127.0.0.1:18080/api/v1/executors  # → consecutive_task_failures: 0
+```
+
+## Previous Session: Python Examples on Single-Node Cluster
+
+All 9 Python examples in `crates/krishiv-python/examples/` pass on the real
+single-node cluster (coordinator + executor + flight-server). No bugs found.
+
+- Batch examples use `Session.embedded()` — run locally, no cluster required.
+- Streaming examples use `Session.from_env()` with `KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051` — windowing routed through coordinator → executor via the `bounded-window` path implemented in the previous session.
+- Rebuilt Python module with `maturin develop` to pick up the new bounded_window coordinator routing.
+
+### Validation
+
+```bash
+# Batch (embedded, no cluster needed)
+python3 crates/krishiv-python/examples/batch_iot_sensor.py
+python3 crates/krishiv-python/examples/batch_ecommerce.py
+python3 crates/krishiv-python/examples/batch_log_analytics.py
+python3 crates/krishiv-python/examples/batch_sql.py
+python3 crates/krishiv-python/examples/batch_delta_audit.py
+python3 crates/krishiv-python/examples/batch_hudi_ingest.py
+
+# Streaming (single-node cluster)
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 python3 crates/krishiv-python/examples/stream_transaction_count.py
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 python3 crates/krishiv-python/examples/stream_session_window.py
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 python3 crates/krishiv-python/examples/stream_continuous_job.py
+# All 9 exit 0. bounded-window-* jobs visible in GET /api/v1/jobs as Succeeded.
+```
+
+## Previous Session: Correct Streaming Architecture — Coordinator → Executor
+
+Fixed the bounded window execution path so streaming examples go through the real
+coordinator → executor pipeline (not the flight server's embedded InProcessCluster).
+
+### Changes
+
+- **`crates/krishiv-executor/src/fragment/batch.rs`**: Added `window:<topic>:<spec_b64>:<batches_b64>` fragment handler. Decodes the window spec (JSON+base64) and input batches (Arrow IPC+base64), then runs `krishiv_exec::execute_bounded_window` and returns inline IPC results.
+- **`crates/krishiv-executor/Cargo.toml`**: Added `base64 = "0.22"` dependency.
+- **`crates/krishiv-scheduler/src/bounded_window.rs`**: New module — `execute_bounded_window_coordinated` submits a `bounded-window` batch job carrying the encoded spec+batches, drives task launches, and waits for inline IPC results (same pattern as `batch_sql.rs`).
+- **`crates/krishiv-scheduler/src/bounded_window_http.rs`**: New module — `api_bounded_window` HTTP handler wrapping the above.
+- **`crates/krishiv-scheduler/Cargo.toml`**: Added `base64 = "0.22"`.
+- **`crates/krishiv-scheduler/src/lib.rs`**: Registered `bounded_window` and `bounded_window_http` modules.
+- **`crates/krishiv-scheduler/src/coordinator_daemon.rs`**: Registered `POST /api/v1/bounded-window` route.
+- **`crates/krishiv-runtime/src/coordinator_http_client.rs`**: Added `execute_coordinator_bounded_window` — POSTs to the coordinator and returns decoded batches.
+- **`crates/krishiv-runtime/src/lib.rs`**: Re-exported `execute_coordinator_bounded_window`.
+- **`crates/krishiv-flight-sql/src/lib.rs`**: `BoundedWindow` action handler now checks `coordinator_http_url()`; when set, forwards to coordinator instead of using the embedded InProcessCluster.
+
+### Architecture after fix
+
+```
+Client (example)
+  → Flight server (port 50051)
+      ├─ Batch SQL        → POST /api/v1/batch-sql    → coordinator → executor ✓
+      └─ BoundedWindow    → POST /api/v1/bounded-window → coordinator → executor ✓
+                                         (fragment: window:<topic>:<spec_b64>:<batches_b64>)
+```
+
+Streaming jobs now appear in the coordinator job list as `bounded-window-*` and
+are executed by the registered executor. Embedded mode (no coordinator URL) still
+runs locally on the flight server's InProcessCluster.
+
+### Validation
+
+All 12 examples pass on a fresh single-node cluster:
+
+```bash
+cargo run -p krishiv -- local stop --data-dir /tmp/krishiv-cluster
+cargo run -p krishiv -- local start --data-dir /tmp/krishiv-cluster
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example <name>
+# All 12 exit 0. bounded-window-* jobs visible in /api/v1/jobs.
+```
+
+## Previous Session: All 12 Examples on Real Single-Node Cluster
+
+### Bugs Fixed
+
+1. **`memory_stream.rs`** — missing `ExecutionMode` import.
+
+2. **`local_cluster.rs`** — coordinator spawned without `--insecure`; executor
+   could not register via gRPC (denied as unauthenticated). Added `--insecure`
+   to the coordinator spawn args in `run_local_start`.
+
+3. **`dataframe.rs` + `session.rs`** — `read_delta_async` / `read_hudi_async`
+   produce `sql_query = Some("SELECT * FROM delta_...")`. In remote mode,
+   `collect_async` routed that SQL to the coordinator batch-sql API. The
+   executor's DataFusion context had no delta/hudi table registered, so the
+   job failed/hung. Fix: added `force_local: bool` flag on `DataFrame`; set it
+   via `with_force_local()` in both lake-house read methods so collection
+   always runs against the local DataFusion plan.
+
+4. **`execution_runtime.rs`** — `RemoteExecutionRuntime::accept_plan` for
+   `ExecutionKind::Streaming` plans called `do_action(ExecutePlan)` → flight
+   server → coordinator batch-sql HTTP 500. Streaming plans are executed by
+   `collect_bounded_window` on the flight server's embedded `InProcessCluster`;
+   the coordinator roundtrip is wrong. Fix: return early with a success report
+   for streaming plans.
+
+### Validation (single-node cluster: coordinator + executor + flight-server)
+
+```bash
+# Start cluster
+cargo run -p krishiv -- local start --data-dir /tmp/krishiv-cluster
+
+# Batch examples
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example batch_iot_sensor
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example batch_ecommerce
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example batch_log_analytics
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example batch_sql
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example batch_delta_audit
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example batch_hudi_ingest
+
+# Streaming examples
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example memory_stream
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example stream_transaction_count
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example stream_multi_source
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example stream_session_window
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example stream_continuous_job
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051 cargo run -p krishiv --example stream_state_ttl
+# All 12 exit 0.
+```
+
+### Pending
+
+- None. All 12 examples pass on the real single-node cluster.
+
+## Previous Session: Single-Node Run of All Rust Examples
+
+- Fixed a missing `ExecutionMode` import in `crates/krishiv/examples/memory_stream.rs` (was in scope from `krishiv` re-export but absent from the use statement).
+- Ran all 12 examples on the embedded single-node cluster — all pass cleanly:
+  - **batch_iot_sensor**: avg temp, max humidity, device count per device.
+  - **batch_ecommerce**: VIP/Standard revenue segmentation.
+  - **batch_log_analytics**: error rate per service.
+  - **batch_delta_audit**: time-travel version 0 vs latest.
+  - **batch_hudi_ingest**: COW snapshot with 3 users.
+  - **batch_sql**: city group-by count.
+  - **memory_stream**: collect + sequence-0 filter over in-memory stream.
+  - **stream_transaction_count**: event-time tumbling window counts.
+  - **stream_multi_source**: sliding window multi-device aggregation.
+  - **stream_session_window**: inactivity-gap session grouping.
+  - **stream_continuous_job**: unbounded job submit + live push + poll.
+  - **stream_state_ttl**: stateful TTL windowed counts.
+
+### Validation
+
+```bash
+cargo check -p krishiv --examples   # Finished (0 errors)
+cargo run -p krishiv --example batch_iot_sensor
+cargo run -p krishiv --example batch_ecommerce
+cargo run -p krishiv --example batch_log_analytics
+cargo run -p krishiv --example batch_sql
+cargo run -p krishiv --example batch_delta_audit
+cargo run -p krishiv --example batch_hudi_ingest
+cargo run -p krishiv --example memory_stream
+cargo run -p krishiv --example stream_transaction_count
+cargo run -p krishiv --example stream_multi_source
+cargo run -p krishiv --example stream_session_window
+cargo run -p krishiv --example stream_continuous_job
+cargo run -p krishiv --example stream_state_ttl
+```
+
+### Pending
+
+- Implementation of remaining Python streaming examples (stream_continuous_job, stream_session_window).
+
+## Previous Session: Python API Binding Enhancements & Batch Examples Implementation
 
 - Created a virtual environment and set up Python 3.14 development dependencies (`maturin`, `pytest`, `pandas`, `pyarrow`, `arro3-core`).
 - Reclaimed 62 GB of disk space by deleting an abandoned 48 GB subagent worktree and a 14 GB duplicate cargo target directory.

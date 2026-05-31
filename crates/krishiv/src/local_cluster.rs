@@ -225,6 +225,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
             "json",
             "--metadata-path",
             meta,
+            "--insecure",
         ],
     ) {
         Ok(pid) => pid,
