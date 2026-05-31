@@ -24,7 +24,59 @@ as a session handoff note, not as a release-plan archive.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
-## Current Session: All 7 Architectural Fixes
+## Current Session: k3s Kubernetes Deployment + All 24 Examples
+
+Installed k3s on Ubuntu 26.04 VPS (11 GiB RAM, 96 GiB disk) and deployed
+Krishiv as a 4-pod distributed cluster. All 24 examples (12 Rust + 12 Python)
+pass against the k3s cluster.
+
+### k3s cluster setup
+
+- k3s v1.35.5+k3s1 installed (`curl -sfL https://get.k3s.io | ... sh -`)
+- Built musl-static binary (`cargo build --target x86_64-unknown-linux-musl`)
+  so the image runs on Alpine without a glibc dependency.
+- Container image: `localhost/krishiv:local` — `FROM alpine:3.21` + musl binary
+  (415 MiB including debug symbols).
+- Deployed to namespace `krishiv-system`:
+  - `coordinator` (1 pod): gRPC `:9090`, HTTP `:18080`, `--insecure`, JSON metadata
+  - `executor` (2 pods, 2 slots each = 4 total): hostPath `/tmp` mount so pods can
+    read temp parquet files written by the client.
+  - `flight-server` (1 pod): `KRISHIV_COORDINATOR_HTTP` → coordinator HTTP
+- NodePort services: flight `:30051`, coordinator HTTP `:30080`
+
+### Bugs fixed during k3s deployment
+
+1. **GLIBC mismatch** — Ubuntu 26.04 binary (glibc 2.43) crashes in Debian
+   bookworm containers (glibc 2.36). Fixed by building with musl
+   (`x86_64-unknown-linux-musl` target) and using `FROM alpine:3.21`.
+
+2. **reqwest CA cert panic** — `FROM scratch` has no CA certificate store.
+   reqwest with rustls panics on startup. Fixed by switching to `FROM alpine:3.21`
+   which ships `/etc/ssl/certs/ca-certificates.crt`.
+
+3. **Executor advertises `0.0.0.0:50055`** — the coordinator can't reach executor
+   pods via `http://0.0.0.0:50055`. Fixed in `cli.rs`: when bind IP is unspecified
+   (`0.0.0.0`), use the configured host for the advertised endpoint. Injected
+   `POD_IP` via the Kubernetes downward API so executors advertise their real pod IP.
+
+### Validation
+
+```bash
+# Cluster health
+curl http://127.0.0.1:30080/readyz        # → ready
+curl http://127.0.0.1:30080/api/v1/executors  # → 2 Healthy executors
+
+# All 12 Rust examples (ExIT 0)
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:30051 cargo run -p krishiv --example <name>
+
+# All 12 Python examples (exit 0)
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:30051 python3 crates/krishiv-python/examples/<name>.py
+```
+
+20 coordinator jobs created, 19 Succeeded (1 Cancelled = timed-out from pre-fix
+run).
+
+## Previous Session: All 7 Architectural Fixes
 
 All 7 bugs/gaps/bottlenecks identified in the session audit were implemented.
 

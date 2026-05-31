@@ -6,6 +6,7 @@ use crate::in_process::BatchSqlTable;
 
 use crate::{RuntimeError, RuntimeResult};
 
+
 #[derive(serde::Serialize)]
 struct BatchSqlRequestBody {
     query: String,

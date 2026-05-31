@@ -206,9 +206,16 @@ async fn heartbeat_loop(
     };
     if let Some(listener) = &task_listener {
         let bound_addr = listener.local_addr().unwrap();
-        let endpoint = format!("http://{bound_addr}");
+        // When bound to 0.0.0.0, use the configured host (HOSTNAME / KRISHIV_HOST)
+        // so the coordinator can reach us via a routable address.
+        let advertised_host = if bound_addr.ip().is_unspecified() {
+            runtime.config().host().to_owned()
+        } else {
+            bound_addr.ip().to_string()
+        };
+        let endpoint = format!("http://{}:{}", advertised_host, bound_addr.port());
         runtime.set_advertised_endpoints(Some(endpoint.clone()), None);
-        println!("Krishiv executor task gRPC listening on {bound_addr}");
+        println!("Krishiv executor task gRPC listening on {bound_addr} (advertised {endpoint})");
     }
     let barrier_listener = if let Some(addr) = barrier_grpc_addr {
         Some(
@@ -221,9 +228,14 @@ async fn heartbeat_loop(
     };
     if let Some(listener) = &barrier_listener {
         let bound_addr = listener.local_addr().unwrap();
-        let endpoint = format!("http://{bound_addr}");
+        let advertised_host = if bound_addr.ip().is_unspecified() {
+            runtime.config().host().to_owned()
+        } else {
+            bound_addr.ip().to_string()
+        };
+        let endpoint = format!("http://{}:{}", advertised_host, bound_addr.port());
         runtime.set_advertised_endpoints(None, Some(endpoint.clone()));
-        println!("Krishiv executor barrier gRPC listening on {bound_addr}");
+        println!("Krishiv executor barrier gRPC listening on {bound_addr} (advertised {endpoint})");
     }
 
     // First register (now with task/barrier endpoints already populated).
@@ -512,7 +524,12 @@ impl ExecutorCliConfig {
         let mut config = Self {
             executor_id: env::var("KRISHIV_EXECUTOR_ID")
                 .unwrap_or_else(|_| String::from("exec-local")),
-            host: env::var("HOSTNAME").unwrap_or_else(|_| String::from("localhost")),
+            // POD_IP is injected via the Kubernetes downward API and is the
+            // correct routable address for coordinator→executor gRPC callbacks.
+            // Fall back to HOSTNAME for non-Kubernetes deployments.
+            host: env::var("POD_IP")
+                .or_else(|_| env::var("HOSTNAME"))
+                .unwrap_or_else(|_| String::from("localhost")),
             slots: env::var("KRISHIV_TASK_SLOTS")
                 .ok()
                 .and_then(|value| value.parse().ok())
