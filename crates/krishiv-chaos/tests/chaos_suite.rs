@@ -122,3 +122,44 @@ async fn leader_election_simulation_acquire_release() {
     election.release().await;
     assert!(!election.is_leader());
 }
+
+// =========================================================================
+// SPRINT 4: Missing failure-mode tests (M6 in review)
+// =========================================================================
+//
+// The following tests should be added to close gaps in chaos coverage:
+//
+// 1. Split-brain scenario: Two coordinators both attempt to commit epoch N.
+//    - Verify fencing tokens prevent duplicate checkpoint commits.
+//    - Expected: second coordinator's commit is rejected via validate_fencing_token.
+//
+// 2. Duplicate task delivery: Same task_id sent twice to same executor.
+//    - Verify executor task runner idempotence (state snapshot on same epoch returns same hash).
+//
+// 3. Coordinator restart mid-epoch: Acks arrive after fencing token rotates.
+//    - Verify validate_fencing_token_for_restore rejects acks from rotated epoch.
+//    - Regression test: FencingToken::initial() == 1 check on restore path.
+//
+// 4. Network partition (asymmetric): Executor delivers acks, coordinator heartbeats fail.
+//    - Simulate via FaultMode::Drop on executor heartbeat path.
+//    - Verify ghost executor detection via lease expiry + re-assignment.
+//
+// 5. Object-store unavailable during commit_epoch write.
+//    - FaultInjector on storage write path.
+//    - Verify: epoch transitions to Failed, no partial metadata written.
+//
+// 6. Executor kafka_source_offset regression (goes backwards).
+//    - Inject negative offset delta into checkpoint ack.
+//    - Verify rejection or logging of invariant violation.
+//
+// 7. UDF panic (not returns Err, actually panics).
+//    - Wrap UDF call in catch_unwind, verify executor doesn't crash.
+//
+// 8. Barrier channel capacity exhaustion.
+//    - Send >64 barriers in rapid succession.
+//    - Verify executor logs warning, continues (doesn't panic/OOM).
+//
+// These tests require expanding FaultInjector to support one-shot and
+// probabilistic modes (M5 in review), and wiring fault injection into
+// gRPC interceptors and storage backends.
+//
