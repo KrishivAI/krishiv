@@ -108,23 +108,6 @@ impl CheckpointInner {
 
 // ── Executor sync helpers (G3) ──────────────────────────────────────────────
 
-/// Synchronise executor state FROM the inner lock INTO the Coordinator fields.
-/// Call after the inner lock's executor registry has been mutated (e.g. via
-/// heartbeat fast path) to propagate the updated lease/tick to the outer
-/// coordinator.
-pub(crate) fn sync_executor_from_inner(
-    inner: &ExecutorInner,
-    dest_executors: &mut ExecutorRegistry,
-    dest_state: &mut CoordinatorState,
-    dest_ticks: &mut u64,
-    dest_recovering: &mut bool,
-) {
-    dest_executors.clone_from(&inner.executors);
-    *dest_state = inner.state;
-    *dest_ticks = inner.ticks_since_restart;
-    *dest_recovering = inner.recovering;
-}
-
 /// Synchronise executor state FROM the Coordinator fields INTO the inner lock.
 /// Call after any coordinator mutation that modifies the executor registry
 /// (register, deregister, advance_heartbeat_clock) so the inner lock's hot-path
@@ -143,18 +126,6 @@ pub(crate) fn sync_executor_to_inner(
 }
 
 // ── Checkpoint sync helpers (G3) ───────────────────────────────────────────
-
-/// Synchronise checkpoint state FROM the inner lock INTO the Coordinator fields.
-pub(crate) fn sync_checkpoint_from_inner(
-    inner: &CheckpointInner,
-    dest_coordinators: &mut HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
-    dest_notify: &mut HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
-    dest_barrier: &mut HashSet<(krishiv_proto::JobId, u64)>,
-) {
-    dest_coordinators.clone_from(&inner.coordinators);
-    dest_notify.clone_from(&inner.notify_sent);
-    dest_barrier.clone_from(&inner.barrier_sent);
-}
 
 /// Synchronise checkpoint state FROM the Coordinator fields INTO the inner lock.
 pub(crate) fn sync_checkpoint_to_inner(

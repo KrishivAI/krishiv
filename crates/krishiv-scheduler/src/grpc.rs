@@ -16,6 +16,7 @@ use krishiv_proto::{
 };
 
 use crate::auth::{extract_auth_context, validate_grpc_auth};
+use crate::checkpoint::CheckpointCoordinator;
 use crate::coordinator::SharedCoordinator;
 use crate::error::{SchedulerError, TaskUpdateOutcome};
 
@@ -272,8 +273,36 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
-        let mut coordinator = self.coordinator.write().await;
-        let response = coordinator.handle_checkpoint_ack_async(ack).await;
+        let job_id = ack.job_id.clone();
+
+        // Phase 1: in-memory ack processing under coordinator lock.
+        let (response, pending) = {
+            let mut coordinator = self.coordinator.write().await;
+            coordinator.handle_checkpoint_ack_async(ack).await
+        };
+
+        // Phase 2: async storage I/O without coordinator lock.
+        if let Some(commit) = pending {
+            let epoch = commit.epoch;
+            if let Err(e) = CheckpointCoordinator::commit_storage(commit).await {
+                // Storage write failed — abort the in-flight epoch so the
+                // coordinator does not hang on awaiting-acks timeout.
+                let mut coordinator = self.coordinator.write().await;
+                if let Some(coord) = coordinator.checkpoint_coordinators.get_mut(&job_id) {
+                    coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
+                }
+                return Err(tonic::Status::internal(format!(
+                    "checkpoint commit failed: {e}"
+                )));
+            }
+
+            // Phase 3: finalize commit under coordinator lock.
+            let mut coordinator = self.coordinator.write().await;
+            if let Some(coord) = coordinator.checkpoint_coordinators.get_mut(&job_id) {
+                coord.finalize_commit(epoch);
+            }
+        }
+
         Ok(tonic::Response::new(response))
     }
 }

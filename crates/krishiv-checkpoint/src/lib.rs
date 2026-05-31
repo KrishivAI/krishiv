@@ -1065,7 +1065,7 @@ pub fn delete_savepoint(
 /// Filesystem-backed checkpoint storage for tests.
 ///
 /// All writes use temp-file + rename for atomicity, matching the pattern used
-/// by `RocksDbStateBackend`.  Production object-store storage wraps
+/// by `RedbStateBackend`.  Production object-store storage wraps
 /// `object_store::ObjectStore` behind the [`CheckpointStorage`] trait.
 #[derive(Debug, Clone)]
 pub struct LocalFsCheckpointStorage {

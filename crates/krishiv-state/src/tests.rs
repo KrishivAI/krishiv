@@ -390,29 +390,29 @@ fn timer_re_register_updates_deadline() {
     assert_eq!(fired[0].deadline_ms, 1000);
 }
 
-// ── RocksDbStateBackend (now RedbStateBackend via type alias) ─────────────
+// ── RedbStateBackend (ephemeral, via legacy alias tests) ──────────────────
 
-fn rocks_backend() -> RocksDbStateBackend {
-    RocksDbStateBackend::ephemeral().expect("ephemeral backend")
+fn redb_ephemeral_backend() -> RedbStateBackend {
+    RedbStateBackend::ephemeral().expect("ephemeral backend")
 }
 
 #[test]
-fn rocks_get_missing_returns_none() {
-    let b = rocks_backend();
+fn redb_ephemeral_get_missing_returns_none() {
+    let b = redb_ephemeral_backend();
     assert!(b.get(&ns("op", "s"), b"k").unwrap().is_none());
 }
 
 #[test]
-fn rocks_put_and_get_roundtrip() {
-    let mut b = rocks_backend();
+fn redb_ephemeral_put_and_get_roundtrip() {
+    let mut b = redb_ephemeral_backend();
     let n = ns("op1", "counts");
     b.put(&n, b"user-a".to_vec(), b"42".to_vec()).unwrap();
     assert_eq!(b.get(&n, b"user-a").unwrap(), Some(b"42".to_vec()));
 }
 
 #[test]
-fn rocks_delete_removes_key() {
-    let mut b = rocks_backend();
+fn redb_ephemeral_delete_removes_key() {
+    let mut b = redb_ephemeral_backend();
     let n = ns("op1", "counts");
     b.put(&n, b"k".to_vec(), b"v".to_vec()).unwrap();
     b.delete(&n, b"k").unwrap();
@@ -420,14 +420,14 @@ fn rocks_delete_removes_key() {
 }
 
 #[test]
-fn rocks_delete_missing_is_noop() {
-    let mut b = rocks_backend();
+fn redb_ephemeral_delete_missing_is_noop() {
+    let mut b = redb_ephemeral_backend();
     b.delete(&ns("op1", "s"), b"nonexistent").unwrap();
 }
 
 #[test]
-fn rocks_clear_namespace_removes_only_matching_keys() {
-    let mut b = rocks_backend();
+fn redb_ephemeral_clear_namespace_removes_only_matching_keys() {
+    let mut b = redb_ephemeral_backend();
     let ns_a = ns("op1", "window");
     let ns_b = ns("op1", "other");
     b.put(&ns_a, b"k1".to_vec(), b"v1".to_vec()).unwrap();
@@ -440,8 +440,8 @@ fn rocks_clear_namespace_removes_only_matching_keys() {
 }
 
 #[test]
-fn rocks_list_namespaces_and_keys() {
-    let mut b = rocks_backend();
+fn redb_ephemeral_list_namespaces_and_keys() {
+    let mut b = redb_ephemeral_backend();
     let n1 = ns("op1", "window");
     let n2 = ns("op2", "counts");
     b.put(&n1, b"a".to_vec(), b"1".to_vec()).unwrap();
@@ -458,7 +458,7 @@ fn rocks_list_namespaces_and_keys() {
 }
 
 #[test]
-fn rocks_survives_reopen() {
+fn redb_ephemeral_survives_reopen() {
     let dir = {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.redb");
@@ -475,8 +475,8 @@ fn rocks_survives_reopen() {
 }
 
 #[test]
-fn rocks_ttl_wrapper_expires_on_reopen() {
-    let b = rocks_backend();
+fn redb_ephemeral_ttl_wrapper_expires_on_reopen() {
+    let b = redb_ephemeral_backend();
     let n = ns("op1", "session");
     let mut ttl = TtlStateBackend::new(b, TtlConfig::new(60_000));
     ttl.put(&n, b"live-key".to_vec(), b"live-val".to_vec())
@@ -492,7 +492,7 @@ fn rocks_ttl_wrapper_expires_on_reopen() {
 }
 
 #[test]
-fn rocks_deterministic_replay() {
+fn redb_ephemeral_deterministic_replay() {
     let write_state = |b: &mut RedbStateBackend| {
         let n = ns("tumbling-1", "window-counts");
         b.put(&n, b"user-a:0".to_vec(), 42i64.to_le_bytes().to_vec())
@@ -501,8 +501,8 @@ fn rocks_deterministic_replay() {
             .unwrap();
     };
 
-    let mut b1 = rocks_backend();
-    let mut b2 = rocks_backend();
+    let mut b1 = redb_ephemeral_backend();
+    let mut b2 = redb_ephemeral_backend();
     write_state(&mut b1);
     write_state(&mut b2);
 
@@ -518,8 +518,8 @@ fn rocks_deterministic_replay() {
 }
 
 #[test]
-fn rocks_state_inspector_reads_without_mutation() {
-    let mut b = rocks_backend();
+fn redb_ephemeral_state_inspector_reads_without_mutation() {
+    let mut b = redb_ephemeral_backend();
     let n = ns("op1", "window");
     b.put(&n, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     b.put(&n, b"k2".to_vec(), b"v2".to_vec()).unwrap();
@@ -532,7 +532,7 @@ fn rocks_state_inspector_reads_without_mutation() {
 }
 
 #[test]
-fn rocks_spawn_blocking_compatible() {
+fn redb_ephemeral_spawn_blocking_compatible() {
     use std::thread;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state.redb");

@@ -1159,9 +1159,10 @@ enum StoreCommand {
 
 /// Non-blocking handle to a [`MetadataStore`].
 ///
-/// When a Tokio runtime is available, writes are enqueued to a background task
-/// so the coordinator lock is released immediately.  In synchronous contexts
-/// (unit tests, startup), writes happen inline on the calling thread.
+/// Writes are sent through a bounded channel to a background task so the
+/// coordinator lock is released immediately (backpressured at capacity).
+/// In synchronous contexts (unit tests, startup), writes happen inline on the
+/// calling thread.
 ///
 /// Use [`NonBlockingStoreHandle::flush`] to wait for all pending async writes
 /// (useful on graceful shutdown).
@@ -1169,8 +1170,8 @@ enum StoreCommand {
 #[derive(Clone)]
 pub struct NonBlockingStoreHandle {
     inner: std::sync::Arc<std::sync::Mutex<dyn MetadataStore + 'static>>,
-    /// Async sender; `None` when no Tokio runtime was available at construction.
-    tx: Option<tokio::sync::mpsc::UnboundedSender<StoreCommand>>,
+    /// Bounded sender; `None` when no Tokio runtime was available at construction.
+    tx: Option<tokio::sync::mpsc::Sender<StoreCommand>>,
 }
 
 impl std::fmt::Debug for NonBlockingStoreHandle {
@@ -1180,6 +1181,9 @@ impl std::fmt::Debug for NonBlockingStoreHandle {
             .finish_non_exhaustive()
     }
 }
+
+/// Default channel capacity: 1024 pending writes before backpressure applies.
+const STORE_CHANNEL_CAPACITY: usize = 1024;
 
 impl NonBlockingStoreHandle {
     /// Create a handle backed by `store`.
@@ -1193,14 +1197,15 @@ impl NonBlockingStoreHandle {
 
         // Only spawn the background task when a Tokio runtime is available.
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StoreCommand>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
                         StoreCommand::AppendEvent(event) => {
                             let bg = std::sync::Arc::clone(&bg_store);
-                            tokio::task::block_in_place(|| {
+                            tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Err(e) = guard.append_event(event) {
                                     tracing::error!(
@@ -1208,11 +1213,13 @@ impl NonBlockingStoreHandle {
                                         "NonBlockingStoreHandle: append_event failed"
                                     );
                                 }
-                            });
+                            })
+                            .await
+                            .ok();
                         }
                         StoreCommand::SaveJob(record) => {
                             let bg = std::sync::Arc::clone(&bg_store);
-                            tokio::task::block_in_place(|| {
+                            tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Err(e) = guard.save_job(&record) {
                                     tracing::error!(
@@ -1220,7 +1227,9 @@ impl NonBlockingStoreHandle {
                                         "NonBlockingStoreHandle: save_job failed"
                                     );
                                 }
-                            });
+                            })
+                            .await
+                            .ok();
                         }
                         StoreCommand::Flush(reply) => {
                             let _ = reply.send(());
@@ -1241,10 +1250,19 @@ impl NonBlockingStoreHandle {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Enqueue an event write (non-blocking when async; synchronous otherwise).
+    /// Enqueue an event write (sync, uses `try_send` with sync fallback).
+    ///
+    /// When the bounded channel is full the write falls back to a synchronous
+    /// write on the calling thread (best-effort backpressure).
     pub fn append_event(&self, event: EventLogEvent) {
         if let Some(ref tx) = self.tx {
-            let _ = tx.send(StoreCommand::AppendEvent(event));
+            if tx.try_send(StoreCommand::AppendEvent(event.clone())).is_err() {
+                // Channel full — fall back to sync write.
+                let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = guard.append_event(event) {
+                    tracing::error!(error = %e, "NonBlockingStoreHandle: append_event fallback failed");
+                }
+            }
         } else {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Err(e) = guard.append_event(event) {
@@ -1253,15 +1271,54 @@ impl NonBlockingStoreHandle {
         }
     }
 
-    /// Enqueue a job save (non-blocking when async; synchronous otherwise).
+    /// Enqueue a job save (sync, uses `try_send` with sync fallback).
+    ///
+    /// When the bounded channel is full the write falls back to a synchronous
+    /// write on the calling thread (best-effort backpressure).
     pub fn save_job(&self, record: &JobRecord) {
         if let Some(ref tx) = self.tx {
-            let _ = tx.send(StoreCommand::SaveJob(Box::new(record.clone())));
+            if tx.try_send(StoreCommand::SaveJob(Box::new(record.clone()))).is_err() {
+                // Channel full — fall back to sync write.
+                let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = guard.save_job(&record) {
+                    tracing::error!(error = %e, "NonBlockingStoreHandle: save_job fallback failed");
+                }
+            }
         } else {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Err(e) = guard.save_job(record) {
                 tracing::error!(error = %e, "NonBlockingStoreHandle: save_job failed (sync)");
             }
+        }
+    }
+
+    /// Async version of `append_event` with proper backpressure.
+    ///
+    /// Awaits until capacity is available in the bounded channel.
+    pub async fn append_event_async(&self, event: EventLogEvent) {
+        if let Some(ref tx) = self.tx {
+            if tx.send(StoreCommand::AppendEvent(event)).await.is_err() {
+                tracing::error!("NonBlockingStoreHandle: store background task dropped");
+            }
+        } else {
+            self.append_event(event);
+        }
+    }
+
+    /// Async version of `save_job` with proper backpressure.
+    ///
+    /// Awaits until capacity is available in the bounded channel.
+    pub async fn save_job_async(&self, record: &JobRecord) {
+        if let Some(ref tx) = self.tx {
+            if tx
+                .send(StoreCommand::SaveJob(Box::new(record.clone())))
+                .await
+                .is_err()
+            {
+                tracing::error!("NonBlockingStoreHandle: store background task dropped");
+            }
+        } else {
+            self.save_job(record);
         }
     }
 
@@ -1271,7 +1328,7 @@ impl NonBlockingStoreHandle {
     pub async fn flush(&self) {
         if let Some(ref tx) = self.tx {
             let (reply_tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(StoreCommand::Flush(reply_tx));
+            let _ = tx.send(StoreCommand::Flush(reply_tx)).await;
             let _ = rx.await;
         }
     }

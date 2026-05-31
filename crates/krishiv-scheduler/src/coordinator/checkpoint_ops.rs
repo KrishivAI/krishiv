@@ -41,12 +41,15 @@ impl Coordinator {
         res
     }
 
-    /// Async variant of [`Self::handle_checkpoint_ack`] for gRPC paths that
-    /// should not bounce checkpoint storage I/O through `block_in_place`.
+    /// Async variant of [`Self::handle_checkpoint_ack`] for gRPC paths.
+    ///
+    /// Returns `(response, Some(pending_commit))` when quorum is reached and
+    /// the caller should perform async storage writes without the coordinator
+    /// lock before calling [`CheckpointCoordinator::finalize_commit`].
     pub async fn handle_checkpoint_ack_async(
         &mut self,
         ack: CheckpointAckRequest,
-    ) -> CheckpointAckResponse {
+    ) -> (CheckpointAckResponse, Option<crate::checkpoint::PendingCommit>) {
         tracing::debug!(
             job_id = %ack.job_id,
             epoch = ack.epoch,
@@ -56,33 +59,43 @@ impl Coordinator {
 
         let job_id = ack.job_id.clone();
 
-        let res = match self.checkpoint_coordinators.get_mut(&job_id) {
-            None => CheckpointAckResponse::JobNotFound,
+        let (res, pending) = match self.checkpoint_coordinators.get_mut(&job_id) {
+            None => (CheckpointAckResponse::JobNotFound, None),
             Some(coord) => {
                 let coordinator_token = coord.fencing_token();
                 if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
-                    return CheckpointAckResponse::StaleFencingToken {
-                        current_token: coordinator_token.as_u64(),
-                    };
+                    return (
+                        CheckpointAckResponse::StaleFencingToken {
+                            current_token: coordinator_token.as_u64(),
+                        },
+                        None,
+                    );
                 }
 
                 let current_epoch = coord.current_epoch();
-                match coord.receive_ack_async(ack.clone()).await {
-                    Ok(true) => {
-                        self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
-                        CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-                        record_checkpoint_epoch(job_id.as_str(), ack.epoch);
-                        CheckpointAckResponse::Accepted
-                    }
-                    Ok(false) => CheckpointAckResponse::Accepted,
-                    Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+                let is_quorum = coord.receive_ack_async(ack.clone()).await;
+                // Release the borrow on `self.checkpoint_coordinators` before
+                // calling self.* methods.
+                let (is_quorum, pending) = match is_quorum {
+                    Ok(true) => (true, coord.take_pending_commit()),
+                    Ok(false) => (true, None),
+                    Err(_) => (false, None),
+                };
+                // coord borrow released — safe to call self.* now.
+                if is_quorum {
+                    self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
+                    CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                    record_checkpoint_epoch(job_id.as_str(), ack.epoch);
+                    (CheckpointAckResponse::Accepted, pending)
+                } else {
+                    (CheckpointAckResponse::StaleEpoch { current_epoch }, None)
                 }
             }
         };
 
         self.notify.notify_waiters();
 
-        res
+        (res, pending)
     }
 
     /// Initiate a savepoint for a streaming job.

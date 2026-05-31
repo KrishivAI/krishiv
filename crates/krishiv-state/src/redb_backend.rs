@@ -381,4 +381,4 @@ impl RedbStateBackend {
     }
 }
 
-pub type RocksDbStateBackend = RedbStateBackend;
+// Legacy alias removed — use RedbStateBackend directly.

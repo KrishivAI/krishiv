@@ -14,8 +14,7 @@
 //!   pure-Rust embedded B-tree database.  Supports file-backed persistence and
 //!   an in-memory mode for tests.  All I/O is synchronous; callers must use
 //!   `spawn_blocking` when called from async tasks.
-//! - `RocksDbStateBackend` — type alias for `RedbStateBackend` (kept for
-//!   source compatibility; the old filesystem-based placeholder is removed).
+//!   removed; use `RedbStateBackend` directly.
 
 // Declared here:
 pub mod incremental;
@@ -49,7 +48,7 @@ pub use namespace::Namespace;
 pub use processing_time::{
     InMemoryProcessingTimeTimerService, ProcessingTimeTimerKey, ProcessingTimeTimerService,
 };
-pub use redb_backend::{RedbStateBackend, RocksDbStateBackend};
+pub use redb_backend::RedbStateBackend;
 pub use snapshot::{SnapshotEntry, decode_snapshot_entries};
 pub use timer::{InMemoryTimerService, TimerKey, TimerService};
 pub use ttl::{TtlConfig, TtlStateBackend};

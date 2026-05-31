@@ -11,6 +11,18 @@ use krishiv_checkpoint::{
 };
 use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 
+/// Commit data extracted from the checkpoint coordinator in preparation for
+/// async object-store writes.  Produced under the coordinator write lock,
+/// consumed without the lock.
+#[derive(Clone)]
+pub struct PendingCommit {
+    pub storage: Arc<dyn CheckpointStorage>,
+    pub job_id: String,
+    pub epoch: u64,
+    pub metadata: CheckpointMetadata,
+    pub operator_snapshots: Vec<OperatorSnapshotRef>,
+}
+
 /// State of the per-job checkpoint coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointCoordinatorState {
@@ -18,6 +30,8 @@ pub enum CheckpointCoordinatorState {
     Idle,
     /// Waiting for executor acks for `epoch`.
     AwaitingAcks { epoch: u64, initiated_at_ms: u64 },
+    /// Quorum reached, storage write in flight (state not yet finalised).
+    Committing { epoch: u64 },
     /// `epoch` was successfully committed.
     Committed { epoch: u64 },
     /// Checkpoint failed; reason recorded.
@@ -44,6 +58,9 @@ pub struct CheckpointCoordinator {
     pub(crate) pending_savepoint_label: Option<String>,
     /// Whether the next commit should be flagged as a savepoint.
     pub(crate) pending_is_savepoint: bool,
+    /// Extracted commit data awaiting async storage I/O.  Populated when
+    /// quorum is reached; cleared after finalise.
+    pub(crate) pending_commit: Option<PendingCommit>,
     /// Accumulated wall-clock ms since the last checkpoint was initiated.
     /// Driven by `try_tick`; resets on each successful `initiate()`.
     pub(crate) elapsed_ms: u64,
@@ -85,6 +102,7 @@ impl CheckpointCoordinator {
             state: CheckpointCoordinatorState::Idle,
             pending_savepoint_label: None,
             pending_is_savepoint: false,
+            pending_commit: None,
             elapsed_ms: 0,
             awaiting_elapsed_ms: 0,
         }
@@ -148,10 +166,16 @@ impl CheckpointCoordinator {
     pub fn try_tick(&mut self, elapsed_ms: u64, ack_timeout_ms: u64) -> Option<u64> {
         // Process awaiting-acks timeout even when expected_task_count is 0,
         // so an epoch doesn't get stuck forever if all tasks finish during it.
-        if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
-            self.awaiting_elapsed_ms = self.awaiting_elapsed_ms.saturating_add(elapsed_ms);
-            if self.awaiting_elapsed_ms >= ack_timeout_ms {
-                self.abort_epoch("timed out waiting for checkpoint acknowledgements");
+        if matches!(
+            self.state,
+            CheckpointCoordinatorState::AwaitingAcks { .. }
+                | CheckpointCoordinatorState::Committing { .. }
+        ) {
+            if matches!(self.state, CheckpointCoordinatorState::AwaitingAcks { .. }) {
+                self.awaiting_elapsed_ms = self.awaiting_elapsed_ms.saturating_add(elapsed_ms);
+                if self.awaiting_elapsed_ms >= ack_timeout_ms {
+                    self.abort_epoch("timed out waiting for checkpoint acknowledgements");
+                }
             }
             return None;
         }
@@ -215,10 +239,21 @@ impl CheckpointCoordinator {
         Ok(false)
     }
 
-    /// Async variant of [`Self::receive_ack`].
+    /// Async variant of [`Self::receive_ack`].  When quorum is reached the
+    /// commit data is extracted *in memory* and stored in `self.pending_commit`;
+    /// the actual async object-store writes are deferred to
+    /// [`Self::commit_storage`] so the coordinator lock is not held across I/O.
     pub async fn receive_ack_async(&mut self, ack: CheckpointAckRequest) -> Result<bool, String> {
         let current_epoch = match &self.state {
             CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            // Acks arriving while we are in Committing are racing the storage
+            // write — reject them (the epoch is already being committed).
+            CheckpointCoordinatorState::Committing { epoch } => {
+                return Err(format!(
+                    "checkpoint coordinator for job {} is already committing epoch {epoch}",
+                    self.job_id
+                ));
+            }
             _ => {
                 return Err(format!(
                     "checkpoint coordinator for job {} is not awaiting acks",
@@ -243,10 +278,168 @@ impl CheckpointCoordinator {
         let key = ack.task_id.as_str().to_owned();
         self.pending_acks.insert(key, ack);
         if self.pending_acks.len() >= self.expected_task_count {
-            self.commit_epoch_async().await.map_err(|e| e.to_string())?;
+            self.pending_commit = Some(self.extract_commit_data()?);
+            self.state = CheckpointCoordinatorState::Committing {
+                epoch: current_epoch,
+            };
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Extract commit data from in-memory state (no I/O).  Called under the
+    /// coordinator write lock when quorum is reached.
+    fn extract_commit_data(&self) -> Result<PendingCommit, String> {
+        let epoch = match &self.state {
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            _ => {
+                return Err(format!(
+                    "checkpoint coordinator for job {} must be awaiting acks to extract commit data",
+                    self.job_id
+                ));
+            }
+        };
+
+        let mut offset_map: HashMap<String, i64> = HashMap::new();
+        for ack in self.pending_acks.values() {
+            for so in &ack.source_offsets {
+                offset_map.insert(so.partition_id.clone(), so.offset);
+            }
+        }
+        let source_offsets: Vec<SourceOffsetRecord> = offset_map
+            .into_iter()
+            .map(|(partition_id, offset)| SourceOffsetRecord {
+                partition_id,
+                offset,
+            })
+            .collect();
+
+        let operator_snapshots: Vec<OperatorSnapshotRef> = self
+            .pending_acks
+            .values()
+            .filter_map(|ack| {
+                ack.snapshot_path.as_ref().map(|path| OperatorSnapshotRef {
+                    operator_id: ack.operator_id.clone(),
+                    task_id: ack.task_id.as_str().to_owned(),
+                    snapshot_path: path.clone(),
+                })
+            })
+            .collect();
+
+        let is_savepoint = self.pending_is_savepoint;
+        let savepoint_label = self.pending_savepoint_label.clone();
+        let metadata = CheckpointMetadata {
+            version: CheckpointMetadata::VERSION,
+            epoch,
+            job_id: self.job_id.as_str().to_owned(),
+            fencing_token: self.fencing_token.as_u64(),
+            coordinator_id: Some(self.coordinator_id.clone()),
+            timestamp_ms: epoch * self.interval_ms,
+            source_offsets,
+            operator_snapshots: operator_snapshots.clone(),
+            is_savepoint,
+            savepoint_label,
+            iceberg_snapshot_id: None,
+            kafka_offsets: None,
+        };
+
+        // GAP-CP-03: Validate fencing token before committing to storage.
+        krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
+            .map_err(|e| {
+                format!("fencing token mismatch for job {}: {e}", self.job_id)
+            })?;
+
+        Ok(PendingCommit {
+            storage: Arc::clone(&self.storage),
+            job_id: self.job_id.as_str().to_owned(),
+            epoch,
+            metadata,
+            operator_snapshots,
+        })
+    }
+
+    /// Take the extracted commit data (moved out of `self`), if any.
+    pub fn take_pending_commit(&mut self) -> Option<PendingCommit> {
+        self.pending_commit.take()
+    }
+
+    /// Perform the async object-store writes for a prepared commit.
+    ///
+    /// Call this **without** the coordinator lock.  After it returns, call
+    /// [`Self::finalize_commit`] (under the coordinator lock) to transition
+    /// the state to `Committed`.
+    pub async fn commit_storage(commit: PendingCommit) -> CheckpointResult<u64> {
+        let epoch = commit.epoch;
+        let job_id = &commit.job_id;
+        let metadata = &commit.metadata;
+
+        write_epoch_metadata_async(
+            commit.storage.as_ref(),
+            job_id,
+            epoch,
+            metadata,
+        )
+        .await?;
+
+        // Build manifest: hash metadata.json + each snapshot file.
+        let mut manifest = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(metadata).map_err(|e| {
+            krishiv_checkpoint::CheckpointError::Storage {
+                message: format!("metadata serialize for manifest: {e}"),
+            }
+        })?;
+        manifest.insert_bytes("metadata.json", &meta_json);
+        for snap_ref in &commit.operator_snapshots {
+            if let Some(bytes) = read_operator_snapshot_async(
+                commit.storage.as_ref(),
+                job_id,
+                epoch,
+                &snap_ref.operator_id,
+                &snap_ref.task_id,
+            )
+            .await?
+            {
+                let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
+                manifest.insert_bytes(&rel_path, &bytes);
+            }
+        }
+        write_manifest_async(commit.storage.as_ref(), job_id, epoch, &manifest).await?;
+
+        write_epoch_hint_async(commit.storage.as_ref(), job_id, epoch).await?;
+
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::CheckpointCommitted {
+                job_id: job_id.to_string(),
+                epoch,
+                fencing_token: metadata.fencing_token,
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
+
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::SinkCommitCompleted {
+                job_id: job_id.to_string(),
+                sink_id: "global".to_string(),
+                epoch,
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
+
+        Ok(epoch)
+    }
+
+    /// Finalize a previously prepared commit: transition state to `Committed`.
+    ///
+    /// Call this under the coordinator write lock **after**
+    /// [`Self::commit_storage`] completes.
+    pub fn finalize_commit(&mut self, epoch: u64) {
+        self.state = CheckpointCoordinatorState::Committed { epoch };
+        self.pending_is_savepoint = false;
+        self.pending_savepoint_label = None;
+        self.awaiting_elapsed_ms = 0;
+        self.pending_commit = None;
     }
 
     /// Commit the current epoch: write metadata + manifest to storage.
@@ -388,127 +581,22 @@ impl CheckpointCoordinator {
     }
 
     /// Async variant of [`Self::commit_epoch`] for Tokio scheduler paths.
+    ///
+    /// Combines extraction, storage I/O, and state finalisation in one call
+    /// for backward compatibility.  New code should prefer the three-phase
+    /// split: [`Self::extract_commit_data`] → [`Self::commit_storage`] →
+    /// [`Self::finalize_commit`].
     pub async fn commit_epoch_async(&mut self) -> CheckpointResult<u64> {
-        let epoch = match &self.state {
-            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
-            _ => {
-                return Err(krishiv_checkpoint::CheckpointError::Storage {
-                    message: format!(
-                        "commit_epoch called but coordinator for job {} is not awaiting acks",
-                        self.job_id
-                    ),
-                });
-            }
-        };
-
-        let mut offset_map: HashMap<String, i64> = HashMap::new();
-        for ack in self.pending_acks.values() {
-            for so in &ack.source_offsets {
-                offset_map.insert(so.partition_id.clone(), so.offset);
-            }
-        }
-        let source_offsets: Vec<SourceOffsetRecord> = offset_map
-            .into_iter()
-            .map(|(partition_id, offset)| SourceOffsetRecord {
-                partition_id,
-                offset,
-            })
-            .collect();
-
-        let operator_snapshots: Vec<OperatorSnapshotRef> = self
-            .pending_acks
-            .values()
-            .filter_map(|ack| {
-                ack.snapshot_path.as_ref().map(|path| OperatorSnapshotRef {
-                    operator_id: ack.operator_id.clone(),
-                    task_id: ack.task_id.as_str().to_owned(),
-                    snapshot_path: path.clone(),
-                })
-            })
-            .collect();
-
-        let is_savepoint = self.pending_is_savepoint;
-        let savepoint_label = self.pending_savepoint_label.take();
-        let metadata = CheckpointMetadata {
-            version: CheckpointMetadata::VERSION,
-            epoch,
-            job_id: self.job_id.as_str().to_owned(),
-            fencing_token: self.fencing_token.as_u64(),
-            coordinator_id: Some(self.coordinator_id.clone()),
-            timestamp_ms: epoch * self.interval_ms,
-            source_offsets,
-            operator_snapshots,
-            is_savepoint,
-            savepoint_label,
-            iceberg_snapshot_id: None,
-            kafka_offsets: None,
-        };
-
-        krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
-            .map_err(|e| krishiv_checkpoint::CheckpointError::Storage {
-                message: format!("fencing token mismatch for job {}: {e}", self.job_id),
-            })?;
-
-        write_epoch_metadata_async(
-            self.storage.as_ref(),
-            self.job_id.as_str(),
-            epoch,
-            &metadata,
-        )
-        .await?;
-
-        let mut manifest = IntegrityManifest::new();
-        let meta_json = serde_json::to_vec_pretty(&metadata).map_err(|e| {
-            krishiv_checkpoint::CheckpointError::Storage {
-                message: format!("metadata serialize for manifest: {e}"),
-            }
+        let commit = self.extract_commit_data().map_err(|e| {
+            krishiv_checkpoint::CheckpointError::Storage { message: e }
         })?;
-        manifest.insert_bytes("metadata.json", &meta_json);
-        for snap_ref in &metadata.operator_snapshots {
-            if let Some(bytes) = read_operator_snapshot_async(
-                self.storage.as_ref(),
-                self.job_id.as_str(),
-                epoch,
-                &snap_ref.operator_id,
-                &snap_ref.task_id,
-            )
-            .await?
-            {
-                let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
-                manifest.insert_bytes(&rel_path, &bytes);
-            }
-        }
-        write_manifest_async(
-            self.storage.as_ref(),
-            self.job_id.as_str(),
-            epoch,
-            &manifest,
-        )
-        .await?;
-        write_epoch_hint_async(self.storage.as_ref(), self.job_id.as_str(), epoch).await?;
+        let epoch = commit.epoch;
 
-        krishiv_governance::audit_log(
-            "scheduler",
-            &krishiv_governance::AuditAction::CheckpointCommitted {
-                job_id: self.job_id.to_string(),
-                epoch,
-                fencing_token: self.fencing_token.as_u64(),
-            },
-            krishiv_governance::AuditOutcome::Allowed,
-        );
-
-        krishiv_governance::audit_log(
-            "scheduler",
-            &krishiv_governance::AuditAction::SinkCommitCompleted {
-                job_id: self.job_id.to_string(),
-                sink_id: "global".to_string(),
-                epoch,
-            },
-            krishiv_governance::AuditOutcome::Allowed,
-        );
+        Self::commit_storage(commit).await?;
 
         self.state = CheckpointCoordinatorState::Committed { epoch };
         self.pending_is_savepoint = false;
+        self.pending_savepoint_label = None;
         self.awaiting_elapsed_ms = 0;
         Ok(epoch)
     }
@@ -516,12 +604,14 @@ impl CheckpointCoordinator {
     /// Abort the current in-progress epoch (timeout or failure).
     pub fn abort_epoch(&mut self, reason: &str) {
         let epoch = match &self.state {
-            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. }
+            | CheckpointCoordinatorState::Committing { epoch } => *epoch,
             _ => return,
         };
         self.pending_acks.clear();
         self.pending_is_savepoint = false;
         self.pending_savepoint_label = None;
+        self.pending_commit = None;
         self.elapsed_ms = 0;
         self.awaiting_elapsed_ms = 0;
         self.state = CheckpointCoordinatorState::Failed {
@@ -721,9 +811,21 @@ mod tests {
         .await
         .unwrap();
 
+        // receive_ack_async transitions to Committing (no I/O under lock).
         let ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
         let done = coord.receive_ack_async(ack).await.unwrap();
         assert!(done, "quorum of 1 should complete immediately");
+        assert_eq!(
+            coord.coordinator_state(),
+            &CheckpointCoordinatorState::Committing { epoch: 1 }
+        );
+
+        // Storage I/O and finalisation happen in separate steps.
+        let commit = coord.take_pending_commit().expect("pending commit");
+        CheckpointCoordinator::commit_storage(commit)
+            .await
+            .unwrap();
+        coord.finalize_commit(1);
 
         let meta =
             krishiv_checkpoint::read_epoch_metadata_async(storage.as_ref(), "job-async-ck", 1)
