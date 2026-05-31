@@ -381,6 +381,33 @@ mod executor_tests {
     }
 
     #[tokio::test]
+    async fn executor_runs_typed_batch_fragment_body() {
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let fragment = krishiv_plan::TypedTaskFragment::new(
+            krishiv_plan::ExecutionKind::Batch,
+            "sql: select 1 as value",
+        )
+        .encode()
+        .unwrap();
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-typed-fragment").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-typed-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(fragment),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        );
+
+        let output = runner.execute_batch_fragment(&assignment).await.unwrap();
+        assert_eq!(output.row_count(), 1);
+        assert_eq!(output.batch_count(), 1);
+    }
+
+    #[tokio::test]
     async fn task_inbox_service_accepts_assignment() {
         let inbox = ExecutorAssignmentInbox::new();
         let service = ExecutorTaskInboxService::new(inbox.clone());
@@ -1755,6 +1782,33 @@ mod executor_tests {
     }
 
     #[tokio::test]
+    async fn executor_runs_typed_streaming_fragment_body() {
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let fragment = krishiv_plan::TypedTaskFragment::new(
+            krishiv_plan::ExecutionKind::Streaming,
+            "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count",
+        )
+        .encode()
+        .unwrap();
+        let assignment = make_streaming_assignment(
+            &fragment,
+            vec![
+                "stream-kafka:events:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1",
+            ],
+        );
+        let output = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.kind(),
+            crate::ExecutorTaskOutputKind::StreamingWindow
+        );
+        assert_eq!(output.row_count(), 2);
+    }
+
+    #[tokio::test]
     async fn streaming_tumbling_window_sum_produces_correct_output() {
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
         let assignment = make_streaming_assignment(
@@ -2104,7 +2158,39 @@ mod executor_tests {
     #[derive(Debug, Default)]
     struct FailingCheckpointStorage;
 
+    #[tonic::async_trait]
     impl CheckpointStorage for FailingCheckpointStorage {
+        async fn write_bytes_async(
+            &self,
+            _path: &str,
+            _data: &[u8],
+        ) -> krishiv_checkpoint::CheckpointResult<()> {
+            Err(krishiv_checkpoint::CheckpointError::Storage {
+                message: "injected write failure".to_string(),
+            })
+        }
+
+        async fn read_bytes_async(
+            &self,
+            _path: &str,
+        ) -> krishiv_checkpoint::CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn list_dir_async(
+            &self,
+            _prefix: &str,
+        ) -> krishiv_checkpoint::CheckpointResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_prefix_async(
+            &self,
+            _prefix: &str,
+        ) -> krishiv_checkpoint::CheckpointResult<()> {
+            Ok(())
+        }
+
         fn write_bytes(
             &self,
             _path: &str,
@@ -2575,24 +2661,12 @@ mod executor_tests {
     async fn stream_loop_emits_window_via_continuous_executor() {
         use std::sync::Arc;
 
-        use arrow::array::{Int64Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-
         // Build an input batch: events at t=100 and t=12_000 ms in a 10s window.
         // With lag=0 the second event advances the watermark past the first window.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "a"])) as _,
-                Arc::new(Int64Array::from(vec![100_i64, 12_000_i64])) as _,
-            ],
-        )
-        .unwrap();
+        let batch = krishiv_common::arrow::make_test_key_ts_batch(
+            vec!["a", "a"],
+            vec![100_i64, 12_000_i64],
+        );
 
         let drainer = OneShotDrainer::new(vec![batch]);
         let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
@@ -2626,34 +2700,11 @@ mod executor_tests {
     async fn stream_loop_reuses_executor_state_across_drains() {
         use std::sync::Arc;
 
-        use arrow::array::{Int64Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-        ]));
-
         // First drain: single event in [0, 10000).  Window not yet emitted.
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["a"])) as _,
-                Arc::new(Int64Array::from(vec![500_i64])) as _,
-            ],
-        )
-        .unwrap();
+        let batch1 = krishiv_common::arrow::make_test_key_ts_batch(vec!["a"], vec![500_i64]);
 
         // Second drain: event that advances watermark past 10000, closing the window.
-        let batch2 = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a"])) as _,
-                Arc::new(Int64Array::from(vec![15_000_i64])) as _,
-            ],
-        )
-        .unwrap();
+        let batch2 = krishiv_common::arrow::make_test_key_ts_batch(vec!["a"], vec![15_000_i64]);
 
         // The runner is CLONED between drains to simulate a re-used runner; its
         // `loop_executors` Arc is shared so state survives.

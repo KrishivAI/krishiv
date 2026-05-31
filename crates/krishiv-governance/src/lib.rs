@@ -259,17 +259,16 @@ const AUDIT_DEDUP_TTL_MS: u64 = 60_000;
 
 /// Compute a stable 64-bit dedup key for an audit event.
 fn audit_dedup_key(principal: &str, action_name: &str, detail: &str) -> u64 {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(principal.as_bytes());
-    h.update(b"\x00");
-    h.update(action_name.as_bytes());
-    h.update(b"\x00");
-    h.update(detail.as_bytes());
-    let digest = h.finalize();
-    // Use the first 8 bytes as a u64 key – collisions are astronomically rare
-    // for the sequential-emission dedup use case.
-    u64::from_le_bytes(digest[..8].try_into().expect("sha256 is at least 8 bytes"))
+    krishiv_common::hash::sha256_dedup_key(
+        &[
+            principal.as_bytes(),
+            b"\x00",
+            action_name.as_bytes(),
+            b"\x00",
+            detail.as_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 /// Install a custom [`AuditSink`] for the lifetime of the process.
@@ -613,43 +612,10 @@ impl OpenLineageEmitter for AsyncHttpEmitter {
     }
 }
 
-/// Return the current UTC time as an RFC 3339 / ISO 8601 string.
-///
-/// Example output: `"2024-05-21T12:34:56.789000000Z"`
 fn event_time_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    let nanos = dur.subsec_nanos();
-    // Manual RFC 3339 formatting without external deps.
-    // secs since epoch → broken-down UTC date/time.
-    let (year, month, day, hour, min, sec) = epoch_secs_to_datetime(secs);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{nanos:09}Z")
-}
-
-/// Decompose Unix epoch seconds into (year, month, day, hour, min, sec) in UTC.
-fn epoch_secs_to_datetime(secs: u64) -> (u64, u8, u8, u8, u8, u8) {
-    let time_of_day = secs % 86_400;
-    let days_since_epoch = secs / 86_400;
-    let hour = (time_of_day / 3_600) as u8;
-    let min = ((time_of_day % 3_600) / 60) as u8;
-    let sec = (time_of_day % 60) as u8;
-
-    // Gregorian calendar computation from days since 1970-01-01.
-    // Algorithm: http://howardhinnant.github.io/date_algorithms.html#civil_from_days
-    let z = days_since_epoch as i64 + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
-    let year = if month <= 2 { y + 1 } else { y } as u64;
-    (year, month, day, hour, min, sec)
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S.%9fZ")
+        .to_string()
 }
 
 /// **Beta API**: Build a new [`RunEvent`] with the current UTC timestamp and a fresh UUID run_id.

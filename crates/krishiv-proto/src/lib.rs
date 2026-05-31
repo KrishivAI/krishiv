@@ -2,6 +2,19 @@
 
 //! Public facade for `krishiv-proto`.
 
+macro_rules! impl_with_version {
+    ($name:ty) => {
+        impl $name {
+            /// Override transport version.
+            #[must_use]
+            pub fn with_version(mut self, version: $crate::TransportVersion) -> Self {
+                self.version = version;
+                self
+            }
+        }
+    };
+}
+
 pub mod checkpoint;
 pub mod executor;
 pub mod ids;

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use krishiv_exec::ContinuousWindowExecutor;
 
+use crate::fragment::common::task_fragment_body;
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_exec::execute_bounded_window;
@@ -274,7 +275,8 @@ pub(crate) async fn execute_streaming_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    let fragment = assignment.plan_fragment().description().trim();
+    let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    let fragment = fragment_body.as_str();
 
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.

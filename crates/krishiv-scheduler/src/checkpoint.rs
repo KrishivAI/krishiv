@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointResult, CheckpointStorage, IntegrityManifest,
-    OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, list_valid_epochs,
-    read_epoch_metadata, read_operator_snapshot, write_epoch_hint, write_epoch_metadata,
-    write_manifest,
+    OperatorSnapshotRef, SourceOffsetRecord, latest_valid_epoch, latest_valid_epoch_async,
+    list_valid_epochs, read_epoch_metadata, read_epoch_metadata_async, read_operator_snapshot,
+    read_operator_snapshot_async, write_epoch_hint, write_epoch_hint_async, write_epoch_metadata,
+    write_epoch_metadata_async, write_manifest, write_manifest_async,
 };
 use krishiv_proto::{CheckpointAckRequest, FencingToken, JobId};
 
@@ -128,7 +129,7 @@ impl CheckpointCoordinator {
         self.pending_acks.clear();
         // Use real wall-clock time (not a deterministic counter) for initiated_at_ms
         // so observability tooling can compute accurate checkpoint latencies.
-        let initiated_at_ms = u64::try_from(krishiv_async_util::unix_now_ms()).unwrap_or(0);
+        let initiated_at_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
         self.state = CheckpointCoordinatorState::AwaitingAcks {
             epoch: self.current_epoch,
             initiated_at_ms,
@@ -209,6 +210,40 @@ impl CheckpointCoordinator {
         self.pending_acks.insert(key, ack);
         if self.pending_acks.len() >= self.expected_task_count {
             self.commit_epoch().map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Async variant of [`Self::receive_ack`].
+    pub async fn receive_ack_async(&mut self, ack: CheckpointAckRequest) -> Result<bool, String> {
+        let current_epoch = match &self.state {
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            _ => {
+                return Err(format!(
+                    "checkpoint coordinator for job {} is not awaiting acks",
+                    self.job_id
+                ));
+            }
+        };
+        if ack.epoch != current_epoch {
+            return Err(format!(
+                "stale checkpoint ack for job {}: expected epoch {current_epoch}, got epoch {}",
+                self.job_id, ack.epoch
+            ));
+        }
+        if ack.fencing_token != self.fencing_token {
+            return Err(format!(
+                "stale fencing token in ack for job {}: expected {}, got {}",
+                self.job_id,
+                self.fencing_token.as_u64(),
+                ack.fencing_token.as_u64()
+            ));
+        }
+        let key = ack.task_id.as_str().to_owned();
+        self.pending_acks.insert(key, ack);
+        if self.pending_acks.len() >= self.expected_task_count {
+            self.commit_epoch_async().await.map_err(|e| e.to_string())?;
             return Ok(true);
         }
         Ok(false)
@@ -352,6 +387,132 @@ impl CheckpointCoordinator {
         Ok(epoch)
     }
 
+    /// Async variant of [`Self::commit_epoch`] for Tokio scheduler paths.
+    pub async fn commit_epoch_async(&mut self) -> CheckpointResult<u64> {
+        let epoch = match &self.state {
+            CheckpointCoordinatorState::AwaitingAcks { epoch, .. } => *epoch,
+            _ => {
+                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                    message: format!(
+                        "commit_epoch called but coordinator for job {} is not awaiting acks",
+                        self.job_id
+                    ),
+                });
+            }
+        };
+
+        let mut offset_map: HashMap<String, i64> = HashMap::new();
+        for ack in self.pending_acks.values() {
+            for so in &ack.source_offsets {
+                offset_map.insert(so.partition_id.clone(), so.offset);
+            }
+        }
+        let source_offsets: Vec<SourceOffsetRecord> = offset_map
+            .into_iter()
+            .map(|(partition_id, offset)| SourceOffsetRecord {
+                partition_id,
+                offset,
+            })
+            .collect();
+
+        let operator_snapshots: Vec<OperatorSnapshotRef> = self
+            .pending_acks
+            .values()
+            .filter_map(|ack| {
+                ack.snapshot_path.as_ref().map(|path| OperatorSnapshotRef {
+                    operator_id: ack.operator_id.clone(),
+                    task_id: ack.task_id.as_str().to_owned(),
+                    snapshot_path: path.clone(),
+                })
+            })
+            .collect();
+
+        let is_savepoint = self.pending_is_savepoint;
+        let savepoint_label = self.pending_savepoint_label.take();
+        let metadata = CheckpointMetadata {
+            version: CheckpointMetadata::VERSION,
+            epoch,
+            job_id: self.job_id.as_str().to_owned(),
+            fencing_token: self.fencing_token.as_u64(),
+            coordinator_id: Some(self.coordinator_id.clone()),
+            timestamp_ms: epoch * self.interval_ms,
+            source_offsets,
+            operator_snapshots,
+            is_savepoint,
+            savepoint_label,
+            iceberg_snapshot_id: None,
+            kafka_offsets: None,
+        };
+
+        krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
+            .map_err(|e| krishiv_checkpoint::CheckpointError::Storage {
+                message: format!("fencing token mismatch for job {}: {e}", self.job_id),
+            })?;
+
+        write_epoch_metadata_async(
+            self.storage.as_ref(),
+            self.job_id.as_str(),
+            epoch,
+            &metadata,
+        )
+        .await?;
+
+        let mut manifest = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(&metadata).map_err(|e| {
+            krishiv_checkpoint::CheckpointError::Storage {
+                message: format!("metadata serialize for manifest: {e}"),
+            }
+        })?;
+        manifest.insert_bytes("metadata.json", &meta_json);
+        for snap_ref in &metadata.operator_snapshots {
+            if let Some(bytes) = read_operator_snapshot_async(
+                self.storage.as_ref(),
+                self.job_id.as_str(),
+                epoch,
+                &snap_ref.operator_id,
+                &snap_ref.task_id,
+            )
+            .await?
+            {
+                let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
+                manifest.insert_bytes(&rel_path, &bytes);
+            }
+        }
+        write_manifest_async(
+            self.storage.as_ref(),
+            self.job_id.as_str(),
+            epoch,
+            &manifest,
+        )
+        .await?;
+        write_epoch_hint_async(self.storage.as_ref(), self.job_id.as_str(), epoch).await?;
+
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::CheckpointCommitted {
+                job_id: self.job_id.to_string(),
+                epoch,
+                fencing_token: self.fencing_token.as_u64(),
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
+
+        krishiv_governance::audit_log(
+            "scheduler",
+            &krishiv_governance::AuditAction::SinkCommitCompleted {
+                job_id: self.job_id.to_string(),
+                sink_id: "global".to_string(),
+                epoch,
+            },
+            krishiv_governance::AuditOutcome::Allowed,
+        );
+
+        self.state = CheckpointCoordinatorState::Committed { epoch };
+        self.pending_is_savepoint = false;
+        self.awaiting_elapsed_ms = 0;
+        Ok(epoch)
+    }
+
     /// Abort the current in-progress epoch (timeout or failure).
     pub fn abort_epoch(&mut self, reason: &str) {
         let epoch = match &self.state {
@@ -385,6 +546,26 @@ impl CheckpointCoordinator {
             Ok(epoch) => {
                 if let Some(meta) =
                     read_epoch_metadata(self.storage.as_ref(), self.job_id.as_str(), epoch)?
+                {
+                    self.fencing_token =
+                        FencingToken::try_new(meta.fencing_token).unwrap_or(self.fencing_token);
+                }
+                self.current_epoch = epoch;
+                self.state = CheckpointCoordinatorState::Committed { epoch };
+                Ok(Some(epoch))
+            }
+            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Async variant of [`Self::recover_from_storage`].
+    pub async fn recover_from_storage_async(&mut self) -> CheckpointResult<Option<u64>> {
+        match latest_valid_epoch_async(self.storage.as_ref(), self.job_id.as_str()).await {
+            Ok(epoch) => {
+                if let Some(meta) =
+                    read_epoch_metadata_async(self.storage.as_ref(), self.job_id.as_str(), epoch)
+                        .await?
                 {
                     self.fencing_token =
                         FencingToken::try_new(meta.fencing_token).unwrap_or(self.fencing_token);
@@ -433,7 +614,7 @@ mod tests {
         CheckpointAckRequest, CheckpointSourceOffset, FencingToken, JobId, TaskId,
     };
 
-    use super::CheckpointCoordinator;
+    use super::{CheckpointCoordinator, CheckpointCoordinatorState};
 
     fn make_ack(
         job_id: &JobId,
@@ -517,6 +698,42 @@ mod tests {
             meta.unwrap().fencing_token,
             2,
             "committed token must match coordinator token"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_receive_ack_commits_epoch_without_blocking_wrapper() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-async-ck").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+
+        assert_eq!(coord.initiate().unwrap(), 1);
+        krishiv_checkpoint::write_operator_snapshot_async(
+            storage.as_ref(),
+            "job-async-ck",
+            1,
+            "op-task-1",
+            "task-1",
+            b"state",
+        )
+        .await
+        .unwrap();
+
+        let ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
+        let done = coord.receive_ack_async(ack).await.unwrap();
+        assert!(done, "quorum of 1 should complete immediately");
+
+        let meta =
+            krishiv_checkpoint::read_epoch_metadata_async(storage.as_ref(), "job-async-ck", 1)
+                .await
+                .unwrap()
+                .expect("metadata");
+        assert_eq!(meta.epoch, 1);
+        assert_eq!(
+            coord.coordinator_state(),
+            &CheckpointCoordinatorState::Committed { epoch: 1 }
         );
     }
 

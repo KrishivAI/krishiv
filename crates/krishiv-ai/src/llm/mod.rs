@@ -4,8 +4,6 @@ mod rate_limit;
 pub use openai::OpenAiLlmUdf;
 pub use rate_limit::LlmRateLimiter;
 
-use std::fmt;
-
 use async_trait::async_trait;
 
 /// LLM UDF configuration.
@@ -43,24 +41,15 @@ pub struct LlmResponse {
 }
 
 /// LLM errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LlmError {
+    #[error("llm http error: {0}")]
     Http(String),
+    #[error("llm rate limit: {0}")]
     RateLimit(String),
+    #[error("llm parse error: {0}")]
     Parse(String),
 }
-
-impl fmt::Display for LlmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(m) => write!(f, "llm http error: {m}"),
-            Self::RateLimit(m) => write!(f, "llm rate limit: {m}"),
-            Self::Parse(m) => write!(f, "llm parse error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for LlmError {}
 
 /// LLM UDF trait.
 #[async_trait]

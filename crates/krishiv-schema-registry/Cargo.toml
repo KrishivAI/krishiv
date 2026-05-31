@@ -9,6 +9,7 @@ license.workspace = true
 apache-avro = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 dashmap = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }

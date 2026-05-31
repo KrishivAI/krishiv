@@ -12,7 +12,7 @@ use krishiv_sql::SqlEngine;
 use super::common::{
     parse_local_parquet_partitions, read_connector_parquet_partitions,
     read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
-    write_object_parquet_sink,
+    task_fragment_body, write_object_parquet_sink,
 };
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
@@ -28,7 +28,8 @@ pub(crate) async fn execute_batch_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    let fragment = assignment.plan_fragment().description().trim();
+    let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    let fragment = fragment_body.as_str();
     if fragment.is_empty() {
         return Err(ExecutorError::InvalidAssignment {
             message: String::from("plan fragment description cannot be empty"),
@@ -366,9 +367,8 @@ async fn execute_inmem_shuffle_write(
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
-    let batches = if let Some(query) =
-        sql_query_from_fragment(assignment.plan_fragment().description().trim())
-    {
+    let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
             engine
                 .register_parquet(partition.table_name(), partition.path())

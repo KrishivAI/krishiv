@@ -38,6 +38,7 @@ pub mod tags {
     pub const CONTINUOUS_DRAIN: &str = "continuous.drain";
     pub const BOUNDED_WINDOW: &str = "bounded_window";
     pub const EXPLAIN: &str = "explain";
+    pub const EXECUTE_PLAN: &str = "execute_plan";
 }
 
 /// Build a stable action type for a tag — `format!("krishiv.v1.{tag}")`.
@@ -90,6 +91,30 @@ pub struct ExplainBody {
     pub sql: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutePlanBody {
+    pub name: String,
+    pub execution_kind: String,
+    pub plan_json: String,
+}
+
+impl ExecutePlanBody {
+    pub fn from_plan(plan: &krishiv_plan::PhysicalPlan) -> RuntimeResult<Self> {
+        let plan_json = serde_json::to_string(plan)
+            .map_err(|e| RuntimeError::transport(format!("plan serialize: {e}")))?;
+        Ok(Self {
+            name: plan.name().to_string(),
+            execution_kind: plan.kind().to_string(),
+            plan_json,
+        })
+    }
+
+    pub fn to_plan(&self) -> RuntimeResult<krishiv_plan::PhysicalPlan> {
+        serde_json::from_str(&self.plan_json)
+            .map_err(|e| RuntimeError::transport(format!("plan deserialize: {e}")))
+    }
+}
+
 /// Typed Flight `DoAction` payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind")]
@@ -100,6 +125,7 @@ pub enum KrishivFlightAction {
     ContinuousDrain(ContinuousDrainBody),
     BoundedWindow(BoundedWindowBody),
     Explain(ExplainBody),
+    ExecutePlan(ExecutePlanBody),
 }
 
 impl KrishivFlightAction {
@@ -112,6 +138,7 @@ impl KrishivFlightAction {
             Self::ContinuousDrain(_) => tags::CONTINUOUS_DRAIN,
             Self::BoundedWindow(_) => tags::BOUNDED_WINDOW,
             Self::Explain(_) => tags::EXPLAIN,
+            Self::ExecutePlan(_) => tags::EXECUTE_PLAN,
         };
         action_type(tag)
     }
@@ -272,6 +299,25 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_execute_plan() {
+        use krishiv_plan::ExecutionKind;
+        let plan = krishiv_plan::PhysicalPlan::new("my-batch-job", ExecutionKind::Batch);
+        let action = KrishivFlightAction::ExecutePlan(ExecutePlanBody::from_plan(&plan).unwrap());
+        let bytes = action.to_action_body().unwrap();
+        let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
+        match decoded {
+            KrishivFlightAction::ExecutePlan(body) => {
+                assert_eq!(body.name, "my-batch-job");
+                assert_eq!(body.execution_kind, "batch");
+                let recovered = body.to_plan().unwrap();
+                assert_eq!(recovered.name(), "my-batch-job");
+                assert_eq!(recovered.kind(), ExecutionKind::Batch);
+            }
+            other => panic!("expected ExecutePlan, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn round_trip_explain() {
         let action = KrishivFlightAction::Explain(ExplainBody {
             sql: "SELECT 1".into(),
@@ -294,6 +340,13 @@ mod tests {
 
     #[test]
     fn action_types_for_all_variants() {
+        let exec_plan = KrishivFlightAction::ExecutePlan(ExecutePlanBody {
+            name: "job".into(),
+            execution_kind: "batch".into(),
+            plan_json: "{}".into(),
+        });
+        assert_eq!(exec_plan.action_type(), "krishiv.v1.execute_plan");
+
         let register = KrishivFlightAction::RegisterParquet(RegisterParquetBody {
             table: "t".into(),
             path: PathBuf::from("/t.parquet"),
@@ -545,6 +598,11 @@ mod tests {
             }),
             KrishivFlightAction::Explain(ExplainBody {
                 sql: "SELECT 1".into(),
+            }),
+            KrishivFlightAction::ExecutePlan(ExecutePlanBody {
+                name: "j".into(),
+                execution_kind: "batch".into(),
+                plan_json: "{}".into(),
             }),
         ];
         for v in variants {

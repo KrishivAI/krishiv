@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -20,26 +19,17 @@ pub struct ModelKey {
 }
 
 /// Embedding errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
+    #[error("embedding load error: {0}")]
     Load(String),
+    #[error("embedding inference error: {0}")]
     Inference(String),
+    #[error("embedding rate limit: {0}")]
     RateLimit(String),
+    #[error("embedding http error: {0}")]
     Http(String),
 }
-
-impl fmt::Display for EmbeddingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Load(m) => write!(f, "embedding load error: {m}"),
-            Self::Inference(m) => write!(f, "embedding inference error: {m}"),
-            Self::RateLimit(m) => write!(f, "embedding rate limit: {m}"),
-            Self::Http(m) => write!(f, "embedding http error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for EmbeddingError {}
 
 /// Embedding model contract.
 #[async_trait]

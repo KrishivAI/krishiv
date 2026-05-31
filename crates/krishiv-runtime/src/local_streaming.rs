@@ -40,6 +40,21 @@ impl LocalWindowExecutionSpec {
         }]
     }
 
+    /// Create a standard tumbling window spec with count aggregation for tests.
+    pub fn new_test_tumbling(key_col: &str, ts_col: &str, window_size_ms: u64) -> Self {
+        Self {
+            key_column: key_col.to_owned(),
+            event_time_column: ts_col.to_owned(),
+            watermark_lag_ms: 0,
+            window_kind: LocalWindowKind::Tumbling,
+            window_size_ms,
+            agg_exprs: Self::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        }
+    }
+
     pub fn to_plan_spec(&self) -> WindowExecutionSpec {
         local_spec_to_plan_spec(self)
     }

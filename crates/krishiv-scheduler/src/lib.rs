@@ -23,13 +23,13 @@ pub mod metrics;
 
 pub mod barrier_client;
 pub mod barrier_dispatch;
-pub(crate) mod coordinator_sharded;
 pub mod barrier_tracker;
 pub mod batch_sql;
 pub mod batch_sql_http;
 pub mod checkpoint;
 pub mod cluster_control;
 pub mod coordinator_daemon;
+pub mod coordinator_sharded;
 pub mod federation_http;
 pub mod heartbeat;
 pub mod in_process;

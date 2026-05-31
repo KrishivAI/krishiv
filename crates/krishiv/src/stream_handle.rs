@@ -58,7 +58,7 @@ impl StreamHandle {
         if self.job_id == "completed" {
             return Ok(vec![]);
         }
-        krishiv_async_util::block_on(self.session.poll_stream_job(&self.job_id))
+        krishiv_common::async_util::block_on(self.session.poll_stream_job(&self.job_id))
     }
 
     /// Expose the cancel flag `Arc` so it can be shared with background threads.

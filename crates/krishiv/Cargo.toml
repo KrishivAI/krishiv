@@ -34,7 +34,7 @@ iceberg = ["krishiv-lakehouse/iceberg"]
 delta = ["krishiv-lakehouse/delta"]
 
 [dependencies]
-krishiv-async-util = { path = "../krishiv-async-util" }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-api = { path = "../krishiv-api" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
@@ -50,6 +50,7 @@ krishiv-shuffle = { path = "../krishiv-shuffle", optional = true }
 krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
 dotenvy = "0.15"
+libc = "0.2"
 tokio = { workspace = true }
 tonic = { workspace = true }
 serde = { workspace = true }

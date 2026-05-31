@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use krishiv_vector_sinks::{EmbeddingBatch, PayloadValue, VectorSink};
-use sha2::{Digest, Sha256};
 
 use crate::chunk::{Chunk, TextChunker};
 use crate::embed::EmbeddingModel;
@@ -149,9 +148,7 @@ impl RagQuery {
 }
 
 fn content_hash(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    hex::encode(hasher.finalize())
+    krishiv_common::hash::sha256_hex(text.as_bytes())
 }
 
 #[cfg(all(test, feature = "fastembed-local"))]

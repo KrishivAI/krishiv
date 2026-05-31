@@ -40,11 +40,41 @@ fn ui_url_from_http_addr(addr: &str) -> String {
     format!("http://{addr}/ui")
 }
 
+fn get_free_port(start: u16) -> Option<u16> {
+    use std::net::TcpListener;
+    for port in start..65535 {
+        if TcpListener::bind(format!("127.0.0.1:{port}")).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
 fn select_local_http_addr(preferred: Option<&str>) -> Result<String, String> {
     if let Some(addr) = preferred {
         return Ok(addr.to_string());
     }
-    Ok(DEFAULT_HTTP_ADDR.to_string())
+    let port = get_free_port(18080).ok_or_else(|| String::from("failed to find free HTTP port"))?;
+    Ok(format!("127.0.0.1:{port}"))
+}
+
+fn kill_pid_or_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-15")
+            .arg(format!("-{pid}"))
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pid}"))
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
 }
 
 impl LocalClusterConfig {
@@ -173,7 +203,11 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     fs::create_dir_all(&data_dir).ok();
 
     let meta_path = data_dir.join("coordinator-meta.json");
-    let grpc_addr = "127.0.0.1:9090";
+    let free_grpc_port = match get_free_port(9090) {
+        Some(port) => port,
+        None => return CliResponse::err(String::from("failed to find free gRPC port\n"), 1),
+    };
+    let grpc_addr = format!("127.0.0.1:{free_grpc_port}");
     let http_addr = match select_local_http_addr(requested_http_addr.as_deref()) {
         Ok(addr) => addr,
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
@@ -184,7 +218,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
         "coordinator",
         &[
             "--grpc-addr",
-            grpc_addr,
+            &grpc_addr,
             "--http-addr",
             &http_addr,
             "--metadata-backend",
@@ -208,19 +242,25 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let coordinator_http = format!("http://{http_addr}");
+    let free_flight_port = match get_free_port(50051) {
+        Some(port) => port,
+        None => {
+            kill_pid_or_group(coordinator_pid);
+            return CliResponse::err(String::from("failed to find free Flight SQL port\n"), 1);
+        }
+    };
+    let flight_addr = format!("127.0.0.1:{free_flight_port}");
     let flight_pid = match spawn_krishiv_daemon_with_env(
         "flight-server",
         &[],
         &[
-            ("KRISHIV_FLIGHT_ADDR", "127.0.0.1:50051"),
+            ("KRISHIV_FLIGHT_ADDR", flight_addr.as_str()),
             ("KRISHIV_COORDINATOR_HTTP", coordinator_http.as_str()),
         ],
     ) {
         Ok(pid) => pid,
         Err(e) => {
-            let _ = Command::new("kill")
-                .arg(coordinator_pid.to_string())
-                .status();
+            kill_pid_or_group(coordinator_pid);
             return CliResponse::err(
                 format!(
                     "failed to spawn krishiv flight-server: {e}\n\
@@ -245,10 +285,8 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     ) {
         Ok(pid) => pid,
         Err(err) => {
-            let _ = Command::new("kill")
-                .arg(coordinator_pid.to_string())
-                .status();
-            let _ = Command::new("kill").arg(flight_pid.to_string()).status();
+            kill_pid_or_group(coordinator_pid);
+            kill_pid_or_group(flight_pid);
             return CliResponse::err(
                 format!(
                     "failed to spawn krishiv executor: {err}\n\
@@ -262,7 +300,7 @@ fn run_local_start(args: &[&str]) -> CliResponse {
     let config = LocalClusterConfig {
         coordinator_grpc: format!("http://{grpc_addr}"),
         coordinator_http: format!("http://{}", http_addr),
-        coordinator_flight: String::from("http://127.0.0.1:50051"),
+        coordinator_flight: format!("http://{flight_addr}"),
         ui_url: ui_url_from_http_addr(&http_addr),
         executor_id: String::from("local-exec-1"),
         data_dir: data_dir.clone(),
@@ -303,16 +341,16 @@ fn run_local_stop(args: &[&str]) -> CliResponse {
         Err(e) => return CliResponse::err(format!("{e}\n"), 1),
     };
     if let Some(pid) = config.flight_pid {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        kill_pid_or_group(pid);
     }
     if let Some(pid) = config.ui_pid {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        kill_pid_or_group(pid);
     }
     if let Some(pid) = config.executor_pid {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        kill_pid_or_group(pid);
     }
     if let Some(pid) = config.coordinator_pid {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        kill_pid_or_group(pid);
     }
     let _ = fs::remove_file(LocalClusterConfig::path(&data_dir));
     CliResponse::ok("Stopped local Krishiv cluster.\n".to_string())

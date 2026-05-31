@@ -31,12 +31,7 @@ pub fn memo_cache_info() -> MemoCacheInfo {
 }
 
 pub fn compute_memo_key(source: &[u8], schema_json: &str, ipc: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(source);
-    hasher.update(schema_json.as_bytes());
-    hasher.update(ipc);
-    hasher.finalize().into()
+    krishiv_common::hash::sha256_bytes_multi(&[source, schema_json.as_bytes(), ipc])
 }
 
 pub fn memo_lookup_or_store(key: [u8; 32], batch: RecordBatch) -> Result<RecordBatch, String> {

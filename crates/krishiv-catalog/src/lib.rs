@@ -19,43 +19,24 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 
 /// Errors produced by catalog operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     /// A requested table was not found in the catalog.
+    #[error("table not found: '{name}'")]
     TableNotFound { name: String },
     /// Table already exists and `if_not_exists` was false.
+    #[error("table already exists: '{name}'")]
     TableAlreadyExists { name: String },
     /// A requested schema was not found.
+    #[error("schema not found: '{name}'")]
     SchemaNotFound { name: String },
     /// The provided schema is structurally invalid.
+    #[error("invalid schema: {message}")]
     InvalidSchema { message: String },
     /// An HTTP request to a remote catalog service failed.
+    #[error("HTTP error {status}: {message}")]
     Http { status: u16, message: String },
 }
-
-impl fmt::Display for CatalogError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CatalogError::TableNotFound { name } => {
-                write!(f, "table not found: '{name}'")
-            }
-            CatalogError::TableAlreadyExists { name } => {
-                write!(f, "table already exists: '{name}'")
-            }
-            CatalogError::SchemaNotFound { name } => {
-                write!(f, "schema not found: '{name}'")
-            }
-            CatalogError::InvalidSchema { message } => {
-                write!(f, "invalid schema: {message}")
-            }
-            CatalogError::Http { status, message } => {
-                write!(f, "HTTP error {status}: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CatalogError {}
 
 /// Convenience result alias for catalog operations.
 pub type CatalogResult<T> = Result<T, CatalogError>;

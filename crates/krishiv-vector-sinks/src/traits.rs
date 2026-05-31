@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt;
 
 use async_trait::async_trait;
 
@@ -43,54 +42,29 @@ pub struct ScoredChunk {
 }
 
 /// Errors from vector sink operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum VectorSinkError {
+    #[error("vector sink connection error: {0}")]
     Connection(String),
+    #[error("vector sink upsert error: {0}")]
     Upsert(String),
+    #[error("vector sink schema conflict: {0}")]
     SchemaConflict(String),
+    #[error("vector sink rate limit: {0}")]
     RateLimit(String),
+    #[error("vector sink timeout: {0}")]
     Timeout(String),
+    #[error("vector sink query error: {0}")]
     Query(String),
 }
-
-impl fmt::Display for VectorSinkError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Connection(m) => write!(f, "vector sink connection error: {m}"),
-            Self::Upsert(m) => write!(f, "vector sink upsert error: {m}"),
-            Self::SchemaConflict(m) => write!(f, "vector sink schema conflict: {m}"),
-            Self::RateLimit(m) => write!(f, "vector sink rate limit: {m}"),
-            Self::Timeout(m) => write!(f, "vector sink timeout: {m}"),
-            Self::Query(m) => write!(f, "vector sink query error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for VectorSinkError {}
 
 pub type VectorSinkResult<T> = Result<T, VectorSinkError>;
 
 /// Validates a SQL/GraphQL identifier (table name, class name, etc.) to prevent injection.
 /// Allowed: ^[A-Za-z_][A-Za-z0-9_]*$ (per S2 in crate-stability-resolution-plan).
 pub fn validate_identifier(name: &str) -> VectorSinkResult<()> {
-    if name.is_empty() {
-        return Err(VectorSinkError::Connection(
-            "identifier cannot be empty".into(),
-        ));
-    }
-    let mut chars = name.chars();
-    let first = chars.next().unwrap();
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(VectorSinkError::Connection(format!(
-            "invalid identifier (must start with letter or _): {name}"
-        )));
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(VectorSinkError::Connection(format!(
-            "invalid identifier (only alphanumeric + _ allowed): {name}"
-        )));
-    }
-    Ok(())
+    krishiv_common::validate::validate_sql_identifier(name)
+        .map_err(|e| VectorSinkError::Connection(e.message))
 }
 
 /// Vector store sink contract (ADR-R17.3 idempotent upsert).

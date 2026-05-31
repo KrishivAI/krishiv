@@ -4,8 +4,6 @@
 //! This crate provides snapshot reads, schema evolution support, and optimistic
 //! concurrency control for multi-writer Iceberg table access.
 
-use std::fmt;
-
 use arrow::record_batch::RecordBatch;
 
 mod as_of;
@@ -43,37 +41,24 @@ pub use two_phase::{
 // ---------------------------------------------------------------------------
 
 #[doc = "**Beta API**: may change between minor releases."]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LakehouseError {
     #[doc = "**Beta API**: may change between minor releases."]
+    #[error("Iceberg error: {0}")]
     Iceberg(String),
     #[doc = "**Beta API**: may change between minor releases."]
+    #[error("Table not found: {table}")]
     NotFound { table: String },
     #[doc = "**Beta API**: may change between minor releases."]
+    #[error("Schema conflict: {message}")]
     SchemaConflict { message: String },
     #[doc = "**Beta API**: may change between minor releases."]
+    #[error("I/O error: {0}")]
     Io(String),
     #[doc = "**Beta API**: may change between minor releases."]
+    #[error("Concurrency conflict: {message}")]
     Concurrency { message: String },
 }
-
-impl fmt::Display for LakehouseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LakehouseError::Iceberg(msg) => write!(f, "Iceberg error: {msg}"),
-            LakehouseError::NotFound { table } => write!(f, "Table not found: {table}"),
-            LakehouseError::SchemaConflict { message } => {
-                write!(f, "Schema conflict: {message}")
-            }
-            LakehouseError::Io(msg) => write!(f, "I/O error: {msg}"),
-            LakehouseError::Concurrency { message } => {
-                write!(f, "Concurrency conflict: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LakehouseError {}
 
 /// Convenience result alias for lakehouse operations.
 pub type LakehouseResult<T> = Result<T, LakehouseError>;

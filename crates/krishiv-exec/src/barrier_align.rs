@@ -4,35 +4,21 @@ use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Errors from barrier alignment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BarrierAlignError {
     /// Input count must be greater than zero.
+    #[error("input_count must be greater than zero")]
     ZeroInputCount,
     /// Barrier alignment timed out.
+    #[error(
+        "checkpoint alignment timeout for epoch {epoch}: received barriers on {waited_inputs}/{expected_inputs} inputs"
+    )]
     CheckpointAlignmentTimeout {
         epoch: u64,
         waited_inputs: usize,
         expected_inputs: usize,
     },
 }
-
-impl std::fmt::Display for BarrierAlignError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroInputCount => write!(f, "input_count must be greater than zero"),
-            Self::CheckpointAlignmentTimeout {
-                epoch,
-                waited_inputs,
-                expected_inputs,
-            } => write!(
-                f,
-                "checkpoint alignment timeout for epoch {epoch}: received barriers on {waited_inputs}/{expected_inputs} inputs",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BarrierAlignError {}
 
 /// Error when barrier alignment times out (backward-compat alias).
 pub type CheckpointAlignmentTimeout = BarrierAlignError;

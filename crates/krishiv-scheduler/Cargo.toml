@@ -10,13 +10,14 @@ sqlite = ["dep:rusqlite"]
 etcd = ["dep:etcd-client"]
 
 [dependencies]
+krishiv-common = { path = "../krishiv-common" }
 arrow = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
-krishiv-async-util = { path = "../krishiv-async-util" }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-optimizer = { path = "../krishiv-optimizer" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-shuffle = { path = "../krishiv-shuffle" }
@@ -32,7 +33,7 @@ tracing.workspace = true
 async-trait.workspace = true
 dashmap = { workspace = true }
 etcd-client = { version = "0.14", optional = true }
-thiserror = "1"
+thiserror = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }

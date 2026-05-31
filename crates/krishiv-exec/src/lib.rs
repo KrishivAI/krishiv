@@ -76,38 +76,25 @@ pub fn lower_to_physical(logical: &LogicalPlan) -> PhysicalPlan {
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
-use std::fmt;
-
 /// Errors that can occur during physical execution.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     /// An Arrow error occurred.
+    #[error("arrow error: {0}")]
     Arrow(String),
     /// A required column was not found in the schema.
+    #[error("column not found: {0}")]
     ColumnNotFound(String),
     /// A data type is not supported for this operation.
+    #[error("unsupported type: {0}")]
     UnsupportedType(String),
     /// A window operator was constructed with an invalid configuration.
+    #[error("invalid window config: {0}")]
     InvalidWindowConfig(String),
     /// Incoming batch schema cannot be evolved to the target schema.
+    #[error("incompatible schema evolution: {0}")]
     IncompatibleSchemaEvolution(String),
 }
-
-impl fmt::Display for ExecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Arrow(msg) => write!(f, "arrow error: {msg}"),
-            Self::ColumnNotFound(col) => write!(f, "column not found: {col}"),
-            Self::UnsupportedType(msg) => write!(f, "unsupported type: {msg}"),
-            Self::InvalidWindowConfig(msg) => write!(f, "invalid window config: {msg}"),
-            Self::IncompatibleSchemaEvolution(msg) => {
-                write!(f, "incompatible schema evolution: {msg}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExecError {}
 
 impl From<arrow::error::ArrowError> for ExecError {
     fn from(e: arrow::error::ArrowError) -> Self {
@@ -1178,7 +1165,7 @@ mod tests {
         // Send one data item.
         tx.send_data(batch.clone()).await.unwrap();
         // Then inject a barrier (unbounded, bypass backpressure).
-        tx.send_barrier(7).unwrap();
+        tx.send_barrier(7).await.unwrap();
 
         // First receive must be the barrier (barrier_rx is drained first).
         let first = rx.recv().await.unwrap();
@@ -1211,7 +1198,7 @@ mod tests {
         let (tx, mut rx) = operator_queue(8);
 
         // Inject a barrier while the data channel is empty.
-        tx.send_barrier(42).unwrap();
+        tx.send_barrier(42).await.unwrap();
 
         // First recv must be the barrier.
         let first = rx.recv().await.unwrap();
@@ -1228,7 +1215,7 @@ mod tests {
         )
         .unwrap();
         tx.send_data(batch).await.unwrap();
-        tx.send_barrier(99).unwrap();
+        tx.send_barrier(99).await.unwrap();
 
         // The barrier channel is drained before data, so we get the barrier first.
         let second = rx.recv().await.unwrap();

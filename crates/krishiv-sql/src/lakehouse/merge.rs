@@ -1,6 +1,5 @@
 //! MERGE INTO dispatch (R18 S5, ADR-18.2).
 
-use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
@@ -34,22 +33,11 @@ pub struct MergeResult {
 }
 
 /// Target table format is not Delta or Iceberg.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MERGE INTO is only supported for delta: and iceberg: targets (got {target})")]
 pub struct MergeTargetUnsupportedError {
     pub target: String,
 }
-
-impl fmt::Display for MergeTargetUnsupportedError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "MERGE INTO is only supported for delta: and iceberg: targets (got {})",
-            self.target
-        )
-    }
-}
-
-impl std::error::Error for MergeTargetUnsupportedError {}
 
 /// Parse and execute a MERGE INTO statement when matched.
 pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec<RecordBatch>> {

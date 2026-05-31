@@ -1,11 +1,8 @@
-use sha2::{Digest, Sha256};
+use krishiv_common::hash::sha256_bytes_multi;
 
 /// Deterministic point id per ADR-R17.3: SHA-256(doc_id || epoch), truncated to u64.
 pub fn point_id_from_doc_epoch(doc_id: &str, epoch: u64) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(doc_id.as_bytes());
-    hasher.update(epoch.to_le_bytes());
-    let digest = hasher.finalize();
+    let digest = sha256_bytes_multi(&[doc_id.as_bytes(), &epoch.to_le_bytes()]);
     let truncated = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
     format!("{truncated:016x}")
 }

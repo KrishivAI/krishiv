@@ -12,24 +12,15 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// Errors returned by [`init`].
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MetricsError {
     /// The OTLP exporter pipeline failed to build.
+    #[error("OTLP exporter build failed: {0}")]
     OtlpBuild(String),
     /// A tracing subscriber initialization error.
+    #[error("subscriber init failed: {0}")]
     Subscriber(String),
 }
-
-impl std::fmt::Display for MetricsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OtlpBuild(msg) => write!(f, "OTLP exporter build failed: {msg}"),
-            Self::Subscriber(msg) => write!(f, "subscriber init failed: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for MetricsError {}
 
 /// **Beta API**: may change between minor releases.
 ///

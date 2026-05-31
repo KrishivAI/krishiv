@@ -77,18 +77,7 @@ mod tests {
     use super::encode_stream_kafka_partition;
 
     fn make_batch(keys: &[&str], times: &[i64]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(keys.to_vec())) as _,
-                Arc::new(Int64Array::from(times.to_vec())) as _,
-            ],
-        )
-        .unwrap()
+        krishiv_common::arrow::make_test_key_ts_batch(keys.to_vec(), times.to_vec())
     }
 
     fn make_batch_with_value(keys: &[&str], times: &[i64], values: &[i64]) -> RecordBatch {

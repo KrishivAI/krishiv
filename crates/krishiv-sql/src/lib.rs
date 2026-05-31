@@ -6,7 +6,6 @@
 //! out of the long-term public API exposed by `krishiv-api`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::error::Error;
 use std::fmt;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -26,6 +25,7 @@ pub mod cep_sql;
 pub mod create_function_ddl;
 mod lakehouse;
 pub mod live_table;
+pub mod policy;
 pub mod spark_compat;
 pub mod spark_compat_date;
 mod udf;
@@ -33,39 +33,31 @@ mod window_functions;
 
 pub use cep_sql::{MatchRecognizeStatement, parse_match_recognize};
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
+pub use policy::PolicyEnforcingSqlEngine;
 
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
 
 /// SQL-layer errors.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SqlError {
     /// Query was empty or whitespace only.
+    #[error("SQL query is empty")]
     EmptyQuery,
     /// A table name was empty.
+    #[error("table name is empty")]
     EmptyTableName,
     /// The requested SQL feature is not available in R1.
+    #[error("unsupported SQL feature: {feature}")]
     Unsupported { feature: String },
     /// DataFusion returned an error.
+    #[error("DataFusion error: {message}")]
     DataFusion { message: String },
     /// Access denied by auth or policy check.
+    #[error("access denied: {reason}")]
     AccessDenied { reason: String },
 }
-
-impl fmt::Display for SqlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyQuery => f.write_str("SQL query is empty"),
-            Self::EmptyTableName => f.write_str("table name is empty"),
-            Self::Unsupported { feature } => write!(f, "unsupported SQL feature: {feature}"),
-            Self::DataFusion { message } => write!(f, "DataFusion error: {message}"),
-            Self::AccessDenied { reason } => write!(f, "access denied: {reason}"),
-        }
-    }
-}
-
-impl Error for SqlError {}
 
 impl From<datafusion::error::DataFusionError> for SqlError {
     fn from(value: datafusion::error::DataFusionError) -> Self {

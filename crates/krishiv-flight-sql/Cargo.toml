@@ -11,11 +11,12 @@ arrow-flight = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 krishiv-api = { path = "../krishiv-api" }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-sql = { path = "../krishiv-sql" }
-krishiv-sql-policy = { path = "../krishiv-sql-policy" }
+
 lru = "0.12"
 sha2 = { workspace = true }
 tokio = { workspace = true }

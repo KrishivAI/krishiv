@@ -1,13 +1,13 @@
 //! Typed identifiers.
 
-use std::error::Error;
 use std::fmt;
 
 /// Result alias for control-plane contract validation.
 pub type ProtoResult<T> = Result<T, IdError>;
 
 /// Identifier validation error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} {reason}")]
 pub struct IdError {
     kind: &'static str,
     reason: &'static str,
@@ -38,14 +38,6 @@ impl IdError {
         self.reason
     }
 }
-
-impl fmt::Display for IdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.kind, self.reason)
-    }
-}
-
-impl Error for IdError {}
 
 macro_rules! id_type {
     ($name:ident, $kind:literal) => {
@@ -156,10 +148,8 @@ impl fmt::Display for LeaseGeneration {
 
 /// Monotonic fencing token for checkpoint epoch ownership.
 ///
-/// The checkpoint store rejects metadata writes where the token is older than
-/// the last committed writer's token, preventing stale coordinators from
-/// committing superseded epochs (see `docs/architecture/checkpoint-protocol.md`
-/// §Fencing Invariant).
+/// Checkpoint writers must carry the active coordinator token so stale
+/// coordinators cannot commit superseded epochs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FencingToken(u64);
 

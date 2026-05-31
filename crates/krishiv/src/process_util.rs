@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Process helpers for spawning Krishiv daemons from the unified binary.
 
 use std::ffi::OsString;
@@ -32,6 +34,16 @@ pub fn spawn_krishiv_daemon_with_env(
     let mut cmd = krishiv_daemon_command(subcommand, args);
     for (key, value) in env {
         cmd.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
     }
     let child = cmd
         .stdout(Stdio::null())

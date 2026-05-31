@@ -22,20 +22,7 @@ impl JobCoordinator {
 
     pub async fn snapshot(&self) -> crate::job::JobSnapshot {
         let job = self.inner.read().await;
-        crate::job::JobSnapshot {
-            job_id: self.job_id.clone(),
-            kind: krishiv_proto::JobKind::Batch,
-            state: job.state,
-            stage_count: job.stages().len(),
-            task_count: 0,
-            assigned_task_count: 0,
-            running_task_count: 0,
-            succeeded_task_count: 0,
-            failed_task_count: 0,
-            priority: 0,
-            namespace_id: None,
-            resource_usage: job.resource_usage().clone(),
-        }
+        job.snapshot()
     }
 
     /// Returns the current high-level job state without exposing the full record.

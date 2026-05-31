@@ -11,13 +11,41 @@ use crate::error::{ConnectorError, ConnectorResult};
 /// Key/value configuration bag for connector instantiation.
 ///
 /// Properties are stored in a sorted map to make serialisation deterministic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectorConfig {
     /// Logical name for this connector instance.
     pub name: String,
     /// Connector kind identifier (e.g., `"parquet"`, `"kafka"`, `"s3"`).
     pub kind: String,
     properties: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ConnectorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_properties: BTreeMap<String, String> = self
+            .properties
+            .iter()
+            .map(|(k, v)| {
+                let lower_k = k.to_lowercase();
+                if lower_k.contains("password")
+                    || lower_k.contains("secret")
+                    || lower_k.contains("token")
+                    || lower_k.contains("key")
+                    || lower_k.contains("credential")
+                {
+                    (k.clone(), "[REDACTED]".to_string())
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+
+        f.debug_struct("ConnectorConfig")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("properties", &redacted_properties)
+            .finish()
+    }
 }
 
 impl ConnectorConfig {

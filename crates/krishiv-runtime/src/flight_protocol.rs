@@ -150,26 +150,19 @@ pub fn parse_sql(sql: &str) -> (Vec<FlightDirective>, String) {
 /// the comment-injection vector documented in B3.  In particular, the
 /// sequence `*/` is impossible inside a valid identifier.
 fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    krishiv_common::validate::is_safe_identifier(s)
 }
 
 /// Filesystem path field — same character class as identifiers plus `/`.
 /// (Tightened from "anything goes" to prevent `*/` injection through the
 /// REGISTER_PARQUET path field.)
 fn is_safe_path(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/' || c == ' '
-        })
+    krishiv_common::validate::is_safe_path(s)
 }
 
 /// Base64 payload — alphabet is `[A-Za-z0-9+/=]`, neither `*` nor whitespace.
 fn is_safe_base64(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    krishiv_common::validate::is_safe_base64(s)
 }
 
 fn parse_comment(comment: &str) -> Option<FlightDirective> {

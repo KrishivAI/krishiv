@@ -1,7 +1,7 @@
 //! Connector certification suite.
 //!
 //! A connector passes certification when all tests in this module pass.
-//! Certification status is recorded in docs/architecture/compatibility-matrices.md.
+//! Certification status follows connector capability declarations in code.
 
 use krishiv_connectors::{ConnectorCapabilities, ConnectorResult};
 

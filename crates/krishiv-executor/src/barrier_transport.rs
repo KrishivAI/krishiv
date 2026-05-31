@@ -106,7 +106,7 @@ pub fn make_checkpoint_barrier(job_id: &str, epoch: u64, checkpoint_id: &str) ->
         job_id: job_id.to_string(),
         checkpoint_id: checkpoint_id.to_string(),
         barrier_kind: BarrierKind::Checkpoint as i32,
-        timestamp_ms: krishiv_async_util::unix_now_ms(),
+        timestamp_ms: krishiv_common::async_util::unix_now_ms(),
     }
 }
 

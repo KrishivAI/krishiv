@@ -10,7 +10,7 @@ name = "krishiv_chaos"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { workspace = true, features = ["time"] }
+krishiv-common = { path = "../krishiv-common", features = ["chaos"] }
 
 [dev-dependencies]
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }

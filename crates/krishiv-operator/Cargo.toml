@@ -19,6 +19,7 @@ ui = ["dep:krishiv-ui"]
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+thiserror = { workspace = true }
 k8s-openapi = { workspace = true, optional = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-proto = { path = "../krishiv-proto" }

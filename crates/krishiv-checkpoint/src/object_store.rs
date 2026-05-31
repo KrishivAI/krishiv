@@ -128,7 +128,24 @@ impl ObjectStoreCheckpointStorage {
     }
 }
 
+#[async_trait::async_trait]
 impl CheckpointStorage for ObjectStoreCheckpointStorage {
+    async fn write_bytes_async(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
+        self.write_bytes_async_inner(path, data).await
+    }
+
+    async fn read_bytes_async(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        self.read_bytes_async_inner(path).await
+    }
+
+    async fn list_dir_async(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
+        self.list_dir_async_inner(prefix).await
+    }
+
+    async fn delete_prefix_async(&self, prefix: &str) -> CheckpointResult<()> {
+        self.delete_prefix_async_inner(prefix).await
+    }
+
     fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
         let this = self.clone();
         let path = path.to_owned();

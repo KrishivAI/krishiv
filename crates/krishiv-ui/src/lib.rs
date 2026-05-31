@@ -6,8 +6,6 @@
 //! surface. It intentionally depends on the in-process R2 scheduler model
 //! rather than introducing Kubernetes clients or a separate frontend build.
 
-use std::error::Error;
-use std::fmt;
 use std::sync::Arc;
 
 use askama::Template;
@@ -56,41 +54,20 @@ impl UiState {
 }
 
 /// UI construction and handler errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum UiError {
     /// Coordinator id validation failed.
+    #[error("invalid id: {0}")]
     Id(String),
     /// Scheduler operation failed.
-    Scheduler(SchedulerError),
+    #[error("{0}")]
+    Scheduler(#[from] SchedulerError),
     /// Shared coordinator lock was poisoned.
+    #[error("coordinator status lock was poisoned")]
     LockPoisoned,
     /// Template rendering failed.
-    Template(askama::Error),
-}
-
-impl fmt::Display for UiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Id(message) => write!(f, "invalid id: {message}"),
-            Self::Scheduler(error) => write!(f, "{error}"),
-            Self::LockPoisoned => f.write_str("coordinator status lock was poisoned"),
-            Self::Template(error) => write!(f, "failed to render status page: {error}"),
-        }
-    }
-}
-
-impl Error for UiError {}
-
-impl From<SchedulerError> for UiError {
-    fn from(value: SchedulerError) -> Self {
-        Self::Scheduler(value)
-    }
-}
-
-impl From<askama::Error> for UiError {
-    fn from(value: askama::Error) -> Self {
-        Self::Template(value)
-    }
+    #[error("failed to render status page: {0}")]
+    Template(#[from] askama::Error),
 }
 
 impl IntoResponse for UiError {
@@ -559,7 +536,10 @@ async fn ui_job_detail(
 }
 
 async fn stylesheet() -> impl IntoResponse {
-    ([(CONTENT_TYPE, "text/css; charset=utf-8")], STYLE)
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/style.css"),
+    )
 }
 
 async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
@@ -693,193 +673,6 @@ fn demo_job(job_id: JobId) -> UiResult<JobSpec> {
 
     Ok(JobSpec::new(job_id, "demo-status-job", JobKind::Batch).with_stage(stage))
 }
-
-const STYLE: &str = r#"
-:root {
-  color-scheme: light;
-  --bg: #f7f8fa;
-  --panel: #ffffff;
-  --text: #1f2933;
-  --muted: #64748b;
-  --line: #d9e2ec;
-  --accent: #0f766e;
-  --accent-dark: #115e59;
-  --warn: #b45309;
-  --bad: #b91c1c;
-  --good: #15803d;
-}
-
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-
-a {
-  color: var(--accent-dark);
-  font-weight: 600;
-  text-decoration: none;
-}
-
-a:hover {
-  text-decoration: underline;
-}
-
-.shell {
-  margin: 0 auto;
-  max-width: 1180px;
-  padding: 28px 24px 48px;
-}
-
-.topbar {
-  align-items: center;
-  display: flex;
-  gap: 18px;
-  justify-content: space-between;
-  margin-bottom: 24px;
-}
-
-.brand {
-  display: grid;
-  gap: 3px;
-}
-
-.brand strong {
-  font-size: 20px;
-  letter-spacing: 0;
-}
-
-.brand span,
-.meta {
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.summary {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-bottom: 22px;
-}
-
-.metric {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 14px;
-}
-
-.metric span {
-  color: var(--muted);
-  display: block;
-  font-size: 12px;
-  margin-bottom: 6px;
-}
-
-.metric strong {
-  font-size: 22px;
-}
-
-.section {
-  margin-top: 26px;
-}
-
-.section h2 {
-  font-size: 16px;
-  margin: 0 0 10px;
-}
-
-.table-wrap {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow-x: auto;
-}
-
-table {
-  border-collapse: collapse;
-  min-width: 760px;
-  width: 100%;
-}
-
-th,
-td {
-  border-bottom: 1px solid var(--line);
-  font-size: 13px;
-  padding: 10px 12px;
-  text-align: left;
-  white-space: nowrap;
-}
-
-th {
-  background: #eef3f7;
-  color: #334155;
-  font-size: 12px;
-  text-transform: uppercase;
-}
-
-tr:last-child td {
-  border-bottom: 0;
-}
-
-.state {
-  border-radius: 999px;
-  display: inline-block;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  padding: 5px 8px;
-}
-
-.state.running,
-.state.healthy,
-.state.active {
-  background: #dff7ec;
-  color: var(--good);
-}
-
-.state.failed,
-.state.lost {
-  background: #fee2e2;
-  color: var(--bad);
-}
-
-.state.assigned,
-.state.scheduling,
-.state.accepted,
-.state.registered {
-  background: #fef3c7;
-  color: var(--warn);
-}
-
-.empty {
-  background: var(--panel);
-  border: 1px dashed var(--line);
-  border-radius: 8px;
-  color: var(--muted);
-  padding: 18px;
-}
-
-@media (max-width: 760px) {
-  .shell {
-    padding: 20px 14px 36px;
-  }
-
-  .topbar {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-"#;
 
 #[cfg(test)]
 mod tests {

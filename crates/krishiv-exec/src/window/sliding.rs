@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
-use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
+use krishiv_state::{Namespace, StateBackend, StateResult};
 
 use crate::aggregate::{AggExpr, AggState};
 use crate::join::format_key_value;
@@ -71,45 +71,12 @@ impl SlidingWindowOperator {
         backend: &mut dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
-        // Remove all previously persisted entries so closed windows don't
-        // survive into the next checkpoint snapshot.
-        backend.clear_namespace(namespace)?;
-
-        if self.accumulators.is_empty() {
-            return Ok(());
-        }
-
-        let op_id = namespace.operator_id();
-        let name = namespace.state_name();
-        let mut state_keys = Vec::with_capacity(self.accumulators.len());
-        let mut values = Vec::with_capacity(self.accumulators.len());
-        for ((key, win_start), agg) in &self.accumulators {
-            let payload = serde_json::json!({
-                "values": agg.values,
-                "has_value": agg.has_value,
-                "avg_sums": agg.avg_sums,
-                "avg_counts": agg.avg_counts,
-            });
-            let bytes = serde_json::to_vec(&payload).map_err(|e| StateError::CorruptEntry {
-                message: e.to_string(),
-            })?;
-            // GAP-18: length-prefix encoding — format: b"sw:" | key_len_le_u32 | key_bytes | win_start_le_i64
-            let key_bytes = key.as_bytes();
-            let mut state_key = Vec::with_capacity(3 + 4 + key_bytes.len() + 8);
-            state_key.extend_from_slice(b"sw:");
-            state_key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
-            state_key.extend_from_slice(key_bytes);
-            state_key.extend_from_slice(&win_start.to_le_bytes());
-            state_keys.push(state_key);
-            values.push(bytes);
-        }
-        let batch_entries: Vec<(&str, &str, &[u8], &[u8])> = state_keys
-            .iter()
-            .zip(values.iter())
-            .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
-            .collect();
-        backend.put_batch(&batch_entries)?;
-        Ok(())
+        super::state_persistence::persist_window_accumulators(
+            backend,
+            namespace,
+            &self.accumulators,
+            b"sw:",
+        )
     }
 
     /// Restore open sliding window accumulators from `StateBackend`.
@@ -118,44 +85,8 @@ impl SlidingWindowOperator {
         backend: &dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
-        let mut restored = HashMap::new();
-        for key_bytes in backend.list_keys(namespace)? {
-            let Some(payload) = backend.get(namespace, &key_bytes)? else {
-                continue;
-            };
-            let parsed: serde_json::Value =
-                serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
-                    message: e.to_string(),
-                })?;
-            let values: Vec<i64> = parsed["values"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-            let has_value: Vec<bool> = parsed["has_value"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_bool()).collect())
-                .unwrap_or_default();
-            let avg_sums: Vec<f64> = parsed["avg_sums"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
-                .unwrap_or_default();
-            let avg_counts: Vec<u64> = parsed["avg_counts"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-                .unwrap_or_default();
-            if let Some((key, win_start)) = parse_sliding_state_key(&key_bytes) {
-                restored.insert(
-                    (key, win_start),
-                    AggState {
-                        values,
-                        has_value,
-                        avg_sums,
-                        avg_counts,
-                    },
-                );
-            }
-        }
-        self.accumulators = restored;
+        self.accumulators =
+            super::state_persistence::restore_window_accumulators(backend, namespace, b"sw:")?;
         Ok(())
     }
 
@@ -271,6 +202,7 @@ impl SlidingWindowOperator {
     }
 }
 
+#[cfg(test)]
 fn parse_sliding_state_key(bytes: &[u8]) -> Option<(String, i64)> {
     // GAP-18: length-prefix format: b"sw:" | key_len_le_u32 | key_bytes | win_start_le_i64
     const PREFIX: &[u8] = b"sw:";

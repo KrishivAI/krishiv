@@ -15,8 +15,10 @@ pgvector = ["dep:sqlx"]
 parquet = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
 qdrant-client = { workspace = true, optional = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

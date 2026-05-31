@@ -27,19 +27,12 @@ pub mod store;
 /// S4 in crate-stability-resolution-plan — prevents path traversal via
 /// untrusted identifiers flowing into disk/object/local-store paths.
 pub fn validate_safe_id(id: &str, label: &str) -> ShuffleResult<()> {
-    if id.is_empty() {
-        return Err(ShuffleError::Io(std::io::Error::new(
+    krishiv_common::validate::validate_safe_id(id, label).map_err(|e| {
+        ShuffleError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{label} cannot be empty"),
-        )));
-    }
-    if id.contains('/') || id.contains('\\') || id.contains('\0') || id.contains("..") {
-        return Err(ShuffleError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{label} contains invalid characters: {id}"),
-        )));
-    }
-    Ok(())
+            e.message,
+        ))
+    })
 }
 
 // Re-export the public API at the crate root for source compatibility.

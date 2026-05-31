@@ -250,13 +250,6 @@ impl DeregisterExecutorRequest {
         }
     }
 
-    /// Override transport version.
-    #[must_use]
-    pub fn with_version(mut self, version: TransportVersion) -> Self {
-        self.version = version;
-        self
-    }
-
     /// Attach a reason.
     #[must_use]
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
@@ -285,6 +278,8 @@ impl DeregisterExecutorRequest {
     }
 }
 
+impl_with_version!(DeregisterExecutorRequest);
+
 /// Versioned executor deregistration response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeregisterExecutorResponse {
@@ -309,13 +304,6 @@ impl DeregisterExecutorResponse {
             disposition,
             message: None,
         }
-    }
-
-    /// Override transport version.
-    #[must_use]
-    pub fn with_version(mut self, version: TransportVersion) -> Self {
-        self.version = version;
-        self
     }
 
     /// Attach response message.
@@ -350,6 +338,8 @@ impl DeregisterExecutorResponse {
         self.message.as_deref()
     }
 }
+
+impl_with_version!(DeregisterExecutorResponse);
 
 // ── R7.2 hot-key / throttle contract types ────────────────────────────────────
 

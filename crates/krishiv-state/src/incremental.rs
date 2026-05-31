@@ -4,7 +4,6 @@
 //! records snapshot blob hashes rather than RocksDB SST files.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Reference to one uploaded state segment.
@@ -83,8 +82,7 @@ impl IncrementalCheckpointWriter {
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    krishiv_common::hash::sha256_hex(bytes)
 }
 
 #[cfg(test)]

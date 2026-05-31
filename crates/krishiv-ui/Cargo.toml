@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 askama.workspace = true
 axum.workspace = true
+thiserror = { workspace = true }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }

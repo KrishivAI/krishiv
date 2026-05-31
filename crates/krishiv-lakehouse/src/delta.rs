@@ -411,7 +411,7 @@ mod kafka_delta {
             let fut = self
                 .producer
                 .send(record, std::time::Duration::from_secs(5));
-            krishiv_async_util::block_on(fut)
+            krishiv_common::async_util::block_on(fut)
                 .map_err(|(e, _)| LakehouseError::Io(e.to_string()))?;
             Ok(())
         }

@@ -3,6 +3,7 @@ members = [
     "crates/krishiv",
     "crates/krishiv-api",
     "crates/krishiv-catalog",
+    "crates/krishiv-common",
     "crates/krishiv-checkpoint",
     "crates/krishiv-connectors",
     "crates/krishiv-executor",
@@ -23,17 +24,15 @@ members = [
     "crates/krishiv-flight-sql",
     "crates/krishiv-metrics",
     "crates/krishiv-governance",
-    "crates/krishiv-upgrade-tests",
     "crates/krishiv-bench",
-    "crates/krishiv-chaos",
-    "crates/krishiv-async-util",
-    "crates/krishiv-sql-policy",
     "crates/krishiv-cep",
+    "crates/krishiv-chaos",
     "crates/krishiv-vector-sinks",
 ]
 default-members = [
     "crates/krishiv",
     "crates/krishiv-api",
+    "crates/krishiv-common",
     "crates/krishiv-catalog",
     "crates/krishiv-checkpoint",
     "crates/krishiv-connectors",
@@ -55,8 +54,7 @@ default-members = [
     "crates/krishiv-flight-sql",
     "crates/krishiv-metrics",
     "crates/krishiv-governance",
-    "crates/krishiv-async-util",
-    "crates/krishiv-sql-policy",
+    "crates/krishiv-chaos",
     "crates/krishiv-cep",
     "crates/krishiv-vector-sinks",
 ]
@@ -110,6 +108,7 @@ uuid = { version = "1", features = ["v4"] }
 lz4_flex = "0.11"
 twox-hash = "2.1"
 zstd = "0.13"
+thiserror = "1"
 dashmap = "6.1"
 fastembed = "4.9"
 qdrant-client = "1.16"

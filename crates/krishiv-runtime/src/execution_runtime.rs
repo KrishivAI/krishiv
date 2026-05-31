@@ -40,6 +40,22 @@ pub enum RuntimeMode {
     Distributed,
 }
 
+/// Explicit placement decision for runtime work.
+///
+/// `RuntimeMode` describes the user-visible execution mode. `ExecutionPlacement`
+/// describes where data-plane work is actually allowed to run. Keeping them
+/// separate prevents distributed sessions from silently falling back to local
+/// execution when a coordinator endpoint is missing or disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPlacement {
+    /// Run coordinator/executor work in the current process.
+    LocalInProcess,
+    /// Route single-node work to a local daemon over Flight/gRPC.
+    SingleNodeDaemon,
+    /// Require a remote cluster endpoint; never use local fallback.
+    RemoteClusterRequired,
+}
+
 /// Parquet table forwarded to executor SQL tasks during batch collect.
 #[derive(Debug, Clone)]
 pub struct BatchTableRegistration {
@@ -61,9 +77,12 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Execution mode label for telemetry.
     fn mode(&self) -> RuntimeMode;
 
+    /// Concrete placement used by this runtime.
+    fn placement(&self) -> ExecutionPlacement;
+
     /// Whether data-plane work is routed to a remote Flight endpoint (no local fallback).
     fn uses_remote_execution(&self) -> bool {
-        false
+        !matches!(self.placement(), ExecutionPlacement::LocalInProcess)
     }
 
     /// Accept or dispatch a physical plan (batch or streaming).
@@ -156,22 +175,24 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
         self.mode
     }
 
+    fn placement(&self) -> ExecutionPlacement {
+        ExecutionPlacement::LocalInProcess
+    }
+
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        krishiv_async_util::block_on(async {
-            match self.mode {
-                RuntimeMode::Embedded => {
-                    let backend = EmbeddedBackend::default();
-                    backend.execute(plan).await
-                }
-                RuntimeMode::SingleNode => {
-                    let sn = SingleNodeBackend;
-                    sn.execute(plan).await
-                }
-                RuntimeMode::Distributed => Err(RuntimeError::unsupported(
-                    "in-process runtime does not serve distributed mode",
-                )),
+        match self.mode {
+            RuntimeMode::Embedded => {
+                let backend = EmbeddedBackend::default();
+                backend.execute(plan)
             }
-        })
+            RuntimeMode::SingleNode => {
+                let sn = SingleNodeBackend;
+                sn.execute(plan)
+            }
+            RuntimeMode::Distributed => Err(RuntimeError::unsupported(
+                "in-process runtime does not serve distributed mode",
+            )),
+        }
     }
 
     fn collect_bounded_window(
@@ -218,13 +239,12 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     }
 }
 
-/// Distributed / remote-cluster runtime (Flight SQL + optional in-process fallback for tests).
+/// Runtime that routes all data-plane work to a Flight/gRPC endpoint.
 pub struct RemoteExecutionRuntime {
     flight_url: String,
     coordinator_grpc_url: Option<String>,
     session_mode: RuntimeMode,
-    /// When set, bounded streaming also uses the in-process cluster (integration tests).
-    local_fallback: Option<Arc<InProcessCluster>>,
+    placement: ExecutionPlacement,
 }
 
 impl RemoteExecutionRuntime {
@@ -232,31 +252,14 @@ impl RemoteExecutionRuntime {
         flight_url: impl Into<String>,
         session_mode: RuntimeMode,
         coordinator_grpc_url: Option<String>,
+        placement: ExecutionPlacement,
     ) -> Self {
         Self {
             flight_url: flight_url.into(),
             coordinator_grpc_url,
             session_mode,
-            local_fallback: None,
+            placement,
         }
-    }
-
-    pub fn with_local_fallback(mut self, cluster: Arc<InProcessCluster>) -> Self {
-        self.local_fallback = Some(cluster);
-        self
-    }
-
-    fn local_accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        let cluster = self.local_fallback.as_ref().ok_or_else(|| {
-            RuntimeError::unsupported("plan acceptance requires a local cluster fallback")
-        })?;
-        let runtime = match self.session_mode {
-            RuntimeMode::Embedded => InProcessExecutionRuntime::embedded(Arc::clone(cluster)),
-            RuntimeMode::SingleNode | RuntimeMode::Distributed => {
-                InProcessExecutionRuntime::single_node(Arc::clone(cluster))
-            }
-        };
-        runtime.accept_plan(plan)
     }
 }
 
@@ -265,18 +268,13 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         self.session_mode
     }
 
-    fn uses_remote_execution(&self) -> bool {
-        self.local_fallback.is_none()
+    fn placement(&self) -> ExecutionPlacement {
+        self.placement
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        if self.local_fallback.is_some() {
-            return self.local_accept_plan(plan);
-        }
-        krishiv_async_util::block_on(async {
-            let backend = DistributedBackend::new(self.flight_url.clone());
-            backend.execute(plan).await
-        })
+        let backend = DistributedBackend::new(self.flight_url.clone());
+        backend.execute(plan)
     }
 
     fn collect_bounded_window(
@@ -285,10 +283,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         input_batches: Vec<RecordBatch>,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>> {
-        if let Some(cluster) = &self.local_fallback {
-            return cluster.collect_bounded_window(topic, input_batches, spec);
-        }
-        use krishiv_async_util::block_on;
+        use krishiv_common::async_util::block_on;
         block_on(crate::flight_client::execute_remote_bounded_window(
             &self.flight_url,
             topic,
@@ -302,10 +297,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         query: &str,
         tables: &[BatchTableRegistration],
     ) -> RuntimeResult<Vec<RecordBatch>> {
-        if let Some(cluster) = &self.local_fallback {
-            return cluster.collect_batch_sql(query, &tables_to_batch_sql(tables));
-        }
-        use krishiv_async_util::block_on;
+        use krishiv_common::async_util::block_on;
         block_on(crate::flight_client::execute_remote_batch_sql(
             &self.flight_url,
             query,
@@ -314,11 +306,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
-        if self.local_fallback.is_some() {
-            return krishiv_sql::explain_sql(query)
-                .map_err(|e| RuntimeError::transport(e.to_string()));
-        }
-        use krishiv_async_util::block_on;
+        use krishiv_common::async_util::block_on;
         block_on(crate::flight_client::execute_remote_explain(
             &self.flight_url,
             query,
@@ -330,10 +318,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<()> {
-        if let Some(cluster) = &self.local_fallback {
-            return cluster.register_continuous_job(job_id, spec);
-        }
-        use krishiv_async_util::block_on;
+        use krishiv_common::async_util::block_on;
         block_on(crate::flight_client::execute_remote_continuous_register(
             &self.flight_url,
             job_id,
@@ -346,10 +331,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         job_id: &str,
         batches: Vec<RecordBatch>,
     ) -> RuntimeResult<()> {
-        if let Some(cluster) = &self.local_fallback {
-            return cluster.push_continuous_input(job_id, batches);
-        }
-        use krishiv_async_util::block_on;
+        use krishiv_common::async_util::block_on;
         block_on(crate::flight_client::execute_remote_continuous_push(
             &self.flight_url,
             job_id,
@@ -358,10 +340,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
     }
 
     fn drain_continuous_stream(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        if let Some(cluster) = &self.local_fallback {
-            return cluster.drain_continuous_job(job_id);
-        }
-        use krishiv_async_util::block_on;
+        use krishiv_common::async_util::block_on;
         block_on(crate::flight_client::execute_remote_continuous_drain(
             &self.flight_url,
             job_id,
@@ -383,34 +362,52 @@ pub fn build_execution_runtime(
     cluster: Arc<InProcessCluster>,
     coordinator_flight_url: Option<String>,
     coordinator_grpc_url: Option<String>,
-    remote_execution: bool,
-) -> Arc<dyn ExecutionRuntime> {
-    match mode {
-        RuntimeMode::Embedded => {
-            Arc::new(InProcessExecutionRuntime::embedded(Arc::clone(&cluster)))
+    placement: ExecutionPlacement,
+) -> RuntimeResult<Arc<dyn ExecutionRuntime>> {
+    match (mode, placement) {
+        (RuntimeMode::Embedded, ExecutionPlacement::LocalInProcess) => Ok(Arc::new(
+            InProcessExecutionRuntime::embedded(Arc::clone(&cluster)),
+        )),
+        (RuntimeMode::SingleNode, ExecutionPlacement::LocalInProcess) => {
+            Ok(Arc::new(InProcessExecutionRuntime::single_node(cluster)))
         }
-        RuntimeMode::SingleNode => {
-            if let Some(url) = coordinator_flight_url {
-                let mut remote =
-                    RemoteExecutionRuntime::new(url, RuntimeMode::SingleNode, coordinator_grpc_url);
-                if !remote_execution {
-                    remote = remote.with_local_fallback(Arc::clone(&cluster));
-                }
-                Arc::new(remote)
-            } else {
-                Arc::new(InProcessExecutionRuntime::single_node(cluster))
-            }
+        (RuntimeMode::SingleNode, ExecutionPlacement::SingleNodeDaemon) => {
+            let url = coordinator_flight_url.ok_or_else(|| {
+                RuntimeError::unsupported(
+                    "SingleNodeDaemon placement requires a local Flight SQL coordinator URL",
+                )
+            })?;
+            Ok(Arc::new(RemoteExecutionRuntime::new(
+                url,
+                RuntimeMode::SingleNode,
+                coordinator_grpc_url,
+                ExecutionPlacement::SingleNodeDaemon,
+            )))
         }
-        RuntimeMode::Distributed => {
-            let url =
-                coordinator_flight_url.unwrap_or_else(|| String::from("http://127.0.0.1:50051"));
-            let mut remote =
-                RemoteExecutionRuntime::new(url, RuntimeMode::Distributed, coordinator_grpc_url);
-            if !remote_execution {
-                remote = remote.with_local_fallback(Arc::clone(&cluster));
-            }
-            Arc::new(remote)
+        (RuntimeMode::Distributed, ExecutionPlacement::RemoteClusterRequired) => {
+            let url = coordinator_flight_url.ok_or_else(|| {
+                RuntimeError::unsupported(
+                    "Distributed placement requires an explicit remote Flight SQL coordinator URL",
+                )
+            })?;
+            Ok(Arc::new(RemoteExecutionRuntime::new(
+                url,
+                RuntimeMode::Distributed,
+                coordinator_grpc_url,
+                ExecutionPlacement::RemoteClusterRequired,
+            )))
         }
+        (RuntimeMode::Embedded, _) => Err(RuntimeError::unsupported(
+            "Embedded mode only supports LocalInProcess placement",
+        )),
+        (RuntimeMode::SingleNode, ExecutionPlacement::RemoteClusterRequired) => {
+            Err(RuntimeError::unsupported(
+                "SingleNode mode cannot use RemoteClusterRequired placement; use Distributed mode",
+            ))
+        }
+        (RuntimeMode::Distributed, _) => Err(RuntimeError::unsupported(
+            "Distributed mode cannot use local fallback; use RemoteClusterRequired placement",
+        )),
     }
 }
 
@@ -424,8 +421,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BatchTableRegistration, ClusterEndpoints, InProcessExecutionRuntime, RuntimeMode,
-        build_execution_runtime,
+        BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, InProcessExecutionRuntime,
+        RuntimeMode, build_execution_runtime,
     };
     use crate::ExecutionRuntime;
     use crate::InProcessCluster;
@@ -439,8 +436,9 @@ mod tests {
             cluster,
             Some(String::from("http://127.0.0.1:50051")),
             Some(String::from("http://127.0.0.1:9090")),
-            false,
-        );
+            ExecutionPlacement::RemoteClusterRequired,
+        )
+        .expect("distributed runtime");
 
         assert_eq!(
             runtime.flight_url(),
@@ -598,36 +596,91 @@ mod tests {
     #[test]
     fn build_runtime_embedded() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false);
+        let rt = build_execution_runtime(
+            RuntimeMode::Embedded,
+            cluster,
+            None,
+            None,
+            ExecutionPlacement::LocalInProcess,
+        )
+        .expect("embedded runtime");
         assert_eq!(rt.mode(), RuntimeMode::Embedded);
+        assert_eq!(rt.placement(), ExecutionPlacement::LocalInProcess);
     }
 
     #[test]
     fn build_runtime_single_node_no_flight_url() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = build_execution_runtime(RuntimeMode::SingleNode, cluster, None, None, false);
+        let rt = build_execution_runtime(
+            RuntimeMode::SingleNode,
+            cluster,
+            None,
+            None,
+            ExecutionPlacement::LocalInProcess,
+        )
+        .expect("single-node runtime");
         assert_eq!(rt.mode(), RuntimeMode::SingleNode);
+        assert_eq!(rt.placement(), ExecutionPlacement::LocalInProcess);
         assert!(rt.flight_url().is_none());
     }
 
     #[test]
-    fn build_runtime_single_node_with_flight_url_and_fallback() {
+    fn build_runtime_single_node_daemon_requires_flight_url() {
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let err = match build_execution_runtime(
+            RuntimeMode::SingleNode,
+            cluster,
+            None,
+            None,
+            ExecutionPlacement::SingleNodeDaemon,
+        ) {
+            Ok(_) => panic!("single-node daemon without Flight URL should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            crate::RuntimeError::unsupported(
+                "SingleNodeDaemon placement requires a local Flight SQL coordinator URL",
+            )
+        );
+    }
+
+    #[test]
+    fn build_runtime_single_node_daemon_with_flight_url() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = build_execution_runtime(
             RuntimeMode::SingleNode,
             cluster,
             Some("http://127.0.0.1:50051".into()),
             None,
-            false,
-        );
+            ExecutionPlacement::SingleNodeDaemon,
+        )
+        .expect("single-node daemon runtime");
+        assert_eq!(rt.mode(), RuntimeMode::SingleNode);
+        assert_eq!(rt.placement(), ExecutionPlacement::SingleNodeDaemon);
+        assert!(rt.uses_remote_execution());
         assert_eq!(rt.flight_url(), Some("http://127.0.0.1:50051"));
     }
 
     #[test]
-    fn build_runtime_distributed_default_flight_url() {
+    fn build_runtime_distributed_requires_explicit_flight_url() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = build_execution_runtime(RuntimeMode::Distributed, cluster, None, None, false);
-        assert_eq!(rt.flight_url(), Some("http://127.0.0.1:50051"));
+        let err = match build_execution_runtime(
+            RuntimeMode::Distributed,
+            cluster,
+            None,
+            None,
+            ExecutionPlacement::RemoteClusterRequired,
+        ) {
+            Ok(_) => panic!("distributed runtime without Flight URL should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            crate::RuntimeError::unsupported(
+                "Distributed placement requires an explicit remote Flight SQL coordinator URL",
+            )
+        );
     }
 
     #[test]
@@ -638,8 +691,11 @@ mod tests {
             cluster,
             Some("http://remote:50051".into()),
             None,
-            false,
-        );
+            ExecutionPlacement::RemoteClusterRequired,
+        )
+        .expect("distributed runtime");
+        assert_eq!(rt.mode(), RuntimeMode::Distributed);
+        assert_eq!(rt.placement(), ExecutionPlacement::RemoteClusterRequired);
         assert_eq!(rt.flight_url(), Some("http://remote:50051"));
     }
 
@@ -651,22 +707,31 @@ mod tests {
             cluster,
             Some("http://remote:50051".into()),
             None,
-            true,
-        );
+            ExecutionPlacement::RemoteClusterRequired,
+        )
+        .expect("distributed runtime");
         assert!(rt.uses_remote_execution());
     }
 
     #[test]
-    fn build_runtime_distributed_with_fallback() {
+    fn build_runtime_distributed_rejects_local_fallback() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
-        let rt = build_execution_runtime(
+        let err = match build_execution_runtime(
             RuntimeMode::Distributed,
             cluster,
             Some("http://remote:50051".into()),
             None,
-            false,
+            ExecutionPlacement::LocalInProcess,
+        ) {
+            Ok(_) => panic!("distributed local fallback should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            crate::RuntimeError::unsupported(
+                "Distributed mode cannot use local fallback; use RemoteClusterRequired placement",
+            )
         );
-        assert!(!rt.uses_remote_execution());
     }
 
     #[test]
@@ -689,8 +754,9 @@ mod tests {
             cluster,
             Some("http://custom:50051".into()),
             Some("http://custom:9090".into()),
-            false,
-        );
+            ExecutionPlacement::RemoteClusterRequired,
+        )
+        .expect("distributed runtime");
         assert_eq!(rt.flight_url(), Some("http://custom:50051"));
         assert_eq!(rt.coordinator_grpc_url(), Some("http://custom:9090"));
     }

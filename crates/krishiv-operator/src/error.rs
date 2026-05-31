@@ -1,46 +1,28 @@
 //! Operator errors.
 
-use std::error::Error;
-use std::fmt;
-
 use krishiv_scheduler::SchedulerError;
 
 /// Operator result alias.
 pub type OperatorResult<T> = Result<T, OperatorError>;
 
 /// Operator and reconciliation errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OperatorError {
     /// Resource validation failed before scheduling.
+    #[error("invalid KrishivJob: {message}")]
     InvalidResource { message: String },
     /// Scheduler operation failed.
-    Scheduler(SchedulerError),
+    #[error("{0}")]
+    Scheduler(#[from] SchedulerError),
     /// Kubernetes client or runtime operation failed.
+    #[error("kubernetes operation failed: {message}")]
     Kubernetes { message: String },
     /// Serialization or deserialization failed.
+    #[error("serialization failed: {message}")]
     Serialization { message: String },
     /// Shared coordinator lock was poisoned.
+    #[error("shared coordinator lock was poisoned")]
     CoordinatorLockPoisoned,
-}
-
-impl fmt::Display for OperatorError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidResource { message } => write!(f, "invalid KrishivJob: {message}"),
-            Self::Scheduler(error) => write!(f, "{error}"),
-            Self::Kubernetes { message } => write!(f, "kubernetes operation failed: {message}"),
-            Self::Serialization { message } => write!(f, "serialization failed: {message}"),
-            Self::CoordinatorLockPoisoned => f.write_str("shared coordinator lock was poisoned"),
-        }
-    }
-}
-
-impl Error for OperatorError {}
-
-impl From<SchedulerError> for OperatorError {
-    fn from(value: SchedulerError) -> Self {
-        Self::Scheduler(value)
-    }
 }
 
 #[cfg(feature = "k8s")]

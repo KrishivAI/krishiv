@@ -6,7 +6,6 @@
 //! Streaming plans are accepted here and executed via [`local_streaming`] on
 //! single-node backends (ADR-12.5).
 
-use std::error::Error;
 use std::fmt;
 
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
@@ -26,8 +25,8 @@ pub mod stream_kafka;
 pub use continuous_stream::ContinuousStreamRegistry;
 pub use coordinator_http_client::execute_coordinator_batch_sql;
 pub use execution_runtime::{
-    BatchTableRegistration, ClusterEndpoints, ExecutionRuntime, InProcessExecutionRuntime,
-    RemoteExecutionRuntime, RuntimeMode, build_execution_runtime,
+    BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, ExecutionRuntime,
+    InProcessExecutionRuntime, RemoteExecutionRuntime, RuntimeMode, build_execution_runtime,
 };
 pub use flight_action::{
     BoundedWindowBody, ContinuousDrainBody, ContinuousPushBody, ContinuousRegisterBody,
@@ -47,17 +46,22 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 /// Runtime errors shared by bootstrap backends and traits.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
     /// A requested capability is not available in the current release slice.
+    #[error("unsupported runtime feature: {feature}")]
     Unsupported { feature: String },
     /// Runtime state was invalid for the requested operation.
+    #[error("invalid runtime state: {message}")]
     InvalidState { message: String },
     /// A transport-level failure (connection refused, timeout, etc.).
+    #[error("transport error: {message}")]
     Transport { message: String },
     /// The submitted plan was rejected by the coordinator.
+    #[error("plan rejected: {reason}")]
     PlanRejected { reason: String },
     /// The operation succeeded for some partitions but not all.
+    #[error("partial result: {succeeded} partitions succeeded, {failed} failed")]
     PartialResult { succeeded: usize, failed: usize },
 }
 
@@ -88,25 +92,6 @@ impl RuntimeError {
         Self::PartialResult { succeeded, failed }
     }
 }
-
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { feature } => {
-                write!(f, "unsupported runtime feature: {feature}")
-            }
-            Self::InvalidState { message } => write!(f, "invalid runtime state: {message}"),
-            Self::Transport { message } => write!(f, "transport error: {message}"),
-            Self::PlanRejected { reason } => write!(f, "plan rejected: {reason}"),
-            Self::PartialResult { succeeded, failed } => write!(
-                f,
-                "partial result: {succeeded} partitions succeeded, {failed} failed"
-            ),
-        }
-    }
-}
-
-impl Error for RuntimeError {}
 
 /// Stable job identifier used by local and future distributed runtimes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -310,14 +295,18 @@ impl ExecutionReport {
 }
 
 /// Runtime backend contract shared by embedded, single-node, and distributed modes.
-#[async_trait::async_trait]
-pub trait ExecutionBackend {
+///
+/// NOTE: execute is deliberately *not* async. Embedded and SingleNode backends
+/// are trivially synchronous (they only inspect plan metadata). DistributedBackend
+/// uses `block_on` internally at its I/O boundary, which is the correct single
+/// sync/async seam.  This eliminates nested `block_on` deadlocks (B1).
+pub trait ExecutionBackend: Send + Sync {
     /// Backend name.
     fn backend_name(&self) -> &str;
 
     /// Accept or execute a physical plan. Batch plans are accepted without
     /// re-running SQL; execution happens in the session `SqlEngine`.
-    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
+    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
 }
 
 /// Minimal task executor contract for future scheduler integration.
@@ -342,13 +331,12 @@ fn accept_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<Execut
 #[derive(Debug, Default)]
 pub struct SingleNodeBackend;
 
-#[async_trait::async_trait]
 impl ExecutionBackend for SingleNodeBackend {
     fn backend_name(&self) -> &str {
         "single-node"
     }
 
-    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         debug!(
             backend = "single-node",
             plan = %plan.name(),
@@ -367,20 +355,19 @@ pub struct EmbeddedBackend {
     single_node: SingleNodeBackend,
 }
 
-#[async_trait::async_trait]
 impl ExecutionBackend for EmbeddedBackend {
     fn backend_name(&self) -> &str {
         "embedded"
     }
 
-    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         if is_streaming_plan(plan) {
             debug!(
                 backend = "embedded",
                 plan = %plan.name(),
                 "EmbeddedBackend: redirecting streaming plan to SingleNodeBackend"
             );
-            return self.single_node.execute(plan).await;
+            return self.single_node.execute(plan);
         }
         debug!(
             backend = "embedded",
@@ -394,6 +381,10 @@ impl ExecutionBackend for EmbeddedBackend {
 
 /// Distributed backend that routes plan execution to a remote coordinator
 /// via Arrow Flight SQL (GAP-RT-01 / ADR-12.3).
+///
+/// This is the one backend that genuinely needs async I/O.  We use `block_on`
+/// at its single sync/async seam — the `ExecutionBackend::execute` trait method
+/// is sync to prevent nested `block_on` deadlocks in embedded/single-node callers.
 #[derive(Debug, Clone)]
 pub struct DistributedBackend {
     flight_url: String,
@@ -411,13 +402,12 @@ impl DistributedBackend {
     }
 }
 
-#[async_trait::async_trait]
 impl ExecutionBackend for DistributedBackend {
     fn backend_name(&self) -> &str {
         "distributed"
     }
 
-    async fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+    fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         debug!(
             backend = "distributed",
             coordinator = %self.flight_url,
@@ -426,7 +416,10 @@ impl ExecutionBackend for DistributedBackend {
             sql = %flight_client::plan_to_sql(plan),
             "DistributedBackend: submitting plan via Flight SQL"
         );
-        flight_client::execute_remote_plan(&self.flight_url, plan).await?;
+        krishiv_common::async_util::block_on(flight_client::execute_remote_plan(
+            &self.flight_url,
+            plan,
+        ))?;
         Ok(ExecutionReport::new(
             self.backend_name(),
             plan.name(),
@@ -446,6 +439,8 @@ mod distributed_flight_tests {
 
     use super::{DistributedBackend, ExecutionBackend};
 
+    /// DistributedBackend::execute is now sync (block_on at I/O boundary).
+    /// The tokio runtime is needed only for the Flight server background task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn distributed_backend_submits_plan_over_flight_sql() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -465,7 +460,8 @@ mod distributed_flight_tests {
         let url = format!("http://{addr}");
         let backend = DistributedBackend::new(url);
         let plan = PhysicalPlan::new("SELECT 1 AS n", ExecutionKind::Batch);
-        let report = backend.execute(&plan).await.expect("execute");
+        // execute is now sync — no .await needed, no nested block_on risk
+        let report = backend.execute(&plan).expect("execute");
         assert!(report.accepted());
         server.abort();
     }
@@ -481,32 +477,32 @@ mod tests {
         accept_local_plan, is_streaming_plan,
     };
 
-    #[tokio::test]
-    async fn embedded_backend_accepts_bootstrap_plan() {
+    #[test]
+    fn embedded_backend_accepts_bootstrap_plan() {
         let plan = PhysicalPlan::new("bootstrap", ExecutionKind::Batch);
         let backend = EmbeddedBackend::default();
 
-        let report = backend.execute(&plan).await.expect("execute");
+        let report = backend.execute(&plan).expect("execute");
 
         assert_eq!(report.backend(), "embedded");
         assert_eq!(report.plan_name(), "bootstrap");
         assert!(report.accepted());
     }
 
-    #[tokio::test]
-    async fn embedded_redirects_streaming_kind_to_single_node() {
+    #[test]
+    fn embedded_redirects_streaming_kind_to_single_node() {
         let plan = PhysicalPlan::new("events", ExecutionKind::Streaming);
         assert!(is_streaming_plan(&plan));
         let backend = EmbeddedBackend::default();
-        let report = backend.execute(&plan).await.expect("execute");
+        let report = backend.execute(&plan).expect("execute");
         assert_eq!(report.backend(), "single-node");
     }
 
-    #[tokio::test]
-    async fn single_node_accepts_streaming_plan() {
+    #[test]
+    fn single_node_accepts_streaming_plan() {
         let plan = PhysicalPlan::new("stream:tw:key=u", ExecutionKind::Batch);
         let backend = SingleNodeBackend;
-        let report = backend.execute(&plan).await.expect("execute");
+        let report = backend.execute(&plan).expect("execute");
         assert_eq!(report.backend(), "single-node");
         assert!(report.accepted());
     }
@@ -750,11 +746,11 @@ mod tests {
         assert_eq!(b.backend_name(), "embedded");
     }
 
-    #[tokio::test]
-    async fn single_node_accepts_batch_plan() {
+    #[test]
+    fn single_node_accepts_batch_plan() {
         let plan = PhysicalPlan::new("SELECT 1", ExecutionKind::Batch);
         let b = SingleNodeBackend;
-        let report = b.execute(&plan).await.unwrap();
+        let report = b.execute(&plan).expect("execute");
         assert!(report.accepted());
     }
 }

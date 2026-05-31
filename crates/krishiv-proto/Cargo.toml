@@ -10,6 +10,7 @@ prost.workspace = true
 # Pinned to match the prost version used by tonic 0.14.x; not workspace-managed.
 prost-types = "0.14.3"
 serde = { workspace = true, optional = true }
+thiserror = { workspace = true }
 tonic.workspace = true
 tonic-prost.workspace = true
 

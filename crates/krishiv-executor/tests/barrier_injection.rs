@@ -16,7 +16,9 @@ fn source_emits_barrier_after_data_via_queue() {
     });
     let first = rt.block_on(rx.recv()).unwrap();
     assert!(matches!(first, OperatorMessage::Data(_)));
-    tx.send_barrier(1).unwrap();
+    rt.block_on(async {
+        tx.send_barrier(1).await.unwrap();
+    });
     let second = rt.block_on(rx.recv()).unwrap();
     assert!(matches!(second, OperatorMessage::Barrier { epoch: 1 }));
 }

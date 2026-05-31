@@ -50,13 +50,16 @@ impl Coordinator {
             .unwrap_or_default();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
         record.apply_assignments(assignments);
+        // Persist the job record to the metadata store BEFORE committing
+        // in-memory state.  A synchronous write ensures durability: if the
+        // store write fails, the caller receives an error and no in-memory
+        // state is leaked (B7 / ADR-12.9).
         if let Some(store) = &self.store {
-            // Non-blocking fire-and-forget: enqueue writes to background task.
-            // The coordinator lock is released immediately after enqueueing.
-            store.save_job(&record);
-            store.append_event(EventLogEvent::JobSubmitted {
+            let mut guard = store.inner();
+            guard.save_job(&record)?;
+            guard.append_event(EventLogEvent::JobSubmitted {
                 job_id: job_id.clone(),
-            });
+            })?;
         }
         let inserted_job_id = record.job_id().clone();
         self.jobs.insert(inserted_job_id.clone(), record.clone());
@@ -339,11 +342,20 @@ impl Coordinator {
     }
 
     /// Convert and submit a Krishiv physical DAG through the R2 scheduler.
+    /// Submit a `PhysicalPlan` as a job.
+    ///
+    /// AQE optimization is applied before submission: the `default_aqe_optimizer`
+    /// runs `CoalesceRule` (guarded by `StreamingAqeGuard` for streaming plans)
+    /// to stamp `coalesced_partition_count` on the plan.  With empty runtime
+    /// stats this is a no-op; re-optimization will be triggered when per-stage
+    /// stats become available.
     pub fn submit_physical_plan(
         &mut self,
         job_id: JobId,
         plan: &PhysicalPlan,
     ) -> SchedulerResult<SubmitOutcome> {
-        self.submit_job(job_spec_from_physical_plan(job_id, plan)?)
+        let aqe = krishiv_optimizer::default_aqe_optimizer();
+        let (optimized, _applied) = aqe.apply(plan.clone(), &[]);
+        self.submit_job(job_spec_from_physical_plan(job_id, &optimized)?)
     }
 }

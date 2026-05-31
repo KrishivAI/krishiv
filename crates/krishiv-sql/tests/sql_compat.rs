@@ -1,6 +1,6 @@
 //! SQL and function compatibility tests — R10 acceptance gate.
 //!
-//! Verifies SQL features listed in docs/architecture/compatibility-matrices.md.
+//! Verifies the currently supported SQL compatibility surface.
 
 use krishiv_sql::SqlEngine;
 

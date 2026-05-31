@@ -225,13 +225,6 @@ impl RegisterExecutorRequest {
         }
     }
 
-    /// Create a registration request with an explicit transport version.
-    #[must_use]
-    pub fn with_version(mut self, version: TransportVersion) -> Self {
-        self.version = version;
-        self
-    }
-
     /// Attach a W3C trace context for distributed tracing (R8 wiring).
     #[must_use]
     pub fn with_trace_context(mut self, ctx: TraceContext) -> Self {
@@ -254,6 +247,8 @@ impl RegisterExecutorRequest {
         self.trace_context.as_ref()
     }
 }
+
+impl_with_version!(RegisterExecutorRequest);
 
 /// Executor registration response sent from coordinator to executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,13 +274,6 @@ impl RegisterExecutorResponse {
             disposition,
             message: None,
         }
-    }
-
-    /// Override the transport version when mapping from a wire response.
-    #[must_use]
-    pub fn with_version(mut self, version: TransportVersion) -> Self {
-        self.version = version;
-        self
     }
 
     /// Attach a human-readable response message.
@@ -320,6 +308,8 @@ impl RegisterExecutorResponse {
         self.message.as_deref()
     }
 }
+
+impl_with_version!(RegisterExecutorResponse);
 
 /// Reference to a task attempt currently owned by an executor.
 #[derive(Debug, Clone, PartialEq, Eq)]

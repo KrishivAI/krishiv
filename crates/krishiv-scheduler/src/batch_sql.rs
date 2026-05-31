@@ -31,7 +31,7 @@ pub async fn execute_batch_sql_coordinated(
 ) -> SchedulerResult<BatchSqlOutcome> {
     let job_id = JobId::try_new(format!(
         "{BATCH_SQL_JOB_PREFIX}{}",
-        krishiv_async_util::unix_now_ms()
+        krishiv_common::async_util::unix_now_ms()
     ))
     .map_err(|error| SchedulerError::InvalidJob {
         message: error.to_string(),
@@ -53,6 +53,11 @@ pub async fn execute_batch_sql_coordinated(
         coord.submit_job(spec)?;
         coord.register_batch_sql_tables(job_id.clone(), tables.to_vec());
     }
+
+    let notify = {
+        let coord = coordinator.read().await;
+        coord.notify.clone()
+    };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
@@ -90,7 +95,20 @@ pub async fn execute_batch_sql_coordinated(
                 });
             }
             JobState::Accepted | JobState::Planning | JobState::Running => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                let state_changed = notify.notified();
+                let recheck_state = {
+                    let coord = coordinator.read().await;
+                    coord.job_snapshot(&job_id).map(|s| s.state())?
+                };
+                if matches!(
+                    recheck_state,
+                    JobState::Accepted | JobState::Planning | JobState::Running
+                ) {
+                    tokio::select! {
+                        _ = state_changed => {}
+                        _ = tokio::time::sleep_until(deadline) => {}
+                    }
+                }
             }
         }
     }

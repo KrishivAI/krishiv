@@ -41,6 +41,50 @@ impl Coordinator {
         res
     }
 
+    /// Async variant of [`Self::handle_checkpoint_ack`] for gRPC paths that
+    /// should not bounce checkpoint storage I/O through `block_in_place`.
+    pub async fn handle_checkpoint_ack_async(
+        &mut self,
+        ack: CheckpointAckRequest,
+    ) -> CheckpointAckResponse {
+        tracing::debug!(
+            job_id = %ack.job_id,
+            epoch = ack.epoch,
+            fencing_token = ack.fencing_token.as_u64(),
+            "handling checkpoint ack"
+        );
+
+        let job_id = ack.job_id.clone();
+
+        let res = match self.checkpoint_coordinators.get_mut(&job_id) {
+            None => CheckpointAckResponse::JobNotFound,
+            Some(coord) => {
+                let coordinator_token = coord.fencing_token();
+                if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
+                    return CheckpointAckResponse::StaleFencingToken {
+                        current_token: coordinator_token.as_u64(),
+                    };
+                }
+
+                let current_epoch = coord.current_epoch();
+                match coord.receive_ack_async(ack.clone()).await {
+                    Ok(true) => {
+                        self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
+                        CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        record_checkpoint_epoch(job_id.as_str(), ack.epoch);
+                        CheckpointAckResponse::Accepted
+                    }
+                    Ok(false) => CheckpointAckResponse::Accepted,
+                    Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+                }
+            }
+        };
+
+        self.notify.notify_waiters();
+
+        res
+    }
+
     /// Initiate a savepoint for a streaming job.
     ///
     /// Returns the savepoint epoch number.  Fails if no `CheckpointCoordinator`

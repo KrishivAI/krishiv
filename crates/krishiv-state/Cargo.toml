@@ -9,7 +9,8 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-krishiv-async-util = { path = "../krishiv-async-util" }
+krishiv-common = { path = "../krishiv-common" }
+thiserror = { workspace = true }
 redb.workspace = true
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

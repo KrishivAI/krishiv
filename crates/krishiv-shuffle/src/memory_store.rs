@@ -273,8 +273,8 @@ impl ShuffleStore for InMemoryShuffleStore {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
 
         let (from_spill, data) = {
-            let spilled_guard = shuffle_read_lock(&self.spilled)?;
             let parts_guard = shuffle_read_lock(&self.partitions)?;
+            let spilled_guard = shuffle_read_lock(&self.spilled)?;
             let hashes_guard = shuffle_read_lock(&self.content_hashes)?;
 
             if spilled_guard.contains(&key) {

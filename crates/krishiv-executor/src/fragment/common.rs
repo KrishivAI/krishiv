@@ -19,6 +19,13 @@ pub(crate) fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
     (!query.is_empty()).then_some(query)
 }
 
+pub(crate) fn task_fragment_body(fragment: &str) -> String {
+    krishiv_plan::TypedTaskFragment::decode_or_legacy(fragment)
+        .body
+        .trim()
+        .to_owned()
+}
+
 pub(crate) fn ensure_status_accepted_or_duplicate(
     disposition: TransportDisposition,
     state: TaskState,

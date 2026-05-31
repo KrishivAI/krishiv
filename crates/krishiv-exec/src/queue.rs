@@ -134,19 +134,12 @@ impl OperatorQueueReceiver {
 }
 
 /// Error from an `OperatorQueue` send/receive operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("operator queue closed")]
 pub enum OperatorQueueError {
     /// The other end of the queue has been dropped.
     Closed,
 }
-
-impl std::fmt::Display for OperatorQueueError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("operator queue closed")
-    }
-}
-
-impl std::error::Error for OperatorQueueError {}
 
 /// Create a bounded operator queue with `capacity` data slots.
 ///

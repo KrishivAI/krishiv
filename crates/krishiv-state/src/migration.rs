@@ -8,18 +8,11 @@ pub type StateMigrationFn =
     Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, StateMigrationError> + Send + Sync>;
 
 /// Migration failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("state migration error: {message}")]
 pub struct StateMigrationError {
     pub message: String,
 }
-
-impl std::fmt::Display for StateMigrationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "state migration error: {}", self.message)
-    }
-}
-
-impl std::error::Error for StateMigrationError {}
 
 /// Registry of `(from_version, to_version) -> migration fn`.
 #[derive(Default)]

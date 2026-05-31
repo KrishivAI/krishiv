@@ -38,53 +38,30 @@ use sha2::{Digest, Sha256};
 // ── Error / Result ────────────────────────────────────────────────────────────
 
 /// Errors from checkpoint storage operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
     /// Underlying storage I/O failed.
+    #[error("checkpoint storage error: {message}")]
     Storage { message: String },
     /// Epoch data failed integrity validation.
+    #[error("checkpoint epoch {epoch} is corrupt: {message}")]
     Corrupt { epoch: u64, message: String },
     /// Checkpoint metadata uses an unsupported format version.
+    #[error("unsupported checkpoint metadata version {version}")]
     IncompatibleVersion { version: u32 },
     /// No valid committed epoch exists to restore from.
+    #[error("no valid committed checkpoint epoch found")]
     NoValidEpoch,
     /// The checkpoint's fencing token predates the current coordinator generation.
-    ///
-    /// A stale coordinator must not commit checkpoint epochs — reject the write.
+    #[error("stale fencing token: metadata token {stored} < current coordinator token {current}")]
     StaleFencingToken { stored: u64, current: u64 },
     /// Attempted to write an epoch that is not newer than the latest committed epoch.
+    #[error("stale checkpoint epoch {attempted}: latest committed is {latest}")]
     StaleEpoch { attempted: u64, latest: u64 },
     /// The resolved path escapes the storage base directory (path-traversal attempt).
+    #[error("path escapes storage base directory: {path}")]
     InvalidPath { path: String },
 }
-
-impl std::fmt::Display for CheckpointError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Storage { message } => write!(f, "checkpoint storage error: {message}"),
-            Self::Corrupt { epoch, message } => {
-                write!(f, "checkpoint epoch {epoch} is corrupt: {message}")
-            }
-            Self::IncompatibleVersion { version } => {
-                write!(f, "unsupported checkpoint metadata version {version}")
-            }
-            Self::NoValidEpoch => write!(f, "no valid committed checkpoint epoch found"),
-            Self::StaleEpoch { attempted, latest } => write!(
-                f,
-                "stale checkpoint epoch {attempted}: latest committed is {latest}"
-            ),
-            Self::StaleFencingToken { stored, current } => write!(
-                f,
-                "stale fencing token: metadata token {stored} < current coordinator token {current}"
-            ),
-            Self::InvalidPath { path } => {
-                write!(f, "path escapes storage base directory: {path}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CheckpointError {}
 
 /// Convenience alias for checkpoint operation results.
 pub type CheckpointResult<T> = Result<T, CheckpointError>;
@@ -249,8 +226,7 @@ impl IntegrityManifest {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
-    format!("{hash:x}")
+    krishiv_common::hash::sha256_hex(data)
 }
 
 // ── Key path helpers ──────────────────────────────────────────────────────────
@@ -283,32 +259,49 @@ fn latest_epoch_hint_path(job_id: &str) -> String {
 
 /// Storage backend for checkpoint data.
 ///
-/// The trait is synchronous because most call sites (CheckpointCoordinator,
-/// executor checkpoint fanout) already drive it from blocking-friendly
-/// contexts.  Object-store backends that internally need a Tokio runtime
-/// (S3 / GCS clients use `reqwest`) MUST use [`run_blocking_on_tokio`] in
-/// their `write_bytes` / `read_bytes` / `list_dir` / `delete_prefix` impls,
-/// which uses `block_in_place` to avoid the worker-thread deadlock that
-/// `futures::executor::block_on` produces (D4).
+/// The async methods are the primary API for scheduler/executor paths that
+/// already run inside Tokio. Synchronous methods remain as compatibility
+/// wrappers for tests and blocking-friendly call sites.
+#[async_trait::async_trait]
 pub trait CheckpointStorage: Send + Sync {
+    /// Async write `data` to `path`.  Overwrites if it already exists.
+    async fn write_bytes_async(&self, path: &str, data: &[u8]) -> CheckpointResult<()>;
+
+    /// Async read the bytes stored at `path`. Returns `None` if absent.
+    async fn read_bytes_async(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>>;
+
+    /// Async list immediate children of `prefix` one level deep.
+    async fn list_dir_async(&self, prefix: &str) -> CheckpointResult<Vec<String>>;
+
+    /// Async recursively delete everything under `prefix`.
+    async fn delete_prefix_async(&self, prefix: &str) -> CheckpointResult<()>;
+
     /// Write `data` to `path`.  Overwrites if it already exists.
     ///
     /// Implementations should write atomically (temp-file + rename) to prevent
     /// partial reads of in-progress writes.
-    fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()>;
+    fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
+        run_blocking_on_tokio("checkpoint write_bytes", self.write_bytes_async(path, data))
+    }
 
     /// Read the bytes stored at `path`.  Returns `None` if the path does not exist.
-    fn read_bytes(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>>;
+    fn read_bytes(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        run_blocking_on_tokio("checkpoint read_bytes", self.read_bytes_async(path))
+    }
 
     /// List immediate children of `prefix` (directory listing one level deep).
     ///
     /// Returns relative names (not full paths).  Returns an empty `Vec` if the
     /// prefix does not exist.
-    fn list_dir(&self, prefix: &str) -> CheckpointResult<Vec<String>>;
+    fn list_dir(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
+        run_blocking_on_tokio("checkpoint list_dir", self.list_dir_async(prefix))
+    }
 
     /// Recursively delete everything under `prefix`.  No-op if `prefix` does
     /// not exist.
-    fn delete_prefix(&self, prefix: &str) -> CheckpointResult<()>;
+    fn delete_prefix(&self, prefix: &str) -> CheckpointResult<()> {
+        run_blocking_on_tokio("checkpoint delete_prefix", self.delete_prefix_async(prefix))
+    }
 }
 
 /// Run an async block from a synchronous `CheckpointStorage` impl without
@@ -403,6 +396,32 @@ pub fn write_epoch_metadata(
     // after write_manifest() succeeds to guarantee the hint only points to sealed epochs.
 }
 
+/// Async variant of [`write_epoch_metadata`].
+pub async fn write_epoch_metadata_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    metadata: &CheckpointMetadata,
+) -> CheckpointResult<()> {
+    match latest_valid_epoch_async(storage, job_id).await {
+        Ok(latest) if epoch <= latest => {
+            return Err(CheckpointError::StaleEpoch {
+                attempted: epoch,
+                latest,
+            });
+        }
+        Ok(_) => {}
+        Err(CheckpointError::NoValidEpoch) => {}
+        Err(e) => return Err(e),
+    }
+    let json = serde_json::to_vec_pretty(metadata).map_err(|e| CheckpointError::Storage {
+        message: format!("metadata serialize: {e}"),
+    })?;
+    storage
+        .write_bytes_async(&metadata_path(job_id, epoch), &json)
+        .await
+}
+
 /// Update the fast-path epoch hint to `epoch`.
 ///
 /// This must be called **last** — after both [`write_epoch_metadata`] and
@@ -424,6 +443,20 @@ pub fn write_epoch_hint(
     )
 }
 
+/// Async variant of [`write_epoch_hint`].
+pub async fn write_epoch_hint_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+) -> CheckpointResult<()> {
+    storage
+        .write_bytes_async(
+            &latest_epoch_hint_path(job_id),
+            epoch.to_string().as_bytes(),
+        )
+        .await
+}
+
 /// Read and deserialize `metadata.json` for `epoch`.  Returns `None` if absent.
 pub fn read_epoch_metadata(
     storage: &dyn CheckpointStorage,
@@ -431,6 +464,28 @@ pub fn read_epoch_metadata(
     epoch: u64,
 ) -> CheckpointResult<Option<CheckpointMetadata>> {
     match storage.read_bytes(&metadata_path(job_id, epoch))? {
+        None => Ok(None),
+        Some(bytes) => {
+            let meta: CheckpointMetadata =
+                serde_json::from_slice(&bytes).map_err(|e| CheckpointError::Corrupt {
+                    epoch,
+                    message: format!("metadata JSON parse: {e}"),
+                })?;
+            Ok(Some(meta))
+        }
+    }
+}
+
+/// Async variant of [`read_epoch_metadata`].
+pub async fn read_epoch_metadata_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+) -> CheckpointResult<Option<CheckpointMetadata>> {
+    match storage
+        .read_bytes_async(&metadata_path(job_id, epoch))
+        .await?
+    {
         None => Ok(None),
         Some(bytes) => {
             let meta: CheckpointMetadata =
@@ -455,6 +510,20 @@ pub fn write_operator_snapshot(
     storage.write_bytes(&snapshot_path(job_id, epoch, op_id, task_id), bytes)
 }
 
+/// Async variant of [`write_operator_snapshot`].
+pub async fn write_operator_snapshot_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    op_id: &str,
+    task_id: &str,
+    bytes: &[u8],
+) -> CheckpointResult<()> {
+    storage
+        .write_bytes_async(&snapshot_path(job_id, epoch, op_id, task_id), bytes)
+        .await
+}
+
 /// Read an operator state snapshot.  Returns `None` if absent.
 pub fn read_operator_snapshot(
     storage: &dyn CheckpointStorage,
@@ -464,6 +533,19 @@ pub fn read_operator_snapshot(
     task_id: &str,
 ) -> CheckpointResult<Option<Vec<u8>>> {
     storage.read_bytes(&snapshot_path(job_id, epoch, op_id, task_id))
+}
+
+/// Async variant of [`read_operator_snapshot`].
+pub async fn read_operator_snapshot_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    op_id: &str,
+    task_id: &str,
+) -> CheckpointResult<Option<Vec<u8>>> {
+    storage
+        .read_bytes_async(&snapshot_path(job_id, epoch, op_id, task_id))
+        .await
 }
 
 /// Write the integrity manifest for `epoch`.
@@ -478,6 +560,18 @@ pub fn write_manifest(
     manifest: &IntegrityManifest,
 ) -> CheckpointResult<()> {
     storage.write_bytes(&manifest_path(job_id, epoch), &manifest.serialize())
+}
+
+/// Async variant of [`write_manifest`].
+pub async fn write_manifest_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    manifest: &IntegrityManifest,
+) -> CheckpointResult<()> {
+    storage
+        .write_bytes_async(&manifest_path(job_id, epoch), &manifest.serialize())
+        .await
 }
 
 /// Validate the integrity manifest for `epoch`.
@@ -531,6 +625,54 @@ pub fn validate_epoch(
     Ok(true)
 }
 
+/// Async variant of [`validate_epoch`].
+pub async fn validate_epoch_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+) -> CheckpointResult<bool> {
+    let manifest_bytes = match storage
+        .read_bytes_async(&manifest_path(job_id, epoch))
+        .await?
+    {
+        None => return Ok(false),
+        Some(b) => b,
+    };
+    let manifest =
+        IntegrityManifest::deserialize(&manifest_bytes).map_err(|e| CheckpointError::Corrupt {
+            epoch,
+            message: format!("manifest parse: {e}"),
+        })?;
+    for (path, expected_hex) in &manifest.entries {
+        let full = format!("{}/{path}", epoch_dir(job_id, epoch));
+        match storage.read_bytes_async(&full).await? {
+            None => return Ok(false),
+            Some(data) => {
+                use std::io::Read as _;
+                let mut reader = std::io::BufReader::new(data.as_slice());
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = reader
+                        .read(&mut buf)
+                        .map_err(|e| CheckpointError::Storage {
+                            message: format!("reading {full} for hash: {e}"),
+                        })?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let hash = format!("{:x}", hasher.finalize());
+                if hash != *expected_hex {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Return all epoch numbers that have a valid integrity manifest, in ascending order.
 ///
 /// Epochs with missing or corrupt manifests are silently excluded.
@@ -559,6 +701,32 @@ pub fn list_valid_epochs(
     Ok(valid)
 }
 
+/// Async variant of [`list_valid_epochs`].
+pub async fn list_valid_epochs_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+) -> CheckpointResult<Vec<u64>> {
+    let checkpoint_prefix = format!("{job_id}/checkpoints");
+    let epoch_dirs = storage.list_dir_async(&checkpoint_prefix).await?;
+    let mut valid = Vec::new();
+    for name in epoch_dirs {
+        let Ok(epoch) = name.parse::<u64>() else {
+            tracing::warn!(epoch_dir = %name, "skipping non-numeric checkpoint epoch directory");
+            continue;
+        };
+        match validate_epoch_async(storage, job_id, epoch).await {
+            Ok(true) => valid.push(epoch),
+            Ok(false) => tracing::warn!(job_id, epoch, "excluding invalid checkpoint epoch"),
+            Err(e) => {
+                tracing::warn!(job_id, epoch, error = %e, "checkpoint epoch validation failed");
+                continue;
+            }
+        }
+    }
+    valid.sort_unstable();
+    Ok(valid)
+}
+
 /// Delete all data for `epoch` from storage.
 pub fn delete_epoch(
     storage: &dyn CheckpointStorage,
@@ -566,6 +734,15 @@ pub fn delete_epoch(
     epoch: u64,
 ) -> CheckpointResult<()> {
     storage.delete_prefix(&epoch_dir(job_id, epoch))
+}
+
+/// Async variant of [`delete_epoch`].
+pub async fn delete_epoch_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+) -> CheckpointResult<()> {
+    storage.delete_prefix_async(&epoch_dir(job_id, epoch)).await
 }
 
 /// Find the most recent valid epoch.  Returns `Err(NoValidEpoch)` if none.
@@ -583,11 +760,50 @@ pub fn latest_valid_epoch(storage: &dyn CheckpointStorage, job_id: &str) -> Chec
         .ok_or(CheckpointError::NoValidEpoch)
 }
 
+/// Async variant of [`latest_valid_epoch`].
+pub async fn latest_valid_epoch_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+) -> CheckpointResult<u64> {
+    if let Some(hinted) = read_latest_epoch_hint_async(storage, job_id).await?
+        && validate_epoch_async(storage, job_id, hinted).await?
+    {
+        return Ok(hinted);
+    }
+
+    let epochs = list_valid_epochs_async(storage, job_id).await?;
+    epochs
+        .into_iter()
+        .last()
+        .ok_or(CheckpointError::NoValidEpoch)
+}
+
 fn read_latest_epoch_hint(
     storage: &dyn CheckpointStorage,
     job_id: &str,
 ) -> CheckpointResult<Option<u64>> {
     let Some(bytes) = storage.read_bytes(&latest_epoch_hint_path(job_id))? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|error| CheckpointError::Storage {
+        message: format!("latest epoch hint is not valid UTF-8: {error}"),
+    })?;
+    text.trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| CheckpointError::Storage {
+            message: format!("latest epoch hint is not a valid u64: {error}"),
+        })
+}
+
+async fn read_latest_epoch_hint_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+) -> CheckpointResult<Option<u64>> {
+    let Some(bytes) = storage
+        .read_bytes_async(&latest_epoch_hint_path(job_id))
+        .await?
+    else {
         return Ok(None);
     };
     let text = std::str::from_utf8(&bytes).map_err(|error| CheckpointError::Storage {
@@ -851,6 +1067,7 @@ pub fn delete_savepoint(
 /// All writes use temp-file + rename for atomicity, matching the pattern used
 /// by `RocksDbStateBackend`.  Production object-store storage wraps
 /// `object_store::ObjectStore` behind the [`CheckpointStorage`] trait.
+#[derive(Debug, Clone)]
 pub struct LocalFsCheckpointStorage {
     base_dir: PathBuf,
 }
@@ -935,7 +1152,49 @@ impl Drop for EphemeralCheckpointStorage {
     }
 }
 
+#[async_trait::async_trait]
 impl CheckpointStorage for LocalFsCheckpointStorage {
+    async fn write_bytes_async(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
+        let storage = self.clone();
+        let path = path.to_owned();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || storage.write_bytes(&path, &data))
+            .await
+            .map_err(|e| CheckpointError::Storage {
+                message: format!("checkpoint write task join failed: {e}"),
+            })?
+    }
+
+    async fn read_bytes_async(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        let storage = self.clone();
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || storage.read_bytes(&path))
+            .await
+            .map_err(|e| CheckpointError::Storage {
+                message: format!("checkpoint read task join failed: {e}"),
+            })?
+    }
+
+    async fn list_dir_async(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
+        let storage = self.clone();
+        let prefix = prefix.to_owned();
+        tokio::task::spawn_blocking(move || storage.list_dir(&prefix))
+            .await
+            .map_err(|e| CheckpointError::Storage {
+                message: format!("checkpoint list task join failed: {e}"),
+            })?
+    }
+
+    async fn delete_prefix_async(&self, prefix: &str) -> CheckpointResult<()> {
+        let storage = self.clone();
+        let prefix = prefix.to_owned();
+        tokio::task::spawn_blocking(move || storage.delete_prefix(&prefix))
+            .await
+            .map_err(|e| CheckpointError::Storage {
+                message: format!("checkpoint delete task join failed: {e}"),
+            })?
+    }
+
     fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
         let full = self.full_path(path)?;
         if let Some(parent) = full.parent() {
@@ -1013,7 +1272,24 @@ impl CheckpointStorage for LocalFsCheckpointStorage {
     }
 }
 
+#[async_trait::async_trait]
 impl CheckpointStorage for EphemeralCheckpointStorage {
+    async fn write_bytes_async(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
+        self.inner.write_bytes_async(path, data).await
+    }
+
+    async fn read_bytes_async(&self, path: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        self.inner.read_bytes_async(path).await
+    }
+
+    async fn list_dir_async(&self, prefix: &str) -> CheckpointResult<Vec<String>> {
+        self.inner.list_dir_async(prefix).await
+    }
+
+    async fn delete_prefix_async(&self, prefix: &str) -> CheckpointResult<()> {
+        self.inner.delete_prefix_async(prefix).await
+    }
+
     fn write_bytes(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
         self.inner.write_bytes(path, data)
     }

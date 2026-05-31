@@ -909,6 +909,17 @@ pub fn default_logical_optimizer() -> Optimizer {
     optimizer
 }
 
+/// Default AQE optimizer with guarded coalescing and the streaming guard.
+///
+/// Includes `CoalesceRule` as a guarded rule (skipped for streaming plans).
+/// Rules that require runtime statistics will be no-ops until stats feed
+/// is wired (see `AqeOptimizer::apply`).
+pub fn default_aqe_optimizer() -> AqeOptimizer {
+    let mut optimizer = AqeOptimizer::new();
+    optimizer.add_guarded_rule(Box::new(CoalesceRule::new(64 * 1024 * 1024)));
+    optimizer
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

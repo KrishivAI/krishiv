@@ -77,28 +77,17 @@ impl RawCdcRecord {
 }
 
 /// Error returned when a Debezium JSON envelope cannot be parsed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DebeziumParseError {
+    #[error("invalid Debezium JSON: {0}")]
     InvalidJson(String),
+    #[error("Debezium envelope missing op field")]
     MissingOp,
+    #[error("unknown Debezium op '{0}'")]
     UnknownOp(String),
+    #[error("Debezium envelope missing required payload for {op:?}")]
     MissingPayload { op: CdcOp },
 }
-
-impl std::fmt::Display for DebeziumParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidJson(e) => write!(f, "invalid Debezium JSON: {e}"),
-            Self::MissingOp => f.write_str("Debezium envelope missing op field"),
-            Self::UnknownOp(op) => write!(f, "unknown Debezium op '{op}'"),
-            Self::MissingPayload { op } => {
-                write!(f, "Debezium envelope missing required payload for {op:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DebeziumParseError {}
 
 /// Deserialize a Debezium JSON envelope into a `CdcEvent`.
 ///
@@ -588,16 +577,9 @@ fn merge_string_schemas(left: &Schema, right: &Schema) -> Arc<Schema> {
 // ---------------------------------------------------------------------------
 
 /// An error type for CDC batch building.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("CDC batch error: {0}")]
 pub struct CdcBatchError(pub String);
-
-impl std::fmt::Display for CdcBatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CDC batch error: {}", self.0)
-    }
-}
-
-impl std::error::Error for CdcBatchError {}
 
 /// Build a single columnar Arrow `RecordBatch` from a slice of `CdcEvent`s.
 ///

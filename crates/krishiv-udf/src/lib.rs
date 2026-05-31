@@ -22,32 +22,21 @@ use arrow::record_batch::RecordBatch;
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during UDF execution.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum UdfError {
     /// An error originating from the Arrow library.
+    #[error("Arrow error: {0}")]
     Arrow(String),
     /// A general execution error.
+    #[error("Execution error: {message}")]
     Execution { message: String },
     /// A panic was caught during UDF execution.
+    #[error("Panic: {0}")]
     Panic(String),
     /// An invalid argument was supplied to the UDF.
+    #[error("Invalid argument: {message}")]
     InvalidArgument { message: String },
 }
-
-impl fmt::Display for UdfError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            UdfError::Arrow(msg) => write!(f, "Arrow error: {msg}"),
-            UdfError::Execution { message } => write!(f, "Execution error: {message}"),
-            UdfError::Panic(msg) => write!(f, "Panic: {msg}"),
-            UdfError::InvalidArgument { message } => {
-                write!(f, "Invalid argument: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for UdfError {}
 
 impl From<arrow::error::ArrowError> for UdfError {
     fn from(e: arrow::error::ArrowError) -> Self {

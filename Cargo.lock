@@ -3846,8 +3846,8 @@ dependencies = [
  "arrow",
  "dotenvy",
  "krishiv-api",
- "krishiv-async-util",
  "krishiv-checkpoint",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-executor",
  "krishiv-flight-sql",
@@ -3860,6 +3860,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-shuffle",
  "krishiv-udf",
+ "libc",
  "parquet 58.3.0",
  "serde",
  "serde_json",
@@ -3879,6 +3880,7 @@ dependencies = [
  "fastembed",
  "futures",
  "hex",
+ "krishiv-common",
  "krishiv-plan",
  "krishiv-vector-sinks",
  "mockito",
@@ -3888,6 +3890,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tiktoken-rs",
  "tokio",
  "tracing",
@@ -3900,7 +3903,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
- "krishiv-async-util",
+ "krishiv-common",
  "krishiv-exec",
  "krishiv-flight-sql",
  "krishiv-governance",
@@ -3908,20 +3911,13 @@ dependencies = [
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
- "krishiv-sql-policy",
  "krishiv-state",
  "krishiv-udf",
  "parquet 58.3.0",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tonic 0.14.6",
-]
-
-[[package]]
-name = "krishiv-async-util"
-version = "0.1.0"
-dependencies = [
- "tokio",
 ]
 
 [[package]]
@@ -3945,6 +3941,7 @@ dependencies = [
  "reqwest 0.13.3",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "url",
  "wiremock",
@@ -3955,6 +3952,7 @@ name = "krishiv-cep"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3963,6 +3961,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "krishiv-checkpoint",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-governance",
  "krishiv-operator",
@@ -3975,17 +3974,29 @@ dependencies = [
 name = "krishiv-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
- "krishiv-async-util",
+ "krishiv-common",
  "krishiv-state",
  "object_store",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "krishiv-common"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "hex",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -3994,7 +4005,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
- "krishiv-async-util",
+ "krishiv-common",
  "krishiv-exec",
  "krishiv-lakehouse",
  "krishiv-proto",
@@ -4006,6 +4017,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -4021,6 +4033,7 @@ dependencies = [
  "krishiv-plan",
  "krishiv-state",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -4033,8 +4046,8 @@ dependencies = [
  "axum 0.8.9",
  "dashmap",
  "krishiv-ai",
- "krishiv-async-util",
  "krishiv-checkpoint",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-exec",
  "krishiv-metrics",
@@ -4065,11 +4078,11 @@ dependencies = [
  "bytes",
  "futures",
  "krishiv-api",
+ "krishiv-common",
  "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
  "krishiv-sql",
- "krishiv-sql-policy",
  "lru",
  "prost 0.14.3",
  "sha2",
@@ -4083,12 +4096,15 @@ name = "krishiv-governance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "dashmap",
+ "krishiv-common",
  "mockito",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
@@ -4102,7 +4118,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "iceberg",
- "krishiv-async-util",
  "krishiv-connectors",
  "parquet 58.3.0",
  "rdkafka",
@@ -4110,6 +4125,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "url",
@@ -4127,6 +4143,7 @@ dependencies = [
  "opentelemetry_sdk",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tonic 0.14.6",
  "tracing",
@@ -4148,6 +4165,7 @@ dependencies = [
  "kube",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -4167,6 +4185,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4178,6 +4197,7 @@ dependencies = [
  "prost-types 0.14.3",
  "protoc-bin-vendored",
  "serde",
+ "thiserror 1.0.69",
  "tonic 0.14.6",
  "tonic-prost",
  "tonic-prost-build",
@@ -4191,6 +4211,7 @@ dependencies = [
  "krishiv-ai",
  "krishiv-api",
  "krishiv-catalog",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-exec",
  "krishiv-governance",
@@ -4218,7 +4239,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
- "krishiv-async-util",
+ "krishiv-common",
  "krishiv-exec",
  "krishiv-executor",
  "krishiv-flight-sql",
@@ -4232,6 +4253,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tonic 0.14.6",
  "tracing",
@@ -4247,11 +4269,12 @@ dependencies = [
  "dashmap",
  "etcd-client",
  "futures",
- "krishiv-async-util",
  "krishiv-checkpoint",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-governance",
  "krishiv-metrics",
+ "krishiv-optimizer",
  "krishiv-plan",
  "krishiv-proto",
  "krishiv-shuffle",
@@ -4282,6 +4305,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -4296,6 +4320,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "krishiv-common",
  "lz4_flex 0.11.6",
  "object_store",
  "parquet 58.3.0",
@@ -4319,24 +4344,15 @@ dependencies = [
  "datafusion",
  "krishiv-catalog",
  "krishiv-cep",
+ "krishiv-common",
+ "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-optimizer",
  "krishiv-plan",
  "krishiv-udf",
  "regex",
  "sqlparser",
- "tokio",
-]
-
-[[package]]
-name = "krishiv-sql-policy"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "krishiv-governance",
- "krishiv-sql",
- "sha2",
- "sqlparser",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -4344,12 +4360,13 @@ dependencies = [
 name = "krishiv-state"
 version = "0.1.0"
 dependencies = [
- "krishiv-async-util",
+ "krishiv-common",
  "redb",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "twox-hash",
@@ -4360,6 +4377,7 @@ name = "krishiv-udf"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4373,18 +4391,9 @@ dependencies = [
  "krishiv-scheduler",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tower 0.5.3",
-]
-
-[[package]]
-name = "krishiv-upgrade-tests"
-version = "0.1.0"
-dependencies = [
- "krishiv-catalog",
- "krishiv-checkpoint",
- "krishiv-connectors",
- "serde_json",
 ]
 
 [[package]]
@@ -4395,6 +4404,7 @@ dependencies = [
  "async-trait",
  "futures",
  "hex",
+ "krishiv-common",
  "mockito",
  "parquet 58.3.0",
  "qdrant-client",
@@ -4404,6 +4414,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

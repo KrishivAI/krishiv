@@ -1,5 +1,5 @@
 use super::*;
-use krishiv_async_util::unix_now_ms;
+use krishiv_common::async_util::unix_now_ms;
 
 fn ns(op: &str, name: &str) -> Namespace {
     Namespace::new(op, name)
@@ -746,7 +746,7 @@ fn p0_7_redb_load_snapshot_failure_leaves_backend_empty() {
 
 #[test]
 fn p0_8_unix_now_ms_checked_returns_positive() {
-    let now = krishiv_async_util::unix_now_ms_checked();
+    let now = krishiv_common::async_util::unix_now_ms_checked();
     assert!(now.is_ok());
     assert!(now.unwrap() > 0);
 }
@@ -992,7 +992,7 @@ fn ttl_set_watermark_drives_event_time_expiry() {
 
     // Set watermark far into the future — event time expiry check will see the
     // entry as expired because watermark > expires_at.
-    let future_ms = krishiv_async_util::unix_now_ms() + 10_000;
+    let future_ms = krishiv_common::async_util::unix_now_ms() + 10_000;
     ttl.set_watermark(future_ms);
     // Now get() should return None because the watermark makes the entry appear
     // expired.
@@ -1007,7 +1007,7 @@ fn ttl_set_watermark_purge_uses_event_time() {
     ttl.put(&n, b"k".to_vec(), b"val".to_vec()).unwrap();
 
     // Set watermark far into the future so the entry looks expired.
-    let future_ms = krishiv_async_util::unix_now_ms() + 10_000;
+    let future_ms = krishiv_common::async_util::unix_now_ms() + 10_000;
     ttl.set_watermark(future_ms);
     let evicted = ttl.purge_expired().unwrap();
     assert_eq!(evicted, 1);

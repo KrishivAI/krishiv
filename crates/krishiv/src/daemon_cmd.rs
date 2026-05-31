@@ -1,6 +1,6 @@
 //! Long-running daemon subcommands (`krishiv coordinator`, `krishiv executor`, …).
 
-use krishiv_async_util::block_on;
+use krishiv_common::async_util::block_on;
 use krishiv_scheduler::{
     coordinator_daemon_help, job_coordinator_daemon_help, parse_coordinator_daemon_config,
     parse_job_coordinator_daemon_config, run_clusterd_daemon, run_job_coordinator_daemon,

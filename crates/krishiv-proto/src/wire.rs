@@ -1,8 +1,5 @@
 //! Generated protobuf wire conversions.
 
-use std::error::Error;
-use std::fmt;
-
 use crate::checkpoint::{CheckpointAckRequest, CheckpointAckResponse, CheckpointSourceOffset};
 use crate::executor::{
     DeregisterExecutorRequest, DeregisterExecutorResponse, ExecutorDescriptor,
@@ -25,7 +22,8 @@ pub mod v1 {
 }
 
 /// Error raised when a protobuf message cannot be converted to a domain contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
 pub struct WireError {
     message: String,
 }
@@ -42,14 +40,6 @@ impl WireError {
         &self.message
     }
 }
-
-impl fmt::Display for WireError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl Error for WireError {}
 
 type WireResult<T> = Result<T, WireError>;
 
@@ -836,9 +826,14 @@ fn input_partition_descriptor_to_wire(
 fn input_partition_descriptor_from_wire(
     value: v1::InputPartitionDescriptor,
 ) -> WireResult<InputPartitionDescriptor> {
-    match v1::InputPartitionDescriptorKind::try_from(value.kind)
-        .unwrap_or(v1::InputPartitionDescriptorKind::Unspecified)
-    {
+    let kind = v1::InputPartitionDescriptorKind::try_from(value.kind).map_err(|_| {
+        WireError::new(format!(
+            "invalid or unrecognized input partition descriptor kind ID: {}",
+            value.kind
+        ))
+    })?;
+
+    match kind {
         v1::InputPartitionDescriptorKind::Unspecified => Err(WireError::new(
             "input partition descriptor kind must be specified",
         )),
@@ -979,9 +974,14 @@ fn output_contract_descriptor_to_wire(
 fn output_contract_descriptor_from_wire(
     value: v1::OutputContractDescriptor,
 ) -> WireResult<OutputContractDescriptor> {
-    match v1::OutputContractDescriptorKind::try_from(value.kind)
-        .unwrap_or(v1::OutputContractDescriptorKind::Unspecified)
-    {
+    let kind = v1::OutputContractDescriptorKind::try_from(value.kind).map_err(|_| {
+        WireError::new(format!(
+            "invalid or unrecognized output contract descriptor kind ID: {}",
+            value.kind
+        ))
+    })?;
+
+    match kind {
         v1::OutputContractDescriptorKind::Unspecified => Err(WireError::new(
             "output contract descriptor kind must be specified",
         )),

@@ -19,22 +19,13 @@ use dashmap::DashMap;
 use reqwest::Client;
 
 /// Errors from schema registry operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SchemaRegistryError {
+    #[error("schema registry http: {0}")]
     Http(String),
+    #[error("schema registry decode: {0}")]
     Decode(String),
 }
-
-impl std::fmt::Display for SchemaRegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Http(m) => write!(f, "schema registry http: {m}"),
-            Self::Decode(m) => write!(f, "schema registry decode: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for SchemaRegistryError {}
 
 pub type SchemaRegistryResult<T> = Result<T, SchemaRegistryError>;
 

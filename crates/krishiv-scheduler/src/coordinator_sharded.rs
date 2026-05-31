@@ -3,19 +3,18 @@
 //! Coordinator maintains a snapshot view for convenience. The dual sync dance
 //! is transitional; hot paths should migrate to direct inner access + Notify
 //! signaling to eliminate block_on and reduce lock contention.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::checkpoint::CheckpointCoordinator;
 use crate::heartbeat::ExecutorRegistry;
-use krishiv_proto::{CoordinatorState, ExecutorId};
+use krishiv_proto::{CheckpointAckRequest, CheckpointAckResponse, CoordinatorState, ExecutorId};
 use tokio::sync::Notify;
 
 /// Executor-facing state guarded by a dedicated `RwLock`.
 #[derive(Clone, Debug)]
-pub(crate) struct ExecutorInner {
+pub struct ExecutorInner {
     pub executors: ExecutorRegistry,
     pub state: CoordinatorState,
     pub ticks_since_restart: u64,
@@ -25,9 +24,29 @@ pub(crate) struct ExecutorInner {
     pub notify: Arc<Notify>,
 }
 
+impl ExecutorInner {
+    /// Handle a heartbeat on the executor inner state — updates the registry
+    /// and returns the new lease generation.
+    pub fn handle_heartbeat(
+        &mut self,
+        heartbeat: krishiv_proto::ExecutorHeartbeat,
+    ) -> Result<krishiv_proto::LeaseGeneration, crate::SchedulerError> {
+        let executor_id = heartbeat.executor_id().clone();
+        let fallback_lease = heartbeat.lease_generation();
+        self.executors.heartbeat(heartbeat)?;
+        let lease_generation = self
+            .executors
+            .find_executor(&executor_id)
+            .map(|e| e.lease_generation())
+            .unwrap_or(fallback_lease);
+        self.notify.notify_waiters();
+        Ok(lease_generation)
+    }
+}
+
 /// Checkpoint-facing state guarded by a dedicated `RwLock`.
 #[derive(Clone, Debug)]
-pub(crate) struct CheckpointInner {
+pub struct CheckpointInner {
     pub coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     pub notify_sent: HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
     pub barrier_sent: HashSet<(krishiv_proto::JobId, u64)>,
@@ -44,6 +63,42 @@ impl CheckpointInner {
             notify: Arc::new(Notify::new()),
         }
     }
+
+    /// Handle a checkpoint ack directly on the inner state, bypassing the full
+    /// coordinator lock.
+    pub fn handle_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
+        let job_id = ack.job_id.clone();
+        let res = match self.coordinators.get_mut(&job_id) {
+            None => CheckpointAckResponse::JobNotFound,
+            Some(coord) => {
+                let coordinator_token = coord.fencing_token();
+                if ack.fencing_token.as_u64() != coordinator_token.as_u64() {
+                    return CheckpointAckResponse::StaleFencingToken {
+                        current_token: coordinator_token.as_u64(),
+                    };
+                }
+                let current_epoch = coord.current_epoch();
+                match coord.receive_ack(ack.clone()) {
+                    Ok(true) => {
+                        self.clear_notify_for_epoch(&job_id, ack.epoch);
+                        // Metrics: caller may track CHECKPOINT_EPOCHS_TOTAL externally
+                        CheckpointAckResponse::Accepted
+                    }
+                    Ok(false) => CheckpointAckResponse::Accepted,
+                    Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
+                }
+            }
+        };
+        self.notify.notify_waiters();
+        res
+    }
+
+    fn clear_notify_for_epoch(&mut self, job_id: &krishiv_proto::JobId, epoch: u64) {
+        self.notify_sent
+            .retain(|(jid, _, e)| jid != job_id || *e != epoch);
+        self.barrier_sent
+            .retain(|(jid, e)| jid != job_id || *e != epoch);
+    }
 }
 
 /// The sync helper functions below are transitional. Hot paths should prefer
@@ -51,8 +106,45 @@ impl CheckpointInner {
 /// the inner locks. The long-term goal is for ExecutorInner/CheckpointInner
 /// (plus Notify) to be the sole source of truth.
 
+// ── Executor sync helpers (G3) ──────────────────────────────────────────────
+
+/// Synchronise executor state FROM the inner lock INTO the Coordinator fields.
+/// Call after the inner lock's executor registry has been mutated (e.g. via
+/// heartbeat fast path) to propagate the updated lease/tick to the outer
+/// coordinator.
+pub(crate) fn sync_executor_from_inner(
+    inner: &ExecutorInner,
+    dest_executors: &mut ExecutorRegistry,
+    dest_state: &mut CoordinatorState,
+    dest_ticks: &mut u64,
+    dest_recovering: &mut bool,
+) {
+    dest_executors.clone_from(&inner.executors);
+    *dest_state = inner.state;
+    *dest_ticks = inner.ticks_since_restart;
+    *dest_recovering = inner.recovering;
+}
+
+/// Synchronise executor state FROM the Coordinator fields INTO the inner lock.
+/// Call after any coordinator mutation that modifies the executor registry
+/// (register, deregister, advance_heartbeat_clock) so the inner lock's hot-path
+/// readers see consistent state.
+pub(crate) fn sync_executor_to_inner(
+    src_executors: &ExecutorRegistry,
+    src_state: CoordinatorState,
+    src_ticks: u64,
+    src_recovering: bool,
+    inner: &mut ExecutorInner,
+) {
+    inner.executors.clone_from(src_executors);
+    inner.state = src_state;
+    inner.ticks_since_restart = src_ticks;
+    inner.recovering = src_recovering;
+}
+
+// ── Checkpoint sync helpers (G3) ───────────────────────────────────────────
+
 /// Synchronise checkpoint state FROM the inner lock INTO the Coordinator fields.
-#[allow(dead_code)]
 pub(crate) fn sync_checkpoint_from_inner(
     inner: &CheckpointInner,
     dest_coordinators: &mut HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
@@ -65,7 +157,6 @@ pub(crate) fn sync_checkpoint_from_inner(
 }
 
 /// Synchronise checkpoint state FROM the Coordinator fields INTO the inner lock.
-#[allow(dead_code)]
 pub(crate) fn sync_checkpoint_to_inner(
     src_coordinators: &HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
     src_notify: &HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,

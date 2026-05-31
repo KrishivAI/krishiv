@@ -8,7 +8,7 @@ use krishiv_api::{
     InProcessCluster, LocalWindowExecutionSpec, LocalWindowKind, QueryResult, Session,
     SessionBuilder,
 };
-use krishiv_async_util::block_on;
+use krishiv_common::async_util::block_on;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::cli::CliResponse;

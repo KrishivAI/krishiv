@@ -50,12 +50,13 @@ impl SingleNodeLeader {
     }
 
     pub fn fencing_token(&self) -> u64 {
-        self.fencing_token.load(std::sync::atomic::Ordering::SeqCst)
+        self.fencing_token
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn bump_fencing_token(&self) -> u64 {
         self.fencing_token
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .saturating_add(1)
     }
 }

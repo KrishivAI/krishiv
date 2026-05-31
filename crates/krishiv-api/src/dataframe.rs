@@ -121,7 +121,7 @@ impl DataFrame {
 
     /// Explain the current plan.
     pub fn explain(&self) -> Result<String> {
-        krishiv_async_util::block_on(self.explain_async())
+        krishiv_common::async_util::block_on(self.explain_async())
     }
 
     pub async fn explain_async(&self) -> Result<String> {
@@ -151,7 +151,7 @@ impl DataFrame {
 
     /// Collect results.
     pub fn collect(&self) -> Result<QueryResult> {
-        krishiv_async_util::block_on(self.collect_async())
+        krishiv_common::async_util::block_on(self.collect_async())
     }
 
     /// Asynchronously collect results.

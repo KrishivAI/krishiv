@@ -318,7 +318,7 @@ impl Relation {
     ) -> crate::Result<crate::StreamHandle> {
         match self.kind {
             RelationKind::Batch(df) => {
-                krishiv_async_util::block_on(async {
+                krishiv_common::async_util::block_on(async {
                     for batch in df.collect()?.into_batches() {
                         sink.write_batch_dyn(batch)
                             .await
@@ -335,7 +335,7 @@ impl Relation {
             RelationKind::Stream(chain) => {
                 if chain.bounded {
                     let stream_batches = chain.execute_bounded()?;
-                    krishiv_async_util::block_on(async {
+                    krishiv_common::async_util::block_on(async {
                         for sb in stream_batches {
                             sink.write_batch_dyn(sb.into_batch()).await.map_err(|e| {
                                 KrishivError::Runtime {

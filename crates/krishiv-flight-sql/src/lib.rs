@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
 use krishiv_sql::SqlEngine;
-use krishiv_sql_policy::PolicyEnforcingSqlEngine;
+use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 
 pub use host::FlightExecutionHost;
 
@@ -167,7 +167,6 @@ fn mask_batch(
     use arrow::array::{Array, ArrayRef, StringArray, new_null_array};
     use arrow::datatypes::{DataType, Field};
     use arrow::util::display::{ArrayFormatter, FormatOptions};
-    use sha2::{Digest, Sha256};
 
     let schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
@@ -220,8 +219,7 @@ fn mask_batch(
                             return None;
                         }
                         let val = formatter.value(row).to_string();
-                        let digest = Sha256::digest(val.as_bytes());
-                        Some(format!("{digest:x}"))
+                        Some(krishiv_common::hash::sha256_hex(val.as_bytes()))
                     })
                     .collect();
                 fields.push(Field::new(field.name().clone(), DataType::Utf8, true));
@@ -503,6 +501,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                 tags::CONTINUOUS_DRAIN,
                 tags::BOUNDED_WINDOW,
                 tags::EXPLAIN,
+                tags::EXECUTE_PLAN,
             ]
             .iter()
             .map(|tag| {
@@ -616,6 +615,18 @@ impl KrishivFlightSqlService {
                 let text = krishiv_sql::explain_sql(&body.sql)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 Ok(text.into_bytes())
+            }
+            A::ExecutePlan(body) => {
+                let plan = body
+                    .to_plan()
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                let sql = krishiv_runtime::flight_client::plan_to_sql(&plan);
+                let _ = self
+                    .host
+                    .execute_sql(&sql)
+                    .await
+                    .map_err(KrishivActionError::Status)?;
+                Ok(Vec::new())
             }
         }
     }

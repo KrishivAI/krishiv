@@ -13,26 +13,13 @@ pub enum UnsupportedCombinator {
 }
 
 /// Pattern compilation error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CepCompileError {
+    #[error("unsupported CEP combinator {0:?} — deferred to R17/R18")]
     UnsupportedCombinator(UnsupportedCombinator),
+    #[error("CEP pattern must have at least one stage")]
     EmptyPattern,
 }
-
-impl std::fmt::Display for CepCompileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedCombinator(c) => write!(
-                f,
-                "unsupported CEP combinator {:?} — deferred to R17/R18",
-                c
-            ),
-            Self::EmptyPattern => write!(f, "CEP pattern must have at least one stage"),
-        }
-    }
-}
-
-impl std::error::Error for CepCompileError {}
 
 /// One stage in a linear CEP pattern.
 #[derive(Debug, Clone)]

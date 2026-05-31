@@ -40,14 +40,14 @@ pub struct AggExpr {
 
 /// Running aggregation state for one group.
 #[derive(Debug)]
-pub(crate) struct AggState {
+pub struct AggState {
     /// Integer aggregates: count, sum, min, max.
-    pub(crate) values: Vec<i64>,
+    pub values: Vec<i64>,
     /// Tracks whether Min/Max has received at least one value.
-    pub(crate) has_value: Vec<bool>,
+    pub has_value: Vec<bool>,
     /// Sum for `Avg` (all numeric types promoted to f64).
-    pub(crate) avg_sums: Vec<f64>,
-    pub(crate) avg_counts: Vec<u64>,
+    pub avg_sums: Vec<f64>,
+    pub avg_counts: Vec<u64>,
 }
 
 impl AggState {

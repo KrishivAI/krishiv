@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 chrono = { workspace = true }
 iceberg = { workspace = true, optional = true }
 parquet = { workspace = true }
@@ -16,7 +17,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-krishiv-async-util = { path = "../krishiv-async-util" }
 url = "2"
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
 

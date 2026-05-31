@@ -8,7 +8,8 @@ license.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 arrow = { workspace = true }
-krishiv-async-util = { path = "../krishiv-async-util" }
+thiserror = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-runtime = { path = "../krishiv-runtime" }
@@ -16,11 +17,11 @@ krishiv-state = { path = "../krishiv-state" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-sql = { path = "../krishiv-sql" }
-krishiv-sql-policy = { path = "../krishiv-sql-policy" }
 krishiv-udf = { path = "../krishiv-udf" }
 tokio = { workspace = true }
 
 [dev-dependencies]
+krishiv-common = { path = "../krishiv-common" }
 krishiv-udf = { path = "../krishiv-udf" }
 krishiv-flight-sql = { path = "../krishiv-flight-sql" }
 parquet = { workspace = true }

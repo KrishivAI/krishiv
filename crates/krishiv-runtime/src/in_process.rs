@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
-use krishiv_async_util::block_on;
+use krishiv_common::async_util::block_on;
 use krishiv_executor::{
     ContinuousJobDrainer, ExecutorAssignmentInbox, ExecutorTaskOutputKind, ExecutorTaskRunner,
 };
@@ -14,9 +14,11 @@ use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, InputPartitionDescriptor, JobId,
     JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
 };
+use krishiv_scheduler::coordinator_sharded::{CheckpointInner, ExecutorInner};
 use krishiv_scheduler::{
     Coordinator, IN_PROCESS_TASK_ENDPOINT, InProcessCoordinatorBridge, SubmitOutcome,
 };
+use tokio::sync::RwLock;
 
 use crate::continuous_stream::{ContinuousStreamRegistry, SharedContinuousStreamRegistry};
 use crate::in_process_cluster::plan_spec_to_local;
@@ -83,6 +85,21 @@ impl InProcessStreamingRuntime {
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let descriptor = ExecutorDescriptor::new(executor_id.clone(), "localhost", 8)
             .with_task_endpoint(IN_PROCESS_TASK_ENDPOINT);
+        // Build sharded inner locks from the initial coordinator state.
+        let executor_inner: Arc<RwLock<ExecutorInner>> = {
+            let coord = coordinator
+                .lock()
+                .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+            Arc::new(RwLock::new(ExecutorInner {
+                executors: coord.executors().clone(),
+                state: coord.state(),
+                ticks_since_restart: coord.ticks_since_restart(),
+                recovering: coord.recovering(),
+                notify: coord.notify().clone(),
+            }))
+        };
+        let checkpoint_inner: Arc<RwLock<CheckpointInner>> =
+            Arc::new(RwLock::new(CheckpointInner::new()));
         {
             let mut coord = coordinator
                 .lock()
@@ -95,7 +112,11 @@ impl InProcessStreamingRuntime {
         let drainer = Arc::new(RegistryDrainer(Arc::clone(&registry)));
         let runner =
             Arc::new(ExecutorTaskRunner::new(inbox.clone()).with_continuous_drainer(drainer));
-        let bridge = InProcessCoordinatorBridge::new(Arc::clone(&coordinator));
+        let bridge = InProcessCoordinatorBridge::new(
+            Arc::clone(&coordinator),
+            executor_inner,
+            checkpoint_inner,
+        );
         Ok(Self {
             coordinator,
             bridge,
@@ -374,33 +395,13 @@ mod tests {
 
     use super::*;
     use crate::in_process_cluster::InProcessCluster;
-    use crate::local_streaming::{LocalWindowExecutionSpec, LocalWindowKind};
+    use crate::local_streaming::LocalWindowExecutionSpec;
 
     #[test]
     fn in_process_windowed_stream_returns_batches() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])) as _,
-                Arc::new(Int64Array::from(vec![1_000, 5_000])) as _,
-            ],
-        )
-        .unwrap();
-        let spec = LocalWindowExecutionSpec {
-            key_column: "user_id".into(),
-            event_time_column: "ts".into(),
-            watermark_lag_ms: 0,
-            window_kind: LocalWindowKind::Tumbling,
-            window_size_ms: 10_000,
-            agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
-            state_ttl_ms: None,
-            source_watermark_lags: std::collections::HashMap::new(),
-            source_id_column: None,
-        };
+        let batch =
+            krishiv_common::arrow::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 5_000]);
+        let spec = LocalWindowExecutionSpec::new_test_tumbling("user_id", "ts", 10_000);
         let cluster = InProcessCluster::new().unwrap();
         let out = cluster
             .collect_bounded_window("events", vec![batch], &spec)

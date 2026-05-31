@@ -218,7 +218,29 @@ impl SharedCoordinator {
         tracing::debug!(
             "advancing heartbeat tick (per-job JCP delegation and Notify will react in two-tier model)"
         );
-        let lost = self.write().await.advance_heartbeat_clock(1)?;
+        let lost = {
+            let mut coord = self.inner.write().await;
+            let lost = coord.advance_heartbeat_clock(1)?;
+            // Sync coordinator → inner locks after mutation to prevent dual-state
+            // drift (G3).  The inner locks are read by in-process hot paths and
+            // must see the updated executor registry and checkpoint state.
+            let mut exec_inner = self.executor_inner.write().await;
+            let mut ckpt_inner = self.checkpoint_inner.write().await;
+            crate::coordinator_sharded::sync_executor_to_inner(
+                &coord.executors,
+                coord.state,
+                coord.executors.current_tick,
+                coord.recovering,
+                &mut exec_inner,
+            );
+            crate::coordinator_sharded::sync_checkpoint_to_inner(
+                &coord.checkpoint_coordinators,
+                &coord.checkpoint_notify_sent,
+                &coord.barrier_dispatch_sent,
+                &mut ckpt_inner,
+            );
+            lost
+        };
 
         // Real JCP usage (Track B ownership): delegate per-job heartbeat staleness,
         // loss recovery, and launch eligibility to the owning JobCoordinator.
@@ -230,7 +252,7 @@ impl SharedCoordinator {
             let (launch_eligible, stages_with_work) = jc.get_launch_work_summary().await;
 
             for lost in &lost {
-                let ts = krishiv_async_util::unix_now_ms() as u64;
+                let ts = krishiv_common::async_util::unix_now_ms() as u64;
                 let stale = jc.record_heartbeat_and_detect_stale(lost, ts).await;
                 let affected = jc.handle_executor_loss(lost).await;
                 if affected > 0 || stale {
@@ -610,6 +632,26 @@ impl Coordinator {
     /// Coordinator state.
     pub fn state(&self) -> CoordinatorState {
         self.state
+    }
+
+    /// Executor registry (used to populate sharded inner locks).
+    pub fn executors(&self) -> &ExecutorRegistry {
+        &self.executors
+    }
+
+    /// Heartbeat ticks since coordinator restart.
+    pub fn ticks_since_restart(&self) -> u64 {
+        self.executors.current_tick
+    }
+
+    /// Whether the coordinator is in recovery mode.
+    pub fn recovering(&self) -> bool {
+        self.recovering
+    }
+
+    /// Notify handle for wake-on-state-change.
+    pub fn notify(&self) -> &Arc<Notify> {
+        &self.notify
     }
 
     /// Promote a standby coordinator to active leader (P0-5 / P3-19).

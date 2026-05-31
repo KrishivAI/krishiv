@@ -7,13 +7,14 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 krishiv-plan = { path = "../krishiv-plan" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-executor = { path = "../krishiv-executor" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-state = { path = "../krishiv-state" }
 krishiv-proto = { path = "../krishiv-proto" }
-krishiv-async-util = { path = "../krishiv-async-util" }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-sql = { path = "../krishiv-sql" }
 reqwest = { workspace = true }
 arrow = { workspace = true }

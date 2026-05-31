@@ -267,18 +267,10 @@ fn tumbling_window_carries_correct_config() {
 #[test]
 fn tumbling_window_collect_executes_in_embedded_mode() {
     let session = Session::builder().build().unwrap();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("ts", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
-            Arc::new(Int64Array::from(vec![1_000, 5_000, 2_000])) as _,
-        ],
-    )
-    .unwrap();
+    let batch = krishiv_common::arrow::make_test_user_ts_batch(
+        vec!["a", "a", "b"],
+        vec![1_000, 5_000, 2_000],
+    );
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -295,18 +287,10 @@ fn tumbling_window_collect_executes_in_embedded_mode() {
 #[test]
 fn sliding_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("ts", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a", "a", "b"])) as _,
-            Arc::new(Int64Array::from(vec![1_000, 5_000, 2_000])) as _,
-        ],
-    )
-    .unwrap();
+    let batch = krishiv_common::arrow::make_test_user_ts_batch(
+        vec!["a", "a", "b"],
+        vec![1_000, 5_000, 2_000],
+    );
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -322,18 +306,7 @@ fn sliding_window_collect_via_unified_runtime() {
 #[test]
 fn session_window_collect_via_unified_runtime() {
     let session = Session::builder().build().unwrap();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("ts", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a", "b"])) as _,
-            Arc::new(Int64Array::from(vec![1_000, 8_000])) as _,
-        ],
-    )
-    .unwrap();
+    let batch = krishiv_common::arrow::make_test_user_ts_batch(vec!["a", "b"], vec![1_000, 8_000]);
     let stream = session
         .memory_stream("events", vec![StreamBatch::new(0, batch)])
         .unwrap();
@@ -349,18 +322,7 @@ fn session_window_collect_via_unified_runtime() {
 #[test]
 fn session_subsequent_window_collects() {
     let session = Session::builder().build().unwrap();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("ts", DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a"])) as _,
-            Arc::new(Int64Array::from(vec![1_000])) as _,
-        ],
-    )
-    .unwrap();
+    let batch = krishiv_common::arrow::make_test_user_ts_batch(vec!["a"], vec![1_000]);
     for _ in 0..2 {
         let stream = session
             .memory_stream("events", vec![StreamBatch::new(0, batch.clone())])
@@ -596,18 +558,17 @@ fn with_coordinator_stores_url_accessible_via_sql() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn distributed_session_sql_collects_via_local_coordinator() {
-    // B2: Distributed mode now defaults to real remote execution.  This test
-    // explicitly opts into the local-fallback path that was the historical
-    // default, since no flight server is running on 127.0.0.1:50051.
-    let session = Session::builder()
+async fn distributed_session_rejects_disabled_remote_execution() {
+    let err = Session::builder()
         .with_coordinator("http://127.0.0.1:50051")
         .with_remote_execution(false)
         .build()
-        .unwrap();
-    let df = session.sql_async("SELECT 3 AS n").await.unwrap();
-    let result = df.collect_async().await.unwrap();
-    assert_eq!(result.row_count(), 1);
+        .expect_err("distributed sessions should not silently run in-process");
+    assert!(
+        err.to_string()
+            .contains("Distributed mode requires remote execution"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -642,15 +603,11 @@ async fn distributed_window_collect_via_local_cluster() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn distributed_read_parquet_collects_via_coordinator() {
+async fn embedded_read_parquet_collects_locally() {
     let temp = tempdir().unwrap();
     let parquet_path = temp.path().join("people.parquet");
     write_people_parquet(&parquet_path);
-    let session = Session::builder()
-        .with_coordinator("http://127.0.0.1:50051")
-        .with_remote_execution(false)
-        .build()
-        .unwrap();
+    let session = Session::builder().build().unwrap();
     let df = session.read_parquet_async(&parquet_path).await.unwrap();
     let result = df.collect_async().await.unwrap();
     assert_eq!(result.row_count(), 3);

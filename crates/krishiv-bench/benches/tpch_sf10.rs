@@ -2,7 +2,8 @@
 //!
 //! These benchmarks measure query execution time against the TPC-H dataset at
 //! scale factor 10 (~10 GB). They are gated against the targets defined in
-//! docs/architecture/benchmark-targets.md.
+//! Keep benchmark thresholds in code or in the minimal docs when they are
+//! reintroduced as enforced gates.
 //!
 //! To run: cargo bench -p krishiv-bench --bench tpch_sf10
 //! Data path: set KRISHIV_TPCH_DATA_DIR to a directory containing Parquet files

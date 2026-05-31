@@ -1,5 +1,6 @@
 pub mod session;
 pub mod sliding;
+pub mod state_persistence;
 pub mod state_tumbling;
 pub mod tumbling;
 

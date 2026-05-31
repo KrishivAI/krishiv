@@ -11,7 +11,10 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
 dashmap = { workspace = true }
+thiserror = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

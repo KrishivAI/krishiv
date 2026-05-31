@@ -5,15 +5,15 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::record_batch::RecordBatch;
-use krishiv_async_util::block_on;
+use krishiv_common::async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
 use krishiv_plan::ExecutionKind;
 use krishiv_runtime::{
-    BatchTableRegistration, ExecutionRuntime, InProcessCluster, JobStatus, LocalJobRegistry,
-    LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
+    BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
+    LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
 use krishiv_sql::SqlEngine;
-use krishiv_sql_policy::PolicyEnforcingSqlEngine;
+use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 use krishiv_udf::{ScalarUdf, UdfRegistry};
 
 use crate::dataframe::DataFrame;
@@ -37,8 +37,8 @@ pub struct SessionBuilder {
     in_process_cluster: Option<Arc<InProcessCluster>>,
     /// Whether `with_remote_execution` was called explicitly (B2): controls
     /// whether `build()` flips Distributed mode to `remote_execution = true`
-    /// automatically.  Tests and integrations that want a local fallback in
-    /// Distributed mode set this via `with_remote_execution(false)`.
+    /// automatically. Explicitly disabling it in Distributed mode now fails
+    /// during build instead of silently creating a local fallback runtime.
     remote_execution_explicit: bool,
 }
 
@@ -109,7 +109,14 @@ pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
     // marker placement only.
     let _ = std::sync::OnceLock::<()>::new();
     let cluster = Arc::new(InProcessCluster::new().expect("orphan embedded in-process cluster"));
-    build_execution_runtime(RuntimeMode::Embedded, cluster, None, None, false)
+    build_execution_runtime(
+        RuntimeMode::Embedded,
+        cluster,
+        None,
+        None,
+        ExecutionPlacement::LocalInProcess,
+    )
+    .expect("embedded in-process runtime placement is valid")
 }
 
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {
@@ -167,10 +174,9 @@ impl SessionBuilder {
         self
     }
 
-    /// When true, batch and streaming data-plane work is routed to the remote Flight
-    /// endpoint instead of the session-embedded in-process cluster.  When false in
-    /// Distributed mode, the session falls back to an in-process cluster — useful
-    /// for integration tests but never the default (see B2).
+    /// When true, batch and streaming data-plane work is routed to the configured
+    /// Flight endpoint. Distributed mode requires this placement and fails closed
+    /// if it is explicitly disabled.
     #[must_use]
     pub fn with_remote_execution(mut self, enabled: bool) -> Self {
         self.remote_execution = enabled;
@@ -218,9 +224,6 @@ impl SessionBuilder {
             })?),
         };
 
-        // B2: Distributed sessions default to true remote execution.  An
-        // explicit `with_remote_execution(false)` (or `KRISHIV_REMOTE_EXEC=0`)
-        // still keeps the local fallback for integration tests.
         let remote_execution =
             if self.remote_execution_explicit || remote_execution_from_env_opt().is_some() {
                 self.remote_execution
@@ -237,13 +240,33 @@ impl SessionBuilder {
             ));
         }
 
+        let placement = match self.mode {
+            ExecutionMode::Embedded => ExecutionPlacement::LocalInProcess,
+            ExecutionMode::SingleNode if self.coordinator_url.is_some() && remote_execution => {
+                ExecutionPlacement::SingleNodeDaemon
+            }
+            ExecutionMode::SingleNode => ExecutionPlacement::LocalInProcess,
+            ExecutionMode::Distributed if remote_execution => {
+                ExecutionPlacement::RemoteClusterRequired
+            }
+            ExecutionMode::Distributed => {
+                return Err(KrishivError::unsupported(
+                    "Distributed mode requires remote execution; remove with_remote_execution(false) \
+                     or use Embedded/SingleNode for local in-process execution",
+                ));
+            }
+        };
+
         let runtime = build_execution_runtime(
             execution_mode_to_runtime_mode(self.mode),
             Arc::clone(&local_cluster),
             self.coordinator_url.clone(),
             self.local_cluster_grpc.clone(),
-            remote_execution,
-        );
+            placement,
+        )
+        .map_err(|e| KrishivError::Runtime {
+            message: e.to_string(),
+        })?;
         Ok(Session {
             mode: self.mode,
             sql_engine,
@@ -331,10 +354,9 @@ impl Session {
 
     /// Validate that the session routing configuration is consistent.
     ///
-    /// **Important**: This method is NOT called automatically by any session method.
-    /// In `Distributed` mode without `remote_execution=true`, SQL queries will
-    /// silently fall through to local execution. Call this method explicitly to
-    /// surface misconfiguration errors early (B2 guard).
+    /// **Important**: `SessionBuilder::build` now rejects distributed local
+    /// fallback, so this method is mostly a defensive guard for prebuilt or
+    /// externally assembled sessions.
     pub fn check_routing(&self) -> Result<()> {
         match self.mode {
             ExecutionMode::Distributed => {

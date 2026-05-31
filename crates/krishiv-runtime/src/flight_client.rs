@@ -57,10 +57,24 @@ async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlService
     Ok(FlightSqlServiceClient::new(channel))
 }
 
-/// Submit `plan` to the remote Flight SQL endpoint and drain the result stream to confirm acceptance.
+/// Submit `plan` to the remote Flight endpoint.
+///
+/// Prefers the typed [`KrishivFlightAction::ExecutePlan`] payload sent over
+/// `do_action`.  Falls back to the legacy SQL-comment protocol when the
+/// server does not understand the action type — preserves backward compat for
+/// older deployments.
 pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> RuntimeResult<()> {
-    let _ = execute_remote_sql(flight_url, &plan_to_sql(plan)).await?;
-    Ok(())
+    use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
+    let body = ExecutePlanBody::from_plan(plan)?;
+    let action = KrishivFlightAction::ExecutePlan(body);
+    match do_action(flight_url, &action).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_unimplemented(&e) => {
+            let _ = execute_remote_sql(flight_url, &plan_to_sql(plan)).await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Execute SQL remotely via Flight and return all result batches.

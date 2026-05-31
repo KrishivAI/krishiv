@@ -73,7 +73,7 @@ impl EtcdMetadataStore {
                     message: format!("etcd metadata snapshot write failed: {e}"),
                 })
         });
-        krishiv_async_util::block_on(handle).map_err(|e| SchedulerError::Transport {
+        krishiv_common::async_util::block_on(handle).map_err(|e| SchedulerError::Transport {
             message: format!("spawn_blocking join failed: {e}"),
         })??;
         Ok(())

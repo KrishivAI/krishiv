@@ -9,7 +9,9 @@ use krishiv_proto::{
     RegisterExecutorResponse, TaskStatusRequest, TaskStatusResponse, TransportDisposition,
     TransportVersion,
 };
+use tokio::sync::RwLock;
 
+use crate::coordinator_sharded::{CheckpointInner, ExecutorInner};
 use crate::{Coordinator, SchedulerError, TaskUpdateOutcome, status_from_scheduler_error};
 
 /// Task endpoint marker: assignments are delivered via [`ExecutorAssignmentInbox`]
@@ -22,15 +24,32 @@ pub fn is_in_process_task_endpoint(endpoint: &str) -> bool {
 }
 
 /// Bridges executor RPCs to an in-memory [`Coordinator`] (no tonic server required).
+///
+/// Lock sharding: dedicated inner locks for executor registry and checkpoint
+/// state so that hot-path operations (heartbeat, checkpoint ack) do not contend
+/// with full coordinator state access.
 #[derive(Clone)]
 pub struct InProcessCoordinatorBridge {
     coordinator: Arc<Mutex<Coordinator>>,
+    /// Dedicated lock for executor registry state.
+    pub(crate) executor_inner: Arc<RwLock<ExecutorInner>>,
+    /// Dedicated lock for checkpoint coordinator state.
+    pub(crate) checkpoint_inner: Arc<RwLock<CheckpointInner>>,
 }
 
 impl InProcessCoordinatorBridge {
-    /// Wrap a coordinator for direct method calls from the executor runner.
-    pub fn new(coordinator: Arc<Mutex<Coordinator>>) -> Self {
-        Self { coordinator }
+    /// Wrap a coordinator with sharded inner locks for direct method calls
+    /// from the executor runner.
+    pub fn new(
+        coordinator: Arc<Mutex<Coordinator>>,
+        executor_inner: Arc<RwLock<ExecutorInner>>,
+        checkpoint_inner: Arc<RwLock<CheckpointInner>>,
+    ) -> Self {
+        Self {
+            coordinator,
+            executor_inner,
+            checkpoint_inner,
+        }
     }
 }
 
@@ -100,15 +119,21 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         request: tonic::Request<ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         let request = request.into_inner();
-        let mut heartbeat = ExecutorHeartbeat::new(request.executor_id().clone(), request.state())
-            .with_lease_generation(request.lease_generation())
-            .with_running_tasks(
-                request
-                    .running_attempts()
-                    .iter()
-                    .map(|a| a.task_id().clone())
-                    .collect(),
-            );
+        let executor_id = request.executor_id().clone();
+        let lease_generation = request.lease_generation();
+        let running_tasks: Vec<_> = request
+            .running_attempts()
+            .iter()
+            .map(|a| a.task_id().clone())
+            .collect();
+        let streaming_states: Vec<_> = request.streaming_task_states().to_vec();
+
+        // Fast path: update the executor registry via the sharded inner lock.
+        // This avoids serializing the heartbeat behind the full coordinator lock
+        // when the heartbeat carries no streaming state updates.
+        let mut heartbeat = ExecutorHeartbeat::new(executor_id.clone(), request.state())
+            .with_lease_generation(lease_generation)
+            .with_running_tasks(running_tasks.clone());
         if let Some(bytes) = request.memory_used_bytes() {
             heartbeat = heartbeat.with_memory_used_bytes(bytes);
         }
@@ -118,16 +143,36 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         if let Some(count) = request.active_task_count() {
             heartbeat = heartbeat.with_active_task_count(count);
         }
-        if !request.streaming_task_states().is_empty() {
-            heartbeat =
-                heartbeat.with_streaming_task_states(request.streaming_task_states().to_vec());
+
+        let lease_generation = {
+            let mut inner = self.executor_inner.write().await;
+            let lg = inner
+                .handle_heartbeat(heartbeat)
+                .map_err(status_from_scheduler_error)?;
+            // Sync inner → outer to prevent dual-state drift (G3).
+            let mut coord = lock_coord(&self.coordinator)?;
+            coord.executors.clone_from(&inner.executors);
+            coord.state = inner.state;
+            coord.recovering = inner.recovering;
+            lg
+        };
+
+        // Complex heartbeat processing (streaming states, hot-keys, LLM quota,
+        // checkpoint initiation) still needs the full coordinator lock.
+        if !streaming_states.is_empty() {
+            let mut coordinator = lock_coord(&self.coordinator)?;
+            coordinator
+                .executor_heartbeat(
+                    ExecutorHeartbeat::new(executor_id, request.state())
+                        .with_lease_generation(lease_generation)
+                        .with_running_tasks(running_tasks)
+                        .with_streaming_task_states(streaming_states),
+                )
+                .map_err(status_from_scheduler_error)?;
         }
-        let mut coordinator = lock_coord(&self.coordinator)?;
-        let effects = coordinator
-            .executor_heartbeat(heartbeat)
-            .map_err(status_from_scheduler_error)?;
+
         Ok(tonic::Response::new(ExecutorHeartbeatResponse::new(
-            effects.lease_generation,
+            lease_generation,
             TransportDisposition::Accepted,
         )))
     }
@@ -189,8 +234,18 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         request: tonic::Request<CheckpointAckRequest>,
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
         let request = request.into_inner();
-        let mut coordinator = lock_coord(&self.coordinator)?;
-        let response = coordinator.handle_checkpoint_ack(request);
+        let response = {
+            let mut inner = self.checkpoint_inner.write().await;
+            let response = inner.handle_ack(request);
+            // Sync inner → outer coordinator to avoid dual-state drift (G3).
+            let mut coord = lock_coord(&self.coordinator)?;
+            coord
+                .checkpoint_coordinators
+                .clone_from(&inner.coordinators);
+            coord.checkpoint_notify_sent.clone_from(&inner.notify_sent);
+            coord.barrier_dispatch_sent.clone_from(&inner.barrier_sent);
+            response
+        };
         Ok(tonic::Response::new(response))
     }
 }

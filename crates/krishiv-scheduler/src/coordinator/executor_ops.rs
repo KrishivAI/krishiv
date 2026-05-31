@@ -108,7 +108,7 @@ impl Coordinator {
         if reports.is_empty() {
             return Vec::new();
         }
-        let now_ms = u64::try_from(krishiv_async_util::unix_now_ms()).unwrap_or(0);
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
         let mut throttles = Vec::new();
 
         for report in reports {

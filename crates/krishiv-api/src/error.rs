@@ -1,19 +1,20 @@
-use std::error::Error;
-use std::fmt;
-
 /// API result alias.
 pub type Result<T> = std::result::Result<T, KrishivError>;
 
 /// Public API errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KrishivError {
     /// A requested capability is not available in the current release.
+    #[error("unsupported Krishiv feature: {feature}")]
     Unsupported { feature: String },
     /// User-provided configuration is invalid.
+    #[error("invalid Krishiv config: {message}")]
     InvalidConfig { message: String },
     /// Runtime error surfaced through the public API.
+    #[error("Krishiv runtime error: {message}")]
     Runtime { message: String },
     /// Access denied by auth or policy.
+    #[error("access denied: {reason}")]
     AccessDenied { reason: String },
 }
 
@@ -25,19 +26,6 @@ impl KrishivError {
         }
     }
 }
-
-impl fmt::Display for KrishivError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { feature } => write!(f, "unsupported Krishiv feature: {feature}"),
-            Self::InvalidConfig { message } => write!(f, "invalid Krishiv config: {message}"),
-            Self::Runtime { message } => write!(f, "Krishiv runtime error: {message}"),
-            Self::AccessDenied { reason } => write!(f, "access denied: {reason}"),
-        }
-    }
-}
-
-impl Error for KrishivError {}
 
 impl From<krishiv_runtime::RuntimeError> for KrishivError {
     fn from(value: krishiv_runtime::RuntimeError) -> Self {

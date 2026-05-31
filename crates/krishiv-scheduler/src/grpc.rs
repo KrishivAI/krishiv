@@ -272,11 +272,8 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         let ack = request.into_inner();
-        // GAP-CK-03: commit_epoch() calls sync disk I/O via LocalFsCheckpointStorage.
-        // Acquire the lock asynchronously (non-blocking), then move the guard
-        // onto a blocking thread for the storage write.
         let mut coordinator = self.coordinator.write().await;
-        let response = tokio::task::block_in_place(|| coordinator.handle_checkpoint_ack(ack));
+        let response = coordinator.handle_checkpoint_ack_async(ack).await;
         Ok(tonic::Response::new(response))
     }
 }

@@ -1126,19 +1126,9 @@ impl ExecutorTaskRunner {
             .unwrap_or_else(|| TaskRunner::new(task_id.clone()));
         // DashMap shard lock is now fully released.
 
-        let ack = match tokio::runtime::Handle::try_current() {
-            Ok(handle)
-                if matches!(
-                    handle.runtime_flavor(),
-                    tokio::runtime::RuntimeFlavor::MultiThread
-                ) =>
-            {
-                tokio::task::block_in_place(|| {
-                    task_runner.handle_initiate_checkpoint(req, state_backend, storage)
-                })
-            }
-            _ => task_runner.handle_initiate_checkpoint(req, state_backend, storage),
-        }
+        let ack = krishiv_common::blocking::run_blocking_safely(|| {
+            task_runner.handle_initiate_checkpoint(req, state_backend, storage)
+        })
         .map_err(|error| tonic::Status::internal(error.to_string()))?;
 
         // Re-insert the updated runner (last_acked_epoch was updated).
