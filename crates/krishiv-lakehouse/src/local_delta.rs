@@ -22,17 +22,17 @@ fn delta_log_dir(root: &Path) -> PathBuf {
 fn next_version(root: &Path) -> LakehouseResult<u64> {
     let dir = delta_log_dir(root);
     fs::create_dir_all(&dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    let mut max = 0u64;
+    let mut max = None;
     for entry in fs::read_dir(&dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
         let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(stem) = name.strip_suffix(".json")
             && let Ok(v) = stem.parse::<u64>()
         {
-            max = max.max(v);
+            max = Some(max.map_or(v, |m| std::cmp::max(m, v)));
         }
     }
-    Ok(max + 1)
+    Ok(max.map_or(0, |m| m + 1))
 }
 
 fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<PathBuf>> {

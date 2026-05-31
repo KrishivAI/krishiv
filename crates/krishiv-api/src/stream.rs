@@ -77,6 +77,12 @@ impl Stream {
         &self.name
     }
 
+    /// Set state TTL in milliseconds for stateful operations on this stream.
+    pub fn with_state_ttl(mut self, ttl_ms: u64) -> Self {
+        self.state_ttl_ms = Some(ttl_ms);
+        self
+    }
+
     /// Stream mode.
     pub fn mode(&self) -> StreamMode {
         self.mode

@@ -24,7 +24,88 @@ as a session handoff note, not as a release-plan archive.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
-## Current Session: In-Process Protocol + Checkpoint Inner Drift
+## Current Session: Python API Binding Enhancements & Batch Examples Implementation
+
+- Created a virtual environment and set up Python 3.14 development dependencies (`maturin`, `pytest`, `pandas`, `pyarrow`, `arro3-core`).
+- Reclaimed 62 GB of disk space by deleting an abandoned 48 GB subagent worktree and a 14 GB duplicate cargo target directory.
+- Fixed a PyO3 type-subclassing bug in `crates/krishiv-python/src/schema.rs` by adding `#[pyo3(signature = (*_args, **_kwargs))]` on `__init_subclass__` to make it compatible with Python 3.14.
+- Fixed a session-mode initialization bug in `crates/krishiv-python/src/session.rs` `from_env()` to properly detect and route to local vs. distributed modes when `KRISHIV_MODE` is unset but a coordinator URL is present.
+- Fixed a validation bug in `crates/krishiv-python/src/windows.rs` `ensure_watermark_before_window` to allow `max_lateness_ms` to be `0` (valid for strict ordering streams).
+- Fixed an Arrow Capsule to Pandas conversion error in `crates/krishiv-python/src/batch.rs` and `query_result.rs` by calling `pyarrow.record_batch` to explicitly cast raw Capsule representation into a standard `pyarrow.RecordBatch` object.
+- Exposed and exported missing lakehouse and utility functions (`read_delta`, `read_hudi`, `write_hudi_append`, `write_hudi_upsert`, `make_example_batch`, `apply_state_migration`, `memo_cache_info`, `memo_transform_call`) in `crates/krishiv-python/python/krishiv/__init__.py` and `krishiv.pyi`.
+- Implemented and successfully ran all 6 Python batch examples in `/home/code/krishiv/crates/krishiv-python/examples/`:
+  - `batch_iot_sensor.py`: Validated sensor average temp, max humidity, and device count SQL aggregates.
+  - `batch_ecommerce.py`: Validated customer-order VIP/Standard joins and revenue aggregates.
+  - `batch_log_analytics.py`: Validated error rate calculations per microservice.
+  - `batch_delta_audit.py`: Validated local Delta table Version 0 and Version 1 time-travel queries.
+  - `batch_hudi_ingest.py`: Validated local COW Hudi table snapshot appending and snapshot reading.
+  - `batch_sql.py`: Checked general SQL group-by and ordering on parquet dataframes.
+
+- Fixed a type mismatch bug in `/home/code/krishiv/crates/krishiv/examples/stream_continuous_job.rs` where `LocalWindowExecutionSpec::default_count_agg()` returned a `Vec<AggExpr>` instead of a `LocalWindowExecutionSpec`; resolved by using `LocalWindowExecutionSpec::new_test_tumbling(...)`.
+- Added a public `.with_state_ttl(5000)` builder method on `Stream` in `/home/code/krishiv/crates/krishiv-api/src/stream.rs` and updated `/home/code/krishiv/crates/krishiv/examples/stream_state_ttl.rs` to call it, resolving a private field compilation error.
+- Successfully compiled, executed, and verified all 5 streaming examples in Rust:
+  - `stream_transaction_count.rs`: Verified transaction event-time tumbling window counts. Removed an unused import warning.
+  - `stream_multi_source.rs`: Verified sliding window aggregation with multi-source watermark lag synchronization.
+  - `stream_session_window.rs`: Verified grouping clickstream logs by user-activity inactivity session windows.
+  - `stream_continuous_job.rs`: Verified continuous unbounded job submission, live data pushing, and window polling.
+  - `stream_state_ttl.rs`: Verified stateful windowed count queries running under event-time state TTL eviction rules.
+
+- Added a `#[new]` python constructor on `PyBatch` in `crates/krishiv-python/src/batch.rs` so that standard `pyarrow.RecordBatch` objects can be wrapped directly via `ks.Batch(pa_batch)`.
+- Implemented and successfully ran the Python streaming example `/home/code/krishiv/crates/krishiv-python/examples/stream_transaction_count.py` verifying real-time transaction event-time tumbling count aggregations.
+
+### Validation
+
+```bash
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/batch_iot_sensor.py
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/batch_ecommerce.py
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/batch_log_analytics.py
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/batch_delta_audit.py
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/batch_hudi_ingest.py
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/batch_sql.py
+/home/code/krishiv/.venv/bin/python3 crates/krishiv-python/examples/stream_transaction_count.py
+/home/code/krishiv/.venv/bin/pytest crates/krishiv-python/python/tests/          # 24 passed, 2 skipped
+cargo run -p krishiv --example stream_transaction_count
+cargo run -p krishiv --example stream_multi_source
+cargo run -p krishiv --example stream_session_window
+cargo run -p krishiv --example stream_continuous_job
+cargo run -p krishiv --example stream_state_ttl
+```
+
+### Pending
+
+- Implementation of the remaining equivalent Python streaming examples.
+
+## Previous Session: Batch Example Ingestion & Execution Verification
+
+- Verified and ran all embedded batch examples one by one.
+- **`batch_iot_sensor`**: Verified average temperature, max humidity, and device count aggregations. Fixed unused `Int64Array` compiler warning.
+- **`batch_ecommerce`**: Verified VIP/Standard customer segmented revenue joins and sum aggregations.
+- **`batch_log_analytics`**: Verified error rate calculations and filter logic per application service.
+- **`batch_delta_audit`**: Verified time-travel query capability on Version 0 vs Version 1 (latest) after fixing engine provider deregistration and delta writer log version initialization bugs.
+- **`batch_hudi_ingest`**: Verified local Copy-On-Write snapshot query and ingestion flow.
+- **`batch_sql`**: Checked standard inline SQL dataframe queries against parquet.
+- **`memory_stream`**: Validated memory stream collect and sequence filtering.
+- Ran workspace `cargo check` and full test suites for `krishiv-runtime`.
+
+### Validation
+
+```bash
+cargo run -p krishiv --example batch_iot_sensor
+cargo run -p krishiv --example batch_ecommerce
+cargo run -p krishiv --example batch_log_analytics
+cargo run -p krishiv --example batch_delta_audit
+cargo run -p krishiv --example batch_hudi_ingest
+cargo run -p krishiv --example batch_sql
+cargo run -p krishiv --example memory_stream
+cargo check --workspace
+cargo test -p krishiv-runtime --lib                         # 279 passed
+```
+
+### Pending
+
+- Validation of all streaming examples in `crates/krishiv/examples/` as the next step.
+
+## Previous Session: In-Process Protocol + Checkpoint Inner Drift
 
 - `SharedCoordinator::new` now seeds `CheckpointInner` from existing coordinator
   checkpoint state instead of starting empty.

@@ -99,18 +99,25 @@ impl PySession {
             .ok();
 
         let builder = krishiv_api::SessionBuilder::new();
-        let builder = match mode.to_lowercase().as_str() {
-            "local" | "single-node" => {
-                builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
-            }
-            "distributed" => {
-                if let Some(url) = coordinator_url {
-                    builder.with_coordinator(url)
-                } else {
-                    builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed)
+        let builder = if !mode.is_empty() {
+            match mode.to_lowercase().as_str() {
+                "local" | "single-node" => {
+                    builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
                 }
+                "distributed" => {
+                    if let Some(url) = &coordinator_url {
+                        builder.with_coordinator(url.clone())
+                    } else {
+                        builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed)
+                    }
+                }
+                "embedded" => builder.with_execution_mode(krishiv_api::ExecutionMode::Embedded),
+                _ => builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode),
             }
-            _ => builder,
+        } else if let Some(url) = &coordinator_url {
+            builder.with_coordinator(url.clone())
+        } else {
+            builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
         };
         let builder = if remote_execution_from_env() {
             builder.with_remote_execution(true)

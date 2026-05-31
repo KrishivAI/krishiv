@@ -34,6 +34,11 @@ impl PyBatch {
 
 #[pymethods]
 impl PyBatch {
+    #[new]
+    fn py_new(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let py_batch: PyRecordBatch = obj.extract()?;
+        Ok(Self::from_record_batch(py_batch.into_inner()))
+    }
     #[getter]
     pub fn num_rows(&self) -> usize {
         self.batch.num_rows()
@@ -52,8 +57,18 @@ impl PyBatch {
 
     pub fn to_pandas(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let arrow_obj = self.to_arrow(py)?;
-        arrow_obj
-            .bind(py)
+        let pyarrow = py.import("pyarrow").map_err(|_| {
+            PyImportError::new_err(
+                "pyarrow required for Batch.to_pandas(). Install with: pip install krishiv[arrow]",
+            )
+        })?;
+        let record_batch_fn = pyarrow.getattr("record_batch")?;
+        let pa_batch = record_batch_fn.call1((arrow_obj,))?;
+
+        let table_cls = pyarrow.getattr("Table")?;
+        let py_list = pyo3::types::PyList::new(py, vec![pa_batch])?;
+        let table = table_cls.call_method1("from_batches", (py_list,))?;
+        table
             .call_method0("to_pandas")
             .map(|o| o.unbind())
             .map_err(|e| {

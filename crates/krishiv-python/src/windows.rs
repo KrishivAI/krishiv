@@ -71,9 +71,9 @@ pub fn register_windows_module(py: Python<'_>, parent: &Bound<'_, PyModule>) -> 
 
 pub fn ensure_watermark_before_window(
     watermark_column: &str,
-    max_lateness_ms: u64,
+    _max_lateness_ms: u64,
 ) -> PyResult<()> {
-    if watermark_column.is_empty() || max_lateness_ms == 0 {
+    if watermark_column.is_empty() {
         return Err(SchemaError::new_err(
             "call with_watermark(column, max_lateness_ms) before window()",
         ));

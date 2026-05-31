@@ -72,13 +72,13 @@ fn make_agg(function: &str, column: Option<String>, output_name: String) -> PyAg
 }
 
 #[pyfunction]
-#[pyo3(name = "count")]
+#[pyo3(name = "count", signature = (output_name=None))]
 fn agg_count(output_name: Option<String>) -> PyAggExpr {
     make_agg("count", None, output_name.unwrap_or_else(|| "count".into()))
 }
 
 #[pyfunction]
-#[pyo3(name = "sum")]
+#[pyo3(name = "sum", signature = (column, output_name=None))]
 fn agg_sum(column: String, output_name: Option<String>) -> PyAggExpr {
     make_agg(
         "sum",
@@ -88,7 +88,7 @@ fn agg_sum(column: String, output_name: Option<String>) -> PyAggExpr {
 }
 
 #[pyfunction]
-#[pyo3(name = "min")]
+#[pyo3(name = "min", signature = (column, output_name=None))]
 fn agg_min(column: String, output_name: Option<String>) -> PyAggExpr {
     make_agg(
         "min",
@@ -98,7 +98,7 @@ fn agg_min(column: String, output_name: Option<String>) -> PyAggExpr {
 }
 
 #[pyfunction]
-#[pyo3(name = "max")]
+#[pyo3(name = "max", signature = (column, output_name=None))]
 fn agg_max(column: String, output_name: Option<String>) -> PyAggExpr {
     make_agg(
         "max",
@@ -108,7 +108,7 @@ fn agg_max(column: String, output_name: Option<String>) -> PyAggExpr {
 }
 
 #[pyfunction]
-#[pyo3(name = "mean")]
+#[pyo3(name = "mean", signature = (column, output_name=None))]
 fn agg_mean(column: String, output_name: Option<String>) -> PyAggExpr {
     make_agg(
         "mean",

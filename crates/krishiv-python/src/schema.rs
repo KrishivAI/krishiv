@@ -76,6 +76,7 @@ impl PySchema {
     }
 
     #[classmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
     fn __init_subclass__(
         cls: &Bound<'_, PyType>,
         _args: &Bound<'_, PyTuple>,

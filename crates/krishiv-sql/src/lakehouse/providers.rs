@@ -25,6 +25,7 @@ pub async fn register_delta_uri(
     path: &str,
     version: Option<i64>,
 ) -> SqlResult<()> {
+    let _ = ctx.deregister_table(table_name);
     let handle = krishiv_lakehouse::DeltaTableHandle::open(path, version)
         .await
         .map_err(|e| SqlError::DataFusion {
@@ -49,6 +50,7 @@ pub async fn register_hudi_uri(
     query_type: HudiQueryType,
     begin_instant: Option<&str>,
 ) -> SqlResult<()> {
+    let _ = ctx.deregister_table(table_name);
     let reader = {
         let mut r = HudiSnapshotReader::open(path).with_query_type(query_type);
         if let Some(inst) = begin_instant {

@@ -51,17 +51,22 @@ impl PyQueryResult {
 
     /// Convert all batches to a single PyArrow Table.
     pub fn to_arrow(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let py_batches: Vec<Py<PyAny>> = self
-            .inner
-            .batches()
-            .iter()
-            .map(|b| PyBatch::from_record_batch(b.clone()).to_arrow(py))
-            .collect::<PyResult<_>>()?;
         let pyarrow = py.import("pyarrow").map_err(|_| {
             PyImportError::new_err(
                 "pyarrow required for QueryResult.to_arrow(). Install with: pip install krishiv[arrow]",
             )
         })?;
+        let record_batch_fn = pyarrow.getattr("record_batch")?;
+        let py_batches: Vec<Py<PyAny>> = self
+            .inner
+            .batches()
+            .iter()
+            .map(|b| {
+                let arrow_obj = PyBatch::from_record_batch(b.clone()).to_arrow(py)?;
+                let pa_batch = record_batch_fn.call1((arrow_obj,))?;
+                Ok(pa_batch.unbind())
+            })
+            .collect::<PyResult<_>>()?;
         let table_cls = pyarrow.getattr("Table")?;
         let py_list = PyList::new(py, py_batches)?;
         table_cls

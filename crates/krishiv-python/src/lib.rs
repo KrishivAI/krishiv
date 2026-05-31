@@ -107,6 +107,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sources::read_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_kafka, m)?)?;
     m.add_function(wrap_pyfunction!(sources::read_iceberg, m)?)?;
+    m.add_function(wrap_pyfunction!(batch::make_example_batch, m)?)?;
     m.add_function(wrap_pyfunction!(migration::register_state_migration, m)?)?;
     m.add_function(wrap_pyfunction!(migration::state_migration, m)?)?;
     m.add_function(wrap_pyfunction!(migration::apply_state_migration, m)?)?;
