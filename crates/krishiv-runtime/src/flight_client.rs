@@ -68,36 +68,66 @@ async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
 
 /// Lazily-connected gRPC channel reused across remote Flight calls.
 ///
-/// Each remote operation previously created a new `tonic::Channel` per
-/// invocation. This pool reuses a single persistent channel to reduce
-/// connection handshakes and TLS negotiations.
+/// Supports multiple coordinator endpoints for failover — on connection
+/// failure, the next endpoint in the list is tried.
 #[derive(Clone)]
 pub struct FlightClientPool {
-    endpoint: String,
-    channel: Arc<tokio::sync::OnceCell<Channel>>,
+    endpoints: Vec<String>,
+    current: Arc<std::sync::atomic::AtomicUsize>,
+    channel: Arc<tokio::sync::RwLock<Option<Channel>>>,
 }
 
 impl FlightClientPool {
     pub fn new(flight_url: impl Into<String>) -> Self {
+        let url = flight_url.into();
+        let endpoint = normalize_flight_endpoint(&url).unwrap_or_else(|_| String::new());
         Self {
-            endpoint: normalize_flight_endpoint(&flight_url.into())
-                .unwrap_or_else(|_| String::new()),
-            channel: Arc::new(tokio::sync::OnceCell::new()),
+            endpoints: vec![endpoint],
+            current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            channel: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
+    pub fn with_alternate(mut self, url: impl Into<String>) -> Self {
+        let endpoint = normalize_flight_endpoint(&url.into()).unwrap_or_else(|_| String::new());
+        if !endpoint.is_empty() {
+            self.endpoints.push(endpoint);
+        }
+        self
+    }
+
     pub fn flight_url(&self) -> &str {
-        &self.endpoint
+        let idx = self.current.load(std::sync::atomic::Ordering::Relaxed);
+        self.endpoints.get(idx).map(|s| s.as_str()).unwrap_or("")
     }
 
     pub async fn get_channel(&self) -> RuntimeResult<Channel> {
-        let cell = self
-            .channel
-            .get_or_try_init(|| async { connect_flight_channel(&self.endpoint).await });
-        cell.await
-            .as_ref()
-            .map(|c| (*c).clone())
-            .map_err(|e| e.clone())
+        {
+            let guard = self.channel.read().await;
+            if let Some(ref ch) = *guard {
+                return Ok(ch.clone());
+            }
+        }
+
+        let endpoint = self.flight_url();
+        let result = connect_flight_channel(&endpoint).await;
+
+        match result {
+            Ok(ch) => {
+                let mut guard = self.channel.write().await;
+                *guard = Some(ch.clone());
+                Ok(ch)
+            }
+            Err(e) if self.endpoints.len() > 1 => {
+                self.current.store(
+                    (self.current.load(std::sync::atomic::Ordering::Relaxed) + 1)
+                        % self.endpoints.len(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn do_action(

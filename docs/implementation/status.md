@@ -19,10 +19,63 @@ as a session handoff note, not as a release-plan archive.
   rather than deferred until query execution.
 - Distributed support uses scheduler, executor, proto, Flight SQL, and optional
   Kubernetes operator/manifests.
+- Durability profiles are explicit via `DurabilityProfile`: `dev-local`,
+  `single-node-durable`, and `distributed-durable`.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
-## Last Session: Coordinator Cleanup + Architecture Bottlenecks
+## Current Session: In-Process Protocol + Checkpoint Inner Drift
+
+- `SharedCoordinator::new` now seeds `CheckpointInner` from existing coordinator
+  checkpoint state instead of starting empty.
+- Added `SharedCoordinator::submit_job`, and routed CCP/federation submit paths
+  through it so streaming checkpoint coordinators are reflected into the
+  sharded checkpoint state.
+- gRPC management `list_checkpoints` and `inspect_state` now read
+  `checkpoint_inner` directly, reducing dependence on the outer coordinator
+  checkpoint snapshot.
+- In-process runtime now builds executor/checkpoint inner locks after local
+  executor registration, so embedded/single-node direct transport starts from
+  the same executor registry state as the coordinator.
+- Executor assignment inbox deduplication now keys by
+  `(job_id, task_id, attempt_id)` instead of `(task_id, attempt_id)`, fixing
+  repeated embedded/single-node jobs that reuse local task ids.
+- `trigger_checkpoint_for_job` explicitly drops its job existence guard before
+  mutating checkpoint state, satisfying the synchronization-lock lint.
+- Added deployment conformance coverage for embedded local execution,
+  single-node daemon placement, distributed fake remote placement, Kubernetes
+  `kind` smoke-test artifacts, and bare-metal/VM coordinator process mode.
+- Added shared `DurabilityProfile` types in `krishiv-common`, re-exported by
+  shuffle/state/checkpoint, and wired coordinator-family daemons to validate
+  `dev-local`, `single-node-durable`, and `distributed-durable` requirements.
+
+### Validation
+
+```bash
+cargo test -p krishiv-scheduler --lib shared_                         # 5 passed
+cargo test -p krishiv-executor --lib same_task_attempt_in_different_jobs_is_not_duplicate  # 1 passed
+cargo test -p krishiv-runtime --lib collect_batch_sql_multiple_queries                     # 1 passed
+cargo test -p krishiv-runtime --lib in_process                                             # 40 passed
+cargo test -p krishiv-runtime --lib deployment_conformance                                 # 2 passed
+cargo test -p krishiv-scheduler --test r2_k8s_manifests deployment_conformance             # 1 passed
+cargo test -p krishiv-common durability                                                    # 2 passed
+cargo test -p krishiv-scheduler --lib parses_defaults
+cargo test -p krishiv-scheduler --lib parses_single_node_durable_profile_with_required_local_storage
+cargo test -p krishiv-scheduler --lib parses_distributed_durable_profile_with_etcd_fencing
+cargo test -p krishiv-scheduler --lib rejects_single_node_durable_without_metadata_path
+cargo check -p krishiv-shuffle -p krishiv-state -p krishiv-checkpoint
+```
+
+### Pending
+
+- Remaining sync dance (`sync_executor_to_inner` / `sync_checkpoint_to_inner`)
+  still exists for tick/checkpoint ack compatibility; more outer coordinator
+  checkpoint/executor APIs need migration to inner-lock reads/writes before it
+  can be removed.
+- Durability profiles are now typed and daemon-validated; remaining work is to
+  carry them through more executor-side state/checkpoint construction sites.
+
+## Previous Session: Coordinator Cleanup + Architecture Bottlenecks
 
 ### Coordinator.jobs elimination (Track B completion)
 

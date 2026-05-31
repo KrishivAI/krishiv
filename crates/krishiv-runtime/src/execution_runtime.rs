@@ -528,6 +528,108 @@ mod tests {
     }
 
     #[test]
+    fn deployment_conformance_embedded_single_node_daemon_and_distributed_fake() {
+        let embedded_cluster = Arc::new(InProcessCluster::new().unwrap());
+        let embedded = build_execution_runtime(
+            RuntimeMode::Embedded,
+            Some(embedded_cluster),
+            None,
+            None,
+            ExecutionPlacement::LocalInProcess,
+        )
+        .expect("embedded runtime");
+        assert_eq!(embedded.mode(), RuntimeMode::Embedded);
+        assert_eq!(embedded.placement(), ExecutionPlacement::LocalInProcess);
+        assert!(!embedded.uses_remote_execution());
+        assert_eq!(
+            embedded.collect_batch_sql("SELECT 1 AS n", &[]).unwrap()[0].num_rows(),
+            1
+        );
+
+        let single_node_daemon = build_execution_runtime(
+            RuntimeMode::SingleNode,
+            None,
+            Some("http://127.0.0.1:50051".into()),
+            Some("http://127.0.0.1:9090".into()),
+            ExecutionPlacement::SingleNodeDaemon,
+        )
+        .expect("single-node daemon runtime");
+        assert_eq!(single_node_daemon.mode(), RuntimeMode::SingleNode);
+        assert_eq!(
+            single_node_daemon.placement(),
+            ExecutionPlacement::SingleNodeDaemon
+        );
+        assert!(single_node_daemon.uses_remote_execution());
+        assert_eq!(
+            single_node_daemon.flight_url(),
+            Some("http://127.0.0.1:50051")
+        );
+        assert_eq!(
+            single_node_daemon.coordinator_grpc_url(),
+            Some("http://127.0.0.1:9090")
+        );
+
+        let distributed_fake = build_execution_runtime(
+            RuntimeMode::Distributed,
+            None,
+            Some("http://distributed.example.invalid:50051".into()),
+            Some("http://distributed.example.invalid:9090".into()),
+            ExecutionPlacement::RemoteClusterRequired,
+        )
+        .expect("distributed fake endpoint runtime");
+        assert_eq!(distributed_fake.mode(), RuntimeMode::Distributed);
+        assert_eq!(
+            distributed_fake.placement(),
+            ExecutionPlacement::RemoteClusterRequired
+        );
+        assert!(distributed_fake.uses_remote_execution());
+        assert_eq!(
+            distributed_fake.flight_url(),
+            Some("http://distributed.example.invalid:50051")
+        );
+        assert_eq!(
+            distributed_fake.coordinator_grpc_url(),
+            Some("http://distributed.example.invalid:9090")
+        );
+    }
+
+    #[test]
+    fn deployment_conformance_rejects_invalid_runtime_placements() {
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let invalid_cases = [
+            (
+                RuntimeMode::Embedded,
+                ExecutionPlacement::SingleNodeDaemon,
+                Some(cluster.clone()),
+                Some("http://127.0.0.1:50051".to_owned()),
+            ),
+            (
+                RuntimeMode::SingleNode,
+                ExecutionPlacement::RemoteClusterRequired,
+                Some(cluster),
+                Some("http://127.0.0.1:50051".to_owned()),
+            ),
+            (
+                RuntimeMode::Distributed,
+                ExecutionPlacement::LocalInProcess,
+                None,
+                Some("http://127.0.0.1:50051".to_owned()),
+            ),
+        ];
+
+        for (mode, placement, cluster, flight_url) in invalid_cases {
+            let err = match build_execution_runtime(mode, cluster, flight_url, None, placement) {
+                Ok(_) => panic!("invalid placement {mode:?}/{placement:?} must be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, crate::RuntimeError::Unsupported { .. }),
+                "expected Unsupported for {mode:?}/{placement:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cluster_endpoints_default() {
         let ep = ClusterEndpoints::default();
         assert!(ep.grpc_url.is_none());

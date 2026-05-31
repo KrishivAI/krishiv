@@ -168,7 +168,6 @@ impl SessionBuilder {
     /// switching to distributed mode (Spark-like `local[*]` client).
     #[must_use]
     pub fn with_local_cluster(mut self, flight_url: impl Into<String>) -> Self {
-        self.local_cluster_grpc = None;
         self.coordinator_url = Some(flight_url.into());
         self.mode = ExecutionMode::SingleNode;
         self
@@ -573,6 +572,10 @@ impl Session {
     }
 
     /// Async variant of [`Self::execute_local`].
+    ///
+    /// Always executes via the local `SqlEngine` (DataFusion) regardless of
+    /// session mode. Returns a DataFrame with pre-collected results so that
+    /// `.collect()` returns immediately without remote routing.
     pub async fn execute_local_async(&self, query: impl AsRef<str>) -> Result<DataFrame> {
         if self.policy_engine.is_some() {
             return Err(KrishivError::AccessDenied {
@@ -581,8 +584,21 @@ impl Session {
                         .into(),
             });
         }
-        let sql_dataframe = self.sql_engine.sql(query.as_ref()).await?;
-        Ok(self.dataframe_from_sql(sql_dataframe))
+        let batches = self
+            .sql_engine
+            .sql_with_view_cache(query.as_ref())
+            .await
+            .map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
+        Ok(DataFrame::from_batches(
+            self.mode,
+            batches,
+            self.jobs.clone(),
+            self.next_job_id.clone(),
+            self.runtime.clone(),
+            self.registered_parquet.clone(),
+        ))
     }
 
     /// Execute SQL through the session [`ExecutionRuntime`] (remote when configured).

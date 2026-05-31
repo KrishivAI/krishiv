@@ -92,8 +92,7 @@ pub async fn federation_submit_job(
     })?;
     let spec = JobSpec::try_from(wire)?;
     tracing::debug!(job_id = %job_id, "federation submit (deserialized spec_json)");
-    let mut coord = coordinator.write().await;
-    coord.submit_job(spec).map_err(|e| match e {
+    coordinator.submit_job(spec).await.map_err(|e| match e {
         SchedulerError::NoExecutors => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     })?;

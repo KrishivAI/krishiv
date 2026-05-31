@@ -40,6 +40,7 @@ mod tests;
 pub use backend::StateBackend;
 pub use error::{StateError, StateResult};
 pub use inspector::StateInspector;
+pub use krishiv_common::durability::{DurabilityProfile, StateDurability};
 pub use memory::InMemoryStateBackend;
 pub use migration::{
     SharedStateMigrationRegistry, StateMigrationError, StateMigrationFn, StateMigrationRegistry,

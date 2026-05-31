@@ -372,14 +372,16 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<ListCheckpointsResponse>, tonic::Status> {
         let req = request.into_inner();
         let (epoch_nums, storage): (Vec<u64>, Option<Arc<dyn CheckpointStorage>>) = {
-            let coordinator = self.coordinator.read().await;
-            let epochs = coordinator
-                .list_job_checkpoints(&req.job_id)
-                .map_err(|e| tonic::Status::internal(e.to_string()))?;
-            let storage = coordinator
-                .checkpoint_coordinator(&req.job_id)
-                .map(|c| Arc::clone(&c.storage));
-            (epochs, storage)
+            let checkpoint_inner = self.coordinator.checkpoint_inner.read().await;
+            match checkpoint_inner.coordinators.get(&req.job_id) {
+                None => (vec![], None),
+                Some(coord) => {
+                    let epochs = coord
+                        .list_epochs()
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    (epochs, Some(Arc::clone(&coord.storage)))
+                }
+            }
         };
         // Enrich each epoch with savepoint metadata.
         // I/O is done outside the coordinator lock.
@@ -418,10 +420,11 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<InspectStateRequest>,
     ) -> Result<tonic::Response<InspectStateResponse>, tonic::Status> {
         let req = request.into_inner();
-        let coordinator = self.coordinator.read().await;
         // Collect snapshot paths for the requested operator from the checkpoint coordinator.
-        let snapshots = coordinator
-            .checkpoint_coordinator(&req.job_id)
+        let checkpoint_inner = self.coordinator.checkpoint_inner.read().await;
+        let snapshots = checkpoint_inner
+            .coordinators
+            .get(&req.job_id)
             .map(|coord| {
                 coord
                     .pending_acks

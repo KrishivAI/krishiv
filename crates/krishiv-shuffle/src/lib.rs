@@ -39,6 +39,7 @@ pub fn validate_safe_id(id: &str, label: &str) -> ShuffleResult<()> {
 pub use compression::{CompressionCodec, ShuffleCompression};
 pub use disk_store::LocalDiskShuffleStore;
 pub use error::{ShuffleError, ShuffleResult, StoreResult};
+pub use krishiv_common::durability::{DurabilityProfile, ShuffleDurability};
 pub use local_store::LocalShuffleStore;
 pub use memory_store::InMemoryShuffleStore;
 pub use metadata::{PartitionState, ShuffleMetadata};

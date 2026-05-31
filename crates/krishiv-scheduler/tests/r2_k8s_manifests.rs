@@ -10,6 +10,8 @@ const RBAC: &str = include_str!("../../../k8s/manifests/rbac.yaml");
 const SAMPLE_JOB: &str = include_str!("../../../k8s/manifests/sample-krishivjob.yaml");
 const SAMPLE_STREAMING_JOB: &str =
     include_str!("../../../k8s/manifests/sample-streaming-krishivjob.yaml");
+const K8S_README: &str = include_str!("../../../k8s/README.md");
+const COORDINATOR_DAEMON: &str = include_str!("../src/coordinator_daemon.rs");
 
 #[test]
 fn krishivjob_crd_declares_expected_api_shape() {
@@ -207,6 +209,35 @@ fn sample_streaming_krishivjob_uses_v1alpha1_contract() {
             "tasks: 1",
             "parallelism: 1",
             "restartPolicy: Never",
+        ],
+    );
+}
+
+#[test]
+fn deployment_conformance_k8s_kind_and_bare_metal_process_modes_are_declared() {
+    assert_contains_all(
+        K8S_README,
+        &[
+            "kind",
+            "KRISHIV_KIND_E2E=1",
+            "cargo test -p krishiv-operator --test r2_kind_smoke",
+            "krishiv-coordinator",
+            "port 9090",
+            "Executor pods run `krishiv-executor --connect`",
+        ],
+    );
+    assert_contains_all(
+        COORDINATOR_DAEMON,
+        &[
+            "bare metal + VM",
+            "CoordinatorDaemonConfig",
+            "build_shared_coordinator",
+            "run_cluster_control_plane",
+            "run_standalone_coordinator",
+            "metadata_backend",
+            "JsonFileMetadataStore",
+            "leader_backend",
+            "serve_coordinator_executor_grpc_with_listener",
         ],
     );
 }

@@ -26,6 +26,7 @@ pub mod object_store;
 pub mod rescaling;
 pub mod storage_uri;
 
+pub use krishiv_common::durability::{CheckpointDurability, DurabilityProfile};
 pub use object_store::ObjectStoreCheckpointStorage;
 pub use storage_uri::open_checkpoint_storage_from_uri;
 

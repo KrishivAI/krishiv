@@ -20,6 +20,8 @@ Core implementation choices:
   APIs rather than being hard-coded into one engine file.
 - Checkpoint storage exposes async primitives for Tokio scheduler/executor paths
   plus sync compatibility wrappers for tests and blocking call sites.
+- Durability is selected through explicit profiles: `dev-local`,
+  `single-node-durable`, and `distributed-durable`.
 
 ## Workspace Map
 
@@ -102,6 +104,19 @@ Distributed:
 - Kubernetes manifests and CRDs live in `k8s/`.
 - Bare-metal/VM operation is process-managed: run coordinator and executors
   directly and point clients at the configured endpoints.
+
+## Durability Profiles
+
+`DurabilityProfile` is shared by shuffle, state, checkpoint, and scheduler
+configuration:
+
+- `dev-local`: in-memory metadata/shuffle/state with ephemeral local
+  checkpoints; not restart durable.
+- `single-node-durable`: local file metadata, local disk shuffle, local redb
+  state, and local filesystem checkpoints; restart durable on one host.
+- `distributed-durable`: consensus metadata, object-store shuffle/checkpoints,
+  local redb state restored from checkpoints, and fenced coordination for
+  multi-node deployments.
 
 ## Commands
 

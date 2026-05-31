@@ -174,7 +174,7 @@ impl ClusterControlPlane {
                 state,
             });
         }
-        self.shared.write().await.submit_job(spec)
+        self.shared.submit_job(spec).await
     }
 
     pub fn job_coordinator(&self, job_id: JobId) -> JobCoordinator {

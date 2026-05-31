@@ -8,17 +8,25 @@ use krishiv_proto::ExecutorTaskAssignment;
 ///
 /// Supports bounded capacity for backpressure (PRR Phase 1/2).
 /// When capacity is reached, `push` returns `ExecutorError::AssignmentQueueFull`.
-/// Deduplicates assignments by (TaskId, AttemptId) — duplicate pushes return
-/// Ok(()) without enqueuing to prevent redundant execution.
+/// Deduplicates assignments by (JobId, TaskId, AttemptId) — duplicate pushes
+/// return Ok(()) without enqueuing to prevent redundant execution.
 const DEFAULT_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
     cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
-    /// Tracks (task_id, attempt_id) pairs already received to prevent
+    /// Tracks (job_id, task_id, attempt_id) tuples already received to prevent
     /// duplicate execution from at-least-once delivery retries.
-    seen: Arc<RwLock<BTreeSet<(krishiv_proto::TaskId, krishiv_proto::AttemptId)>>>,
+    seen: Arc<
+        RwLock<
+            BTreeSet<(
+                krishiv_proto::JobId,
+                krishiv_proto::TaskId,
+                krishiv_proto::AttemptId,
+            )>,
+        >,
+    >,
     /// None = unbounded (legacy / test default). Some(n) = hard limit.
     max_capacity: Option<usize>,
 }
@@ -63,11 +71,15 @@ impl ExecutorAssignmentInbox {
 
     /// Store one received assignment.
     ///
-    /// Deduplicates by (TaskId, AttemptId) — returns `Ok(())` silently if
-    /// this assignment was already received. Returns `Err(AssignmentQueueFull)`
+    /// Deduplicates by (JobId, TaskId, AttemptId) — returns `Ok(())` silently
+    /// if this assignment was already received. Returns `Err(AssignmentQueueFull)`
     /// when at capacity — the backpressure signal to the coordinator.
     pub fn push(&self, assignment: ExecutorTaskAssignment) -> ExecutorResult<()> {
-        let key = (assignment.task_id().clone(), assignment.attempt_id());
+        let key = (
+            assignment.job_id().clone(),
+            assignment.task_id().clone(),
+            assignment.attempt_id(),
+        );
         {
             let mut seen = self
                 .seen
@@ -185,9 +197,13 @@ mod tests {
     };
 
     fn make_assignment(task_id: &str) -> ExecutorTaskAssignment {
+        make_assignment_for_job("job-1", task_id)
+    }
+
+    fn make_assignment_for_job(job_id: &str, task_id: &str) -> ExecutorTaskAssignment {
         ExecutorTaskAssignment::new(
             TaskAttemptRef::new(
-                JobId::try_new("job-1").unwrap(),
+                JobId::try_new(job_id).unwrap(),
                 StageId::try_new("stage-1").unwrap(),
                 TaskId::try_new(task_id).unwrap(),
                 AttemptId::initial(),
@@ -302,6 +318,19 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].task_id().as_str(), "task-1");
         assert_eq!(all[1].task_id().as_str(), "task-2");
+    }
+
+    #[test]
+    fn same_task_attempt_in_different_jobs_is_not_duplicate() {
+        let inbox = ExecutorAssignmentInbox::new();
+        inbox
+            .push(make_assignment_for_job("job-1", "task-0"))
+            .unwrap();
+        inbox
+            .push(make_assignment_for_job("job-2", "task-0"))
+            .unwrap();
+
+        assert_eq!(inbox.len().unwrap(), 2);
     }
 
     #[test]

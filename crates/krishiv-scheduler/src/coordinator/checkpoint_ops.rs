@@ -253,7 +253,7 @@ impl Coordinator {
         job_id: &JobId,
     ) -> SchedulerResult<Vec<InitiateCheckpointRequest>> {
         // Validate job exists first.
-        self.find_job(job_id)?;
+        drop(self.find_job(job_id)?);
 
         let running = self.running_task_count_for_job(job_id);
         let coord = self
@@ -285,6 +285,21 @@ impl Coordinator {
     /// Read-only access to the checkpoint coordinator for a specific job.
     pub fn checkpoint_coordinator(&self, job_id: &JobId) -> Option<&CheckpointCoordinator> {
         self.checkpoint_coordinators.get(job_id)
+    }
+
+    /// Snapshot checkpoint-owned state for initializing a sharded checkpoint inner.
+    pub fn checkpoint_inner_parts(
+        &self,
+    ) -> (
+        std::collections::HashMap<JobId, CheckpointCoordinator>,
+        std::collections::HashSet<(JobId, ExecutorId, u64)>,
+        std::collections::HashSet<(JobId, u64)>,
+    ) {
+        (
+            self.checkpoint_coordinators.clone(),
+            self.checkpoint_notify_sent.clone(),
+            self.barrier_dispatch_sent.clone(),
+        )
     }
 
     /// Mutable access to the checkpoint coordinator for a specific job.

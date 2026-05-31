@@ -85,21 +85,6 @@ impl InProcessStreamingRuntime {
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         let descriptor = ExecutorDescriptor::new(executor_id.clone(), "localhost", 8)
             .with_task_endpoint(IN_PROCESS_TASK_ENDPOINT);
-        // Build sharded inner locks from the initial coordinator state.
-        let executor_inner: Arc<RwLock<ExecutorInner>> = {
-            let coord = coordinator
-                .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
-            Arc::new(RwLock::new(ExecutorInner {
-                executors: coord.executors().clone(),
-                state: coord.state(),
-                ticks_since_restart: coord.ticks_since_restart(),
-                recovering: coord.recovering(),
-                notify: coord.notify().clone(),
-            }))
-        };
-        let checkpoint_inner: Arc<RwLock<CheckpointInner>> =
-            Arc::new(RwLock::new(CheckpointInner::new()));
         {
             let mut coord = coordinator
                 .lock()
@@ -108,6 +93,32 @@ impl InProcessStreamingRuntime {
                 .register_executor(descriptor)
                 .map_err(|e| RuntimeError::transport(e.to_string()))?;
         }
+        // Build sharded inner locks after registering the local executor so the
+        // bridge starts from the same control-plane state as the coordinator.
+        let (executor_inner, checkpoint_inner): (
+            Arc<RwLock<ExecutorInner>>,
+            Arc<RwLock<CheckpointInner>>,
+        ) = {
+            let coord = coordinator
+                .lock()
+                .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+            let (checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) =
+                coord.checkpoint_inner_parts();
+            (
+                Arc::new(RwLock::new(ExecutorInner {
+                    executors: coord.executors().clone(),
+                    state: coord.state(),
+                    ticks_since_restart: coord.ticks_since_restart(),
+                    recovering: coord.recovering(),
+                    notify: coord.notify().clone(),
+                })),
+                Arc::new(RwLock::new(CheckpointInner::from_parts(
+                    checkpoint_coordinators,
+                    checkpoint_notify_sent,
+                    barrier_dispatch_sent,
+                ))),
+            )
+        };
         let inbox = ExecutorAssignmentInbox::new();
         let drainer = Arc::new(RegistryDrainer(Arc::clone(&registry)));
         let runner =

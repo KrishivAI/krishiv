@@ -11,6 +11,7 @@ pub mod async_util;
 pub mod blocking;
 #[cfg(feature = "chaos")]
 pub mod chaos;
+pub mod durability;
 pub mod hash;
 pub mod validate;
 

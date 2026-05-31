@@ -95,6 +95,19 @@ impl CheckpointInner {
         }
     }
 
+    pub fn from_parts(
+        coordinators: HashMap<krishiv_proto::JobId, CheckpointCoordinator>,
+        notify_sent: HashSet<(krishiv_proto::JobId, ExecutorId, u64)>,
+        barrier_sent: HashSet<(krishiv_proto::JobId, u64)>,
+    ) -> Self {
+        Self {
+            coordinators,
+            notify_sent,
+            barrier_sent,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
     /// Handle a checkpoint ack with the async 3-phase protocol.
     ///
     /// Phase 1 (under lock): extract commit data in-memory.

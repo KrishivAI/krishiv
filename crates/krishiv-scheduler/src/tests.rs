@@ -2658,6 +2658,76 @@ mod scheduler_tests {
         assert_eq!(response, CheckpointAckResponse::JobNotFound);
     }
 
+    #[tokio::test]
+    async fn shared_coordinator_seeds_checkpoint_inner_from_existing_state() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage_path = storage.base_dir().to_string_lossy().to_string();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-shared-ck-seed").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-shared-ck-seed").unwrap(),
+                "pod-shared-ck-seed",
+                1,
+            ))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-shared-ck-seed").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "shared-ck-seed", JobKind::Streaming)
+            .with_checkpoint(5_000, &storage_path)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-shared-ck-seed").unwrap(), "stage")
+                    .with_task(TaskSpec::new(
+                        TaskId::try_new("task-shared-ck-seed").unwrap(),
+                        "stream:shared-ck-seed",
+                    )),
+            );
+        coordinator.submit_job(spec).unwrap();
+        assert!(coordinator.checkpoint_coordinator(&job_id).is_some());
+
+        let shared = SharedCoordinator::new(coordinator);
+        let checkpoint_inner = shared.checkpoint_inner.read().await;
+        assert!(
+            checkpoint_inner.coordinators.contains_key(&job_id),
+            "SharedCoordinator must seed CheckpointInner from existing coordinator state"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_submit_job_refreshes_checkpoint_inner() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage_path = storage.base_dir().to_string_lossy().to_string();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-shared-submit").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(
+                ExecutorId::try_new("exec-shared-submit").unwrap(),
+                "pod-shared-submit",
+                1,
+            ))
+            .unwrap();
+        let shared = SharedCoordinator::new(coordinator);
+
+        let job_id = JobId::try_new("job-shared-submit").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "shared-submit", JobKind::Streaming)
+            .with_checkpoint(5_000, &storage_path)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-shared-submit").unwrap(), "stage")
+                    .with_task(TaskSpec::new(
+                        TaskId::try_new("task-shared-submit").unwrap(),
+                        "stream:shared-submit",
+                    )),
+            );
+
+        let outcome = shared.submit_job(spec).await.unwrap();
+        assert!(matches!(outcome, SubmitOutcome::Accepted));
+        let checkpoint_inner = shared.checkpoint_inner.read().await;
+        assert!(
+            checkpoint_inner.coordinators.contains_key(&job_id),
+            "SharedCoordinator::submit_job must keep CheckpointInner current"
+        );
+    }
+
     // ── Group D: savepoint_job / list_job_checkpoints / restore ───────────────
 
     #[test]

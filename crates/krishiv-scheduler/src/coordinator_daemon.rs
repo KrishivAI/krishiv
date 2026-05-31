@@ -12,6 +12,7 @@ use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
+use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{CoordinatorId, CoordinatorState};
 use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
@@ -35,6 +36,7 @@ pub struct CoordinatorDaemonConfig {
     pub grpc_addr: SocketAddr,
     pub http_addr: Option<SocketAddr>,
     pub shuffle_dir: Option<PathBuf>,
+    pub durability_profile: DurabilityProfile,
     pub metadata_backend: Option<String>,
     pub metadata_path: Option<PathBuf>,
     /// `single` (default) or `etcd` (requires `feature = "etcd"` on clusterd builds).
@@ -515,6 +517,11 @@ pub fn parse_coordinator_daemon_config(
             .ok()
             .and_then(|value| value.parse().ok()),
         shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR").ok().map(PathBuf::from),
+        durability_profile: env::var("KRISHIV_DURABILITY_PROFILE")
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or_default(),
         metadata_backend: env::var("KRISHIV_METADATA_BACKEND").ok(),
         metadata_path: env::var("KRISHIV_METADATA_PATH").ok().map(PathBuf::from),
         leader_backend: env::var("KRISHIV_LEADER_BACKEND")
@@ -554,6 +561,10 @@ pub fn parse_coordinator_daemon_config(
             "--shuffle-dir" => {
                 config.shuffle_dir =
                     Some(PathBuf::from(next_daemon_arg(&mut args, "--shuffle-dir")?));
+            }
+            "--durability-profile" => {
+                config.durability_profile =
+                    next_daemon_arg(&mut args, "--durability-profile")?.parse()?;
             }
             "--metadata-backend" => {
                 config.metadata_backend = Some(next_daemon_arg(&mut args, "--metadata-backend")?);
@@ -600,7 +611,51 @@ pub fn parse_coordinator_daemon_config(
     if config.leader_lease_duration_s == 0 {
         return Err("--leader-lease-secs must be greater than zero".into());
     }
+    validate_durability_profile_config(&config)?;
     Ok(config)
+}
+
+fn validate_durability_profile_config(
+    config: &CoordinatorDaemonConfig,
+) -> Result<(), Box<dyn Error>> {
+    match config.durability_profile {
+        DurabilityProfile::DevLocal => Ok(()),
+        DurabilityProfile::SingleNodeDurable => {
+            match config.metadata_backend.as_deref() {
+                Some("json" | "sqlite") => {}
+                _ => {
+                    return Err(
+                        "single-node-durable requires --metadata-backend json|sqlite".into(),
+                    );
+                }
+            }
+            if config.metadata_path.is_none() {
+                return Err("single-node-durable requires --metadata-path".into());
+            }
+            if config.shuffle_dir.is_none() {
+                return Err("single-node-durable requires --shuffle-dir".into());
+            }
+            if config.leader_backend != "single" {
+                return Err("single-node-durable requires --leader-backend single".into());
+            }
+            Ok(())
+        }
+        DurabilityProfile::DistributedDurable => {
+            if config.metadata_backend.as_deref() != Some("etcd") {
+                return Err("distributed-durable requires --metadata-backend etcd".into());
+            }
+            if config.leader_backend != "etcd" {
+                return Err("distributed-durable requires --leader-backend etcd".into());
+            }
+            if config.etcd_endpoints.is_empty() {
+                return Err(
+                    "distributed-durable requires --etcd-endpoints or KRISHIV_ETCD_ENDPOINTS"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn parse_etcd_endpoints_env() -> Vec<String> {
@@ -640,6 +695,7 @@ pub fn coordinator_daemon_help() -> &'static str {
        --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:9090)\n\
        --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
+       --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
        --metadata-backend <TYPE>   memory | json | sqlite | etcd\n\
        --metadata-path <PATH>      Durable metadata path (required for json/sqlite)\n\
        --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
@@ -896,6 +952,7 @@ pub async fn run_job_coordinator_daemon(
 mod parse_tests {
     use super::{parse_coordinator_daemon_config, render_metrics_body};
     use crate::{Coordinator, SharedCoordinator};
+    use krishiv_common::durability::DurabilityProfile;
     use krishiv_proto::CoordinatorId;
 
     #[test]
@@ -903,6 +960,7 @@ mod parse_tests {
         let config = parse_coordinator_daemon_config(std::iter::empty::<String>()).unwrap();
         assert_eq!(config.coordinator_id, "coord-local");
         assert_eq!(config.grpc_addr.port(), 9090);
+        assert_eq!(config.durability_profile, DurabilityProfile::DevLocal);
         assert!(!config.help);
     }
 
@@ -939,6 +997,67 @@ mod parse_tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("etcd-endpoints"));
+    }
+
+    #[test]
+    fn parses_single_node_durable_profile_with_required_local_storage() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("single-node-durable"),
+            String::from("--metadata-backend"),
+            String::from("json"),
+            String::from("--metadata-path"),
+            String::from("/tmp/krishiv-metadata.json"),
+            String::from("--shuffle-dir"),
+            String::from("/tmp/krishiv-shuffle"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.durability_profile,
+            DurabilityProfile::SingleNodeDurable
+        );
+        assert_eq!(config.metadata_backend.as_deref(), Some("json"));
+        assert!(config.metadata_path.is_some());
+        assert!(config.shuffle_dir.is_some());
+    }
+
+    #[test]
+    fn rejects_single_node_durable_without_metadata_path() {
+        let err = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("single-node-durable"),
+            String::from("--metadata-backend"),
+            String::from("json"),
+            String::from("--shuffle-dir"),
+            String::from("/tmp/krishiv-shuffle"),
+        ])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("metadata-path"));
+    }
+
+    #[test]
+    fn parses_distributed_durable_profile_with_etcd_fencing() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("distributed-durable"),
+            String::from("--metadata-backend"),
+            String::from("etcd"),
+            String::from("--leader-backend"),
+            String::from("etcd"),
+            String::from("--etcd-endpoints"),
+            String::from("http://127.0.0.1:2379"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.durability_profile,
+            DurabilityProfile::DistributedDurable
+        );
+        assert_eq!(config.metadata_backend.as_deref(), Some("etcd"));
+        assert_eq!(config.leader_backend, "etcd");
+        assert_eq!(config.etcd_endpoints, vec!["http://127.0.0.1:2379"]);
     }
 
     #[tokio::test]

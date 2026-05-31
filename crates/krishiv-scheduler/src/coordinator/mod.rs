@@ -193,7 +193,11 @@ impl SharedCoordinator {
             recovering: coordinator.recovering,
             notify: coordinator.notify.clone(),
         };
-        let checkpoint_inner = CheckpointInner::new();
+        let checkpoint_inner = CheckpointInner::from_parts(
+            coordinator.checkpoint_coordinators.clone(),
+            coordinator.checkpoint_notify_sent.clone(),
+            coordinator.barrier_dispatch_sent.clone(),
+        );
         Self {
             inner: Arc::new(RwLock::new(coordinator)),
             executor_inner: Arc::new(RwLock::new(executor_inner)),
@@ -209,6 +213,30 @@ impl SharedCoordinator {
     /// Borrow the coordinator for scheduler mutations.
     pub async fn write(&self) -> RwLockWriteGuard<'_, Coordinator> {
         self.inner.write().await
+    }
+
+    /// Submit a job through the shared coordinator and refresh sharded checkpoint state.
+    pub async fn submit_job(&self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
+        let (outcome, checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) = {
+            let mut coord = self.inner.write().await;
+            let outcome = coord.submit_job(spec)?;
+            (
+                outcome,
+                coord.checkpoint_coordinators.clone(),
+                coord.checkpoint_notify_sent.clone(),
+                coord.barrier_dispatch_sent.clone(),
+            )
+        };
+
+        let mut checkpoint_inner = self.checkpoint_inner.write().await;
+        crate::coordinator_sharded::sync_checkpoint_to_inner(
+            &checkpoint_coordinators,
+            &checkpoint_notify_sent,
+            &barrier_dispatch_sent,
+            &mut checkpoint_inner,
+        );
+
+        Ok(outcome)
     }
 
     /// Advance the heartbeat clock by one tick (P0-4).
