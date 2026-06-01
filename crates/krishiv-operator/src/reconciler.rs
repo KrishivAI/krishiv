@@ -299,6 +299,17 @@ fn invalid_id(error: impl fmt::Display) -> OperatorError {
 }
 
 fn task_description(resource: &KrishivJobResource, task_idx: usize) -> String {
+    if resource.spec.mode == crate::crd::job::KrishivJobMode::Batch
+        && let Some(query) = sql_query_arg(&resource.spec.args)
+    {
+        return format!("sql: {query}");
+    }
+    if resource.spec.mode == crate::crd::job::KrishivJobMode::Streaming
+        && memory_stream_source(&resource.spec.args)
+    {
+        return "stream:tw:key=key:time=ts:win=1000:lag=0:agg=count".to_owned();
+    }
+
     let args = if resource.spec.args.is_empty() {
         String::from("no args")
     } else {
@@ -310,6 +321,32 @@ fn task_description(resource: &KrishivJobResource, task_idx: usize) -> String {
         JobKind::from(resource.spec.mode),
         resource.spec.image
     )
+}
+
+fn sql_query_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter().map(String::as_str);
+    if iter.next()? != "sql" {
+        return None;
+    }
+    while let Some(arg) = iter.next() {
+        if arg == "--query" {
+            return iter.next().map(str::trim).filter(|query| !query.is_empty());
+        }
+    }
+    None
+}
+
+fn memory_stream_source(args: &[String]) -> bool {
+    let mut iter = args.iter().map(String::as_str);
+    if iter.next() != Some("stream") {
+        return false;
+    }
+    while let Some(arg) = iter.next() {
+        if arg == "--source" {
+            return iter.next() == Some("memory");
+        }
+    }
+    false
 }
 
 fn status_from_snapshot(

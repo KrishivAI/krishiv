@@ -7,12 +7,14 @@ use krishiv_proto::{
 };
 use krishiv_scheduler::{Coordinator, SharedCoordinator};
 use kube::Client;
-use kube::api::Api;
+use kube::api::{Api, ListParams};
 use kube::core::DynamicObject;
 use kube::runtime::watcher::{self, Event as WatchEvent};
 
-use crate::dynamic::patch_krishivjob_status;
 use crate::dynamic::{krishivjob_api, resource_from_dynamic_object};
+use crate::dynamic::{
+    patch_krishivjob_finalizer, patch_krishivjob_status, remove_krishivjob_finalizer,
+};
 use crate::error::{OperatorError, OperatorResult};
 use crate::pod_manager::PodLifecycleManager;
 use crate::reconciler::*;
@@ -197,32 +199,41 @@ pub async fn run_kubernetes_controller_runtime_with_client(
     config: KubernetesControllerConfig,
     runtime: KubernetesControllerRuntime,
 ) -> OperatorResult<()> {
-    let tick_coordinator = runtime.coordinator.clone();
-    let tick_period_ms = {
-        let coord = tick_coordinator.read().await;
-        coord.config().tick_period_ms()
-    };
-    // Shutdown signal so the tick loop can be cleanly stopped.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let tick_handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_period_ms));
+    let orchestration = runtime.coordinator.spawn_orchestration_loops();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let jobs = krishivjob_api(client, config.namespace())?;
+    let watcher_config = watcher_config(&config);
+
+    let status_jobs = jobs.clone();
+    let status_runtime = runtime.clone();
+    let mut status_shutdown_rx = shutdown_rx.clone();
+    let status_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let mut coord = tick_coordinator.write().await;
-                    if let Err(e) = coord.coordinator_tick() {
-                        tracing::warn!(error = %e, "embedded coordinator tick failed");
+                    match status_jobs.list(&ListParams::default()).await {
+                        Ok(resources) => {
+                            for object in resources {
+                                if let Err(error) = reconcile_dynamic_object_with_runtime(
+                                    &status_jobs,
+                                    &status_runtime,
+                                    object,
+                                ).await {
+                                    tracing::warn!(error = %error, "periodic KrishivJob status reconcile failed");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "failed to list KrishivJob resources for status reconcile");
+                        }
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    break;
-                }
+                _ = status_shutdown_rx.changed() => { if *status_shutdown_rx.borrow() { return; } }
             }
         }
     });
-
-    let jobs = krishivjob_api(client, config.namespace())?;
-    let watcher_config = watcher_config(&config);
 
     let mut events = watcher::watcher(jobs.clone(), watcher_config).boxed();
     while let Some(event) = events.next().await {
@@ -234,9 +245,9 @@ pub async fn run_kubernetes_controller_runtime_with_client(
         }
     }
 
-    // Signal the tick loop to stop cleanly.
     let _ = shutdown_tx.send(true);
-    tick_handle.abort();
+    status_handle.abort();
+    orchestration.shutdown();
 
     Ok(())
 }
@@ -262,7 +273,11 @@ pub async fn reconcile_dynamic_object_with_runtime(
         (outcome, job_id)
     };
 
+    let remove_finalizer = outcome.action() == ReconcileAction::FinalizerRemoved;
     match outcome.action() {
+        ReconcileAction::FinalizerAdded => {
+            patch_krishivjob_finalizer(jobs, &resource).await?;
+        }
         ReconcileAction::Submitted => {
             if let Some(ref job_id) = job_id {
                 // BUG-2: Create executor Pods so the scheduler has executors to
@@ -317,6 +332,9 @@ pub async fn reconcile_dynamic_object_with_runtime(
     }
 
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
+    if remove_finalizer {
+        remove_krishivjob_finalizer(jobs, &resource).await?;
+    }
 
     Ok(KubernetesReconcileReport {
         namespace: resource.metadata.namespace_or_default().to_owned(),
@@ -335,7 +353,13 @@ pub async fn reconcile_dynamic_object(
 ) -> OperatorResult<KubernetesReconcileReport> {
     let resource = resource_from_dynamic_object(&object)?;
     let outcome = reconciler.reconcile(coordinator, &resource)?;
+    if outcome.action() == ReconcileAction::FinalizerAdded {
+        patch_krishivjob_finalizer(jobs, &resource).await?;
+    }
     patch_krishivjob_status(jobs, &resource, outcome.status()).await?;
+    if outcome.action() == ReconcileAction::FinalizerRemoved {
+        remove_krishivjob_finalizer(jobs, &resource).await?;
+    }
 
     Ok(KubernetesReconcileReport {
         namespace: resource.metadata.namespace_or_default().to_owned(),

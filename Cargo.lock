@@ -4169,6 +4169,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-ui",
  "kube",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

@@ -2260,9 +2260,16 @@ mod scheduler_tests {
             .register_executor(ExecutorDescriptor::new(executor_b.clone(), "pod-b", 1))
             .unwrap();
 
-        // Re-assign the pending task, then launch it.
-        let reassigned = coordinator.assign_pending_tasks(&job_id).unwrap();
-        assert_eq!(reassigned, 1, "should re-assign the pending task");
+        // Re-registering a healthy executor should assign pending work without
+        // requiring an external reconcile loop to call assign_pending_tasks.
+        {
+            let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+            assert_eq!(
+                detail.stages()[0].tasks()[0].state(),
+                TaskState::Assigned,
+                "task should be assigned when an executor registers after a crash"
+            );
+        }
         let relaunch = coordinator
             .launch_assigned_task_assignments(&job_id)
             .unwrap();

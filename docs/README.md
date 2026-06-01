@@ -105,6 +105,73 @@ Distributed:
 - Bare-metal/VM operation is process-managed: run coordinator and executors
   directly and point clients at the configured endpoints.
 
+## Build Feature Matrix
+
+Execution mode is selected at runtime through `RuntimeMode`,
+`ExecutionPlacement`, session builders, and environment variables. Cargo
+features select compiled capabilities and optional dependency families only.
+Because Cargo features are additive, do not use them as mutually exclusive mode
+switches.
+
+Rust `krishiv` facade feature presets:
+
+| Feature | Purpose |
+|---|---|
+| `minimal` | Smallest facade surface; no optional deployment capabilities. |
+| `local` | Default developer build; embedded plus single-node capabilities. |
+| `embedded` | In-process API use; intentionally has no optional dependencies. |
+| `single-node` | Local daemon/in-process cluster support with Flight SQL, shuffle, and SQLite metadata. |
+| `distributed` | Bare remote cluster support with Flight SQL, shuffle, and etcd metadata. |
+| `bare-metal` | Alias for distributed process-managed deployments. |
+| `cluster` | Compatibility alias for `distributed`. |
+| `k8s` | Distributed support plus Kubernetes operator/CRD capability. |
+| `full` | Broad integration build for release and compatibility checks. |
+
+Rust optional integration features:
+
+| Feature | Purpose |
+|---|---|
+| `flight-sql` | Arrow Flight SQL transport/server support. |
+| `shuffle` | Shuffle service/store support. |
+| `etcd` | etcd-backed scheduler metadata and coordination. |
+| `sqlite` | SQLite scheduler metadata option. |
+| `kafka` | Kafka connector support. |
+| `state` | Connector/state integration. |
+| `iceberg` | Iceberg lakehouse support. |
+| `delta` | Delta lakehouse support. |
+| `ui` | Operator UI integration. |
+
+Recommended Rust build commands:
+
+```bash
+cargo check -p krishiv --no-default-features --features embedded
+cargo check -p krishiv --no-default-features --features single-node
+cargo build -p krishiv --no-default-features --features bare-metal --release
+cargo build -p krishiv --no-default-features --features k8s --profile release-k8s
+cargo check -p krishiv --all-features
+```
+
+Python bindings default to the lean local/remote API surface. Optional native
+extension features are enabled only for integration families:
+
+| Python feature | Purpose |
+|---|---|
+| `kafka` | Kafka sources/connectors. |
+| `iceberg` | Iceberg lakehouse bindings. |
+| `ai` | Local embedding/RAG support. |
+| `vector-sinks` | Alias for AI/vector sink support. |
+| `qdrant` | Qdrant vector sink. |
+| `pgvector` | pgvector sink. |
+
+Recommended Python build commands:
+
+```bash
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features iceberg
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features kafka
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features ai,qdrant
+```
+
 ## Durability Profiles
 
 `DurabilityProfile` is shared by shuffle, state, checkpoint, and scheduler

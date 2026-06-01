@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/part-of: krishiv
 spec:
   mode: streaming
-  image: ghcr.io/krishiv/krishiv:dev
+  image: localhost/krishiv:local
   tasks: 1
   parallelism: 1
   restartPolicy: Never

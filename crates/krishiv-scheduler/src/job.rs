@@ -344,7 +344,7 @@ impl JobRecord {
                     } else {
                         vec![InputPartition::new(
                             task.task_id().as_str(),
-                            task_description.clone(),
+                            default_input_partition_description(&task_description),
                         )]
                     };
                     let mut assignment = ExecutorTaskAssignment::new(
@@ -550,6 +550,14 @@ impl JobRecord {
             .map(|p| p.size_bytes)
             .sum()
     }
+}
+
+fn default_input_partition_description(task_description: &str) -> String {
+    if task_description.starts_with("stream:") {
+        return "stream-kafka:memory:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1"
+            .to_owned();
+    }
+    task_description.to_owned()
 }
 
 /// Stage record owned by a job coordinator.

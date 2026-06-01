@@ -16,14 +16,26 @@ name = "krishiv"
 path = "src/main.rs"
 
 [features]
-# Product-facing crate defaults to the cluster-oriented surface. Lower-level
-# engine crates keep their own finer-grained features.
-default = ["cluster"]
+# Product-facing crate defaults to a local developer surface. Execution mode is
+# still selected at runtime; features only select compiled capabilities and
+# optional dependency families.
+default = ["local"]
 
-# Deployment surfaces
-cluster = ["flight-sql", "shuffle", "etcd"]
-k8s = ["dep:krishiv-operator", "krishiv-operator/k8s"]
+# Build presets
+minimal = []
+local = ["embedded", "single-node"]
+full = ["single-node", "distributed", "k8s", "ui", "kafka", "iceberg", "delta"]
+
+# Execution/deployment capability surfaces
+embedded = []
+single-node = ["flight-sql", "shuffle", "sqlite"]
+distributed = ["flight-sql", "shuffle", "etcd"]
+bare-metal = ["distributed"]
+cluster = ["distributed"]
+k8s = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
 ui = ["dep:krishiv-operator", "krishiv-operator/ui"]
+
+# Optional dependency families
 flight-sql = ["dep:krishiv-flight-sql"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
@@ -41,7 +53,7 @@ krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-operator = { path = "../krishiv-operator", optional = true }
+krishiv-operator = { path = "../krishiv-operator", optional = true, default-features = false }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-executor = { path = "../krishiv-executor" }

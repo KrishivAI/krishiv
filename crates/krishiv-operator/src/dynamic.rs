@@ -5,7 +5,7 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use serde_json::{Value, json};
 
-use crate::constants::{API_GROUP, API_VERSION, FIELD_MANAGER, FINALIZER, KIND};
+use crate::constants::{API_GROUP, API_VERSION, FINALIZER, KIND};
 use crate::crd::job::{KrishivJobResource, KrishivJobStatus};
 use crate::error::OperatorResult;
 
@@ -23,16 +23,6 @@ pub fn resource_from_dynamic_object(object: &DynamicObject) -> OperatorResult<Kr
 }
 
 /// Patch `metadata.finalizers` to include the Krishiv job finalizer (P0-6).
-///
-/// # Risk: `force=true` field manager conflicts
-///
-/// This function uses `PatchParams::apply(FIELD_MANAGER).force()`.  The
-/// `force` flag causes this field manager to **take ownership** of any fields
-/// that conflict with other managers.  If another controller or webhook has
-/// set finalizers on this resource, the force-apply may overwrite or remove
-/// those entries.  Use `Patch::Merge` or a strategic-merge patch without
-/// `force` if coexistence with other finalizer-setting controllers is
-/// required.
 pub async fn patch_krishivjob_finalizer(
     jobs: &Api<DynamicObject>,
     resource: &KrishivJobResource,
@@ -42,8 +32,26 @@ pub async fn patch_krishivjob_finalizer(
         finalizers.push(FINALIZER.to_string());
     }
     let patch = json!({ "metadata": { "finalizers": finalizers } });
-    let params = PatchParams::apply(FIELD_MANAGER).force();
-    jobs.patch(&resource.metadata.name, &params, &Patch::Apply(&patch))
+    let params = PatchParams::default();
+    jobs.patch(&resource.metadata.name, &params, &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_krishivjob_finalizer(
+    jobs: &Api<DynamicObject>,
+    resource: &KrishivJobResource,
+) -> OperatorResult<()> {
+    let finalizers: Vec<String> = resource
+        .metadata
+        .finalizers
+        .iter()
+        .filter(|finalizer| finalizer.as_str() != FINALIZER)
+        .cloned()
+        .collect();
+    let patch = json!({ "metadata": { "finalizers": finalizers } });
+    let params = PatchParams::default();
+    jobs.patch(&resource.metadata.name, &params, &Patch::Merge(&patch))
         .await?;
     Ok(())
 }
@@ -53,9 +61,9 @@ pub async fn patch_krishivjob_status(
     resource: &KrishivJobResource,
     status: &KrishivJobStatus,
 ) -> OperatorResult<()> {
-    let params = PatchParams::apply(FIELD_MANAGER).force();
+    let params = PatchParams::default();
     let patch = status_patch(status);
-    jobs.patch_status(&resource.metadata.name, &params, &Patch::Apply(&patch))
+    jobs.patch_status(&resource.metadata.name, &params, &Patch::Merge(&patch))
         .await?;
     Ok(())
 }

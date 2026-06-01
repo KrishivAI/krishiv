@@ -18,7 +18,9 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec, PodTemplateSpec};
+use k8s_openapi::api::core::v1::{
+    Container, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;
 use kube::api::{Api, DeleteParams, ObjectMeta as KubeObjectMeta, PostParams};
@@ -40,6 +42,8 @@ const ENV_EXECUTOR_ID: &str = "KRISHIV_EXECUTOR_ID";
 const ENV_JOB_ID: &str = "KRISHIV_JOB_ID";
 /// Number of task slots advertised by each executor Pod.
 const ENV_TASK_SLOTS: &str = "KRISHIV_TASK_SLOTS";
+/// Pod IP used by executors when advertising task/barrier gRPC endpoints.
+const ENV_POD_IP: &str = "POD_IP";
 
 /// Manages the lifecycle of executor Pods spawned for a `KrishivJob`.
 #[derive(Clone)]
@@ -179,6 +183,7 @@ impl PodLifecycleManager {
             .unwrap_or_default();
 
         let mut env_vars = vec![
+            pod_ip_env_var(),
             EnvVar {
                 name: ENV_COORDINATOR_ENDPOINT.to_owned(),
                 value: Some(self.coordinator_endpoint.clone()),
@@ -226,11 +231,7 @@ impl PodLifecycleManager {
             } else {
                 Some(resource.spec.entrypoint.clone())
             },
-            args: if resource.spec.args.is_empty() {
-                None
-            } else {
-                Some(resource.spec.args.clone())
-            },
+            args: Some(executor_args(&self.coordinator_endpoint)),
             env: Some(env_vars),
             ..Default::default()
         };
@@ -278,12 +279,9 @@ pub fn build_executor_pod_template(
         } else {
             Some(resource.spec.entrypoint.clone())
         },
-        args: if resource.spec.args.is_empty() {
-            None
-        } else {
-            Some(resource.spec.args.clone())
-        },
+        args: Some(executor_args(coordinator_endpoint)),
         env: Some(vec![
+            pod_ip_env_var(),
             EnvVar {
                 name: ENV_COORDINATOR_ENDPOINT.to_owned(),
                 value: Some(coordinator_endpoint.to_owned()),
@@ -292,6 +290,11 @@ pub fn build_executor_pod_template(
             EnvVar {
                 name: ENV_JOB_ID.to_owned(),
                 value: Some(resource.metadata.scheduler_job_id()),
+                ..Default::default()
+            },
+            EnvVar {
+                name: ENV_TASK_SLOTS.to_owned(),
+                value: Some("1".to_owned()),
                 ..Default::default()
             },
         ]),
@@ -311,5 +314,30 @@ pub fn build_executor_pod_template(
             }),
             ..Default::default()
         }),
+    }
+}
+
+fn executor_args(coordinator_endpoint: &str) -> Vec<String> {
+    vec![
+        "executor".to_owned(),
+        "--coordinator".to_owned(),
+        coordinator_endpoint.to_owned(),
+        "--connect".to_owned(),
+        "--heartbeat-interval-secs".to_owned(),
+        "1".to_owned(),
+    ]
+}
+
+fn pod_ip_env_var() -> EnvVar {
+    EnvVar {
+        name: ENV_POD_IP.to_owned(),
+        value_from: Some(EnvVarSource {
+            field_ref: Some(ObjectFieldSelector {
+                api_version: Some("v1".to_owned()),
+                field_path: "status.podIP".to_owned(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }

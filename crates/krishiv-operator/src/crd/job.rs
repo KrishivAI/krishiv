@@ -27,7 +27,11 @@ pub struct ObjectMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub finalizers: Vec<String>,
     /// Non-null when the resource has been deleted but finalizers are still present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "deletionTimestamp",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub deletion_timestamp: Option<String>,
 }
 

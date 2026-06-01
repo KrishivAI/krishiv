@@ -21,6 +21,8 @@ use kube::Client;
 #[cfg(feature = "k8s")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider();
+    configure_grpc_auth_from_env();
     let config = OperatorCliConfig::parse(std::env::args().skip(1))?;
     if config.help {
         print!("{}", OperatorCliConfig::help());
@@ -58,6 +60,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         run_kubernetes_controller_runtime_with_client(client, controller_config, runtime).await?;
     }
     Ok(())
+}
+
+#[cfg(feature = "k8s")]
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(feature = "k8s")]
+fn configure_grpc_auth_from_env() {
+    if std::env::var("KRISHIV_ALLOW_ANONYMOUS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        krishiv_scheduler::set_allow_anonymous();
+    }
 }
 
 #[cfg(not(feature = "k8s"))]

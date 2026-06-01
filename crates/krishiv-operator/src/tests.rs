@@ -11,9 +11,9 @@ mod operator_tests {
         KrishivJobPhase, KrishivJobReconciler, KrishivJobResource, KrishivJobSpec,
         KrishivJobStatus, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus,
         KubernetesControllerConfig, KubernetesControllerRuntime, ObjectMeta, OperatorError,
-        ReconcileAction, TaskStatusCounters, demo_coordinator, detect_executor_pod_launch_failure,
-        job_spec_from_resource, krishivjob_api_resource, resource_from_dynamic_object,
-        status_patch,
+        ReconcileAction, TaskStatusCounters, build_executor_pod_template, demo_coordinator,
+        detect_executor_pod_launch_failure, job_spec_from_resource, krishivjob_api_resource,
+        resource_from_dynamic_object, status_patch,
     };
     use krishiv_scheduler::{Coordinator, LeaderElection as _};
     use kube::core::DynamicObject;
@@ -29,7 +29,10 @@ mod operator_tests {
         assert_eq!(job.name(), "sample-batch");
         assert_eq!(job.kind().to_string(), "batch");
         assert_eq!(job.task_count(), 2);
-        assert!(job.stages()[0].tasks()[0].description().contains("select"));
+        assert_eq!(
+            job.stages()[0].tasks()[0].description(),
+            "sql: select 1 as value"
+        );
     }
 
     #[test]
@@ -166,6 +169,26 @@ mod operator_tests {
         assert_eq!(resource.version, "v1alpha1");
         assert_eq!(resource.kind, "KrishivJob");
         assert_eq!(resource.plural, "krishivjobs");
+    }
+
+    #[test]
+    fn executor_pod_template_runs_executor_not_job_args() {
+        let resource = sample_resource();
+        let template = build_executor_pod_template(&resource, "http://krishiv-coordinator:9090");
+        let spec = template.spec.expect("pod template spec");
+        let container = spec.containers.first().expect("executor container");
+
+        assert_eq!(
+            container.args.as_ref().expect("executor args"),
+            &vec![
+                String::from("executor"),
+                String::from("--coordinator"),
+                String::from("http://krishiv-coordinator:9090"),
+                String::from("--connect"),
+                String::from("--heartbeat-interval-secs"),
+                String::from("1"),
+            ]
+        );
     }
 
     #[test]

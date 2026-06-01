@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/part-of: krishiv
 spec:
   mode: batch
-  image: ghcr.io/krishiv/krishiv:dev
+  image: localhost/krishiv:local
   tasks: 2
   parallelism: 2
   restartPolicy: Never

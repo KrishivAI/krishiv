@@ -24,6 +24,89 @@ as a session handoff note, not as a release-plan archive.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
+## Current Session: Build Feature Matrix Cleanup
+
+Implemented explicit Rust facade build presets in `crates/krishiv`:
+
+- `default = ["local"]` instead of the previous cluster-oriented default.
+- Added `minimal`, `local`, `embedded`, `single-node`, `distributed`,
+  `bare-metal`, `k8s`, and `full` presets.
+- Kept `cluster` as a compatibility alias for `distributed`.
+- Changed the optional `krishiv-operator` dependency to
+  `default-features = false` so `k8s` and `ui` control operator capabilities
+  explicitly.
+- Documented the Rust and Python feature/build matrix in `docs/README.md`.
+
+Validation:
+
+```bash
+cargo check -p krishiv --no-default-features --features embedded
+cargo check -p krishiv --no-default-features --features single-node
+cargo check -p krishiv --no-default-features --features bare-metal
+cargo check -p krishiv --no-default-features --features k8s
+cargo check -p krishiv
+cargo check -p krishiv --all-features
+cargo check -p krishiv-python --no-default-features
+```
+
+All passed. `cargo check -p krishiv --all-features` emitted one pre-existing
+warning in `krishiv-connectors/src/kafka.rs` for an unused `at_eof` variable.
+
+## Current Session: Operator Path + Dual-Mode Image
+
+Validated the Kubernetes operator path on the local k3s cluster and optimized
+the container image so one runtime image supports both direct single-node/
+distributed commands and the Kubernetes operator deployment.
+
+Implemented fixes:
+
+- Docker image now stages stripped `release-k8s` musl binaries from
+  `dist/docker/` and includes both `krishiv` and `krishiv-operator`.
+- Added root `k8s/kustomization.yaml` so CRDs and namespaced manifests apply
+  together with `kubectl apply -k k8s`.
+- Operator deployment now runs one active coordinator pod from
+  `localhost/krishiv:local` with anonymous gRPC explicitly enabled for the
+  dev manifest.
+- Executor deployment uses the unified `krishiv executor` command, local image
+  pull policy, and a heartbeat interval below the coordinator lease timeout.
+- Added Kubernetes lease RBAC for operator leadership primitives.
+- Installed the rustls ring crypto provider before creating kube clients.
+- Dynamic CR status/finalizer patches use merge patches, avoiding invalid
+  server-side apply objects.
+- Reconciliation now patches finalizers on add/remove, and the typed CRD model
+  correctly maps `deletionTimestamp`.
+- Operator runtime now keeps the shared coordinator orchestration loops alive
+  and periodically republishes CR status.
+- Scheduler now assigns pending tasks when executors register or become healthy
+  on heartbeat, covering operator restart and executor recovery races.
+- `KrishivJob` batch SQL and memory streaming samples now map to executable
+  executor fragments instead of prose task descriptions.
+- Documented the staged-image build flow in `k8s/README.md`; ignored generated
+  staged binaries under `dist/docker/`.
+
+Validation:
+
+```bash
+cargo build -p krishiv -p krishiv-operator --target x86_64-unknown-linux-musl --profile release-k8s
+buildah bud -t localhost/krishiv:local .
+kubectl apply -k k8s
+kubectl -n krishiv-system rollout status deployment/krishiv-operator
+kubectl -n krishiv-system rollout status deployment/krishiv-executor
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:30051 cargo run -p krishiv --example <name>
+KRISHIV_COORDINATOR_URL=http://127.0.0.1:30051 .venv/bin/python crates/krishiv-python/examples/<name>.py
+cargo test -p krishiv-operator
+cargo check -p krishiv-operator --features k8s,ui
+cargo check -p krishiv --no-default-features --features k8s
+```
+
+All 12 Rust examples and all 12 Python examples passed against the k8s Flight
+endpoint. `cargo test -p krishiv-operator` passed 45 tests. The local image
+`localhost/krishiv:local` is 146 MB and contains both entrypoints.
+Final live operator state: all pods Ready; `sample-batch` reached `Succeeded`,
+and `sample-streaming` stays `Running` as a streaming job. The session also
+cleared k3s node disk pressure by cleaning generated Cargo artifacts and stale
+local image archives after validation.
+
 ## Current Session: All 6 Architecture Fixes + k3s Validation
 
 All 6 architectural fixes from the session audit were implemented, built into

@@ -9,6 +9,7 @@ impl Coordinator {
         self.ensure_active()?;
         let res = self.executors.register(descriptor);
         if res.is_ok() {
+            self.assign_pending_tasks_for_schedulable_jobs();
             self.notify.notify_waiters();
         }
         res
@@ -56,6 +57,7 @@ impl Coordinator {
         let streaming_progress: Vec<StreamingProgressReport> =
             heartbeat.streaming_progress().to_vec();
         self.executors.heartbeat(heartbeat)?;
+        self.assign_pending_tasks_for_schedulable_jobs();
         for state in &streaming_states {
             self.apply_streaming_task_state(state);
         }
@@ -355,6 +357,42 @@ impl Coordinator {
         for job_id in jobs_to_reassign {
             if let Err(error) = self.assign_pending_tasks(&job_id) {
                 tracing::warn!(job_id = %job_id, error = %error, "failed to reassign tasks after executor loss");
+            }
+        }
+    }
+}
+
+impl Coordinator {
+    fn assign_pending_tasks_for_schedulable_jobs(&mut self) {
+        let job_ids: Vec<JobId> = self
+            .job_coordinators
+            .iter()
+            .filter_map(|(job_id, job_coordinator)| {
+                if job_coordinator.read_record().state().is_terminal() {
+                    None
+                } else {
+                    Some(job_id.clone())
+                }
+            })
+            .collect();
+
+        for job_id in job_ids {
+            match self.assign_pending_tasks(&job_id) {
+                Ok(0) | Err(SchedulerError::NoExecutors) => {}
+                Ok(count) => {
+                    tracing::debug!(
+                        job_id = %job_id,
+                        task_count = count,
+                        "assigned pending tasks after executor registration"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "failed to assign pending tasks after executor registration"
+                    );
+                }
             }
         }
     }

@@ -24,17 +24,22 @@ spec:
       serviceAccountName: krishiv-controller
       containers:
         - name: executor
-          image: ghcr.io/krishiv/krishiv:dev
-          imagePullPolicy: IfNotPresent
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
           command:
-            - krishiv-executor
+            - /usr/local/bin/krishiv
           args:
+            - executor
             - --coordinator
             - http://krishiv-coordinator.krishiv-system.svc:9090
             - --connect
             - --heartbeat-interval-secs
-            - "10"
+            - "1"
           env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: KRISHIV_EXECUTOR_ID
               valueFrom:
                 fieldRef:
