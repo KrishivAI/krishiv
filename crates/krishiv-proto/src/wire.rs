@@ -820,14 +820,15 @@ fn input_partition_descriptor_to_wire(
             shuffle_partition_id: *partition_id,
             ..Default::default()
         },
-        InputPartitionDescriptor::InlineIpc { table_name, ipc_bytes } => {
-            v1::InputPartitionDescriptor {
-                kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
-                table_name: table_name.clone(),
-                ipc_bytes: ipc_bytes.clone(),
-                ..Default::default()
-            }
-        }
+        InputPartitionDescriptor::InlineIpc {
+            table_name,
+            ipc_bytes,
+        } => v1::InputPartitionDescriptor {
+            kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
+            table_name: table_name.clone(),
+            ipc_bytes: ipc_bytes.clone(),
+            ..Default::default()
+        },
     }
 }
 

@@ -113,8 +113,7 @@ pub async fn api_batch_sql_poll(
     Path(job_id_str): Path<String>,
 ) -> Result<Json<BatchSqlPollResponse>, StatusCode> {
     use krishiv_proto::JobState;
-    let job_id = krishiv_proto::JobId::try_new(&job_id_str)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let job_id = krishiv_proto::JobId::try_new(&job_id_str).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let state = {
         let coord = coordinator.read().await;

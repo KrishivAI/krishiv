@@ -35,15 +35,20 @@ pub async fn execute_bounded_window_coordinated(
         "{WINDOW_JOB_PREFIX}{}",
         krishiv_common::async_util::unix_now_ms()
     ))
-    .map_err(|e| SchedulerError::InvalidJob { message: e.to_string() })?;
+    .map_err(|e| SchedulerError::InvalidJob {
+        message: e.to_string(),
+    })?;
 
-    let stage_id = StageId::try_new("stage-window")
-        .map_err(|e| SchedulerError::InvalidJob { message: e.to_string() })?;
-    let task_id = TaskId::try_new("task-window")
-        .map_err(|e| SchedulerError::InvalidJob { message: e.to_string() })?;
+    let stage_id = StageId::try_new("stage-window").map_err(|e| SchedulerError::InvalidJob {
+        message: e.to_string(),
+    })?;
+    let task_id = TaskId::try_new("task-window").map_err(|e| SchedulerError::InvalidJob {
+        message: e.to_string(),
+    })?;
 
-    let spec_json = serde_json::to_string(spec)
-        .map_err(|e| SchedulerError::InvalidJob { message: format!("window spec json: {e}") })?;
+    let spec_json = serde_json::to_string(spec).map_err(|e| SchedulerError::InvalidJob {
+        message: format!("window spec json: {e}"),
+    })?;
     let spec_b64 = base64::engine::general_purpose::STANDARD.encode(spec_json.as_bytes());
 
     // Fragment carries only the topic and spec — no inline data.
@@ -61,10 +66,9 @@ pub async fn execute_bounded_window_coordinated(
         },
     );
 
-    let stage = StageSpec::new(stage_id, "bounded-window")
-        .with_task(TaskSpec::new(task_id, fragment));
-    let job_spec =
-        JobSpec::new(job_id.clone(), "bounded-window", JobKind::Batch).with_stage(stage);
+    let stage =
+        StageSpec::new(stage_id, "bounded-window").with_task(TaskSpec::new(task_id, fragment));
+    let job_spec = JobSpec::new(job_id.clone(), "bounded-window", JobKind::Batch).with_stage(stage);
 
     {
         let mut coord = coordinator.write().await;

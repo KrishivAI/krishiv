@@ -4,7 +4,9 @@ use std::error::Error;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
-use krishiv::{DataType, ExecutionMode, Field, QueryResult, RecordBatch, Schema, Session, StreamBatch};
+use krishiv::{
+    DataType, ExecutionMode, Field, QueryResult, RecordBatch, Schema, Session, StreamBatch,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut builder = Session::builder();

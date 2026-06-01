@@ -10,9 +10,9 @@ use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDesc
 use krishiv_sql::SqlEngine;
 
 use super::common::{
-    parse_local_parquet_partitions, read_connector_parquet_partitions,
-    read_inline_ipc_partitions, read_object_parquet_partitions, read_shuffle_flight_partitions,
-    sql_query_from_fragment, task_fragment_body, write_object_parquet_sink,
+    parse_local_parquet_partitions, read_connector_parquet_partitions, read_inline_ipc_partitions,
+    read_object_parquet_partitions, read_shuffle_flight_partitions, sql_query_from_fragment,
+    task_fragment_body, write_object_parquet_sink,
 };
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
@@ -139,9 +139,7 @@ pub(crate) async fn execute_batch_fragment(
                 })?;
         }
         // InlineIpc: Arrow IPC bytes delivered in-band with the task assignment.
-        for (table_name, batches) in
-            read_inline_ipc_partitions(assignment.input_partitions())?
-        {
+        for (table_name, batches) in read_inline_ipc_partitions(assignment.input_partitions())? {
             engine
                 .register_record_batches(&table_name, batches)
                 .await
@@ -208,12 +206,16 @@ async fn execute_window_fragment(
 
     // Format: <topic>:<spec_b64>
     let mut parts = rest.splitn(2, ':');
-    let _topic = parts.next().ok_or_else(|| ExecutorError::InvalidAssignment {
-        message: format!("window fragment missing topic: {rest}"),
-    })?;
-    let spec_b64 = parts.next().ok_or_else(|| ExecutorError::InvalidAssignment {
-        message: format!("window fragment missing spec_b64: {rest}"),
-    })?;
+    let _topic = parts
+        .next()
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: format!("window fragment missing topic: {rest}"),
+        })?;
+    let spec_b64 = parts
+        .next()
+        .ok_or_else(|| ExecutorError::InvalidAssignment {
+            message: format!("window fragment missing spec_b64: {rest}"),
+        })?;
 
     let spec_json = base64::engine::general_purpose::STANDARD
         .decode(spec_b64.as_bytes())

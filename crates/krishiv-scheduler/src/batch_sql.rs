@@ -133,10 +133,12 @@ pub async fn submit_batch_sql_job(
         message: error.to_string(),
     })?;
 
-    let stage_id = StageId::try_new("stage-sql")
-        .map_err(|error| SchedulerError::InvalidJob { message: error.to_string() })?;
-    let task_id = TaskId::try_new("task-sql")
-        .map_err(|error| SchedulerError::InvalidJob { message: error.to_string() })?;
+    let stage_id = StageId::try_new("stage-sql").map_err(|error| SchedulerError::InvalidJob {
+        message: error.to_string(),
+    })?;
+    let task_id = TaskId::try_new("task-sql").map_err(|error| SchedulerError::InvalidJob {
+        message: error.to_string(),
+    })?;
 
     let fragment = format!("sql: {query}");
     let stage = StageSpec::new(stage_id, "batch-sql").with_task(TaskSpec::new(task_id, fragment));

@@ -37,17 +37,13 @@ pub async fn api_bounded_window(
         StatusCode::BAD_REQUEST
     })?;
 
-    let outcome = execute_bounded_window_coordinated(
-        &coordinator,
-        &body.topic,
-        &body.spec,
-        &input_batches,
-    )
-    .await
-    .map_err(|e| {
-        eprintln!("execute_bounded_window_coordinated failed: {:?}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let outcome =
+        execute_bounded_window_coordinated(&coordinator, &body.topic, &body.spec, &input_batches)
+            .await
+            .map_err(|e| {
+                eprintln!("execute_bounded_window_coordinated failed: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     Ok(Json(BoundedWindowResponse {
         job_id: outcome.job_id.as_str().to_owned(),
@@ -55,9 +51,7 @@ pub async fn api_bounded_window(
     }))
 }
 
-fn decode_batches_b64(
-    b64: &str,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+fn decode_batches_b64(b64: &str) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
     if b64.is_empty() {
         return Ok(vec![]);
     }

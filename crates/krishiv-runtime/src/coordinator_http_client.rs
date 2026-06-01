@@ -78,10 +78,7 @@ fn parquet_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = std::fs::File::open(path).map_err(|e| {
-        RuntimeError::transport(format!(
-            "failed to open parquet '{}': {e}",
-            path.display()
-        ))
+        RuntimeError::transport(format!("failed to open parquet '{}': {e}", path.display()))
     })?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
         RuntimeError::transport(format!(
@@ -89,9 +86,9 @@ fn parquet_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
             path.display()
         ))
     })?;
-    let reader = builder.build().map_err(|e| {
-        RuntimeError::transport(format!("parquet reader build failed: {e}"))
-    })?;
+    let reader = builder
+        .build()
+        .map_err(|e| RuntimeError::transport(format!("parquet reader build failed: {e}")))?;
 
     let batches: Vec<_> = reader
         .collect::<Result<Vec<_>, _>>()
@@ -201,9 +198,10 @@ pub async fn execute_coordinator_batch_sql(
             )));
         }
 
-        let payload: BatchSqlResponseBody = poll_resp.json().await.map_err(|e| {
-            RuntimeError::transport(format!("batch-sql poll decode failed: {e}"))
-        })?;
+        let payload: BatchSqlResponseBody = poll_resp
+            .json()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("batch-sql poll decode failed: {e}")))?;
 
         match payload.state.as_str() {
             "Succeeded" => {
@@ -214,10 +212,7 @@ pub async fn execute_coordinator_batch_sql(
                 return Err(RuntimeError::transport(format!(
                     "batch-sql job {job_id} finished in state {}{}",
                     payload.state,
-                    payload
-                        .error
-                        .map(|e| format!(": {e}"))
-                        .unwrap_or_default()
+                    payload.error.map(|e| format!(": {e}")).unwrap_or_default()
                 )));
             }
             _ => {
@@ -298,9 +293,10 @@ pub async fn execute_coordinator_batch_sql_inline(
                 poll_resp.status()
             )));
         }
-        let payload: BatchSqlResponseBody = poll_resp.json().await.map_err(|e| {
-            RuntimeError::transport(format!("batch-sql poll decode failed: {e}"))
-        })?;
+        let payload: BatchSqlResponseBody = poll_resp
+            .json()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("batch-sql poll decode failed: {e}")))?;
         match payload.state.as_str() {
             "Succeeded" => {
                 return decode_inline_record_batches(&payload.inline_record_batch_ipc)
@@ -348,15 +344,17 @@ pub async fn execute_coordinator_bounded_window(
     let base = normalize_http_base(coordinator_http)?;
     let url = format!("{base}/api/v1/bounded-window");
     let input_batches_b64 = encode_batches(input_batches)?;
-    let body = BoundedWindowRequest { topic, spec, input_batches_b64 };
+    let body = BoundedWindowRequest {
+        topic,
+        spec,
+        input_batches_b64,
+    };
 
     let client = coordinator_http_client()?;
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("bounded-window HTTP request failed: {e}")))?;
+    let response =
+        client.post(&url).json(&body).send().await.map_err(|e| {
+            RuntimeError::transport(format!("bounded-window HTTP request failed: {e}"))
+        })?;
 
     if !response.status().is_success() {
         return Err(RuntimeError::transport(format!(

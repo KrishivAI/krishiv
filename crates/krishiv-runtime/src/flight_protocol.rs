@@ -104,9 +104,13 @@ fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
     let file = std::fs::File::open(path)
         .map_err(|e| RuntimeError::transport(format!("open '{}': {e}", path.display())))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display())))?
+        .map_err(|e| {
+            RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display()))
+        })?
         .build()
-        .map_err(|e| RuntimeError::transport(format!("parquet build for '{}': {e}", path.display())))?;
+        .map_err(|e| {
+            RuntimeError::transport(format!("parquet build for '{}': {e}", path.display()))
+        })?;
 
     let batches: Vec<_> = reader
         .collect::<Result<_, _>>()
@@ -121,9 +125,13 @@ fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
         let mut writer = StreamWriter::try_new(&mut buf, &schema)
             .map_err(|e| RuntimeError::transport(format!("ipc writer: {e}")))?;
         for batch in &batches {
-            writer.write(batch).map_err(|e| RuntimeError::transport(format!("ipc write: {e}")))?;
+            writer
+                .write(batch)
+                .map_err(|e| RuntimeError::transport(format!("ipc write: {e}")))?;
         }
-        writer.finish().map_err(|e| RuntimeError::transport(format!("ipc finish: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| RuntimeError::transport(format!("ipc finish: {e}")))?;
     }
     Ok(BASE64.encode(&buf))
 }

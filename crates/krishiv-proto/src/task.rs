@@ -803,7 +803,10 @@ impl InputPartitionDescriptor {
                     "shuffle-flight:{table_name}:{flight_endpoint}:{upstream_stage_id}:{partition_id}"
                 )
             }
-            Self::InlineIpc { table_name, ipc_bytes } => {
+            Self::InlineIpc {
+                table_name,
+                ipc_bytes,
+            } => {
                 format!("inline-ipc:{table_name}:{}b", ipc_bytes.len())
             }
         }

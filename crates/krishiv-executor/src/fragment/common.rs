@@ -330,9 +330,10 @@ pub(crate) fn read_inline_ipc_partitions(
     let mut result = Vec::new();
     for partition in partitions {
         let (table_name, ipc_bytes) = match partition.descriptor() {
-            Some(InputPartitionDescriptor::InlineIpc { table_name, ipc_bytes }) => {
-                (table_name.clone(), ipc_bytes.clone())
-            }
+            Some(InputPartitionDescriptor::InlineIpc {
+                table_name,
+                ipc_bytes,
+            }) => (table_name.clone(), ipc_bytes.clone()),
             Some(_) | None => continue,
         };
         if ipc_bytes.is_empty() {
@@ -341,14 +342,20 @@ pub(crate) fn read_inline_ipc_partitions(
         }
         let reader = StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None).map_err(|e| {
             ExecutorError::InvalidAssignment {
-                message: format!("inline-ipc decode failed for partition '{}': {e}", partition.partition_id()),
+                message: format!(
+                    "inline-ipc decode failed for partition '{}': {e}",
+                    partition.partition_id()
+                ),
             }
         })?;
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ExecutorError::InvalidAssignment {
-                message: format!("inline-ipc read failed for partition '{}': {e}", partition.partition_id()),
-            })?;
+        let batches = reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            ExecutorError::InvalidAssignment {
+                message: format!(
+                    "inline-ipc read failed for partition '{}': {e}",
+                    partition.partition_id()
+                ),
+            }
+        })?;
         result.push((table_name, batches));
     }
     Ok(result)

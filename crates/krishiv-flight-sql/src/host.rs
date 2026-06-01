@@ -101,7 +101,9 @@ impl FlightExecutionHost {
         if let Some(http_base) = self.coordinator_http.as_deref() {
             let ipc_tables = self.ipc_tables();
             return krishiv_runtime::execute_coordinator_batch_sql_inline(
-                http_base, &sql, &ipc_tables,
+                http_base,
+                &sql,
+                &ipc_tables,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()));
@@ -208,7 +210,6 @@ impl FlightExecutionHost {
         }
         Ok(vec![status_batch("ok")?])
     }
-
 }
 
 async fn run_blocking<T>(
@@ -231,7 +232,11 @@ fn explain_batch(text: &str) -> Result<RecordBatch, Status> {
 }
 
 fn status_batch(label: &str) -> Result<RecordBatch, Status> {
-    let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "status",
+        DataType::Utf8,
+        false,
+    )]));
     let col = Arc::new(StringArray::from(vec![label])) as ArrayRef;
     RecordBatch::try_new(schema, vec![col]).map_err(|e| Status::internal(e.to_string()))
 }
