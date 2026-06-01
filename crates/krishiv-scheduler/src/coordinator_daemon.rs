@@ -279,6 +279,8 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/batch-sql", post(api_batch_sql))
+        .route("/api/v1/batch-sql/submit", post(crate::batch_sql_http::api_batch_sql_submit))
+        .route("/api/v1/batch-sql/{job_id}", get(crate::batch_sql_http::api_batch_sql_poll))
         .route("/api/v1/bounded-window", post(crate::bounded_window_http::api_bounded_window))
         .route("/federation/v1/jobs", post(federation_submit_job))
         .route("/federation/v1/jobs/{job_id}", get(federation_job_status))

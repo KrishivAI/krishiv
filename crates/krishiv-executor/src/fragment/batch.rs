@@ -138,6 +138,17 @@ pub(crate) async fn execute_batch_fragment(
                     message: error.to_string(),
                 })?;
         }
+        // InlineIpc: Arrow IPC bytes delivered in-band with the task assignment.
+        for (table_name, batches) in
+            read_inline_ipc_partitions(assignment.input_partitions())?
+        {
+            engine
+                .register_record_batches(&table_name, batches)
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
+        }
 
         let dataframe = engine
             .sql(query)

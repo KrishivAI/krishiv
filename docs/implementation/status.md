@@ -24,7 +24,39 @@ as a session handoff note, not as a release-plan archive.
 - The documentation set has been collapsed to `docs/README.md` plus this
   handoff file to avoid stale release-roadmap drift.
 
-## Current Session: k3s Kubernetes Deployment + All 24 Examples
+## Current Session: All 6 Architecture Fixes + k3s Validation
+
+All 6 architectural fixes from the session audit were implemented, built into
+the release container image, and validated by running all 24 examples (12 Rust
++ 12 Python) against the k3s distributed cluster.
+
+### Fixes Implemented
+
+1. **webpki-root-certs bundled at compile time** — Added `webpki-root-certs = "1.0"` to workspace and `krishiv-runtime`. `coordinator_http_client()` now loads Mozilla's CA roots via `webpki_root_certs::TLS_SERVER_ROOT_CERTS` so the binary never panics in containers without a system CA store.
+
+2. **Executor HTTP health probes** — Executor pods now start with `--http-addr 0.0.0.0:8080`. The k8s manifest adds readiness (`/readyz`) and liveness (`/healthz`) probes so k8s detects crashes immediately instead of waiting for the heartbeat TTL.
+
+3. **InlineIpc batch SQL — no shared filesystem** — Client-side: `encode_batch_sql` reads each local parquet file → converts to Arrow IPC → encodes as a `/* krishiv-register-parquet-ipc:table:BASE64 */` SQL comment. Flight server: parses the new `RegisterParquetIpc` directive → stores IPC bytes in `ipc_catalog` → passes to coordinator as `BatchSqlInlineTable`. Executor: `execute_batch_fragment` now calls `read_inline_ipc_partitions` for SQL fragments. The `hostPath /tmp` mount is no longer required for correctness (kept in manifest for compatibility).
+
+4. **Async batch SQL** — `POST /api/v1/batch-sql/submit` returns `{job_id}` immediately. `GET /api/v1/batch-sql/{job_id}` polls for completion. Client uses exponential backoff (50–500ms). Eliminates long-held HTTP connections; coordinator HTTP server never blocks per-request.
+
+5. **Release image: 123 MB** — New `[profile.release-k8s]` (thin LTO, codegen-units=4) fits in VPS build memory. Binary stripped after build. Down from 415 MB debug to 123 MB stripped release.
+
+6. **RBAC + resource limits + NetworkPolicy** — Written to `k8s/manifests/krishiv-distributed.yaml`: ServiceAccounts for coordinator/executor, Role/RoleBinding for pod reads, NetworkPolicy restricting executor egress to coordinator only, ResourceRequirements on all containers, health probes on all pods.
+
+### Additional Bugs Fixed During Validation
+
+- **Axum 0.8 route syntax**: Changed `:job_id` → `{job_id}` (coordinator panicked on startup).
+- **`read_inline_ipc_partitions` not called in SQL fragment**: The batch SQL executor path was missing the InlineIpc partition reader; added alongside the existing LocalParquet/ConnectorParquet readers.
+- **`parquet_to_ipc_b64` in wrong process**: The function was called inside the flight server pod but the files only existed on the client host. Fixed by moving parquet→IPC conversion to the client side (`encode_batch_sql` in `flight_protocol.rs`).
+
+### Final State
+
+- Image: `localhost/krishiv:local` 123.8 MiB (Alpine 3.21 + stripped musl release binary)
+- 4 pods: coordinator, 2 executors (4 total slots, pod-IP advertised), flight-server
+- All 24 examples: 12 Rust + 12 Python → all pass, 18/18 coordinator jobs Succeeded
+
+## Previous Session: k3s Kubernetes Deployment + All 24 Examples
 
 Installed k3s on Ubuntu 26.04 VPS (11 GiB RAM, 96 GiB disk) and deployed
 Krishiv as a 4-pod distributed cluster. All 24 examples (12 Rust + 12 Python)

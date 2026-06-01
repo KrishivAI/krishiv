@@ -3,17 +3,35 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use krishiv_proto::{JobId, JobKind, JobSpec, JobState, StageId, StageSpec, TaskId, TaskSpec};
+use krishiv_proto::{
+    InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, StageId,
+    StageSpec, TaskId, TaskSpec,
+};
 
 use crate::{SchedulerError, SchedulerResult, SharedCoordinator};
 
 const BATCH_SQL_JOB_PREFIX: &str = "batch-sql-";
 
-/// Parquet table registration for coordinated batch SQL.
+/// Legacy file-path table registration (single-node local cluster only).
+///
+/// For multi-node / distributed deployments use `BatchSqlInlineTable` instead,
+/// which delivers Arrow IPC bytes in-band so executors need no shared filesystem.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchSqlTable {
     pub table_name: String,
     pub path: PathBuf,
+}
+
+/// Inline Arrow IPC table for distributed batch SQL.
+///
+/// The data is delivered as base64-encoded Arrow IPC stream bytes so the
+/// executor receives everything it needs in the task assignment without
+/// accessing any shared filesystem or object store.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BatchSqlInlineTable {
+    pub table_name: String,
+    /// Arrow IPC stream bytes, base64-encoded.
+    pub ipc_b64: String,
 }
 
 /// Outcome of a coordinated batch SQL job.
@@ -24,35 +42,20 @@ pub struct BatchSqlOutcome {
 }
 
 /// Execute SQL on registered executors via the active coordinator.
+///
+/// Input tables are provided as inline Arrow IPC (base64-encoded) so this
+/// function works on multi-node clusters where executors have no access to
+/// the client's local filesystem.
+/// Execute SQL synchronously — submits a job then polls until completion.
+///
+/// For non-blocking submission use [`submit_batch_sql_job`] and poll the
+/// `GET /api/v1/batch-sql/{job_id}` HTTP endpoint instead.
 pub async fn execute_batch_sql_coordinated(
     coordinator: &SharedCoordinator,
     query: &str,
-    tables: &[BatchSqlTable],
+    tables: &[BatchSqlInlineTable],
 ) -> SchedulerResult<BatchSqlOutcome> {
-    let job_id = JobId::try_new(format!(
-        "{BATCH_SQL_JOB_PREFIX}{}",
-        krishiv_common::async_util::unix_now_ms()
-    ))
-    .map_err(|error| SchedulerError::InvalidJob {
-        message: error.to_string(),
-    })?;
-
-    let stage_id = StageId::try_new("stage-sql").map_err(|error| SchedulerError::InvalidJob {
-        message: error.to_string(),
-    })?;
-    let task_id = TaskId::try_new("task-sql").map_err(|error| SchedulerError::InvalidJob {
-        message: error.to_string(),
-    })?;
-    let fragment = format!("sql: {query}");
-    let stage = StageSpec::new(stage_id, "batch-sql").with_task(TaskSpec::new(task_id, fragment));
-    let spec = JobSpec::new(job_id.clone(), "batch-sql", JobKind::Batch).with_stage(stage);
-
-    {
-        let mut coord = coordinator.write().await;
-        coord.ensure_active()?;
-        coord.submit_job(spec)?;
-        coord.register_batch_sql_tables(job_id.clone(), tables.to_vec());
-    }
+    let job_id = submit_batch_sql_job(coordinator, query, tables).await?;
 
     let notify = {
         let coord = coordinator.read().await;
@@ -108,6 +111,59 @@ pub async fn execute_batch_sql_coordinated(
             }
         }
     }
+}
+
+/// Submit a batch SQL job and return immediately with the `JobId`.
+///
+/// The background orchestration loop drives task dispatch.  The caller
+/// should poll `coordinator.job_snapshot(&job_id).state()` or use the
+/// `GET /api/v1/batch-sql/{job_id}` HTTP endpoint for results.
+pub async fn submit_batch_sql_job(
+    coordinator: &SharedCoordinator,
+    query: &str,
+    tables: &[BatchSqlInlineTable],
+) -> SchedulerResult<JobId> {
+    use base64::Engine as _;
+
+    let job_id = JobId::try_new(format!(
+        "{BATCH_SQL_JOB_PREFIX}{}",
+        krishiv_common::async_util::unix_now_ms()
+    ))
+    .map_err(|error| SchedulerError::InvalidJob {
+        message: error.to_string(),
+    })?;
+
+    let stage_id = StageId::try_new("stage-sql")
+        .map_err(|error| SchedulerError::InvalidJob { message: error.to_string() })?;
+    let task_id = TaskId::try_new("task-sql")
+        .map_err(|error| SchedulerError::InvalidJob { message: error.to_string() })?;
+
+    let fragment = format!("sql: {query}");
+    let stage = StageSpec::new(stage_id, "batch-sql").with_task(TaskSpec::new(task_id, fragment));
+    let spec = JobSpec::new(job_id.clone(), "batch-sql", JobKind::Batch).with_stage(stage);
+
+    let input_partitions: Vec<InputPartition> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, t)| {
+            let ipc_bytes = base64::engine::general_purpose::STANDARD
+                .decode(t.ipc_b64.as_bytes())
+                .ok()?;
+            Some(InputPartition::typed(
+                format!("inline-{idx}"),
+                InputPartitionDescriptor::InlineIpc {
+                    table_name: t.table_name.clone(),
+                    ipc_bytes,
+                },
+            ))
+        })
+        .collect();
+
+    let mut coord = coordinator.write().await;
+    coord.ensure_active()?;
+    coord.submit_job(spec)?;
+    coord.register_window_partitions(job_id.clone(), input_partitions);
+    Ok(job_id)
 }
 
 /// Decode inline Arrow IPC payloads into record batches.

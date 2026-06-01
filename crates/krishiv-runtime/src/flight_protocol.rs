@@ -26,6 +26,7 @@ use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
 
 const REGISTER_PARQUET: &str = "krishiv-register-parquet";
+const REGISTER_PARQUET_IPC: &str = "krishiv-register-parquet-ipc";
 const CONTINUOUS_REGISTER: &str = "krishiv-continuous-register";
 const CONTINUOUS_PUSH: &str = "krishiv-continuous-push";
 const CONTINUOUS_DRAIN: &str = "krishiv-continuous-drain";
@@ -38,6 +39,11 @@ pub enum FlightDirective {
     RegisterParquet {
         table: String,
         path: PathBuf,
+    },
+    /// Arrow IPC bytes delivered inline — no filesystem access required.
+    RegisterParquetIpc {
+        table: String,
+        ipc_b64: String,
     },
     ContinuousRegister {
         job_id: String,
@@ -58,18 +64,68 @@ pub enum FlightDirective {
     Explain,
 }
 
-/// Encode batch SQL with client-side parquet catalog registrations.
+/// Encode batch SQL with inline Arrow IPC for each table.
+///
+/// Reads each local parquet file on the **client** side and embeds the IPC
+/// bytes as base64 in the SQL comment so the flight server never needs
+/// filesystem access.  Falls back to path-based encoding if the file cannot
+/// be read (backward-compatible with single-node deployments where the flight
+/// server shares the host filesystem).
 pub fn encode_batch_sql(query: &str, tables: &[BatchSqlTable]) -> String {
     let mut parts = Vec::new();
     for table in tables {
-        parts.push(format!(
-            "/* {REGISTER_PARQUET}:{}:{} */",
-            table.table_name,
-            table.path.display()
-        ));
+        match parquet_file_to_ipc_b64(&table.path) {
+            Ok(ipc_b64) if !ipc_b64.is_empty() => {
+                // Inline IPC: safe because base64 alphabet has no `*/` sequence.
+                parts.push(format!(
+                    "/* {REGISTER_PARQUET_IPC}:{}:{ipc_b64} */",
+                    table.table_name
+                ));
+            }
+            _ => {
+                // Fallback: path-based (works when flight server shares filesystem).
+                parts.push(format!(
+                    "/* {REGISTER_PARQUET}:{}:{} */",
+                    table.table_name,
+                    table.path.display()
+                ));
+            }
+        }
     }
     parts.push(query.to_string());
     parts.join("\n")
+}
+
+/// Read a local parquet file and return base64-encoded Arrow IPC bytes.
+fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
+    use arrow::ipc::writer::StreamWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| RuntimeError::transport(format!("open '{}': {e}", path.display())))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| RuntimeError::transport(format!("parquet reader for '{}': {e}", path.display())))?
+        .build()
+        .map_err(|e| RuntimeError::transport(format!("parquet build for '{}': {e}", path.display())))?;
+
+    let batches: Vec<_> = reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| RuntimeError::transport(format!("parquet read: {e}")))?;
+    if batches.is_empty() {
+        return Ok(String::new());
+    }
+
+    let schema = batches[0].schema();
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)
+            .map_err(|e| RuntimeError::transport(format!("ipc writer: {e}")))?;
+        for batch in &batches {
+            writer.write(batch).map_err(|e| RuntimeError::transport(format!("ipc write: {e}")))?;
+        }
+        writer.finish().map_err(|e| RuntimeError::transport(format!("ipc finish: {e}")))?;
+    }
+    Ok(BASE64.encode(&buf))
 }
 
 /// Encode remote continuous job registration.
@@ -166,6 +222,18 @@ fn is_safe_base64(s: &str) -> bool {
 }
 
 fn parse_comment(comment: &str) -> Option<FlightDirective> {
+    // Inline IPC (preferred, no filesystem dependency) — check before path variant.
+    if let Some(rest) = comment.strip_prefix(REGISTER_PARQUET_IPC) {
+        let rest = rest.strip_prefix(':')?;
+        let (table, ipc_b64) = rest.split_once(':')?;
+        if !is_safe_identifier(table) || (!ipc_b64.is_empty() && !is_safe_base64(ipc_b64)) {
+            return None;
+        }
+        return Some(FlightDirective::RegisterParquetIpc {
+            table: table.to_string(),
+            ipc_b64: ipc_b64.to_string(),
+        });
+    }
     if let Some(rest) = comment.strip_prefix(REGISTER_PARQUET) {
         let rest = rest.strip_prefix(':')?;
         let (table, path) = rest.split_once(':')?;

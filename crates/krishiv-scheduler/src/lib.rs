@@ -56,7 +56,8 @@ pub use auth::{
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
 pub use batch_sql::{
-    BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches, execute_batch_sql_coordinated,
+    BatchSqlInlineTable, BatchSqlOutcome, BatchSqlTable, decode_inline_record_batches,
+    execute_batch_sql_coordinated, submit_batch_sql_job,
 };
 pub use checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 pub use cluster_control::{ClusterControlPlane, SingleNodeLeader};

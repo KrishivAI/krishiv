@@ -4087,6 +4087,7 @@ dependencies = [
  "krishiv-governance",
  "krishiv-plan",
  "krishiv-runtime",
+ "krishiv-scheduler",
  "krishiv-sql",
  "lru",
  "prost 0.14.3",
@@ -4264,6 +4265,7 @@ dependencies = [
  "tokio",
  "tonic 0.14.6",
  "tracing",
+ "webpki-root-certs",
 ]
 
 [[package]]

@@ -104,6 +104,7 @@ opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 redb = "4.1.0"
 mockito = "1"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
+webpki-root-certs = "1.0"
 uuid = { version = "1", features = ["v4"] }
 lz4_flex = "0.11"
 twox-hash = "2.1"
@@ -133,3 +134,11 @@ debug = 1
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# release-k8s: optimized for constrained build environments (limited RAM).
+# Uses thin LTO and more codegen units to reduce peak linker memory.
+# Produces a slightly larger binary than `release` but avoids OOM on VPS servers.
+[profile.release-k8s]
+inherits = "release"
+lto = "thin"
+codegen-units = 4

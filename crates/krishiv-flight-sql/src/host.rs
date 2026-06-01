@@ -31,7 +31,12 @@ pub struct FlightExecutionHost {
     /// batch SQL and bounded windows in embedded mode.
     cluster: Arc<InProcessCluster>,
     continuous: Arc<ContinuousStreamRegistry>,
+    /// Path-based catalog (fallback for single-node / shared-filesystem setups).
     catalog: Arc<DashMap<String, PathBuf>>,
+    /// Inline IPC catalog: Arrow IPC bytes (base64) keyed by table name.
+    /// Populated when the client sends `RegisterParquetIpc` directives so the
+    /// flight server never needs to read from the local filesystem.
+    ipc_catalog: Arc<DashMap<String, String>>,
     /// When set, routes batch SQL and bounded windows through the coordinator.
     coordinator_http: Option<String>,
 }
@@ -64,6 +69,7 @@ impl FlightExecutionHost {
             cluster: Arc::new(cluster),
             continuous: Arc::new(ContinuousStreamRegistry::new()),
             catalog: Arc::new(DashMap::new()),
+            ipc_catalog: Arc::new(DashMap::new()),
             coordinator_http,
         })
     }
@@ -93,9 +99,12 @@ impl FlightExecutionHost {
         let sql = sql.to_string();
 
         if let Some(http_base) = self.coordinator_http.as_deref() {
-            return krishiv_runtime::execute_coordinator_batch_sql(http_base, &sql, &tables)
-                .await
-                .map_err(|e| Status::internal(e.to_string()));
+            let ipc_tables = self.ipc_tables();
+            return krishiv_runtime::execute_coordinator_batch_sql_inline(
+                http_base, &sql, &ipc_tables,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()));
         }
 
         let cluster = self.cluster();
@@ -108,6 +117,12 @@ impl FlightExecutionHost {
         for (table, path) in catalog_map {
             self.catalog.insert(table, path);
         }
+        // Handle inline IPC directives.
+        for directive in directives {
+            if let FlightDirective::RegisterParquetIpc { table, ipc_b64 } = directive {
+                self.ipc_catalog.insert(table.clone(), ipc_b64.clone());
+            }
+        }
         Ok(())
     }
 
@@ -117,6 +132,17 @@ impl FlightExecutionHost {
             .map(|entry| BatchSqlTable {
                 table_name: entry.key().clone(),
                 path: entry.value().clone(),
+            })
+            .collect()
+    }
+
+    /// Inline IPC tables (base64-encoded Arrow IPC bytes keyed by table name).
+    fn ipc_tables(&self) -> Vec<krishiv_scheduler::BatchSqlInlineTable> {
+        self.ipc_catalog
+            .iter()
+            .map(|entry| krishiv_scheduler::BatchSqlInlineTable {
+                table_name: entry.key().clone(),
+                ipc_b64: entry.value().clone(),
             })
             .collect()
     }
@@ -175,7 +201,9 @@ impl FlightExecutionHost {
                     })
                     .await;
                 }
+                // Already applied in apply_catalog_directives.
                 FlightDirective::RegisterParquet { .. } => {}
+                FlightDirective::RegisterParquetIpc { .. } => {}
             }
         }
         Ok(vec![status_batch("ok")?])

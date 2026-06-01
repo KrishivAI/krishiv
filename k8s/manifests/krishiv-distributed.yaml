@@ -1,0 +1,347 @@
+# Krishiv single-node k3s / single-host Kubernetes deployment.
+#
+# Topology:
+#   coordinator (1 pod)   — gRPC :9090, HTTP :18080  NodePort :30080
+#   executor    (2 pods)  — task gRPC :50055, health HTTP :8080
+#   flight-server (1 pod) — Arrow Flight :50051       NodePort :30051
+#
+# Usage:
+#   kubectl apply -f k8s/manifests/krishiv-distributed.yaml
+#
+# Prerequisites:
+#   - Namespace krishiv-system must exist
+#   - Container image localhost/krishiv:local must be imported into k3s containerd
+#   - For multi-node: replace hostPath /tmp with a PVC or object-store data path
+
+---
+# ── Namespace ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: krishiv-system
+
+---
+# ── ServiceAccounts ───────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: krishiv-executor
+  namespace: krishiv-system
+
+---
+# ── RBAC: coordinator needs read on pods for health checks ────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: krishiv-coordinator
+  namespace: krishiv-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: krishiv-coordinator
+subjects:
+  - kind: ServiceAccount
+    name: krishiv-coordinator
+    namespace: krishiv-system
+
+---
+# ── NetworkPolicy: executor can only reach coordinator ────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: krishiv-executor-egress
+  namespace: krishiv-system
+spec:
+  podSelector:
+    matchLabels:
+      app: krishiv-executor
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: krishiv-coordinator
+      ports:
+        - port: 9090
+          protocol: TCP
+        - port: 18080
+          protocol: TCP
+    # Allow DNS resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+
+---
+# ── Coordinator ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  namespace: krishiv-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: krishiv-coordinator
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: krishiv-coordinator
+    spec:
+      serviceAccountName: krishiv-coordinator
+      containers:
+        - name: coordinator
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - /usr/local/bin/krishiv
+            - coordinator
+            - --grpc-addr
+            - 0.0.0.0:9090
+            - --http-addr
+            - 0.0.0.0:18080
+            - --metadata-backend
+            - json
+            - --metadata-path
+            - /data/coordinator-meta.json
+            - --insecure
+          ports:
+            - name: grpc
+              containerPort: 9090
+            - name: http
+              containerPort: 18080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 18080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+  namespace: krishiv-system
+spec:
+  selector:
+    app: krishiv-coordinator
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+    - name: http
+      port: 18080
+      targetPort: 18080
+
+---
+# NodePort for external access to coordinator HTTP (diagnostics / jobs API)
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator-ext
+  namespace: krishiv-system
+spec:
+  type: NodePort
+  selector:
+    app: krishiv-coordinator
+  ports:
+    - name: http
+      port: 18080
+      targetPort: 18080
+      nodePort: 30080
+
+---
+# ── Executor ──────────────────────────────────────────────────────────────────
+# Each pod advertises its real pod IP (via POD_IP downward API) so the
+# coordinator can call back on the task gRPC service.
+# hostPath /tmp allows executor pods to read parquet files written by clients
+# on the same node. Replace with a PVC for multi-node deployments.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: executor
+  namespace: krishiv-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: krishiv-executor
+  template:
+    metadata:
+      labels:
+        app: krishiv-executor
+    spec:
+      serviceAccountName: krishiv-executor
+      containers:
+        - name: executor
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - /usr/local/bin/krishiv
+            - executor
+            - --connect
+            - --coordinator
+            - http://coordinator.krishiv-system.svc:9090
+            - --heartbeat-interval-secs
+            - "10"
+            - --slots
+            - "2"
+            - --http-addr
+            - 0.0.0.0:8080
+          ports:
+            - name: health
+              containerPort: 8080
+            - name: task-grpc
+              containerPort: 50055
+            - name: barrier-grpc
+              containerPort: 50056
+          env:
+            - name: KRISHIV_EXECUTOR_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          hostPath:
+            path: /tmp
+            type: DirectoryOrCreate
+
+---
+# ── Flight Server ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flight-server
+  namespace: krishiv-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: krishiv-flight
+  template:
+    metadata:
+      labels:
+        app: krishiv-flight
+    spec:
+      containers:
+        - name: flight
+          image: localhost/krishiv:local
+          imagePullPolicy: Never
+          command:
+            - /usr/local/bin/krishiv
+            - flight-server
+          env:
+            - name: KRISHIV_FLIGHT_ADDR
+              value: "0.0.0.0:50051"
+            - name: KRISHIV_COORDINATOR_HTTP
+              value: "http://coordinator.krishiv-system.svc:18080"
+          ports:
+            - name: flight
+              containerPort: 50051
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+---
+# NodePort for external access to Flight SQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: flight-server
+  namespace: krishiv-system
+spec:
+  type: NodePort
+  selector:
+    app: krishiv-flight
+  ports:
+    - name: flight
+      port: 50051
+      targetPort: 50051
+      nodePort: 30051
