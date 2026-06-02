@@ -2436,13 +2436,25 @@ mod scheduler_tests {
             )
             .unwrap();
 
-        // Submit should fail with NoExecutors because the executor is over the threshold.
+        // With deferred placement, submitting when all executors are over the memory
+        // threshold now accepts the job (tasks stay Pending) instead of rejecting it.
+        // The orchestration loop will assign tasks once an executor becomes schedulable.
         let result = coordinator.submit_job(single_task_job(job_id.clone()));
         assert!(
-            matches!(result, Err(SchedulerError::NoExecutors)),
-            "expected NoExecutors, got {:?}",
+            matches!(result, Ok(SubmitOutcome::Accepted)),
+            "deferred placement: job must be accepted even when executors exceed memory threshold; got {:?}",
             result
         );
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        for stage in detail.stages() {
+            for task in stage.tasks() {
+                assert_eq!(
+                    task.state(),
+                    TaskState::Pending,
+                    "tasks must remain Pending when no schedulable executors exist"
+                );
+            }
+        }
     }
 
     // ── CheckpointCoordinator tests ───────────────────────────────────────────
@@ -6000,6 +6012,67 @@ mod scheduler_tests {
         assert!(
             result.is_ok(),
             "EtcdMetadataStore::connect must succeed with live etcd"
+        );
+    }
+
+    // ── Deferred placement: submit without executors ──────────────────────────
+
+    #[test]
+    fn submit_job_without_executors_queues_as_pending() {
+        allow_anonymous_for_tests();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-defer").unwrap());
+
+        // Submit with NO executors registered.
+        let job_id = JobId::try_new("deferred-job").unwrap();
+        let outcome = coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .expect("submit_job must succeed even with no executors");
+        assert!(
+            matches!(outcome, SubmitOutcome::Accepted),
+            "job must be Accepted, not rejected for missing executors; got {outcome:?}"
+        );
+
+        // All tasks must be Pending — not Failed or Assigned.
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        for stage in detail.stages() {
+            for task in stage.tasks() {
+                assert_eq!(
+                    task.state(),
+                    TaskState::Pending,
+                    "tasks must be Pending when submitted without executors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_job_assigned_after_executor_registers() {
+        allow_anonymous_for_tests();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-defer2").unwrap());
+
+        // Submit before any executor is registered.
+        let job_id = JobId::try_new("deferred-job-2").unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+
+        // Now register an executor.
+        let exec_id = ExecutorId::try_new("exec-deferred").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-d", 4))
+            .unwrap();
+
+        // The orchestration tick should assign the pending task.
+        coordinator.coordinator_tick().unwrap();
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task = &detail.stages()[0].tasks()[0];
+        assert_eq!(
+            task.state(),
+            TaskState::Assigned,
+            "task must be Assigned after executor registers and tick fires"
         );
     }
 }

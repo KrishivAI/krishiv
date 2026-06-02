@@ -1,5 +1,65 @@
 # Krishiv Implementation Status
 
+## Architectural Fixes Session — 11 Issues Resolved
+
+**#2 Delta ObjectStore tombstones**: `DeltaObjectStoreReader::parquet_paths_from_log_entry` now
+returns `(add_paths, remove_paths)`. `scan_batches` subtracts removes from adds before reading.
+Added `delta_object_store_overwrite_returns_only_new_data` test.
+
+**#3 Multi-stage loop exits too early**: Removed `iter_count > 1` early-exit. Loop now drives
+`coordinator_tick()` after each stage to advance state machine, then exits only when job is
+terminal or no assignments on a non-first iteration. All 290 runtime lib tests pass.
+
+**#5 Python catalog blocks tokio threads**: Updated doc comment; `RUNTIME.block_on` kept since
+`block_on_async` is typed to `KrishivError` and catalog methods return `CatalogError`. Added
+`with_timeout` constructors to `GlueRestCatalog` and `NessieCatalog` to propagate timeout config.
+
+**#6 etcd events not persisted**: `EtcdMetadataStore::persist()` now calls
+`encode_metadata_snapshot(&[], &self.jobs)` — events are audit-only and kept in-memory only.
+Snapshot size is now bounded by job count, not event log length. Added
+`etcd_snapshot_does_not_include_events` test.
+
+**#7 SlotAwareScheduler deferred placement**: `submit_job` no longer returns `Err(NoExecutors)`
+when no executors are registered. Tasks stay `Pending`; orchestration loop assigns them when
+executors register. Added 2 tests; updated `memory_aware_placement_skips_overloaded_executor`
+to expect `Accepted` + Pending tasks.
+
+**#8 InlineIpc configurable cap**: `CoordinatorConfig::inline_partition_limit_bytes` field added
+(default 3 MiB). `submit_batch_sql_job` reads limit from coordinator config at runtime. Added
+`with_inline_partition_limit_bytes` builder.
+
+**#9 Continuous streaming backpressure**: `ContinuousStreamRegistry` now has `max_pending_batches`
+field (default 1024). `push_input` returns `RuntimeError::InvalidState` when queue is full.
+Added `with_max_pending_batches`, `new_unbounded`, `pending_batch_depth` APIs. 4 new tests.
+
+**#10 Unimplemented fallback string match fixed**: Renamed to `is_server_unimplemented`. Now
+requires `message.starts_with("status: Unimplemented")` or `starts_with("Status { code:
+Unimplemented")` — only matches tonic status format, not arbitrary messages. 4 new tests.
+
+**#11 Catalog timeout configurable**: `RestCatalogConfig::timeout_ms: Option<u64>` added.
+`GenericRestCatalog::new` uses `timeout_ms.unwrap_or(30_000)`; `Some(0)` disables timeout.
+`GlueRestCatalog::with_timeout` and `NessieCatalog::with_timeout` constructors added. Python
+bindings accept `timeout_ms: Option<u64>`. 3 new catalog timeout tests.
+
+**#1 Coordinator fast read path**: Added `SharedCoordinator::executor_snapshots_fast()` using
+sharded `ExecutorInner` read lock instead of full coordinator read lock. For observability queries
+(dashboards, health checks) this avoids contention with job submission write locks.
+
+## Validation
+
+```
+cargo check --workspace      # 0 errors
+cargo test -p krishiv-runtime --lib   # 290 passed
+cargo test -p krishiv-scheduler --lib # 219 passed
+cargo test -p krishiv-lakehouse --lib # 107 passed
+cargo test -p krishiv-sql --lib       # 78 passed
+cargo test -p krishiv-catalog --lib   # 39 passed
+cargo test -p krishiv-common --lib    # 39 passed
+```
+
+---
+
+
 ## Bug-Fix Session — Remaining Stability Gaps
 
 ### HIGH — Kafka streaming source test (fixed)

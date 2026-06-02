@@ -194,8 +194,15 @@ impl DeltaObjectStoreReader {
         Ok(versions)
     }
 
-    /// Read the add-file paths from a single log entry JSON.
-    async fn parquet_paths_from_log_entry(&self, version: u64) -> LakehouseResult<Vec<String>> {
+    /// Read the add and remove file paths from a single Delta log entry.
+    ///
+    /// Returns `(add_paths, remove_paths)`. Callers must subtract removes from
+    /// the accumulated add set to get the correct snapshot — ignoring remove
+    /// entries causes double-counting after `DeltaWriteMode::Overwrite`.
+    async fn parquet_paths_from_log_entry(
+        &self,
+        version: u64,
+    ) -> LakehouseResult<(Vec<String>, Vec<String>)> {
         let log_path = object_store::path::Path::from(format!(
             "{}/_delta_log/{:020}.json",
             self.prefix, version
@@ -209,39 +216,59 @@ impl DeltaObjectStoreReader {
             .bytes()
             .await
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        let mut paths = Vec::new();
+        let mut add_paths = Vec::new();
+        let mut remove_paths = Vec::new();
         for line in std::str::from_utf8(&bytes)
             .map_err(|e| LakehouseError::Io(e.to_string()))?
             .lines()
         {
+            if line.trim().is_empty() {
+                continue;
+            }
             let v: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
-            // Delta log "add" action: {"add": {"path": "part-xxx.parquet", ...}}
+            // Delta add action: {"add": {"path": "part-xxx.parquet", ...}}
             if let Some(path) = v["add"]["path"].as_str() {
-                paths.push(path.to_string());
+                add_paths.push(path.to_string());
+            }
+            // Delta remove action: {"remove": {"path": "part-xxx.parquet", ...}}
+            if let Some(path) = v["remove"]["path"].as_str() {
+                remove_paths.push(path.to_string());
             }
         }
-        Ok(paths)
+        Ok((add_paths, remove_paths))
     }
 
-    /// Scan all Parquet files referenced by the latest Delta snapshot and
-    /// return all record batches.
+    /// Scan all Parquet files in the latest Delta snapshot and return all record batches.
+    ///
+    /// Correctly handles remove (tombstone) actions: files removed by an overwrite or
+    /// delete operation are excluded from the result even if they appeared in an earlier
+    /// add action.
     pub async fn scan_batches(&self) -> LakehouseResult<Vec<arrow::record_batch::RecordBatch>> {
-        use futures::StreamExt as _;
+        use std::collections::HashSet;
         let versions = self.list_versions().await?;
         if versions.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Collect all add-paths from the log (simplified: no remove/overwrite tracking).
-        let mut all_parquet_paths = Vec::new();
+        // Accumulate all adds and removes across every log version.
+        // The final readable set is: adds − removes.
+        let mut all_adds: Vec<String> = Vec::new();
+        let mut removed: HashSet<String> = HashSet::new();
         for version in &versions {
-            let paths = self.parquet_paths_from_log_entry(*version).await?;
-            all_parquet_paths.extend(paths);
+            let (add_paths, remove_paths) = self.parquet_paths_from_log_entry(*version).await?;
+            all_adds.extend(add_paths);
+            removed.extend(remove_paths);
         }
+        // Deduplicate adds and subtract tombstoned paths in one pass.
+        let mut seen: HashSet<String> = HashSet::new();
+        let unique_readable: Vec<String> = all_adds
+            .into_iter()
+            .filter(|p| !removed.contains(p) && seen.insert(p.clone()))
+            .collect();
 
         let mut out = Vec::new();
-        for rel_path in &all_parquet_paths {
+        for rel_path in &unique_readable {
             let obj_path = object_store::path::Path::from(format!("{}/{}", self.prefix, rel_path));
             let get_result = match self.store.get_opts(&obj_path, Default::default()).await {
                 Ok(r) => r,
@@ -778,6 +805,36 @@ mod tests {
         let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "empty_tbl");
         let batches = reader.scan_batches().await.unwrap();
         assert!(batches.is_empty(), "no log entries → no batches");
+    }
+
+    #[tokio::test]
+    async fn delta_object_store_overwrite_returns_only_new_data() {
+        // Verify tombstone handling: an overwrite writes a remove for the old
+        // file and an add for the new file. The reader must return only the
+        // new file's rows, not both old and new (the pre-fix bug).
+        let store = make_inmemory_delta_store();
+
+        // Version 0: add part-0 (3 rows)
+        let old_batch = sample_batch(&[1, 2, 3], &["a", "b", "c"]);
+        write_parquet_to_store(store.as_ref(), "ow", "part-0.parquet", &old_batch).await;
+        let log_v0 = r#"{"add":{"path":"part-0.parquet","size":100}}"#;
+        let log_v0_path = object_store::path::Path::from("ow/_delta_log/00000000000000000000.json");
+        store.as_ref().put_opts(&log_v0_path, bytes::Bytes::from(log_v0).into(), Default::default()).await.unwrap();
+
+        // Version 1: remove part-0, add part-1 (1 row) — simulates an overwrite
+        let new_batch = sample_batch(&[99], &["new"]);
+        write_parquet_to_store(store.as_ref(), "ow", "part-1.parquet", &new_batch).await;
+        let log_v1 = "{\"remove\":{\"path\":\"part-0.parquet\",\"dataChange\":true}}\n{\"add\":{\"path\":\"part-1.parquet\",\"size\":50}}";
+        let log_v1_path = object_store::path::Path::from("ow/_delta_log/00000000000000000001.json");
+        store.as_ref().put_opts(&log_v1_path, bytes::Bytes::from(log_v1).into(), Default::default()).await.unwrap();
+
+        let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "ow");
+        let batches = reader.scan_batches().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            rows, 1,
+            "overwrite must return only the new file's rows (tombstone removes old file)"
+        );
     }
 
     #[tokio::test]

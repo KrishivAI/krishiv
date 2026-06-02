@@ -14,7 +14,15 @@ pub struct RestCatalogConfig {
     pub warehouse: Option<String>,
     pub prefix: String,
     pub bearer_token: Option<String>,
+    /// HTTP request timeout in milliseconds.
+    /// - `None` (default): falls back to `DEFAULT_CATALOG_TIMEOUT_MS` (30 s).
+    /// - `Some(0)`: no timeout (requests may block indefinitely).
+    /// - `Some(n)`: timeout after `n` milliseconds.
+    pub timeout_ms: Option<u64>,
 }
+
+/// Default HTTP request timeout for catalog operations (30 seconds).
+pub const DEFAULT_CATALOG_TIMEOUT_MS: u64 = 30_000;
 
 /// Iceberg table identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -63,10 +71,12 @@ pub struct GenericRestCatalog {
 
 impl GenericRestCatalog {
     pub fn new(config: RestCatalogConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
+        let timeout_ms = config.timeout_ms.unwrap_or(DEFAULT_CATALOG_TIMEOUT_MS);
+        let mut builder = Client::builder();
+        if timeout_ms > 0 {
+            builder = builder.timeout(Duration::from_millis(timeout_ms));
+        }
+        let client = builder.build().expect("failed to build HTTP client");
         Self { config, client }
     }
 
@@ -232,6 +242,15 @@ impl GlueRestCatalog {
         database: impl Into<String>,
         rest_url: impl Into<String>,
     ) -> Self {
+        Self::with_timeout(region, database, rest_url, None)
+    }
+
+    pub fn with_timeout(
+        region: impl Into<String>,
+        database: impl Into<String>,
+        rest_url: impl Into<String>,
+        timeout_ms: Option<u64>,
+    ) -> Self {
         let region = region.into();
         let database = database.into();
         Self {
@@ -240,6 +259,7 @@ impl GlueRestCatalog {
                 warehouse: Some(format!("glue://{region}/{database}")),
                 prefix: "v1".into(),
                 bearer_token: None,
+                timeout_ms,
             }),
             region,
             database,
@@ -289,6 +309,14 @@ pub struct NessieCatalog {
 
 impl NessieCatalog {
     pub fn new(uri: impl Into<String>, reference: impl Into<String>) -> Self {
+        Self::with_timeout(uri, reference, None)
+    }
+
+    pub fn with_timeout(
+        uri: impl Into<String>,
+        reference: impl Into<String>,
+        timeout_ms: Option<u64>,
+    ) -> Self {
         let uri = uri.into();
         let reference = reference.into();
         Self {
@@ -297,6 +325,7 @@ impl NessieCatalog {
                 warehouse: Some(reference),
                 prefix: "v1".into(),
                 bearer_token: None,
+                timeout_ms,
             }),
         }
     }
@@ -361,6 +390,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert_eq!(tables, vec!["t1".to_string()]);
@@ -385,6 +415,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let mut tables = catalog.list_tables("ns").await.unwrap();
         tables.sort();
@@ -410,6 +441,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert!(tables.is_empty());
@@ -430,6 +462,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert!(tables.is_empty());
@@ -450,6 +483,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert!(tables.is_empty());
@@ -470,6 +504,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert!(tables.is_empty());
@@ -497,6 +532,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "my_ns".into(),
@@ -524,6 +560,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -554,6 +591,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -582,6 +620,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -622,6 +661,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let err = catalog.list_tables("ns").await.unwrap_err();
         match err {
@@ -646,6 +686,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -671,6 +712,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -704,6 +746,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -732,6 +775,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -787,6 +831,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert!(tables.is_empty());
@@ -863,6 +908,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("my-ns").await.unwrap();
         assert_eq!(tables, vec!["t1".to_string()]);
@@ -885,6 +931,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -1289,6 +1336,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -1343,6 +1391,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let table_id = IcebergTableId {
             namespace: "ns".into(),
@@ -1381,5 +1430,56 @@ mod tests {
         let err = CatalogError::TableNotFound { name: "t".into() };
         let dbg = format!("{err:?}");
         assert!(dbg.contains("TableNotFound"));
+    }
+
+    // ── Timeout configuration ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn catalog_custom_timeout_applied_on_unreachable_server() {
+        // A 1 ms timeout pointed at a non-listening port must return an error
+        // quickly, confirming the timeout is respected.
+        use std::time::Instant;
+        let catalog = GenericRestCatalog::new(RestCatalogConfig {
+            base_url: "http://127.0.0.1:19999".into(),
+            warehouse: None,
+            prefix: "v1".into(),
+            bearer_token: None,
+            timeout_ms: Some(1), // 1 millisecond — far shorter than any real latency
+        });
+        let start = Instant::now();
+        let result = catalog.list_tables("ns").await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "request to non-listening port must fail");
+        assert!(
+            elapsed.as_secs() < 5,
+            "1 ms timeout must not block for seconds; elapsed: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn timeout_none_uses_default() {
+        // Constructing with timeout_ms: None must use DEFAULT_CATALOG_TIMEOUT_MS.
+        let config = RestCatalogConfig {
+            base_url: "http://example.com".into(),
+            warehouse: None,
+            prefix: "v1".into(),
+            bearer_token: None,
+            timeout_ms: None,
+        };
+        let _catalog = GenericRestCatalog::new(config); // Must not panic
+    }
+
+    #[test]
+    fn timeout_zero_disables_timeout() {
+        // timeout_ms: Some(0) means no timeout — must construct without panic.
+        let config = RestCatalogConfig {
+            base_url: "http://example.com".into(),
+            warehouse: None,
+            prefix: "v1".into(),
+            bearer_token: None,
+            timeout_ms: Some(0),
+        };
+        let _catalog = GenericRestCatalog::new(config);
     }
 }

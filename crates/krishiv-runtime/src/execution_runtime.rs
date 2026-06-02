@@ -265,8 +265,19 @@ impl RemoteExecutionRuntime {
     }
 }
 
-fn is_unimplemented_err(e: &RuntimeError) -> bool {
-    matches!(e, RuntimeError::Transport { message } if message.contains("Unimplemented"))
+/// Returns `true` only when `e` is a tonic `Status::Unimplemented` response
+/// from the server — meaning the server explicitly does not support the
+/// requested action and the client should fall back to the SQL protocol.
+///
+/// This is intentionally strict to avoid triggering the fallback on real errors
+/// that happen to contain the word "Unimplemented" (schema errors, auth errors,
+/// user-facing messages, etc.). Tonic formats unimplemented status as:
+/// `"status: Unimplemented, message: ..."`.
+fn is_server_unimplemented(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::Transport { message }
+        if message.starts_with("status: Unimplemented")
+            || message.starts_with("Status { code: Unimplemented")
+    )
 }
 
 impl ExecutionRuntime for RemoteExecutionRuntime {
@@ -296,7 +307,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let result = block_on(self.pool.do_action(&action));
         match result {
             Ok(_) => {}
-            Err(ref e) if is_unimplemented_err(e) => {
+            Err(ref e) if is_server_unimplemented(e) => {
                 let sql = crate::flight_client::plan_to_sql(plan);
                 let _ = block_on(self.pool.execute_sql(&sql))?;
             }
@@ -329,7 +340,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let result = block_on(self.pool.do_action(&action));
         match result {
             Ok(body) => decode_ipc_response(&body),
-            Err(ref e) if is_unimplemented_err(e) => {
+            Err(ref e) if is_server_unimplemented(e) => {
                 let sql = encode_bounded_window(topic, spec, &input_batches)?;
                 block_on(self.pool.execute_sql(&sql))
             }
@@ -376,7 +387,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let result = block_on(self.pool.do_action(&action));
         match result {
             Ok(_) => Ok(()),
-            Err(ref e) if is_unimplemented_err(e) => {
+            Err(ref e) if is_server_unimplemented(e) => {
                 let sql = encode_continuous_register(job_id, spec)?;
                 let _ = block_on(self.pool.execute_sql(&sql))?;
                 Ok(())
@@ -401,7 +412,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let result = block_on(self.pool.do_action(&action));
         match result {
             Ok(_) => Ok(()),
-            Err(ref e) if is_unimplemented_err(e) => {
+            Err(ref e) if is_server_unimplemented(e) => {
                 let sql = encode_continuous_push(job_id, &batches)?;
                 let _ = block_on(self.pool.execute_sql(&sql))?;
                 Ok(())
@@ -421,7 +432,7 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let result = block_on(self.pool.do_action(&action));
         match result {
             Ok(body) => decode_ipc_response(&body),
-            Err(ref e) if is_unimplemented_err(e) => {
+            Err(ref e) if is_server_unimplemented(e) => {
                 let sql = encode_continuous_drain(job_id);
                 block_on(self.pool.execute_sql(&sql))
             }
@@ -1043,6 +1054,56 @@ mod tests {
             .collect_bounded_window("events", vec![batch], &spec)
             .unwrap();
         assert!(!out.is_empty());
+    }
+
+    // ── is_server_unimplemented guard ─────────────────────────────────────────
+
+    use super::is_server_unimplemented;
+
+    #[test]
+    fn fallback_triggered_on_tonic_unimplemented_status() {
+        let err = crate::RuntimeError::Transport {
+            message: "status: Unimplemented, message: action not yet supported".into(),
+        };
+        assert!(
+            is_server_unimplemented(&err),
+            "tonic Unimplemented status must trigger the SQL fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_not_triggered_on_word_unimplemented_in_message() {
+        // A schema error or user message containing "Unimplemented" as a word
+        // must NOT trigger the fallback — only tonic status prefix matches.
+        let err = crate::RuntimeError::Transport {
+            message: "schema column 'Unimplemented' type is not supported".into(),
+        };
+        assert!(
+            !is_server_unimplemented(&err),
+            "non-tonic error containing 'Unimplemented' must not trigger fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_not_triggered_on_auth_error() {
+        let err = crate::RuntimeError::Transport {
+            message: "status: Unauthenticated, message: API key required".into(),
+        };
+        assert!(
+            !is_server_unimplemented(&err),
+            "auth error must not trigger Unimplemented fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_triggered_on_status_code_format() {
+        let err = crate::RuntimeError::Transport {
+            message: "Status { code: Unimplemented, message: \"not yet\" }".into(),
+        };
+        assert!(
+            is_server_unimplemented(&err),
+            "alternative tonic Status format must also trigger fallback"
+        );
     }
 
     #[test]

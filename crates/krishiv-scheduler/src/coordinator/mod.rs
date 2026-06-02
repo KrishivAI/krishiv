@@ -241,6 +241,20 @@ impl SharedCoordinator {
         Ok(outcome)
     }
 
+    /// Return executor snapshots using the sharded `ExecutorInner` read lock,
+    /// avoiding the full coordinator read lock for high-frequency observability
+    /// queries (dashboards, health checks, metrics scrapes).
+    ///
+    /// The returned snapshots reflect the executor registry as maintained by the
+    /// sharded inner state, which is kept in sync with the main coordinator on
+    /// every heartbeat tick and task assignment. Use this in preference to
+    /// `coordinator.read().await.executor_snapshots()` when the coordinator lock
+    /// is a contention point.
+    pub async fn executor_snapshots_fast(&self) -> Vec<crate::coordinator::ExecutorRecord> {
+        let inner = self.executor_inner.read().await;
+        inner.executors.list()
+    }
+
     /// Advance the heartbeat clock by one tick (P0-4).
     pub async fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
         tracing::debug!(

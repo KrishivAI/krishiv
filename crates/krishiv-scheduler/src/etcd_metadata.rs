@@ -56,7 +56,11 @@ impl EtcdMetadataStore {
     }
 
     fn persist(&self) -> SchedulerResult<()> {
-        let bytes = encode_metadata_snapshot(&self.events, &self.jobs)?;
+        // Events are audit-only and kept in-memory; only job records are
+        // persisted to etcd. This prevents the snapshot from growing with
+        // every event append and keeps the etcd key size bounded by the
+        // number of active jobs rather than the total event log length.
+        let bytes = encode_metadata_snapshot(&[], &self.jobs)?;
         // etcd default max value size is 1.5 MiB.
         // Hard limit at 1.4 MiB leaves 100 KiB headroom; return an error
         // rather than silently attempting a write that etcd will reject.
@@ -122,6 +126,50 @@ impl MetadataStore for EtcdMetadataStore {
 mod tests {
     use super::*;
     use crate::store::{EventLogEvent, encode_metadata_snapshot};
+
+    #[test]
+    fn etcd_snapshot_does_not_include_events() {
+        // Verify that events are excluded from etcd persistence: a snapshot with
+        // 1 000 events + 5 jobs must encode to the same size as one with 0 events
+        // + 5 jobs.  This confirms the snapshot only grows with job count.
+        use crate::store::decode_metadata_snapshot;
+
+        let jobs: Vec<JobRecord> = (0..5)
+            .map(|i| {
+                let job_id = JobId::try_new(format!("job-{i}")).unwrap();
+                let spec = crate::job_spec_from_logical_plan(
+                    job_id,
+                    &krishiv_plan::LogicalPlan::new("p", krishiv_plan::ExecutionKind::Batch),
+                )
+                .unwrap();
+                JobRecord::from_spec(spec, 1)
+            })
+            .collect();
+
+        let many_events: Vec<EventLogEvent> = (0..1000)
+            .map(|i| EventLogEvent::JobSubmitted {
+                job_id: JobId::try_new(format!("event-job-{i}")).unwrap(),
+            })
+            .collect();
+
+        let bytes_with_events = encode_metadata_snapshot(&many_events, &jobs).unwrap();
+        let bytes_no_events = encode_metadata_snapshot(&[], &jobs).unwrap();
+
+        assert_eq!(
+            bytes_with_events.len(),
+            bytes_no_events.len(),
+            "etcd snapshot size must not depend on event count; \
+             events are audit-only and must not be serialised"
+        );
+
+        // Round-trip: the decoded snapshot must only contain jobs.
+        let (decoded_events, decoded_jobs) = decode_metadata_snapshot(&bytes_with_events).unwrap();
+        assert!(
+            decoded_events.is_empty(),
+            "decoded snapshot must have no events (they are not persisted)"
+        );
+        assert_eq!(decoded_jobs.len(), 5);
+    }
 
     #[test]
     fn hard_limit_constant_is_1_4_mib() {

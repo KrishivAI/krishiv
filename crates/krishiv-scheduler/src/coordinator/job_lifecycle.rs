@@ -40,8 +40,13 @@ impl Coordinator {
             ));
         }
 
+        // Deferred placement: attempt to place tasks on available executors at
+        // submission time, but do not reject the job if no executors are
+        // registered yet. Tasks stay Pending and the orchestration loop
+        // (assign_pending_tasks_for_schedulable_jobs) will assign them as soon
+        // as executors register or become healthy. This prevents submission
+        // failures during rolling executor restarts.
         let executors = self.executors.schedulable_executors();
-        let assignments = SlotAwareScheduler::place(&spec, &executors)?;
         let job_id = spec.job_id().clone();
         let job_name = spec.name().to_owned();
         let namespace = spec
@@ -49,7 +54,12 @@ impl Coordinator {
             .map(|s| s.to_owned())
             .unwrap_or_default();
         let mut record = JobRecord::from_spec(spec, self.config.max_stage_retries());
-        record.apply_assignments(assignments);
+        if !executors.is_empty() {
+            let assignments = SlotAwareScheduler::place(&record.spec, &executors)?;
+            record.apply_assignments(assignments);
+        }
+        // If no executors: all tasks remain Pending; assign_pending_tasks will
+        // place them on the next orchestration tick when executors register.
         // Persist the job record to the metadata store BEFORE committing
         // in-memory state.  A synchronous write ensures durability: if the
         // store write fails, the caller receives an error and no in-memory

@@ -40,6 +40,14 @@ pub struct CoordinatorConfig {
     /// Consecutive task failures after which an executor is avoided by the
     /// basic circuit breaker (PRR Immediate + Short term).
     circuit_breaker_failure_threshold: u32,
+
+    /// Maximum size in bytes for a single InlineIpc partition payload.
+    ///
+    /// Partitions larger than this limit are rejected with [`SchedulerError::InvalidJob`].
+    /// The default is 3 MiB (3 × 1 024 × 1 024 bytes), which matches the historic
+    /// hard-coded constant. Operators with large in-memory tables can raise this
+    /// limit; operators with memory-constrained coordinators can lower it.
+    inline_partition_limit_bytes: usize,
 }
 
 impl CoordinatorConfig {
@@ -55,6 +63,7 @@ impl CoordinatorConfig {
             llm_quota_requests_per_minute: 100,
             llm_quota_tokens_per_minute: 10_000,
             circuit_breaker_failure_threshold: 5,
+            inline_partition_limit_bytes: 3 * 1024 * 1024,
         }
     }
 
@@ -147,6 +156,18 @@ impl CoordinatorConfig {
     /// Consecutive failures threshold for the basic circuit breaker.
     pub fn circuit_breaker_failure_threshold(&self) -> u32 {
         self.circuit_breaker_failure_threshold
+    }
+
+    /// Maximum size in bytes for a single InlineIpc partition payload.
+    pub fn inline_partition_limit_bytes(&self) -> usize {
+        self.inline_partition_limit_bytes
+    }
+
+    /// Override the InlineIpc partition size limit.
+    #[must_use]
+    pub fn with_inline_partition_limit_bytes(mut self, limit: usize) -> Self {
+        self.inline_partition_limit_bytes = limit;
+        self
     }
 }
 

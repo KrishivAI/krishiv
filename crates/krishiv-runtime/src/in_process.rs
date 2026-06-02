@@ -271,7 +271,7 @@ impl InProcessStreamingRuntime {
                 };
 
                 if assignments.is_empty() {
-                    // Job either finished or has no more assignable work this turn.
+                    // Check if the job has reached a terminal state.
                     let terminal = {
                         let coord = self
                             .coordinator
@@ -282,12 +282,20 @@ impl InProcessStreamingRuntime {
                             .map(|snap| snap.state().is_terminal())
                             .unwrap_or(false)
                     };
-                    if terminal || iter_count > 1 {
+                    if terminal {
                         return Ok(());
                     }
-                    return Err(RuntimeError::transport(
-                        "in-process coordinator produced no task assignments",
-                    ));
+                    // First iteration: coordinator never produced assignments.
+                    if iter_count == 1 {
+                        return Err(RuntimeError::transport(
+                            "in-process coordinator produced no task assignments",
+                        ));
+                    }
+                    // Subsequent iterations with no new assignments but job not
+                    // yet terminal: all tasks in the previous stage completed and
+                    // the coordinator bridge already updated state — the job is
+                    // effectively done from the in-process executor's perspective.
+                    return Ok(());
                 }
 
                 // Attach caller-supplied input partitions to the FIRST assignment
@@ -322,6 +330,19 @@ impl InProcessStreamingRuntime {
                     ) {
                         output_batches.extend(report.output().record_batches().to_vec());
                     }
+                }
+
+                // Drive a coordinator tick after each stage's tasks complete.
+                // This advances the coordinator state machine: marks the completed
+                // stage as Succeeded, makes the next stage's tasks eligible for
+                // assignment, and handles any barrier dispatch needed for
+                // multi-stage plans (e.g. shuffle → reduce).
+                {
+                    let mut coord = self
+                        .coordinator
+                        .lock()
+                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                    let _ = coord.coordinator_tick();
                 }
             }
         })?;

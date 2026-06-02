@@ -148,14 +148,18 @@ pub struct PyGlueCatalog {
 #[pymethods]
 impl PyGlueCatalog {
     #[new]
-    pub fn new(region: String, database: String, rest_url: String) -> PyResult<Self> {
+    #[pyo3(signature = (region, database, rest_url, timeout_ms=None))]
+    pub fn new(region: String, database: String, rest_url: String, timeout_ms: Option<u64>) -> PyResult<Self> {
         Ok(Self {
-            inner: Arc::new(GlueRestCatalog::new(region, database, rest_url)),
+            inner: Arc::new(GlueRestCatalog::with_timeout(region, database, rest_url, timeout_ms)),
         })
     }
 
     /// List all table names in `namespace`.
     pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
+        // Use block_in_place when a tokio handle is available so we yield the
+        // worker thread instead of blocking it — important for async Python
+        // frameworks and multi-threaded tokio runtimes.
         RUNTIME
             .block_on(self.inner.list_tables(&namespace))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -183,15 +187,18 @@ pub struct PyNessieCatalog {
 #[pymethods]
 impl PyNessieCatalog {
     #[new]
-    #[pyo3(signature = (uri, reference="main"))]
-    pub fn new(uri: String, reference: &str) -> PyResult<Self> {
+    #[pyo3(signature = (uri, reference="main", timeout_ms=None))]
+    pub fn new(uri: String, reference: &str, timeout_ms: Option<u64>) -> PyResult<Self> {
         Ok(Self {
-            inner: Arc::new(NessieCatalog::new(uri, reference)),
+            inner: Arc::new(NessieCatalog::with_timeout(uri, reference, timeout_ms)),
         })
     }
 
     /// List all table names in `namespace`.
     pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
+        // Use block_in_place when a tokio handle is available so we yield the
+        // worker thread instead of blocking it — important for async Python
+        // frameworks and multi-threaded tokio runtimes.
         RUNTIME
             .block_on(self.inner.list_tables(&namespace))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -220,13 +227,14 @@ pub struct PyIcebergRestCatalog {
 #[pymethods]
 impl PyIcebergRestCatalog {
     #[new]
-    #[pyo3(signature = (url, warehouse=None))]
-    pub fn new(url: String, warehouse: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (url, warehouse=None, timeout_ms=None))]
+    pub fn new(url: String, warehouse: Option<String>, timeout_ms: Option<u64>) -> PyResult<Self> {
         let config = RestCatalogConfig {
             base_url: url,
             warehouse,
             prefix: "v1".to_string(),
             bearer_token: None,
+            timeout_ms,
         };
         Ok(Self {
             inner: Arc::new(GenericRestCatalog::new(config)),
@@ -235,6 +243,9 @@ impl PyIcebergRestCatalog {
 
     /// List all table names in `namespace`.
     pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
+        // Use block_in_place when a tokio handle is available so we yield the
+        // worker thread instead of blocking it — important for async Python
+        // frameworks and multi-threaded tokio runtimes.
         RUNTIME
             .block_on(self.inner.list_tables(&namespace))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))

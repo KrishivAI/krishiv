@@ -12,11 +12,6 @@ use crate::{SchedulerError, SchedulerResult, SharedCoordinator};
 
 const BATCH_SQL_JOB_PREFIX: &str = "batch-sql-";
 
-/// Maximum Arrow IPC bytes per inline partition (3 MB).
-/// Rejects oversized payloads before they enter the gRPC channel where
-/// the default max-message-size cap would produce an opaque transport error.
-const MAX_INLINE_PARTITION_BYTES: usize = 3 * 1024 * 1024;
-
 /// Legacy file-path table registration (single-node local cluster only).
 ///
 /// For multi-node / distributed deployments use `BatchSqlInlineTable` instead,
@@ -158,12 +153,17 @@ pub async fn submit_batch_sql_job(
             .map_err(|e| SchedulerError::InvalidJob {
                 message: format!("inline partition {idx} ({}) base64 decode failed: {e}", t.table_name),
             })?;
-        if ipc_bytes.len() > MAX_INLINE_PARTITION_BYTES {
+        let limit = {
+            let coord = coordinator.read().await;
+            coord.config().inline_partition_limit_bytes()
+        };
+        if ipc_bytes.len() > limit {
             return Err(SchedulerError::InvalidJob {
                 message: format!(
                     "inline partition {idx} ('{}') is {} bytes, which exceeds the \
-                     {MAX_INLINE_PARTITION_BYTES}-byte per-partition limit; \
-                     split the table into smaller chunks or use object-store references",
+                     {limit}-byte per-partition limit (coordinator config \
+                     inline_partition_limit_bytes); split the table into smaller \
+                     chunks or raise the limit via CoordinatorConfig",
                     t.table_name,
                     ipc_bytes.len(),
                 ),

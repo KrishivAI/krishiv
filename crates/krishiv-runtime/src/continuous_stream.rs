@@ -19,15 +19,45 @@ struct ContinuousJobEntry {
     pending_output: VecDeque<RecordBatch>,
 }
 
+/// Default maximum pending input batches per job before backpressure kicks in.
+const DEFAULT_MAX_PENDING_BATCHES: usize = 1024;
+
 /// Registry for long-running streaming jobs (session-scoped).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ContinuousStreamRegistry {
     jobs: DashMap<String, Arc<Mutex<ContinuousJobEntry>>>,
+    /// Maximum number of pending (not yet drained) input batches per job.
+    /// `push_input` returns [`RuntimeError::InvalidState`] when this limit is
+    /// reached so callers can apply backpressure instead of silently filling
+    /// memory. Set to `usize::MAX` for unbounded behaviour (tests only).
+    max_pending_batches: usize,
+}
+
+impl Default for ContinuousStreamRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ContinuousStreamRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            jobs: DashMap::new(),
+            max_pending_batches: DEFAULT_MAX_PENDING_BATCHES,
+        }
+    }
+
+    /// Create a registry with a custom per-job input queue depth limit.
+    pub fn with_max_pending_batches(max: usize) -> Self {
+        Self {
+            jobs: DashMap::new(),
+            max_pending_batches: max,
+        }
+    }
+
+    /// Create a registry with no backpressure limit. Use only in tests.
+    pub fn new_unbounded() -> Self {
+        Self::with_max_pending_batches(usize::MAX)
     }
 
     /// Register a continuous job with its window spec.
@@ -51,6 +81,11 @@ impl ContinuousStreamRegistry {
     }
 
     /// Enqueue input batches for a continuous job.
+    ///
+    /// Returns [`RuntimeError::InvalidState`] when the job's input queue has
+    /// reached `max_pending_batches`. Callers should drain the job before
+    /// pushing more data. This prevents unbounded memory accumulation when
+    /// producers outrun consumers.
     pub fn push_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> RuntimeResult<()> {
         let entry = self
             .jobs
@@ -61,8 +96,33 @@ impl ContinuousStreamRegistry {
         let mut guard = entry
             .lock()
             .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
+        let current_depth = guard.pending_input.len();
+        if current_depth >= self.max_pending_batches {
+            return Err(RuntimeError::InvalidState {
+                message: format!(
+                    "continuous job '{job_id}' input queue is full ({current_depth} batches \
+                     pending, limit {limit}); call drain_job before pushing more data",
+                    limit = self.max_pending_batches,
+                ),
+            });
+        }
         guard.pending_input.extend(batches);
         Ok(())
+    }
+
+    /// Returns the number of pending input batches for a job.
+    /// Callers can use this to implement self-rate-limiting before calling `push_input`.
+    pub fn pending_batch_depth(&self, job_id: &str) -> RuntimeResult<usize> {
+        let entry = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| RuntimeError::InvalidState {
+                message: format!("unknown continuous stream job '{job_id}'"),
+            })?;
+        let guard = entry
+            .lock()
+            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
+        Ok(guard.pending_input.len())
     }
 
     /// Drain pending input through the window operator and return newly emitted batches.
@@ -293,6 +353,72 @@ mod tests {
             .unwrap();
         let out = registry.drain_job("j1").unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn push_input_returns_error_when_queue_full() {
+        // Create a registry with a tiny queue limit of 2 batches per job.
+        let registry = ContinuousStreamRegistry::with_max_pending_batches(2);
+        registry
+            .register_job("j-bp", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .unwrap();
+
+        // First two pushes succeed.
+        registry.push_input("j-bp", vec![batch(1_000)]).unwrap();
+        registry.push_input("j-bp", vec![batch(2_000)]).unwrap();
+
+        // Third push must fail: queue is at capacity.
+        let err = registry.push_input("j-bp", vec![batch(3_000)]).unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidState { .. }),
+            "expected InvalidState backpressure error, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("input queue is full"),
+            "error message must mention queue full: {msg}"
+        );
+    }
+
+    #[test]
+    fn push_input_after_drain_succeeds() {
+        // Verify that draining frees space so subsequent pushes succeed.
+        let registry = ContinuousStreamRegistry::with_max_pending_batches(1);
+        registry
+            .register_job("j-drain-bp", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .unwrap();
+
+        registry.push_input("j-drain-bp", vec![batch(1_000)]).unwrap();
+        // Queue is full — drain first.
+        let _ = registry.drain_job("j-drain-bp").unwrap();
+        // After drain, pushing again must succeed.
+        registry.push_input("j-drain-bp", vec![batch(2_000)]).unwrap();
+    }
+
+    #[test]
+    fn new_unbounded_has_no_backpressure() {
+        let registry = ContinuousStreamRegistry::new_unbounded();
+        registry
+            .register_job("j-unb", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .unwrap();
+        for i in 0..2000 {
+            registry
+                .push_input("j-unb", vec![batch(i as i64 * 1_000)])
+                .expect("unbounded registry must never return backpressure error");
+        }
+    }
+
+    #[test]
+    fn pending_batch_depth_tracks_pushes_and_drains() {
+        let registry = ContinuousStreamRegistry::new_unbounded();
+        registry
+            .register_job("j-depth", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .unwrap();
+        assert_eq!(registry.pending_batch_depth("j-depth").unwrap(), 0);
+        registry.push_input("j-depth", vec![batch(1_000), batch(2_000)]).unwrap();
+        assert_eq!(registry.pending_batch_depth("j-depth").unwrap(), 2);
+        let _ = registry.drain_job("j-depth").unwrap();
+        assert_eq!(registry.pending_batch_depth("j-depth").unwrap(), 0);
     }
 
     #[test]
