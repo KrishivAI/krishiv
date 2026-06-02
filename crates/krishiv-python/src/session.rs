@@ -485,6 +485,50 @@ mod tests {
         let result = session.register_unbounded("stream_src", schema);
         assert!(result.is_ok(), "register_unbounded must succeed for embedded session");
     }
+
+    #[test]
+    fn from_env_succeeds_without_panic() {
+        // Exercise the Session::from_env() parse path without mutating env vars
+        // (unsafe env mutation is workspace-forbidden). The test passes regardless
+        // of which mode is inferred from the environment; what matters is no panic.
+        let result = krishiv_api::Session::from_env();
+        assert!(result.is_ok(), "Session::from_env must succeed in default env: {result:?}");
+    }
+
+    #[test]
+    fn from_env_returns_valid_mode() {
+        // Verify that whatever mode from_env() selects, the session is internally
+        // consistent (mode() returns one of the known variants).
+        if let Ok(session) = krishiv_api::Session::from_env() {
+            let mode = session.mode();
+            assert!(
+                matches!(
+                    mode,
+                    ExecutionMode::Embedded | ExecutionMode::SingleNode | ExecutionMode::Distributed
+                ),
+                "from_env must produce a valid execution mode, got {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_builder_single_node_mode() {
+        let session = SessionBuilder::new()
+            .with_execution_mode(ExecutionMode::SingleNode)
+            .build()
+            .expect("single-node session");
+        assert_eq!(session.mode(), ExecutionMode::SingleNode);
+    }
+
+    #[test]
+    fn session_builder_state_ttl_propagated() {
+        use krishiv_api::StateTtlConfig;
+        let session = SessionBuilder::new()
+            .with_state_ttl(StateTtlConfig::new(60_000))
+            .build()
+            .expect("session with TTL");
+        assert!(session.state_ttl().is_some());
+    }
 }
 
 fn parse_role(role: &str) -> PyResult<Role> {

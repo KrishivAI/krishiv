@@ -144,6 +144,124 @@ pub async fn merge_delta(
     })
 }
 
+// ── ObjectStore-backed Delta reader ────────────────────────────────────────
+
+/// ObjectStore-backed Delta Lake reader.
+///
+/// Reads the `_delta_log/` directory from any `ObjectStore` implementation
+/// (S3, GCS, Azure, or in-memory for tests). Compatible with tables written
+/// by [`write_delta`] via a local filesystem layout or any other Delta writer
+/// that produces the standard `_delta_log/*.json` structure.
+pub struct DeltaObjectStoreReader {
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    prefix: String,
+}
+
+impl DeltaObjectStoreReader {
+    /// Create a reader targeting `prefix` within `store`.
+    ///
+    /// `prefix` is the root of the Delta table (the directory that contains
+    /// `_delta_log/`).
+    pub fn new(
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// List available Delta log versions sorted ascending.
+    async fn list_versions(&self) -> LakehouseResult<Vec<u64>> {
+        use futures::StreamExt as _;
+        let log_prefix = object_store::path::Path::from(format!(
+            "{}/_delta_log",
+            self.prefix
+        ));
+        let mut stream = self.store.list(Some(&log_prefix));
+        let mut versions = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let name = meta.location.filename().unwrap_or("").to_string();
+            if name.ends_with(".json") {
+                if let Ok(v) = name.trim_end_matches(".json").parse::<u64>() {
+                    versions.push(v);
+                }
+            }
+        }
+        versions.sort_unstable();
+        Ok(versions)
+    }
+
+    /// Read the add-file paths from a single log entry JSON.
+    async fn parquet_paths_from_log_entry(&self, version: u64) -> LakehouseResult<Vec<String>> {
+        let log_path = object_store::path::Path::from(format!(
+            "{}/_delta_log/{:020}.json",
+            self.prefix, version
+        ));
+        let result = self
+            .store
+            .get_opts(&log_path, Default::default())
+            .await
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let mut paths = Vec::new();
+        for line in std::str::from_utf8(&bytes)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?
+            .lines()
+        {
+            let v: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            // Delta log "add" action: {"add": {"path": "part-xxx.parquet", ...}}
+            if let Some(path) = v["add"]["path"].as_str() {
+                paths.push(path.to_string());
+            }
+        }
+        Ok(paths)
+    }
+
+    /// Scan all Parquet files referenced by the latest Delta snapshot and
+    /// return all record batches.
+    pub async fn scan_batches(&self) -> LakehouseResult<Vec<arrow::record_batch::RecordBatch>> {
+        use futures::StreamExt as _;
+        let versions = self.list_versions().await?;
+        if versions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect all add-paths from the log (simplified: no remove/overwrite tracking).
+        let mut all_parquet_paths = Vec::new();
+        for version in &versions {
+            let paths = self.parquet_paths_from_log_entry(*version).await?;
+            all_parquet_paths.extend(paths);
+        }
+
+        let mut out = Vec::new();
+        for rel_path in &all_parquet_paths {
+            let obj_path = object_store::path::Path::from(format!("{}/{}", self.prefix, rel_path));
+            let get_result = match self.store.get_opts(&obj_path, Default::default()).await {
+                Ok(r) => r,
+                Err(_) => continue, // file may have been removed
+            };
+            let data = get_result
+                .bytes()
+                .await
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+            let reader = ParquetRecordBatchReader::try_new(data, 1024)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            for batch in reader {
+                out.push(batch.map_err(|e| LakehouseError::Io(e.to_string()))?);
+            }
+        }
+        Ok(out)
+    }
+}
+
 use arrow::array::Array;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
@@ -588,6 +706,95 @@ mod tests {
         let read = handle.scan_batches().await.unwrap();
         let rows: usize = read.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2);
+    }
+
+    // ── DeltaObjectStoreReader tests ──────────────────────────────────────────
+
+    fn make_inmemory_delta_store() -> std::sync::Arc<dyn object_store::ObjectStore> {
+        std::sync::Arc::new(object_store::memory::InMemory::new())
+    }
+
+    async fn write_delta_log_entry(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        version: u64,
+        parquet_path: &str,
+    ) {
+        let log_path = object_store::path::Path::from(format!(
+            "{prefix}/_delta_log/{version:020}.json"
+        ));
+        let log_entry = format!(r#"{{"add":{{"path":"{parquet_path}","size":100}}}}"#);
+        store
+            .put_opts(
+                &log_path,
+                bytes::Bytes::from(log_entry).into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn write_parquet_to_store(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        rel_path: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) {
+        use parquet::arrow::ArrowWriter;
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        let obj_path = object_store::path::Path::from(format!("{prefix}/{rel_path}"));
+        store
+            .put_opts(
+                &obj_path,
+                bytes::Bytes::from(buf).into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delta_object_store_reader_roundtrip() {
+        let store = make_inmemory_delta_store();
+        let batch = sample_batch(&[1, 2, 3], &["a", "b", "c"]);
+
+        // Write a Delta log entry pointing at a Parquet file.
+        let rel_parquet = "part-0.parquet";
+        write_parquet_to_store(store.as_ref(), "tbl", rel_parquet, &batch).await;
+        write_delta_log_entry(store.as_ref(), "tbl", 0, rel_parquet).await;
+
+        let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "tbl");
+        let batches = reader.scan_batches().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 3, "object-store Delta roundtrip must return all rows");
+    }
+
+    #[tokio::test]
+    async fn delta_object_store_reader_empty_log_returns_empty() {
+        let store = make_inmemory_delta_store();
+        let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "empty_tbl");
+        let batches = reader.scan_batches().await.unwrap();
+        assert!(batches.is_empty(), "no log entries → no batches");
+    }
+
+    #[tokio::test]
+    async fn delta_object_store_reader_multiple_versions() {
+        let store = make_inmemory_delta_store();
+
+        let b1 = sample_batch(&[1], &["a"]);
+        let b2 = sample_batch(&[2], &["b"]);
+        write_parquet_to_store(store.as_ref(), "mv", "part-0.parquet", &b1).await;
+        write_parquet_to_store(store.as_ref(), "mv", "part-1.parquet", &b2).await;
+        write_delta_log_entry(store.as_ref(), "mv", 0, "part-0.parquet").await;
+        write_delta_log_entry(store.as_ref(), "mv", 1, "part-1.parquet").await;
+
+        let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "mv");
+        let batches = reader.scan_batches().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "both versions must be readable");
     }
 
     #[tokio::test]

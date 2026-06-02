@@ -1180,4 +1180,27 @@ mod tests {
         let batches = reader.scan_batches().await.unwrap();
         assert!(batches.is_empty(), "empty object store must return no batches");
     }
+
+    #[tokio::test]
+    async fn hudi_object_store_rapid_commits_are_independent_no_overwrite() {
+        // next_instant() uses AtomicU64 compare-exchange for monotonicity, so two
+        // rapid appends must produce distinct commit instants and both must be
+        // readable — neither overwrites the other.
+        let store = make_inmemory_store();
+        let writer = HudiObjectStoreWriter::new(Arc::clone(&store), "mono/table");
+        let r1 = writer.append(batch(&[(1, "first")])).await.unwrap();
+        let r2 = writer.append(batch(&[(2, "second")])).await.unwrap();
+        assert_ne!(
+            r1.instant, r2.instant,
+            "consecutive appends must produce distinct Hudi instants (monotonic clock)"
+        );
+
+        let reader = HudiObjectStoreReader::new(Arc::clone(&store), "mono/table");
+        let batches = reader.scan_batches().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "both commits must be readable — no overwrite from same-ms instants"
+        );
+    }
 }

@@ -287,4 +287,60 @@ mod catalog_tests {
         let cat = PyIcebergRestCatalog::new("http://catalog.example.com".into(), None).unwrap();
         let _ = cat;
     }
+
+    // ── Catalog HTTP error-path tests ─────────────────────────────────────────
+    // Verify CatalogError → PyRuntimeError mapping without panicking.
+    // Use a port that is not listening so the HTTP request fails immediately.
+
+    #[test]
+    fn glue_catalog_list_tables_returns_err_on_unreachable_server() {
+        let cat = PyGlueCatalog::new(
+            "us-east-1".into(),
+            "test_db".into(),
+            "http://127.0.0.1:19999".into(), // non-listening port
+        )
+        .unwrap();
+        let result = cat.list_tables("test_namespace".into());
+        assert!(
+            result.is_err(),
+            "list_tables must return Err when the server is unreachable, not panic"
+        );
+    }
+
+    #[test]
+    fn nessie_catalog_list_tables_returns_err_on_unreachable_server() {
+        let cat =
+            PyNessieCatalog::new("http://127.0.0.1:19999".into(), "main").unwrap();
+        let result = cat.list_tables("warehouse".into());
+        assert!(
+            result.is_err(),
+            "NessieCatalog::list_tables must return Err when unreachable"
+        );
+    }
+
+    #[test]
+    fn iceberg_rest_catalog_list_tables_returns_err_on_unreachable_server() {
+        let cat =
+            PyIcebergRestCatalog::new("http://127.0.0.1:19999".into(), None).unwrap();
+        let result = cat.list_tables("default".into());
+        assert!(
+            result.is_err(),
+            "IcebergRestCatalog::list_tables must return Err when unreachable"
+        );
+    }
+
+    #[test]
+    fn glue_catalog_load_metadata_returns_err_on_unreachable_server() {
+        let cat = PyGlueCatalog::new(
+            "eu-west-1".into(),
+            "my_db".into(),
+            "http://127.0.0.1:19999".into(),
+        )
+        .unwrap();
+        let result = cat.load_table_metadata("ns".into(), "tbl".into());
+        assert!(
+            result.is_err(),
+            "load_table_metadata must return Err when unreachable"
+        );
+    }
 }

@@ -217,4 +217,53 @@ mod tests {
         assert!(distributed.multi_node_safe);
         assert!(distributed.requires_fencing);
     }
+
+    // ── Shuffle durability wiring ────────────────────────────────────────────
+    // Regression guard: changes to profile→shuffle mapping must be explicit.
+
+    #[test]
+    fn dev_local_maps_to_memory_shuffle() {
+        assert_eq!(
+            DurabilityProfile::DevLocal.spec().shuffle,
+            ShuffleDurability::Memory,
+            "DevLocal must use in-memory shuffle (no disk I/O)"
+        );
+    }
+
+    #[test]
+    fn single_node_durable_maps_to_local_disk_shuffle() {
+        assert_eq!(
+            DurabilityProfile::SingleNodeDurable.spec().shuffle,
+            ShuffleDurability::LocalDisk,
+            "SingleNodeDurable must use LocalDisk shuffle (restart-safe)"
+        );
+    }
+
+    #[test]
+    fn distributed_durable_maps_to_object_store_shuffle() {
+        assert_eq!(
+            DurabilityProfile::DistributedDurable.spec().shuffle,
+            ShuffleDurability::ObjectStore,
+            "DistributedDurable must use ObjectStore shuffle (multi-node safe)"
+        );
+    }
+
+    #[test]
+    fn single_node_durable_is_restart_safe_but_not_multi_node() {
+        let spec = DurabilityProfile::SingleNodeDurable.spec();
+        assert!(spec.restart_durable, "SingleNodeDurable must survive restarts");
+        assert!(
+            !spec.multi_node_safe,
+            "SingleNodeDurable must not claim multi-node safety"
+        );
+    }
+
+    #[test]
+    fn default_profile_is_dev_local() {
+        assert_eq!(
+            DurabilityProfile::default(),
+            DurabilityProfile::DevLocal,
+            "default profile must be DevLocal for safe embedded use"
+        );
+    }
 }

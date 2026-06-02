@@ -25,6 +25,7 @@ pub use delta_lake::{
     DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, remove_merge_key_column,
     write_delta,
 };
+pub use delta_lake::DeltaObjectStoreReader;
 pub use hudi::{
     HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType,
     HudiSnapshotReader, HudiWriteResult, write_hudi_cow_append, write_hudi_cow_fixture,

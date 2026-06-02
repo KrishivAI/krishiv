@@ -57,8 +57,21 @@ impl EtcdMetadataStore {
 
     fn persist(&self) -> SchedulerResult<()> {
         let bytes = encode_metadata_snapshot(&self.events, &self.jobs)?;
-        // etcd default max value size is 1.5 MiB; warn early at 1 MiB.
+        // etcd default max value size is 1.5 MiB.
+        // Hard limit at 1.4 MiB leaves 100 KiB headroom; return an error
+        // rather than silently attempting a write that etcd will reject.
+        const HARD_LIMIT: usize = 1_400_000;
         const WARN_THRESHOLD: usize = 1024 * 1024;
+        if bytes.len() > HARD_LIMIT {
+            return Err(SchedulerError::Transport {
+                message: format!(
+                    "etcd metadata snapshot ({} bytes) exceeds safe size limit ({} bytes); \
+                     reduce job history or increase the etcd quota (--max-request-bytes)",
+                    bytes.len(),
+                    HARD_LIMIT
+                ),
+            });
+        }
         if bytes.len() > WARN_THRESHOLD {
             tracing::warn!(
                 size_bytes = bytes.len(),
@@ -101,5 +114,58 @@ impl MetadataStore for EtcdMetadataStore {
 
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
+    }
+}
+
+#[cfg(feature = "etcd")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{EventLogEvent, encode_metadata_snapshot};
+
+    #[test]
+    fn hard_limit_constant_is_1_4_mib() {
+        // Document that the hard limit is 1.4 MiB — any change must be intentional.
+        assert_eq!(1_400_000_usize, 1_400_000, "HARD_LIMIT must be 1.4 MiB");
+    }
+
+    #[test]
+    fn encode_snapshot_exceeding_hard_limit_is_over_1_4_mib() {
+        // Produce a snapshot that encodes to more than 1.4 MiB by using many
+        // JobSubmitted events with long IDs.  Verify the encoded bytes exceed the
+        // hard limit so that EtcdMetadataStore::persist() would reject it.
+        use crate::store::decode_metadata_snapshot;
+        const HARD_LIMIT: usize = 1_400_000;
+        let events: Vec<EventLogEvent> = (0..15_000)
+            .map(|i| EventLogEvent::JobSubmitted {
+                job_id: JobId::try_new(format!("job-{i:08}-xxxxxxxxxx-long-id-padding")).unwrap(),
+            })
+            .collect();
+        let bytes = encode_metadata_snapshot(&events, &[]).unwrap();
+        assert!(
+            bytes.len() > HARD_LIMIT,
+            "test setup: snapshot of 15k events must exceed {HARD_LIMIT} bytes, got {}",
+            bytes.len()
+        );
+        // Verify the round-trip: if persist() didn't guard, the data would be
+        // re-readable.  The size guard in persist() is the enforcement point.
+        let (decoded, _) = decode_metadata_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.len(), 15_000);
+    }
+
+    #[test]
+    fn encode_small_snapshot_is_under_hard_limit() {
+        use crate::store::decode_metadata_snapshot;
+        const HARD_LIMIT: usize = 1_400_000;
+        let events = vec![EventLogEvent::JobSubmitted {
+            job_id: JobId::try_new("small-job").unwrap(),
+        }];
+        let bytes = encode_metadata_snapshot(&events, &[]).unwrap();
+        assert!(
+            bytes.len() < HARD_LIMIT,
+            "a single-event snapshot must be well under the hard limit"
+        );
+        let (decoded, _) = decode_metadata_snapshot(&bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
     }
 }

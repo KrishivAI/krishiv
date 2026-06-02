@@ -30,7 +30,11 @@ pub enum TracerExporter {
     Stdout,
     /// Disables all span export. Used in tests and when telemetry is not needed.
     NoOp,
-    /// Captures exported spans in memory. Useful for asserting span attributes in tests.
+    /// Captures exported spans in memory for assertion in unit tests.
+    ///
+    /// **For testing only.** Uses a synchronous simple span processor that blocks
+    /// the tracing thread on each export. Do not use in production; use
+    /// [`TracerExporter::NoOp`] or the OTLP path (`otlp_endpoint`) instead.
     InMemory(opentelemetry_sdk::trace::InMemorySpanExporter),
 }
 

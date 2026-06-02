@@ -10,6 +10,18 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
 use crate::{SqlError, SqlResult};
 
 /// Parsed `MATCH_RECOGNIZE` statement.
+/// Parsed `MATCH_RECOGNIZE` statement ready for execution.
+///
+/// ## Window boundary semantics
+///
+/// The `WITHIN` clause sets a window duration in milliseconds.  The expiry
+/// check uses a **strict greater-than** comparison:
+/// `event_time_ms - partial.start_time_ms > window_ms`.
+///
+/// This means an event arriving at **exactly** `start_time + window_ms` is
+/// still considered within the window and will advance (or complete) the
+/// partial match. Only events arriving strictly *after* that point cause the
+/// partial to expire and be discarded.
 #[derive(Debug, Clone)]
 pub struct MatchRecognizeStatement {
     pub source_table: String,
@@ -419,6 +431,93 @@ mod tests {
                 "each match must contain 2 events (one for stage A, one for stage B)"
             );
         }
+    }
+
+    #[test]
+    fn execute_match_recognize_boundary_event_at_exact_window_matches() {
+        // An event arriving at exactly start_time + window_ms must still match
+        // because the expiry check is strict greater-than (not >=).
+        use std::sync::Arc;
+        use std::time::Duration;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_cep::Pattern;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // A at t=0, B at t=100 with window_ms=100 → 100 - 0 = 100, not > 100 → within window.
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["u1", "u1"])) as _,
+                Arc::new(Int64Array::from(vec![0_i64, 100])) as _,
+            ],
+        )
+        .unwrap();
+
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_millis(100))
+            .compile()
+            .unwrap();
+
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern,
+        };
+
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "event at exactly start_time + window_ms (t=100) must still match (strict > check)"
+        );
+    }
+
+    #[test]
+    fn execute_match_recognize_one_ms_past_window_does_not_match() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_cep::Pattern;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // A at t=0, B at t=101 with window_ms=100 → 101 - 0 = 101 > 100 → expired.
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["u1", "u1"])) as _,
+                Arc::new(Int64Array::from(vec![0_i64, 101])) as _,
+            ],
+        )
+        .unwrap();
+
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_millis(100))
+            .compile()
+            .unwrap();
+
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern,
+        };
+
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
+        assert!(
+            result.is_empty(),
+            "event 1 ms past window_ms must not match (expired partial)"
+        );
     }
 
     #[test]
