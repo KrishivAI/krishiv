@@ -627,6 +627,25 @@ impl SqlEngine {
             return Ok(SqlDataFrame::new("merge", dataframe).with_query(query));
         }
 
+        // ── Intercept MATCH_RECOGNIZE ─────────────────────────────────────────
+        // DataFusion does not parse MATCH_RECOGNIZE. Route it through the CEP
+        // path: parse → run PatternMatcher on the source table → return results.
+        if query.to_ascii_uppercase().contains(" MATCH_RECOGNIZE ") {
+            if let Some(stmt) = cep_sql::parse_match_recognize(query)? {
+                let source_df = self.context.sql(&format!("SELECT * FROM {}", stmt.source_table)).await?;
+                let source_batches = source_df.collect().await?;
+                let results = cep_sql::execute_match_recognize(stmt, &source_batches)?;
+                lakehouse::register_scan_batches(
+                    &self.context,
+                    "_krishiv_cep_result",
+                    results,
+                )
+                .await?;
+                let dataframe = self.context.sql("SELECT * FROM _krishiv_cep_result").await?;
+                return Ok(SqlDataFrame::new("cep", dataframe).with_query(query));
+            }
+        }
+
         let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query)
             .unwrap_or_else(|_| (query.to_string(), vec![]));
         lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;

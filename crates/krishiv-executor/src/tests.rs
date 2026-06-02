@@ -2389,6 +2389,7 @@ mod executor_tests {
         use std::sync::{Arc, Mutex};
 
         #[derive(Default)]
+        #[derive(Clone)]
         struct RecordingCoordinator {
             acks: Arc<Mutex<Vec<CheckpointAckRequest>>>,
         }
@@ -2465,7 +2466,7 @@ mod executor_tests {
         };
 
         let response = runner
-            .initiate_checkpoint_and_deliver_ack(&assignment, req, &backend, &storage, &coordinator)
+            .initiate_checkpoint_and_deliver_ack(&assignment, req, Arc::new(backend), Arc::new(storage), coordinator.clone())
             .await
             .unwrap();
         assert_eq!(response, CheckpointAckResponse::Accepted);

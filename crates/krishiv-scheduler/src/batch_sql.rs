@@ -12,6 +12,11 @@ use crate::{SchedulerError, SchedulerResult, SharedCoordinator};
 
 const BATCH_SQL_JOB_PREFIX: &str = "batch-sql-";
 
+/// Maximum Arrow IPC bytes per inline partition (3 MB).
+/// Rejects oversized payloads before they enter the gRPC channel where
+/// the default max-message-size cap would produce an opaque transport error.
+const MAX_INLINE_PARTITION_BYTES: usize = 3 * 1024 * 1024;
+
 /// Legacy file-path table registration (single-node local cluster only).
 ///
 /// For multi-node / distributed deployments use `BatchSqlInlineTable` instead,
@@ -55,7 +60,7 @@ pub async fn execute_batch_sql_coordinated(
     query: &str,
     tables: &[BatchSqlInlineTable],
 ) -> SchedulerResult<BatchSqlOutcome> {
-    let job_id = submit_batch_sql_job(coordinator, query, tables).await?;
+    let job_id = submit_batch_sql_job(coordinator, query, tables, false).await?;
 
     let notify = {
         let coord = coordinator.read().await;
@@ -122,6 +127,7 @@ pub async fn submit_batch_sql_job(
     coordinator: &SharedCoordinator,
     query: &str,
     tables: &[BatchSqlInlineTable],
+    is_streaming: bool,
 ) -> SchedulerResult<JobId> {
     use base64::Engine as _;
 
@@ -142,24 +148,35 @@ pub async fn submit_batch_sql_job(
 
     let fragment = format!("sql: {query}");
     let stage = StageSpec::new(stage_id, "batch-sql").with_task(TaskSpec::new(task_id, fragment));
-    let spec = JobSpec::new(job_id.clone(), "batch-sql", JobKind::Batch).with_stage(stage);
+    let job_kind = if is_streaming { JobKind::Streaming } else { JobKind::Batch };
+    let spec = JobSpec::new(job_id.clone(), "batch-sql", job_kind).with_stage(stage);
 
-    let input_partitions: Vec<InputPartition> = tables
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, t)| {
-            let ipc_bytes = base64::engine::general_purpose::STANDARD
-                .decode(t.ipc_b64.as_bytes())
-                .ok()?;
-            Some(InputPartition::typed(
-                format!("inline-{idx}"),
-                InputPartitionDescriptor::InlineIpc {
-                    table_name: t.table_name.clone(),
-                    ipc_bytes,
-                },
-            ))
-        })
-        .collect();
+    let mut input_partitions: Vec<InputPartition> = Vec::with_capacity(tables.len());
+    for (idx, t) in tables.iter().enumerate() {
+        let ipc_bytes = base64::engine::general_purpose::STANDARD
+            .decode(t.ipc_b64.as_bytes())
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: format!("inline partition {idx} ({}) base64 decode failed: {e}", t.table_name),
+            })?;
+        if ipc_bytes.len() > MAX_INLINE_PARTITION_BYTES {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "inline partition {idx} ('{}') is {} bytes, which exceeds the \
+                     {MAX_INLINE_PARTITION_BYTES}-byte per-partition limit; \
+                     split the table into smaller chunks or use object-store references",
+                    t.table_name,
+                    ipc_bytes.len(),
+                ),
+            });
+        }
+        input_partitions.push(InputPartition::typed(
+            format!("inline-{idx}"),
+            InputPartitionDescriptor::InlineIpc {
+                table_name: t.table_name.clone(),
+                ipc_bytes,
+            },
+        ));
+    }
 
     let mut coord = coordinator.write().await;
     coord.ensure_active()?;

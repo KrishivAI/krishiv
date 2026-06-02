@@ -23,13 +23,18 @@ impl InProcessCluster {
         })
     }
 
-    /// Execute batch SQL via coordinator → executor (`sql:` task).
     pub fn collect_batch_sql(
         &self,
         query: &str,
         tables: &[crate::in_process::BatchSqlTable],
+        is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
-        self.inner.execute_batch_sql(query, tables)
+        self.inner.execute_batch_sql(query, tables, is_streaming)
+    }
+
+    /// Check if a query is streaming.
+    pub fn is_streaming_query(&self, query: &str) -> RuntimeResult<bool> {
+        self.inner.is_streaming_query(query)
     }
 
     /// Register a continuous streaming job.
@@ -231,7 +236,7 @@ mod tests {
     fn collect_batch_sql_returns_results() {
         let cluster = InProcessCluster::new().expect("cluster");
         let batches = cluster
-            .collect_batch_sql("SELECT 42 AS answer", &[])
+            .collect_batch_sql("SELECT 42 AS answer", &[], false)
             .expect("batch sql");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -245,7 +250,7 @@ mod tests {
             table_name: "t".into(),
             path: PathBuf::from("/nonexistent.parquet"),
         }];
-        let result = cluster.collect_batch_sql("SELECT 1", &tables);
+        let result = cluster.collect_batch_sql("SELECT 1", &tables, false);
         // May fail because file doesn't exist, but the routing works
         assert!(result.is_ok() || result.is_err());
     }
@@ -331,9 +336,9 @@ mod tests {
     #[test]
     fn collect_batch_sql_multiple_queries() {
         let cluster = InProcessCluster::new().expect("cluster");
-        let b1 = cluster.collect_batch_sql("SELECT 1 AS n", &[]).unwrap();
+        let b1 = cluster.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap();
         assert_eq!(b1[0].num_rows(), 1);
-        let b2 = cluster.collect_batch_sql("SELECT 2 AS n", &[]).unwrap();
+        let b2 = cluster.collect_batch_sql("SELECT 2 AS n", &[], false).unwrap();
         assert_eq!(b2[0].num_rows(), 1);
         assert_eq!(
             b2[0]

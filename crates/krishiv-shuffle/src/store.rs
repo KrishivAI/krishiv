@@ -19,6 +19,13 @@ pub struct ShufflePartition {
     pub batches: Vec<RecordBatch>,
 }
 
+/// A streaming shuffle partition.
+pub struct ShuffleStream {
+    pub id: PartitionId,
+    pub schema: SchemaRef,
+    pub batches: futures::stream::BoxStream<'static, ShuffleResult<RecordBatch>>,
+}
+
 /// An async shuffle store that persists inter-stage partition data.
 ///
 /// Implementations must be `Send + Sync` so they can be shared across async
@@ -49,6 +56,25 @@ pub trait ShuffleStore: Send + Sync {
         &self,
         id: &PartitionId,
     ) -> impl Future<Output = ShuffleResult<Option<ShufflePartition>>> + Send;
+
+    /// Stream a partition. Default implementation buffers via read_partition.
+    fn stream_partition(
+        &self,
+        id: &PartitionId,
+    ) -> impl Future<Output = ShuffleResult<Option<ShuffleStream>>> + Send {
+        let id = id.clone();
+        async move {
+            if let Some(partition) = self.read_partition(&id).await? {
+                Ok(Some(ShuffleStream {
+                    id: partition.id,
+                    schema: partition.schema,
+                    batches: Box::pin(futures::stream::iter(partition.batches.into_iter().map(Ok))),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 
     /// Delete all partitions for a job (called on job completion or cancellation).
     fn delete_job_partitions(&self, job_id: &str)

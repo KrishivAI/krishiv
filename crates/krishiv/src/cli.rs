@@ -158,7 +158,19 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
             2,
         ),
         ["compat", "analyze", rest @ ..] => run_compat_analyze(rest),
-        ["compat", ..] => CliResponse::ok("compat (R15): PySpark migration tools are not yet implemented in this release.\nThis command is a placeholder for future functionality.\n".to_string()),
+        ["compat"] => CliResponse::ok(compat_help()),
+        ["compat", sub, ..] => CliResponse::err(
+            format!(
+                "compat: unknown subcommand '{sub}'\n\n\
+                 Available subcommands:\n\
+                   analyze   Analyze a PySpark script for migration compatibility\n\n\
+                 Planned (not yet available):\n\
+                   convert   Automatically rewrite PySpark scripts to Krishiv API\n\
+                   report    Generate a full HTML migration report\n\n\
+                 Run 'krishiv compat --help' for usage.\n"
+            ),
+            2,
+        ),
         ["sql", rest @ ..] => run_sql(rest),
         ["explain", rest @ ..] => run_explain(rest),
         ["stream", rest @ ..] => crate::stream_cmd::run_stream(rest),
@@ -343,9 +355,6 @@ fn run_jobs(args: &[&str]) -> CliResponse {
             2,
         );
     }
-    eprintln!(
-        "[local-mode] Jobs are local to this process. Persistent job history is not yet implemented."
-    );
     let session = match Session::builder().build() {
         Ok(session) => session,
         Err(error) => return CliResponse::err(format!("{error}\n"), 1),

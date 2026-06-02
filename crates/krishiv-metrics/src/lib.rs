@@ -48,6 +48,21 @@ pub struct MetricsConfig {
     /// When `Some`, the OTLP gRPC exporter is used instead of the `exporter`
     /// field.  When `None`, the `exporter` field controls output.
     pub otlp_endpoint: Option<String>,
+    /// Deployment target emitted as the `deployment.target` OTel resource
+    /// attribute on every span. Falls back to the `KRISHIV_DEPLOYMENT_TARGET`
+    /// environment variable when `None`. Typical values: `"embedded"`,
+    /// `"single-node"`, `"distributed"`, `"k8s"`, `"bare-metal"`.
+    pub deployment_target: Option<String>,
+}
+
+impl MetricsConfig {
+    /// Resolve the effective deployment target: explicit config → env var → "unknown".
+    pub fn resolved_deployment_target(&self) -> String {
+        self.deployment_target
+            .clone()
+            .or_else(|| std::env::var("KRISHIV_DEPLOYMENT_TARGET").ok())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
 }
 
 impl Default for MetricsConfig {
@@ -58,6 +73,7 @@ impl Default for MetricsConfig {
             exporter: TracerExporter::NoOp,
             log_filter: None,
             otlp_endpoint: None,
+            deployment_target: None,
         }
     }
 }
@@ -106,8 +122,20 @@ impl Drop for MetricsHandle {
 /// possible when `config.otlp_endpoint` is `Some`).
 pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
     let filter_str = config.log_filter.as_deref().unwrap_or("info").to_string();
-
     let filter = tracing_subscriber::EnvFilter::new(&filter_str);
+    let deployment_target = config.resolved_deployment_target();
+
+    // Build a resource with service.name and deployment.target attributes.
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_attribute(opentelemetry::KeyValue::new(
+            "service.name",
+            config.service_name.clone(),
+        ))
+        .with_attribute(opentelemetry::KeyValue::new(
+            "deployment.target",
+            deployment_target,
+        ))
+        .build();
 
     let tracer_provider = if let Some(endpoint) = config.otlp_endpoint {
         // Build an OTLP gRPC exporter pipeline.
@@ -120,11 +148,13 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
             .map_err(|e| MetricsError::OtlpBuild(format!("{e}")))?;
 
         SdkTracerProvider::builder()
+            .with_resource(resource)
             .with_batch_exporter(exporter)
             .build()
     } else {
         match config.exporter {
             TracerExporter::Stdout => SdkTracerProvider::builder()
+                .with_resource(resource)
                 .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
                 .build(),
             TracerExporter::NoOp => SdkTracerProvider::builder().build(),

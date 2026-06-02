@@ -1472,3 +1472,25 @@ impl TaskStatusResponse {
         self.trace_context.as_ref()
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushContinuousInputRequest {
+    pub version: TransportVersion,
+    pub job_id: JobId,
+    pub task_id: TaskId,
+    pub ipc_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainContinuousOutputRequest {
+    pub version: TransportVersion,
+    pub job_id: JobId,
+    pub task_id: TaskId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainContinuousOutputResponse {
+    pub version: TransportVersion,
+    pub disposition: TransportDisposition,
+    pub ipc_bytes: Vec<u8>,
+}

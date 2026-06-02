@@ -1,5 +1,6 @@
 use crate::{
-    PartitionId, ShuffleError, ShufflePartition, ShuffleResult, ShuffleStore,
+    DurabilityProfile, PartitionId, PartitionState, ShuffleError, ShufflePartition, ShufflePath,
+    ShuffleResult, ShuffleStore, ShuffleStream,
     compression::{ShuffleCompression, parquet_writer_properties},
     error::{io_err, shuffle_write_lock},
     store::LeaseMap,
@@ -253,71 +254,88 @@ impl ShuffleStore for LocalDiskShuffleStore {
     }
 
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
+        let id = id.clone();
+        let stream_opt = self.stream_partition(&id).await?;
+        let Some(mut stream) = stream_opt else { return Ok(None) };
+        let mut batches = Vec::new();
+        use futures::StreamExt;
+        while let Some(batch_res) = stream.batches.next().await {
+            batches.push(batch_res?);
+        }
+        Ok(Some(ShufflePartition {
+            id,
+            schema: stream.schema,
+            batches,
+        }))
+    }
+
+    async fn stream_partition(
+        &self,
+        id: &PartitionId,
+    ) -> ShuffleResult<Option<ShuffleStream>> {
         let path = self.partition_path(id)?;
         let id = id.clone();
+        let id_clone = id.clone();
         let content_hashes = Arc::clone(&self.content_hashes);
 
-        // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
-        // async executor thread is never stalled by synchronous disk calls.
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-            // Read raw Parquet bytes for hash verification before decoding.
             let raw_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => {
-                    return Err(io_err(format!(
-                        "failed to read partition file '{}': {e}",
-                        path.display()
-                    )));
-                }
+                Err(e) => return Err(io_err(format!("failed to read partition file '{}': {e}", path.display()))),
             };
 
-            // Strict content-hash verification on disk read: compare against
-            // the BLAKE3 hash of the Parquet bytes stored at write time.
-            {
-                let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-                if let Some(stored_ref) = content_hashes.get(&key) {
-                    let stored = *stored_ref;
-                    let computed = compute_hash_bytes(&raw_bytes);
-                    if computed != stored {
-                        return Err(ShuffleError::ContentHashMismatch {
-                            partition: format!("{:?}", key),
-                            expected: format!("{:02x?}", stored),
-                            actual: format!("{:02x?}", computed),
-                        });
-                    }
+            let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+            if let Some(stored_ref) = content_hashes.get(&key) {
+                let stored = *stored_ref;
+                let computed = compute_hash_bytes(&raw_bytes);
+                if computed != stored {
+                    return Err(ShuffleError::ContentHashMismatch {
+                        partition: format!("{:?}", key),
+                        expected: format!("{:02x?}", stored),
+                        actual: format!("{:02x?}", computed),
+                    });
                 }
             }
 
-            // Decode the Parquet bytes into Arrow record batches.
-            // Use `bytes::Bytes` which implements `ChunkReader` for parquet.
             let parquet_bytes_frozen = bytes::Bytes::from(raw_bytes);
             let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes_frozen)
                 .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
             let schema = builder.schema().clone();
-            let reader = builder
-                .build()
+            let reader = builder.build()
                 .map_err(|e| io_err(format!("failed to build Parquet batch reader: {e}")))?;
-            let mut batches = Vec::new();
-            for result in reader {
-                let batch =
-                    result.map_err(|e| io_err(format!("error reading Parquet batch: {e}")))?;
-                batches.push(batch);
-            }
-            let partition = ShufflePartition {
-                id,
-                schema,
-                batches,
-            };
-
-            Ok(Some(partition))
+            
+            Ok::<_, ShuffleError>(Some((schema, reader)))
         })
         .await
-        .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?
-    }
+        .map_err(|e| io_err(format!("spawn_blocking join error: {e}")))?;
 
+        let Some((schema, reader)) = result? else {
+            return Ok(None);
+        };
+
+        let stream = futures::stream::unfold(Some(reader), move |reader_opt| async move {
+            let mut reader = reader_opt?;
+            let res = tokio::task::spawn_blocking(move || {
+                reader.next().map(|batch_res| (batch_res, reader))
+            }).await;
+            
+            match res {
+                Ok(Some((Ok(batch), reader))) => Some((Ok(batch), Some(reader))),
+                Ok(Some((Err(e), reader))) => Some((Err(io_err(format!("error reading Parquet batch: {e}"))), Some(reader))),
+                Ok(None) => None,
+                Err(e) => Some((Err(io_err(format!("spawn_blocking error: {e}"))), None)),
+            }
+        });
+
+        Ok(Some(ShuffleStream {
+            id: id_clone,
+            schema,
+            batches: Box::pin(stream),
+        }))
+    }
     async fn delete_job_partitions(&self, job_id: &str) -> ShuffleResult<()> {
         crate::validate_safe_id(job_id, "job_id")?;
         let dir = self.base_dir.join(job_id);

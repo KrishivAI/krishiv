@@ -742,6 +742,11 @@ impl ExecutorTaskRunner {
         self
     }
 
+    /// Access the shared SQL engine.
+    pub fn sql_engine(&self) -> &Arc<SqlEngine> {
+        &self.sql_engine
+    }
+
     /// Attach a shared barrier injector so barriers received via gRPC are
     /// consumed by the runner loop and trigger checkpoint initiation.
     pub fn with_barrier_injector(mut self, injector: SharedBarrierInjector) -> Self {
@@ -1109,12 +1114,12 @@ impl ExecutorTaskRunner {
         &self,
         assignment: &ExecutorTaskAssignment,
         req: InitiateCheckpointRequest,
-        state_backend: &dyn StateBackend,
-        storage: &(impl CheckpointStorage + ?Sized),
-        coordinator: &S,
+        state_backend: Arc<dyn StateBackend>,
+        storage: Arc<dyn CheckpointStorage>,
+        coordinator: S,
     ) -> Result<CheckpointAckResponse, tonic::Status>
     where
-        S: CoordinatorExecutorService,
+        S: CoordinatorExecutorService + Clone + 'static,
     {
         // Take ownership of the TaskRunner out of the DashMap so we don't hold
         // a shard lock across blocking file I/O (snapshot + write_bytes).
@@ -1126,10 +1131,15 @@ impl ExecutorTaskRunner {
             .unwrap_or_else(|| TaskRunner::new(task_id.clone()));
         // DashMap shard lock is now fully released.
 
-        let ack = krishiv_common::blocking::run_blocking_safely(|| {
-            task_runner.handle_initiate_checkpoint(req, state_backend, storage)
+        let ack = tokio::task::spawn_blocking(move || {
+            task_runner.handle_initiate_checkpoint(req, state_backend.as_ref(), storage.as_ref())
+                .map(|ack| (ack, task_runner))
         })
+        .await
+        .map_err(|error| tonic::Status::internal(error.to_string()))?
         .map_err(|error| tonic::Status::internal(error.to_string()))?;
+
+        let (ack, task_runner) = ack;
 
         // Re-insert the updated runner (last_acked_epoch was updated).
         self.checkpoint_runners.insert(task_id, task_runner);
@@ -1148,12 +1158,12 @@ impl ExecutorTaskRunner {
     pub async fn initiate_checkpoint_for_job<S>(
         &self,
         req: &InitiateCheckpointRequest,
-        state_backend: &dyn StateBackend,
-        storage: &(impl CheckpointStorage + ?Sized),
-        coordinator: &S,
+        state_backend: Arc<dyn StateBackend>,
+        storage: Arc<dyn CheckpointStorage>,
+        coordinator: S,
     ) -> Result<(), tonic::Status>
     where
-        S: CoordinatorExecutorService,
+        S: CoordinatorExecutorService + Clone + 'static,
     {
         use krishiv_proto::{
             ExecutorTaskAssignment, OutputContract, OutputContractKind, PlanFragment,
@@ -1192,13 +1202,17 @@ impl ExecutorTaskRunner {
                 PlanFragment::new("checkpoint"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );
+            
+            let sb_clone = Arc::clone(&state_backend);
+            let s_clone = Arc::clone(&storage);
+            let coord_clone = coordinator.clone();
             if let Err(error) = self
                 .initiate_checkpoint_and_deliver_ack(
                     &assignment,
                     req.clone(),
-                    state_backend,
-                    storage,
-                    coordinator,
+                    sb_clone,
+                    s_clone,
+                    coord_clone,
                 )
                 .await
             {
@@ -1212,11 +1226,11 @@ impl ExecutorTaskRunner {
     /// checkpoints for each one.  Called from the runner loop in `cli.rs`.
     pub async fn drain_pending_barriers<S>(
         &self,
-        state_backend: &dyn StateBackend,
-        storage: &(impl CheckpointStorage + ?Sized),
-        coordinator: &S,
+        state_backend: Arc<dyn StateBackend>,
+        storage: Arc<dyn CheckpointStorage>,
+        coordinator: S,
     ) where
-        S: CoordinatorExecutorService,
+        S: CoordinatorExecutorService + Clone + 'static,
     {
         let Some(ref injector) = self.barrier_injector else {
             return;
@@ -1237,8 +1251,12 @@ impl ExecutorTaskRunner {
                 epoch: barrier.epoch,
                 fencing_token,
             };
+            
+            let sb_clone = Arc::clone(&state_backend);
+            let s_clone = Arc::clone(&storage);
+            let coord_clone = coordinator.clone();
             if let Err(e) = self
-                .initiate_checkpoint_for_job(&req, state_backend, storage, coordinator)
+                .initiate_checkpoint_for_job(&req, sb_clone, s_clone, coord_clone)
                 .await
             {
                 tracing::warn!(error = %e, "barrier checkpoint failed");

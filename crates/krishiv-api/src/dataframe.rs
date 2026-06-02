@@ -195,7 +195,7 @@ impl DataFrame {
                     BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
                 })
                 .collect::<Vec<_>>();
-            crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables)
+            crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, false)
                 .await
                 .map(QueryResult::new)
         } else if let Some(dataframe) = &self.sql_dataframe {
@@ -254,7 +254,7 @@ impl DataFrame {
                     BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
                 })
                 .collect::<Vec<_>>();
-            let batches = crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables).await?;
+            let batches = crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, false).await?;
             let stream = futures::stream::iter(batches.into_iter().map(Ok));
             Ok(Box::pin(stream) as krishiv_plan::SendableRecordBatchStream)
         } else if let Some(dataframe) = &self.sql_dataframe {

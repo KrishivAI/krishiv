@@ -278,6 +278,46 @@ pub(crate) async fn execute_streaming_fragment(
     let fragment_body = task_fragment_body(assignment.plan_fragment().description());
     let fragment = fragment_body.as_str();
 
+    if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
+        let engine = std::sync::Arc::clone(&runner.sql_engine);
+        
+        // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
+        let dataframe = engine
+            .sql(query)
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: error.to_string(),
+            })?;
+            
+        let mut stream = dataframe.execute_stream().await.map_err(|error| {
+            ExecutorError::LocalExecution { message: error.to_string() }
+        })?;
+        
+        use tokio_stream::StreamExt;
+        let mut total_rows = 0;
+        let mut total_batches = 0;
+        let mut column_count = 0;
+        
+        while let Some(batch_res) = stream.next().await {
+            let batch = batch_res.map_err(|error| {
+                ExecutorError::LocalExecution { message: error.to_string() }
+            })?;
+            
+            column_count = batch.num_columns();
+            
+            if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
+                && assignment.output_contract().description().trim().starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX)
+            {
+                crate::fragment::common::write_object_parquet_sink(assignment.output_contract(), &[batch.clone()]).await?;
+            }
+            
+            total_rows += batch.num_rows();
+            total_batches += 1;
+        }
+        
+        return Ok(ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, vec![]));
+    }
+
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
@@ -291,16 +331,20 @@ pub(crate) async fn execute_streaming_fragment(
                 message: String::from("stream:continuous fragment requires a job id"),
             });
         }
-        let drainer = runner.continuous_drainer.as_ref().ok_or_else(|| {
-            ExecutorError::InvalidAssignment {
-                message: String::from(
-                    "stream:continuous fragment requires a continuous drainer on the executor runner",
-                ),
-            }
-        })?;
-        let collected_batches = drainer
-            .drain_job(job_id)
-            .map_err(|message| ExecutorError::LocalExecution { message })?;
+        // In-process mode: drain from the shared ContinuousStreamRegistry.
+        // Distributed mode: read InlineIpc partitions delivered in the task
+        // assignment — pushed there by api_continuous_push via the coordinator.
+        let collected_batches = if let Some(drainer) = runner.continuous_drainer.as_ref() {
+            drainer
+                .drain_job(job_id)
+                .map_err(|message| ExecutorError::LocalExecution { message })?
+        } else {
+            // Flatten all InlineIpc partitions into a single batch list.
+            crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
+                .into_iter()
+                .flat_map(|(_, batches)| batches)
+                .collect()
+        };
         let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
         let total_batches = collected_batches.len();
         let column_count = collected_batches

@@ -590,15 +590,18 @@ impl OptimizerRule for ProjectionPruningRule {
 
 /// Push `Filter` predicates down into `TableScan` nodes.
 ///
-/// Walks the logical plan looking for `Filter` nodes whose direct input is a
-/// `Scan` node. The filter's predicate is decomposed into AND-conjuncts, and
-/// any conjuncts that reference only columns present in the scan's output
-/// schema are pushed into the scan node's `filters` list. If all conjuncts
-/// are pushed, the `Filter` node is removed from the plan; remaining conjuncts
-/// stay in place.
+/// Walks the logical plan looking for `Filter` nodes and decomposes each
+/// filter's predicate into AND-conjuncts. Conjuncts that reference only
+/// columns present in one scan's output schema are pushed into that scan
+/// node's `filters` list. If all conjuncts are pushed the `Filter` node is
+/// removed; remaining cross-join conjuncts stay in place.
 ///
-/// Pushdown through join nodes is not yet implemented — only the
-/// Filter-above-Scan pattern is handled.
+/// Two patterns are handled:
+/// - **Filter-above-Scan**: filter's direct input is a scan.
+/// - **Filter-above-Join**: filter sits above a join; each conjunct is tested
+///   against the left and right scan inputs independently and pushed as far
+///   down as it can go. Cross-join predicates (referencing both sides) remain
+///   in the filter.
 pub struct PredicatePushdownRule;
 
 impl OptimizerRule for PredicatePushdownRule {
@@ -627,12 +630,37 @@ impl OptimizerRule for PredicatePushdownRule {
                 _ => continue,
             };
 
-            let scan_indices: Vec<usize> = node
+            // Collect all scan nodes reachable in one or two hops from this
+            // filter. One hop covers Filter-above-Scan; two hops covers
+            // Filter-above-Join-above-Scan so each side of the join can
+            // independently receive the conjuncts that belong to it.
+            let direct_inputs: Vec<usize> = node
                 .inputs()
                 .iter()
                 .filter_map(|input_id| id_to_idx.get(input_id.as_str()).copied())
+                .collect();
+
+            let mut scan_indices: Vec<usize> = direct_inputs
+                .iter()
+                .copied()
                 .filter(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Scan { .. })))
                 .collect();
+
+            // Filter-above-Join: descend through join nodes to collect
+            // both left and right scan inputs for per-side pushdown.
+            for join_idx in direct_inputs
+                .iter()
+                .copied()
+                .filter(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Join { .. })))
+            {
+                for child_id in nodes[join_idx].inputs() {
+                    if let Some(&child_idx) = id_to_idx.get(child_id.as_str()) {
+                        if matches!(nodes[child_idx].op(), Some(NodeOp::Scan { .. })) {
+                            scan_indices.push(child_idx);
+                        }
+                    }
+                }
+            }
 
             if scan_indices.is_empty() {
                 continue;
@@ -2933,5 +2961,93 @@ mod tests {
         let optimizer = Optimizer::new();
         let result = optimizer.optimize(empty_plan());
         assert_eq!(result.describe(), "optimizer: no rules applied");
+    }
+
+    // ── predicate pushdown through Join ────────────────────────────────────────
+
+    fn join_node(id: &str, left: &str, right: &str) -> PlanNode {
+        PlanNode::new(id, "join", ExecutionKind::Batch)
+            .with_inputs(vec![left.to_string(), right.to_string()])
+            .with_op(NodeOp::Join { join_type: krishiv_plan::JoinType::Inner })
+    }
+
+    #[test]
+    fn predicate_pushdown_through_join_pushes_single_side_predicate() {
+        // Filter(ts > 0) above Join(scan_users, scan_orders):
+        // `ts` belongs only to scan_users → predicate pushed to scan_users, not scan_orders.
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "scan-users",
+                "users",
+                &[("user_id", FieldType::Utf8), ("ts", FieldType::Int64)],
+            ))
+            .with_node(scan_with_schema(
+                "scan-orders",
+                "orders",
+                &[("order_id", FieldType::Int64), ("amount", FieldType::Int64)],
+            ))
+            .with_node(join_node("join", "scan-users", "scan-orders"))
+            .with_node(filter_node("filter", &["join"], "ts > 0"));
+
+        let result = PredicatePushdownRule.apply(&plan).unwrap();
+
+        let users_scan = result.nodes().iter().find(|n| n.id() == "scan-users").unwrap();
+        if let Some(NodeOp::Scan { filters, .. }) = users_scan.op() {
+            assert!(
+                !filters.is_empty(),
+                "predicate must be pushed into scan-users"
+            );
+            assert!(
+                filters.iter().any(|f| f.contains("ts")),
+                "pushed filter must reference ts"
+            );
+        } else {
+            panic!("scan-users must have NodeOp::Scan");
+        }
+
+        let orders_scan = result.nodes().iter().find(|n| n.id() == "scan-orders").unwrap();
+        if let Some(NodeOp::Scan { filters, .. }) = orders_scan.op() {
+            assert!(
+                filters.is_empty(),
+                "scan-orders must not receive ts predicate"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_pushdown_through_join_leaves_cross_predicate_in_filter() {
+        // Filter(ts > 0 AND order_id > 100): ts on left, order_id on right.
+        // Both single-side conjuncts are pushed into their respective scans.
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "su",
+                "users",
+                &[("ts", FieldType::Int64)],
+            ))
+            .with_node(scan_with_schema(
+                "so",
+                "orders",
+                &[("order_id", FieldType::Int64)],
+            ))
+            .with_node(join_node("j", "su", "so"))
+            .with_node(filter_node("f", &["j"], "ts > 0 AND order_id > 100"));
+
+        let result = PredicatePushdownRule.apply(&plan).unwrap();
+
+        let users = result.nodes().iter().find(|n| n.id() == "su").unwrap();
+        let orders = result.nodes().iter().find(|n| n.id() == "so").unwrap();
+
+        if let Some(NodeOp::Scan { filters, .. }) = users.op() {
+            assert!(
+                filters.iter().any(|f| f.contains("ts")),
+                "ts predicate must be pushed into users scan"
+            );
+        }
+        if let Some(NodeOp::Scan { filters, .. }) = orders.op() {
+            assert!(
+                filters.iter().any(|f| f.contains("order_id")),
+                "order_id predicate must be pushed into orders scan"
+            );
+        }
     }
 }

@@ -13,6 +13,8 @@ service CoordinatorExecutor {
 service ExecutorTask {
   rpc AssignTask(ExecutorTaskAssignment) returns (TaskStatusResponse);
   rpc CancelTask(TaskCancellationRequest) returns (TaskStatusResponse);
+  rpc PushContinuousInput(PushContinuousInputRequest) returns (TaskStatusResponse);
+  rpc DrainContinuousOutput(DrainContinuousOutputRequest) returns (DrainContinuousOutputResponse);
 }
 
 // Management API for CLI-to-coordinator operations (GAP-RT-04).
@@ -400,4 +402,23 @@ message HeartbeatThrottleCommand {
   string source_id = 1;
   uint64 rows_per_second = 2;
   bool throttle_cleared = 3;
+}
+
+message PushContinuousInputRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string task_id = 3;
+  bytes ipc_bytes = 4;
+}
+
+message DrainContinuousOutputRequest {
+  TransportVersion version = 1;
+  string job_id = 2;
+  string task_id = 3;
+}
+
+message DrainContinuousOutputResponse {
+  TransportVersion version = 1;
+  TransportDisposition disposition = 2;
+  bytes ipc_bytes = 3;
 }

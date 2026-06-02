@@ -49,6 +49,8 @@ struct BatchSqlRequestBody {
     query: String,
     /// Inline Arrow IPC tables (base64-encoded).
     tables: Vec<BatchSqlInlineTableJson>,
+    #[serde(default)]
+    is_streaming: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -128,6 +130,7 @@ pub async fn execute_coordinator_batch_sql(
     coordinator_http: &str,
     query: &str,
     tables: &[BatchSqlTable],
+    is_streaming: bool,
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     let base = normalize_http_base(coordinator_http)?;
 
@@ -154,8 +157,9 @@ pub async fn execute_coordinator_batch_sql(
         })??;
 
     let submit_body = BatchSqlRequestBody {
-        query: query.to_string(),
+        query: query.to_owned(),
         tables: inline_tables,
+        is_streaming,
     };
 
     let client = coordinator_http_client()?;
@@ -243,6 +247,7 @@ pub async fn execute_coordinator_batch_sql_inline(
     coordinator_http: &str,
     query: &str,
     tables: &[krishiv_scheduler::BatchSqlInlineTable],
+    is_streaming: bool,
 ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
     let base = normalize_http_base(coordinator_http)?;
 
@@ -255,6 +260,7 @@ pub async fn execute_coordinator_batch_sql_inline(
                 ipc_b64: t.ipc_b64.clone(),
             })
             .collect(),
+        is_streaming,
     };
 
     let client = coordinator_http_client()?;
@@ -443,4 +449,116 @@ mod tests {
         let result = normalize_http_base("http://host:8080/api/v1").unwrap();
         assert_eq!(result, "http://host:8080/api/v1");
     }
+}
+
+// ── Continuous Streaming ───────────────────────────────────────────────────────
+
+pub async fn execute_coordinator_continuous_register(
+    coordinator_http: &str,
+    job_id: &str,
+    spec: &krishiv_plan::window::WindowExecutionSpec,
+) -> RuntimeResult<()> {
+    #[derive(serde::Serialize)]
+    struct ContinuousRegisterRequest<'a> {
+        job_id: &'a str,
+        spec: &'a krishiv_plan::window::WindowExecutionSpec,
+    }
+
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous-register");
+    let body = ContinuousRegisterRequest { job_id, spec };
+
+    let client = coordinator_http_client()?;
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-register request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "continuous-register HTTP {} from {url}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
+pub async fn execute_coordinator_continuous_push(
+    coordinator_http: &str,
+    job_id: &str,
+    input_batches: &[arrow::record_batch::RecordBatch],
+) -> RuntimeResult<()> {
+    use crate::flight_action::encode_batches;
+
+    #[derive(serde::Serialize)]
+    struct ContinuousPushRequest<'a> {
+        job_id: &'a str,
+        input_batches_b64: String,
+    }
+
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous-push");
+    let input_batches_b64 = encode_batches(input_batches)?;
+    let body = ContinuousPushRequest {
+        job_id,
+        input_batches_b64,
+    };
+
+    let client = coordinator_http_client()?;
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-push request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "continuous-push HTTP {} from {url}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
+pub async fn execute_coordinator_continuous_drain(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    #[derive(serde::Serialize)]
+    struct ContinuousDrainRequest<'a> {
+        job_id: &'a str,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ContinuousDrainResponse {
+        inline_record_batch_ipc: Vec<Vec<u8>>,
+    }
+
+    let base = normalize_http_base(coordinator_http)?;
+    let url = format!("{base}/api/v1/continuous-drain");
+    let body = ContinuousDrainRequest { job_id };
+
+    let client = coordinator_http_client()?;
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-drain request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "continuous-drain HTTP {} from {url}",
+            response.status()
+        )));
+    }
+
+    let payload: ContinuousDrainResponse = response.json().await.map_err(|e| {
+        RuntimeError::transport(format!("continuous-drain response decode failed: {e}"))
+    })?;
+
+    decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
 }

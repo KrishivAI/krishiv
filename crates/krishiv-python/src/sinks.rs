@@ -1,5 +1,6 @@
 //! Sink configuration types and `krishiv.sinks` submodule.
 
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 #[pyclass(name = "ParquetSink")]
@@ -25,14 +26,11 @@ impl PyParquetSink {
 }
 
 #[pyclass(name = "KafkaSink")]
-/// Kafka sink configuration.
+/// Kafka sink — produces Arrow record batches to a Kafka topic.
 ///
-/// **Note**: This is a configuration descriptor only. It does not establish a broker
-/// connection or produce messages. Wire it into a pipeline via `PyRelation.sink_to()`
-/// (not yet implemented) or use the `kafka` feature connector directly.
-///
-/// **Feature gate**: Constructing this object succeeds even when the `kafka` feature
-/// is not compiled in, but actual message production requires the feature.
+/// Each record batch is serialized as Arrow IPC and sent as a single message.
+/// Requires the `kafka` Cargo feature; raises `RuntimeError` when called
+/// without it.
 pub struct PyKafkaSink {
     topic: String,
     bootstrap_servers: String,
@@ -58,6 +56,49 @@ impl PyKafkaSink {
         &self.bootstrap_servers
     }
 
+    /// Write a list of PyBatch objects to the configured Kafka topic as JSON rows.
+    ///
+    /// Requires the `kafka` Cargo feature.
+    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+        #[cfg(feature = "kafka")]
+        {
+            use krishiv_connectors::kafka::{KafkaConfig, KafkaSink};
+            use krishiv_connectors::sink::Sink as _;
+            use krishiv_common::async_util::block_on;
+
+            let records: Vec<arrow::record_batch::RecordBatch> =
+                batches.into_iter().map(|b| b.into_inner()).collect();
+            if records.is_empty() {
+                return Ok(0);
+            }
+            let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
+            let cfg = KafkaConfig {
+                bootstrap_servers: self.bootstrap_servers.clone(),
+                topic: self.topic.clone(),
+                group_id: String::from("krishiv-python"),
+                auto_commit_interval_ms: None,
+            };
+            let mut sink = KafkaSink::new(cfg)
+                .map_err(|e| PyRuntimeError::new_err(format!("kafka sink init: {e}")))?;
+            block_on(async {
+                for batch in records {
+                    sink.write_batch(batch).await?;
+                }
+                sink.flush().await
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("kafka write: {e}")))?;
+            Ok(total_rows)
+        }
+        #[cfg(not(feature = "kafka"))]
+        {
+            let _ = batches;
+            Err(PyRuntimeError::new_err(
+                "KafkaSink.write_batches requires the 'kafka' feature; \
+                 rebuild with: maturin develop --features kafka",
+            ))
+        }
+    }
+
     pub fn __repr__(&self) -> String {
         format!(
             "KafkaSink(topic={:?}, bootstrap={})",
@@ -67,14 +108,12 @@ impl PyKafkaSink {
 }
 
 #[pyclass(name = "IcebergSink")]
-/// Iceberg sink configuration.
+/// Iceberg sink — appends Arrow record batches to a local Iceberg table.
 ///
-/// **Note**: This is a configuration descriptor only. It does not establish a connection
-/// or write data to an Iceberg table. Wire it into a pipeline via `PyRelation.sink_to()`
-/// (not yet implemented) or use the `iceberg` feature connector directly.
-///
-/// **Feature gate**: Constructing this object succeeds even when the `iceberg` feature
-/// is not compiled in, but actual message production requires the feature.
+/// `catalog` is interpreted as a local filesystem base directory;
+/// `table` is the namespace-qualified table name (e.g. `"db.events"`).
+/// Requires the `iceberg` Cargo feature; raises `RuntimeError` when called
+/// without it.
 pub struct PyIcebergSink {
     catalog: String,
     table: String,
@@ -95,6 +134,41 @@ impl PyIcebergSink {
     #[getter]
     pub fn table(&self) -> &str {
         &self.table
+    }
+
+    /// Append a list of PyBatch objects to the configured Iceberg table.
+    ///
+    /// `catalog` is the local filesystem base directory; `table` is the
+    /// dot-separated table reference (e.g. `"db.events"`).
+    /// Requires the `iceberg` Cargo feature.
+    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+        #[cfg(feature = "iceberg")]
+        {
+            use std::path::PathBuf;
+            use krishiv_lakehouse::IcebergFsTable;
+            use krishiv_common::async_util::block_on;
+
+            let records: Vec<arrow::record_batch::RecordBatch> =
+                batches.into_iter().map(|b| b.into_inner()).collect();
+            if records.is_empty() {
+                return Ok(0);
+            }
+            let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
+            let base = PathBuf::from(&self.catalog);
+            let tbl = IcebergFsTable::new(&base, self.table.clone(), records[0].schema())
+                .map_err(|e| PyRuntimeError::new_err(format!("iceberg open: {e}")))?;
+            block_on(tbl.append(records))
+                .map_err(|e| PyRuntimeError::new_err(format!("iceberg append: {e}")))?;
+            Ok(total_rows)
+        }
+        #[cfg(not(feature = "iceberg"))]
+        {
+            let _ = batches;
+            Err(PyRuntimeError::new_err(
+                "IcebergSink.write_batches requires the 'iceberg' feature; \
+                 rebuild with: maturin develop --features iceberg",
+            ))
+        }
     }
 
     pub fn __repr__(&self) -> String {

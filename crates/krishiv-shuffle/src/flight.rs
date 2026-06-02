@@ -16,6 +16,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use futures::StreamExt;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -135,16 +136,15 @@ impl FlightService for ShuffleFlightService {
 
         let partition_data = self
             .store
-            .read_partition(&id)
+            .stream_partition(&id)
             .await
-            .map_err(|e| Status::internal(format!("read_partition: {e}")))?;
+            .map_err(|e| Status::internal(format!("stream_partition: {e}")))?;
         let partition_data = partition_data
             .ok_or_else(|| Status::not_found(format!("partition {id:?} not found")))?;
 
-        let batches: Vec<RecordBatch> = partition_data.batches;
         let schema: SchemaRef = partition_data.schema;
+        let stream = partition_data.batches.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)));
 
-        let stream = futures::stream::iter(batches.into_iter().map(Ok));
         let encoder = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .with_options(IpcWriteOptions::default())

@@ -47,7 +47,7 @@ pub use object_store::ObjectStoreShuffleStore;
 pub use orphan::{cleanup_orphans, scan_orphans};
 pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
-pub use store::{PartitionId, ShufflePartition, ShuffleStore};
+pub use store::{PartitionId, ShufflePartition, ShuffleStream, ShuffleStore};
 
 // StoreError is deprecated but retained for source compatibility.
 #[allow(deprecated)]

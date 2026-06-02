@@ -323,8 +323,14 @@ impl Coordinator {
             .map(|jc| jc.read_record())
             && let Some(store) = &self.store
         {
-            // Non-blocking fire-and-forget: enqueue the save to background task.
-            store.save_job(&record);
+            if terminal_state.is_terminal() {
+                // Synchronous durable commit for critical task state transitions
+                let mut guard = store.inner();
+                guard.save_job(&record)?;
+            } else {
+                // Non-blocking fire-and-forget: enqueue the save to background task.
+                store.save_job(&record);
+            }
         }
         // P1.1: Remove streaming task index entries when job reaches a terminal state.
         let is_terminal = self

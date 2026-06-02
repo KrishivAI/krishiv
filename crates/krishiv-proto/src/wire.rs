@@ -1247,3 +1247,53 @@ impl WireError {
         Self::new(value.to_string())
     }
 }
+
+pub fn push_continuous_input_request_to_wire(value: crate::task::PushContinuousInputRequest) -> v1::PushContinuousInputRequest {
+    v1::PushContinuousInputRequest {
+        version: Some(transport_version_to_wire(value.version)),
+        job_id: value.job_id.as_str().to_owned(),
+        task_id: value.task_id.as_str().to_owned(),
+        ipc_bytes: value.ipc_bytes,
+    }
+}
+
+pub fn push_continuous_input_request_from_wire(value: v1::PushContinuousInputRequest) -> WireResult<crate::task::PushContinuousInputRequest> {
+    Ok(crate::task::PushContinuousInputRequest {
+        version: transport_version_from_wire(required(value.version, "version")?)?,
+        job_id: crate::ids::JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+        task_id: crate::ids::TaskId::try_new(value.task_id).map_err(WireError::from_id)?,
+        ipc_bytes: value.ipc_bytes,
+    })
+}
+
+pub fn drain_continuous_output_request_to_wire(value: crate::task::DrainContinuousOutputRequest) -> v1::DrainContinuousOutputRequest {
+    v1::DrainContinuousOutputRequest {
+        version: Some(transport_version_to_wire(value.version)),
+        job_id: value.job_id.as_str().to_owned(),
+        task_id: value.task_id.as_str().to_owned(),
+    }
+}
+
+pub fn drain_continuous_output_request_from_wire(value: v1::DrainContinuousOutputRequest) -> WireResult<crate::task::DrainContinuousOutputRequest> {
+    Ok(crate::task::DrainContinuousOutputRequest {
+        version: transport_version_from_wire(required(value.version, "version")?)?,
+        job_id: crate::ids::JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+        task_id: crate::ids::TaskId::try_new(value.task_id).map_err(WireError::from_id)?,
+    })
+}
+
+pub fn drain_continuous_output_response_to_wire(value: crate::task::DrainContinuousOutputResponse) -> v1::DrainContinuousOutputResponse {
+    v1::DrainContinuousOutputResponse {
+        version: Some(transport_version_to_wire(value.version)),
+        disposition: transport_disposition_to_wire(value.disposition) as i32,
+        ipc_bytes: value.ipc_bytes,
+    }
+}
+
+pub fn drain_continuous_output_response_from_wire(value: v1::DrainContinuousOutputResponse) -> WireResult<crate::task::DrainContinuousOutputResponse> {
+    Ok(crate::task::DrainContinuousOutputResponse {
+        version: transport_version_from_wire(required(value.version, "version")?)?,
+        disposition: transport_disposition_from_wire(value.disposition)?,
+        ipc_bytes: value.ipc_bytes,
+    })
+}

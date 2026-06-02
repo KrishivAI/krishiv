@@ -197,8 +197,8 @@ spec:
 # ── Executor ──────────────────────────────────────────────────────────────────
 # Each pod advertises its real pod IP (via POD_IP downward API) so the
 # coordinator can call back on the task gRPC service.
-# hostPath /tmp allows executor pods to read parquet files written by clients
-# on the same node. Replace with a PVC for multi-node deployments.
+# Data is delivered via InlineIpc in the task assignment — no shared filesystem
+# or hostPath mount is required.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -247,9 +247,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-          volumeMounts:
-            - name: tmp
-              mountPath: /tmp
           resources:
             requests:
               cpu: "250m"
@@ -271,11 +268,6 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3
-      volumes:
-        - name: tmp
-          hostPath:
-            path: /tmp
-            type: DirectoryOrCreate
 
 ---
 # ── Flight Server ─────────────────────────────────────────────────────────────

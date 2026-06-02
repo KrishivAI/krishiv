@@ -101,6 +101,7 @@ pub trait ExecutionRuntime: Send + Sync {
         &self,
         query: &str,
         tables: &[BatchTableRegistration],
+        is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>>;
 
     /// Explain a SQL query (plan metadata only).
@@ -209,9 +210,10 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
         &self,
         query: &str,
         tables: &[BatchTableRegistration],
+        is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         self.cluster
-            .collect_batch_sql(query, &tables_to_batch_sql(tables))
+            .collect_batch_sql(query, &tables_to_batch_sql(tables), is_streaming)
     }
 
     fn explain_sql(&self, query: &str) -> RuntimeResult<String> {
@@ -278,15 +280,13 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
         use krishiv_plan::ExecutionKind;
-        // Streaming plans are executed locally via collect_bounded_window on the
-        // flight server's embedded InProcessCluster. Routing them through the
-        // coordinator batch-sql path is wrong and causes HTTP 500 errors.
+        // Streaming plans must use collect_bounded_window or the continuous
+        // stream APIs, not accept_plan. Silently returning success here would
+        // hide the fact that no execution happened on the remote cluster.
         if plan.kind() == ExecutionKind::Streaming {
-            return Ok(ExecutionReport::new(
-                "distributed",
-                plan.name(),
-                plan.kind(),
-                true,
+            return Err(RuntimeError::unsupported(
+                "streaming plan dispatch to a remote cluster is not yet implemented; \
+                 use collect_bounded_window or the continuous stream APIs instead",
             ));
         }
         use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
@@ -341,10 +341,14 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         &self,
         query: &str,
         tables: &[BatchTableRegistration],
+        is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         use crate::flight_protocol::encode_batch_sql;
         use krishiv_common::async_util::block_on;
-        let sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
+        let mut sql = encode_batch_sql(query, &tables_to_batch_sql(tables));
+        if is_streaming {
+            sql = format!("-- krishiv:streaming=true\n{sql}");
+        }
         block_on(self.pool.execute_sql(&sql))
     }
 
@@ -554,7 +558,7 @@ mod tests {
         assert_eq!(embedded.placement(), ExecutionPlacement::LocalInProcess);
         assert!(!embedded.uses_remote_execution());
         assert_eq!(
-            embedded.collect_batch_sql("SELECT 1 AS n", &[]).unwrap()[0].num_rows(),
+            embedded.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap()[0].num_rows(),
             1
         );
 
@@ -723,7 +727,7 @@ mod tests {
     fn embedded_runtime_collect_batch_sql() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
-        let batches = rt.collect_batch_sql("SELECT 1 AS n", &[]).unwrap();
+        let batches = rt.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
     }
@@ -917,6 +921,68 @@ mod tests {
             crate::RuntimeError::unsupported(
                 "Distributed mode cannot use local fallback; use RemoteClusterRequired placement",
             )
+        );
+    }
+
+    // ── Durability profile smoke tests ────────────────────────────────────────
+
+    #[test]
+    fn dev_local_profile_batch_sql_returns_results() {
+        // dev-local is the default in-memory profile used by InProcessCluster.
+        // Verifies that batch SQL works end-to-end under the default durability profile.
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let rt = InProcessExecutionRuntime::embedded(cluster);
+        let batches = rt.collect_batch_sql("SELECT 42 AS answer", &[], false).unwrap();
+        assert_eq!(batches.len(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 42, "batch SQL must return correct result");
+    }
+
+    #[test]
+    fn dev_local_profile_continuous_double_drain_does_not_panic() {
+        // Verifies that draining a continuous job twice (second drain is idempotent)
+        // does not panic or produce stale results under dev-local.
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let rt = InProcessExecutionRuntime::embedded(cluster);
+        let spec = crate::LocalWindowExecutionSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: crate::LocalWindowKind::Tumbling,
+            window_size_ms: 10_000,
+            agg_exprs: crate::LocalWindowExecutionSpec::default_count_agg(),
+            state_ttl_ms: None,
+            source_watermark_lags: std::collections::HashMap::new(),
+            source_id_column: None,
+        };
+        rt.register_continuous_stream("durable-j1", &spec).unwrap();
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])) as _,
+                Arc::new(arrow::array::Int64Array::from(vec![1_000_i64, 2_000])) as _,
+            ],
+        )
+        .unwrap();
+
+        rt.push_continuous_stream_input("durable-j1", vec![batch]).unwrap();
+        let first_drain = rt.drain_continuous_stream("durable-j1").unwrap();
+
+        // Second drain with no new input must return empty (results consumed once).
+        let second_drain = rt.drain_continuous_stream("durable-j1").unwrap();
+        let _ = first_drain; // first drain result is not asserted (may be empty for in-window data)
+        assert!(
+            second_drain.is_empty(),
+            "second drain with no new input must be empty under dev-local"
         );
     }
 

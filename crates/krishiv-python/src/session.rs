@@ -73,16 +73,12 @@ impl PySession {
     #[classmethod]
     /// Create a session connected to a remote coordinator.
     ///
-    /// **Note**: Remote execution is only enabled when the environment variable
-    /// `KRISHIV_REMOTE_EXEC=1` is set. Without it, SQL queries run locally
-    /// even when a coordinator URL is provided.
-    /// For fully remote execution, set `KRISHIV_REMOTE_EXEC=1`.
+    /// All SQL queries are routed to the remote coordinator. Use
+    /// `Session.embedded()` or `Session.local()` for local execution.
     pub fn connect(_cls: &Bound<'_, PyType>, url: String) -> PyResult<Self> {
-        let mut builder = krishiv_api::SessionBuilder::new().with_coordinator(url);
-        if remote_execution_from_env() {
-            builder = builder.with_remote_execution(true);
-        }
-        builder
+        krishiv_api::SessionBuilder::new()
+            .with_coordinator(url)
+            .with_remote_execution(true)
             .build()
             .map(|s| Self {
                 inner: Arc::new(s),

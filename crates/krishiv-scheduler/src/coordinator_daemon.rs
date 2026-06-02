@@ -278,6 +278,10 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
         .route(
+            "/api/v1/executors/{executor_id}/reset",
+            post(api_executor_reset),
+        )
+        .route(
             "/api/v1/batch-sql/submit",
             post(crate::batch_sql_http::api_batch_sql_submit),
         )
@@ -288,6 +292,18 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route(
             "/api/v1/bounded-window",
             post(crate::bounded_window_http::api_bounded_window),
+        )
+        .route(
+            "/api/v1/continuous-register",
+            post(crate::continuous_stream_http::api_continuous_register),
+        )
+        .route(
+            "/api/v1/continuous-push",
+            post(crate::continuous_stream_http::api_continuous_push),
+        )
+        .route(
+            "/api/v1/continuous-drain",
+            post(crate::continuous_stream_http::api_continuous_drain),
         )
         .route("/federation/v1/jobs", post(federation_submit_job))
         .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
@@ -378,6 +394,35 @@ async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl Int
             .collect::<Vec<_>>()
     };
     Json(LiveExecutorsResponse { executors })
+}
+
+/// Reset the circuit-breaker failure counter for one executor.
+///
+/// Call this after confirming an executor is healthy again so the coordinator
+/// resumes assigning tasks to it without waiting for a successful task cycle.
+async fn api_executor_reset(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Path(executor_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use krishiv_proto::ExecutorId;
+    let executor_id = match ExecutorId::try_new(&executor_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid executor id"})),
+            );
+        }
+    };
+    coordinator
+        .write()
+        .await
+        .executors
+        .reset_task_failures(&executor_id);
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({"reset": true, "executor_id": executor_id_str})),
+    )
 }
 
 async fn live_ui(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
@@ -1082,5 +1127,72 @@ mod parse_tests {
         assert!(body.contains("krishiv_scheduler_jobs_submitted_total"));
         assert!(body.contains("krishiv_scheduler_checkpoint_epochs_total"));
         assert!(body.contains("krishiv_scheduler_tasks_assigned_total"));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_reset_endpoint_returns_ok() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{ExecutorDescriptor, ExecutorId};
+        use tower::ServiceExt;
+        use crate::coordinator_http_router;
+
+        crate::auth::set_allow_anonymous();
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-cb-reset").unwrap(),
+        ));
+
+        let exec_id = ExecutorId::try_new("exec-cb-reset").unwrap();
+        let descriptor = ExecutorDescriptor::new(exec_id.clone(), "localhost", 4)
+            .with_task_endpoint(crate::IN_PROCESS_TASK_ENDPOINT);
+        coordinator
+            .write()
+            .await
+            .register_executor(descriptor)
+            .unwrap();
+
+        // Simulate consecutive task failures so the circuit breaker has state to reset.
+        let threshold = coordinator.read().await.config().circuit_breaker_failure_threshold();
+        for _ in 0..threshold {
+            coordinator
+                .write()
+                .await
+                .executors
+                .record_task_failure(&exec_id, threshold);
+        }
+
+        let router = coordinator_http_router(coordinator.clone());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/executors/{exec_id}/reset"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["reset"], serde_json::json!(true));
+        assert_eq!(json["executor_id"], serde_json::json!(exec_id.to_string()));
+
+        // Verify the failure counter was actually reset.
+        let failures = coordinator
+            .read()
+            .await
+            .executor_snapshots()
+            .into_iter()
+            .find(|s| s.executor_id() == &exec_id)
+            .map(|s| s.consecutive_task_failures)
+            .unwrap_or(1);
+        assert_eq!(failures, 0, "circuit breaker counter must be zero after reset");
     }
 }

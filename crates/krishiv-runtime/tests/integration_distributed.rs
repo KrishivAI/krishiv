@@ -84,7 +84,7 @@ async fn cluster_create_submit_sql_verify() {
     let cluster = InProcessCluster::new().expect("cluster creation");
 
     let batches = cluster
-        .collect_batch_sql("SELECT 42 AS answer", &[])
+        .collect_batch_sql("SELECT 42 AS answer", &[], false)
         .expect("batch sql");
 
     assert_eq!(batches.len(), 1);
@@ -162,6 +162,7 @@ async fn cluster_register_tables_join_query() {
         .collect_batch_sql(
             "SELECT u.user_id, o.amount FROM users u JOIN orders o ON u.user_id = o.user_id ORDER BY u.user_id",
             &tables,
+            false,
         )
         .expect("join query");
 
@@ -347,6 +348,7 @@ async fn distributed_batch_plan_execute_verify() {
         .collect_batch_sql(
             "SELECT user_id, amount FROM batch_table ORDER BY amount",
             &tables,
+            false,
         )
         .expect("batch execute");
 
@@ -429,8 +431,8 @@ async fn multiple_clusters_are_independent() {
     assert_ne!(id1, id2);
 
     // Both can independently execute SQL.
-    let b1 = c1.collect_batch_sql("SELECT 1 AS n", &[]).unwrap();
-    let b2 = c2.collect_batch_sql("SELECT 2 AS n", &[]).unwrap();
+    let b1 = c1.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap();
+    let b2 = c2.collect_batch_sql("SELECT 2 AS n", &[], false).unwrap();
     assert_eq!(b1[0].num_rows(), 1);
     assert_eq!(b2[0].num_rows(), 1);
 }

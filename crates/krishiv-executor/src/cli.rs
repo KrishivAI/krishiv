@@ -358,7 +358,7 @@ async fn heartbeat_loop(
                 // Drain any pending barriers from the gRPC injector before
                 // picking up the next task assignment.
                 runner_loop
-                    .drain_pending_barriers(backend.as_ref(), storage.as_ref(), coord.as_ref())
+                    .drain_pending_barriers(Arc::clone(&backend) as Arc<dyn krishiv_state::StateBackend>, Arc::clone(&storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>, coord.as_ref().clone())
                     .await;
 
                 match runner_loop.run_next_with(coord.as_ref()).await {
@@ -439,9 +439,9 @@ async fn heartbeat_loop(
                                 let _ = runner
                                     .initiate_checkpoint_for_job(
                                         &req,
-                                        state_backend.as_ref(),
-                                        checkpoint_storage.as_ref(),
-                                        coord_service.as_ref(),
+                                        Arc::clone(&state_backend) as Arc<dyn krishiv_state::StateBackend>,
+                                        Arc::clone(&checkpoint_storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>,
+                                        coord_service.as_ref().clone(),
                                     )
                                     .await;
                             }

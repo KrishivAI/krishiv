@@ -762,7 +762,8 @@ impl Session {
             .iter()
             .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
-        let batches = runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables).await?;
+        let is_streaming = self.sql_engine.is_streaming_query(query).unwrap_or(false);
+        let batches = runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, is_streaming).await?;
         Ok(DataFrame::from_batches(
             self.mode,
             batches,
@@ -800,8 +801,9 @@ impl Session {
             .iter()
             .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
+        let is_streaming = self.sql_engine.is_streaming_query(&effective_sql).unwrap_or(false);
         let batches =
-            runtime_collect_batch_sql(Arc::clone(&self.runtime), &effective_sql, &tables).await?;
+            runtime_collect_batch_sql(Arc::clone(&self.runtime), &effective_sql, &tables, is_streaming).await?;
         let masked = engine
             .mask_result_batches(&principal, query_str, batches)
             .map_err(KrishivError::from)?;
@@ -990,10 +992,11 @@ pub(crate) async fn runtime_collect_batch_sql(
     runtime: Arc<dyn ExecutionRuntime>,
     query: &str,
     tables: &[BatchTableRegistration],
+    is_streaming: bool,
 ) -> Result<Vec<RecordBatch>> {
     let query = query.to_owned();
     let tables = tables.to_vec();
-    tokio::task::spawn_blocking(move || runtime.collect_batch_sql(&query, &tables))
+    tokio::task::spawn_blocking(move || runtime.collect_batch_sql(&query, &tables, is_streaming))
         .await
         .map_err(|e| KrishivError::Runtime {
             message: format!("runtime collect task failed: {e}"),

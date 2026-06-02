@@ -40,6 +40,7 @@ thiserror = { workspace = true }
 arrow = { workspace = true }
 krishiv-connectors = { path = "../krishiv-connectors" }
 tempfile = { workspace = true }
+tower = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

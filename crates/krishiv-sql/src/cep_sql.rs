@@ -1,8 +1,10 @@
-//! `MATCH_RECOGNIZE` SQL extension planning (R16 S2).
+//! `MATCH_RECOGNIZE` SQL extension planning and execution (R16 S2).
 
 use std::time::Duration;
 
-use krishiv_cep::{CompiledPattern, Pattern};
+use arrow::array::{Array, StringArray};
+use arrow::record_batch::RecordBatch;
+use krishiv_cep::{CepKeyState, CompiledPattern, Pattern, SequentialPatternMatcher};
 use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
 
 use crate::{SqlError, SqlResult};
@@ -104,6 +106,103 @@ pub fn plan_match_recognize(stmt: MatchRecognizeStatement, query: &str) -> Logic
     )
 }
 
+/// Execute a `MATCH_RECOGNIZE` statement against pre-collected source batches.
+///
+/// For each partition key, events are fed to a `SequentialPatternMatcher` in
+/// event-time order. Completed pattern matches are concatenated and returned as
+/// a single output `RecordBatch` per match (one row per stage event).
+pub fn execute_match_recognize(
+    stmt: MatchRecognizeStatement,
+    source_batches: &[RecordBatch],
+) -> SqlResult<Vec<RecordBatch>> {
+    use arrow::array::Int64Array;
+    use std::collections::HashMap;
+
+    if source_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Locate key and event-time column indices.
+    let schema = source_batches[0].schema();
+    let key_idx = schema.index_of(&stmt.key_column).map_err(|_| SqlError::Unsupported {
+        feature: format!("MATCH_RECOGNIZE: key column '{}' not found", stmt.key_column),
+    })?;
+    let time_idx = schema
+        .index_of(&stmt.event_time_column)
+        .map_err(|_| SqlError::Unsupported {
+            feature: format!(
+                "MATCH_RECOGNIZE: event time column '{}' not found",
+                stmt.event_time_column
+            ),
+        })?;
+
+    // Collect all (key, event_time, row_batch) tuples and sort by event time.
+    let mut events: Vec<(String, i64, RecordBatch)> = Vec::new();
+    for batch in source_batches {
+        let key_col = batch.column(key_idx);
+        let time_col = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: format!(
+                    "MATCH_RECOGNIZE: event time column '{}' must be Int64",
+                    stmt.event_time_column
+                ),
+            })?;
+        let key_str = key_col.as_any().downcast_ref::<StringArray>();
+        for i in 0..batch.num_rows() {
+            let key = if let Some(k) = key_str {
+                if k.is_null(i) { continue; } else { k.value(i).to_string() }
+            } else {
+                i.to_string()
+            };
+            if time_col.is_null(i) {
+                continue;
+            }
+            events.push((key, time_col.value(i), batch.slice(i, 1)));
+        }
+    }
+    events.sort_by_key(|(_, t, _)| *t);
+
+    // Feed events to per-key matchers.
+    let matcher = SequentialPatternMatcher::new(stmt.pattern.clone());
+    let mut key_states: HashMap<String, CepKeyState> = HashMap::new();
+    let mut output: Vec<RecordBatch> = Vec::new();
+
+    let stage_names: Vec<&str> = stmt.pattern.stages.iter().map(|s| s.name.as_str()).collect();
+
+    for (key, event_time, row) in &events {
+        let state = key_states.entry(key.clone()).or_default();
+        // Track (stage_index, start_time_ms) together so we can detect both
+        // new partial starts AND restarts-after-expiry (where stage_index stays
+        // at 0 but start_time changes). Break as soon as state changes so each
+        // event is consumed by exactly one stage.
+        let partial_key_before =
+            state.partial.as_ref().map(|p| (p.stage_index, p.start_time_ms));
+        for &stage in &stage_names {
+            let completed = matcher.process_event(state, stage, row.clone(), *event_time);
+            if !completed.is_empty() {
+                for matched_rows in completed {
+                    if let Ok(concat) = arrow::compute::concat_batches(&schema, &matched_rows) {
+                        output.push(concat);
+                    }
+                }
+                break;
+            }
+            // Stop trying further stage names once the partial match state
+            // changed (started, advanced, or reset-and-restarted).
+            let partial_key_after =
+                state.partial.as_ref().map(|p| (p.stage_index, p.start_time_ms));
+            if partial_key_after != partial_key_before {
+                break;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 fn extract_after_keyword(
     body: &str,
     body_upper: &str,
@@ -185,6 +284,95 @@ fn parse_within_ms(body: &str, body_upper: &str) -> SqlResult<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_batch_with_key_ts(keys: &[&str], times: &[i64]) -> arrow::record_batch::RecordBatch {
+        use std::sync::Arc;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())) as _,
+                Arc::new(Int64Array::from(times.to_vec())) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn execute_match_recognize_three_stage_pattern_produces_match() {
+        use std::time::Duration;
+        use krishiv_cep::Pattern;
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .followed_by("C")
+            .within(Duration::from_secs(60))
+            .compile()
+            .unwrap();
+
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern,
+        };
+
+        // Three events for "u1" (one per stage) and one unrelated event for "u2".
+        let batch = make_batch_with_key_ts(
+            &["u1", "u1", "u1", "u2"],
+            &[1_000, 2_000, 3_000, 9_000],
+        );
+
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
+        assert_eq!(result.len(), 1, "expected one completed A→B→C match for u1");
+        assert_eq!(result[0].num_rows(), 3, "match should span all three stage events");
+    }
+
+    #[test]
+    fn execute_match_recognize_no_match_when_window_expired() {
+        use std::time::Duration;
+        use krishiv_cep::Pattern;
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_millis(100))
+            .compile()
+            .unwrap();
+
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern,
+        };
+
+        // B arrives 200 ms after A — past the 100 ms window.
+        let batch = make_batch_with_key_ts(&["u1", "u1"], &[0, 200]);
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
+        assert!(result.is_empty(), "expired window must not produce a match");
+    }
+
+    #[test]
+    fn execute_match_recognize_empty_source_returns_empty() {
+        use std::time::Duration;
+        use krishiv_cep::Pattern;
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_secs(10))
+            .compile()
+            .unwrap();
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern,
+        };
+        let result = execute_match_recognize(stmt, &[]).unwrap();
+        assert!(result.is_empty());
+    }
 
     #[test]
     fn parses_match_recognize_subset() {

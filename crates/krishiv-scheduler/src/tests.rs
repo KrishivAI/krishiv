@@ -64,6 +64,22 @@ mod scheduler_tests {
                 TaskStatusResponse::new(TransportDisposition::Accepted),
             )))
         }
+
+        async fn push_continuous_input(
+            &self,
+            _request: tonic::Request<wire::v1::PushContinuousInputRequest>,
+        ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+            Ok(tonic::Response::new(wire::task_status_response_to_wire(
+                TaskStatusResponse::new(TransportDisposition::Accepted),
+            )))
+        }
+
+        async fn drain_continuous_output(
+            &self,
+            _request: tonic::Request<wire::v1::DrainContinuousOutputRequest>,
+        ) -> Result<tonic::Response<wire::v1::DrainContinuousOutputResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
     }
 
     #[test]

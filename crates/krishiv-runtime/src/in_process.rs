@@ -169,14 +169,24 @@ impl InProcessStreamingRuntime {
         self.continuous_registry.push_input(job_id, batches)
     }
 
-    /// Execute batch SQL through coordinator → executor (`sql:` fragment).
+    /// Check if a query is streaming.
+    pub fn is_streaming_query(&self, query: &str) -> RuntimeResult<bool> {
+        self.runner
+            .sql_engine()
+            .is_streaming_query(query)
+            .map_err(|e| RuntimeError::transport(format!("sql parse error: {e}")))
+    }
+
+    /// Execute batch SQL on the in-process executor via the coordinator. → executor (`sql:` fragment).
     pub fn execute_batch_sql(
         &self,
         query: &str,
         tables: &[BatchSqlTable],
+        is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         let fragment = format!("sql: {query}");
-        self.run_terminal_task(&fragment, JobKind::Batch, tables, Vec::new())
+        let kind = if is_streaming { JobKind::Streaming } else { JobKind::Batch };
+        self.run_terminal_task(&fragment, kind, tables, Vec::new())
     }
 
     /// Drain a continuous streaming job through coordinator → executor.
@@ -424,7 +434,7 @@ mod tests {
     fn batch_sql_routes_through_coordinator() {
         let runtime = InProcessStreamingRuntime::new().expect("runtime");
         let batches = runtime
-            .execute_batch_sql("SELECT 1 AS value", &[])
+            .execute_batch_sql("SELECT 1 AS value", &[], false)
             .expect("batch sql");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -458,7 +468,7 @@ mod tests {
     #[test]
     fn runtime_new_creates_working_runtime() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        let batches = runtime.execute_batch_sql("SELECT 42", &[]).unwrap();
+        let batches = runtime.execute_batch_sql("SELECT 42", &[], false).unwrap();
         assert_eq!(batches.len(), 1);
     }
 
@@ -466,7 +476,7 @@ mod tests {
     fn execute_batch_sql_returns_single_batch() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
         let batches = runtime
-            .execute_batch_sql("SELECT 'hello' AS msg", &[])
+            .execute_batch_sql("SELECT 'hello' AS msg", &[], false)
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -477,7 +487,7 @@ mod tests {
     fn execute_batch_sql_multi_column() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
         let batches = runtime
-            .execute_batch_sql("SELECT 1 AS a, 'x' AS b", &[])
+            .execute_batch_sql("SELECT 1 AS a, 'x' AS b", &[], false)
             .unwrap();
         assert_eq!(batches[0].num_columns(), 2);
         assert_eq!(batches[0].num_rows(), 1);
@@ -536,14 +546,14 @@ mod tests {
             path: PathBuf::from("/no/such/file.parquet"),
         }];
         // This may fail because file doesn't exist but the routing path is tested
-        let result = runtime.execute_batch_sql("SELECT 1", &tables);
+        let result = runtime.execute_batch_sql("SELECT 1", &tables, false);
         assert!(result.is_ok() || result.is_err());
     }
 
     #[test]
     fn batch_sql_with_empty_tables() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        let result = runtime.execute_batch_sql("SELECT 1 AS n", &[]).unwrap();
+        let result = runtime.execute_batch_sql("SELECT 1 AS n", &[], false).unwrap();
         assert_eq!(result[0].num_rows(), 1);
     }
 

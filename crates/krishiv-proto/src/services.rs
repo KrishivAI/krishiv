@@ -56,4 +56,16 @@ pub trait ExecutorTaskService: Send + Sync + 'static {
         &self,
         request: tonic::Request<TaskCancellationRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status>;
+
+    /// Push data to a continuous streaming task on an executor.
+    async fn push_continuous_input(
+        &self,
+        request: tonic::Request<PushContinuousInputRequest>,
+    ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status>;
+
+    /// Drain output from a continuous streaming task on an executor.
+    async fn drain_continuous_output(
+        &self,
+        request: tonic::Request<DrainContinuousOutputRequest>,
+    ) -> Result<tonic::Response<DrainContinuousOutputResponse>, tonic::Status>;
 }

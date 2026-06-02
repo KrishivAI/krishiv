@@ -118,18 +118,21 @@ impl FlightExecutionHost {
         let tables = self.catalog_tables();
         let sql = sql.to_string();
 
+        let is_streaming = self.cluster().is_streaming_query(&sql).unwrap_or(false);
+
         if let Some(http_base) = self.coordinator_http.as_deref() {
             return krishiv_runtime::execute_coordinator_batch_sql_inline(
                 http_base,
                 &sql,
                 &ipc_tables,
+                is_streaming,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()));
         }
 
         let cluster = self.cluster();
-        run_blocking(move || cluster.collect_batch_sql(&sql, &tables)).await
+        run_blocking(move || cluster.collect_batch_sql(&sql, &tables, is_streaming)).await
     }
 
     fn apply_catalog_directives(&self, directives: &[FlightDirective]) -> Result<(), Status> {
@@ -165,6 +168,13 @@ impl FlightExecutionHost {
                     return Ok(vec![explain_batch(&text)?]);
                 }
                 FlightDirective::ContinuousRegister { job_id, spec } => {
+                    if let Some(http_base) = self.coordinator_http.as_deref() {
+                        krishiv_runtime::execute_coordinator_continuous_register(http_base, &job_id, &spec)
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                        continue;
+                    }
+
                     let cluster = self.cluster();
                     let local = plan_spec_to_local(&spec);
                     let continuous = Arc::clone(&self.continuous);
@@ -177,6 +187,13 @@ impl FlightExecutionHost {
                     .await?;
                 }
                 FlightDirective::ContinuousPush { job_id, batches } => {
+                    if let Some(http_base) = self.coordinator_http.as_deref() {
+                        krishiv_runtime::execute_coordinator_continuous_push(http_base, &job_id, &batches)
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()))?;
+                        continue;
+                    }
+
                     let cluster = self.cluster();
                     let continuous = Arc::clone(&self.continuous);
                     let job_id = job_id.clone();
@@ -187,6 +204,12 @@ impl FlightExecutionHost {
                     .await?;
                 }
                 FlightDirective::ContinuousDrain { job_id } => {
+                    if let Some(http_base) = self.coordinator_http.as_deref() {
+                        return krishiv_runtime::execute_coordinator_continuous_drain(http_base, &job_id)
+                            .await
+                            .map_err(|e| Status::internal(e.to_string()));
+                    }
+
                     let cluster = self.cluster();
                     let job_id = job_id.clone();
                     return run_blocking(move || cluster.drain_continuous_job(&job_id)).await;

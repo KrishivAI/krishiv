@@ -202,10 +202,15 @@ mod tests {
                 "panic"
             }
             fn input_schema(&self) -> &Schema {
-                todo!()
+                static SCHEMA: std::sync::LazyLock<Schema> =
+                    std::sync::LazyLock::new(Schema::empty);
+                &SCHEMA
             }
             fn output_field(&self) -> &Field {
-                todo!()
+                static FIELD: std::sync::LazyLock<Field> = std::sync::LazyLock::new(|| {
+                    Field::new("out", arrow::datatypes::DataType::Null, true)
+                });
+                &FIELD
             }
             fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
                 panic!("intentional panic from test")

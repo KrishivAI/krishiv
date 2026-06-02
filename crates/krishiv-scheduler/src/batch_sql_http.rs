@@ -15,6 +15,8 @@ pub struct BatchSqlRequest {
     /// Data travels in-band so executor pods need no shared filesystem.
     #[serde(default)]
     pub tables: Vec<BatchSqlInlineTable>,
+    #[serde(default)]
+    pub is_streaming: bool,
 }
 
 // ── Async submit / poll ────────────────────────────────────────────────────────
@@ -35,7 +37,7 @@ pub async fn api_batch_sql_submit(
     if body.query.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let job_id = submit_batch_sql_job(&coordinator, &body.query, &body.tables)
+    let job_id = submit_batch_sql_job(&coordinator, &body.query, &body.tables, body.is_streaming)
         .await
         .map_err(|e| {
             eprintln!("submit_batch_sql_job failed: {:?}", e);

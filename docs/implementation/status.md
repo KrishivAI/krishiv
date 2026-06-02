@@ -1,92 +1,160 @@
 # Krishiv Implementation Status
 
-## Current Session (Completed)
+## Current Session — Five Stabilization Phases
 
-### Bug / Gap / Bottleneck Fixes (Post-Audit)
+### Phase 1 — Fix collect_batch_sql arity mismatch (B1)
+All call sites in `execution_runtime.rs`, `in_process.rs`, `in_process_cluster.rs`, and
+`integration_distributed.rs` updated to pass `is_streaming: bool` (all `false` for batch queries).
+`cargo test -p krishiv-runtime` now compiles and all integration tests pass.
 
-Five fixes applied from the prior session audit, in priority order:
+### Phase 2 — Tests for previously untested Beta paths
+- **CEP/MATCH_RECOGNIZE** (`krishiv-sql/src/cep_sql.rs`): Fixed routing bug where multi-stage
+  patterns (A→B→C) could never complete — tracking `(stage_index, start_time_ms)` instead of
+  stage_index alone catches both state advances and expiry-then-restart cases.
+  Added 3 tests including a 3-stage pattern that now produces output.
+- **temporal_join + interval_join** (`krishiv-api/src/streaming_dataframe.rs`): 6 tests covering
+  latest-version match, inner/left join semantics, event windows in/out, multiple matches, empty.
+- **Circuit-breaker reset HTTP endpoint** (`krishiv-scheduler/src/coordinator_daemon.rs`):
+  Test uses `tower::ServiceExt::oneshot` to POST to `/api/v1/executors/{id}/reset` and
+  asserts 200 + `{"reset":true}` + counter cleared. Added `tower` to scheduler dev-deps.
+- **Continuous stream HTTP push/drain** (`krishiv-scheduler/src/continuous_stream_http.rs`):
+  3 tests for register/drain, push, and invalid job-id rejection. Tests register a real executor
+  so `SlotAwareScheduler::place` succeeds.
+- **Predicate pushdown through Join** (`krishiv-optimizer/src/lib.rs`): 2 tests confirm
+  single-side conjuncts are pushed only into the owning scan.
 
-**Fix 1 — `ipc_catalog` per-request scoping** (`crates/krishiv-flight-sql/src/host.rs`)
-- Removed shared `ipc_catalog: Arc<DashMap<String, String>>` field from `FlightExecutionHost`.
-- Added `collect_ipc_tables(directives)` free function: builds per-call inline table list from
-  this request's `RegisterParquetIpc` directives only — not persisted to shared state.
-- `execute_sql` now passes per-request IPC tables to `execute_coordinator_batch_sql_inline`
-  without writing to any shared DashMap. Concurrent callers cannot observe each other's tables.
-- `apply_catalog_directives` now only handles path-based `RegisterParquet` registrations.
+### Phase 3 — Fix B2 and B3
+- **B2** (`krishiv-python/src/session.rs`): `Session.connect(url)` now always enables remote
+  execution — removed `KRISHIV_REMOTE_EXEC` env-var gate that caused silent local fallback.
+- **B3** (`krishiv-runtime/src/execution_runtime.rs`): `RemoteExecutionRuntime::accept_plan`
+  for streaming plans now returns `RuntimeError::Unsupported` instead of silently accepting.
 
-**Fix 2 — Rename `window_job_partitions` → `job_input_partitions`**
-  (`coordinator/mod.rs`, `coordinator/task_assignment.rs`, `batch_sql.rs`, `bounded_window.rs`)
-- Field and method renamed throughout. Old name implied window-only; map holds inline IPC
-  inputs for both batch-sql and bounded-window jobs.
+### Phase 4 — Durability profile smoke tests
+Two inline tests in `execution_runtime.rs`: `dev_local_profile_batch_sql_returns_results`
+and `dev_local_profile_continuous_double_drain_does_not_panic` confirm second-drain idempotence.
 
-**Fix 3 — GC `job_input_partitions` and `batch_sql_job_tables` on terminal job state**
-  (`coordinator/job_lifecycle.rs`)
-- Both maps `.remove()`'d when a job reaches terminal state (succeeded, failed, cancelled),
-  in both the `update_task_status` terminal path and the `cancel_job` path.
-- Eliminates the unbounded coordinator memory leak that accumulated input data across all jobs.
-
-**Fix 4 — Remove redundant synchronous `POST /api/v1/batch-sql` endpoint**
-  (`batch_sql_http.rs`, `coordinator_daemon.rs`)
-- Removed `api_batch_sql`, `BatchSqlResponse`, and the `/api/v1/batch-sql` POST route.
-- Only async paths remain: `POST /api/v1/batch-sql/submit` + `GET /api/v1/batch-sql/{job_id}`.
-
-**Fix 5 — `spawn_blocking` for parquet-to-IPC conversion** (`coordinator_http_client.rs`)
-- `parquet_to_ipc_b64` blocks on file I/O and CPU encoding.
-- Wrapped in `tokio::task::spawn_blocking` so async executor threads are not stalled.
+### Phase 5 — Stubs to clear errors
+- `cep_sql.rs` lakehouse stubs: already used `PyRuntimeError::new_err` — verified, no change.
+- `session.rs` `read_delta_async`: delegates to `sql_engine.read_delta()` — already errors properly.
+- `lib.rs` PanicUdf test: replaced `todo!()` in `input_schema()`/`output_field()` with static stubs.
 
 ## Validation
 
 ```
-cargo check --workspace    # 0 errors
+cargo check --workspace      # 0 errors
+cargo test -p krishiv-runtime              # all pass (integration + lib)
+cargo test -p krishiv-scheduler --lib      # 214 passed
+cargo test -p krishiv-executor --lib       # all pass
+cargo test -p krishiv-optimizer --lib      # 145 passed
+cargo test -p krishiv-sql --lib            # 66 passed
+cargo test -p krishiv-api --lib            # all pass
 ```
-
-### Rust examples — all 12 pass (embedded mode)
-
-| Example | Output |
-|---------|--------|
-| `batch_sql` | London=2, Paris=1 |
-| `batch_iot_sensor` | device-1 avg_temp=23.3, device-2=18.75 |
-| `batch_ecommerce` | VIP=2 orders $249.9, Standard=1 $45.5 |
-| `batch_delta_audit` | Current=3 rows, Historical v0=2 rows |
-| `batch_hudi_ingest` | 3 users ingested, snapshot read |
-| `batch_log_analytics` | payment-service 50% error rate |
-| `memory_stream` | [1, 2, 3] |
-| `stream_transaction_count` | Alice/Bob tumbling windows |
-| `stream_session_window` | Alice sessions 1000-18000, 20000-30000 |
-| `stream_state_ttl` | Alice windows with TTL gap |
-| `stream_multi_source` | device-1/device-2 sliding windows |
-| `stream_continuous_job` | job submitted, 0 batches polled (expected) |
-
-### Python examples — all 12 pass (embedded mode, `KRISHIV_MODE=embedded`)
-
-| Example | Output |
-|---------|--------|
-| `batch_sql.py` | London=2, Paris=1 |
-| `batch_iot_sensor.py` | device-1 avg_temp=23.3, device-2=18.75 |
-| `batch_ecommerce.py` | VIP=2, Standard=1 |
-| `batch_delta_audit.py` | Current=3 rows, Historical v0=2 rows |
-| `batch_hudi_ingest.py` | 3 users ingested |
-| `batch_log_analytics.py` | payment-service 50% error rate |
-| `memory_stream.py` | [1, 2, 3] |
-| `stream_transaction_count.py` | Alice/Bob windows |
-| `stream_session_window.py` | Alice sessions |
-| `stream_state_ttl.py` | Alice TTL windows |
-| `stream_multi_source.py` | device sliding windows |
-| `stream_continuous_job.py` | job submitted, 0 batches polled |
-
-## What was NOT changed (correct as-is)
-
-- `job_inline_results`: NOT GC'd on terminal state — client retrieves async results via
-  `take_job_inline_results`; entries are consumed on first read.
-- `execute_batch_sql_coordinated` in `batch_sql.rs`: kept for internal callers (tests, CLI).
-  Only the HTTP handler was removed.
-- `hostPath /tmp` in k8s manifest: safe to remove once fully on InlineIpc, not urgent.
-- HTTP long-poll for batch SQL: client-side exponential backoff; server-push is future work.
 
 ## Next Steps
 
-- gRPC message size cap for InlineIpc: validate byte count at `register_job_input_partitions`;
-  reject submissions exceeding ~3 MB per partition.
-- Circuit breaker reset API: `POST /api/v1/executors/{id}/reset` for operator recovery.
-- Continuous stream coordinator routing through coordinator for durability.
-- `session.deployment_target()` in OTLP metrics labels.
+- Add tests for the new `execute_match_recognize` path with concurrent-key patterns.
+- Add HTTP-level test for the `/api/v1/continuous-push` path using a real IPC-encoded batch.
+- Add a smoke test that exercises `RemoteExecutionRuntime::accept_plan` for streaming and
+  asserts `Unsupported` error (B3 regression guard).
+- Consider renaming `Session.connect()` env-var in docs now that the behavior changed.
+
+---
+
+
+## Current Session (Completed)
+
+### All 14 audit gaps / bugs fixed
+
+**Fix 1 — InlineIpc 3 MB per-partition size cap** (`krishiv-scheduler/src/batch_sql.rs`)
+- Added `MAX_INLINE_PARTITION_BYTES = 3 MB` constant.
+- `submit_batch_sql_job` now returns `SchedulerError::InvalidJob` with a clear message
+  if any decoded partition exceeds the limit, instead of silently crashing the gRPC channel.
+- Decode errors also surface as `InvalidJob` instead of being silently dropped.
+
+**Fix 2 — Continuous streaming coordinator-mediated routing** (`krishiv-scheduler/src/continuous_stream_http.rs`)
+- Removed direct executor gRPC calls from `api_continuous_push` and `api_continuous_drain`.
+- Push now stores batches as `InlineIpc` partitions via `register_job_input_partitions`.
+- Drain now returns results from `take_job_inline_results` (same path as batch SQL).
+- Register now uses the `stream:continuous:<job_id>` fragment so the executor reads from
+  InlineIpc partitions in its assignment.
+- Executor `stream:continuous:` handler (`krishiv-executor/src/fragment/streaming.rs`) now
+  falls back to `read_inline_ipc_partitions` when no in-process drainer is available (distributed mode).
+
+**Fix 3 — Circuit-breaker reset HTTP endpoint** (`krishiv-scheduler/src/coordinator_daemon.rs`)
+- Added `POST /api/v1/executors/{executor_id}/reset` route.
+- Handler calls `coord.executors.reset_task_failures(&executor_id)` (pre-existing method).
+- Returns `{"reset": true, "executor_id": "..."}` on success.
+
+**Fix 4 — Optimizer predicate pushdown through join nodes** (`krishiv-optimizer/src/lib.rs`)
+- Extended `PredicatePushdownRule.apply()` to also collect scans two hops away through
+  `NodeOp::Join` nodes.  Each conjunct is now tested against both join sides independently;
+  single-side predicates are pushed into the appropriate scan's `filters` list.
+
+**Fix 5 — Python KafkaSink.write_batches()** (`krishiv-python/src/sinks.rs`)
+- Implemented `write_batches(Vec<PyBatch>)` using `KafkaConfig` + `KafkaSink` from
+  `krishiv_connectors::kafka` (feature-gated `#[cfg(feature = "kafka")]`).
+- Non-kafka builds raise a `RuntimeError` with a clear rebuild instruction.
+
+**Fix 6 — Python IcebergSink.write_batches()** (`krishiv-python/src/sinks.rs`)
+- Implemented `write_batches(Vec<PyBatch>)` using `IcebergFsTable::new` + `append` from
+  `krishiv_lakehouse` (feature-gated `#[cfg(feature = "iceberg")]`).
+- Non-iceberg builds raise a `RuntimeError`.
+
+**Fix 7–9 — Temporal join, interval join, side output in Rust API**
+  (`krishiv-api/src/streaming_dataframe.rs`)
+- Added `StreamingDataFrame::with_side_output(name, lateness_ms)` — filters late rows
+  out of the main pipeline using `SideOutputRouter::is_late`.
+- Added free function `temporal_join(stream, table, spec, lookback_ms)` using
+  `VersionedTableState::upsert_version` + `lookup_as_of`.
+- Added free function `interval_join(left, right, left_col, right_col, spec)` using
+  `IntervalJoinState::push_left` / `push_right`.
+
+**Fix 10 — CEP/MATCH_RECOGNIZE wired into SqlEngine** (`krishiv-sql/src/lib.rs`, `cep_sql.rs`)
+- `SqlEngine::sql()` now intercepts queries containing `MATCH_RECOGNIZE` before DataFusion.
+- Added `execute_match_recognize(stmt, source_batches)` to `cep_sql.rs`: applies
+  `SequentialPatternMatcher` per partition key, returns matched-event batches.
+- Results are registered into DataFusion as `_krishiv_cep_result` and returned as a normal
+  `SqlDataFrame`.
+
+**Fix 11 — OTLP `deployment_target` label** (`krishiv-metrics/src/lib.rs`)
+- Added `MetricsConfig::deployment_target: Option<String>` field.
+- Added `resolved_deployment_target()` helper: explicit config → `KRISHIV_DEPLOYMENT_TARGET`
+  env var → `"unknown"`.
+- Both OTLP and Stdout tracer providers now attach `service.name` and `deployment.target`
+  as OTel resource attributes via `SdkTracerProvider::builder().with_resource(...)`.
+
+**Fix 12 — Jobs CLI no longer prints misleading "not yet implemented" message**
+  (`krishiv/src/cli.rs`)
+- Removed the `eprintln!("[local-mode] Jobs are local to this process...")` line.
+  In-session jobs were already listed correctly; only the message was wrong.
+
+**Fix 13 — `compat` CLI stubs now return actionable subcommand listing** (`krishiv/src/cli.rs`)
+- `krishiv compat <unknown>` now returns a specific error listing `analyze` (available) and
+  `convert`/`report` (planned) with instructions, instead of a generic placeholder message.
+- `krishiv compat` with no args returns the help text.
+
+**Fix 14 — Remove `hostPath /tmp` from k8s executor manifest** (`k8s/direct/krishiv-distributed.yaml`)
+- Removed the `hostPath /tmp` volume and `volumeMounts` from the executor Deployment.
+- Data is now delivered via InlineIpc in task assignments; no shared filesystem is needed.
+
+## Validation
+
+```
+cargo check --workspace      # 0 errors
+cargo test -p krishiv-scheduler --lib   # 210 passed
+cargo test -p krishiv-executor --lib    # 163 passed
+```
+
+## Pre-existing test failures (not introduced by this session)
+
+`cargo test -p krishiv-runtime` fails on `in_process.rs`, `execution_runtime.rs`,
+`in_process_cluster.rs`, and `tests/integration_distributed.rs` with
+`E0061: this method takes 3 arguments but 2 were supplied` — these call sites predate
+this session and are unrelated to the 14 fixes above (confirmed by stash isolation).
+
+## Next Steps
+
+- Add tests for the new `execute_match_recognize` path with a multi-stage pattern.
+- Add tests for `temporal_join` and `interval_join` helper functions.
+- Add test for the circuit-breaker reset endpoint via HTTP.
+- Fix the pre-existing `collect_batch_sql` arity mismatch in runtime integration tests.
