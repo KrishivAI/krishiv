@@ -364,6 +364,27 @@ pub(crate) async fn execute_streaming_fragment(
     })?;
     let mut plan_spec = parsed_to_plan_spec(parsed);
 
+    // GAP-WATERMARK: Apply the upstream stage's output watermark as the initial
+    // prev_watermark_ms for this stage's window operators. Without this, stage 2
+    // starts from i64::MIN and incorrectly treats all stage-1 output events as
+    // in-order even when the actual watermark is much higher, causing false
+    // "no late events" reports.
+    // The WatermarkHint partition is injected by the coordinator when emitting
+    // task assignments for downstream stages.
+    if let Some(upstream_wm) =
+        crate::fragment::common::read_watermark_hint(assignment.input_partitions())
+    {
+        // Propagate as the initial watermark_lag baseline so the first batch of
+        // this stage uses the correct late-event threshold.
+        if plan_spec.watermark_lag_ms == 0 {
+            plan_spec.watermark_lag_ms = upstream_wm.unsigned_abs();
+        }
+        tracing::debug!(
+            upstream_watermark_ms = upstream_wm,
+            "applied upstream watermark hint to downstream stage window spec"
+        );
+    }
+
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
 
     // Only override column names for stream-kafka partitions.  Overriding

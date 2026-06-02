@@ -6,6 +6,7 @@ metadata:
 spec:
   # Explicitly enable the Job Coordinator Pod (JCP) isolation
   jcpEnabled: true
+  durabilityProfile: "tiered"
   type: batch
   sql: "SELECT 1 as operator_test;"
   executors:

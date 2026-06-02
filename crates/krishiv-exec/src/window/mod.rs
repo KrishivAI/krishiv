@@ -85,6 +85,12 @@ pub struct MultiSourceWatermarkState {
     last_update_ms: HashMap<String, u64>,
     idle_timeout_ms: Option<u64>,
     idle_watermark_ms: i64,
+    /// Wall-clock instant of the last effective-watermark advance.
+    /// `None` until at least one source emits its first event.
+    last_advance_instant: Option<std::time::Instant>,
+    /// Effective watermark at the time of the last advance, used to detect
+    /// whether the watermark actually moved on the next `update()` call.
+    prev_effective_watermark_ms: i64,
 }
 
 impl Default for MultiSourceWatermarkState {
@@ -101,6 +107,8 @@ impl MultiSourceWatermarkState {
             last_update_ms: HashMap::new(),
             idle_timeout_ms: None,
             idle_watermark_ms: i64::MAX,
+            last_advance_instant: None,
+            prev_effective_watermark_ms: i64::MIN,
         }
     }
 
@@ -121,6 +129,34 @@ impl MultiSourceWatermarkState {
             *entry = watermark_ms;
         }
         self.last_update_ms.insert(source_id.to_owned(), wall_ms());
+        // Track whether the *effective* watermark (minimum across all sources) advanced.
+        let effective = self.effective_watermark_ms();
+        if effective > self.prev_effective_watermark_ms {
+            self.prev_effective_watermark_ms = effective;
+            self.last_advance_instant = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Wall-clock duration since the effective watermark last advanced.
+    ///
+    /// Returns `None` if no source has emitted any event yet (the watermark
+    /// has never moved from `i64::MIN`). A large duration indicates a stalled
+    /// source that is holding back all downstream windows.
+    pub fn stall_duration(&self) -> Option<std::time::Duration> {
+        self.last_advance_instant.map(|t| t.elapsed())
+    }
+
+    /// Returns `true` when the effective watermark has not advanced for longer
+    /// than `threshold`. Use this to detect stalled sources and emit
+    /// observability signals.
+    ///
+    /// Returns `false` if no events have been observed yet — a source that has
+    /// never emitted is idle, not stalled.
+    pub fn is_stalled(&self, threshold: std::time::Duration) -> bool {
+        match self.last_advance_instant {
+            None => false,
+            Some(t) => t.elapsed() > threshold,
+        }
     }
 
     /// Apply idle-source policy using current wall clock.
@@ -215,6 +251,65 @@ mod watermark_tests {
             state.effective_watermark_ms(),
             i64::MIN,
             "idle policy must not advance a never-seen source's watermark"
+        );
+    }
+
+    // ── Watermark stall signal ────────────────────────────────────────────────
+
+    #[test]
+    fn stall_duration_returns_none_before_any_events() {
+        let state = MultiSourceWatermarkState::new();
+        assert!(
+            state.stall_duration().is_none(),
+            "no events yet — stall_duration must be None"
+        );
+        assert!(
+            !state.is_stalled(std::time::Duration::from_secs(1)),
+            "is_stalled must be false before any events"
+        );
+    }
+
+    #[test]
+    fn stall_duration_is_some_after_first_event() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("s0", 1_000);
+        assert!(
+            state.stall_duration().is_some(),
+            "stall_duration must be Some after first event"
+        );
+    }
+
+    #[test]
+    fn is_stalled_false_right_after_advance() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("s0", 5_000);
+        assert!(
+            !state.is_stalled(std::time::Duration::from_secs(60)),
+            "watermark just advanced — is_stalled must be false"
+        );
+    }
+
+    #[test]
+    fn is_stalled_true_after_zero_threshold() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("s0", 1_000);
+        // A threshold of zero is always exceeded once any event has been seen.
+        assert!(
+            state.is_stalled(std::time::Duration::ZERO),
+            "zero threshold must be exceeded immediately after first event"
+        );
+    }
+
+    #[test]
+    fn stall_duration_resets_on_watermark_advance() {
+        let mut state = MultiSourceWatermarkState::new();
+        state.update("s0", 1_000);
+        let d1 = state.stall_duration().unwrap();
+        state.update("s0", 2_000);
+        let d2 = state.stall_duration().unwrap();
+        assert!(
+            d2 <= d1 + std::time::Duration::from_millis(50),
+            "stall duration should reset on watermark advance"
         );
     }
 

@@ -152,3 +152,27 @@ try:
 except (ImportError, AttributeError):
     pass
 
+
+
+
+def arrow_udf(fn):
+    """Mark a UDF as Arrow-native.
+
+    An Arrow-native UDF receives and must return a ``pyarrow.RecordBatch``
+    instead of a column dict.  The first column of the returned batch is used
+    as the scalar output array.  This avoids per-column
+    ``Vec<Option<T>> → PyList → Arrow`` marshalling and can be significantly
+    faster for large batches.
+
+    Usage::
+
+        @krishiv.arrow_udf
+        def double_value(batch):
+            import pyarrow.compute as pc
+            col = batch.column("value")
+            return batch.set_column(0, "value", pc.multiply(col, 2))
+
+    The decorated function is registered with the standard ``session.udf()`` API.
+    """
+    fn._krishiv_arrow_udf = True
+    return fn

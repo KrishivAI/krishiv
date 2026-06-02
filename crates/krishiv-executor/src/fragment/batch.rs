@@ -443,7 +443,7 @@ async fn execute_inmem_shuffle_write(
     engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
-    store: &std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
+    store: &std::sync::Arc<dyn krishiv_shuffle::ShuffleStore>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -580,7 +580,7 @@ async fn execute_inmem_shuffle_write(
 async fn execute_inmem_shuffle_read(
     assignment: &ExecutorTaskAssignment,
     read_cfg: &krishiv_proto::ShuffleReadConfig,
-    store: &std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
+    store: &std::sync::Arc<dyn krishiv_shuffle::ShuffleStore>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{PartitionId, ShuffleStore as _};
 

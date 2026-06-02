@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use pyo3_arrow;
+
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampNanosecondArray,
@@ -44,6 +46,45 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
 
     fn call(&self, batch: &RecordBatch) -> Result<ArrayRef, krishiv_udf::UdfError> {
         Python::attach(|py| {
+            // ── Arrow-native fast path ────────────────────────────────────────
+            // If the Python callable has `_krishiv_arrow_udf = True`, pass the
+            // whole RecordBatch as a pyo3_arrow::PyRecordBatch and expect back a
+            // PyRecordBatch (the first column is used as the output array).
+            // This avoids the per-column Vec<Option<T>> → PyList → Arrow conversion
+            // that the dict-based path requires.
+            let is_arrow_native = self
+                .callable
+                .getattr(py, "_krishiv_arrow_udf")
+                .ok()
+                .and_then(|v| v.is_truthy(py).ok())
+                .unwrap_or(false);
+
+            if is_arrow_native {
+                let py_batch = pyo3_arrow::PyRecordBatch::new(batch.clone());
+                let result =
+                    self.callable
+                        .call1(py, (py_batch,))
+                        .map_err(|e| krishiv_udf::UdfError::Execution {
+                            message: format!("arrow-native UDF call failed: {e}"),
+                        })?;
+                let out_batch: RecordBatch = result
+                    .extract::<pyo3_arrow::PyRecordBatch>(py)
+                    .map_err(|e| krishiv_udf::UdfError::Execution {
+                        message: format!(
+                            "arrow-native UDF must return a pyarrow.RecordBatch: {e}"
+                        ),
+                    })?
+                    .into_inner();
+                if out_batch.num_columns() == 0 {
+                    return Err(krishiv_udf::UdfError::Execution {
+                        message: "arrow-native UDF returned a RecordBatch with 0 columns; \
+                                  the first column is used as the output array"
+                            .into(),
+                    });
+                }
+                return Ok(Arc::clone(out_batch.column(0)));
+            }
+
             macro_rules! to_py_list {
                 ($col:expr, $arr_ty:ty, $native:ty, $field:expr) => {{
                     let arr = $col.as_any().downcast_ref::<$arr_ty>().ok_or_else(|| {

@@ -147,8 +147,10 @@ pub enum ShuffleDurability {
     Memory,
     /// Local disk on one host.
     LocalDisk,
-    /// Shared object store for multi-host workers.
+    /// Remote object store (S3, GCS) only.
     ObjectStore,
+    /// Tiered hybrid mode: writes locally first for P2P fetch, asynchronously backs up to Object Store.
+    Tiered,
 }
 
 /// Operator state durability class.

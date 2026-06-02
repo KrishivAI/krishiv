@@ -4207,6 +4207,7 @@ dependencies = [
 name = "krishiv-proto"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "prost 0.14.3",
  "prost-build 0.14.3",
  "prost-types 0.14.3",

@@ -322,6 +322,21 @@ pub(crate) async fn read_shuffle_flight_partitions(
 ///
 /// The IPC bytes are Arrow IPC stream format, delivered in-band with the task
 /// assignment to avoid any external data dependency.
+/// Extract the upstream watermark hint from task input partitions if present.
+/// Returns the highest watermark_ms value found (in case multiple hints exist).
+pub(crate) fn read_watermark_hint(partitions: &[krishiv_proto::InputPartition]) -> Option<i64> {
+    partitions
+        .iter()
+        .filter_map(|p| {
+            if let Some(InputPartitionDescriptor::WatermarkHint { watermark_ms }) = p.descriptor() {
+                Some(*watermark_ms)
+            } else {
+                None
+            }
+        })
+        .max()
+}
+
 pub(crate) fn read_inline_ipc_partitions(
     partitions: &[krishiv_proto::InputPartition],
 ) -> ExecutorResult<Vec<(String, Vec<arrow::record_batch::RecordBatch>)>> {
@@ -329,6 +344,15 @@ pub(crate) fn read_inline_ipc_partitions(
 
     let mut result = Vec::new();
     for partition in partitions {
+        // Handle zero-copy InMemory partitions directly — no IPC decode needed.
+        if let Some(InputPartitionDescriptor::InMemory { table_name, batches }) =
+            partition.descriptor()
+        {
+            let owned: Vec<_> = batches.iter().map(|b| (**b).clone()).collect();
+            result.push((table_name.clone(), owned));
+            continue;
+        }
+
         let (table_name, ipc_bytes) = match partition.descriptor() {
             Some(InputPartitionDescriptor::InlineIpc {
                 table_name,

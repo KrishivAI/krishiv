@@ -829,6 +829,36 @@ fn input_partition_descriptor_to_wire(
             ipc_bytes: ipc_bytes.clone(),
             ..Default::default()
         },
+        // InMemory and WatermarkHint are in-process only; they must never
+        // cross the wire. Serialise them as empty/noop InlineIpc entries so
+        // the proto schema doesn't need to change for these internal variants.
+        InputPartitionDescriptor::InMemory { table_name, batches } => {
+            use arrow::ipc::writer::StreamWriter;
+            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| {
+                std::sync::Arc::new(arrow::datatypes::Schema::empty())
+            });
+            let mut buf = Vec::new();
+            if let Ok(mut writer) = StreamWriter::try_new(&mut buf, &schema) {
+                for b in batches.iter() {
+                    let _ = writer.write(b);
+                }
+                let _ = writer.finish();
+            }
+            v1::InputPartitionDescriptor {
+                kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
+                table_name: table_name.clone(),
+                ipc_bytes: buf,
+                ..Default::default()
+            }
+        }
+        InputPartitionDescriptor::WatermarkHint { watermark_ms } => {
+            v1::InputPartitionDescriptor {
+                kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
+                table_name: format!("__watermark_hint_{watermark_ms}"),
+                ipc_bytes: vec![],
+                ..Default::default()
+            }
+        }
     }
 }
 

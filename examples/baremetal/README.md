@@ -11,7 +11,7 @@ KRISHIV_FLIGHT_ADDR=0.0.0.0:50051 KRISHIV_COORDINATOR_HTTP=http://127.0.0.1:1808
 
 **On Node 2 (Executor):**
 ```bash
-krishiv executor --executor-id node2-exec --coordinator http://<NODE_1_IP>:9090 --connect
+krishiv executor --executor-id node2-exec --coordinator http://<NODE_1_IP>:9090 --durability-profile distributed-durable --connect
 ```
 
 ## Running Examples

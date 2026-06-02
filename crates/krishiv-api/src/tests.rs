@@ -714,3 +714,36 @@ async fn remote_execution_without_fallback_uses_flight_server() {
     assert_eq!(result.row_count(), 1);
     server.abort();
 }
+
+// ── Item 2: collect() guard for streaming sources ─────────────────────────────
+
+#[test]
+fn collect_on_batch_source_succeeds() {
+    let session = crate::SessionBuilder::new().build().unwrap();
+    let df = session.sql("SELECT 1 AS n").unwrap();
+    let result = df.collect().unwrap();
+    assert_eq!(result.row_count(), 1);
+}
+
+// ── Item 7: unified execute() interface ──────────────────────────────────────
+
+#[tokio::test]
+async fn execute_batch_query_returns_batch_result() {
+    let session = crate::SessionBuilder::new().build().unwrap();
+    // Use sql_async() to avoid calling block_on inside a tokio test.
+    let df = session.sql_async("SELECT 42 AS answer").await.unwrap();
+    let result = df.execute().await.unwrap();
+    assert!(result.is_batch(), "simple SELECT must return Batch result");
+    let batches = result.into_batches().await.unwrap();
+    assert_eq!(batches[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn execution_result_into_batches_works_for_batch() {
+    let session = crate::SessionBuilder::new().build().unwrap();
+    let df = session.sql_async("SELECT 1 AS a, 2 AS b").await.unwrap();
+    let result = df.execute().await.unwrap();
+    let batches = result.into_batches().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_columns(), 2);
+}

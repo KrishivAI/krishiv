@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow = { workspace = true }
 prost.workspace = true
 # Pinned to match the prost version used by tonic 0.14.x; not workspace-managed.
 prost-types = "0.14.3"

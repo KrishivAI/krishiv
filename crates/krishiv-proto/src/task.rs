@@ -717,7 +717,7 @@ impl ExecutorHeartbeatResponse {
 }
 
 /// Typed connector/runtime input descriptor for one executor partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum InputPartitionDescriptor {
     /// Local Parquet file registered directly with DataFusion.
     LocalParquet { table_name: String, path: String },
@@ -764,6 +764,24 @@ pub enum InputPartitionDescriptor {
         table_name: String,
         ipc_bytes: Vec<u8>,
     },
+    /// Zero-copy in-process Arrow RecordBatches.
+    ///
+    /// Only valid when coordinator and executor run in the **same process**
+    /// (embedded mode). Passes pre-built `RecordBatch` values directly,
+    /// eliminating the IPC encode → Base64 → decode round-trip that
+    /// `InlineIpc` incurs. Remote/distributed callers must use `InlineIpc`
+    /// instead.
+    InMemory {
+        table_name: String,
+        batches: Vec<std::sync::Arc<arrow::record_batch::RecordBatch>>,
+    },
+    /// Carries the upstream stage's output watermark to initialise the
+    /// downstream stage's window operators. The executor reads this hint and
+    /// applies it as the initial `prev_watermark_ms` so late-event detection
+    /// is accurate from the very first batch.
+    WatermarkHint {
+        watermark_ms: i64,
+    },
 }
 
 impl InputPartitionDescriptor {
@@ -809,6 +827,13 @@ impl InputPartitionDescriptor {
             } => {
                 format!("inline-ipc:{table_name}:{}b", ipc_bytes.len())
             }
+            Self::InMemory { table_name, batches } => {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                format!("in-memory:{table_name}:{rows}rows")
+            }
+            Self::WatermarkHint { watermark_ms } => {
+                format!("watermark-hint:{watermark_ms}")
+            }
         }
     }
 }
@@ -833,7 +858,7 @@ impl MemoryKafkaRecord {
 }
 
 /// Descriptor for one input partition assigned to an executor task.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InputPartition {
     partition_id: String,
     description: String,
@@ -1013,7 +1038,7 @@ impl OutputContract {
 }
 
 /// Versioned task assignment sent from coordinator to executor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutorTaskAssignment {
     version: TransportVersion,
     job_id: JobId,

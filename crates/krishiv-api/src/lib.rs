@@ -16,7 +16,7 @@ pub mod window;
 mod tests;
 
 // Re-export the public API at the crate root for perfect source compatibility.
-pub use dataframe::DataFrame;
+pub use dataframe::{DataFrame, ExecutionResult};
 pub use error::{KrishivError, Result};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};

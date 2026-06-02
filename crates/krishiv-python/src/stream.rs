@@ -249,7 +249,18 @@ impl PyWindowedStream {
     pub fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
         let mut rx_guard = self.stream_rx.lock().unwrap();
         if let Some(rx) = rx_guard.as_mut() {
-            let res = rx.blocking_recv();
+            // Use block_in_place when running inside a tokio context so the
+            // worker thread is properly yielded during the recv rather than
+            // being permanently blocked. When no tokio runtime is active, fall
+            // back to blocking_recv directly.
+            let res = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        rx.recv().await
+                    })
+                }),
+                Err(_) => rx.blocking_recv(),
+            };
             match res {
                 Some(Ok(batch)) => Ok(Some(Py::new(py, batch)?)),
                 Some(Err(e)) => Err(e),
@@ -257,6 +268,21 @@ impl PyWindowedStream {
             }
         } else {
             Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+        }
+    }
+
+    /// Non-blocking poll — returns `None` immediately if no batch is ready.
+    /// Useful for polling patterns in async Python without blocking the event loop.
+    pub fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
+        let mut rx_guard = self.stream_rx.lock().unwrap();
+        if let Some(rx) = rx_guard.as_mut() {
+            match rx.try_recv() {
+                Ok(Ok(batch)) => Ok(Some(Py::new(py, batch)?)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Ok(None), // channel empty or closed — not ready yet
+            }
+        } else {
+            Ok(None)
         }
     }
 

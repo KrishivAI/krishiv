@@ -14,6 +14,53 @@ use krishiv_sql::KrishivDataFrameOps;
 use crate::error::{KrishivError, Result};
 use crate::types::{ExecutionMode, QueryResult};
 
+/// Unified execution result for [`DataFrame::execute`].
+///
+/// A batch query produces a finite `Batch` result. A streaming query
+/// (referencing an unbounded source) produces a `Stream` that must be
+/// consumed incrementally. This type lets callers write a single code
+/// path without knowing ahead of time which kind of query they have.
+pub enum ExecutionResult {
+    /// Query produced a finite set of record batches.
+    Batch(Vec<RecordBatch>),
+    /// Query produces an unbounded stream of record batches.
+    Stream(krishiv_plan::SendableRecordBatchStream),
+}
+
+impl ExecutionResult {
+    /// Collect all batches from a `Batch` result, or collect the full stream.
+    ///
+    /// **Warning**: calling this on a `Stream` result backed by an unbounded
+    /// source will block the executor thread indefinitely. Use this only when
+    /// you know the stream is finite (e.g. a bounded window output) or as a
+    /// convenience in tests.
+    pub async fn into_batches(self) -> Result<Vec<RecordBatch>> {
+        match self {
+            ExecutionResult::Batch(batches) => Ok(batches),
+            ExecutionResult::Stream(mut stream) => {
+                use futures::StreamExt as _;
+                let mut out = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    out.push(batch.map_err(|e| KrishivError::Runtime {
+                        message: e.to_string(),
+                    })?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Returns `true` if this is a streaming result.
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, ExecutionResult::Stream(_))
+    }
+
+    /// Returns `true` if this is a batch result.
+    pub fn is_batch(&self) -> bool {
+        matches!(self, ExecutionResult::Batch(_))
+    }
+}
+
 /// DataFrame API backed by DataFusion for R1 local execution.
 #[derive(Clone)]
 pub struct DataFrame {
@@ -138,6 +185,26 @@ impl DataFrame {
         krishiv_common::async_util::block_on(self.explain_async())
     }
 
+    /// Unified execution entry point — routes to `collect_async()` for batch
+    /// queries and `execute_stream_async()` for streaming queries.
+    ///
+    /// The routing decision is based on the logical plan's `ExecutionKind`.
+    /// Queries built against registered streaming sources (Kafka, etc.) return
+    /// `ExecutionResult::Stream`; all other queries return `ExecutionResult::Batch`.
+    ///
+    /// This is the preferred API when the caller does not know ahead of time
+    /// whether the query is batch or streaming. The existing `collect()` and
+    /// `execute_stream_async()` methods remain available for explicit control.
+    pub async fn execute(self) -> Result<ExecutionResult> {
+        if self.logical_plan.kind() == ExecutionKind::Streaming {
+            let stream = self.execute_stream_async().await?;
+            Ok(ExecutionResult::Stream(stream))
+        } else {
+            let result = self.collect_async().await?;
+            Ok(ExecutionResult::Batch(result.into_batches()))
+        }
+    }
+
     /// Convert this DataFrame into a fluent `StreamingDataFrame` builder
     /// for executing async stream operations with windows and aggregations.
     pub fn stream(&self) -> crate::streaming_dataframe::StreamingDataFrame {
@@ -182,6 +249,23 @@ impl DataFrame {
         if let Some(batches) = &self.pre_collected {
             self.update_job(&job_id, "local-dataframe", JobState::Succeeded);
             return Ok(QueryResult::new(batches.clone()));
+        }
+
+        // Guard: collecting an unbounded streaming query would block forever.
+        // The plan kind is set to Streaming by SqlEngine::sql() when the query
+        // references a registered streaming source (Kafka, etc.).
+        // Callers should use .stream().execute_stream_async() instead.
+        if self.logical_plan.kind() == ExecutionKind::Streaming {
+            self.update_job(&job_id, "local-dataframe", JobState::Failed);
+            let query_hint = self
+                .sql_query
+                .as_deref()
+                .unwrap_or("<streaming query>");
+            return Err(KrishivError::unsupported(format!(
+                "collect() on streaming query '{}' would block forever on an unbounded source; \
+                 use .stream() / .execute_stream_async() to consume the stream incrementally",
+                query_hint
+            )));
         }
 
         let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;

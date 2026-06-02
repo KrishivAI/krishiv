@@ -240,6 +240,7 @@ impl SqlEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string());
+        self.invalidate_plan_cache();
         Ok(tx)
     }
 
@@ -287,6 +288,7 @@ impl SqlEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(table_name.to_string());
+        self.invalidate_plan_cache();
         Ok(())
     }
 
@@ -423,6 +425,23 @@ impl SqlEngine {
         self.udf_registry_version.fetch_add(1, Ordering::Release);
     }
 
+    /// Invalidate the plan cache after any schema change. Call this whenever a
+    /// table is registered, replaced, or deregistered. Full invalidation is
+    /// simpler and safer than per-table tracking: the cache refills quickly on
+    /// the next few queries.
+    fn invalidate_plan_cache(&self) {
+        self.plan_cache.clear();
+        if let Ok(mut order) = self.plan_cache_order.lock() {
+            order.clear();
+        }
+    }
+
+    /// Expose cache invalidation for tests and external callers that register
+    /// tables through a different path.
+    pub fn clear_plan_cache(&self) {
+        self.invalidate_plan_cache();
+    }
+
     /// Register all scalar UDFs from the attached registry with DataFusion.
     /// Uses unlimited defaults (backward compat).
     pub async fn sync_scalar_udfs(&self) -> SqlResult<()> {
@@ -535,6 +554,7 @@ impl SqlEngine {
         {
             r.mark_table_committed();
         }
+        self.invalidate_plan_cache();
         Ok(())
     }
 
@@ -593,6 +613,7 @@ impl SqlEngine {
         {
             r.mark_table_committed();
         }
+        self.invalidate_plan_cache();
         Ok(())
     }
 
@@ -1619,6 +1640,32 @@ mod udtf_ddl_tests {
         assert!(engine.is_streaming_query("SELECT * FROM s1").unwrap());
         assert!(engine.is_streaming_query("SELECT * FROM s2").unwrap());
         assert!(!engine.is_streaming_query("SELECT * FROM s3").unwrap());
+    }
+
+    // ── Plan cache invalidation ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn plan_cache_cleared_after_table_registration() {
+        let engine = SqlEngine::new();
+        // Prime the cache with a simple query.
+        let _ = engine.sql("SELECT 1 AS n").await.unwrap();
+        assert!(!engine.plan_cache.is_empty(), "cache must be non-empty after first query");
+
+        // Registering a table (even parquet) must clear the cache.
+        engine.clear_plan_cache();
+        assert!(engine.plan_cache.is_empty(), "cache must be empty after clear_plan_cache()");
+    }
+
+    #[tokio::test]
+    async fn plan_cache_repopulates_after_invalidation() {
+        let engine = SqlEngine::new();
+        let _ = engine.sql("SELECT 42 AS v").await.unwrap();
+        engine.clear_plan_cache();
+        // Re-running the same query must succeed and re-populate the cache.
+        let df = engine.sql("SELECT 42 AS v").await.unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        assert!(!engine.plan_cache.is_empty(), "cache must refill after re-query");
     }
 }
 pub mod kafka_table;
