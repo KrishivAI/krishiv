@@ -19,13 +19,14 @@ use krishiv_udf::{ScalarUdf, UdfRegistry};
 use crate::dataframe::DataFrame;
 use crate::error::{KrishivError, Result};
 use crate::stream::Stream;
-use crate::types::{ExecutionMode, StreamBatch, StreamMode};
+use crate::types::{DeploymentTarget, ExecutionMode, StreamBatch, StreamMode};
 use crate::window::StateTtlConfig;
 
 /// Builder for Krishiv sessions.
 #[derive(Clone)]
 pub struct SessionBuilder {
     mode: ExecutionMode,
+    deployment_target: DeploymentTarget,
     auth: Option<Arc<dyn AuthProvider>>,
     policy: Option<Arc<dyn PolicyHook>>,
     coordinator_url: Option<String>,
@@ -67,6 +68,7 @@ impl Default for SessionBuilder {
     fn default() -> Self {
         Self {
             mode: ExecutionMode::Embedded,
+            deployment_target: DeploymentTarget::Embedded,
             auth: None,
             policy: None,
             coordinator_url: None,
@@ -131,6 +133,94 @@ impl SessionBuilder {
     /// Create a session builder.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a session from environment variables.
+    ///
+    /// | Variable | Values | Default |
+    /// |---|---|---|
+    /// | `KRISHIV_MODE` | `embedded`, `single-node`, `distributed`, `k8s`, `bare-metal` | `embedded` |
+    /// | `KRISHIV_COORDINATOR_URL` | Arrow Flight URL | — |
+    /// | `KRISHIV_COORDINATOR` | alias for `KRISHIV_COORDINATOR_URL` | — |
+    /// | `KRISHIV_REMOTE_EXEC` | `1`, `true` | derived from mode |
+    ///
+    /// Preferred entry point for k8s and bare-metal deployments where the
+    /// execution mode is injected via environment variables rather than
+    /// hard-coded in source.
+    pub fn from_env() -> Result<Self> {
+        let mode_raw = std::env::var("KRISHIV_MODE").unwrap_or_default();
+        let coordinator_url = std::env::var("KRISHIV_COORDINATOR_URL")
+            .or_else(|_| std::env::var("KRISHIV_COORDINATOR"))
+            .ok();
+
+        let mut builder = SessionBuilder::new();
+
+        match mode_raw.trim().to_ascii_lowercase().as_str() {
+            // No mode: infer from coordinator URL presence.
+            "" => {
+                if let Some(url) = coordinator_url {
+                    builder = builder.with_local_cluster(url);
+                }
+            }
+            "embedded" => {}
+            "single-node" | "single_node" | "singlenode" | "local" => {
+                builder = builder.with_execution_mode(ExecutionMode::SingleNode);
+                if let Some(url) = coordinator_url {
+                    builder = builder.with_local_cluster(url);
+                }
+            }
+            "distributed" | "cluster" => {
+                let url = coordinator_url.ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "KRISHIV_MODE=distributed requires KRISHIV_COORDINATOR_URL",
+                    )
+                })?;
+                builder = builder
+                    .with_coordinator(url)
+                    .with_deployment_target(DeploymentTarget::BareMetal);
+            }
+            "bare-metal" | "baremetal" => {
+                let url = coordinator_url.ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "KRISHIV_MODE=bare-metal requires KRISHIV_COORDINATOR_URL",
+                    )
+                })?;
+                builder = builder
+                    .with_coordinator(url)
+                    .with_deployment_target(DeploymentTarget::BareMetal);
+            }
+            "k8s" | "kubernetes" => {
+                let url = coordinator_url.ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "KRISHIV_MODE=k8s requires KRISHIV_COORDINATOR_URL \
+                         (typically the coordinator service's Flight SQL endpoint)",
+                    )
+                })?;
+                builder = builder
+                    .with_coordinator(url)
+                    .with_deployment_target(DeploymentTarget::Kubernetes);
+            }
+            other => {
+                return Err(KrishivError::unsupported(format!(
+                    "unknown KRISHIV_MODE '{other}'; valid values: \
+                     embedded, single-node, distributed, bare-metal, k8s"
+                )));
+            }
+        }
+
+        if let Some(remote) = remote_execution_from_env_opt() {
+            builder = builder.with_remote_execution(remote);
+        }
+
+        Ok(builder)
+    }
+
+    /// Override the deployment target (where the cluster physically runs).
+    /// `from_env()` sets this automatically from `KRISHIV_MODE`.
+    #[must_use]
+    pub fn with_deployment_target(mut self, target: DeploymentTarget) -> Self {
+        self.deployment_target = target;
+        self
     }
 
     /// Select an execution mode.
@@ -266,8 +356,19 @@ impl SessionBuilder {
         .map_err(|e| KrishivError::Runtime {
             message: e.to_string(),
         })?;
+        // Derive deployment_target from builder field; if not explicitly set,
+        // fall back to the mode-based default.
+        let deployment_target = if self.deployment_target == DeploymentTarget::default()
+            && self.mode != ExecutionMode::Embedded
+        {
+            DeploymentTarget::from(self.mode)
+        } else {
+            self.deployment_target
+        };
+
         Ok(Session {
             mode: self.mode,
+            deployment_target,
             sql_engine,
             policy_engine,
             jobs: Arc::new(Mutex::new(LocalJobRegistry::default())),
@@ -290,6 +391,7 @@ impl SessionBuilder {
 #[derive(Clone)]
 pub struct Session {
     mode: ExecutionMode,
+    deployment_target: DeploymentTarget,
     sql_engine: SqlEngine,
     policy_engine: Option<PolicyEnforcingSqlEngine>,
     jobs: Arc<Mutex<LocalJobRegistry>>,
@@ -328,9 +430,29 @@ impl Session {
         SessionBuilder::new()
     }
 
+    /// Build a session from environment variables.
+    ///
+    /// Reads `KRISHIV_MODE`, `KRISHIV_COORDINATOR_URL` / `KRISHIV_COORDINATOR`,
+    /// and `KRISHIV_REMOTE_EXEC`.  See [`SessionBuilder::from_env`] for the full
+    /// variable reference.
+    ///
+    /// This is the recommended entry point for container and k8s deployments
+    /// where modes are configured via environment injection rather than source.
+    pub fn from_env() -> Result<Self> {
+        SessionBuilder::from_env()?.build()
+    }
+
     /// Current execution mode.
     pub fn mode(&self) -> ExecutionMode {
         self.mode
+    }
+
+    /// Where the cluster physically runs (embedded, single-node, bare-metal, kubernetes).
+    ///
+    /// Set automatically by [`Session::from_env`] from `KRISHIV_MODE`.
+    /// Override explicitly with [`SessionBuilder::with_deployment_target`].
+    pub fn deployment_target(&self) -> DeploymentTarget {
+        self.deployment_target
     }
 
     /// Streaming state TTL configuration, if set.

@@ -2,13 +2,16 @@ use arrow::record_batch::RecordBatch;
 use std::fmt;
 
 /// Execution mode selected for a session.
+///
+/// Controls HOW query routing works (local vs remote Flight).
+/// Orthogonal to [`DeploymentTarget`], which says WHERE the cluster runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// In-process execution for embedding Krishiv in a Rust application.
     Embedded,
     /// Single-node execution through the local Krishiv runtime.
     SingleNode,
-    /// Reserved for the R2 Kubernetes/distributed runtime.
+    /// Distributed execution routed to a remote coordinator over Arrow Flight.
     Distributed,
 }
 
@@ -18,6 +21,49 @@ impl fmt::Display for ExecutionMode {
             Self::Embedded => f.write_str("embedded"),
             Self::SingleNode => f.write_str("single-node"),
             Self::Distributed => f.write_str("distributed"),
+        }
+    }
+}
+
+/// Where the Krishiv cluster physically runs.
+///
+/// Orthogonal to [`ExecutionMode`] — both `Kubernetes` and `BareMetal`
+/// use `Distributed` execution mode (Arrow Flight routing), but they differ
+/// in how the cluster was provisioned and how nodes discover each other.
+/// Stored in the session for telemetry labels and future auto-configuration
+/// (k8s service-account token injection, bare-metal config-file discovery, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeploymentTarget {
+    /// In-process — library embedding or tests.
+    #[default]
+    Embedded,
+    /// Single host — local process or local Flight daemon.
+    SingleNode,
+    /// Bare-metal or VM cluster — coordinator/executors run as processes.
+    BareMetal,
+    /// Kubernetes cluster — operator-managed pods, service-account auth.
+    Kubernetes,
+}
+
+impl fmt::Display for DeploymentTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Embedded => f.write_str("embedded"),
+            Self::SingleNode => f.write_str("single-node"),
+            Self::BareMetal => f.write_str("bare-metal"),
+            Self::Kubernetes => f.write_str("kubernetes"),
+        }
+    }
+}
+
+impl From<ExecutionMode> for DeploymentTarget {
+    fn from(mode: ExecutionMode) -> Self {
+        match mode {
+            ExecutionMode::Embedded => Self::Embedded,
+            ExecutionMode::SingleNode => Self::SingleNode,
+            // Distributed covers both; use BareMetal as the default.
+            // from_env() sets Kubernetes explicitly when KRISHIV_MODE=k8s.
+            ExecutionMode::Distributed => Self::BareMetal,
         }
     }
 }

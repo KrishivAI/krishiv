@@ -2,38 +2,45 @@
 
 ## Current Session (Completed)
 
-### Gap/Bug Fixes — Native Kafka Connector
+### Runtime Mode Improvements
 
-All 10 gaps identified post-implementation have been resolved:
+**`crates/krishiv-api/src/types.rs`**
+- Added `DeploymentTarget` enum: `Embedded | SingleNode | BareMetal | Kubernetes`
+  — orthogonal to `ExecutionMode` (HOW queries route vs WHERE the cluster runs).
+  `From<ExecutionMode>` impl provides the default mapping.
 
-| # | Fix | File |
-|---|-----|------|
-| 1 | Removed dead `spawn_blocking` watermark RPC on every poll timeout | `connectors/src/kafka.rs` |
-| 2 | `project_batch` cast failure now emits tracing warning + null fill (no silent drop) | `sql/src/kafka_table.rs` |
-| 3 | DDL-created Kafka tables (`CREATE EXTERNAL TABLE … STORED AS KAFKA`) now tracked in `streaming_sources` | `sql/src/kafka_table.rs`, `sql/src/lib.rs` |
-| 4 | Demo binary now uses `register_kafka_source` end-to-end | `examples/rust/src/bin/kafka_streaming_sql.rs` |
-| 5 | Unique group IDs per binary run (timestamp suffix) — repeat runs no longer re-read history | `examples/rust/src/bin/kafka_streaming_sql.rs` |
-| 6 | Spawned polling task checks `tx.is_closed()` before each poll for proactive cancellation | `sql/src/kafka_table.rs` |
-| 7 | Deleted empty `streaming_test.rs` placeholder | deleted |
-| 8 | Added `SqlEngine::sql_to_kafka` write-back path | `sql/src/lib.rs` |
-| 9 | `auto_commit_interval_ms: Option<u64>` added to `KafkaConfig`; streaming SQL path uses 1 s auto-commit | `connectors/src/kafka.rs`, `sql/src/kafka_table.rs`, `sql/src/lib.rs` |
-| 10 | `RdkafkaKafkaSource` now uses `HashMap<i32, i64>` for per-partition offsets + `all_current_offsets()` | `connectors/src/kafka.rs` |
+**`crates/krishiv-api/src/session.rs`**
+- `SessionBuilder::from_env()` — reads `KRISHIV_MODE`, `KRISHIV_COORDINATOR_URL`/`KRISHIV_COORDINATOR`, `KRISHIV_REMOTE_EXEC`. Handles all five mode values: `embedded`, `single-node`, `distributed`, `bare-metal`, `k8s`. Returns clear errors for unknown modes or missing coordinator URLs in distributed modes.
+- `Session::from_env()` — convenience wrapper, recommended entry for k8s/bare-metal pods.
+- `SessionBuilder::with_deployment_target()` — explicit override for telemetry.
+- `Session::deployment_target()` — accessor; k8s deployments get `Kubernetes`, bare-metal get `BareMetal`.
+- `deployment_target` stored in `Session` struct alongside `mode`.
 
-### Architecture after fixes
-- `KafkaTableFactory` holds a shared `Arc<RwLock<HashSet<String>>>` created in `SqlEngine::new`
-  so DDL and programmatic paths both update `streaming_sources`.
-- `KafkaConfig.with_auto_commit(ms)` builder enables at-least-once for streaming SQL paths.
-- `SqlEngine::sql_to_kafka(sql, bootstrap, topic) -> SqlResult<u64>` writes batch SQL results
-  to any Kafka topic as JSON rows.
-- Multi-partition topics tracked correctly via `HashMap<partition, offset>`.
+**`crates/krishiv-api/src/lib.rs`**
+- `DeploymentTarget` added to public re-exports.
+
+**`crates/krishiv/src/lib.rs`**
+- `DeploymentTarget` added to facade re-exports.
+
+**`crates/krishiv-python/src/session.rs`**
+- `PySession::from_env()` now delegates to `krishiv_api::Session::from_env()` — Python and Rust share identical env-var parsing. Previously Python re-implemented the logic with slight differences (`k8s` not handled, default was `SingleNode` not `Embedded`).
+
+**`crates/krishiv/Cargo.toml`**
+- Feature flag comments rewritten to accurately describe that features gate DEPENDENCIES not code paths, and that execution mode is always runtime-selected.
+
+## What was NOT changed (correct as-is)
+- `ExecutionMode → RuntimeMode + ExecutionPlacement` two-layer design — sound, keep it.
+- Feature flags gating `flight-sql`, `shuffle`, `etcd`, `sqlite`, `k8s` optional deps — correct.
+- All backends (Embedded, SingleNode, Distributed) always compiled — intentional; `#[cfg]` guards on backends would save marginal binary size at high complexity cost.
+- `InProcessCluster::new()` for distributed sessions — it creates in-memory data structures only, no OS thread spawning; not worth a `new_minimal()`.
 
 ## Validation
 ```
-cargo check -p krishiv-sql -p krishiv-connectors   # clean
-BOOTSTRAP=localhost:9092 cargo run --bin kafka_streaming_sql  # 10/10 scenarios + sql_to_kafka pass
+cargo check -p krishiv-api -p krishiv-python -p krishiv   # clean
+just check   # all 4 modes clean
 ```
 
 ## Next Steps
-- True streaming windows (DataFusion streaming execution for unbounded GROUP BY).
-- Wire `all_current_offsets()` into `krishiv-checkpoint` for exactly-once SQL streaming.
-- Avro/Protobuf deserialization via `krishiv-schema-registry`.
+- Expose `SqlEngine::register_kafka_source` to Python via PyO3.
+- Use `session.deployment_target()` in metrics labels (once OTLP plumbing is wired).
+- True streaming windows for unbounded `GROUP BY` (DataFusion streaming exec).

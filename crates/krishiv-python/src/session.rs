@@ -91,48 +91,19 @@ impl PySession {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Build a session from environment variables.
+    ///
+    /// Reads ``KRISHIV_MODE``, ``KRISHIV_COORDINATOR_URL`` / ``KRISHIV_COORDINATOR``,
+    /// and ``KRISHIV_REMOTE_EXEC``.
+    ///
+    /// Valid ``KRISHIV_MODE`` values: ``embedded``, ``single-node``, ``distributed``,
+    /// ``bare-metal``, ``k8s``.
+    ///
+    /// Delegates to ``SessionBuilder::from_env`` in Rust so Python and Rust share
+    /// identical env-var parsing logic.
     #[classmethod]
     pub fn from_env(_cls: &Bound<'_, PyType>) -> PyResult<Self> {
-        let mode = std::env::var("KRISHIV_MODE").unwrap_or_default();
-        let coordinator_url = std::env::var("KRISHIV_COORDINATOR_URL")
-            .or_else(|_| std::env::var("KRISHIV_COORDINATOR"))
-            .ok();
-
-        let builder = krishiv_api::SessionBuilder::new();
-        let builder = if !mode.is_empty() {
-            match mode.to_lowercase().as_str() {
-                "local" | "single-node" => {
-                    let mut b = builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode);
-                    if let Some(ref url) = coordinator_url {
-                        b = b.with_local_cluster(url.clone());
-                    }
-                    b
-                }
-                "distributed" => {
-                    if let Some(url) = &coordinator_url {
-                        builder.with_coordinator(url.clone())
-                    } else {
-                        builder.with_execution_mode(krishiv_api::ExecutionMode::Distributed)
-                    }
-                }
-                "embedded" => builder.with_execution_mode(krishiv_api::ExecutionMode::Embedded),
-                _ => builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode),
-            }
-        } else if let Some(url) = &coordinator_url {
-            // No explicit mode but a coordinator URL is present: use single-node
-            // local-cluster routing (same as `with_local_cluster`), matching the
-            // behaviour of the Rust examples.
-            builder.with_local_cluster(url.clone())
-        } else {
-            builder.with_execution_mode(krishiv_api::ExecutionMode::SingleNode)
-        };
-        let builder = if remote_execution_from_env() {
-            builder.with_remote_execution(true)
-        } else {
-            builder
-        };
-        builder
-            .build()
+        krishiv_api::Session::from_env()
             .map(|s| Self {
                 inner: Arc::new(s),
                 state_migrations: SharedStateMigrationRegistry::new(),

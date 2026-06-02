@@ -63,7 +63,7 @@
 // ── Session API ───────────────────────────────────────────────────────────────
 
 pub use krishiv_api::{
-    AggExpr, AggFunction, DataFrame, ExecutionMode, KeyedStream, KrishivError,
+    AggExpr, AggFunction, DataFrame, DeploymentTarget, ExecutionMode, KeyedStream, KrishivError,
     MultiSourceWatermarkSpec, QueryResult, RecordBatch, Session, SessionBuilder,
     SessionWindowedStream, SlidingWindowedStream, StateTtlConfig, Stream, StreamBatch, StreamMode,
     StreamingDataFrame, WatermarkSpec, WindowedStream,

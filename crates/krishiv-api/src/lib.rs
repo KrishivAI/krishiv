@@ -21,7 +21,7 @@ pub use error::{KrishivError, Result};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
 pub use streaming_dataframe::StreamingDataFrame;
-pub use types::{ExecutionMode, QueryResult, StreamBatch, StreamMode};
+pub use types::{DeploymentTarget, ExecutionMode, QueryResult, StreamBatch, StreamMode};
 pub use window::{
     MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig,
     WatermarkSpec, WindowedStream,

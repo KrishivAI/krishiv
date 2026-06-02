@@ -16,24 +16,35 @@ name = "krishiv"
 path = "src/main.rs"
 
 [features]
-# Product-facing crate defaults to a local developer surface. Execution mode is
-# still selected at runtime; features only select compiled capabilities and
-# optional dependency families.
+# Features gate OPTIONAL DEPENDENCY FAMILIES, not code paths.
+# Execution mode (embedded / single-node / distributed) is always selected at
+# runtime via SessionBuilder or KRISHIV_MODE env var — no recompile needed.
+#
+# What features DO control:
+#   embedded    → no extra deps (baseline API surface, always compiles)
+#   single-node → pulls in Flight SQL server, shuffle service, SQLite metadata
+#   distributed → pulls in Flight SQL server, shuffle service, etcd metadata
+#   k8s         → distributed + Kubernetes operator CRD + reconciler
+#
+# Design intent: keep binary surface predictable. A `--features embedded` build
+# still compiles all three runtime backends (EmbeddedBackend, SingleNodeBackend,
+# DistributedBackend) but omits Flight SQL, shuffle, etcd, and operator deps that
+# would never be activated in a pure in-process deployment.
 default = ["local"]
 
 # Build presets
 minimal = []
-local = ["embedded", "single-node"]
-full = ["single-node", "distributed", "k8s", "ui", "kafka", "iceberg", "delta"]
+local   = ["embedded", "single-node"]
+full    = ["single-node", "distributed", "k8s", "ui", "kafka", "iceberg", "delta"]
 
-# Execution/deployment capability surfaces
-embedded = []
-single-node = ["flight-sql", "shuffle", "sqlite"]
-distributed = ["flight-sql", "shuffle", "etcd"]
-bare-metal = ["distributed"]
-cluster = ["distributed"]
-k8s = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
-ui = ["dep:krishiv-operator", "krishiv-operator/ui"]
+# Deployment capability surfaces (gate optional dep families)
+embedded    = []                                                 # baseline; no optional deps
+single-node = ["flight-sql", "shuffle", "sqlite"]               # local daemon + SQLite metadata
+distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster + etcd metadata
+bare-metal  = ["distributed"]                                    # alias: process-managed cluster
+cluster     = ["distributed"]                                    # alias: distributed
+k8s         = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
+ui          = ["dep:krishiv-operator", "krishiv-operator/ui"]
 
 # Optional dependency families
 flight-sql = ["dep:krishiv-flight-sql"]
