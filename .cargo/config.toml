@@ -1,9 +1,43 @@
+# ── Local dev linker ──────────────────────────────────────────────────────────
+# lld is faster than ld for incremental dev builds.
+# target-cpu=native is intentionally NOT set here: it breaks Docker builds and
+# cross-compilation silently (the binary won't run on any machine but the builder).
+# Set it per-profile in Cargo.toml or via RUSTFLAGS if you need native tuning
+# for a specific local benchmark.
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
     "-C", "link-arg=-fuse-ld=lld",
-    "-C", "target-cpu=native",
 ]
 
-# Avoid /tmp quota/race failures during native dependency builds (ring, aws-lc-sys, protoc).
+# musl target for portable release binaries (k8s image, bare-metal releases).
+# No special linker flags — uses musl's built-in static linker.
+[target.x86_64-unknown-linux-musl]
+rustflags = []
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# Redirect tmp files to a repo-local dir to avoid /tmp quota and race failures
+# during native dependency builds (ring, aws-lc-sys, protoc).
+# Only applies when building locally; Docker builds use their own tmp.
 [env]
 TMPDIR = { value = ".tmp", relative = true }
+
+# ── Cargo aliases (execution-mode shortcuts) ──────────────────────────────────
+# Usage: cargo <alias>  e.g. `cargo check-k8s`
+[alias]
+check-embedded    = "check -p krishiv --no-default-features --features embedded"
+check-single-node = "check -p krishiv --no-default-features --features single-node"
+check-distributed = "check -p krishiv --no-default-features --features bare-metal"
+check-k8s         = ["check", "-p", "krishiv", "-p", "krishiv-operator",
+                     "--no-default-features", "--features", "k8s"]
+
+build-single-node = "build -p krishiv --no-default-features --features single-node"
+build-distributed = "build -p krishiv --no-default-features --features bare-metal --release"
+build-k8s         = ["build", "-p", "krishiv", "-p", "krishiv-operator",
+                     "--no-default-features", "--features", "k8s",
+                     "--profile", "release-k8s"]
+
+test-sql          = "test -p krishiv-sql --lib"
+test-connectors   = "test -p krishiv-connectors --lib"
+test-scheduler    = "test -p krishiv-scheduler --lib"
+test-runtime      = "test -p krishiv-runtime --lib"
+test-operator     = "test -p krishiv-operator --lib"

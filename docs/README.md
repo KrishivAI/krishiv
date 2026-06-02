@@ -141,14 +141,21 @@ Rust optional integration features:
 | `delta` | Delta lakehouse support. |
 | `ui` | Operator UI integration. |
 
-Recommended Rust build commands:
+Recommended Rust build commands (`just` is the project command runner):
 
 ```bash
-cargo check -p krishiv --no-default-features --features embedded
-cargo check -p krishiv --no-default-features --features single-node
-cargo build -p krishiv --no-default-features --features bare-metal --release
-cargo build -p krishiv --no-default-features --features k8s --profile release-k8s
-cargo check -p krishiv --all-features
+just check              # verify all four modes compile
+just check-embedded
+just check-single-node
+just check-distributed
+just check-k8s
+
+just build-single-node  # debug binary for local dev
+just build-bare-metal   # release binary for VMs
+just build-k8s          # release binary + operator for Kubernetes
+
+just docker-local       # multi-stage build → load into k3s
+just deploy-k8s         # kubectl apply -k k8s/operator
 ```
 
 Python bindings default to the lean local/remote API surface. Optional native

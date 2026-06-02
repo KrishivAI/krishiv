@@ -41,6 +41,12 @@ k8s/
 Install CRDs + operator in one command:
 
 ```bash
+just deploy-k8s
+```
+
+Or manually:
+
+```bash
 kubectl apply -k k8s/operator
 ```
 
@@ -54,12 +60,13 @@ kubectl get krishivjobs -n krishiv-system
 Build and load the image before applying:
 
 ```bash
-cargo build -p krishiv -p krishiv-operator \
-  --target x86_64-unknown-linux-musl \
-  --profile release-k8s
-mkdir -p dist/docker
-cp target/x86_64-unknown-linux-musl/release-k8s/krishiv dist/docker/
-cp target/x86_64-unknown-linux-musl/release-k8s/krishiv-operator dist/docker/
+just docker-local    # multi-stage build + load into k3s in one step
+```
+
+Or stage binaries manually (faster if already built):
+
+```bash
+just build-k8s && just stage
 docker build -t localhost/krishiv:local .
 ```
 

@@ -2565,6 +2565,7 @@ dependencies = [
  "arrow",
  "futures",
  "krishiv",
+ "krishiv-api",
  "krishiv-sql",
  "parquet",
  "rdkafka",

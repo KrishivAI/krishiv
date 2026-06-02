@@ -31,31 +31,33 @@ async fn main() {
     ).unwrap();
     
     session.register_memory_stream("batch_events", vec![batch]).unwrap();
-    
-    let df_batch = session.sql("SELECT user_id, count(action) as action_count FROM batch_events GROUP BY user_id ORDER BY user_id");
+
+    let df_batch = session
+        .sql("SELECT user_id, count(action) as action_count FROM batch_events GROUP BY user_id ORDER BY user_id")
+        .unwrap();
     let result = df_batch.collect_async().await.unwrap();
-    
+
     println!("Batch Query Result:");
     for batch in result {
         println!("{:?}", batch);
     }
-    
+
     println!("=====================================");
     println!("2. CONTINUOUS STREAMING SQL EXAMPLE");
     println!("=====================================");
-    
+
     let stream_schema = Arc::new(Schema::new(vec![
         Field::new("event_id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
     ]));
-    
+
     session.register_unbounded("live_events", stream_schema.clone()).unwrap();
-    
+
     let session_clone = session.clone();
     let stream_schema_clone = stream_schema.clone();
-    
+
     tokio::spawn(async move {
-        for i in 1..=5 {
+        for i in 1..=5i64 {
             sleep(Duration::from_millis(500)).await;
             let stream_batch = RecordBatch::try_new(
                 stream_schema_clone.clone(),
@@ -64,13 +66,14 @@ async fn main() {
                     Arc::new(Int64Array::from(vec![i * 10])),
                 ],
             ).unwrap();
-            
             session_clone.push_stream_job_input("live_events", vec![stream_batch]).unwrap();
             println!("Pushed event_id = {}", i);
         }
     });
-    
-    let df_stream = session.sql("SELECT event_id, value * 2 as doubled_value FROM live_events");
+
+    let df_stream = session
+        .sql("SELECT event_id, value * 2 as doubled_value FROM live_events")
+        .unwrap();
     let mut stream = df_stream.execute_stream_async().await.unwrap();
     
     let mut count = 0;

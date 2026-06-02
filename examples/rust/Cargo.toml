@@ -12,6 +12,7 @@ publish = false
 arrow = { version = "58.3.0", features = ["json"] }
 futures = "0.3.32"
 krishiv = { path = "../../crates/krishiv" }
+krishiv-api = { path = "../../crates/krishiv-api" }
 krishiv-sql = { path = "../../crates/krishiv-sql" }
 parquet = "58.3.0"
 rdkafka = { version = "0.36", optional = false, default-features = false, features = ["tokio"] }

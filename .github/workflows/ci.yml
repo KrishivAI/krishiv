@@ -8,23 +8,89 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Redirect tmp to workspace to avoid /tmp quota issues on CI runners.
+  TMPDIR: .tmp
 
 jobs:
-  check-fmt-clippy-test:
+  # ── Format + lint ────────────────────────────────────────────────────────────
+  fmt-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Install system dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler cmake
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake lld
+      - uses: taiki-e/install-action@just
+      - run: just fmt
+      - run: just lint
 
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --exclude krishiv-python --exclude krishiv-chaos -- -D warnings
-      - run: cargo check --workspace --exclude krishiv-python --exclude krishiv-chaos
-      - run: cargo test --workspace --lib --exclude krishiv-python --exclude krishiv-chaos
+  # ── Execution-mode feature matrix ────────────────────────────────────────────
+  # Each mode must compile independently. A regression that breaks one mode
+  # without breaking the others will only appear in this matrix.
+  check-modes:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: embedded
+            features: embedded
+            crates: -p krishiv
+          - mode: single-node
+            features: single-node
+            crates: -p krishiv
+          - mode: bare-metal
+            features: bare-metal
+            crates: -p krishiv
+          - mode: k8s
+            features: k8s
+            crates: -p krishiv -p krishiv-operator
+    name: check (${{ matrix.mode }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.mode }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake lld
+      - uses: taiki-e/install-action@just
+      - name: check-${{ matrix.mode }}
+        run: just check-${{ matrix.mode }}
+
+  # ── Tests ─────────────────────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    needs: [fmt-lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev pkg-config cmake lld
+      - uses: taiki-e/install-action@just
+      - name: Run workspace tests
+        run: just test
