@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry-stdout = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 thiserror = { workspace = true }

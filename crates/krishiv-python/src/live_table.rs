@@ -137,3 +137,74 @@ pub fn create_live_table(name: String, query: String) -> PyResult<PyLiveTable> {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyLiveTable { name, store, exec })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_table(suffix: &str) -> PyLiveTable {
+        create_live_table(
+            format!("test_table_{suffix}"),
+            "SELECT 1 AS n".to_string(),
+        )
+        .expect("create_live_table must succeed")
+    }
+
+    #[test]
+    fn live_table_name_accessor() {
+        let table = make_table("name");
+        assert_eq!(table.name(), "test_table_name");
+    }
+
+    #[test]
+    fn live_table_refresh_succeeds() {
+        let table = make_table("refresh");
+        let count = table.refresh().expect("refresh must succeed");
+        // No rows ingested yet, so compact count is 0.
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn live_table_ingest_row_and_change_feed() {
+        let table = make_table("ingest");
+        table.ingest_row(42, "insert").expect("ingest_row insert must succeed");
+        let mut feed = table.change_feed().expect("change_feed must succeed");
+        let entry = feed.entries.next().expect("change_feed must yield one entry");
+        assert_eq!(
+            entry.op,
+            DeltaOp::Insert,
+            "change feed entry must reflect the insert op"
+        );
+        assert_eq!(
+            entry.batch.num_rows(),
+            1,
+            "change feed entry must contain the ingested row"
+        );
+    }
+
+    #[test]
+    fn live_table_ingest_wrong_op_errors() {
+        let table = make_table("bad_op");
+        let err = table.ingest_row(1, "upsert").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown op"),
+            "unsupported op must produce a clear error"
+        );
+    }
+
+    #[test]
+    fn live_table_change_feed_empty_before_ingest() {
+        let table = make_table("empty");
+        let feed = table.change_feed().expect("change_feed must succeed");
+        let entries: Vec<_> = feed.entries.collect();
+        assert!(entries.is_empty(), "no entries expected before any ingest");
+    }
+
+    #[test]
+    fn live_table_drop_does_not_panic() {
+        let table = make_table("drop_test");
+        // drop() removes from the global registry — must not panic.
+        let result = table.drop();
+        assert!(result.is_ok(), "drop() must succeed: {result:?}");
+    }
+}

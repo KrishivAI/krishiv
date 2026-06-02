@@ -4125,9 +4125,12 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "bytes",
  "chrono",
+ "futures",
  "iceberg",
  "krishiv-connectors",
+ "object_store",
  "parquet 58.3.0",
  "rdkafka",
  "redb",
@@ -5388,6 +5391,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -129,46 +129,162 @@ pub struct PySchemaRegistryConfig {
     pub(crate) inner: krishiv_schema_registry::SchemaRegistryConfig,
 }
 
+use std::sync::Arc;
+use krishiv_catalog::iceberg_rest::{
+    GlueRestCatalog, IcebergCatalogClient, IcebergTableId, NessieCatalog, GenericRestCatalog,
+    RestCatalogConfig,
+};
+
+/// AWS Glue Iceberg catalog (R18 S3.1).
+///
+/// Connects to the Glue REST-compatible endpoint and exposes table operations
+/// (`list_tables`, `load_table_metadata`). Requires valid AWS credentials in
+/// the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.).
 #[pyclass(name = "GlueCatalog")]
-pub struct PyGlueCatalog;
+pub struct PyGlueCatalog {
+    inner: Arc<GlueRestCatalog>,
+}
 
 #[pymethods]
 impl PyGlueCatalog {
     #[new]
     pub fn new(region: String, database: String, rest_url: String) -> PyResult<Self> {
-        let _ = (region, database, rest_url);
-        Err(PyRuntimeError::new_err(
-            "GlueCatalog is not yet implemented (placeholder for future AWS Glue connector)",
-        ))
+        Ok(Self {
+            inner: Arc::new(GlueRestCatalog::new(region, database, rest_url)),
+        })
+    }
+
+    /// List all table names in `namespace`.
+    pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
+        RUNTIME
+            .block_on(self.inner.list_tables(&namespace))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Load table metadata for `namespace.table_name` as a JSON string.
+    pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
+        let table_id = IcebergTableId { namespace, name: table_name };
+        RUNTIME
+            .block_on(self.inner.load_table_metadata(&table_id))
+            .map(|v| v.to_string())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
+/// Nessie Iceberg catalog (R18 S3.1).
+///
+/// Connects to a Project Nessie server via its REST API. Wraps a
+/// `GenericRestCatalog` with Nessie-specific URL construction.
 #[pyclass(name = "NessieCatalog")]
-pub struct PyNessieCatalog;
+pub struct PyNessieCatalog {
+    inner: Arc<NessieCatalog>,
+}
 
 #[pymethods]
 impl PyNessieCatalog {
     #[new]
     #[pyo3(signature = (uri, reference="main"))]
     pub fn new(uri: String, reference: &str) -> PyResult<Self> {
-        let _ = (uri, reference);
-        Err(PyRuntimeError::new_err(
-            "NessieCatalog is not yet implemented (placeholder for future Nessie catalog connector)",
-        ))
+        Ok(Self {
+            inner: Arc::new(NessieCatalog::new(uri, reference)),
+        })
+    }
+
+    /// List all table names in `namespace`.
+    pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
+        RUNTIME
+            .block_on(self.inner.list_tables(&namespace))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Load table metadata for `namespace.table_name` as a JSON string.
+    pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
+        let table_id = IcebergTableId { namespace, name: table_name };
+        RUNTIME
+            .block_on(self.inner.load_table_metadata(&table_id))
+            .map(|v| v.to_string())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
+/// Generic Iceberg REST catalog (R18 S3.1).
+///
+/// Compatible with any Iceberg REST catalog implementation (Tabular, AWS Glue
+/// via generic REST, self-hosted). See the Iceberg REST catalog specification
+/// for the expected API surface.
 #[pyclass(name = "IcebergRestCatalog")]
-pub struct PyIcebergRestCatalog;
+pub struct PyIcebergRestCatalog {
+    inner: Arc<GenericRestCatalog>,
+}
 
 #[pymethods]
 impl PyIcebergRestCatalog {
     #[new]
     #[pyo3(signature = (url, warehouse=None))]
     pub fn new(url: String, warehouse: Option<String>) -> PyResult<Self> {
-        let _ = (url, warehouse);
-        Err(PyRuntimeError::new_err(
-            "IcebergRestCatalog is not yet implemented (placeholder for future Iceberg REST catalog connector)",
-        ))
+        let config = RestCatalogConfig {
+            base_url: url,
+            warehouse,
+            prefix: "v1".to_string(),
+            bearer_token: None,
+        };
+        Ok(Self {
+            inner: Arc::new(GenericRestCatalog::new(config)),
+        })
+    }
+
+    /// List all table names in `namespace`.
+    pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
+        RUNTIME
+            .block_on(self.inner.list_tables(&namespace))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Load table metadata for `namespace.table_name` as a JSON string.
+    pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
+        let table_id = IcebergTableId { namespace, name: table_name };
+        RUNTIME
+            .block_on(self.inner.load_table_metadata(&table_id))
+            .map(|v| v.to_string())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn glue_catalog_new_stores_region_and_database() {
+        let cat = PyGlueCatalog::new(
+            "us-east-1".into(),
+            "analytics".into(),
+            "http://glue.us-east-1.amazonaws.com".into(),
+        )
+        .unwrap();
+        assert_eq!(cat.inner.region, "us-east-1");
+        assert_eq!(cat.inner.database, "analytics");
+    }
+
+    #[test]
+    fn nessie_catalog_new_succeeds() {
+        let cat =
+            PyNessieCatalog::new("http://nessie.example.com/api".into(), "main").unwrap();
+        // Constructor must not panic or error — no live server needed.
+        let _ = cat;
+    }
+
+    #[test]
+    fn iceberg_rest_catalog_new_succeeds() {
+        let cat =
+            PyIcebergRestCatalog::new("http://catalog.example.com".into(), Some("my_warehouse".into()))
+                .unwrap();
+        let _ = cat;
+    }
+
+    #[test]
+    fn iceberg_rest_catalog_new_without_warehouse_succeeds() {
+        let cat = PyIcebergRestCatalog::new("http://catalog.example.com".into(), None).unwrap();
+        let _ = cat;
     }
 }

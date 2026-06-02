@@ -26,8 +26,9 @@ pub use delta_lake::{
     write_delta,
 };
 pub use hudi::{
-    HudiCowWriter, HudiQueryType, HudiSnapshotReader, HudiWriteResult, write_hudi_cow_append,
-    write_hudi_cow_fixture, write_hudi_cow_upsert,
+    HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType,
+    HudiSnapshotReader, HudiWriteResult, write_hudi_cow_append, write_hudi_cow_fixture,
+    write_hudi_cow_upsert,
 };
 pub use iceberg_fs::IcebergFsTable;
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};

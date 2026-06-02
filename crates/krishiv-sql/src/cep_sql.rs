@@ -375,6 +375,53 @@ mod tests {
     }
 
     #[test]
+    fn execute_match_recognize_two_keys_both_complete() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_cep::Pattern;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // Events in time order: u1 does A@1000, u2 does A@1500, u1 does B@2000, u2 does B@2500.
+        // Both keys independently complete the A→B pattern.
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["u1", "u2", "u1", "u2"])) as _,
+                Arc::new(Int64Array::from(vec![1_000_i64, 1_500, 2_000, 2_500])) as _,
+            ],
+        )
+        .unwrap();
+
+        let pattern = Pattern::begin("A")
+            .followed_by("B")
+            .within(Duration::from_secs(60))
+            .compile()
+            .unwrap();
+
+        let stmt = MatchRecognizeStatement {
+            source_table: "events".to_string(),
+            key_column: "user_id".to_string(),
+            event_time_column: "ts".to_string(),
+            pattern,
+        };
+
+        let result = execute_match_recognize(stmt, &[batch]).unwrap();
+        assert_eq!(result.len(), 2, "both u1 and u2 must independently complete the A→B pattern");
+        for matched in &result {
+            assert_eq!(
+                matched.num_rows(),
+                2,
+                "each match must contain 2 events (one for stage A, one for stage B)"
+            );
+        }
+    }
+
+    #[test]
     fn parses_match_recognize_subset() {
         let stmt = parse_match_recognize(
             "SELECT * FROM events MATCH_RECOGNIZE (PARTITION BY user_id ORDER BY ts PATTERN (A B) WITHIN 10 SECONDS)",

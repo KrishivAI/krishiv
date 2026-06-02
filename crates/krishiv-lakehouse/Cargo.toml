@@ -8,9 +8,12 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 iceberg = { workspace = true, optional = true }
+object_store = { workspace = true, features = ["aws", "fs"] }
 parquet = { workspace = true }
 redb = { workspace = true }
 serde = { workspace = true }
@@ -30,6 +33,7 @@ exactly-once-integration = []
 [dev-dependencies]
 krishiv-connectors = { path = "../krishiv-connectors" }
 tempfile = { workspace = true }
+tokio = { workspace = true }
 
 [[test]]
 name = "exactly_once"

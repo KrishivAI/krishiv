@@ -15,7 +15,10 @@ use krishiv_proto::{
 use krishiv_runtime::in_process::BatchSqlTable;
 use krishiv_runtime::in_process_cluster::InProcessCluster;
 use krishiv_runtime::local_streaming::{LocalWindowExecutionSpec, LocalWindowKind};
-use krishiv_runtime::{DistributedBackend, ExecutionBackend};
+use krishiv_runtime::execution_runtime::{
+    ExecutionPlacement, RuntimeMode, build_execution_runtime,
+};
+use krishiv_runtime::{DistributedBackend, ExecutionBackend, ExecutionRuntime};
 use krishiv_scheduler::Coordinator;
 use tonic::transport::Server;
 
@@ -466,6 +469,61 @@ async fn distributed_backend_end_to_end() {
         .expect("execute via distributed backend");
     assert!(report.accepted());
     assert_eq!(report.backend(), "distributed");
+
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 10. Flight SQL: continuous stream E2E (register → push → drain)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flight_sql_continuous_stream_register_push_drain() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(make_flight_sql_server())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("serve");
+    });
+
+    let url = format!("http://{addr}");
+    let rt = build_execution_runtime(
+        RuntimeMode::Distributed,
+        None,
+        Some(url),
+        None,
+        ExecutionPlacement::RemoteClusterRequired,
+    )
+    .expect("distributed runtime");
+
+    let spec = LocalWindowExecutionSpec {
+        key_column: "user_id".into(),
+        event_time_column: "ts".into(),
+        watermark_lag_ms: 0,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms: 10_000,
+        agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+        state_ttl_ms: None,
+        source_watermark_lags: std::collections::HashMap::new(),
+        source_id_column: None,
+    };
+
+    rt.register_continuous_stream("flight-cs-1", &spec)
+        .expect("register_continuous_stream via Flight SQL");
+
+    rt.push_continuous_stream_input("flight-cs-1", vec![])
+        .expect("push_continuous_stream_input via Flight SQL");
+
+    let _result = rt
+        .drain_continuous_stream("flight-cs-1")
+        .expect("drain_continuous_stream via Flight SQL");
 
     server.abort();
 }

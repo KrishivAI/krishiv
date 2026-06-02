@@ -3112,4 +3112,91 @@ mod tests {
         assert!(validate_epoch(&s, "j-del", 2).unwrap());
         assert_eq!(latest_valid_epoch(&s, "j-del").unwrap(), 2);
     }
+
+    // ── Restart-from-new-storage-instance ─────────────────────────────────────
+
+    #[test]
+    fn checkpoint_survives_storage_recreate() {
+        // Write a checkpoint to a real tempdir, then create a NEW storage instance
+        // pointing at the same directory to simulate a process restart.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let storage = LocalFsCheckpointStorage::new(dir.path()).unwrap();
+            let meta = sample_metadata(1);
+            write_epoch_metadata(&storage, "restart-job", 1, &meta).unwrap();
+            let mut manifest = IntegrityManifest::new();
+            let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+            // Manifest entries use paths RELATIVE to the epoch directory.
+            manifest.insert_bytes("metadata.json", &meta_json);
+            write_manifest(&storage, "restart-job", 1, &manifest).unwrap();
+            write_epoch_hint(&storage, "restart-job", 1).unwrap();
+        }
+        // Simulate restart by creating a fresh storage pointing at the same dir.
+        let storage2 = LocalFsCheckpointStorage::new(dir.path()).unwrap();
+        let epochs = list_valid_epochs(&storage2, "restart-job").unwrap();
+        assert!(epochs.contains(&1), "epoch 1 must survive storage recreate (restart)");
+        let latest = latest_valid_epoch(&storage2, "restart-job").unwrap();
+        assert_eq!(latest, 1, "latest_valid_epoch must return 1 after restart");
+    }
+
+    #[test]
+    fn partial_write_only_shows_complete_epochs() {
+        // Epoch 1: write metadata only (no manifest) — incomplete.
+        // Epoch 2: write metadata + manifest — complete.
+        // list_valid_epochs must return only epoch 2.
+        let s = make_storage();
+        write_epoch_metadata(&s, "partial-job", 1, &sample_metadata(1)).unwrap();
+        // Write epoch 2 fully.
+        let meta2 = sample_metadata(2);
+        write_epoch_metadata(&s, "partial-job", 2, &meta2).unwrap();
+        let mut m2 = IntegrityManifest::new();
+        let meta2_json = serde_json::to_vec_pretty(&meta2).unwrap();
+        // Manifest entries use paths RELATIVE to the epoch directory.
+        m2.insert_bytes("metadata.json", &meta2_json);
+        write_manifest(&s, "partial-job", 2, &m2).unwrap();
+
+        let epochs = list_valid_epochs(&s, "partial-job").unwrap();
+        assert!(
+            !epochs.contains(&1),
+            "epoch 1 (metadata only, no manifest) must not appear in list_valid_epochs"
+        );
+        assert!(
+            epochs.contains(&2),
+            "epoch 2 (complete write) must appear in list_valid_epochs"
+        );
+        assert_eq!(latest_valid_epoch(&s, "partial-job").unwrap(), 2);
+    }
+
+    // ── ObjectStoreCheckpointStorage round-trip ────────────────────────────────
+
+    #[tokio::test]
+    async fn object_store_checkpoint_write_read_roundtrip() {
+        use crate::object_store::ObjectStoreCheckpointStorage;
+        use std::sync::Arc;
+
+        let inner = Arc::new(::object_store::memory::InMemory::new());
+        let storage = ObjectStoreCheckpointStorage::new(inner, "ckpt-pfx");
+
+        storage
+            .write_bytes_async("test/file.bin", b"hello checkpoint")
+            .await
+            .unwrap();
+        let read = storage.read_bytes_async("test/file.bin").await.unwrap();
+        assert_eq!(
+            read.as_deref(),
+            Some(b"hello checkpoint".as_slice()),
+            "object-store checkpoint round-trip must preserve bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_checkpoint_missing_returns_none() {
+        use crate::object_store::ObjectStoreCheckpointStorage;
+        use std::sync::Arc;
+
+        let inner = Arc::new(::object_store::memory::InMemory::new());
+        let storage = ObjectStoreCheckpointStorage::new(inner, "pfx");
+        let result = storage.read_bytes_async("no/such/file.bin").await.unwrap();
+        assert!(result.is_none(), "missing file must return None");
+    }
 }

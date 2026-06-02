@@ -499,6 +499,179 @@ pub fn write_hudi_cow_fixture(
     Ok(())
 }
 
+// ── ObjectStore-backed Hudi reader/writer ────────────────────────────────────
+
+/// Serialize a `RecordBatch` to Parquet bytes in memory.
+fn batch_to_parquet_bytes(batch: &RecordBatch) -> LakehouseResult<bytes::Bytes> {
+    use parquet::arrow::ArrowWriter;
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    writer.write(batch).map_err(|e| LakehouseError::Io(e.to_string()))?;
+    writer.close().map_err(|e| LakehouseError::Io(e.to_string()))?;
+    Ok(bytes::Bytes::from(buf))
+}
+
+/// Read `RecordBatch`es from Parquet bytes.
+fn parquet_bytes_to_batches(data: bytes::Bytes) -> LakehouseResult<Vec<RecordBatch>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+    let reader = ParquetRecordBatchReader::try_new(data, 1024)
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| LakehouseError::Io(e.to_string()))
+}
+
+/// ObjectStore-backed Hudi Copy-On-Write reader.
+///
+/// Reads commits and Parquet data files from any `ObjectStore` implementation
+/// (S3, GCS, Azure, or in-memory for tests). Compatible with tables written
+/// by [`HudiObjectStoreWriter`].
+pub struct HudiObjectStoreReader {
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: String,
+    query_type: HudiQueryType,
+    begin_instant: Option<String>,
+}
+
+impl HudiObjectStoreReader {
+    /// Create a reader pointing at `prefix` within `store`.
+    pub fn new(store: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            store,
+            prefix: prefix.into(),
+            query_type: HudiQueryType::Snapshot,
+            begin_instant: None,
+        }
+    }
+
+    /// Restrict to commits after `instant` for incremental queries.
+    #[must_use]
+    pub fn with_begin_instant(mut self, instant: impl Into<String>) -> Self {
+        self.begin_instant = Some(instant.into());
+        self
+    }
+
+    /// Set query type.
+    #[must_use]
+    pub fn with_query_type(mut self, query_type: HudiQueryType) -> Self {
+        self.query_type = query_type;
+        self
+    }
+
+    async fn timeline_prefix(&self) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{}/.hoodie/timeline", self.prefix))
+    }
+
+    async fn list_commits(&self) -> LakehouseResult<Vec<String>> {
+        use futures::StreamExt as _;
+        let prefix = self.timeline_prefix().await;
+        let mut commits = Vec::new();
+        let mut stream = self.store.list(Some(&prefix));
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let name = meta.location.filename().unwrap_or("").to_string();
+            if name.ends_with(".commit") {
+                commits.push(name.trim_end_matches(".commit").to_string());
+            }
+        }
+        commits.sort();
+        Ok(commits)
+    }
+
+    /// Scan all matching Parquet files and return record batches.
+    pub async fn scan_batches(&self) -> LakehouseResult<Vec<RecordBatch>> {
+        use futures::StreamExt as _;
+        let all_commits = self.list_commits().await?;
+        let commits: Vec<_> = match self.query_type {
+            HudiQueryType::Snapshot => all_commits,
+            HudiQueryType::Incremental => {
+                let begin = self.begin_instant.as_deref().ok_or_else(|| {
+                    LakehouseError::Io("incremental query requires begin_instant".into())
+                })?;
+                all_commits.into_iter().filter(|c| c.as_str() > begin).collect()
+            }
+        };
+
+        let mut out = Vec::new();
+        for commit in &commits {
+            // Find Parquet files under <prefix>/<commit>/
+            let commit_prefix =
+                object_store::path::Path::from(format!("{}/{}", self.prefix, commit));
+            let mut stream = self.store.list(Some(&commit_prefix));
+            while let Some(meta) = stream.next().await {
+                let meta = meta.map_err(|e| LakehouseError::Io(e.to_string()))?;
+                let name = meta.location.filename().unwrap_or("").to_string();
+                if name.ends_with(".parquet") {
+                    let get_result = self
+                        .store
+                        .get_opts(&meta.location, Default::default())
+                        .await
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                    let data = get_result
+                        .bytes()
+                        .await
+                        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                    out.extend(parquet_bytes_to_batches(data)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// ObjectStore-backed Hudi Copy-On-Write writer.
+///
+/// Each commit writes one Parquet data file and a marker file in the timeline.
+pub struct HudiObjectStoreWriter {
+    store: Arc<dyn object_store::ObjectStore>,
+    prefix: String,
+}
+
+impl HudiObjectStoreWriter {
+    /// Create a writer targeting `prefix` within `store`.
+    pub fn new(store: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            store,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Append rows, generating a new Hudi instant.
+    pub async fn append(&self, batch: RecordBatch) -> LakehouseResult<HudiWriteResult> {
+        let instant = next_instant();
+        let parquet_bytes = batch_to_parquet_bytes(&batch)?;
+        let data_path = object_store::path::Path::from(format!(
+            "{}/{}/part-0.parquet",
+            self.prefix, instant
+        ));
+        self.store
+            .put_opts(&data_path, parquet_bytes.into(), Default::default())
+            .await
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Write timeline commit marker.
+        let commit_path = object_store::path::Path::from(format!(
+            "{}/.hoodie/timeline/{}.commit",
+            self.prefix, instant
+        ));
+        self.store
+            .put_opts(
+                &commit_path,
+                bytes::Bytes::from("{}").into(),
+                Default::default(),
+            )
+            .await
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let rows = batch.num_rows() as u64;
+        Ok(HudiWriteResult {
+            instant,
+            rows_inserted: rows,
+            rows_updated: 0,
+            snapshot_rows: rows,
+        })
+    }
+}
+
 fn write_parquet_i64_string(path: &Path, rows: &[(i64, &str)]) -> LakehouseResult<()> {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -965,5 +1138,46 @@ mod tests {
         .unwrap();
         let err = writer.upsert_at("20240101120000", "id", batch);
         assert!(matches!(err, Err(LakehouseError::Io(_))));
+    }
+
+    // ── ObjectStore-backed Hudi: round-trip tests ──────────────────────────
+
+    fn make_inmemory_store() -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(object_store::memory::InMemory::new())
+    }
+
+    #[tokio::test]
+    async fn hudi_object_store_write_then_read() {
+        let store = make_inmemory_store();
+        let writer = HudiObjectStoreWriter::new(Arc::clone(&store), "test/table");
+        let input = batch(&[(1, "alice"), (2, "bob")]);
+        let result = writer.append(input).await.unwrap();
+        assert_eq!(result.rows_inserted, 2);
+
+        let reader = HudiObjectStoreReader::new(Arc::clone(&store), "test/table");
+        let batches = reader.scan_batches().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2, "object-store Hudi round-trip must return all written rows");
+    }
+
+    #[tokio::test]
+    async fn hudi_object_store_multiple_commits_readable() {
+        let store = make_inmemory_store();
+        let writer = HudiObjectStoreWriter::new(Arc::clone(&store), "multi/table");
+        writer.append(batch(&[(1, "a")])).await.unwrap();
+        writer.append(batch(&[(2, "b"), (3, "c")])).await.unwrap();
+
+        let reader = HudiObjectStoreReader::new(Arc::clone(&store), "multi/table");
+        let batches = reader.scan_batches().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "all rows across two commits must be readable");
+    }
+
+    #[tokio::test]
+    async fn hudi_object_store_empty_store_returns_empty() {
+        let store = make_inmemory_store();
+        let reader = HudiObjectStoreReader::new(Arc::clone(&store), "empty/table");
+        let batches = reader.scan_batches().await.unwrap();
+        assert!(batches.is_empty(), "empty object store must return no batches");
     }
 }

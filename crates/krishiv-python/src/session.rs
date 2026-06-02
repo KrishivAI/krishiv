@@ -437,6 +437,56 @@ fn remote_execution_from_env() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+mod tests {
+    use krishiv_api::{ExecutionMode, SessionBuilder};
+    use krishiv_runtime::ExecutionRuntime;
+
+    #[test]
+    fn connect_always_enables_remote_execution() {
+        let session = SessionBuilder::new()
+            .with_coordinator("http://fake.invalid:50051")
+            .with_remote_execution(true)
+            .build()
+            .expect("session build");
+        assert!(
+            session.execution_runtime().uses_remote_execution(),
+            "Session::connect must always route to remote coordinator"
+        );
+        assert_eq!(session.mode(), ExecutionMode::Distributed);
+    }
+
+    #[test]
+    fn session_builder_embedded_mode() {
+        // Build embedded session via Rust SessionBuilder directly (no env vars needed).
+        let session = SessionBuilder::new().build().expect("embedded session");
+        assert_eq!(session.mode(), ExecutionMode::Embedded);
+        assert!(!session.execution_runtime().uses_remote_execution());
+    }
+
+    #[test]
+    fn session_builder_distributed_mode_with_coordinator() {
+        // Build a distributed session with explicit coordinator URL.
+        let session = SessionBuilder::new()
+            .with_coordinator("http://fake.invalid:50051")
+            .with_remote_execution(true)
+            .build()
+            .expect("distributed session");
+        assert_eq!(session.mode(), ExecutionMode::Distributed);
+        assert!(session.execution_runtime().uses_remote_execution());
+    }
+
+    #[test]
+    fn embedded_session_stream_registration_succeeds() {
+        let session = SessionBuilder::new().build().expect("embedded session");
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let result = session.register_unbounded("stream_src", schema);
+        assert!(result.is_ok(), "register_unbounded must succeed for embedded session");
+    }
+}
+
 fn parse_role(role: &str) -> PyResult<Role> {
     match role.to_lowercase().as_str() {
         "admin" => Ok(Role::Admin),

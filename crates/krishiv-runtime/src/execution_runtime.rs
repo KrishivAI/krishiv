@@ -1044,4 +1044,22 @@ mod tests {
             .unwrap();
         assert!(!out.is_empty());
     }
+
+    #[test]
+    fn remote_runtime_rejects_streaming_plan() {
+        let rt = build_execution_runtime(
+            RuntimeMode::Distributed,
+            None,
+            Some("http://fake.invalid:50051".into()),
+            None,
+            ExecutionPlacement::RemoteClusterRequired,
+        )
+        .expect("distributed runtime");
+        let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
+        let err = rt.accept_plan(&plan).unwrap_err();
+        assert!(
+            matches!(err, crate::RuntimeError::Unsupported { .. }),
+            "streaming plan dispatch to remote must return Unsupported, got: {err:?}"
+        );
+    }
 }

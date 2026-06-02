@@ -5828,4 +5828,178 @@ mod scheduler_tests {
         let valid_outcome = coordinator.apply_task_update(valid_update).unwrap();
         assert_eq!(valid_outcome, TaskUpdateOutcome::Applied);
     }
+
+    // ── Executor failover ─────────────────────────────────────────────────────
+
+    #[test]
+    fn executor_failover_reassigns_task_to_surviving_executor() {
+        allow_anonymous_for_tests();
+        let exec_a = ExecutorId::try_new("failover-exec-a").unwrap();
+        let exec_b = ExecutorId::try_new("failover-exec-b").unwrap();
+        let job_id = JobId::try_new("failover-job").unwrap();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("failover-coord").unwrap());
+
+        let _lease_a = coordinator
+            .register_executor(ExecutorDescriptor::new(exec_a.clone(), "pod-a", 4))
+            .unwrap();
+        let _lease_b = coordinator
+            .register_executor(ExecutorDescriptor::new(exec_b.clone(), "pod-b", 4))
+            .unwrap();
+
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+
+        // Assign task and launch it so it has an assigned executor.
+        let assignments = coordinator
+            .launch_assigned_task_assignments(&job_id)
+            .unwrap();
+        assert_eq!(assignments.len(), 1, "single-task job must produce one assignment");
+        let assigned_exec = assignments[0].executor_id().clone();
+
+        // The task is in-flight on `assigned_exec`. Simulate that executor going lost.
+        coordinator.reset_running_tasks_for_lost_executor(&assigned_exec);
+
+        // After reset, the task should be pending/assigned on the surviving executor.
+        // reset_running_tasks_for_lost_executor calls assign_pending_tasks internally.
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task = &detail.stages()[0].tasks()[0];
+        assert!(
+            task.state() == TaskState::Assigned || task.state() == TaskState::Pending,
+            "task must be re-queued (Pending or Assigned) after executor loss, got {:?}",
+            task.state()
+        );
+    }
+
+    #[test]
+    fn executor_max_losses_permanently_fails_task() {
+        allow_anonymous_for_tests();
+        const MAX_LOSSES: u32 = 5;
+        let exec_id = ExecutorId::try_new("loss-exec").unwrap();
+        let job_id = JobId::try_new("loss-job").unwrap();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("loss-coord").unwrap());
+
+        coordinator
+            .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-loss", 4))
+            .unwrap();
+        coordinator
+            .submit_job(single_task_job(job_id.clone()))
+            .unwrap();
+
+        // Simulate MAX_LOSSES consecutive executor losses.
+        for i in 0..MAX_LOSSES {
+            // Launch to get an assignment so the task is in-flight.
+            let assignments = coordinator
+                .launch_assigned_task_assignments(&job_id)
+                .unwrap();
+            if assignments.is_empty() {
+                // Task might already be Failed at this point.
+                break;
+            }
+            let exec_for_task = assignments[0].executor_id().clone();
+            let _ = i;
+            coordinator.reset_running_tasks_for_lost_executor(&exec_for_task);
+        }
+
+        let detail = coordinator.job_detail_snapshot(&job_id).unwrap();
+        let task_state = detail.stages()[0].tasks()[0].state();
+        assert_eq!(
+            task_state,
+            TaskState::Failed,
+            "task must be permanently Failed after {MAX_LOSSES} consecutive executor losses"
+        );
+    }
+
+    // ── Admission quota: saturating_add at boundary ────────────────────────────
+
+    #[test]
+    fn quota_saturating_add_at_u64_max_does_not_panic() {
+        // QuotaQueueManager must not overflow (panic) when existing reservations
+        // are near u64::MAX. saturating_add prevents wrapping.
+        // With cpu_nanos_limit = u64::MAX and reserved = u64::MAX, adding any
+        // nonzero request saturates to u64::MAX which equals the limit, so the
+        // job may be admitted or queued depending on the comparison (> vs >=).
+        // What matters: no panic.
+        let qm = QuotaQueueManager::with_default(QuotaPolicy {
+            cpu_nanos_limit: Some(u64::MAX),
+            memory_bytes_limit: Some(u64::MAX),
+            max_concurrent_jobs: None,
+        });
+        let spec = demo_job()
+            .with_cpu_limit_nanos(u64::MAX)
+            .with_memory_limit_bytes(u64::MAX);
+        let quota = NamespaceQuotaSnapshot {
+            cpu_nanos_reserved: u64::MAX,
+            memory_bytes_reserved: u64::MAX,
+            ..Default::default()
+        };
+        // Must not panic regardless of Accepted/Queued outcome.
+        let _outcome = qm.admit(&spec, &quota);
+    }
+
+    // ── etcd: simulation-mode tests (no live etcd required) ─────────────────
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn etcd_lease_simulation_new_is_not_leader() {
+        let election = crate::EtcdLeaseElection::new(
+            "/krishiv/test/leader",
+            "test-holder",
+            15,
+        );
+        assert!(
+            !election.is_leader(),
+            "simulation mode must start with is_leader=false"
+        );
+    }
+
+    #[cfg(feature = "etcd")]
+    #[tokio::test]
+    async fn etcd_lease_simulation_try_acquire_makes_leader() {
+        use crate::LeaderElection;
+        let election = crate::EtcdLeaseElection::new(
+            "/krishiv/test/leader",
+            "test-holder",
+            15,
+        );
+        assert!(!election.is_leader());
+        let became_leader = election.try_acquire().await;
+        assert!(became_leader, "simulation mode must always grant leadership");
+        assert!(election.is_leader());
+    }
+
+    #[cfg(feature = "etcd")]
+    #[tokio::test]
+    async fn etcd_lease_simulation_release_clears_leader() {
+        use crate::LeaderElection;
+        let election = crate::EtcdLeaseElection::new(
+            "/krishiv/test/leader",
+            "test-holder",
+            15,
+        );
+        election.try_acquire().await;
+        assert!(election.is_leader());
+        election.release().await;
+        assert!(!election.is_leader(), "release() must clear is_leader");
+    }
+
+    #[cfg(feature = "etcd")]
+    #[ignore = "requires a live etcd at localhost:2379; run with --features etcd"]
+    #[tokio::test]
+    async fn coordinator_with_etcd_metadata_backend_roundtrip() {
+        // This test validates EtcdMetadataStore connect + save/recover against
+        // a real etcd instance. To run:
+        //   cargo test -p krishiv-scheduler --lib --features etcd -- \
+        //       coordinator_with_etcd_metadata_backend_roundtrip --ignored
+        let result = crate::EtcdMetadataStore::connect(vec![
+            "http://localhost:2379".to_string(),
+        ])
+        .await;
+        assert!(
+            result.is_ok(),
+            "EtcdMetadataStore::connect must succeed with live etcd"
+        );
+    }
 }

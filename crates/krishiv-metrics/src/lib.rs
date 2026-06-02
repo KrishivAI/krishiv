@@ -30,6 +30,8 @@ pub enum TracerExporter {
     Stdout,
     /// Disables all span export. Used in tests and when telemetry is not needed.
     NoOp,
+    /// Captures exported spans in memory. Useful for asserting span attributes in tests.
+    InMemory(opentelemetry_sdk::trace::InMemorySpanExporter),
 }
 
 /// **Beta API**: may change between minor releases.
@@ -158,6 +160,10 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
                 .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
                 .build(),
             TracerExporter::NoOp => SdkTracerProvider::builder().build(),
+            TracerExporter::InMemory(exporter) => SdkTracerProvider::builder()
+                .with_resource(resource)
+                .with_simple_exporter(exporter)
+                .build(),
         }
     };
 
@@ -1627,10 +1633,89 @@ mod tests {
         assert!(body.contains("krishiv_checkpoint_epoch"));
     }
 
-    // ── OTLP integration test ───────────────────────────────────────────────
+    // ── deployment_target unit tests ────────────────────────────────────────
 
-    /// OTLP integration test — only runs when OTEL_EXPORTER_OTLP_ENDPOINT is set.
-    #[tokio::test]
+    #[test]
+    fn resolved_deployment_target_explicit_config() {
+        let config = MetricsConfig {
+            deployment_target: Some("production".into()),
+            ..MetricsConfig::default()
+        };
+        assert_eq!(config.resolved_deployment_target(), "production");
+    }
+
+    #[test]
+    fn resolved_deployment_target_none_returns_env_or_unknown() {
+        // When no explicit config is given, the function reads the env var or
+        // falls back to "unknown". We verify the documented fallback chain
+        // without mutating the environment (unsafe_code is workspace-forbidden).
+        let config = MetricsConfig { deployment_target: None, ..MetricsConfig::default() };
+        let result = config.resolved_deployment_target();
+        let expected = std::env::var("KRISHIV_DEPLOYMENT_TARGET")
+            .unwrap_or_else(|_| "unknown".to_string());
+        assert_eq!(
+            result, expected,
+            "resolved value must match the env var when set, or 'unknown' when absent"
+        );
+    }
+
+    #[test]
+    fn resolved_deployment_target_explicit_beats_any_env() {
+        // When deployment_target is explicitly set, it wins regardless of any
+        // env var — no env mutation needed to test this invariant.
+        let config = MetricsConfig {
+            deployment_target: Some("explicit-wins".into()),
+            ..MetricsConfig::default()
+        };
+        assert_eq!(
+            config.resolved_deployment_target(),
+            "explicit-wins",
+            "explicit config must always override the env var fallback"
+        );
+    }
+
+    #[test]
+    fn inmemory_exporter_captures_spans_after_init() {
+        // Verifies that TracerExporter::InMemory is correctly wired into init()
+        // and that emitted spans reach the exporter's capture buffer.
+        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+        let exporter = InMemorySpanExporter::default();
+        let config = MetricsConfig {
+            service_name: "span-capture-test".into(),
+            exporter: TracerExporter::InMemory(exporter.clone()),
+            deployment_target: Some("test-cluster".into()),
+            otlp_endpoint: None,
+            log_filter: None,
+        };
+        let handle = init(config).expect("init must succeed with InMemory exporter");
+
+        // Emit a span and close it so the simple span processor exports it.
+        {
+            let tracer = opentelemetry::global::tracer("capture-test");
+            let span = tracer.start("test-capture-span");
+            drop(span);
+        }
+
+        // Force flush to drain the processor.
+        let _ = handle.tracer_provider.force_flush();
+
+        let spans = exporter.get_finished_spans().expect("get_finished_spans must succeed");
+        assert!(
+            !spans.is_empty(),
+            "at least one span must be captured by InMemory exporter after init()"
+        );
+        // The deployment.target is passed to the resource builder in init().
+        // Its correctness is validated by the resolved_deployment_target unit tests.
+        // Here we just verify the span name is preserved.
+        assert!(
+            spans.iter().any(|s| s.name.as_ref() == "test-capture-span"),
+            "captured span must have the expected name"
+        );
+    }
+
+
     #[ignore = "requires live OTLP collector at OTEL_EXPORTER_OTLP_ENDPOINT"]
     async fn otlp_integration_exports_span() {
         let endpoint = match std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
