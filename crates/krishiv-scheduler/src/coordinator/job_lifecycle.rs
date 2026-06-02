@@ -147,6 +147,8 @@ impl Coordinator {
             self.gc_ready_jobs.push(job_id.clone());
         }
         self.checkpoint_coordinators.remove(job_id);
+        self.job_input_partitions.remove(job_id);
+        self.batch_sql_job_tables.remove(job_id);
 
         // Emit OpenLineage FAIL event for job cancellation (Phase 3 M5 / GAP-OB-06)
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -290,6 +292,11 @@ impl Coordinator {
             }
             self.gc_ready_jobs.push(job_id.clone());
             self.checkpoint_coordinators.remove(&job_id);
+            // Free inline input data (InlineIpc partitions for batch-sql and
+            // bounded-window jobs) — executors have already consumed this by the
+            // time the job reaches a terminal state.
+            self.job_input_partitions.remove(&job_id);
+            self.batch_sql_job_tables.remove(&job_id);
             self.queue_manager.on_job_complete(&job_id, &usage);
 
             // Emit OpenLineage COMPLETE/FAIL events (Phase 3 M5 / GAP-OB-06)

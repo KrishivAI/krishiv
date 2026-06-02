@@ -50,13 +50,13 @@ impl Coordinator {
         self.batch_sql_job_tables.insert(job_id, tables);
     }
 
-    /// Register inline input partitions for a bounded-window job.
-    pub fn register_window_partitions(
+    /// Register inline input partitions for a batch-sql or bounded-window job.
+    pub fn register_job_input_partitions(
         &mut self,
         job_id: JobId,
         partitions: Vec<krishiv_proto::InputPartition>,
     ) {
-        self.window_job_partitions.insert(job_id, partitions);
+        self.job_input_partitions.insert(job_id, partitions);
     }
 
     /// Launch all assigned tasks for a job and return executor transport assignments.
@@ -91,7 +91,7 @@ impl Coordinator {
         }
 
         let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();
-        let window_parts = self.window_job_partitions.get(job_id).cloned();
+        let window_parts = self.job_input_partitions.get(job_id).cloned();
         let assignments = self
             .find_job_mut(job_id)?
             .launch_assigned_task_assignments(

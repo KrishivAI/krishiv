@@ -263,7 +263,6 @@ pub async fn spawn_coordinator_sidecars(
 }
 
 pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
-    use crate::batch_sql_http::api_batch_sql;
     use crate::federation_http::{
         federation_cancel_job, federation_job_status, federation_submit_job,
     };
@@ -278,7 +277,6 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
         .route("/ui", get(live_ui))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
-        .route("/api/v1/batch-sql", post(api_batch_sql))
         .route(
             "/api/v1/batch-sql/submit",
             post(crate::batch_sql_http::api_batch_sql_submit),

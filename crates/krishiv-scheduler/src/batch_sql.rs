@@ -164,7 +164,7 @@ pub async fn submit_batch_sql_job(
     let mut coord = coordinator.write().await;
     coord.ensure_active()?;
     coord.submit_job(spec)?;
-    coord.register_window_partitions(job_id.clone(), input_partitions);
+    coord.register_job_input_partitions(job_id.clone(), input_partitions);
     Ok(job_id)
 }
 

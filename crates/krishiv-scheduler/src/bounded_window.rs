@@ -75,7 +75,7 @@ pub async fn execute_bounded_window_coordinated(
         coord.ensure_active()?;
         coord.submit_job(job_spec)?;
         // Register inline partitions separately — same pattern as batch_sql_job_tables.
-        coord.register_window_partitions(job_id.clone(), vec![input_partition]);
+        coord.register_job_input_partitions(job_id.clone(), vec![input_partition]);
     }
 
     let notify = {

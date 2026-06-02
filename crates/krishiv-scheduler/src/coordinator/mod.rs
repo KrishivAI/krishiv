@@ -134,8 +134,8 @@ pub struct Coordinator {
     pub(crate) job_inline_results: HashMap<JobId, Vec<Vec<u8>>>,
     /// Parquet tables registered for coordinated `batch-sql` jobs.
     pub(crate) batch_sql_job_tables: HashMap<JobId, Vec<crate::batch_sql::BatchSqlTable>>,
-    /// Inline input partitions registered for coordinated `bounded-window` jobs.
-    pub(crate) window_job_partitions: HashMap<JobId, Vec<krishiv_proto::InputPartition>>,
+    /// Inline input partitions registered for coordinated batch-sql and bounded-window jobs.
+    pub(crate) job_input_partitions: HashMap<JobId, Vec<krishiv_proto::InputPartition>>,
 
     /// Notify channel for waking daemon tick and other waiters on state change.
     pub(crate) notify: Arc<Notify>,
@@ -636,7 +636,7 @@ impl Coordinator {
             ),
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
-            window_job_partitions: HashMap::new(),
+            job_input_partitions: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
         }

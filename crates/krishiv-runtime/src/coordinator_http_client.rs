@@ -132,16 +132,26 @@ pub async fn execute_coordinator_batch_sql(
     let base = normalize_http_base(coordinator_http)?;
 
     // Step 1: convert local parquet files to inline IPC and submit.
-    let inline_tables: Vec<BatchSqlInlineTableJson> = tables
-        .iter()
-        .map(|t| {
-            let ipc_b64 = parquet_to_ipc_b64(&t.path)?;
-            Ok(BatchSqlInlineTableJson {
-                table_name: t.table_name.clone(),
-                ipc_b64,
-            })
+    // parquet_to_ipc_b64 is CPU/IO-bound; run it on the blocking thread pool so
+    // the async executor is not stalled while reading and encoding the files.
+    let tables_owned: Vec<_> = tables.to_vec();
+    let inline_tables: Vec<BatchSqlInlineTableJson> =
+        tokio::task::spawn_blocking(move || {
+            tables_owned
+                .iter()
+                .map(|t| {
+                    let ipc_b64 = parquet_to_ipc_b64(&t.path)?;
+                    Ok(BatchSqlInlineTableJson {
+                        table_name: t.table_name.clone(),
+                        ipc_b64,
+                    })
+                })
+                .collect::<RuntimeResult<_>>()
         })
-        .collect::<RuntimeResult<_>>()?;
+        .await
+        .map_err(|e| {
+            RuntimeError::transport(format!("parquet-to-ipc blocking task failed: {e}"))
+        })??;
 
     let submit_body = BatchSqlRequestBody {
         query: query.to_string(),

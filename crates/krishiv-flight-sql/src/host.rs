@@ -16,6 +16,26 @@ use krishiv_runtime::in_process_cluster::{InProcessCluster, plan_spec_to_local};
 use krishiv_sql::explain_sql;
 use tonic::Status;
 
+/// Extract `RegisterParquetIpc` directives into a per-request inline table list.
+///
+/// These tables are scoped to a single `execute_sql` call so concurrent callers
+/// cannot see each other's in-flight data.
+fn collect_ipc_tables(directives: &[FlightDirective]) -> Vec<krishiv_scheduler::BatchSqlInlineTable> {
+    directives
+        .iter()
+        .filter_map(|d| {
+            if let FlightDirective::RegisterParquetIpc { table, ipc_b64 } = d {
+                Some(krishiv_scheduler::BatchSqlInlineTable {
+                    table_name: table.clone(),
+                    ipc_b64: ipc_b64.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Server-side catalog and cluster state shared across Flight SQL requests.
 ///
 /// In **proxy mode** (`coordinator_http` is `Some`), batch SQL and bounded
@@ -31,12 +51,8 @@ pub struct FlightExecutionHost {
     /// batch SQL and bounded windows in embedded mode.
     cluster: Arc<InProcessCluster>,
     continuous: Arc<ContinuousStreamRegistry>,
-    /// Path-based catalog (fallback for single-node / shared-filesystem setups).
+    /// Path-based catalog shared across requests (persisted registrations).
     catalog: Arc<DashMap<String, PathBuf>>,
-    /// Inline IPC catalog: Arrow IPC bytes (base64) keyed by table name.
-    /// Populated when the client sends `RegisterParquetIpc` directives so the
-    /// flight server never needs to read from the local filesystem.
-    ipc_catalog: Arc<DashMap<String, String>>,
     /// When set, routes batch SQL and bounded windows through the coordinator.
     coordinator_http: Option<String>,
 }
@@ -69,7 +85,6 @@ impl FlightExecutionHost {
             cluster: Arc::new(cluster),
             continuous: Arc::new(ContinuousStreamRegistry::new()),
             catalog: Arc::new(DashMap::new()),
-            ipc_catalog: Arc::new(DashMap::new()),
             coordinator_http,
         })
     }
@@ -91,6 +106,11 @@ impl FlightExecutionHost {
         let (directives, sql) = parse_sql(raw_sql);
         self.apply_catalog_directives(&directives)?;
 
+        // Build per-request inline IPC table list from this call's directives only.
+        // Tables are NOT stored in shared state, so concurrent calls cannot observe
+        // each other's in-flight data.
+        let ipc_tables = collect_ipc_tables(&directives);
+
         if has_control_directive(&directives) {
             return self.handle_control_directives(directives, &sql).await;
         }
@@ -99,7 +119,6 @@ impl FlightExecutionHost {
         let sql = sql.to_string();
 
         if let Some(http_base) = self.coordinator_http.as_deref() {
-            let ipc_tables = self.ipc_tables();
             return krishiv_runtime::execute_coordinator_batch_sql_inline(
                 http_base,
                 &sql,
@@ -119,12 +138,8 @@ impl FlightExecutionHost {
         for (table, path) in catalog_map {
             self.catalog.insert(table, path);
         }
-        // Handle inline IPC directives.
-        for directive in directives {
-            if let FlightDirective::RegisterParquetIpc { table, ipc_b64 } = directive {
-                self.ipc_catalog.insert(table.clone(), ipc_b64.clone());
-            }
-        }
+        // RegisterParquetIpc directives are handled per-request in collect_ipc_tables
+        // and are NOT stored in shared state.
         Ok(())
     }
 
@@ -134,17 +149,6 @@ impl FlightExecutionHost {
             .map(|entry| BatchSqlTable {
                 table_name: entry.key().clone(),
                 path: entry.value().clone(),
-            })
-            .collect()
-    }
-
-    /// Inline IPC tables (base64-encoded Arrow IPC bytes keyed by table name).
-    fn ipc_tables(&self) -> Vec<krishiv_scheduler::BatchSqlInlineTable> {
-        self.ipc_catalog
-            .iter()
-            .map(|entry| krishiv_scheduler::BatchSqlInlineTable {
-                table_name: entry.key().clone(),
-                ipc_b64: entry.value().clone(),
             })
             .collect()
     }
