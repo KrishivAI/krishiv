@@ -1,0 +1,6 @@
+grpcio>=1.60
+protobuf>=4.25
+pyarrow>=15.0
+
+[pandas]
+pandas>=2.0

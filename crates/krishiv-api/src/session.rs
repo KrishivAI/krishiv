@@ -281,6 +281,7 @@ impl SessionBuilder {
             runtime,
             registered_parquet: Arc::new(DashMap::new()),
             stream_jobs: Arc::new(DashMap::new()),
+            unbounded_streams: Arc::new(DashMap::new()),
         })
     }
 }
@@ -302,6 +303,7 @@ pub struct Session {
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
+    unbounded_streams: Arc<DashMap<String, tokio::sync::mpsc::UnboundedSender<RecordBatch>>>,
 }
 
 impl fmt::Debug for Session {
@@ -397,8 +399,15 @@ impl Session {
         Ok(name)
     }
 
-    /// Push input batches to a continuous streaming job.
     pub fn push_stream_job_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> Result<()> {
+        if let Some(tx) = self.unbounded_streams.get(job_id) {
+            for batch in batches {
+                tx.send(batch).map_err(|e| KrishivError::Runtime {
+                    message: format!("Failed to push to stream {}: {}", job_id, e),
+                })?;
+            }
+            return Ok(());
+        }
         self.runtime
             .push_continuous_stream_input(job_id, batches)
             .map_err(KrishivError::from)
@@ -501,10 +510,12 @@ impl Session {
     /// any SQL that references `name`.  The registration is visible to all
     /// clones of this session because the underlying set is shared via
     /// `Arc<RwLock<>>`.
-    pub fn register_unbounded(&self, name: &str) -> Result<()> {
-        self.sql_engine
-            .register_streaming_source(name)
-            .map_err(KrishivError::from)
+    pub fn register_unbounded(&self, name: &str, schema: arrow::datatypes::SchemaRef) -> Result<()> {
+        let tx = self.sql_engine
+            .register_streaming_table(name, schema)
+            .map_err(KrishivError::from)?;
+        self.unbounded_streams.insert(name.to_string(), tx);
+        Ok(())
     }
 
     /// Returns `true` if `sql` references any registered streaming source.

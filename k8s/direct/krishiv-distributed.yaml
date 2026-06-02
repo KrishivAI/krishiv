@@ -6,7 +6,7 @@
 #   flight-server (1 pod) — Arrow Flight :50051       NodePort :30051
 #
 # Usage:
-#   kubectl apply -f k8s/manifests/krishiv-distributed.yaml
+#   kubectl apply -f k8s/direct/krishiv-distributed.yaml
 #
 # Prerequisites:
 #   - Namespace krishiv-system must exist

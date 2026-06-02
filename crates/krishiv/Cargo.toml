@@ -76,3 +76,8 @@ krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-udf = { path = "../krishiv-udf" }
 parquet = { workspace = true }
 tempfile = { workspace = true }
+
+[[bin]]
+name = "k8s_sql_examples"
+path = "../../examples/rust/k8s_sql_examples.rs"
+

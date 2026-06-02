@@ -1,14 +1,18 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+
 resources:
-  - ../crds/krishivjobs.yaml
-  - ../crds/krishivqueues.yaml
+  # CRDs (referenced as a kustomization directory, not individual files)
+  - ../crds
+  # Namespace and access control
   - namespace.yaml
   - serviceaccount.yaml
   - rbac.yaml
+  # Control plane
   - operator-deployment.yaml
   - coordinator-service.yaml
   - executor-deployment.yaml
-  - sample-krishivjob.yaml
-  - sample-streaming-krishivjob.yaml
   - network-policy.yaml
+  # Example workloads
+  - samples/krishivjob-batch.yaml
+  - samples/krishivjob-streaming.yaml

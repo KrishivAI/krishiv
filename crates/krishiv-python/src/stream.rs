@@ -16,7 +16,7 @@ fn new_windowed_stream(pipeline: StreamPipeline) -> PyWindowedStream {
     PyWindowedStream {
         pipeline,
         cached: Mutex::new(None),
-        iter_idx: Mutex::new(0),
+        stream_rx: Mutex::new(None),
     }
 }
 
@@ -196,7 +196,7 @@ impl PyKeyedStream {
 pub struct PyWindowedStream {
     pub(crate) pipeline: StreamPipeline,
     cached: Mutex<Option<Vec<PyBatch>>>,
-    iter_idx: Mutex<usize>,
+    stream_rx: Mutex<Option<tokio::sync::mpsc::Receiver<PyResult<PyBatch>>>>,
 }
 
 impl PyWindowedStream {
@@ -205,7 +205,6 @@ impl PyWindowedStream {
         if cached.is_none() {
             let batches = execute_pipeline(&self.pipeline)?;
             *cached = Some(batches);
-            *self.iter_idx.lock().unwrap() = 0;
         }
         Ok(())
     }
@@ -237,20 +236,28 @@ impl PyWindowedStream {
     }
 
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        let mut rx_guard = slf.stream_rx.lock().unwrap();
+        if rx_guard.is_none() {
+            if let Ok(rx) = crate::stream_exec::spawn_pipeline_stream(slf.pipeline.clone()) {
+                *rx_guard = Some(rx);
+            }
+        }
+        drop(rx_guard);
         slf
     }
 
     pub fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
-        self.ensure_collected()?;
-        let cached = self.cached.lock().unwrap();
-        let mut idx = self.iter_idx.lock().unwrap();
-        let batches = cached.as_ref().expect("collected");
-        if *idx >= batches.len() {
-            return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+        let mut rx_guard = self.stream_rx.lock().unwrap();
+        if let Some(rx) = rx_guard.as_mut() {
+            let res = rx.blocking_recv();
+            match res {
+                Some(Ok(batch)) => Ok(Some(Py::new(py, batch)?)),
+                Some(Err(e)) => Err(e),
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        } else {
+            Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
         }
-        let batch = batches[*idx].clone();
-        *idx += 1;
-        Ok(Some(Py::new(py, batch)?))
     }
 
     pub fn __repr__(&self) -> String {

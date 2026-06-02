@@ -23,6 +23,10 @@ pub use task_fragment::{
     TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
 };
 
+pub type SendableRecordBatchStream = std::pin::Pin<
+    Box<dyn futures::stream::Stream<Item = Result<arrow::record_batch::RecordBatch, String>> + Send>,
+>;
+
 /// Errors returned by plan encoding, decoding, and validation operations.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PlanError {

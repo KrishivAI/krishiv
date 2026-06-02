@@ -3904,6 +3904,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "dashmap",
+ "futures",
  "krishiv-common",
  "krishiv-exec",
  "krishiv-flight-sql",
@@ -4028,7 +4029,9 @@ name = "krishiv-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-stream",
  "dashmap",
+ "futures",
  "krishiv-ai",
  "krishiv-cep",
  "krishiv-lakehouse",
@@ -4190,6 +4193,8 @@ dependencies = [
 name = "krishiv-plan"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4216,6 +4221,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "dashmap",
+ "futures",
  "krishiv-ai",
  "krishiv-api",
  "krishiv-catalog",
@@ -4353,9 +4359,11 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "futures",
  "krishiv-catalog",
  "krishiv-cep",
  "krishiv-common",
+ "krishiv-connectors",
  "krishiv-governance",
  "krishiv-lakehouse",
  "krishiv-optimizer",
@@ -4365,6 +4373,8 @@ dependencies = [
  "sqlparser",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

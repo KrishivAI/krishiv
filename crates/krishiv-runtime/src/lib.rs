@@ -38,7 +38,9 @@ pub use flight_action::{
 };
 pub use in_process::{BatchSqlTable, InProcessStreamingRuntime, execute_windowed_in_process};
 pub use in_process_cluster::{InProcessCluster, fragment_from_local_spec, plan_spec_to_local};
-pub use local_streaming::{LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream};
+pub use local_streaming::{
+    LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
+};
 pub use plan::is_streaming_plan;
 
 // tracing is used for debug-level plan delegation logging.

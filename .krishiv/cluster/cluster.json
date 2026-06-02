@@ -1,0 +1,12 @@
+{
+  "clusterd_grpc": "http://127.0.0.1:9090",
+  "ui_url": "http://127.0.0.1:18080/ui",
+  "metadata_path": ".krishiv/cluster/metadata.json",
+  "data_dir": ".krishiv/cluster",
+  "clusterd_pid": 3488231,
+  "executor_pids": [
+    3488232,
+    3488233
+  ],
+  "ui_pid": null
+}

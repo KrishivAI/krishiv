@@ -144,7 +144,8 @@ pub use aggregate::{AggExpr, AggFunction, LocalAggregator};
 pub use continuous::ContinuousWindowExecutor;
 pub use join::{BroadcastJoin, BuiltBroadcastJoin, HashJoin, StreamTableJoin};
 pub use operator_runtime::{
-    LocalWindowKindBridge, execute_bounded_window, local_spec_to_window_execution,
+    LocalWindowKindBridge, execute_bounded_window, execute_streaming_window,
+    local_spec_to_window_execution,
 };
 pub use queue::{
     OperatorMessage, OperatorQueueError, OperatorQueueMetrics, OperatorQueueReceiver,

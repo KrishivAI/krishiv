@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: krishiv-spark-compat
+Version: 0.1.0
+Summary: PySpark-compatible SparkSession shim for Krishiv
+Requires-Python: >=3.10
+Requires-Dist: grpcio>=1.60
+Requires-Dist: protobuf>=4.25
+Requires-Dist: pyarrow>=15.0
+Provides-Extra: pandas
+Requires-Dist: pandas>=2.0; extra == "pandas"

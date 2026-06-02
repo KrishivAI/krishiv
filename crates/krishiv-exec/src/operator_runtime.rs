@@ -11,6 +11,8 @@ use crate::{
     StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
     StateBackedTumblingWindowOperator, TumblingWindowSpec, WatermarkState,
 };
+use futures::stream::{Stream, StreamExt};
+use std::pin::Pin;
 
 pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
     let function = match agg.kind {
@@ -150,6 +152,232 @@ pub fn execute_bounded_window(
     }
 
     Ok(output)
+}
+
+pub fn execute_streaming_window(
+    mut input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>,
+    spec: WindowExecutionSpec,
+) -> ExecResult<Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>> {
+    if spec.agg_exprs.is_empty() {
+        return Err(ExecError::InvalidWindowConfig(
+            "window execution requires at least one aggregate".into(),
+        ));
+    }
+
+    let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
+
+    match spec.window_kind {
+        WindowKind::Tumbling => {
+            let tw_spec = TumblingWindowSpec {
+                key_column: spec.key_column.clone(),
+                event_time_column: spec.event_time_column.clone(),
+                window_size_ms: spec.window_size_ms,
+                agg_exprs: agg_exprs.clone(),
+            };
+            let redb = RedbStateBackend::ephemeral()
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
+            } else {
+                Box::new(redb)
+            };
+            let mut op =
+                StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
+            let mut multi_watermark =
+                MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
+
+            let stream = async_stream::stream! {
+                while let Some(batch_res) = input.next().await {
+                    match batch_res {
+                        Ok(batch) => {
+                            multi_watermark.apply_idle_source_policy();
+                            let wm = match advance_effective_watermark(
+                                &batch,
+                                &spec.event_time_column,
+                                spec.source_id_column.as_deref(),
+                                &spec.source_watermark_lags,
+                                &mut single_watermark,
+                                &mut multi_watermark,
+                            ) {
+                                Ok(wm) => wm,
+                                Err(e) => {
+                                    yield Err(e);
+                                    continue;
+                                }
+                            };
+                            match op.process_batch(&batch, wm) {
+                                Ok(output_batches) => {
+                                    for out_batch in output_batches {
+                                        yield Ok(out_batch);
+                                    }
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    }
+                }
+                match op.flush_closed_windows(i64::MAX) {
+                    Ok(output_batches) => {
+                        for out_batch in output_batches {
+                            yield Ok(out_batch);
+                        }
+                    }
+                    Err(e) => yield Err(e),
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+        WindowKind::Sliding => {
+            let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
+            let sw_spec = SlidingWindowSpec {
+                key_column: spec.key_column.clone(),
+                event_time_column: spec.event_time_column.clone(),
+                window_size_ms: spec.window_size_ms,
+                slide_ms,
+                agg_exprs,
+            };
+            let redb = RedbStateBackend::ephemeral()
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
+            } else {
+                Box::new(redb)
+            };
+            let mut op =
+                StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
+            let mut multi_watermark =
+                MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
+
+            let stream = async_stream::stream! {
+                while let Some(batch_res) = input.next().await {
+                    match batch_res {
+                        Ok(batch) => {
+                            multi_watermark.apply_idle_source_policy();
+                            let wm = match advance_effective_watermark(
+                                &batch,
+                                &spec.event_time_column,
+                                spec.source_id_column.as_deref(),
+                                &spec.source_watermark_lags,
+                                &mut single_watermark,
+                                &mut multi_watermark,
+                            ) {
+                                Ok(wm) => wm,
+                                Err(e) => {
+                                    yield Err(e);
+                                    continue;
+                                }
+                            };
+                            match op.process_batch(&batch, wm) {
+                                Ok(output_batches) => {
+                                    for out_batch in output_batches {
+                                        yield Ok(out_batch);
+                                    }
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    }
+                }
+                match op.flush_closed_windows(i64::MAX) {
+                    Ok(output_batches) => {
+                        for out_batch in output_batches {
+                            yield Ok(out_batch);
+                        }
+                    }
+                    Err(e) => yield Err(e),
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+        WindowKind::Session => {
+            let session_gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
+            let sess_spec = SessionWindowSpec {
+                key_column: spec.key_column.clone(),
+                event_time_column: spec.event_time_column.clone(),
+                session_gap_ms,
+                agg_exprs,
+            };
+            let redb = RedbStateBackend::ephemeral()
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
+                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
+            } else {
+                Box::new(redb)
+            };
+            let mut op =
+                StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
+                    .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
+            let mut single_watermark = WatermarkState::new(spec.watermark_lag_ms);
+            let mut multi_watermark =
+                MultiSourceWatermarkState::new().with_idle_source_policy(60_000, i64::MAX);
+
+            let stream = async_stream::stream! {
+                while let Some(batch_res) = input.next().await {
+                    match batch_res {
+                        Ok(batch) => {
+                            multi_watermark.apply_idle_source_policy();
+                            let wm = match advance_effective_watermark(
+                                &batch,
+                                &spec.event_time_column,
+                                spec.source_id_column.as_deref(),
+                                &spec.source_watermark_lags,
+                                &mut single_watermark,
+                                &mut multi_watermark,
+                            ) {
+                                Ok(wm) => wm,
+                                Err(e) => {
+                                    yield Err(e);
+                                    continue;
+                                }
+                            };
+                            match op.process_batch(&batch, wm) {
+                                Ok(output_batches) => {
+                                    for out_batch in output_batches {
+                                        yield Ok(out_batch);
+                                    }
+                                }
+                                Err(e) => {
+                                    yield Err(e);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(e);
+                            return;
+                        }
+                    }
+                }
+                match op.flush_closed_sessions(i64::MAX) {
+                    Ok(output_batches) => {
+                        for out_batch in output_batches {
+                            yield Ok(out_batch);
+                        }
+                    }
+                    Err(e) => yield Err(e),
+                }
+            };
+            Ok(Box::pin(stream))
+        }
+    }
 }
 
 /// Convert legacy runtime local spec fields into a plan `WindowExecutionSpec`.

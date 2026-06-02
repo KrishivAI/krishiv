@@ -8,6 +8,7 @@ pub mod dataframe;
 pub mod error;
 pub mod session;
 pub mod stream;
+pub mod streaming_dataframe;
 pub mod types;
 pub mod window;
 
@@ -19,6 +20,7 @@ pub use dataframe::DataFrame;
 pub use error::{KrishivError, Result};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
+pub use streaming_dataframe::StreamingDataFrame;
 pub use types::{ExecutionMode, QueryResult, StreamBatch, StreamMode};
 pub use window::{
     MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig,
@@ -32,7 +34,8 @@ pub use krishiv_exec::{AggExpr, AggFunction};
 pub use krishiv_plan::{LogicalPlan as KrishivLogicalPlan, PhysicalPlan as KrishivPhysicalPlan};
 pub use krishiv_runtime::{
     ClusterEndpoints, InProcessCluster, InProcessStreamingRuntime, JobStatus, LocalJobRegistry,
-    LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream, is_streaming_plan,
+    LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
+    is_streaming_plan,
 };
 pub use krishiv_state::TtlConfig;
 pub use krishiv_udf::{ScalarUdf, UdfError, UdfRegistry};

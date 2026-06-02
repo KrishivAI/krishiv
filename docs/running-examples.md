@@ -247,7 +247,7 @@ k3s ctr images import /tmp/krishiv.tar
 
 ```bash
 # Apply the full manifest (namespace, RBAC, deployments, services, NetworkPolicy)
-kubectl apply -f k8s/manifests/krishiv-distributed.yaml
+kubectl apply -f k8s/direct/krishiv-distributed.yaml
 
 # Wait for all pods to be ready
 kubectl rollout status deployment/coordinator deployment/executor deployment/flight-server \

@@ -138,6 +138,12 @@ impl DataFrame {
         krishiv_common::async_util::block_on(self.explain_async())
     }
 
+    /// Convert this DataFrame into a fluent `StreamingDataFrame` builder
+    /// for executing async stream operations with windows and aggregations.
+    pub fn stream(&self) -> crate::streaming_dataframe::StreamingDataFrame {
+        crate::streaming_dataframe::StreamingDataFrame::new(self.clone())
+    }
+
     pub async fn explain_async(&self) -> Result<String> {
         let is_local = !self.runtime.uses_remote_execution();
         if is_local {
@@ -221,6 +227,64 @@ impl DataFrame {
         match &result {
             Ok(_) => self.update_job(&job_id, "local-dataframe", JobState::Succeeded),
             Err(_) => self.update_job(&job_id, "local-dataframe", JobState::Failed),
+        }
+
+        result
+    }
+
+    /// Asynchronously execute and return a record batch stream.
+    pub async fn execute_stream_async(&self) -> Result<krishiv_plan::SendableRecordBatchStream> {
+        let job_id = self.start_job("local-streaming");
+        self.update_job(&job_id, "local-streaming", JobState::Running);
+
+        if let Some(batches) = &self.pre_collected {
+            self.update_job(&job_id, "local-streaming", JobState::Succeeded);
+            let stream = futures::stream::iter(batches.clone().into_iter().map(Ok));
+            return Ok(Box::pin(stream));
+        }
+
+        let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;
+
+        let result = if uses_remote && self.sql_query.is_some() {
+            let query = self.sql_query.as_deref().unwrap();
+            let tables = self
+                .registered_parquet
+                .iter()
+                .map(|entry| {
+                    BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
+                })
+                .collect::<Vec<_>>();
+            let batches = crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables).await?;
+            let stream = futures::stream::iter(batches.into_iter().map(Ok));
+            Ok(Box::pin(stream) as krishiv_plan::SendableRecordBatchStream)
+        } else if let Some(dataframe) = &self.sql_dataframe {
+            if !self.force_local {
+                self.runtime
+                    .accept_plan(&PhysicalPlan::new(
+                        self.logical_plan.name(),
+                        self.logical_plan.kind(),
+                    ))
+                    .map_err(KrishivError::from)?;
+            }
+            dataframe
+                .execute_stream()
+                .await
+                .map_err(Into::into)
+        } else {
+            self.runtime
+                .accept_plan(&PhysicalPlan::new(
+                    self.logical_plan.name(),
+                    self.logical_plan.kind(),
+                ))
+                .map_err(KrishivError::from)?;
+            Err(KrishivError::unsupported(
+                "logical-only DataFrame cannot be streamed",
+            ))
+        };
+
+        match &result {
+            Ok(_) => self.update_job(&job_id, "local-streaming", JobState::Succeeded),
+            Err(_) => self.update_job(&job_id, "local-streaming", JobState::Failed),
         }
 
         result

@@ -70,6 +70,16 @@ pub fn execute_windowed_stream(
         .map_err(|e| RuntimeError::transport(e.to_string()))
 }
 
+/// Run windowed aggregation lazily over an unbounded input stream.
+pub fn execute_streaming_window(
+    input: std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_exec::ExecError>> + Send>>,
+    spec: &LocalWindowExecutionSpec,
+) -> Result<std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, krishiv_exec::ExecError>> + Send>>, RuntimeError> {
+    let plan_spec = spec.to_plan_spec();
+    krishiv_exec::execute_streaming_window(input, plan_spec)
+        .map_err(|e| RuntimeError::transport(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

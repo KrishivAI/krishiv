@@ -28,6 +28,7 @@ pub mod live_table;
 pub mod policy;
 pub mod spark_compat;
 pub mod spark_compat_date;
+pub mod streaming;
 mod udf;
 mod window_functions;
 
@@ -127,7 +128,32 @@ impl Default for SqlEngine {
 impl SqlEngine {
     /// Create a local SQL engine.
     pub fn new() -> Self {
-        let context = SessionContext::new();
+        // Create streaming_sources first so it can be shared with KafkaTableFactory.
+        // DDL-created Kafka tables (CREATE EXTERNAL TABLE … STORED AS KAFKA) then
+        // correctly register in is_streaming_query.
+        let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
+            Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+        let mut config = datafusion::prelude::SessionConfig::new()
+            .with_target_partitions(1)
+            .set_bool("datafusion.optimizer.enable_round_robin_repartition", false);
+        config.options_mut().optimizer.repartition_windows = false;
+        config.options_mut().optimizer.repartition_aggregations = false;
+
+        let mut table_factories: std::collections::HashMap<String, Arc<dyn datafusion::catalog::TableProviderFactory>> = std::collections::HashMap::new();
+        table_factories.insert(
+            "KAFKA".to_string(),
+            Arc::new(crate::kafka_table::KafkaTableFactory {
+                streaming_sources: streaming_sources.clone(),
+            }),
+        );
+
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_table_factories(table_factories)
+            .build();
+        let context = SessionContext::new_with_state(state);
         window_functions::register_window_functions(&context)
             .expect("failed to register window functions");
         Self {
@@ -135,14 +161,29 @@ impl SqlEngine {
             krishiv_catalog: None,
             view_registry: None,
             udf_registry: None,
-            streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            streaming_sources,
             udf_limits: None,
         }
     }
 
     /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
     pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self> {
-        let context = SessionContext::new();
+        let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
+            Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+        let mut table_factories: std::collections::HashMap<String, Arc<dyn datafusion::catalog::TableProviderFactory>> = std::collections::HashMap::new();
+        table_factories.insert(
+            "KAFKA".to_string(),
+            Arc::new(crate::kafka_table::KafkaTableFactory {
+                streaming_sources: streaming_sources.clone(),
+            }),
+        );
+
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_table_factories(table_factories)
+            .build();
+        let context = SessionContext::new_with_state(state);
         context.register_catalog(
             "krishiv",
             Arc::new(DataFusionCatalogBridge::new(catalog.clone())),
@@ -154,21 +195,121 @@ impl SqlEngine {
             krishiv_catalog: Some(catalog),
             view_registry: None,
             udf_registry: None,
-            streaming_sources: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            streaming_sources,
             udf_limits: None,
         })
     }
 
-    /// Mark a table name as an unbounded streaming source.
-    ///
-    /// Uses `Arc<RwLock<>>` so all `Session` clones sharing this engine see
-    /// the registration immediately.
-    pub fn register_streaming_source(&self, name: &str) -> SqlResult<()> {
+    /// Mark a table name as an unbounded streaming source, returning a sender to push batches into it.
+    pub fn register_streaming_table(
+        &self,
+        name: &str,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> SqlResult<tokio::sync::mpsc::UnboundedSender<RecordBatch>> {
+        let (table, tx) = crate::streaming::create_continuous_table(schema)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        self.context
+            .register_table(name, table)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
         self.streaming_sources
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string());
+        Ok(tx)
+    }
+
+    /// Register a live Kafka/Redpanda topic as an unbounded streaming table.
+    ///
+    /// This is the native Rust path — no Python bridge or external process
+    /// required.  Under the hood it creates an `rdkafka` consumer and wraps it
+    /// in a DataFusion `StreamingTable` so normal SQL queries (`SELECT`,
+    /// `GROUP BY`, windowed aggregations) work against the live topic.
+    ///
+    /// Equivalent SQL DDL:
+    /// ```sql
+    /// CREATE EXTERNAL TABLE <name> (<cols>) STORED AS KAFKA
+    ///   LOCATION '<topic>'
+    ///   OPTIONS ('bootstrap.servers' = '…', 'group.id' = '…');
+    /// ```
+    pub fn register_kafka_source(
+        &self,
+        table_name: impl AsRef<str>,
+        schema: arrow::datatypes::SchemaRef,
+        bootstrap_servers: impl Into<String>,
+        topic: impl Into<String>,
+        group_id: impl Into<String>,
+    ) -> SqlResult<()> {
+        let table_name = table_name.as_ref();
+        if table_name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        let config = krishiv_connectors::kafka::KafkaConfig {
+            bootstrap_servers: bootstrap_servers.into(),
+            topic: topic.into(),
+            group_id: group_id.into(),
+            // Enable at-least-once delivery for the streaming SQL path.
+            auto_commit_interval_ms: Some(1_000),
+        };
+        let table = crate::kafka_table::create_kafka_streaming_table(schema, config)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        if self.context.table_exist(table_name).map_err(SqlError::from)? {
+            let _ = self.context.deregister_table(table_name).map_err(SqlError::from)?;
+        }
+        self.context
+            .register_table(table_name, table)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        self.streaming_sources
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table_name.to_string());
         Ok(())
+    }
+
+    /// Execute a SQL query and write every result row to a Kafka/Redpanda topic.
+    ///
+    /// Each row is serialised as a JSON object using the same format as
+    /// [`KafkaSink`].  The method blocks until the query stream ends and the
+    /// producer queue is flushed, then returns the total number of rows written.
+    ///
+    /// **Note**: If `sql` targets an unbounded streaming table (e.g. one
+    /// registered via [`register_kafka_source`]) this call will never return.
+    /// Use it with batch sources or add a `LIMIT` clause.
+    pub async fn sql_to_kafka(
+        &self,
+        sql: impl AsRef<str>,
+        bootstrap_servers: impl Into<String>,
+        topic: impl Into<String>,
+    ) -> SqlResult<u64> {
+        use futures::StreamExt;
+        use krishiv_connectors::Sink as _;
+        use krishiv_connectors::kafka::{KafkaConfig, KafkaSink};
+
+        let config = KafkaConfig {
+            bootstrap_servers: bootstrap_servers.into(),
+            topic: topic.into(),
+            group_id: "krishiv-sql-writer".into(),
+            auto_commit_interval_ms: None,
+        };
+        let mut sink = KafkaSink::new(config)
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+
+        let df = self.sql(sql.as_ref()).await?;
+        let mut stream = df.execute_stream().await?;
+        let mut total_rows = 0u64;
+
+        while let Some(result) = stream.next().await {
+            let batch = result.map_err(|e| SqlError::DataFusion { message: e })?;
+            if batch.num_rows() > 0 {
+                total_rows += batch.num_rows() as u64;
+                sink.write_batch(batch)
+                    .await
+                    .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            }
+        }
+        sink.flush()
+            .await
+            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        Ok(total_rows)
     }
 
     /// Configure this engine with explicit UDF resource limits (Track E).
@@ -487,7 +628,7 @@ impl SqlEngine {
         }
 
         let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query)
-            .map_err(|e| SqlError::DataFusion { message: e })?;
+            .unwrap_or_else(|_| (query.to_string(), vec![]));
         lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;
         let dataframe = self.context.sql(&rewritten).await?;
         Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten))
@@ -562,6 +703,8 @@ pub trait KrishivDataFrameOps: Send + Sync {
     fn krishiv_logical_plan(&self) -> LogicalPlan;
     /// The original SQL query string, if any.
     fn query(&self) -> Option<&str>;
+    /// Execute and return a record batch stream.
+    async fn execute_stream(&self) -> SqlResult<krishiv_plan::SendableRecordBatchStream>;
 }
 
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
@@ -620,6 +763,14 @@ impl SqlDataFrame {
     /// Execute and collect this DataFrame.
     pub async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
         Ok(self.dataframe.clone().collect().await?)
+    }
+
+    /// Execute and return a record batch stream.
+    pub async fn execute_stream(&self) -> SqlResult<krishiv_plan::SendableRecordBatchStream> {
+        let df_stream = self.dataframe.clone().execute_stream().await?;
+        use futures::StreamExt;
+        let mapped = df_stream.map(|res| res.map_err(|e| e.to_string()));
+        Ok(Box::pin(mapped))
     }
 
     /// Execute and collect this DataFrame, also returning lightweight runtime statistics.
@@ -683,6 +834,9 @@ impl KrishivDataFrameOps for SqlDataFrame {
     }
     fn query(&self) -> Option<&str> {
         SqlDataFrame::query(self)
+    }
+    async fn execute_stream(&self) -> SqlResult<krishiv_plan::SendableRecordBatchStream> {
+        SqlDataFrame::execute_stream(self).await
     }
 }
 
@@ -1283,3 +1437,4 @@ mod udtf_ddl_tests {
         );
     }
 }
+pub mod kafka_table;

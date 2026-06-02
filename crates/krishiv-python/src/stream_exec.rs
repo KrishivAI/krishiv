@@ -45,6 +45,28 @@ async fn resolve_input_batches(
     ))
 }
 
+async fn resolve_input_stream(
+    pipeline: &StreamPipeline,
+) -> Result<krishiv_plan::SendableRecordBatchStream, krishiv_api::KrishivError> {
+    if let Some(name) = pipeline.source_id.strip_prefix("memory:") {
+        let batches = pipeline.session.memory_stream_batches(name).ok_or_else(|| {
+            krishiv_api::KrishivError::unsupported(format!(
+                "memory stream '{name}' is not registered on this session"
+            ))
+        })?;
+        let stream = futures::stream::iter(batches.into_iter().map(Ok));
+        return Ok(Box::pin(stream));
+    }
+    let upper = pipeline.source_id.to_ascii_uppercase();
+    if upper.contains("SELECT") || upper.contains("FROM") {
+        let df = pipeline.session.sql_async(&pipeline.source_id).await?;
+        return df.execute_stream_async().await;
+    }
+    Err(krishiv_api::KrishivError::unsupported(
+        "streaming source must be SQL (Session.stream) or memory:<name> (Session.memory_stream)",
+    ))
+}
+
 pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWindowExecutionSpec> {
     let window = pipeline.window.as_ref().ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
@@ -135,4 +157,53 @@ pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatc
     let output = krishiv_api::execute_windowed_stream(input, &spec)
         .map_err(|e| map_krishiv_error(krishiv_api::KrishivError::from(e)))?;
     Ok(output.into_iter().map(PyBatch::from_record_batch).collect())
+}
+
+pub(crate) fn spawn_pipeline_stream(
+    pipeline: StreamPipeline,
+) -> PyResult<tokio::sync::mpsc::Receiver<PyResult<PyBatch>>> {
+    let spec = spec_from_pipeline(&pipeline)?;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let input_res = resolve_input_stream(&pipeline).await;
+            let input_stream = match input_res {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(map_krishiv_error(e))).await;
+                    return;
+                }
+            };
+            
+            use futures::StreamExt;
+            let mapped_input_stream = input_stream.map(|res| res.map_err(|e| krishiv_exec::ExecError::InvalidWindowConfig(e)));
+            
+            let output_res = krishiv_api::execute_streaming_window(Box::pin(mapped_input_stream), &spec);
+            let mut output_stream = match output_res {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(map_krishiv_error(krishiv_api::KrishivError::from(e)))).await;
+                    return;
+                }
+            };
+            
+            while let Some(batch_res) = output_stream.next().await {
+                match batch_res {
+                    Ok(batch) => {
+                        if tx.send(Ok(PyBatch::from_record_batch(batch))).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(map_krishiv_error(krishiv_api::KrishivError::unsupported(e.to_string())))).await;
+                        break;
+                    }
+                }
+            }
+        });
+    });
+    
+    Ok(rx)
 }

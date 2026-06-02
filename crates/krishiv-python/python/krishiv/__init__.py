@@ -8,6 +8,7 @@ from .krishiv import (  # noqa: F401
     CheckpointError,
     ConnectorError,
     DataFrame,
+    DataFrameStream,
     IcebergSink,
     KafkaSink,
     KrishivError,
@@ -53,6 +54,30 @@ async def connect_async(url: str) -> Session:
     return await loop.run_in_executor(None, lambda: Session.connect(url))
 
 
+def _register_arrow_stream(self, job_name: str, async_gen):
+    """
+    Register a Python async generator of PyArrow RecordBatches to continuously feed a running stream job.
+    This bridges Python's async ecosystem directly into Rust's continuous stream pipeline.
+    """
+    from .krishiv import Batch
+    async def _pump():
+        try:
+            async for pyarrow_batch in async_gen:
+                self.push_stream_job_input(job_name, [Batch(pyarrow_batch)])
+        except Exception as e:
+            print(f"Error pumping stream {job_name}: {e}")
+
+    try:
+        loop = _asyncio.get_running_loop()
+        loop.create_task(_pump())
+    except RuntimeError:
+        # If no loop is running, this function assumes the caller will run it later
+        pass
+
+Session.register_arrow_stream = _register_arrow_stream
+
+
+
 __all__ = [
     "KrishivError",
     "QueryError",
@@ -64,6 +89,7 @@ __all__ = [
     "UdfError",
     "Session",
     "DataFrame",
+    "DataFrameStream",
     "Schema",
     "Stream",
     "KeyedStream",
@@ -113,6 +139,16 @@ try:
     async def _new_live_anext(self):
         return _orig_live_anext(self)
     LiveTable.__anext__ = _new_live_anext
+except (ImportError, AttributeError):
+    pass
+
+try:
+    from .krishiv import DataFrameStream
+    _orig_dfs_anext = DataFrameStream.__anext__
+    async def _new_dfs_anext(self):
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _orig_dfs_anext, self)
+    DataFrameStream.__anext__ = _new_dfs_anext
 except (ImportError, AttributeError):
     pass
 

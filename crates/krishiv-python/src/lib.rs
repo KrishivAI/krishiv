@@ -85,6 +85,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<session::PySession>()?;
     m.add_class::<dataframe::PyDataFrame>()?;
+    m.add_class::<dataframe::PyDataFrameStream>()?;
     m.add_class::<stream::PyStream>()?;
     m.add_class::<stream::PyKeyedStream>()?;
     m.add_class::<stream::PyWindowedStream>()?;

@@ -33,6 +33,7 @@ pyo3 = { workspace = true }
 pyo3-arrow = "0.17"
 sha2 = { workspace = true }
 tokio = { workspace = true }
+futures.workspace = true
 
 [features]
 default = []

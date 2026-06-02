@@ -1,72 +1,133 @@
 # Krishiv Kubernetes Manifests
 
-These manifests are the R2 Kubernetes Distributed Alpha skeleton. They define
-the first `KrishivJob` custom resource shape and the minimal objects needed for
-one operator-owned active coordinator runtime plus replaceable executors.
+Two distinct deployment paths — pick one, they do not need to coexist:
 
-Build the local Kubernetes/single-node image from release-k8s binaries. The
-Dockerfile intentionally consumes staged binaries from `dist/docker/` so the
-runtime image can stay small and so `.dockerignore` can continue excluding the
-large Cargo `target/` tree.
+| Path | Entry point | When to use |
+|------|-------------|-------------|
+| **Operator** | `kubectl apply -k k8s/operator` | Production; CRDs + operator manages jobs |
+| **Direct** | `kubectl apply -f k8s/direct/krishiv-dev.yaml` | Local dev, k3s, bare-metal — no operator |
+| **Helm** | `helm install krishiv k8s/helm/krishiv` | Production; Helm-managed releases |
+
+---
+
+## Directory layout
+
+```
+k8s/
+  crds/               Custom Resource Definitions (KrishivJob, KrishivQueue, KrishivExecutorPool)
+  operator/           Operator-managed production deployment
+    kustomization.yaml
+    namespace.yaml, serviceaccount.yaml, rbac.yaml
+    operator-deployment.yaml
+    coordinator-service.yaml, executor-deployment.yaml
+    network-policy.yaml, jcp-pod-template.yaml, keda-scaledobject.yaml
+    samples/           example KrishivJob CRs
+  direct/             Raw Deployments — no operator, no CRDs required
+    krishiv-dev.yaml         single-node local cluster (uses localhost/krishiv:local)
+    krishiv-distributed.yaml full multi-node direct deployment
+  infra/              Shared infrastructure dependencies
+    redpanda.yaml      Redpanda StatefulSet + headless Service
+  jobs/               One-shot Kubernetes Jobs for examples and benchmarks
+    python-examples.yaml
+    kafka-streaming-sql.yaml
+    benchmark.yaml
+  helm/               Helm chart (operator-mode, production releases)
+```
+
+---
+
+## Operator path (production)
+
+Install CRDs + operator in one command:
+
+```bash
+kubectl apply -k k8s/operator
+```
+
+Submit a batch job via the `KrishivJob` CR:
+
+```bash
+kubectl apply -f k8s/operator/samples/krishivjob-batch.yaml
+kubectl get krishivjobs -n krishiv-system
+```
+
+Build and load the image before applying:
 
 ```bash
 cargo build -p krishiv -p krishiv-operator \
   --target x86_64-unknown-linux-musl \
   --profile release-k8s
-strip \
-  target/x86_64-unknown-linux-musl/release-k8s/krishiv \
-  target/x86_64-unknown-linux-musl/release-k8s/krishiv-operator
 mkdir -p dist/docker
-cp target/x86_64-unknown-linux-musl/release-k8s/krishiv dist/docker/krishiv
-cp target/x86_64-unknown-linux-musl/release-k8s/krishiv-operator dist/docker/krishiv-operator
+cp target/x86_64-unknown-linux-musl/release-k8s/krishiv dist/docker/
+cp target/x86_64-unknown-linux-musl/release-k8s/krishiv-operator dist/docker/
 docker build -t localhost/krishiv:local .
 ```
 
-Apply from the repository root after building/publishing that compatible image:
+---
+
+## Direct path (dev / local k3s)
+
+No operator or CRDs required. Runs coordinator + executors as plain Deployments.
 
 ```bash
-kubectl apply -k k8s
+# Quick local cluster (uses localhost/krishiv:local image)
+kubectl apply -f k8s/direct/krishiv-dev.yaml
+
+# Full multi-node deployment
+kubectl apply -f k8s/direct/krishiv-distributed.yaml
 ```
 
-After the operator is ready, the scheduler-backed status UI can be inspected
-through the coordinator service:
+---
+
+## Infrastructure
+
+Redpanda (Kafka-compatible) StatefulSet for streaming scenarios:
 
 ```bash
-kubectl -n krishiv-system port-forward svc/krishiv-coordinator 8080:8080
+kubectl apply -f k8s/infra/redpanda.yaml
+
+# Verify
+kubectl exec redpanda-0 -- rpk topic list
 ```
 
-The same service also exposes the coordinator/executor gRPC endpoint on port
-9090. Executor pods run the unified `krishiv executor` command and use that
-endpoint for registration and heartbeats.
+---
 
-For local `kind` smoke testing:
+## Jobs (one-shot examples)
+
+```bash
+# Native Rust Kafka streaming SQL (10 scenarios)
+kubectl apply -f k8s/jobs/kafka-streaming-sql.yaml
+
+# Python example suite
+kubectl apply -f k8s/jobs/python-examples.yaml
+
+# Throughput benchmark
+kubectl apply -f k8s/jobs/benchmark.yaml
+```
+
+Local run against in-cluster Redpanda:
+
+```bash
+kubectl port-forward pod/redpanda-0 9092:9092 &
+BOOTSTRAP=localhost:9092 cargo run --bin kafka_streaming_sql
+```
+
+---
+
+## Helm
+
+```bash
+helm install krishiv k8s/helm/krishiv \
+  --set image.repository=ghcr.io/yourorg/krishiv \
+  --set image.tag=0.1.0
+```
+
+---
+
+## kind smoke test
 
 ```bash
 docker build -t krishiv:dev .
-KRISHIV_KIND_E2E=1 KRISHIV_KIND_IMAGE=krishiv:dev cargo test -p krishiv-operator --test r2_kind_smoke
+KRISHIV_KIND_E2E=1 KRISHIV_KIND_IMAGE=krishiv:dev \
+  cargo test -p krishiv-operator --test r2_kind_smoke
 ```
-
-Useful test flags:
-
-- `KRISHIV_KIND_CLUSTER` sets the cluster name, default `krishiv-r2`.
-- `KRISHIV_KIND_SKIP_CREATE=1` reuses the current `kind` cluster context.
-- `KRISHIV_KIND_SKIP_LOAD_IMAGE=1` skips `kind load docker-image`.
-- `KRISHIV_KIND_TIMEOUT_SECS` changes status polling timeout.
-
-Current limitations:
-
-- The operator deployment is intentionally `replicas: 1` and owns the active
-  coordinator scheduler in this release.
-- The `krishiv-coordinator` service exposes the operator's scheduler-backed
-  status API and Web UI on port 8080, plus the coordinator/executor gRPC API
-  on port 9090.
-- `crates/krishiv-operator` includes the typed reconciliation foundation,
-  first live Kubernetes watch/status-patch path, and shared in-process
-  coordinator runtime used by the status API and gRPC server.
-- Executor pods connect to the coordinator gRPC endpoint for registration,
-  heartbeat, and task-assignment delivery. Keep the static manifest heartbeat
-  below the coordinator lease timeout.
-- The operator includes lease-election primitives, but this manifest keeps one
-  active coordinator pod and does not advertise active-active job ownership.
-- The `kind` smoke tests are opt-in because they require Docker, `kind`,
-  `kubectl`, and a locally built or published image.

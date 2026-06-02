@@ -12,6 +12,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 datafusion = { workspace = true }
 krishiv-catalog = { path = "../krishiv-catalog" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka"] }
 krishiv-cep = { path = "../krishiv-cep" }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-governance = { path = "../krishiv-governance" }
@@ -21,6 +22,10 @@ krishiv-plan = { path = "../krishiv-plan" }
 krishiv-udf = { path = "../krishiv-udf" }
 regex = "1"
 sqlparser = "0.61"
+tracing = { workspace = true }
+futures.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 
 [features]
 default = ["delta"]

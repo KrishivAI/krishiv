@@ -20,6 +20,7 @@ krishiv-sql = { path = "../krishiv-sql" }
 krishiv-udf = { path = "../krishiv-udf" }
 dashmap = { workspace = true }
 tokio = { workspace = true }
+futures.workspace = true
 
 [dev-dependencies]
 krishiv-common = { path = "../krishiv-common" }

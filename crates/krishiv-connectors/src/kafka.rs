@@ -85,13 +85,19 @@ pub struct KafkaConfig {
     pub topic: String,
     /// The consumer group id used for offset management.
     pub group_id: String,
+    /// `None` = manual commit (default, use `commit_watermark` explicitly).
+    /// `Some(ms)` enables rdkafka auto-commit every `ms` milliseconds —
+    /// gives at-least-once delivery for streaming SQL paths without
+    /// requiring explicit offset management.
+    pub auto_commit_interval_ms: Option<u64>,
 }
 
 impl KafkaConfig {
     /// Validate and extract a `KafkaConfig` from a [`ConnectorConfig`].
     ///
     /// Required properties: `bootstrap.servers`, `topic`.
-    /// Optional: `group.id` (defaults to `"krishiv-default"`).
+    /// Optional: `group.id` (defaults to `"krishiv-default"`),
+    ///           `auto.commit.interval.ms` (enables auto-commit when present).
     pub fn from_config(config: &ConnectorConfig) -> ConnectorResult<Self> {
         Ok(Self {
             bootstrap_servers: config.required("bootstrap.servers")?.to_string(),
@@ -100,7 +106,17 @@ impl KafkaConfig {
                 .get("group.id")
                 .unwrap_or("krishiv-default")
                 .to_string(),
+            auto_commit_interval_ms: config
+                .get("auto.commit.interval.ms")
+                .and_then(|s| s.parse().ok()),
         })
+    }
+
+    /// Enable rdkafka auto-commit with the given interval.
+    #[must_use]
+    pub fn with_auto_commit(mut self, interval_ms: u64) -> Self {
+        self.auto_commit_interval_ms = Some(interval_ms);
+        self
     }
 }
 
@@ -161,12 +177,24 @@ impl KafkaSource {
             config.bootstrap_servers.clone(),
             config.group_id.clone(),
             config.topic.clone(),
+            config.auto_commit_interval_ms,
         )
         .map_err(|message| ConnectorError::Kafka {
             message,
             retriable: false,
         })?;
         Ok(Self { inner, config })
+    }
+
+    /// Commit the current watermark offset for all partitions read so far.
+    /// No-op if no messages have been read yet.
+    pub fn commit_current_offset(&self) {
+        self.inner.commit_watermark();
+    }
+
+    /// All per-partition offsets read so far (suitable for checkpoint storage).
+    pub fn all_current_offsets(&self) -> Vec<KafkaOffset> {
+        self.inner.all_current_offsets()
     }
 
     /// Return the config this source was created with.
@@ -499,11 +527,10 @@ impl OffsetCommitter<KafkaOffset> for InMemoryKafkaOffsetCommitter {
 pub struct RdkafkaKafkaSource {
     consumer: std::sync::Arc<rdkafka::consumer::StreamConsumer>,
     topic: String,
-    partition: i32,
     /// Timeout per poll attempt in milliseconds.
     poll_timeout_ms: u64,
-    /// Last successfully read (partition, offset) for watermark commits.
-    last_offset: Option<(i32, i64)>,
+    /// Latest offset read per partition — tracks all partitions, not just the last one.
+    partition_offsets: std::collections::HashMap<i32, i64>,
 }
 
 #[cfg(feature = "kafka")]
@@ -516,21 +543,36 @@ impl RdkafkaKafkaSource {
     ///
     /// Returns an error string if the consumer cannot be created or the
     /// subscription fails.
+    /// Create a new source subscribed to `topic`.
+    ///
+    /// `auto_commit_interval_ms`: `None` = manual commit; `Some(ms)` enables
+    /// rdkafka auto-commit every `ms` milliseconds (at-least-once delivery).
     pub fn new(
         bootstrap_servers: impl AsRef<str>,
         group_id: impl AsRef<str>,
         topic: impl Into<String>,
+        auto_commit_interval_ms: Option<u64>,
     ) -> Result<Self, String> {
         use rdkafka::ClientConfig;
         use rdkafka::consumer::Consumer;
 
         let topic = topic.into();
-
-        let consumer: rdkafka::consumer::StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", bootstrap_servers.as_ref())
+        let mut cfg = ClientConfig::new();
+        cfg.set("bootstrap.servers", bootstrap_servers.as_ref())
             .set("group.id", group_id.as_ref())
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
+            .set("auto.offset.reset", "earliest");
+
+        match auto_commit_interval_ms {
+            Some(ms) => {
+                cfg.set("enable.auto.commit", "true")
+                    .set("auto.commit.interval.ms", ms.to_string());
+            }
+            None => {
+                cfg.set("enable.auto.commit", "false");
+            }
+        }
+
+        let consumer: rdkafka::consumer::StreamConsumer = cfg
             .create()
             .map_err(|e| format!("rdkafka consumer creation failed: {e}"))?;
 
@@ -541,16 +583,15 @@ impl RdkafkaKafkaSource {
         Ok(Self {
             consumer: std::sync::Arc::new(consumer),
             topic,
-            partition: 0,
             poll_timeout_ms: 100,
-            last_offset: None,
+            partition_offsets: std::collections::HashMap::new(),
         })
     }
 
-    /// Create a source from a [`crate::cdc::KafkaCdcConfig`].
+    /// Create a source from a [`crate::cdc::KafkaCdcConfig`] (manual commit mode).
     #[cfg(feature = "kafka")]
     pub fn from_cdc_config(config: &crate::cdc::KafkaCdcConfig) -> Result<Self, String> {
-        Self::new(&config.bootstrap_servers, &config.group_id, &config.topic)
+        Self::new(&config.bootstrap_servers, &config.group_id, &config.topic, None)
     }
 
     /// Override the per-poll timeout (default: 100 ms).
@@ -579,14 +620,30 @@ impl RdkafkaKafkaSource {
         }
     }
 
-    /// Return the current `KafkaOffset` (the next offset that will be read,
-    /// suitable for committing after downstream acknowledgement).
+    /// Latest committed offset for the most recently read partition.
+    /// For multi-partition topics use [`all_current_offsets`] instead.
     pub fn current_kafka_offset(&self) -> Option<KafkaOffset> {
-        self.last_offset.map(|(partition, offset)| KafkaOffset {
-            topic: self.topic.clone(),
-            partition,
-            offset: offset + 1, // Kafka convention: committed offset = next to read
-        })
+        self.partition_offsets
+            .iter()
+            .max_by_key(|&(_, offset)| offset)
+            .map(|(&partition, &offset)| KafkaOffset {
+                topic: self.topic.clone(),
+                partition,
+                offset: offset + 1, // Kafka convention: committed offset = next to read
+            })
+    }
+
+    /// All per-partition offsets read so far — correct for multi-partition topics.
+    /// Each entry is the *next* offset to read (last_read + 1).
+    pub fn all_current_offsets(&self) -> Vec<KafkaOffset> {
+        self.partition_offsets
+            .iter()
+            .map(|(&partition, &offset)| KafkaOffset {
+                topic: self.topic.clone(),
+                partition,
+                offset: offset + 1,
+            })
+            .collect()
     }
 
     /// Deserialise a raw UTF-8 Kafka payload into a single-row `RecordBatch`.
@@ -662,45 +719,14 @@ impl Source for RdkafkaKafkaSource {
         .await;
 
         match msg {
-            // GAP-16: Poll timeout — no message available on this poll cycle.
-            // Check whether the consumer has reached the broker's high-water mark
-            // for this partition.  If so, return `Ok(None)` to signal EOF so the
-            // caller can stop polling instead of spinning indefinitely.
-            //
-            // `fetch_watermarks` is a synchronous metadata RPC; we run it on a
-            // blocking thread so it does not stall the async runtime.  On error
-            // we fall back to returning an empty batch (momentary idle) so the
-            // pipeline does not abort on a transient metadata failure.
-            Err(_timeout) => {
-                let consumer = self.consumer.clone();
-                let topic = self.topic.clone();
-                let partition = self.partition;
-                let next_offset = self.last_offset.map(|(_, o)| o + 1).unwrap_or(0);
-
-                let at_eof = tokio::task::spawn_blocking(move || {
-                    use rdkafka::consumer::Consumer;
-                    match consumer.fetch_watermarks(
-                        &topic,
-                        partition,
-                        std::time::Duration::from_millis(500),
-                    ) {
-                        Ok((_low, high)) => next_offset >= high,
-                        Err(_) => false, // conservatively assume not at EOF on metadata error
-                    }
-                })
-                .await
-                .unwrap_or(false);
-
-                // Return Ok(None) both at EOF and on idle timeout so the caller
-                // can back off instead of busy-looping on empty batches.
-                Ok(None)
-            }
+            // Poll timeout — no message ready on this cycle; caller retries.
+            Err(_timeout) => Ok(None),
             Ok(Err(e)) => Err(crate::ConnectorError::IoStr {
                 message: format!("rdkafka receive error: {e}"),
             }),
             Ok(Ok(msg)) => {
-                self.partition = msg.partition();
-                self.last_offset = Some((msg.partition(), msg.offset()));
+                // Track offset per partition so multi-partition topics are correct.
+                self.partition_offsets.insert(msg.partition(), msg.offset());
 
                 let payload = match msg.payload_view::<str>() {
                     Some(Ok(s)) => s,
@@ -725,8 +751,14 @@ impl Source for RdkafkaKafkaSource {
     }
 
     fn current_offset(&self) -> Option<Box<dyn std::any::Any + Send>> {
-        self.current_kafka_offset()
-            .map(|o| Box::new(o) as Box<dyn std::any::Any + Send>)
+        // Returns all per-partition offsets boxed as Vec<KafkaOffset>.
+        // Single-partition callers may downcast to KafkaOffset via current_kafka_offset().
+        let offsets = self.all_current_offsets();
+        if offsets.is_empty() {
+            None
+        } else {
+            Some(Box::new(offsets) as Box<dyn std::any::Any + Send>)
+        }
     }
 }
 
@@ -797,6 +829,7 @@ mod tests {
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),
             group_id: "test-group".into(),
+            auto_commit_interval_ms: None,
         };
         #[cfg(not(feature = "kafka"))]
         let source = KafkaSource::new(config);
@@ -822,6 +855,7 @@ mod tests {
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),
             group_id: "test-group".into(),
+            auto_commit_interval_ms: None,
         };
         let sink = KafkaSink::new(config);
         let caps = sink.capabilities();
@@ -843,6 +877,7 @@ mod tests {
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),
             group_id: "test-group".into(),
+            auto_commit_interval_ms: None,
         };
         let mut source = KafkaSource::new(config);
         let err = source.read_batch().await.unwrap_err();
@@ -879,6 +914,7 @@ mod tests {
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),
             group_id: "test-group".into(),
+            auto_commit_interval_ms: None,
         };
         let mut sink = KafkaSink::new(config);
 
@@ -964,7 +1000,7 @@ mod tests {
     async fn rdkafka_kafka_source_constructor_fails_gracefully_without_broker() {
         // Connecting to an unreachable broker should fail with a descriptive
         // error rather than panicking.
-        let result = super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic");
+        let result = super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic", None);
         // rdkafka validates config synchronously; creation may succeed or fail
         // depending on platform.  Both are acceptable — we only assert no panic.
         let _ = result;
@@ -989,6 +1025,7 @@ mod tests {
                 bootstrap_servers: "localhost:9092".to_string(),
                 topic: "events".to_string(),
                 group_id: "krishiv-default".to_string(),
+                auto_commit_interval_ms: None,
             };
             let mut sink = KafkaSink::new(config);
             let result = sink.flush().await;

@@ -1,14 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+
+# Root kustomization — delegates to the operator overlay.
+# For direct (no-operator) deployment use k8s/direct/ instead.
 resources:
-  - crds/krishivjobs.yaml
-  - crds/krishivqueues.yaml
-  - manifests/namespace.yaml
-  - manifests/serviceaccount.yaml
-  - manifests/rbac.yaml
-  - manifests/operator-deployment.yaml
-  - manifests/coordinator-service.yaml
-  - manifests/executor-deployment.yaml
-  - manifests/sample-krishivjob.yaml
-  - manifests/sample-streaming-krishivjob.yaml
-  - manifests/network-policy.yaml
+  - operator

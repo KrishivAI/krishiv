@@ -1,0 +1,72 @@
+# Multi-stage Dockerfile — builds Krishiv inside Docker.
+#
+# Build args:
+#   FEATURES  Cargo feature set (default: k8s)
+#             embedded | single-node | bare-metal | k8s | full
+#   PROFILE   Cargo build profile (default: release-k8s)
+#             release | release-k8s
+#
+# Usage:
+#   docker build -f Dockerfile.build -t localhost/krishiv:local .
+#   docker build --build-arg FEATURES=bare-metal --build-arg PROFILE=release \
+#       -f Dockerfile.build -t krishiv:bare-metal .
+
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM rust:1.92-slim AS builder
+
+ARG FEATURES=k8s
+ARG PROFILE=release-k8s
+
+# System deps required by transitive C build scripts (ring, openssl-sys).
+# cmake is needed by some crypto crates; pkg-config links native libs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+        cmake \
+        lld \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy workspace manifests first so dependency layers cache independently
+# of source changes.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+# Disable target-cpu=native (host-tuned, breaks cross-arch builds) and
+# TMPDIR override (only needed on space-constrained dev hosts).
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+
+# Build the binaries that go into the runtime image.
+# krishiv-operator is only included when FEATURES contains 'k8s'.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    set -e; \
+    PKGS="-p krishiv"; \
+    case "$FEATURES" in *k8s*) PKGS="$PKGS -p krishiv-operator" ;; esac; \
+    cargo build $PKGS \
+        --no-default-features --features "$FEATURES" \
+        --profile "$PROFILE" && \
+    # Copy out of the cache-mounted target dir before it disappears.
+    OUTDIR="/out"; \
+    mkdir -p "$OUTDIR"; \
+    PROFILE_DIR=$(echo "$PROFILE" | sed 's/-/_/g'); \
+    cp "target/$PROFILE_DIR/krishiv" "$OUTDIR/krishiv" 2>/dev/null || \
+    cp "target/$(echo $PROFILE_DIR)/krishiv" "$OUTDIR/krishiv"; \
+    cp "target/$PROFILE_DIR/krishiv-operator" "$OUTDIR/krishiv-operator" 2>/dev/null || true
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM ubuntu:26.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/krishiv /usr/local/bin/krishiv
+# krishiv-operator is optional (only present for k8s builds)
+COPY --from=builder /out/krishiv-operator /usr/local/bin/krishiv-operator 2>/dev/null || true
+
+RUN chmod +x /usr/local/bin/krishiv; \
+    chmod +x /usr/local/bin/krishiv-operator 2>/dev/null || true
+
+ENTRYPOINT ["/usr/local/bin/krishiv"]

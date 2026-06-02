@@ -66,7 +66,7 @@ pub use krishiv_api::{
     AggExpr, AggFunction, DataFrame, ExecutionMode, KeyedStream, KrishivError,
     MultiSourceWatermarkSpec, QueryResult, RecordBatch, Session, SessionBuilder,
     SessionWindowedStream, SlidingWindowedStream, StateTtlConfig, Stream, StreamBatch, StreamMode,
-    WatermarkSpec, WindowedStream,
+    StreamingDataFrame, WatermarkSpec, WindowedStream,
 };
 
 // Arrow schema/type primitives re-exported so users never import `arrow` directly.

@@ -243,6 +243,14 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    pub fn register_unbounded(&self, name: String, schema: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<()> {
+        let py_schema: pyo3_arrow::PySchema = schema.extract()?;
+        let schema_ref = py_schema.into_inner();
+        self.inner
+            .register_unbounded(&name, schema_ref)
+            .map_err(map_krishiv_error)
+    }
+
     pub fn jobs(&self) -> Vec<PyJobStatus> {
         self.inner
             .jobs()
