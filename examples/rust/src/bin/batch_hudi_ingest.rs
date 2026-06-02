@@ -1,5 +1,5 @@
 //! Local Apache Hudi Copy-On-Write ingestion and SQL read batch example.
-//! Run with: `cargo run -p krishiv --example batch_hudi_ingest`
+//! Run with: `cargo run -p krishiv-rust-examples --bin batch_hudi_ingest`
 
 #![forbid(unsafe_code)]
 

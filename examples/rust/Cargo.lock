@@ -2465,7 +2465,10 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "bytes",
  "chrono",
+ "futures",
+ "object_store",
  "parquet",
  "redb",
  "serde",
@@ -2566,6 +2569,8 @@ dependencies = [
  "futures",
  "krishiv",
  "krishiv-api",
+ "krishiv-lakehouse",
+ "krishiv-runtime",
  "krishiv-sql",
  "parquet",
  "rdkafka",
@@ -2635,6 +2640,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "chrono",
+ "dashmap",
  "datafusion",
  "futures",
  "krishiv-catalog",
@@ -3151,6 +3157,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

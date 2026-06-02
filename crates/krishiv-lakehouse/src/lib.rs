@@ -212,6 +212,9 @@ struct MemoryLakehouseTableState {
     layers: Vec<SnapshotLayer>,
     /// Last assigned snapshot id; `0` means no snapshots yet.
     last_snapshot_id: i64,
+    /// When set, compact the oldest layers into one whenever `layers.len()` would
+    /// exceed this limit. Prevents unbounded memory growth in streaming-write workloads.
+    max_snapshot_layers: Option<usize>,
 }
 
 impl MemoryLakehouseTableState {
@@ -238,6 +241,11 @@ impl MemoryLakehouseTableState {
             .collect()
     }
 
+    /// Iterate all batches by reference without cloning.
+    fn all_batches_ref(&self) -> impl Iterator<Item = &RecordBatch> {
+        self.layers.iter().flat_map(|layer| layer.batches.iter())
+    }
+
     fn append_layer(&mut self, batches: Vec<RecordBatch>) -> i64 {
         self.last_snapshot_id += 1;
         let snapshot_id = self.last_snapshot_id;
@@ -245,7 +253,36 @@ impl MemoryLakehouseTableState {
             snapshot_id,
             batches,
         });
+        self.maybe_compact();
         snapshot_id
+    }
+
+    /// Compact oldest snapshot layers into one when `max_snapshot_layers` is set
+    /// and the current layer count exceeds it. Preserves all data; only changes
+    /// the granularity of snapshot boundaries (time-travel before the merge point
+    /// will resolve to the merged snapshot).
+    fn maybe_compact(&mut self) {
+        let Some(max) = self.max_snapshot_layers else {
+            return;
+        };
+        if self.layers.len() <= max {
+            return;
+        }
+        // Merge the oldest (len - max + 1) layers into a single compacted layer.
+        let to_merge = self.layers.len() - max + 1;
+        let compacted_snapshot_id = self.layers[0].snapshot_id;
+        let merged_batches: Vec<RecordBatch> = self
+            .layers
+            .drain(..to_merge)
+            .flat_map(|l| l.batches)
+            .collect();
+        self.layers.insert(
+            0,
+            SnapshotLayer {
+                snapshot_id: compacted_snapshot_id,
+                batches: merged_batches,
+            },
+        );
     }
 }
 
@@ -268,6 +305,17 @@ impl MemoryLakehouseTable {
             state: tokio::sync::Mutex::new(MemoryLakehouseTableState::default()),
             partition_spec: tokio::sync::Mutex::new(PartitionSpecResolver::new(0)),
         }
+    }
+
+    /// Set the maximum number of snapshot layers retained before compaction.
+    ///
+    /// When the number of layers would exceed `max` after an append, the oldest
+    /// layers are merged into one to keep memory bounded. Use this for
+    /// streaming-write workloads where continuous appends would otherwise cause
+    /// unbounded snapshot accumulation.
+    pub async fn with_max_snapshot_layers(self, max: usize) -> Self {
+        self.state.lock().await.max_snapshot_layers = Some(max);
+        self
     }
 
     /// Add a partition field to the active spec (spec evolution).
@@ -766,5 +814,53 @@ mod tests {
             let s = v.to_string();
             assert!(!s.is_empty(), "Display for {v:?} should not be empty");
         }
+    }
+
+    // ── MemoryLakehouseTable compaction ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_table_compaction_preserves_all_rows() {
+        let sv = make_schema_version();
+        let tr = make_table_ref();
+        let table = MemoryLakehouseTable::new(tr, sv)
+            .with_max_snapshot_layers(10)
+            .await;
+
+        // Append 50 single-row snapshots — with max=10 this should compact aggressively.
+        for i in 0i64..50 {
+            table.append(vec![make_batch(vec![i])]).await.unwrap();
+        }
+
+        // All 50 rows must still be readable after compaction.
+        let rows: usize = table
+            .scan(&IcebergScanOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 50, "compaction must not lose any rows");
+
+        // Layer count must be bounded to max.
+        let layer_count = table.state.lock().await.layers.len();
+        assert!(
+            layer_count <= 10,
+            "layer count must be ≤ max_snapshot_layers after compaction; got {layer_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_table_no_compaction_without_max() {
+        let sv = make_schema_version();
+        let tr = make_table_ref();
+        let table = MemoryLakehouseTable::new(tr, sv);
+
+        for i in 0i64..20 {
+            table.append(vec![make_batch(vec![i])]).await.unwrap();
+        }
+
+        // Without max_snapshot_layers, all 20 layers must exist.
+        let layer_count = table.state.lock().await.layers.len();
+        assert_eq!(layer_count, 20, "no compaction should occur without max_snapshot_layers");
     }
 }

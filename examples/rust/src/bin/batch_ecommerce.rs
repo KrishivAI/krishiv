@@ -1,5 +1,5 @@
 //! E-commerce SQL Join and aggregate batch execution on local Parquet files.
-//! Run with: `cargo run -p krishiv --example batch_ecommerce`
+//! Run with: `cargo run -p krishiv-rust-examples --bin batch_ecommerce`
 
 #![forbid(unsafe_code)]
 

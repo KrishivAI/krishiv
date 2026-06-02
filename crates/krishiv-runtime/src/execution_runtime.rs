@@ -136,6 +136,11 @@ pub trait ExecutionRuntime: Send + Sync {
 }
 
 fn tables_to_batch_sql(tables: &[BatchTableRegistration]) -> Vec<BatchSqlTable> {
+    // Skip the allocation entirely for the common empty-table case (most
+    // queries in embedded mode don't register parquet tables).
+    if tables.is_empty() {
+        return Vec::new();
+    }
     tables
         .iter()
         .map(|t| BatchSqlTable {

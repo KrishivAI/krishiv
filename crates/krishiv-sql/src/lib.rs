@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
@@ -97,6 +98,9 @@ impl SqlPlan {
 /// Methods like `register_parquet`, `read_delta`, and `read_hudi` treat
 /// path arguments as local filesystem paths. S3/GCS paths require the
 /// object-store connector layer.
+/// Maximum number of query plans stored in the plan cache before random eviction.
+const PLAN_CACHE_MAX_ENTRIES: usize = 256;
+
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
@@ -109,6 +113,19 @@ pub struct SqlEngine {
     /// Optional UDF resource limits to apply when syncing UDFs for this engine.
     /// Set for job-specific engines so sandbox enforcement uses the job's budgets.
     udf_limits: Option<krishiv_udf::ResourceLimits>,
+    /// Monotonically increasing version counter; incremented on every UDF
+    /// registration or removal. Used to skip `sync_all_udfs()` when nothing
+    /// has changed since the last sync.
+    udf_registry_version: Arc<AtomicU64>,
+    /// The version at which the last `sync_all_udfs()` was performed.
+    /// Compared against `udf_registry_version` to detect staleness.
+    udf_last_synced_version: Arc<AtomicU64>,
+    /// Bounded query plan cache: query text → DataFusion LogicalPlan.
+    /// Skips re-parsing and re-optimising identical repeated queries.
+    /// Max `PLAN_CACHE_MAX_ENTRIES` entries; oldest entry evicted when full.
+    plan_cache: Arc<dashmap::DashMap<String, datafusion::logical_expr::LogicalPlan>>,
+    /// Insertion-order queue for LRU eviction in the plan cache.
+    plan_cache_order: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -163,6 +180,10 @@ impl SqlEngine {
             udf_registry: None,
             streaming_sources,
             udf_limits: None,
+            udf_registry_version: Arc::new(AtomicU64::new(0)),
+            udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
+            plan_cache: Arc::new(dashmap::DashMap::new()),
+            plan_cache_order: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -197,6 +218,10 @@ impl SqlEngine {
             udf_registry: None,
             streaming_sources,
             udf_limits: None,
+            udf_registry_version: Arc::new(AtomicU64::new(0)),
+            udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
+            plan_cache: Arc::new(dashmap::DashMap::new()),
+            plan_cache_order: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         })
     }
 
@@ -320,6 +345,14 @@ impl SqlEngine {
         self
     }
 
+    /// Returns `true` if `table_name` is registered as an unbounded streaming source.
+    pub fn is_streaming_source(&self, table_name: &str) -> bool {
+        self.streaming_sources
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(table_name)
+    }
+
     /// Register a table name as a streaming source without creating a live connector.
     ///
     /// This is the test-safe alternative to [`register_kafka_source`]: it marks
@@ -379,7 +412,15 @@ impl SqlEngine {
         registry: std::sync::Arc<std::sync::RwLock<krishiv_udf::UdfRegistry>>,
     ) -> Self {
         self.udf_registry = Some(registry);
+        // Mark UDFs as dirty so the first sql() call syncs them.
+        self.bump_udf_version();
         self
+    }
+
+    /// Increment the UDF version counter to signal that `sync_all_udfs()` is
+    /// needed on the next `sql()` call.
+    pub(crate) fn bump_udf_version(&self) {
+        self.udf_registry_version.fetch_add(1, Ordering::Release);
     }
 
     /// Register all scalar UDFs from the attached registry with DataFusion.
@@ -588,7 +629,17 @@ impl SqlEngine {
             return Err(SqlError::EmptyQuery);
         }
 
-        self.sync_all_udfs().await?;
+        // Lazy UDF sync: only re-sync when the registry has changed since the
+        // last sync. Avoids 3 RwLock reads per query when no UDFs are registered
+        // or when the UDF set hasn't changed.
+        {
+            let current = self.udf_registry_version.load(Ordering::Acquire);
+            let last = self.udf_last_synced_version.load(Ordering::Relaxed);
+            if current != last {
+                self.sync_all_udfs().await?;
+                self.udf_last_synced_version.store(current, Ordering::Release);
+            }
+        }
 
         // ── Intercept CREATE FUNCTION … RETURNS TABLE ────────────────────────
         // DataFusion does not understand this extended DDL syntax.  Parse it
@@ -646,6 +697,18 @@ impl SqlEngine {
         // path: parse → run PatternMatcher on the source table → return results.
         if query.to_ascii_uppercase().contains(" MATCH_RECOGNIZE ") {
             if let Some(stmt) = cep_sql::parse_match_recognize(query)? {
+                // Guard: CEP buffers ALL source rows before pattern matching.
+                // An unbounded streaming source would fill memory indefinitely.
+                if self.is_streaming_source(&stmt.source_table) {
+                    return Err(SqlError::Unsupported {
+                        feature: format!(
+                            "MATCH_RECOGNIZE on unbounded streaming source '{}' is not \
+                             supported; use a bounded (batch) table or apply LIMIT to \
+                             bound the scan before pattern matching",
+                            stmt.source_table
+                        ),
+                    });
+                }
                 let source_df = self.context.sql(&format!("SELECT * FROM {}", stmt.source_table)).await?;
                 let source_batches = source_df.collect().await?;
                 let results = cep_sql::execute_match_recognize(stmt, &source_batches)?;
@@ -663,7 +726,39 @@ impl SqlEngine {
         let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query)
             .unwrap_or_else(|_| (query.to_string(), vec![]));
         lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;
+
+        // ── Plan cache ────────────────────────────────────────────────────────
+        // Check the cache before sending the query through DataFusion's full
+        // parse → analyse → optimise pipeline. Only cache simple queries without
+        // DDL or AS-OF refs; DDL side effects must not be bypassed.
+        let can_cache = as_ofs.is_empty();
+        if can_cache {
+            if let Some(cached_plan) = self.plan_cache.get(&rewritten).map(|r| r.clone()) {
+                let dataframe = self.context.execute_logical_plan(cached_plan).await?;
+                return Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten));
+            }
+        }
+
         let dataframe = self.context.sql(&rewritten).await?;
+
+        // Cache the logical plan for future repeated calls.
+        if can_cache {
+            let plan = dataframe.logical_plan().clone();
+            if self.plan_cache.len() < PLAN_CACHE_MAX_ENTRIES {
+                if let Ok(mut order) = self.plan_cache_order.lock() {
+                    order.push_back(rewritten.clone());
+                    self.plan_cache.insert(rewritten.clone(), plan);
+                }
+            } else if let Ok(mut order) = self.plan_cache_order.lock() {
+                // Evict the oldest entry (simple LRU approximation).
+                if let Some(oldest) = order.pop_front() {
+                    self.plan_cache.remove(&oldest);
+                }
+                order.push_back(rewritten.clone());
+                self.plan_cache.insert(rewritten.clone(), plan);
+            }
+        }
+
         Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten))
     }
 

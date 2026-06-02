@@ -1,5 +1,5 @@
 //! Delta Lake time-travel query and audit batch example.
-//! Run with: `cargo run -p krishiv --example batch_delta_audit`
+//! Run with: `cargo run -p krishiv-rust-examples --bin batch_delta_audit`
 
 #![forbid(unsafe_code)]
 

@@ -1,6 +1,6 @@
 //! Real-time sliding window with Multi-Source Watermark synchronization.
 //! Tested locally using in-memory streams without requiring a Kafka broker.
-//! Run with: `cargo run -p krishiv --example stream_multi_source`
+//! Run with: `cargo run -p krishiv-rust-examples --bin stream_multi_source`
 
 #![forbid(unsafe_code)]
 

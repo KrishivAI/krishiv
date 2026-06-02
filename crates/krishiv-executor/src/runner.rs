@@ -674,6 +674,12 @@ pub struct ExecutorTaskRunner {
     /// rows emitted, state size) via this callback. The heartbeat loop wires
     /// this to forward snapshots to the coordinator for metrics exposure.
     pub(crate) progress_callback: SharedProgressCallback,
+
+    /// Cache of `"table_name:path"` keys for parquet tables already registered
+    /// in the SQL engine. Prevents re-reading parquet file footers on every task
+    /// when the same file is queried repeatedly in a session.
+    /// Invalidated when `deregister_table` is called on the engine.
+    pub(crate) registered_parquet_cache: Arc<DashMap<String, ()>>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -732,6 +738,7 @@ impl ExecutorTaskRunner {
             )),
             source_throttle_limits: crate::source_throttle::SourceThrottleTable::new(),
             progress_callback: Arc::new(NoOpProgressCallback),
+            registered_parquet_cache: Arc::new(DashMap::new()),
         }
     }
 

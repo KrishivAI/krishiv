@@ -27,7 +27,7 @@ cargo run -p krishiv -- jobs --distributed
 Run the embedded Parquet example using the unified `krishiv` crate:
 
 ```bash
-cargo run -p krishiv --example batch_sql
+cargo run -p krishiv-rust-examples --bin batch_sql
 ```
 
 For CLI Parquet registration:

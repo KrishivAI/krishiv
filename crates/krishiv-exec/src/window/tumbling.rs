@@ -47,6 +47,8 @@ pub struct TumblingWindowOperator {
     // Watermark from before the last processed batch; used for late-event
     // detection.  Initialised to i64::MIN so the first batch is never late.
     prev_watermark_ms: i64,
+    /// Total late events dropped by this operator since creation.
+    pub late_events_dropped: u64,
 }
 
 impl TumblingWindowOperator {
@@ -56,6 +58,7 @@ impl TumblingWindowOperator {
             spec,
             accumulators: HashMap::new(),
             prev_watermark_ms: i64::MIN,
+            late_events_dropped: 0,
         }
     }
 
@@ -142,6 +145,7 @@ impl TumblingWindowOperator {
             let event_time_ms = time_arr.value(row);
             // Drop events that arrived late relative to the previous watermark.
             if event_time_ms < late_threshold {
+                self.late_events_dropped = self.late_events_dropped.saturating_add(1);
                 continue;
             }
             let key = extract_agg_key(batch, key_idx, row)?.to_string();

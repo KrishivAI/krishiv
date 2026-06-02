@@ -6,16 +6,16 @@ that re-exports all public APIs under a single `use krishiv::...` import.
 Run local SQL over a generated Parquet file:
 
 ```bash
-cargo run -p krishiv --example batch_sql
+cargo run -p krishiv-rust-examples --bin batch_sql
 ```
 
 Run a bounded in-memory stream pipeline:
 
 ```bash
-cargo run -p krishiv --example memory_stream
+cargo run -p krishiv-rust-examples --bin memory_stream
 ```
 
-The source files live under `crates/krishiv/examples/`.
+The source files live under `examples/rust/src/bin/`.
 
 ## Rust API Quick-Start
 

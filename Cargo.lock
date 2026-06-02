@@ -4362,6 +4362,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "chrono",
+ "dashmap",
  "datafusion",
  "futures",
  "krishiv-catalog",

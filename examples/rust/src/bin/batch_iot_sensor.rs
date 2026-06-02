@@ -1,5 +1,5 @@
 //! IoT Sensor metrics aggregation from local Parquet files using SQL.
-//! Run with: `cargo run -p krishiv --example batch_iot_sensor`
+//! Run with: `cargo run -p krishiv-rust-examples --bin batch_iot_sensor`
 
 #![forbid(unsafe_code)]
 

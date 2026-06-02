@@ -1,5 +1,65 @@
 # Krishiv Implementation Status
 
+## Embedded Mode Optimizations — 10 Items
+
+**Item 1 — Coordinator bypass fast-path** (`krishiv-runtime/src/in_process.rs`):
+`InProcessStreamingRuntime::execute_batch_sql` routes non-streaming batch queries directly
+through `SqlEngine::sql()` + `collect()`, bypassing the 6+ Mutex coordinator state machine.
+`can_execute_inline()` uses `is_streaming_query()` to guard the path. 3 new tests.
+
+**Item 2 — Lazy UDF sync** (`krishiv-sql/src/lib.rs`):
+Added `udf_registry_version: Arc<AtomicU64>` + `udf_last_synced_version: Arc<AtomicU64>` to
+`SqlEngine`. `sync_all_udfs()` is now only called when the version counter changes — skips 3
+RwLock reads per query when no UDFs have changed. `bump_udf_version()` called on `with_udf_registry`.
+
+**Item 3 — `tables_to_batch_sql` early-exit** (`krishiv-runtime/src/execution_runtime.rs`):
+Empty slice path returns `Vec::new()` without iterating or cloning.
+
+**Item 4 — Late-event drop counter** (`krishiv-exec/src/window/`):
+Added `late_events_dropped: u64` to `TumblingWindowOperator`, `SlidingWindowOperator`,
+`SessionWindowOperator`. Each `if event_time_ms < late_threshold { continue; }` now
+increments the counter. `WatermarkState` gets a `record_late_drop()` method. 2 new tests.
+
+**Item 5 — CEP unbounded source guard + batch explosion fix** (`krishiv-sql/src/lib.rs`, `cep_sql.rs`):
+Added `is_streaming_source(&str) -> bool` to `SqlEngine`. `MATCH_RECOGNIZE` interception now
+returns `SqlError::Unsupported` when the source table is a registered streaming source.
+`execute_match_recognize` refactored from `Vec<(String, i64, RecordBatch)>` to
+`Vec<(String, i64, usize, usize)>` — deferred materialisation eliminates N single-row
+RecordBatch allocations. 2 new tests.
+
+**Item 6 — MemoryLakehouseTable compaction** (`krishiv-lakehouse/src/lib.rs`):
+Added `max_snapshot_layers: Option<usize>` to `MemoryLakehouseTableState`. `append_layer()`
+calls `maybe_compact()` which merges oldest layers when count exceeds max.
+`MemoryLakehouseTable::with_max_snapshot_layers(n)` builder added. 2 new tests.
+
+**Item 8 — DataFusion plan cache** (`krishiv-sql/src/lib.rs`):
+Added `plan_cache: Arc<DashMap<String, LogicalPlan>>` + LRU order queue to `SqlEngine`.
+`sql()` checks cache before DataFusion planning; caches the plan on miss. Max 256 entries.
+Invalidated implicitly when `as_ofs` refs are present (DDL bypass safety). Added `dashmap`
+to `krishiv-sql/Cargo.toml`.
+
+**Item 9 — IPC serialisation TODO** (`krishiv-scheduler/src/batch_sql.rs`):
+Added detailed TODO comment at the IPC encode site documenting the `InMemoryPartition` variant
+optimization for the embedded path.
+
+**Item 10 — Per-task parquet registration cache** (`krishiv-executor/src/runner.rs`, `fragment/batch.rs`):
+Added `registered_parquet_cache: Arc<DashMap<String, ()>>` to `ExecutorTaskRunner`.
+Parquet registration skipped when `"table_name:path"` key is already in cache.
+
+## Validation
+
+```
+cargo check --workspace     # 0 errors
+cargo test -p krishiv-runtime --lib    # 293 passed
+cargo test -p krishiv-sql --lib        # 78 passed
+cargo test -p krishiv-exec --lib       # 170 passed
+cargo test -p krishiv-lakehouse --lib  # 109 passed
+cargo test -p krishiv-scheduler --lib  # 219 passed
+```
+
+---
+
+
 ## Architectural Fixes Session — 11 Issues Resolved
 
 **#2 Delta ObjectStore tombstones**: `DeltaObjectStoreReader::parquet_paths_from_log_entry` now

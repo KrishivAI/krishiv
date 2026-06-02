@@ -25,6 +25,10 @@ use std::collections::HashMap;
 pub struct WatermarkState {
     max_event_time_ms: i64,
     lag_ms: u64,
+    /// Cumulative count of events dropped because their event time was strictly
+    /// below the current watermark. Exposed for observability; callers should
+    /// surface this in metrics so operators can detect misconfigured lag windows.
+    pub late_events_dropped: u64,
 }
 
 impl WatermarkState {
@@ -33,7 +37,14 @@ impl WatermarkState {
         Self {
             max_event_time_ms: i64::MIN,
             lag_ms,
+            late_events_dropped: 0,
         }
+    }
+
+    /// Record a single late-event drop. Callers MUST call this whenever they
+    /// skip a row due to `is_late()` returning true.
+    pub fn record_late_drop(&mut self) {
+        self.late_events_dropped = self.late_events_dropped.saturating_add(1);
     }
 
     /// Advance the high-water mark to `event_time_ms` if it is greater than
@@ -205,6 +216,72 @@ mod watermark_tests {
             i64::MIN,
             "idle policy must not advance a never-seen source's watermark"
         );
+    }
+
+    // ── Late-event drop counter ───────────────────────────────────────────────
+
+    #[test]
+    fn late_event_drop_counter_increments_on_late_events() {
+        use super::tumbling::{TumblingWindowOperator, TumblingWindowSpec};
+        use crate::AggExpr;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let spec = TumblingWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 10_000,
+            agg_exprs: vec![AggExpr { function: crate::AggFunction::Count, input_column: String::new(), output_column: "count".into() }],
+        };
+        let mut op = TumblingWindowOperator::new(spec);
+
+        // First batch advances watermark to 5000.
+        let b1 = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
+            Arc::new(Int64Array::from(vec![5_000_i64])) as _,
+        ]).unwrap();
+        let _ = op.process_batch(&b1, 5_000);
+        assert_eq!(op.late_events_dropped, 0, "no late events yet");
+
+        // Second batch has an event at t=1000 which is below watermark=5000.
+        let b2 = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
+            Arc::new(Int64Array::from(vec![1_000_i64])) as _,
+        ]).unwrap();
+        let _ = op.process_batch(&b2, 5_000);
+        assert_eq!(op.late_events_dropped, 1, "one late event must be counted");
+    }
+
+    #[test]
+    fn on_time_events_do_not_increment_drop_counter() {
+        use super::tumbling::{TumblingWindowOperator, TumblingWindowSpec};
+        use crate::AggExpr;
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let spec = TumblingWindowSpec {
+            key_column: "k".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 10_000,
+            agg_exprs: vec![AggExpr { function: crate::AggFunction::Count, input_column: String::new(), output_column: "count".into() }],
+        };
+        let mut op = TumblingWindowOperator::new(spec);
+        let b = arrow::record_batch::RecordBatch::try_new(schema, vec![
+            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])) as _,
+            Arc::new(Int64Array::from(vec![1_000_i64, 2_000, 3_000])) as _,
+        ]).unwrap();
+        let _ = op.process_batch(&b, 3_000);
+        assert_eq!(op.late_events_dropped, 0, "no events should be late");
     }
 
     /// GAP-14 (positive case): a source that HAS seen events should be advanced

@@ -1,6 +1,6 @@
-//! Real-time transaction count using a Tumbling Event-Time Window.
+//! Real-time user session grouping using Session Windows.
 //! Tested locally using in-memory streams without requiring a Kafka broker.
-//! Run with: `cargo run -p krishiv --example stream_transaction_count`
+//! Run with: `cargo run -p krishiv-rust-examples --bin stream_session_window`
 
 #![forbid(unsafe_code)]
 
@@ -14,7 +14,6 @@ use krishiv::{
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 1. Build session
     let mut builder = Session::builder();
     if let Ok(url) = std::env::var("KRISHIV_COORDINATOR_URL") {
         builder = builder.with_local_cluster(url);
@@ -23,7 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let session = builder.build()?;
 
-    // 2. Prepare streaming mock transaction batches (timestamp, user_id)
+    // Alice has a 12-second gap between the third and fourth interactions (triggers session split)
     let schema = Arc::new(Schema::new(vec![
         Field::new("timestamp", DataType::Int64, false),
         Field::new("user_id", DataType::Utf8, false),
@@ -31,28 +30,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(vec![1000, 2000, 61000, 62000])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Alice", "Alice"])),
+            Arc::new(Int64Array::from(vec![1000, 5000, 8000, 20000])),
+            Arc::new(StringArray::from(vec!["Alice", "Alice", "Alice", "Alice"])),
         ],
     )?;
 
-    // 3. Register as a bounded memory stream (sequence=0)
-    let stream_batch = StreamBatch::new(0, batch);
     let stream = session
-        .memory_stream("transactions", vec![stream_batch])
+        .memory_stream("clicks", vec![StreamBatch::new(0, batch)])
         .unwrap();
 
-    // 4. Declare event-time windowing via the fluent Rust API
-    let windowed = stream
+    let session_windowed = stream
         .key_by("user_id")
         .with_event_time("timestamp")
-        .watermark(WatermarkSpec::fixed_lag_ms(5000)) // 5s allowed lateness
-        .tumbling_window(60000); // 1-minute tumbling window size
+        .watermark(WatermarkSpec::fixed_lag_ms(2000))
+        .session_window(10000); // 10-second inactivity gap
 
-    // 5. Execute in-process and collect output stream batches
-    let results = windowed.collect()?;
+    let results = session_windowed.collect()?;
 
-    // Extract record batches and print formatted query result
     let batches = results.into_iter().map(|b| b.batch().clone()).collect();
     println!("{}", QueryResult::new(batches).pretty()?);
 

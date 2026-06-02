@@ -101,12 +101,20 @@ pub(crate) async fn execute_batch_fragment(
     if let Some(query) = sql_query_from_fragment(fragment) {
         let engine = Arc::clone(&runner.sql_engine);
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
+            // Skip re-registration if this table+path combo is already in the
+            // session-scoped cache. Avoids reading parquet file footers on every
+            // repeated query against the same files.
+            let cache_key = format!("{}:{}", partition.table_name(), partition.path().display());
+            if runner.registered_parquet_cache.contains_key(&cache_key) {
+                continue;
+            }
             engine
                 .register_parquet(partition.table_name(), partition.path())
                 .await
                 .map_err(|error| ExecutorError::LocalExecution {
                     message: error.to_string(),
                 })?;
+            runner.registered_parquet_cache.insert(cache_key, ());
         }
         for (table_name, batches) in
             read_connector_parquet_partitions(assignment.input_partitions()).await?

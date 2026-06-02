@@ -146,6 +146,15 @@ pub async fn submit_batch_sql_job(
     let job_kind = if is_streaming { JobKind::Streaming } else { JobKind::Batch };
     let spec = JobSpec::new(job_id.clone(), "batch-sql", job_kind).with_stage(stage);
 
+    // OPTIMIZATION OPPORTUNITY: In the embedded in-process path, the caller
+    // already has RecordBatch values in memory. Routing them through Base64 +
+    // Arrow IPC encode → coordinator store → decode → re-register is
+    // unnecessary serialisation. A future `InputPartitionDescriptor::InMemory`
+    // variant could pass `Arc<RecordBatch>` directly, eliminating two encode
+    // and two decode round-trips per partition. This is safe in the in-process
+    // path because coordinator and executor share the same address space.
+    // Track: replace InlineIpc with InMemory for embedded sessions (no cross-
+    // process boundary, zero-copy).
     let mut input_partitions: Vec<InputPartition> = Vec::with_capacity(tables.len());
     for (idx, t) in tables.iter().enumerate() {
         let ipc_bytes = base64::engine::general_purpose::STANDARD

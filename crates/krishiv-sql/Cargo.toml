@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+dashmap = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 datafusion = { workspace = true }

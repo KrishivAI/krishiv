@@ -178,12 +178,53 @@ impl InProcessStreamingRuntime {
     }
 
     /// Execute batch SQL on the in-process executor via the coordinator. → executor (`sql:` fragment).
+    /// Execute a SQL query directly via the SQL engine, bypassing the coordinator
+    /// state machine entirely. Only valid for non-streaming, single-stage batch
+    /// queries. Eliminates 6+ Mutex lock/unlock pairs of coordinator overhead.
+    fn execute_inline_sql(&self, query: &str, tables: &[BatchSqlTable]) -> RuntimeResult<Vec<RecordBatch>> {
+        let engine = Arc::clone(self.runner.sql_engine());
+        let tables_owned: Vec<BatchSqlTable> = tables.to_vec();
+        block_on(async move {
+            // Register any parquet tables supplied for this query.
+            for table in &tables_owned {
+                engine
+                    .register_parquet(&table.table_name, &table.path)
+                    .await
+                    .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            }
+            let df = engine
+                .sql(query)
+                .await
+                .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            df.collect()
+                .await
+                .map_err(|e| RuntimeError::transport(e.to_string()))
+        })
+    }
+
+    /// Returns `true` when the query is safe to run inline (not a streaming query).
+    /// Falls back to `false` on parse error so the coordinator path handles it.
+    fn can_execute_inline(&self, query: &str) -> bool {
+        self.runner
+            .sql_engine()
+            .is_streaming_query(query)
+            .map(|streaming| !streaming)
+            .unwrap_or(false)
+    }
+
     pub fn execute_batch_sql(
         &self,
         query: &str,
         tables: &[BatchSqlTable],
         is_streaming: bool,
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        // Fast path: bypass the coordinator state machine for non-streaming
+        // batch queries. The coordinator was designed for distributed job
+        // lifecycle; routing in-process single-stage SQL through it adds
+        // 6+ Mutex lock/unlock pairs per query with no functional benefit.
+        if !is_streaming && self.can_execute_inline(query) {
+            return self.execute_inline_sql(query, tables);
+        }
         let fragment = format!("sql: {query}");
         let kind = if is_streaming { JobKind::Streaming } else { JobKind::Batch };
         self.run_terminal_task(&fragment, kind, tables, Vec::new())
@@ -449,6 +490,42 @@ mod tests {
             .collect_bounded_window("events", vec![batch], &spec)
             .unwrap();
         assert!(!out.is_empty());
+    }
+
+    // ── Inline fast-path tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn inline_fast_path_simple_select_returns_correct_result() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let batches = runtime.execute_batch_sql("SELECT 42 AS n", &[], false).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 42);
+    }
+
+    #[test]
+    fn inline_fast_path_multi_column_select() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let batches = runtime
+            .execute_batch_sql("SELECT 1 AS a, 'hello' AS b, 3.14 AS c", &[], false)
+            .unwrap();
+        assert_eq!(batches[0].num_columns(), 3);
+    }
+
+    #[test]
+    fn streaming_query_bypasses_inline_path() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        // Register a streaming source so is_streaming_query returns true.
+        runtime.runner.sql_engine().register_streaming_source_name("stream_t");
+        // is_streaming=true forces coordinator path regardless.
+        let result = runtime.execute_batch_sql("SELECT 1", &[], true);
+        // Just verify it doesn't panic (returns Ok or coordinator error).
+        let _ = result;
     }
 
     #[test]

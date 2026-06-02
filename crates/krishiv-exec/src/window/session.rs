@@ -39,6 +39,8 @@ pub struct SessionWindowOperator {
     // Keyed by serialised key value.
     sessions: HashMap<String, SessionState>,
     prev_watermark_ms: i64,
+    /// Total late events dropped by this operator since creation.
+    pub late_events_dropped: u64,
 }
 
 impl SessionWindowOperator {
@@ -48,6 +50,7 @@ impl SessionWindowOperator {
             spec,
             sessions: HashMap::new(),
             prev_watermark_ms: i64::MIN,
+            late_events_dropped: 0,
         }
     }
 
@@ -196,6 +199,7 @@ impl SessionWindowOperator {
         for row in 0..batch.num_rows() {
             let event_time_ms = time_arr.value(row);
             if event_time_ms < late_threshold {
+                self.late_events_dropped = self.late_events_dropped.saturating_add(1);
                 continue;
             }
             let key = extract_agg_key(batch, key_idx, row)?.to_string();

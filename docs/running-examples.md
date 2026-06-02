@@ -8,7 +8,7 @@ examples work in all three modes; only the session configuration changes.
 
 ## Examples at a Glance
 
-### Rust (`crates/krishiv/examples/`)
+### Rust (`examples/rust/src/bin/`)
 
 | Example | What it demonstrates |
 |---------|---------------------|
@@ -84,18 +84,18 @@ session = ks.Session.from_env()   # embedded when KRISHIV_COORDINATOR_URL is uns
 # Unset the coordinator URL to force embedded mode
 unset KRISHIV_COORDINATOR_URL
 
-cargo run -p krishiv --example batch_iot_sensor
-cargo run -p krishiv --example batch_ecommerce
-cargo run -p krishiv --example batch_log_analytics
-cargo run -p krishiv --example batch_sql
-cargo run -p krishiv --example batch_delta_audit
-cargo run -p krishiv --example batch_hudi_ingest
-cargo run -p krishiv --example memory_stream
-cargo run -p krishiv --example stream_transaction_count
-cargo run -p krishiv --example stream_multi_source
-cargo run -p krishiv --example stream_session_window
-cargo run -p krishiv --example stream_continuous_job
-cargo run -p krishiv --example stream_state_ttl
+cargo run -p krishiv-rust-examples --bin batch_iot_sensor
+cargo run -p krishiv-rust-examples --bin batch_ecommerce
+cargo run -p krishiv-rust-examples --bin batch_log_analytics
+cargo run -p krishiv-rust-examples --bin batch_sql
+cargo run -p krishiv-rust-examples --bin batch_delta_audit
+cargo run -p krishiv-rust-examples --bin batch_hudi_ingest
+cargo run -p krishiv-rust-examples --bin memory_stream
+cargo run -p krishiv-rust-examples --bin stream_transaction_count
+cargo run -p krishiv-rust-examples --bin stream_multi_source
+cargo run -p krishiv-rust-examples --bin stream_session_window
+cargo run -p krishiv-rust-examples --bin stream_continuous_job
+cargo run -p krishiv-rust-examples --bin stream_state_ttl
 ```
 
 ### Run Python examples (embedded)
@@ -151,18 +151,18 @@ curl http://127.0.0.1:18080/api/v1/executors
 ```bash
 export KRISHIV_COORDINATOR_URL=http://127.0.0.1:50051
 
-cargo run -p krishiv --example batch_iot_sensor
-cargo run -p krishiv --example batch_ecommerce
-cargo run -p krishiv --example batch_log_analytics
-cargo run -p krishiv --example batch_sql
-cargo run -p krishiv --example batch_delta_audit
-cargo run -p krishiv --example batch_hudi_ingest
-cargo run -p krishiv --example memory_stream
-cargo run -p krishiv --example stream_transaction_count
-cargo run -p krishiv --example stream_multi_source
-cargo run -p krishiv --example stream_session_window
-cargo run -p krishiv --example stream_continuous_job
-cargo run -p krishiv --example stream_state_ttl
+cargo run -p krishiv-rust-examples --bin batch_iot_sensor
+cargo run -p krishiv-rust-examples --bin batch_ecommerce
+cargo run -p krishiv-rust-examples --bin batch_log_analytics
+cargo run -p krishiv-rust-examples --bin batch_sql
+cargo run -p krishiv-rust-examples --bin batch_delta_audit
+cargo run -p krishiv-rust-examples --bin batch_hudi_ingest
+cargo run -p krishiv-rust-examples --bin memory_stream
+cargo run -p krishiv-rust-examples --bin stream_transaction_count
+cargo run -p krishiv-rust-examples --bin stream_multi_source
+cargo run -p krishiv-rust-examples --bin stream_session_window
+cargo run -p krishiv-rust-examples --bin stream_continuous_job
+cargo run -p krishiv-rust-examples --bin stream_state_ttl
 ```
 
 ### Run Python examples (single-node)
@@ -269,18 +269,18 @@ The manifest exposes two NodePort services:
 ```bash
 export KRISHIV_COORDINATOR_URL=http://127.0.0.1:30051
 
-cargo run -p krishiv --example batch_iot_sensor
-cargo run -p krishiv --example batch_ecommerce
-cargo run -p krishiv --example batch_log_analytics
-cargo run -p krishiv --example batch_sql
-cargo run -p krishiv --example batch_delta_audit
-cargo run -p krishiv --example batch_hudi_ingest
-cargo run -p krishiv --example memory_stream
-cargo run -p krishiv --example stream_transaction_count
-cargo run -p krishiv --example stream_multi_source
-cargo run -p krishiv --example stream_session_window
-cargo run -p krishiv --example stream_continuous_job
-cargo run -p krishiv --example stream_state_ttl
+cargo run -p krishiv-rust-examples --bin batch_iot_sensor
+cargo run -p krishiv-rust-examples --bin batch_ecommerce
+cargo run -p krishiv-rust-examples --bin batch_log_analytics
+cargo run -p krishiv-rust-examples --bin batch_sql
+cargo run -p krishiv-rust-examples --bin batch_delta_audit
+cargo run -p krishiv-rust-examples --bin batch_hudi_ingest
+cargo run -p krishiv-rust-examples --bin memory_stream
+cargo run -p krishiv-rust-examples --bin stream_transaction_count
+cargo run -p krishiv-rust-examples --bin stream_multi_source
+cargo run -p krishiv-rust-examples --bin stream_session_window
+cargo run -p krishiv-rust-examples --bin stream_continuous_job
+cargo run -p krishiv-rust-examples --bin stream_state_ttl
 ```
 
 ### Run Python examples (distributed)

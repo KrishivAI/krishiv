@@ -1,6 +1,6 @@
 //! Continuous unbounded streaming job execution.
 //! Registering, submitting, pushing inputs, and polling/draining output window results.
-//! Run with: `cargo run -p krishiv --example stream_continuous_job`
+//! Run with: `cargo run -p krishiv-rust-examples --bin stream_continuous_job`
 
 #![forbid(unsafe_code)]
 

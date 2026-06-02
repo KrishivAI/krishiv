@@ -1,5 +1,5 @@
 //! Application log analytics and SLA error rate calculation using SQL.
-//! Run with: `cargo run -p krishiv --example batch_log_analytics`
+//! Run with: `cargo run -p krishiv-rust-examples --bin batch_log_analytics`
 
 #![forbid(unsafe_code)]
 

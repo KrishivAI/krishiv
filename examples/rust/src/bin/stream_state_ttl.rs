@@ -1,6 +1,6 @@
 //! Stateful streaming with event-time State TTL eviction.
 //! Tested locally using in-memory streams without requiring a Kafka broker.
-//! Run with: `cargo run -p krishiv --example stream_state_ttl`
+//! Run with: `cargo run -p krishiv-rust-examples --bin stream_state_ttl`
 
 #![forbid(unsafe_code)]
 
