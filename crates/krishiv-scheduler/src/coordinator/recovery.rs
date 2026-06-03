@@ -16,18 +16,12 @@ impl Coordinator {
         // Always prefer the persisted store as the authoritative source of truth.
         self.job_coordinators.clear();
         self.streaming_task_index.clear();
-        self.job_coordinators.clear();
         for record in store.jobs() {
             let job_id = record.job_id().clone();
             self.job_coordinators.insert(
                 job_id.clone(),
-                Arc::new(JobCoordinator::new(job_id.clone(), record.clone())),
+                Arc::new(JobCoordinator::new(job_id, record.clone())),
             );
-            // Track B (two-tier): repopulate JobCoordinator map on recovery so the
-            // per-job ownership seam (launch decisions, heartbeat windows, recovery)
-            // survives coordinator restart / failover for long-lived jobs.
-            let jcp = crate::job_coordinator::JobCoordinator::new(job_id.clone(), record.clone());
-            self.job_coordinators.insert(job_id, Arc::new(jcp));
         }
         // RC1: Rebuild streaming_task_index so heartbeats arriving during the
         // recovery window are not silently dropped.  Without this, every call to
@@ -79,7 +73,14 @@ impl Coordinator {
                         interval_ms,
                         task_count,
                     );
-                    let _ = coord.recover_from_storage();
+                    if let Err(e) = coord.recover_from_storage() {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %e,
+                            "checkpoint epoch state could not be recovered; \
+                             job will checkpoint from scratch (possible re-processing from last committed offset)"
+                        );
+                    }
                     self.checkpoint_coordinators.insert(job_id, coord);
                 }
                 Err(e) => {
@@ -91,6 +92,22 @@ impl Coordinator {
                 }
             }
         }
+        // R10: Restore executor descriptors so re-attaching executors are
+        // recognised without a fresh registration handshake. Executors that
+        // were persisted but have not yet re-registered start in the
+        // Registered state; they will be evicted by the heartbeat timeout if
+        // they never reconnect.
+        for descriptor in store.executors() {
+            if let Err(e) = self.executors.register(descriptor.clone()) {
+                tracing::warn!(
+                    executor_id = %descriptor.executor_id(),
+                    error = %e,
+                    "could not restore executor descriptor during recovery; \
+                     executor must re-register before receiving tasks"
+                );
+            }
+        }
+
         // Start the re-attach grace period.
         self.ticks_since_restart = 0;
         self.recovering = true;

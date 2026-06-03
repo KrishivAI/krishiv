@@ -137,6 +137,15 @@ pub struct Coordinator {
     /// Inline input partitions registered for coordinated batch-sql and bounded-window jobs.
     pub(crate) job_input_partitions: HashMap<JobId, Vec<krishiv_proto::InputPartition>>,
 
+    /// S1: Skew-aware repartitioning overrides. When a hot-key report exceeds
+    /// the threshold, the affected job's stage is added here with a RoundRobin
+    /// bucket count. `launch_assigned_task_assignments` uses this to override
+    /// Hash partitioning with RoundRobin for the next task batch, distributing
+    /// hot-key data evenly across available executors.
+    /// Entry is removed after the next task launch to allow normal partitioning
+    /// to resume (adaptive: only applies to the immediate next batch).
+    pub(crate) skew_repartition_overrides: HashMap<JobId, u32>,
+
     /// Notify channel for waking daemon tick and other waiters on state change.
     pub(crate) notify: Arc<Notify>,
 
@@ -651,6 +660,7 @@ impl Coordinator {
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
             job_input_partitions: HashMap::new(),
+            skew_repartition_overrides: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
         }
@@ -784,7 +794,45 @@ impl Coordinator {
         for job_id in &job_ids {
             let _ = self.launch_assigned_task_assignments(job_id)?;
         }
+        // R5: Stall detection — reset Running tasks whose executor is still
+        // alive (heartbeating) but the task itself has not progressed past
+        // TaskState::Running for longer than the stall timeout. This catches
+        // deadlocked operators that block a thread without crashing the executor.
+        self.detect_and_reset_stalled_tasks();
         Ok(())
+    }
+
+    /// R5: Scan all Running tasks and reset those that have been in-flight
+    /// longer than `TASK_STALL_TIMEOUT_MS`. The task is marked Failed so the
+    /// coordinator retries it on a different executor slot.
+    fn detect_and_reset_stalled_tasks(&mut self) {
+        const TASK_STALL_TIMEOUT_MS: u64 = 30 * 60 * 1_000; // 30 minutes
+        let now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
+        for jc in self.job_coordinators.values() {
+            let mut record = jc.write_record();
+            for stage in record.stages_mut() {
+                for task in stage.tasks_mut() {
+                    if task.state() != krishiv_proto::TaskState::Running {
+                        continue;
+                    }
+                    if let Some(assigned_ms) = task.assigned_at_ms {
+                        if now_ms.saturating_sub(assigned_ms) > TASK_STALL_TIMEOUT_MS {
+                            tracing::warn!(
+                                task_id = %task.task_id(),
+                                stall_secs = now_ms.saturating_sub(assigned_ms) / 1000,
+                                "resetting stalled task (no progress for >30 min)"
+                            );
+                            task.state = krishiv_proto::TaskState::Failed;
+                            task.last_failure_reason =
+                                Some(format!("task stalled: no progress for {} min",
+                                    now_ms.saturating_sub(assigned_ms) / 60_000));
+                            task.launch_in_flight = false;
+                            task.assigned_at_ms = None;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn ensure_active(&self) -> SchedulerResult<()> {

@@ -69,6 +69,11 @@ pub enum RuntimeError {
     /// The operation succeeded for some partitions but not all.
     #[error("partial result: {succeeded} partitions succeeded, {failed} failed")]
     PartialResult { succeeded: usize, failed: usize },
+    /// The remote server responded with gRPC `Unimplemented` — the client should
+    /// fall back to the legacy SQL-comment protocol.  Kept as a distinct variant
+    /// so callers use a proper enum match instead of fragile string comparison.
+    #[error("server unimplemented: {message}")]
+    ServerUnimplemented { message: String },
 }
 
 impl RuntimeError {
@@ -367,8 +372,15 @@ impl ExecutionBackend for EmbeddedBackend {
     }
 
     fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        // Streaming plans are rejected upstream in InProcessExecutionRuntime::accept_plan
-        // before reaching this backend — this path only sees batch plans.
+        if plan.kind() == krishiv_plan::ExecutionKind::Streaming {
+            debug!(
+                backend = "embedded",
+                plan = %plan.name(),
+                "EmbeddedBackend: delegating streaming plan to SingleNodeBackend"
+            );
+            return self.single_node.execute(plan);
+        }
+
         debug!(
             backend = "embedded",
             plan = %plan.name(),

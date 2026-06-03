@@ -7,8 +7,13 @@ impl Coordinator {
         descriptor: ExecutorDescriptor,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
-        let res = self.executors.register(descriptor);
+        let res = self.executors.register(descriptor.clone());
         if res.is_ok() {
+            // R10: Persist the descriptor so the executor is recognised on
+            // coordinator restart without requiring a fresh registration RPC.
+            if let Some(ref store) = self.store {
+                store.save_executor(&descriptor);
+            }
             self.assign_pending_tasks_for_schedulable_jobs();
             self.notify.notify_waiters();
         }
@@ -30,6 +35,11 @@ impl Coordinator {
                 && let Some(endpoint) = record.descriptor().task_endpoint()
             {
                 self.executor_channels.remove(endpoint);
+            }
+            // R10: Remove the persisted descriptor — clean deregister means the
+            // executor won't be auto-restored on next coordinator restart.
+            if let Some(ref store) = self.store {
+                store.remove_executor(executor_id);
             }
             self.notify.notify_waiters();
         }
@@ -140,7 +150,7 @@ impl Coordinator {
                 ),
                 applied,
             };
-            let log_bucket = self.adaptive_decision_log.entry(job_id).or_default();
+            let log_bucket = self.adaptive_decision_log.entry(job_id.clone()).or_default();
             const MAX_LOG_PER_JOB: usize = 100;
             if log_bucket.len() >= MAX_LOG_PER_JOB {
                 log_bucket.pop_front(); // O(1) with VecDeque
@@ -162,6 +172,12 @@ impl Coordinator {
                     throttle_rate = reduced_rate,
                     "hot-key throttle applied"
                 );
+                // S1: Mark the job for round-robin repartitioning on the next
+                // task batch. This spreads hot-key data evenly across all
+                // available executor slots rather than concentrating it on the
+                // bucket that hashes to the hot key.
+                let buckets = self.executors.list().len().max(2) as u32;
+                self.skew_repartition_overrides.insert(job_id.clone(), buckets);
             }
         }
         throttles

@@ -556,71 +556,62 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::ContinuousRegister(body) => {
-                let cluster = self.host.cluster();
+                let cluster = self.host.cluster()
+                    .ok_or_else(|| KrishivActionError::Other("embedded cluster unavailable in proxy mode".into()))?;
+                let registry = self.host.continuous_registry()
+                    .ok_or_else(|| KrishivActionError::Other("continuous registry unavailable in proxy mode".into()))?;
                 let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
-                let registry = self.host.continuous_registry();
                 let job_id = body.job_id.clone();
-                let job_id_for_blocking = job_id.clone();
                 let spec_copy = body.spec.clone();
-                tokio::task::spawn_blocking(move || {
-                    cluster.register_continuous_job(&job_id_for_blocking, &local)?;
-                    registry.register_job(job_id_for_blocking, spec_copy)
+                tokio::task::block_in_place(|| {
+                    cluster.register_continuous_job(&job_id, &local)?;
+                    registry.register_job(job_id, spec_copy)
                 })
-                .await
-                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
                 .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 Ok(Vec::new())
             }
             A::ContinuousPush(body) => {
                 let batches = krishiv_runtime::decode_batches(&body.batches_b64)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
-                let cluster = self.host.cluster();
-                let registry = self.host.continuous_registry();
+                let cluster = self.host.cluster()
+                    .ok_or_else(|| KrishivActionError::Other("embedded cluster unavailable in proxy mode".into()))?;
+                let registry = self.host.continuous_registry()
+                    .ok_or_else(|| KrishivActionError::Other("continuous registry unavailable in proxy mode".into()))?;
                 let job_id = body.job_id.clone();
                 let batches_for_cluster = batches.clone();
-                tokio::task::spawn_blocking(move || {
+                tokio::task::block_in_place(|| {
                     cluster.push_continuous_input(&job_id, batches_for_cluster)?;
                     registry.push_input(&job_id, batches)
                 })
-                .await
-                .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
                 .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 Ok(Vec::new())
             }
             A::ContinuousDrain(body) => {
-                let cluster = self.host.cluster();
+                let cluster = self.host.cluster()
+                    .ok_or_else(|| KrishivActionError::Other("embedded cluster unavailable in proxy mode".into()))?;
                 let job_id = body.job_id.clone();
-                let batches =
-                    tokio::task::spawn_blocking(move || cluster.drain_continuous_job(&job_id))
-                        .await
-                        .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
-                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                let batches = tokio::task::block_in_place(|| cluster.drain_continuous_job(&job_id))
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 encode_batches_ipc(&batches)
             }
             A::BoundedWindow(body) => {
                 let input_batches = krishiv_runtime::decode_batches(&body.batches_b64)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 if let Some(http_base) = self.host.coordinator_http_url() {
-                    // Route through the real coordinator → executor for true single-node execution.
                     let result = krishiv_runtime::execute_coordinator_bounded_window(
-                        http_base,
-                        &body.topic,
-                        &body.spec,
-                        &input_batches,
+                        http_base, &body.topic, &body.spec, &input_batches,
                     )
                     .await
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                     encode_batches_ipc(&result)
                 } else {
-                    // Embedded mode: run on the local InProcessCluster (always present).
-                    let cluster = self.host.cluster();
+                    let cluster = self.host.cluster()
+                        .ok_or_else(|| KrishivActionError::Other("embedded cluster unavailable".into()))?;
                     let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
                     let topic = body.topic.clone();
-                    let result = tokio::task::spawn_blocking(move || {
+                    let result = tokio::task::block_in_place(|| {
                         cluster.collect_bounded_window(&topic, input_batches, &local)
                     })
-                    .await
-                    .map_err(|e| KrishivActionError::Other(format!("blocking task: {e}")))?
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                     encode_batches_ipc(&result)
                 }

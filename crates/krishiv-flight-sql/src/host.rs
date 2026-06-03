@@ -38,22 +38,23 @@ fn collect_ipc_tables(directives: &[FlightDirective]) -> Vec<krishiv_scheduler::
 
 /// Server-side catalog and cluster state shared across Flight SQL requests.
 ///
-/// In **proxy mode** (`coordinator_http` is `Some`), batch SQL and bounded
-/// windows are forwarded to the real coordinator/executor. Continuous stream
-/// operations still run on the embedded `InProcessCluster` because the
-/// coordinator does not yet have a continuous-stream execution path.
+/// **Proxy mode** (`coordinator_http` is `Some`): batch SQL, bounded windows,
+/// and continuous streams are all forwarded to the external coordinator. No
+/// `InProcessCluster` or `ContinuousStreamRegistry` is created — those
+/// allocations are unnecessary overhead in proxy deployments.
 ///
-/// In **embedded mode** (`coordinator_http` is `None`), all operations run on
-/// the embedded `InProcessCluster`.
+/// **Embedded mode** (`coordinator_http` is `None`): all operations run on the
+/// local `InProcessCluster`.
 #[derive(Clone)]
 pub struct FlightExecutionHost {
-    /// Always present. Used for continuous streams in all modes; also handles
-    /// batch SQL and bounded windows in embedded mode.
-    cluster: Arc<InProcessCluster>,
-    continuous: Arc<ContinuousStreamRegistry>,
+    /// Present only in embedded mode. `None` in proxy mode — all execution is
+    /// forwarded to the coordinator, so no local cluster is needed.
+    cluster: Option<Arc<InProcessCluster>>,
+    /// Present only in embedded mode for the legacy continuous-stream local path.
+    continuous: Option<Arc<ContinuousStreamRegistry>>,
     /// Path-based catalog shared across requests (persisted registrations).
     catalog: Arc<DashMap<String, PathBuf>>,
-    /// When set, routes batch SQL and bounded windows through the coordinator.
+    /// When set, routes all execution through the coordinator HTTP API.
     coordinator_http: Option<String>,
 }
 
@@ -76,26 +77,32 @@ impl FlightExecutionHost {
 
     /// Create a host with an optional coordinator HTTP base URL.
     ///
-    /// - `Some(url)` → proxy mode: batch SQL and bounded windows forwarded to coordinator.
-    ///   Continuous streams still run locally on the embedded cluster.
-    /// - `None` → embedded mode: all operations run on the embedded cluster.
+    /// - `Some(url)` → proxy mode: all execution forwarded to the coordinator.
+    ///   No `InProcessCluster` is created — avoids the coordinator/executor
+    ///   allocation overhead in pure proxy deployments.
+    /// - `None` → embedded mode: all operations run on the local cluster.
     pub fn with_coordinator_http(coordinator_http: Option<String>) -> Result<Self, Status> {
-        let cluster = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
+        let (cluster, continuous) = if coordinator_http.is_none() {
+            let c = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
+            (Some(Arc::new(c)), Some(Arc::new(ContinuousStreamRegistry::new())))
+        } else {
+            (None, None)
+        };
         Ok(Self {
-            cluster: Arc::new(cluster),
-            continuous: Arc::new(ContinuousStreamRegistry::new()),
+            cluster,
+            continuous,
             catalog: Arc::new(DashMap::new()),
             coordinator_http,
         })
     }
 
-    /// Embedded cluster — always present.
-    pub fn cluster(&self) -> Arc<InProcessCluster> {
-        Arc::clone(&self.cluster)
+    /// Embedded cluster — `None` in proxy mode.
+    pub fn cluster(&self) -> Option<Arc<InProcessCluster>> {
+        self.cluster.clone()
     }
 
-    pub fn continuous_registry(&self) -> Arc<ContinuousStreamRegistry> {
-        Arc::clone(&self.continuous)
+    pub fn continuous_registry(&self) -> Option<Arc<ContinuousStreamRegistry>> {
+        self.continuous.clone()
     }
 
     pub fn coordinator_http_url(&self) -> Option<&str> {
@@ -106,9 +113,6 @@ impl FlightExecutionHost {
         let (directives, sql) = parse_sql(raw_sql);
         self.apply_catalog_directives(&directives)?;
 
-        // Build per-request inline IPC table list from this call's directives only.
-        // Tables are NOT stored in shared state, so concurrent calls cannot observe
-        // each other's in-flight data.
         let ipc_tables = collect_ipc_tables(&directives);
 
         if has_control_directive(&directives) {
@@ -118,21 +122,33 @@ impl FlightExecutionHost {
         let tables = self.catalog_tables();
         let sql = sql.to_string();
 
-        let is_streaming = self.cluster().is_streaming_query(&sql).unwrap_or(false);
-
         if let Some(http_base) = self.coordinator_http.as_deref() {
+            // Proxy mode: is_streaming classification cannot use the local cluster
+            // (none is allocated). The coordinator classifies the query itself based
+            // on its own registered streaming sources, so passing false is safe here
+            // — the coordinator's handler ignores this hint for non-streaming SQL.
+            let is_streaming = false;
             return krishiv_runtime::execute_coordinator_batch_sql_inline(
-                http_base,
-                &sql,
-                &ipc_tables,
-                is_streaming,
+                http_base, &sql, &ipc_tables, is_streaming,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()));
         }
 
-        let cluster = self.cluster();
-        run_blocking(move || cluster.collect_batch_sql(&sql, &tables, is_streaming)).await
+        let cluster = self.cluster().ok_or_else(|| {
+            Status::internal("embedded cluster unavailable")
+        })?;
+        let is_streaming = match cluster.is_streaming_query(&sql) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "streaming detection failed; treating query as batch"
+                );
+                false
+            }
+        };
+        run_blocking(|| cluster.collect_batch_sql(&sql, &tables, is_streaming))
     }
 
     fn apply_catalog_directives(&self, directives: &[FlightDirective]) -> Result<(), Status> {
@@ -174,17 +190,15 @@ impl FlightExecutionHost {
                             .map_err(|e| Status::internal(e.to_string()))?;
                         continue;
                     }
-
-                    let cluster = self.cluster();
+                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
+                    let continuous = self.continuous.clone().ok_or_else(|| Status::internal("continuous registry unavailable"))?;
                     let local = plan_spec_to_local(&spec);
-                    let continuous = Arc::clone(&self.continuous);
                     let job_id = job_id.clone();
                     let spec = spec.clone();
                     run_blocking(move || {
                         cluster.register_continuous_job(&job_id, &local)?;
                         continuous.register_job(job_id, spec)
-                    })
-                    .await?;
+                    })?;
                 }
                 FlightDirective::ContinuousPush { job_id, batches } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
@@ -193,15 +207,13 @@ impl FlightExecutionHost {
                             .map_err(|e| Status::internal(e.to_string()))?;
                         continue;
                     }
-
-                    let cluster = self.cluster();
-                    let continuous = Arc::clone(&self.continuous);
+                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
+                    let continuous = self.continuous.clone().ok_or_else(|| Status::internal("continuous registry unavailable"))?;
                     let job_id = job_id.clone();
                     run_blocking(move || {
                         cluster.push_continuous_input(&job_id, batches.clone())?;
                         continuous.push_input(&job_id, batches.to_vec())
-                    })
-                    .await?;
+                    })?;
                 }
                 FlightDirective::ContinuousDrain { job_id } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
@@ -209,16 +221,11 @@ impl FlightExecutionHost {
                             .await
                             .map_err(|e| Status::internal(e.to_string()));
                     }
-
-                    let cluster = self.cluster();
+                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
                     let job_id = job_id.clone();
-                    return run_blocking(move || cluster.drain_continuous_job(&job_id)).await;
+                    return run_blocking(move || cluster.drain_continuous_job(&job_id));
                 }
-                FlightDirective::BoundedWindow {
-                    topic,
-                    spec,
-                    input_batches,
-                } => {
+                FlightDirective::BoundedWindow { topic, spec, input_batches } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
                         return krishiv_runtime::execute_coordinator_bounded_window(
                             http_base, &topic, &spec, &input_batches,
@@ -226,14 +233,13 @@ impl FlightExecutionHost {
                         .await
                         .map_err(|e| Status::internal(e.to_string()));
                     }
+                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
                     let local = plan_spec_to_local(&spec);
-                    let cluster = self.cluster();
                     let topic = topic.clone();
                     let input_batches = input_batches.clone();
                     return run_blocking(move || {
                         cluster.collect_bounded_window(&topic, input_batches, &local)
-                    })
-                    .await;
+                    });
                 }
                 // Already applied in apply_catalog_directives.
                 FlightDirective::RegisterParquet { .. } => {}
@@ -244,15 +250,23 @@ impl FlightExecutionHost {
     }
 }
 
-async fn run_blocking<T>(
-    f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError> + Send + 'static,
-) -> Result<T, Status>
-where
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Status::internal(format!("blocking task failed: {e}")))?
+/// Run a blocking cluster operation on the current tokio worker thread.
+///
+/// Uses `block_in_place` instead of `spawn_blocking`:
+/// - Stays on the same thread pool — no cross-thread overhead.
+/// - Allows the tokio executor to continue other tasks while this one blocks.
+/// - Eliminates the `spawn_blocking → block_on → FALLBACK_RUNTIME` triple-hop
+///   that `spawn_blocking` caused (cluster methods call `block_on` internally;
+///   inside `block_in_place`, `block_on` uses `block_in_place + handle.block_on`
+///   rather than the fallback runtime).
+/// - Drops the `'static` and `Send` bounds — the closure can borrow locals.
+///
+/// Requires a multi-threaded tokio runtime, which is always the case for a
+/// Flight SQL gRPC server.
+fn run_blocking<T>(
+    f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError>,
+) -> Result<T, Status> {
+    tokio::task::block_in_place(f)
         .map_err(|e| Status::internal(e.to_string()))
 }
 

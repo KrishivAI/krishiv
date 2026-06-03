@@ -202,15 +202,7 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        // Streaming plans carry long-running operator state and must go through
-        // collect_bounded_window or the continuous stream APIs.  Accepting them
-        // silently here would return a success report without executing anything.
-        if plan.kind() == ExecutionKind::Streaming {
-            return Err(RuntimeError::unsupported(
-                "streaming plans must use collect_bounded_window or the continuous \
-                 stream APIs; submit via Session::submit_stream_job for unbounded pipelines",
-            ));
-        }
+
         match self.mode {
             RuntimeMode::Embedded => {
                 let backend = EmbeddedBackend::default();
@@ -303,11 +295,67 @@ impl RemoteExecutionRuntime {
 /// that happen to contain the word "Unimplemented" (schema errors, auth errors,
 /// user-facing messages, etc.). Tonic formats unimplemented status as:
 /// `"status: Unimplemented, message: ..."`.
+/// Split `batches` into `num_shards` groups based on the hash of each row's
+/// `key_column` value (R7 — partition-key routing).
+///
+/// Rows where the key column is missing or non-string are placed in shard 0.
+/// The split is deterministic: the same key always routes to the same shard,
+/// ensuring that a given aggregation key is processed by exactly one executor.
+fn shard_batches_by_key(
+    batches: &[RecordBatch],
+    key_column: &str,
+    num_shards: usize,
+) -> RuntimeResult<Vec<Vec<RecordBatch>>> {
+    use arrow::array::{Array, BooleanBuilder, StringArray};
+    use arrow::compute::filter_record_batch;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut shards: Vec<Vec<RecordBatch>> = (0..num_shards).map(|_| Vec::new()).collect();
+
+    for batch in batches {
+        // Clone the Arc<dyn Array> so that `keys` doesn't borrow `batch`,
+        // allowing `filter_record_batch(batch, …)` later in the same scope.
+        let key_col_opt = batch.schema().index_of(key_column).ok()
+            .filter(|&idx| batch.column(idx).as_any().is::<StringArray>())
+            .map(|idx| Arc::clone(batch.column(idx)));
+
+        if let Some(key_col) = key_col_opt {
+            let keys = key_col.as_any().downcast_ref::<StringArray>()
+                .expect("type already verified above");
+            // Build one boolean mask per shard.
+            let mut masks: Vec<BooleanBuilder> =
+                (0..num_shards).map(|_| BooleanBuilder::with_capacity(batch.num_rows())).collect();
+            for i in 0..batch.num_rows() {
+                let shard = if keys.is_null(i) {
+                    0
+                } else {
+                    let mut h = DefaultHasher::new();
+                    keys.value(i).hash(&mut h);
+                    (h.finish() as usize) % num_shards
+                };
+                for (s, mask) in masks.iter_mut().enumerate() {
+                    mask.append_value(s == shard);
+                }
+            }
+            for (shard_idx, mut mask_builder) in masks.into_iter().enumerate() {
+                let mask = mask_builder.finish();
+                if mask.true_count() > 0 {
+                    let filtered = filter_record_batch(batch, &mask)
+                        .map_err(|e| RuntimeError::transport(format!("shard filter: {e}")))?;
+                    shards[shard_idx].push(filtered);
+                }
+            }
+        } else {
+            // Key column not found or not string — route entire batch to shard 0.
+            shards[0].push(batch.clone());
+        }
+    }
+    Ok(shards)
+}
+
 fn is_server_unimplemented(e: &RuntimeError) -> bool {
-    matches!(e, RuntimeError::Transport { message }
-        if message.starts_with("status: Unimplemented")
-            || message.starts_with("Status { code: Unimplemented")
-    )
+    matches!(e, RuntimeError::ServerUnimplemented { .. })
 }
 
 impl ExecutionRuntime for RemoteExecutionRuntime {
@@ -371,6 +419,52 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         use crate::flight_client::decode_ipc_response;
         use crate::flight_protocol::encode_bounded_window;
         use krishiv_common::async_util::block_on;
+
+        let num_shards = self.pool.shard_count();
+
+        // R7: If multiple executor endpoints are configured, split batches by
+        // key-column hash and route each shard to its designated endpoint.
+        // Each executor handles its own key partition independently, so keyed
+        // aggregations (GROUP BY) are distributed across the executor pool.
+        if num_shards > 1 && !input_batches.is_empty() {
+            let sharded = shard_batches_by_key(&input_batches, &spec.key_column, num_shards)?;
+            let mut all_batches: Vec<RecordBatch> = Vec::new();
+            let mut global_watermark: Option<i64> = None;
+
+            for (shard_idx, shard_batches) in sharded.into_iter().enumerate() {
+                if shard_batches.is_empty() {
+                    continue;
+                }
+                let batches_b64 = encode_batches(&shard_batches)?;
+                let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
+                    topic: topic.to_string(),
+                    spec: spec.to_plan_spec(),
+                    batches_b64,
+                    response_watermark_ms: None,
+                });
+                match block_on(self.pool.do_action_on_shard(shard_idx, &action)) {
+                    Ok(body) => {
+                        let wm = serde_json::from_slice::<BoundedWindowBody>(&body)
+                            .ok()
+                            .and_then(|r| r.response_watermark_ms);
+                        if let Some(wm) = wm {
+                            global_watermark = Some(
+                                global_watermark.map_or(wm, |prev: i64| prev.min(wm)),
+                            );
+                        }
+                        all_batches.extend(decode_ipc_response(&body)?);
+                    }
+                    Err(ref e) if is_server_unimplemented(e) => {
+                        let sql = encode_bounded_window(topic, spec, &shard_batches)?;
+                        all_batches.extend(block_on(self.pool.execute_sql(&sql))?);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            return Ok((all_batches, global_watermark));
+        }
+
+        // Single endpoint: send all batches to the one executor (original path).
         let batches_b64 = encode_batches(&input_batches)?;
         let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
             topic: topic.to_string(),
@@ -381,16 +475,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         let result = block_on(self.pool.do_action(&action));
         match result {
             Ok(body) => {
-                // Attempt to decode as BoundedWindowBody response (server populates
-                // response_watermark_ms on the reply path). Fall back to raw IPC if
-                // the server returns plain batches without a JSON envelope (C8).
-                let watermark = if let Ok(resp) =
-                    serde_json::from_slice::<BoundedWindowBody>(&body)
-                {
-                    resp.response_watermark_ms
-                } else {
-                    None
-                };
+                let watermark = serde_json::from_slice::<BoundedWindowBody>(&body)
+                    .ok()
+                    .and_then(|r| r.response_watermark_ms);
                 let batches = decode_ipc_response(&body)?;
                 Ok((batches, watermark))
             }
@@ -1117,12 +1204,14 @@ mod tests {
 
     #[test]
     fn fallback_triggered_on_tonic_unimplemented_status() {
-        let err = crate::RuntimeError::Transport {
-            message: "status: Unimplemented, message: action not yet supported".into(),
+        // The ServerUnimplemented variant is emitted by do_action when tonic
+        // returns Code::Unimplemented — this is the only error that triggers fallback.
+        let err = crate::RuntimeError::ServerUnimplemented {
+            message: "action not yet supported".into(),
         };
         assert!(
             is_server_unimplemented(&err),
-            "tonic Unimplemented status must trigger the SQL fallback"
+            "ServerUnimplemented variant must trigger the SQL fallback"
         );
     }
 
@@ -1152,12 +1241,16 @@ mod tests {
 
     #[test]
     fn fallback_triggered_on_status_code_format() {
+        // A Transport error whose message contains the old tonic status string
+        // must NOT trigger fallback — only the dedicated variant does.
+        // This protects against coincidental string matches (user error messages,
+        // schema errors) that previously caused silent incorrect fallback.
         let err = crate::RuntimeError::Transport {
             message: "Status { code: Unimplemented, message: \"not yet\" }".into(),
         };
         assert!(
-            is_server_unimplemented(&err),
-            "alternative tonic Status format must also trigger fallback"
+            !is_server_unimplemented(&err),
+            "Transport error with Unimplemented text must not trigger fallback; use ServerUnimplemented"
         );
     }
 
@@ -1179,30 +1272,24 @@ mod tests {
         );
     }
 
-    // ── G3: In-process streaming plan guard ──────────────────────────────────
+    // ── G3: In-process streaming plan delegation ─────────────────────────────
 
     #[test]
-    fn in_process_embedded_rejects_streaming_plan() {
+    fn in_process_embedded_accepts_streaming_plan() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
         let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
-        let err = rt.accept_plan(&plan).unwrap_err();
-        assert!(
-            matches!(err, crate::RuntimeError::Unsupported { .. }),
-            "embedded accept_plan must reject streaming plans, got: {err:?}"
-        );
+        let report = rt.accept_plan(&plan).expect("embedded accept_plan should delegate streaming plans");
+        assert_eq!(report.backend(), "single-node"); // Embedded mode delegates to SingleNode
     }
 
     #[test]
-    fn in_process_single_node_rejects_streaming_plan() {
+    fn in_process_single_node_accepts_streaming_plan() {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::single_node(cluster);
         let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
-        let err = rt.accept_plan(&plan).unwrap_err();
-        assert!(
-            matches!(err, crate::RuntimeError::Unsupported { .. }),
-            "single-node accept_plan must reject streaming plans, got: {err:?}"
-        );
+        let report = rt.accept_plan(&plan).expect("single-node accept_plan should handle streaming plans");
+        assert_eq!(report.backend(), "single-node");
     }
 
     // ── G1: is_streaming flag encoding in remote collect_batch_sql ────────────

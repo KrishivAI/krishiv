@@ -18,6 +18,11 @@ use crate::{RuntimeError, RuntimeResult};
 /// Retry delays (ms) for transient Flight connection failures.
 const RETRY_DELAYS_MS: &[u64] = &[100, 500, 2_000];
 
+/// Timeout for establishing a gRPC channel to the Flight coordinator.
+const FLIGHT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Per-request timeout for in-flight gRPC calls.
+const FLIGHT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 /// Returns `true` for tonic status codes that indicate a transient failure
 /// worth retrying (e.g. network blip, server briefly overloaded).
 fn is_transient_status(e: &RuntimeError) -> bool {
@@ -95,6 +100,8 @@ fn normalize_flight_endpoint(url: &str) -> RuntimeResult<String> {
 async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlServiceClient<Channel>> {
     let channel = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
+        .connect_timeout(std::time::Duration::from_secs(FLIGHT_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(FLIGHT_REQUEST_TIMEOUT_SECS))
         .connect()
         .await
         .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;
@@ -106,6 +113,8 @@ async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
     with_retry(|| async {
         Endpoint::from_shared(ep.clone())
             .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(FLIGHT_CONNECT_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(FLIGHT_REQUEST_TIMEOUT_SECS))
             .connect()
             .await
             .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))
@@ -139,9 +148,18 @@ impl FlightClientPool {
     }
 
     pub fn with_alternate(mut self, url: impl Into<String>) -> Self {
-        let endpoint = normalize_flight_endpoint(&url.into()).unwrap_or_else(|_| String::new());
-        if !endpoint.is_empty() {
-            self.endpoints.push(endpoint);
+        let raw = url.into();
+        match normalize_flight_endpoint(&raw) {
+            Ok(endpoint) => {
+                self.endpoints.push(endpoint);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    url = %raw,
+                    error = %e,
+                    "ignoring invalid alternate Flight endpoint"
+                );
+            }
         }
         self
     }
@@ -176,10 +194,13 @@ impl FlightClientPool {
                 Ok(ch)
             }
             Err(e) if self.endpoints.len() > 1 => {
+                // Two threads racing here both compute (current + 1) % len and
+                // write the same next-index value — no inconsistency is possible.
+                // AcqRel provides sequentially-consistent visibility across cores.
                 self.current.store(
-                    (self.current.load(std::sync::atomic::Ordering::Relaxed) + 1)
+                    (self.current.load(std::sync::atomic::Ordering::Acquire) + 1)
                         % self.endpoints.len(),
-                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Release,
                 );
                 // Channel is already None (we never set it); no need to clear.
                 Err(e)
@@ -207,7 +228,13 @@ impl FlightClientPool {
             let mut stream = client
                 .do_action(tonic::Request::new(req))
                 .await
-                .map_err(|e| RuntimeError::transport(format!("do_action: {e}")))?
+                .map_err(|s| {
+                    if s.code() == tonic::Code::Unimplemented {
+                        RuntimeError::ServerUnimplemented { message: s.message().to_string() }
+                    } else {
+                        RuntimeError::transport(format!("do_action: {s}"))
+                    }
+                })?
                 .into_inner();
             let mut buf = Vec::new();
             while let Some(item) = stream.next().await {
@@ -258,6 +285,51 @@ impl FlightClientPool {
                 batches.push(batch);
             }
             Ok(batches)
+        })
+        .await
+    }
+
+    /// Number of executor endpoints configured — the shard count for key-based
+    /// routing (R7).
+    pub fn shard_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    /// Execute a Flight action on a specific shard endpoint (R7).
+    ///
+    /// Routes to `endpoints[shard_idx % len]`, enabling key-hashed batches to
+    /// be sent to different executor Flight endpoints for distributed aggregation.
+    pub async fn do_action_on_shard(
+        &self,
+        shard_idx: usize,
+        action: &crate::flight_action::KrishivFlightAction,
+    ) -> RuntimeResult<Vec<u8>> {
+        use futures::StreamExt;
+        let ep_idx = shard_idx % self.endpoints.len();
+        let endpoint = self.endpoints[ep_idx].clone();
+        let body = action.to_action_body()?;
+        let action_type = action.action_type();
+        with_retry(|| async {
+            let channel = connect_flight_channel(&endpoint).await?;
+            let mut client =
+                arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+            let req = arrow_flight::Action {
+                r#type: action_type.clone(),
+                body: body.clone().into(),
+            };
+            let mut stream = client
+                .do_action(tonic::Request::new(req))
+                .await
+                .map_err(|e| RuntimeError::transport(format!("do_action_on_shard: {e}")))?
+                .into_inner();
+            let mut buf = Vec::new();
+            while let Some(item) = stream.next().await {
+                let part = item.map_err(|e| {
+                    RuntimeError::transport(format!("do_action_on_shard stream: {e}"))
+                })?;
+                buf.extend_from_slice(&part.body);
+            }
+            Ok(buf)
         })
         .await
     }
@@ -481,7 +553,7 @@ pub async fn execute_remote_bounded_window(
 }
 
 fn is_unimplemented(e: &RuntimeError) -> bool {
-    matches!(e, RuntimeError::Transport { message } if message.contains("Unimplemented"))
+    matches!(e, RuntimeError::ServerUnimplemented { .. })
 }
 
 pub fn decode_ipc_response(body: &[u8]) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
@@ -521,7 +593,13 @@ pub(crate) async fn do_action(
     let mut stream = client
         .do_action(tonic::Request::new(req))
         .await
-        .map_err(|e| RuntimeError::transport(format!("do_action: {e}")))?
+        .map_err(|s| {
+            if s.code() == tonic::Code::Unimplemented {
+                RuntimeError::ServerUnimplemented { message: s.message().to_string() }
+            } else {
+                RuntimeError::transport(format!("do_action: {s}"))
+            }
+        })?
         .into_inner();
 
     let mut buf = Vec::new();
@@ -688,14 +766,16 @@ mod tests {
     }
 
     #[test]
-    fn is_unimplemented_matches_unimplemented() {
-        let err = RuntimeError::transport("Unimplemented: method not found");
+    fn is_unimplemented_matches_server_unimplemented_variant() {
+        let err = RuntimeError::ServerUnimplemented { message: "action not supported".into() };
         assert!(is_unimplemented(&err));
     }
 
     #[test]
-    fn is_unimplemented_matches_invalid() {
-        let err = RuntimeError::transport("invalid argument");
+    fn is_unimplemented_rejects_transport_error() {
+        // A Transport error whose message happens to contain "Unimplemented"
+        // must NOT trigger the fallback — only the dedicated variant does.
+        let err = RuntimeError::transport("Unimplemented: some random message");
         assert!(!is_unimplemented(&err));
     }
 

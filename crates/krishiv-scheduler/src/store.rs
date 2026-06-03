@@ -188,11 +188,33 @@ impl JsonFileMetadataStore {
     }
 
     /// Truncate the events NDJSON log (called after a full snapshot rewrite).
+    ///
+    /// Uses explicit open + set_len(0) + sync_all so that a crash between the
+    /// snapshot write and the truncation does not leave stale events replaying
+    /// on the next recovery.
     fn truncate_events_log(&self) -> SchedulerResult<()> {
         let log_path = self.events_log_path();
         if log_path.exists() {
-            std::fs::write(&log_path, b"").map_err(|e| SchedulerError::Transport {
-                message: format!("failed to truncate event log '{}': {e}", log_path.display()),
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log_path)
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!(
+                        "failed to open event log '{}' for truncation: {e}",
+                        log_path.display()
+                    ),
+                })?;
+            file.set_len(0).map_err(|e| SchedulerError::Transport {
+                message: format!(
+                    "failed to truncate event log '{}': {e}",
+                    log_path.display()
+                ),
+            })?;
+            file.sync_all().map_err(|e| SchedulerError::Transport {
+                message: format!(
+                    "failed to fsync event log '{}' after truncation: {e}",
+                    log_path.display()
+                ),
             })?;
         }
         Ok(())
@@ -1057,6 +1079,7 @@ impl TryFrom<PersistedTaskRecord> for TaskRecord {
             // Streaming state is not persisted in R5.1; executors re-report it on re-attach.
             last_watermark_ms: None,
             last_source_offset: None,
+            assigned_at_ms: None,
         })
     }
 }
@@ -1450,6 +1473,29 @@ impl NonBlockingStoreHandle {
             }
         } else {
             self.save_job(record);
+        }
+    }
+
+    /// Persist an executor descriptor (synchronous — executor registration is
+    /// infrequent so inline locking is acceptable; R10).
+    pub fn save_executor(&self, descriptor: &ExecutorDescriptor) {
+        if let Err(e) = self.inner().save_executor(descriptor) {
+            tracing::warn!(
+                executor_id = %descriptor.executor_id().as_str(),
+                error = %e,
+                "failed to persist executor descriptor to metadata store"
+            );
+        }
+    }
+
+    /// Remove a persisted executor descriptor (synchronous; R10).
+    pub fn remove_executor(&self, executor_id: &ExecutorId) {
+        if let Err(e) = self.inner().remove_executor(executor_id) {
+            tracing::warn!(
+                executor_id = %executor_id.as_str(),
+                error = %e,
+                "failed to remove executor descriptor from metadata store"
+            );
         }
     }
 
