@@ -69,7 +69,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression"] }
 arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
-pyo3 = { version = "0.28.3", features = ["extension-module"] }
+pyo3 = { version = "0.28.3" }
 iceberg = "0.9.1"
 async-trait = "0.1"
 bytes = "1"
@@ -132,7 +132,7 @@ debug = 1
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = false
 codegen-units = 1
 
 # release-single-node: fast local release build for single-node deployments.

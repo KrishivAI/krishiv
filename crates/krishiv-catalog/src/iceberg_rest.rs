@@ -811,6 +811,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: Some("my-secret-token".into()),
+            timeout_ms: None,
         });
         let tables = catalog.list_tables("ns").await.unwrap();
         assert_eq!(tables, vec!["t1".to_string()]);
@@ -848,6 +849,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let url = catalog.url("namespaces/ns/tables");
         assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
@@ -860,6 +862,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let url = catalog.url("/namespaces/ns/tables");
         assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
@@ -872,6 +875,7 @@ mod tests {
             warehouse: None,
             prefix: "/v1/".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let url = catalog.url("/namespaces/ns/tables");
         assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
@@ -884,6 +888,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let url = catalog.url("namespaces/ns/tables");
         assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
@@ -1037,6 +1042,7 @@ mod tests {
             warehouse: Some("wh".into()),
             prefix: "v1".into(),
             bearer_token: Some("tok".into()),
+            timeout_ms: None,
         };
         let cloned = config.clone();
         assert_eq!(config.base_url, cloned.base_url);
@@ -1052,6 +1058,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         };
         let dbg = format!("{config:?}");
         assert!(dbg.contains("RestCatalogConfig"));
@@ -1314,6 +1321,7 @@ mod tests {
             warehouse: None,
             prefix: "v1".into(),
             bearer_token: None,
+            timeout_ms: None,
         });
         let cloned = catalog.clone();
         assert_eq!(cloned.config.base_url, "http://localhost");

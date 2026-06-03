@@ -5,12 +5,12 @@
 //! This crate owns the DataFusion integration for R1 while keeping DataFusion
 //! out of the long-term public API exposed by `krishiv-api`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
@@ -39,6 +39,48 @@ pub use policy::PolicyEnforcingSqlEngine;
 
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
+
+// ── Plan cache (single-lock, race-free) ──────────────────────────────────────
+
+/// Bounded query-plan cache keyed by query text.
+///
+/// A single `Mutex<PlanCache>` replaces the previous two-structure approach
+/// (`DashMap` + `Mutex<VecDeque>`) which had a TOCTOU race: two threads could
+/// both see `len() < MAX` and both insert, growing the cache past the limit.
+struct PlanCache {
+    map: HashMap<String, datafusion::logical_expr::LogicalPlan>,
+    order: VecDeque<String>,
+    max: usize,
+}
+
+impl PlanCache {
+    fn new(max: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), max }
+    }
+
+    fn get(&self, key: &str) -> Option<&datafusion::logical_expr::LogicalPlan> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: String, plan: datafusion::logical_expr::LogicalPlan) {
+        if self.map.len() >= self.max {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, plan);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
 
 /// SQL-layer errors.
 #[non_exhaustive]
@@ -101,6 +143,21 @@ impl SqlPlan {
 /// Maximum number of query plans stored in the plan cache before random eviction.
 const PLAN_CACHE_MAX_ENTRIES: usize = 256;
 
+/// Build the DataFusion session config.
+///
+/// Embedded mode (`parallelism=1`): queries run against small in-process datasets;
+/// the extra thread-spawn overhead of multi-partition execution outweighs the gain.
+/// Single-node daemon mode should override with `available_parallelism()` after
+/// construction if it expects large parquet scans.
+fn build_single_node_session_config() -> datafusion::prelude::SessionConfig {
+    let mut config = datafusion::prelude::SessionConfig::new()
+        .with_target_partitions(1)
+        .set_bool("datafusion.optimizer.enable_round_robin_repartition", false);
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    config.options_mut().execution.parquet.enable_page_index = true;
+    config
+}
+
 #[derive(Clone)]
 pub struct SqlEngine {
     context: SessionContext,
@@ -110,6 +167,11 @@ pub struct SqlEngine {
     /// Table names registered as unbounded streaming sources.
     /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
     streaming_sources: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// `true` once any streaming source has been registered.  Checked with a
+    /// relaxed atomic load before acquiring `streaming_sources` so that the
+    /// common case (no streaming sources, pure batch workload) avoids both the
+    /// lock and the SQL parse inside `is_streaming_query`.
+    has_streaming_sources: Arc<AtomicBool>,
     /// Optional UDF resource limits to apply when syncing UDFs for this engine.
     /// Set for job-specific engines so sandbox enforcement uses the job's budgets.
     udf_limits: Option<krishiv_udf::ResourceLimits>,
@@ -123,9 +185,9 @@ pub struct SqlEngine {
     /// Bounded query plan cache: query text → DataFusion LogicalPlan.
     /// Skips re-parsing and re-optimising identical repeated queries.
     /// Max `PLAN_CACHE_MAX_ENTRIES` entries; oldest entry evicted when full.
-    plan_cache: Arc<dashmap::DashMap<String, datafusion::logical_expr::LogicalPlan>>,
-    /// Insertion-order queue for LRU eviction in the plan cache.
-    plan_cache_order: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Single-lock design prevents the TOCTOU race of the previous two-structure
+    /// (`DashMap` + `VecDeque`) implementation.
+    plan_cache: Arc<Mutex<PlanCache>>,
 }
 
 impl fmt::Debug for SqlEngine {
@@ -151,23 +213,19 @@ impl SqlEngine {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
 
-        let mut config = datafusion::prelude::SessionConfig::new()
-            .with_target_partitions(1)
-            .set_bool("datafusion.optimizer.enable_round_robin_repartition", false);
-        config.options_mut().optimizer.repartition_windows = false;
-        config.options_mut().optimizer.repartition_aggregations = false;
-
-        let mut table_factories: std::collections::HashMap<String, Arc<dyn datafusion::catalog::TableProviderFactory>> = std::collections::HashMap::new();
+        let dummy_state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .build();
+        let mut table_factories = dummy_state.table_factories().clone();
         table_factories.insert(
             "KAFKA".to_string(),
             Arc::new(crate::kafka_table::KafkaTableFactory {
                 streaming_sources: streaming_sources.clone(),
             }),
         );
-
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
-            .with_config(config)
+            .with_config(build_single_node_session_config())
             .with_table_factories(table_factories)
             .build();
         let context = SessionContext::new_with_state(state);
@@ -179,11 +237,11 @@ impl SqlEngine {
             view_registry: None,
             udf_registry: None,
             streaming_sources,
+            has_streaming_sources: Arc::new(AtomicBool::new(false)),
             udf_limits: None,
             udf_registry_version: Arc::new(AtomicU64::new(0)),
             udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
-            plan_cache: Arc::new(dashmap::DashMap::new()),
-            plan_cache_order: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            plan_cache: Arc::new(Mutex::new(PlanCache::new(PLAN_CACHE_MAX_ENTRIES))),
         }
     }
 
@@ -192,7 +250,10 @@ impl SqlEngine {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
 
-        let mut table_factories: std::collections::HashMap<String, Arc<dyn datafusion::catalog::TableProviderFactory>> = std::collections::HashMap::new();
+        let dummy_state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .build();
+        let mut table_factories = dummy_state.table_factories().clone();
         table_factories.insert(
             "KAFKA".to_string(),
             Arc::new(crate::kafka_table::KafkaTableFactory {
@@ -202,6 +263,7 @@ impl SqlEngine {
 
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
+            .with_config(build_single_node_session_config())
             .with_table_factories(table_factories)
             .build();
         let context = SessionContext::new_with_state(state);
@@ -217,11 +279,11 @@ impl SqlEngine {
             view_registry: None,
             udf_registry: None,
             streaming_sources,
+            has_streaming_sources: Arc::new(AtomicBool::new(false)),
             udf_limits: None,
             udf_registry_version: Arc::new(AtomicU64::new(0)),
             udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
-            plan_cache: Arc::new(dashmap::DashMap::new()),
-            plan_cache_order: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            plan_cache: Arc::new(Mutex::new(PlanCache::new(PLAN_CACHE_MAX_ENTRIES))),
         })
     }
 
@@ -240,6 +302,7 @@ impl SqlEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string());
+        self.has_streaming_sources.store(true, Ordering::Release);
         self.invalidate_plan_cache();
         Ok(tx)
     }
@@ -288,6 +351,7 @@ impl SqlEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(table_name.to_string());
+        self.has_streaming_sources.store(true, Ordering::Release);
         self.invalidate_plan_cache();
         Ok(())
     }
@@ -362,15 +426,58 @@ impl SqlEngine {
     /// returns `true` for queries that reference it, without constructing any
     /// broker connection. Useful for unit tests where a live Kafka broker is not
     /// available and rdkafka's log subsystem is not initialised.
-    pub fn register_streaming_source_name(&self, table_name: impl Into<String>) {
+    /// Returns [`SqlError::EmptyTableName`] if `table_name` is blank.
+    pub fn register_streaming_source_name(
+        &self,
+        table_name: impl Into<String>,
+    ) -> SqlResult<()> {
+        let name: String = table_name.into();
+        if name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
         self.streaming_sources
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(table_name.into());
+            .insert(name);
+        self.has_streaming_sources.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove a streaming source registration.
+    ///
+    /// Deregisters the table from DataFusion and removes it from the streaming-
+    /// sources set. Invalidates the plan cache. Idempotent — deregistering a
+    /// name that was never registered is not an error.
+    pub fn deregister_streaming_source(&self, name: &str) -> SqlResult<()> {
+        if name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        // Idempotent: ignore the Option return (None when table wasn't registered).
+        let _ = self.context.deregister_table(name).map_err(SqlError::from)?;
+        {
+            let mut sources = self
+                .streaming_sources
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            sources.remove(name);
+            if sources.is_empty() {
+                self.has_streaming_sources.store(false, Ordering::Release);
+            }
+            // Invalidate while still holding the write lock so there is no window
+            // between source removal and cache invalidation where a concurrent
+            // is_streaming_query returns false but serves a stale cached plan (N5).
+            self.invalidate_plan_cache();
+        }
+        Ok(())
     }
 
     /// Returns `true` if any table referenced in `sql` is a registered streaming source.
     pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool> {
+        // Fast-path: avoid the RwLock acquire and SQL parse for the common case
+        // where no streaming sources have ever been registered (pure batch engines).
+        if !self.has_streaming_sources.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let sources = self
             .streaming_sources
             .read()
@@ -430,9 +537,9 @@ impl SqlEngine {
     /// simpler and safer than per-table tracking: the cache refills quickly on
     /// the next few queries.
     fn invalidate_plan_cache(&self) {
-        self.plan_cache.clear();
-        if let Ok(mut order) = self.plan_cache_order.lock() {
-            order.clear();
+        match self.plan_cache.lock() {
+            Ok(mut cache) => cache.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
         }
     }
 
@@ -732,7 +839,7 @@ impl SqlEngine {
                 }
                 let source_df = self.context.sql(&format!("SELECT * FROM {}", stmt.source_table)).await?;
                 let source_batches = source_df.collect().await?;
-                let results = cep_sql::execute_match_recognize(stmt, &source_batches)?;
+                let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
                 lakehouse::register_scan_batches(
                     &self.context,
                     "_krishiv_cep_result",
@@ -752,10 +859,19 @@ impl SqlEngine {
         // Check the cache before sending the query through DataFusion's full
         // parse → analyse → optimise pipeline. Only cache simple queries without
         // DDL or AS-OF refs; DDL side effects must not be bypassed.
+        // Single-lock design: lookup and insert share the same Mutex<PlanCache>,
+        // eliminating the TOCTOU race of the previous DashMap + VecDeque approach.
         let can_cache = as_ofs.is_empty();
         if can_cache {
-            if let Some(cached_plan) = self.plan_cache.get(&rewritten).map(|r| r.clone()) {
-                let dataframe = self.context.execute_logical_plan(cached_plan).await?;
+            // Scope the guard so it is dropped before any .await point.
+            let cached_plan: Option<datafusion::logical_expr::LogicalPlan> = self
+                .plan_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&rewritten)
+                .cloned();
+            if let Some(plan) = cached_plan {
+                let dataframe = self.context.execute_logical_plan(plan).await?;
                 return Ok(SqlDataFrame::new("sql-query", dataframe).with_query(rewritten));
             }
         }
@@ -765,18 +881,9 @@ impl SqlEngine {
         // Cache the logical plan for future repeated calls.
         if can_cache {
             let plan = dataframe.logical_plan().clone();
-            if self.plan_cache.len() < PLAN_CACHE_MAX_ENTRIES {
-                if let Ok(mut order) = self.plan_cache_order.lock() {
-                    order.push_back(rewritten.clone());
-                    self.plan_cache.insert(rewritten.clone(), plan);
-                }
-            } else if let Ok(mut order) = self.plan_cache_order.lock() {
-                // Evict the oldest entry (simple LRU approximation).
-                if let Some(oldest) = order.pop_front() {
-                    self.plan_cache.remove(&oldest);
-                }
-                order.push_back(rewritten.clone());
-                self.plan_cache.insert(rewritten.clone(), plan);
+            match self.plan_cache.lock() {
+                Ok(mut cache) => cache.insert(rewritten.clone(), plan),
+                Err(poisoned) => poisoned.into_inner().insert(rewritten.clone(), plan),
             }
         }
 
@@ -1595,7 +1702,7 @@ mod udtf_ddl_tests {
     #[test]
     fn register_streaming_source_name_marks_table_as_streaming() {
         let engine = SqlEngine::new();
-        engine.register_streaming_source_name("stream_events");
+        engine.register_streaming_source_name("stream_events").unwrap();
         assert!(
             engine.is_streaming_query("SELECT * FROM stream_events").unwrap(),
             "register_streaming_source_name must make the query streaming"
@@ -1605,7 +1712,7 @@ mod udtf_ddl_tests {
     #[test]
     fn register_streaming_source_name_does_not_affect_other_tables() {
         let engine = SqlEngine::new();
-        engine.register_streaming_source_name("my_stream");
+        engine.register_streaming_source_name("my_stream").unwrap();
         assert!(
             !engine.is_streaming_query("SELECT * FROM other_table").unwrap(),
             "only the registered table name must be streaming"
@@ -1624,7 +1731,7 @@ mod udtf_ddl_tests {
     #[test]
     fn is_streaming_query_true_after_source_registered() {
         let engine = SqlEngine::new();
-        engine.register_streaming_source_name("events");
+        engine.register_streaming_source_name("events").unwrap();
         assert!(
             engine
                 .is_streaming_query("SELECT ts, user_id FROM events WHERE ts > 0")
@@ -1635,11 +1742,60 @@ mod udtf_ddl_tests {
     #[test]
     fn multiple_streaming_sources_any_makes_query_streaming() {
         let engine = SqlEngine::new();
-        engine.register_streaming_source_name("s1");
-        engine.register_streaming_source_name("s2");
+        engine.register_streaming_source_name("s1").unwrap();
+        engine.register_streaming_source_name("s2").unwrap();
         assert!(engine.is_streaming_query("SELECT * FROM s1").unwrap());
         assert!(engine.is_streaming_query("SELECT * FROM s2").unwrap());
         assert!(!engine.is_streaming_query("SELECT * FROM s3").unwrap());
+    }
+
+    #[test]
+    fn is_streaming_query_true_for_table_alias() {
+        let engine = SqlEngine::new();
+        engine.register_streaming_source_name("kafka_source").unwrap();
+        // visit_relations must return the base table name, not the alias.
+        assert!(
+            engine
+                .is_streaming_query("SELECT * FROM kafka_source AS k")
+                .unwrap(),
+            "aliased streaming table must still be classified as streaming"
+        );
+        assert!(
+            engine
+                .is_streaming_query(
+                    "SELECT * FROM kafka_source AS k JOIN other AS o ON k.id = o.id"
+                )
+                .unwrap(),
+            "JOIN with alias must still detect the streaming source"
+        );
+    }
+
+    #[test]
+    fn register_streaming_source_name_empty_returns_error() {
+        let engine = SqlEngine::new();
+        assert!(engine.register_streaming_source_name("").is_err());
+        assert!(engine.register_streaming_source_name("   ").is_err());
+    }
+
+    #[test]
+    fn deregister_streaming_source_removes_name() {
+        let engine = SqlEngine::new();
+        engine.register_streaming_source_name("topic").unwrap();
+        assert!(engine.is_streaming_query("SELECT * FROM topic").unwrap());
+        engine.deregister_streaming_source("topic").unwrap();
+        assert!(
+            !engine.is_streaming_query("SELECT * FROM topic").unwrap(),
+            "deregistered source must no longer be classified as streaming"
+        );
+    }
+
+    #[test]
+    fn deregister_nonexistent_source_is_ok() {
+        let engine = SqlEngine::new();
+        // Deregistering a name that was never registered must be idempotent.
+        engine
+            .deregister_streaming_source("never_registered")
+            .expect("deregister of unknown name must not error");
     }
 
     // ── Plan cache invalidation ───────────────────────────────────────────────
@@ -1649,11 +1805,17 @@ mod udtf_ddl_tests {
         let engine = SqlEngine::new();
         // Prime the cache with a simple query.
         let _ = engine.sql("SELECT 1 AS n").await.unwrap();
-        assert!(!engine.plan_cache.is_empty(), "cache must be non-empty after first query");
+        assert!(
+            !engine.plan_cache.lock().unwrap().is_empty(),
+            "cache must be non-empty after first query"
+        );
 
         // Registering a table (even parquet) must clear the cache.
         engine.clear_plan_cache();
-        assert!(engine.plan_cache.is_empty(), "cache must be empty after clear_plan_cache()");
+        assert!(
+            engine.plan_cache.lock().unwrap().is_empty(),
+            "cache must be empty after clear_plan_cache()"
+        );
     }
 
     #[tokio::test]
@@ -1665,7 +1827,10 @@ mod udtf_ddl_tests {
         let df = engine.sql("SELECT 42 AS v").await.unwrap();
         let batches = df.collect().await.unwrap();
         assert_eq!(batches[0].num_rows(), 1);
-        assert!(!engine.plan_cache.is_empty(), "cache must refill after re-query");
+        assert!(
+            !engine.plan_cache.lock().unwrap().is_empty(),
+            "cache must refill after re-query"
+        );
     }
 }
 pub mod kafka_table;

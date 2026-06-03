@@ -47,8 +47,8 @@ fn parsed_to_plan_spec(parsed: krishiv_plan::window::ParsedStreamFragment) -> Wi
         session_gap_ms,
         agg_exprs: vec![parsed.agg],
         state_ttl_ms: parsed.ttl_ms,
-        source_watermark_lags: std::collections::HashMap::new(),
-        source_id_column: None,
+        source_watermark_lags: parsed.source_watermark_lags,
+        source_id_column: parsed.source_id_column,
     }
 }
 
@@ -249,8 +249,9 @@ fn execute_loop_fragment(
         let mut exec = executor_arc
             .lock()
             .map_err(|_| ExecutorError::LocalExecution {
-                message: String::from(
-                    "stream:loop executor lock poisoned; executor state is inconsistent",
+                message: format!(
+                    "stream:loop job '{job_id}' executor lock poisoned; \
+                     window state is inconsistent — restart the job",
                 ),
             })?;
         exec.drain(input_batches)
@@ -278,6 +279,11 @@ pub(crate) async fn execute_streaming_fragment(
     let fragment_body = task_fragment_body(assignment.plan_fragment().description());
     let fragment = fragment_body.as_str();
 
+    // Fragment dispatch priority (first match wins):
+    //   1. SQL query          — detected via sql_query_from_fragment()
+    //   2. stream:loop:       — stateful ContinuousWindowExecutor (long-lived)
+    //   3. stream:continuous: — ContinuousStreamRegistry drain (session-scoped)
+    //   4. <default>          — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
         let engine = std::sync::Arc::clone(&runner.sql_engine);
         
@@ -385,6 +391,15 @@ pub(crate) async fn execute_streaming_fragment(
         );
     }
 
+    // G2/G3: InMemory partitions (embedded mode fast path — no ASCII round-trip).
+    // Produced by InProcessStreamingRuntime::execute_windowed using direct Arrow
+    // RecordBatches rather than stream-kafka ASCII strings. Preserves all columns
+    // so multi-aggregation windows work correctly.
+    let inmem_batches = read_inmem_stream_batches(assignment.input_partitions());
+    if !inmem_batches.is_empty() {
+        return execute_streaming_with_batches(inmem_batches, plan_spec).await;
+    }
+
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
 
     // Only override column names for stream-kafka partitions.  Overriding
@@ -425,6 +440,46 @@ pub(crate) async fn execute_streaming_fragment(
         column_count,
         collected_batches,
     );
+    if let Some(wm) = observed_watermark_ms {
+        output = output.with_watermark_ms(wm);
+    }
+    Ok(output)
+}
+
+/// Collect all InMemory partition batches into a flat Vec.
+///
+/// Returns empty if no InMemory partitions are present so callers can fall
+/// through to the stream-kafka ASCII path.
+fn read_inmem_stream_batches(
+    partitions: &[krishiv_proto::InputPartition],
+) -> Vec<arrow::record_batch::RecordBatch> {
+    use krishiv_proto::InputPartitionDescriptor;
+    let mut out = Vec::new();
+    for p in partitions {
+        if let Some(InputPartitionDescriptor::InMemory { batches, .. }) = p.descriptor() {
+            for b in batches {
+                out.push((**b).clone());
+            }
+        }
+    }
+    out
+}
+
+/// Execute a bounded streaming window over pre-decoded in-memory batches.
+///
+/// Used by the InMemory partition fast path to skip stream-kafka ASCII parsing.
+async fn execute_streaming_with_batches(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    spec: WindowExecutionSpec,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    let observed_watermark_ms = compute_input_watermark(&batches, &spec);
+    let collected = execute_bounded_window(batches, &spec).map_err(|e| ExecutorError::LocalExecution {
+        message: e.to_string(),
+    })?;
+    let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
+    let total_batches = collected.len();
+    let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);
+    let mut output = ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, collected);
     if let Some(wm) = observed_watermark_ms {
         output = output.with_watermark_ms(wm);
     }

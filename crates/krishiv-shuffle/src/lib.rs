@@ -19,6 +19,7 @@ pub mod partitioner;
 pub mod path;
 pub mod shuffle_svc;
 pub mod store;
+pub mod tiered_store;
 
 /// Validate that an identifier (job_id, stage_id, etc.) is safe for use in a
 /// filesystem path.  Rejects empty strings and strings containing path
@@ -47,7 +48,8 @@ pub use object_store::ObjectStoreShuffleStore;
 pub use orphan::{cleanup_orphans, scan_orphans};
 pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
-pub use store::{PartitionId, ShufflePartition, ShuffleStream, ShuffleStore};
+pub use store::{PartitionId, ShufflePartition, ShuffleStream, ShuffleStore, ShuffleBackend};
+pub use tiered_store::TieredShuffleStore;
 
 // StoreError is deprecated but retained for source compatibility.
 #[allow(deprecated)]

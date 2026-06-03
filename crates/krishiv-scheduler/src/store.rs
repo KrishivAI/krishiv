@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use krishiv_proto::{
-    AttemptId, ConnectorCapabilityFlags, ExecutorId, JobId, JobKind, JobSpec, JobState, StageId,
+    AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec, JobState, StageId,
     StageSpec, StageState, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
 };
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,19 @@ pub trait MetadataStore: Send + Sync {
     fn events(&self) -> &[EventLogEvent];
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()>;
     fn jobs(&self) -> &[JobRecord];
+
+    /// Persist an executor descriptor so it survives coordinator restarts (R10).
+    ///
+    /// On recovery, executors reloaded from the store are re-registered in the
+    /// `ExecutorRegistry` so re-attaching executors are recognised without a
+    /// fresh registration handshake.
+    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()>;
+
+    /// Return all persisted executor descriptors.
+    fn executors(&self) -> Vec<ExecutorDescriptor>;
+
+    /// Remove a persisted executor descriptor (called on clean deregister).
+    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()>;
 }
 
 /// In-memory metadata store for tests and single-process deployments.
@@ -72,6 +85,7 @@ pub trait MetadataStore: Send + Sync {
 pub struct InMemoryMetadataStore {
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
+    executor_descriptors: Vec<ExecutorDescriptor>,
 }
 
 impl MetadataStore for InMemoryMetadataStore {
@@ -96,6 +110,30 @@ impl MetadataStore for InMemoryMetadataStore {
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
     }
+
+    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
+        let id = descriptor.executor_id();
+        if let Some(existing) = self
+            .executor_descriptors
+            .iter_mut()
+            .find(|d| d.executor_id() == id)
+        {
+            *existing = descriptor.clone();
+        } else {
+            self.executor_descriptors.push(descriptor.clone());
+        }
+        Ok(())
+    }
+
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
+    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        self.executor_descriptors
+            .retain(|d| d.executor_id() != executor_id);
+        Ok(())
+    }
 }
 
 const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
@@ -115,6 +153,7 @@ pub struct JsonFileMetadataStore {
     path: PathBuf,
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
+    executor_descriptors: Vec<ExecutorDescriptor>,
 }
 
 impl JsonFileMetadataStore {
@@ -188,9 +227,10 @@ impl JsonFileMetadataStore {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let store = Self {
-                    path,
-                    events: Vec::new(),
-                    jobs: Vec::new(),
+                    path: path.clone(),
+                    events: vec![],
+                    jobs: vec![],
+                    executor_descriptors: vec![],
                 };
                 store.persist()?;
                 return Ok(store);
@@ -225,6 +265,11 @@ impl JsonFileMetadataStore {
             .collect::<SchedulerResult<Vec<_>>>()?;
         let extra_events = Self::load_events_from_log(&path);
         events.extend(extra_events);
+        let executor_descriptors: Vec<ExecutorDescriptor> = persisted
+            .executor_descriptors
+            .into_iter()
+            .filter_map(|p| ExecutorDescriptor::try_from(p).ok())
+            .collect();
         Ok(Self {
             path,
             events,
@@ -233,6 +278,7 @@ impl JsonFileMetadataStore {
                 .into_iter()
                 .map(JobRecord::try_from)
                 .collect::<SchedulerResult<Vec<_>>>()?,
+            executor_descriptors,
         })
     }
 
@@ -250,6 +296,7 @@ impl JsonFileMetadataStore {
             store_kind: String::from("krishiv.scheduler.metadata"),
             events: self.events.iter().map(PersistedEvent::from).collect(),
             jobs: self.jobs.iter().map(PersistedJobRecord::from).collect(),
+            executor_descriptors: self.executor_descriptors.iter().map(PersistedExecutorDescriptor::from).collect(),
         };
         let bytes =
             serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
@@ -327,6 +374,29 @@ impl MetadataStore for JsonFileMetadataStore {
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
     }
+
+    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
+        if let Some(pos) = self
+            .executor_descriptors
+            .iter()
+            .position(|e| e.executor_id() == descriptor.executor_id())
+        {
+            self.executor_descriptors[pos] = descriptor.clone();
+        } else {
+            self.executor_descriptors.push(descriptor.clone());
+        }
+        self.persist()
+    }
+
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
+    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        self.executor_descriptors
+            .retain(|e| e.executor_id() != executor_id);
+        self.persist()
+    }
 }
 
 // ── SqliteMetadataStore ───────────────────────────────────────────────────────
@@ -343,6 +413,7 @@ pub struct SqliteMetadataStore {
     conn: std::sync::Mutex<rusqlite::Connection>,
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
+    executor_descriptors: Vec<ExecutorDescriptor>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -416,6 +487,7 @@ impl SqliteMetadataStore {
             conn: std::sync::Mutex::new(conn),
             events,
             jobs,
+            executor_descriptors: vec![],
         })
     }
 }
@@ -472,6 +544,72 @@ impl MetadataStore for SqliteMetadataStore {
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
     }
+
+    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
+        if let Some(pos) = self
+            .executor_descriptors
+            .iter()
+            .position(|e| e.executor_id() == descriptor.executor_id())
+        {
+            self.executor_descriptors[pos] = descriptor.clone();
+        } else {
+            self.executor_descriptors.push(descriptor.clone());
+        }
+        // Sqlite backend currently does not persist executors across restarts.
+        Ok(())
+    }
+
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
+    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        self.executor_descriptors
+            .retain(|e| e.executor_id() != executor_id);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PersistedExecutorDescriptor {
+    executor_id: String,
+    host: String,
+    slots: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    barrier_endpoint: Option<String>,
+}
+
+impl From<&ExecutorDescriptor> for PersistedExecutorDescriptor {
+    fn from(d: &ExecutorDescriptor) -> Self {
+        Self {
+            executor_id: d.executor_id().as_str().to_string(),
+            host: d.host().to_string(),
+            slots: d.slots(),
+            task_endpoint: d.task_endpoint().map(str::to_string),
+            barrier_endpoint: d.barrier_endpoint().map(str::to_string),
+        }
+    }
+}
+
+impl TryFrom<PersistedExecutorDescriptor> for ExecutorDescriptor {
+    type Error = SchedulerError;
+    fn try_from(p: PersistedExecutorDescriptor) -> SchedulerResult<Self> {
+        let executor_id = ExecutorId::try_new(p.executor_id).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("invalid executor_id in metadata store: {e}"),
+            }
+        })?;
+        let mut d = ExecutorDescriptor::new(executor_id, p.host, p.slots);
+        if let Some(ep) = p.task_endpoint {
+            d = d.with_task_endpoint(ep);
+        }
+        if let Some(ep) = p.barrier_endpoint {
+            d = d.with_barrier_endpoint(ep);
+        }
+        Ok(d)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -482,6 +620,8 @@ pub(crate) struct PersistedMetadata {
     store_kind: String,
     pub(crate) events: Vec<PersistedEvent>,
     pub(crate) jobs: Vec<PersistedJobRecord>,
+    #[serde(default)]
+    pub(crate) executor_descriptors: Vec<PersistedExecutorDescriptor>,
 }
 
 impl PersistedMetadata {
@@ -1143,6 +1283,7 @@ pub(crate) fn encode_metadata_snapshot(
         store_kind: String::from("krishiv.scheduler.metadata"),
         events: events.iter().map(PersistedEvent::from).collect(),
         jobs: jobs.iter().map(PersistedJobRecord::from).collect(),
+        executor_descriptors: vec![],
     };
     serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
         message: format!("failed to encode metadata snapshot: {error}"),

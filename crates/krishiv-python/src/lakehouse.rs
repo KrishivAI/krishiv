@@ -271,6 +271,7 @@ mod catalog_tests {
             "us-east-1".into(),
             "analytics".into(),
             "http://glue.us-east-1.amazonaws.com".into(),
+            None,
         )
         .unwrap();
         assert_eq!(cat.inner.region, "us-east-1");
@@ -280,7 +281,7 @@ mod catalog_tests {
     #[test]
     fn nessie_catalog_new_succeeds() {
         let cat =
-            PyNessieCatalog::new("http://nessie.example.com/api".into(), "main").unwrap();
+            PyNessieCatalog::new("http://nessie.example.com/api".into(), "main", None).unwrap();
         // Constructor must not panic or error — no live server needed.
         let _ = cat;
     }
@@ -288,14 +289,14 @@ mod catalog_tests {
     #[test]
     fn iceberg_rest_catalog_new_succeeds() {
         let cat =
-            PyIcebergRestCatalog::new("http://catalog.example.com".into(), Some("my_warehouse".into()))
+            PyIcebergRestCatalog::new("http://catalog.example.com".into(), Some("my_warehouse".into()), None)
                 .unwrap();
         let _ = cat;
     }
 
     #[test]
     fn iceberg_rest_catalog_new_without_warehouse_succeeds() {
-        let cat = PyIcebergRestCatalog::new("http://catalog.example.com".into(), None).unwrap();
+        let cat = PyIcebergRestCatalog::new("http://catalog.example.com".into(), None, None).unwrap();
         let _ = cat;
     }
 
@@ -309,6 +310,7 @@ mod catalog_tests {
             "us-east-1".into(),
             "test_db".into(),
             "http://127.0.0.1:19999".into(), // non-listening port
+            None,
         )
         .unwrap();
         let result = cat.list_tables("test_namespace".into());
@@ -321,7 +323,7 @@ mod catalog_tests {
     #[test]
     fn nessie_catalog_list_tables_returns_err_on_unreachable_server() {
         let cat =
-            PyNessieCatalog::new("http://127.0.0.1:19999".into(), "main").unwrap();
+            PyNessieCatalog::new("http://127.0.0.1:19999".into(), "main", None).unwrap();
         let result = cat.list_tables("warehouse".into());
         assert!(
             result.is_err(),
@@ -332,7 +334,7 @@ mod catalog_tests {
     #[test]
     fn iceberg_rest_catalog_list_tables_returns_err_on_unreachable_server() {
         let cat =
-            PyIcebergRestCatalog::new("http://127.0.0.1:19999".into(), None).unwrap();
+            PyIcebergRestCatalog::new("http://127.0.0.1:19999".into(), None, None).unwrap();
         let result = cat.list_tables("default".into());
         assert!(
             result.is_err(),
@@ -346,6 +348,7 @@ mod catalog_tests {
             "eu-west-1".into(),
             "my_db".into(),
             "http://127.0.0.1:19999".into(),
+            None,
         )
         .unwrap();
         let result = cat.load_table_metadata("ns".into(), "tbl".into());

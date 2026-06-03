@@ -377,6 +377,12 @@ impl PlanNode {
     }
 }
 
+/// Maximum number of nodes allowed in a single plan.
+///
+/// Prevents adversarial or accidental plans from causing stack overflows in
+/// recursive plan walkers or excessive memory allocation (S7).
+pub const MAX_PLAN_NODES: usize = 10_000;
+
 /// Shared core fields for logical and physical plans.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PlanCore {
@@ -395,6 +401,12 @@ impl PlanCore {
     }
 
     fn add_node(&mut self, node: PlanNode) {
+        assert!(
+            self.nodes.len() < MAX_PLAN_NODES,
+            "plan '{}' exceeds MAX_PLAN_NODES ({MAX_PLAN_NODES}); \
+             check for plan-builder loops or reduce query complexity",
+            self.name
+        );
         self.nodes.push(node);
     }
 

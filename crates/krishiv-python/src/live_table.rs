@@ -184,6 +184,7 @@ mod tests {
 
     #[test]
     fn live_table_ingest_wrong_op_errors() {
+        pyo3::Python::initialize();
         let table = make_table("bad_op");
         let err = table.ingest_row(1, "upsert").unwrap_err();
         assert!(

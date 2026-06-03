@@ -367,14 +367,8 @@ impl ExecutionBackend for EmbeddedBackend {
     }
 
     fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-        if is_streaming_plan(plan) {
-            debug!(
-                backend = "embedded",
-                plan = %plan.name(),
-                "EmbeddedBackend: redirecting streaming plan to SingleNodeBackend"
-            );
-            return self.single_node.execute(plan);
-        }
+        // Streaming plans are rejected upstream in InProcessExecutionRuntime::accept_plan
+        // before reaching this backend — this path only sees batch plans.
         debug!(
             backend = "embedded",
             plan = %plan.name(),
@@ -496,12 +490,14 @@ mod tests {
     }
 
     #[test]
-    fn embedded_redirects_streaming_kind_to_single_node() {
-        let plan = PhysicalPlan::new("events", ExecutionKind::Streaming);
-        assert!(is_streaming_plan(&plan));
+    fn embedded_accepts_batch_plan_only() {
+        // EmbeddedBackend::execute is only reached for batch plans — streaming plans
+        // are rejected upstream in InProcessExecutionRuntime::accept_plan.
+        let plan = PhysicalPlan::new("SELECT 1", ExecutionKind::Batch);
         let backend = EmbeddedBackend::default();
         let report = backend.execute(&plan).expect("execute");
-        assert_eq!(report.backend(), "single-node");
+        assert_eq!(report.backend(), "embedded");
+        assert!(report.accepted());
     }
 
     #[test]

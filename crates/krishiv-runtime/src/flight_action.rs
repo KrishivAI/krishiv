@@ -84,6 +84,18 @@ pub struct BoundedWindowBody {
     pub topic: String,
     pub spec: WindowExecutionSpec,
     pub batches_b64: String,
+    /// Maximum watermark observed across all output batches, populated by the
+    /// server on the response path. `None` if no window has closed yet or if
+    /// the executor has not yet advanced its watermark (C8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_watermark_ms: Option<i64>,
+}
+
+impl BoundedWindowBody {
+    /// Create a request body (response_watermark_ms is None for requests).
+    pub fn request(topic: String, spec: WindowExecutionSpec, batches_b64: String) -> Self {
+        Self { topic, spec, batches_b64, response_watermark_ms: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +295,7 @@ mod tests {
             topic: "events".into(),
             spec: WindowExecutionSpec::tumbling("user_id", "ts", 5_000),
             batches_b64: batches_b64.clone(),
+            response_watermark_ms: None,
         });
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
@@ -376,6 +389,7 @@ mod tests {
             topic: "t".into(),
             spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
             batches_b64: String::new(),
+            response_watermark_ms: None,
         });
         assert_eq!(bounded.action_type(), "krishiv.v1.bounded_window");
 
@@ -486,6 +500,7 @@ mod tests {
             topic: "user-events".into(),
             spec,
             batches_b64: encode_batches(&[batch]).unwrap(),
+            response_watermark_ms: None,
         });
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
@@ -595,6 +610,7 @@ mod tests {
                 topic: "t".into(),
                 spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
                 batches_b64: String::new(),
+            response_watermark_ms: None,
             }),
             KrishivFlightAction::Explain(ExplainBody {
                 sql: "SELECT 1".into(),
@@ -701,6 +717,7 @@ mod tests {
             topic: "events".into(),
             spec: WindowExecutionSpec::tumbling("k", "ts", 5_000),
             batches_b64: String::new(),
+            response_watermark_ms: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         let decoded: BoundedWindowBody = serde_json::from_str(&json).unwrap();

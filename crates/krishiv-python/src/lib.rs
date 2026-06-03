@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! **Beta API**: may change between minor releases.
 //!
 //! PyO3 Python bindings for Krishiv — Session, DataFrame, Stream, WindowedStream,

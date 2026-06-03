@@ -29,6 +29,15 @@ fn build_embedded_session() -> PyResult<PySession> {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+// Uses crate::RUNTIME as the Tokio fallback rather than krishiv_common's FALLBACK_RUNTIME
+// because the python crate owns its own runtime handle for PyO3 thread safety.
+//
+// Implementation note (O6/S6): `block_in_place` parks the current tokio worker
+// thread for the duration of the call. For the common case (GIL released via
+// `py.detach()` before calling this), the thread park is acceptable because
+// PyO3 ensures no other Python threads are competing for this runtime thread.
+// A `spawn` + channel approach would free the thread but requires `Send + 'static`
+// bounds incompatible with the borrowed PyO3 contexts used by callers here.
 pub(crate) fn block_on_async<F, T>(future: F) -> Result<T, krishiv_api::KrishivError>
 where
     F: std::future::Future<Output = Result<T, krishiv_api::KrishivError>>,
@@ -40,6 +49,17 @@ where
 }
 
 /// A Krishiv query session.
+///
+/// ## Thread Safety
+///
+/// `Session` is internally ref-counted (`Arc`) and safe to clone. The `sql()`,
+/// `push_stream_job_input()`, and other methods release the Python GIL via
+/// `py.detach()` and may be called concurrently from multiple Python threads.
+///
+/// **Stream jobs** (`submit_stream_job`, `push_stream_job_input`, `poll_stream_job`)
+/// should be driven from a single thread per job to guarantee ordered input
+/// delivery. Concurrent input pushes from multiple threads are accepted but the
+/// ordering between them is undefined.
 #[pyclass(name = "Session")]
 pub struct PySession {
     pub(crate) inner: Arc<krishiv_api::Session>,
@@ -363,16 +383,8 @@ impl PySession {
             .into_iter()
             .map(|b| b.record_batch().clone())
             .collect();
-        let stream_batches: Vec<StreamBatch> = record_batches
-            .into_iter()
-            .enumerate()
-            .map(|(seq, b)| StreamBatch::new(seq as u64, b))
-            .collect();
         self.inner
-            .register_memory_stream(
-                name.clone(),
-                stream_batches.iter().map(|sb| sb.batch().clone()).collect(),
-            )
+            .register_memory_stream(name.clone(), record_batches)
             .map_err(map_krishiv_error)?;
         let pipeline = StreamPipeline {
             session: self.inner.clone(),
@@ -426,21 +438,10 @@ impl PySession {
     }
 }
 
-fn remote_execution_from_env() -> bool {
-    std::env::var("KRISHIV_REMOTE_EXEC")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
 
 #[cfg(test)]
 mod tests {
     use krishiv_api::{ExecutionMode, SessionBuilder};
-    use krishiv_runtime::ExecutionRuntime;
 
     #[test]
     fn connect_always_enables_remote_execution() {

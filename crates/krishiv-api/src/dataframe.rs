@@ -283,26 +283,12 @@ impl DataFrame {
                 .await
                 .map(QueryResult::new)
         } else if let Some(dataframe) = &self.sql_dataframe {
-            if !self.force_local {
-                self.runtime
-                    .accept_plan(&PhysicalPlan::new(
-                        self.logical_plan.name(),
-                        self.logical_plan.kind(),
-                    ))
-                    .map_err(KrishivError::from)?;
-            }
             dataframe
                 .collect()
                 .await
                 .map(QueryResult::new)
                 .map_err(Into::into)
         } else {
-            self.runtime
-                .accept_plan(&PhysicalPlan::new(
-                    self.logical_plan.name(),
-                    self.logical_plan.kind(),
-                ))
-                .map_err(KrishivError::from)?;
             Err(KrishivError::unsupported(
                 "logical-only DataFrame cannot be collected",
             ))

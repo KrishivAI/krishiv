@@ -30,6 +30,12 @@ use crate::{
 /// blocking the stage indefinitely.
 pub(crate) const DEFAULT_BATCH_TASK_TIMEOUT_SECS: u64 = 3600;
 
+/// Default streaming task safety timeout in seconds (5 minutes).
+/// Streaming fragments run continuously, but a deadlocked window operator
+/// would block forever without this guard (R6). Operators that legitimately
+/// need longer windows should set `task_timeout_secs` explicitly.
+pub(crate) const DEFAULT_STREAMING_TASK_TIMEOUT_SECS: u64 = 300;
+
 /// Maximum bytes used in the failure message sent to the coordinator.  Larger
 /// messages are truncated with `…` so they cannot blow past gRPC payload limits.
 pub(crate) const TASK_FAILURE_MESSAGE_MAX_BYTES: usize = 4096;
@@ -428,8 +434,8 @@ impl ExecutorTaskOutputKind {
 /// the local store and report `ShufflePartitionOutput` back to the coordinator.
 #[derive(Clone)]
 pub struct ShuffleContext {
-    pub store: std::sync::Arc<krishiv_shuffle::LocalDiskShuffleStore>,
-    /// `<host>:<port>` of this executor's Arrow IPC flight server.
+    pub store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
+    pub local_dir: PathBuf,
     pub flight_endpoint: String,
 }
 
@@ -503,17 +509,33 @@ impl TaskRunner {
             });
         }
 
-        // Take a state snapshot (EXE-1: fail-closed — do not ack a new epoch on error).
-        let snapshot_bytes = match state_backend.snapshot() {
-            Ok(bytes) => bytes,
-            Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => Vec::new(),
-            Err(_) => {
-                return Err(ExecutorError::LocalExecution {
+        // Take a state snapshot with retry for transient I/O errors (R9).
+        // SnapshotUnsupported is permanent (stateless operator) and skipped.
+        // Other errors are retried up to 3 times with 200 ms back-off.
+        let snapshot_bytes = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0u8..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                match state_backend.snapshot() {
+                    Ok(bytes) => { result = Some(bytes); break; }
+                    Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => {
+                        result = Some(Vec::new()); break;
+                    }
+                    Err(e) => { last_err = Some(e); }
+                }
+            }
+            match result {
+                Some(bytes) => bytes,
+                None => return Err(ExecutorError::LocalExecution {
                     message: format!(
-                        "checkpoint snapshot failed for task {} at epoch {}",
-                        self.task_id, req.epoch
+                        "checkpoint snapshot failed after 3 attempts for task {} at epoch {}: {}",
+                        self.task_id, req.epoch,
+                        last_err.map(|e| e.to_string()).unwrap_or_default()
                     ),
-                });
+                }),
             }
         };
 
@@ -622,7 +644,7 @@ impl StreamingProgressCallback for NoOpProgressCallback {
 pub struct ExecutorTaskRunner {
     pub(crate) inbox: ExecutorAssignmentInbox,
     pub(crate) shuffle: Option<ShuffleContext>,
-    pub(crate) inmem_shuffle: Option<std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>>,
+    pub(crate) inmem_shuffle: Option<std::sync::Arc<krishiv_shuffle::ShuffleBackend>>,
     /// Shared SQL engine — one instance per runner rather than per-fragment.
     pub(crate) sql_engine: Arc<SqlEngine>,
     /// Per-task checkpoint state keyed by task id.
@@ -754,6 +776,29 @@ impl ExecutorTaskRunner {
         &self.sql_engine
     }
 
+    /// Access the registered-parquet cache (keyed by `"table_name:path"`).
+    ///
+    /// Used by sibling crates (e.g. `krishiv-runtime`) to skip redundant
+    /// `register_parquet` calls for tables already registered in a previous
+    /// inline SQL execution.
+    pub fn registered_parquet_cache(&self) -> &Arc<dashmap::DashMap<String, ()>> {
+        &self.registered_parquet_cache
+    }
+
+    /// Inject a pre-existing parquet cache so multiple executor sessions can
+    /// share the same file-footer cache without re-reading the same files on
+    /// every new session (process-level cache sharing).
+    ///
+    /// By default each [`ExecutorTaskRunner`] creates a fresh private cache.
+    /// Call this builder with a shared `Arc` to enable cross-session reuse.
+    pub fn with_shared_parquet_cache(
+        mut self,
+        cache: Arc<dashmap::DashMap<String, ()>>,
+    ) -> Self {
+        self.registered_parquet_cache = cache;
+        self
+    }
+
     /// Attach a shared barrier injector so barriers received via gRPC are
     /// consumed by the runner loop and trigger checkpoint initiation.
     pub fn with_barrier_injector(mut self, injector: SharedBarrierInjector) -> Self {
@@ -841,7 +886,7 @@ impl ExecutorTaskRunner {
     /// Attach an in-memory shuffle store for R4a typed shuffle write/read tasks.
     pub fn with_inmem_shuffle(
         mut self,
-        store: std::sync::Arc<krishiv_shuffle::InMemoryShuffleStore>,
+        store: std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
     ) -> Self {
         self.inmem_shuffle = Some(store);
         self
@@ -962,12 +1007,27 @@ impl ExecutorTaskRunner {
                 }
             }
             crate::ExecutionModel::Streaming => {
-                // Streaming tasks run an unbounded loop; task_timeout_secs is
-                // intentionally ignored.  The real continuous operator loop
-                // arrives in R5.1; until then return a clear not-implemented
-                // error so R5 can replace this branch without touching call
-                // sites.
-                execute_streaming_fragment(self, &assignment).await
+                // Streaming tasks run a bounded-window loop. A safety timeout
+                // prevents deadlocked operators from blocking indefinitely (R6).
+                // Callers that need longer execution windows should set
+                // task_timeout_secs explicitly in the task spec.
+                let timeout_secs = assignment
+                    .task_timeout_secs()
+                    .unwrap_or(DEFAULT_STREAMING_TASK_TIMEOUT_SECS);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    execute_streaming_fragment(self, &assignment),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => Err(crate::ExecutorError::InvalidAssignment {
+                        message: format!(
+                            "streaming task timed out after {timeout_secs}s; \
+                             set task_timeout_secs in the task spec to allow longer execution"
+                        ),
+                    }),
+                }
             }
         };
 

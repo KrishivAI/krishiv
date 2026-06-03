@@ -73,6 +73,29 @@ impl InProcessCluster {
             .execute_windowed(topic, input_batches, &plan_spec)
     }
 
+    /// Deregister a streaming source and clear matching parquet-cache entries.
+    pub fn deregister_streaming_source(&self, name: &str) -> RuntimeResult<()> {
+        self.inner.deregister_streaming_source(name)
+    }
+
+    /// Expose the parquet-cache handle so it can be shared with new sessions.
+    ///
+    /// Pass the returned `Arc` to [`InProcessStreamingRuntime::with_parquet_cache`]
+    /// or [`InProcessCluster::with_parquet_cache`] to create sessions that reuse
+    /// the same file-footer cache across session boundaries.
+    pub fn parquet_cache(&self) -> std::sync::Arc<dashmap::DashMap<String, ()>> {
+        self.inner.parquet_cache()
+    }
+
+    /// Create a new cluster that shares an existing parquet-file-footer cache.
+    pub fn with_parquet_cache(
+        cache: std::sync::Arc<dashmap::DashMap<String, ()>>,
+    ) -> RuntimeResult<Self> {
+        Ok(Self {
+            inner: Arc::new(InProcessStreamingRuntime::with_parquet_cache(cache)?),
+        })
+    }
+
     /// Borrow the underlying streaming runtime (tests, advanced use).
     pub fn streaming_runtime(&self) -> &InProcessStreamingRuntime {
         &self.inner

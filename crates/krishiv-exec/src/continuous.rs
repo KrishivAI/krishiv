@@ -280,6 +280,16 @@ impl ContinuousWindowExecutor {
         let mut raw: Vec<RecordBatch> = Vec::new();
         for batch in &input_batches {
             let wm = self.watermark.advance(batch)?;
+            // G4: Warn when the watermark stalls so operators can detect idle sources.
+            if self.watermark.multi.is_stalled(std::time::Duration::from_secs(60)) {
+                if let Some(dur) = self.watermark.multi.stall_duration() {
+                    tracing::warn!(
+                        stall_secs = dur.as_secs(),
+                        "watermark has not advanced for {}s — check for idle or slow sources",
+                        dur.as_secs()
+                    );
+                }
+            }
             // Keep the TTL backend's event-time reference current as the
             // watermark advances within this drain cycle.
             self.operator.set_watermark(wm);

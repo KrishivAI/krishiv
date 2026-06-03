@@ -9,6 +9,7 @@
 /dist/docker/
 
 
+
 # Python build artifacts
 crates/krishiv-python/.venv/
 crates/krishiv-python/dist/
@@ -26,3 +27,8 @@ coordinator.log
 executor.log
 flight.log
 scheduler.log
+*.db
+
+# Data directories
+tpch_sf1/
+tpch_sf10/

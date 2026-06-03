@@ -118,8 +118,30 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
         .map(|ms| format!(":ttl={ms}"))
         .unwrap_or_default();
 
+    // Encode multi-source watermark fields: srcid=<col> and srcs=id1:lag1,id2:lag2.
+    // These are omitted when not configured so the fragment stays compact for the
+    // common single-source case.
+    let srcid = spec
+        .source_id_column
+        .as_deref()
+        .map(|c| format!(":srcid={c}"))
+        .unwrap_or_default();
+
+    let srcs = if spec.source_watermark_lags.is_empty() {
+        String::new()
+    } else {
+        // Sort by key for deterministic encoding (HashMap iteration order is unspecified).
+        let mut pairs: Vec<_> = spec.source_watermark_lags.iter().collect();
+        pairs.sort_by_key(|(k, _)| k.as_str());
+        let encoded: Vec<String> = pairs
+            .iter()
+            .map(|(id, lag)| format!("{id}:{lag}"))
+            .collect();
+        format!(":srcs={}", encoded.join(","))
+    };
+
     format!(
-        "{prefix}:key={}:time={}:win={}:lag={}:{agg}{extra}{ttl}",
+        "{prefix}:key={}:time={}:win={}:lag={}:{agg}{extra}{ttl}{srcid}{srcs}",
         spec.key_column, spec.event_time_column, spec.window_size_ms, spec.watermark_lag_ms,
     )
 }
@@ -146,6 +168,10 @@ pub struct ParsedStreamFragment {
     pub session_gap_ms: Option<u64>,
     pub ttl_ms: Option<u64>,
     pub agg: WindowAgg,
+    /// Source-id column name for multi-source watermark tracking.
+    pub source_id_column: Option<String>,
+    /// Per-source fixed watermark lags: source_id → lag_ms.
+    pub source_watermark_lags: HashMap<String, u64>,
 }
 
 use crate::PlanError;
@@ -173,6 +199,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
     let mut ttl_ms = None;
     let mut agg_kind: Option<String> = None;
     let mut agg_col: Option<String> = None;
+    let mut source_id_column: Option<String> = None;
+    let mut source_watermark_lags: HashMap<String, u64> = HashMap::new();
 
     for part in payload.split(':') {
         let part = part.trim();
@@ -223,6 +251,23 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             }
             "agg" => agg_kind = Some(v.trim().to_owned()),
             "col" => agg_col = Some(v.trim().to_owned()),
+            "srcid" => source_id_column = Some(v.trim().to_owned()),
+            "srcs" => {
+                // Format: id1:lag1,id2:lag2
+                for pair in v.split(',') {
+                    let pair = pair.trim();
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    let (id, lag_str) = pair.split_once(':').ok_or_else(|| {
+                        PlanError::Parse(format!("srcs entry must be id:lag_ms; got '{pair}'"))
+                    })?;
+                    let lag: u64 = lag_str.trim().parse().map_err(|e| {
+                        PlanError::Parse(format!("invalid lag in srcs entry '{pair}': {e}"))
+                    })?;
+                    source_watermark_lags.insert(id.trim().to_owned(), lag);
+                }
+            }
             _ => {}
         }
     }
@@ -294,6 +339,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
         session_gap_ms,
         ttl_ms,
         agg,
+        source_id_column,
+        source_watermark_lags,
     })
 }
 

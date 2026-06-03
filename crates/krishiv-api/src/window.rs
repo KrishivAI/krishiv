@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 use krishiv_exec::AggExpr;
-use krishiv_plan::{ExecutionKind, PhysicalPlan};
 use krishiv_runtime::{LocalWindowExecutionSpec, LocalWindowKind};
 
 use crate::error::{KrishivError, Result};
@@ -204,11 +203,6 @@ fn execute_windowed_inner(
             "unbounded stream window execution requires Session::submit_stream_job",
         ));
     }
-    let plan_name = krishiv_runtime::fragment_from_local_spec(&spec);
-    stream
-        .runtime
-        .accept_plan(&PhysicalPlan::new(plan_name, ExecutionKind::Streaming))
-        .map_err(KrishivError::from)?;
     let input: Vec<RecordBatch> = stream.batches.iter().map(|b| b.batch().clone()).collect();
     let output = stream
         .runtime

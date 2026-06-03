@@ -1,7 +1,7 @@
 //! gRPC service types for the executor task assignment protocol.
 
 use krishiv_proto::{
-    ExecutorTaskAssignment, ExecutorTaskService, TaskCancellationRequest, TaskStatusResponse,
+    ExecutorTaskAssignment, ExecutorTaskService, TaskStatusResponse,
     TransportDisposition, TransportVersion, wire,
 };
 
@@ -83,9 +83,11 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         &self,
         request: tonic::Request<krishiv_proto::task::PushContinuousInputRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
-        let request = request.into_inner();
-        // Since the executor uses Runner internally, pushing input is not directly supported via inbox yet.
-        // It's a placeholder for now since we just need the API to compile and the analyst wants Coordinator bypass.
+        let _request = request.into_inner();
+        // Continuous input is not routed through the executor gRPC endpoint.
+        // In embedded mode input is pushed via ContinuousStreamRegistry directly;
+        // in distributed mode the coordinator delivers batches as InlineIpc in task
+        // assignments. This endpoint satisfies the proto interface but is never called.
         Ok(tonic::Response::new(TaskStatusResponse::new(
             TransportDisposition::Accepted,
         )))
@@ -95,8 +97,9 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         &self,
         request: tonic::Request<krishiv_proto::task::DrainContinuousOutputRequest>,
     ) -> Result<tonic::Response<krishiv_proto::task::DrainContinuousOutputResponse>, tonic::Status> {
-        let request = request.into_inner();
-        // Placeholder for now.
+        let _request = request.into_inner();
+        // Output is returned via the coordinator's task-result path, not polled from
+        // the executor directly. Satisfies the proto interface; never called in practice.
         Ok(tonic::Response::new(krishiv_proto::task::DrainContinuousOutputResponse {
             version: TransportVersion::CURRENT,
             disposition: TransportDisposition::Accepted,

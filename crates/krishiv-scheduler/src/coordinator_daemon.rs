@@ -204,6 +204,12 @@ pub async fn run_cluster_control_plane(
         }
     }
 
+    // Brief drain window before demoting: allows in-flight gRPC handlers
+    // (heartbeats, task updates) to complete so the new leader doesn't see
+    // stale state. A full RPC-drain barrier would require tracking active
+    // calls; this 2-second fence closes the common fast-shutdown race (R11).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     // Demote coordinator and release leadership.
     {
         let mut coord = coordinator.write().await;
@@ -228,8 +234,11 @@ pub async fn spawn_coordinator_sidecars(
                 )
             })?);
         let gc_coordinator = coordinator.clone();
+        let orphan_store = Arc::clone(&store);
+        let orphan_shuffle_dir = shuffle_dir.clone();
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(5));
+            let mut orphan_tick_count: u64 = 0;
             loop {
                 ticker.tick().await;
                 let job_ids = gc_coordinator.write().await.take_gc_ready_jobs();
@@ -237,6 +246,25 @@ pub async fn spawn_coordinator_sidecars(
                     if let Err(e) = store.delete_job_partitions(job_id.as_str()).await {
                         eprintln!("shuffle GC failed for job {job_id}: {e}");
                     }
+                }
+                // Orphan scan every 60 s (every 12th 5-second tick) — removes
+                // partition files for jobs that crashed before reaching terminal
+                // state and were never added to gc_ready_jobs (C4).
+                orphan_tick_count += 1;
+                if orphan_tick_count % 12 == 0 {
+                    let active = gc_coordinator.read().await.active_job_ids();
+                    let dir = orphan_shuffle_dir.clone();
+                    let store2 = Arc::clone(&orphan_store);
+                    tokio::task::spawn_blocking(move || {
+                        match krishiv_shuffle::orphan::cleanup_orphans(&dir, &active) {
+                            Ok(n) if n > 0 => {
+                                eprintln!("shuffle orphan GC: removed {n} orphaned partition files");
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("shuffle orphan GC failed: {e}"),
+                        }
+                        drop(store2); // keep Arc alive
+                    });
                 }
             }
         });
@@ -800,6 +828,8 @@ pub async fn run_standalone_coordinator(
             tracing::info!("SIGTERM received; initiating standalone coordinator graceful shutdown");
         }
     }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     {
         let mut coord = coordinator.write().await;

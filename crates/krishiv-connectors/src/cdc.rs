@@ -1455,7 +1455,7 @@ mod tests {
         assert!(result.is_ok(), "shutdown via empty source should succeed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_returns_err_without_source() {
         let pipeline = CdcToLakehousePipeline::new(
             "orders",

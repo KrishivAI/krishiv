@@ -46,3 +46,11 @@ spec:
                   fieldPath: metadata.name
             - name: KRISHIV_TASK_SLOTS
               value: "1"
+          volumeMounts:
+            - name: tpch-data
+              mountPath: /home/code/krishiv/tpch_sf10
+      volumes:
+        - name: tpch-data
+          hostPath:
+            path: /home/code/krishiv/tpch_sf10
+            type: Directory

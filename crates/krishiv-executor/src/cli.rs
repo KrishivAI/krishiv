@@ -312,11 +312,12 @@ async fn heartbeat_loop(
         let endpoint = local_addr.to_string();
         println!("Krishiv executor shuffle flight listening on {endpoint}");
         runner_builder = runner_builder.with_shuffle(ShuffleContext {
-            store: disk,
+            store: Arc::new(krishiv_shuffle::ShuffleBackend::Local(disk)),
+            local_dir: dir.clone(),
             flight_endpoint: endpoint,
         });
     }
-    let inmem_shuffle = Arc::new(InMemoryShuffleStore::new());
+    let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(InMemoryShuffleStore::new())));
     runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
 
     // Streaming progress buffer (GAP-OB-04): shared between runner tasks

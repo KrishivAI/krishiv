@@ -674,7 +674,8 @@ fn multi_source_watermark_window_collect_with_source_column() {
         .with_multi_source_watermark(
             MultiSourceWatermarkSpec::new()
                 .source("src-a", WatermarkSpec::fixed_lag_ms(0))
-                .source("src-b", WatermarkSpec::fixed_lag_ms(0)),
+                .source("src-b", WatermarkSpec::fixed_lag_ms(0))
+                .with_source_id_column("source_id"),
         )
         .tumbling_window(10_000)
         .collect()

@@ -564,6 +564,19 @@ impl RdkafkaKafkaSource {
 
         match auto_commit_interval_ms {
             Some(ms) => {
+                // At-least-once risk: auto-commit fires on a timer that is
+                // independent of the distributed checkpoint cycle. If the
+                // executor crashes after auto-commit but before the state
+                // snapshot, messages committed here will be skipped on restart.
+                // For exactly-once semantics, use None and call commit_offsets()
+                // only after state_backend.snapshot() succeeds (C7).
+                tracing::warn!(
+                    topic = %topic,
+                    interval_ms = ms,
+                    "Kafka auto-commit enabled: at-least-once delivery only. \
+                     For exactly-once, set auto_commit_interval_ms=None and call \
+                     commit_offsets() after each durable state checkpoint."
+                );
                 cfg.set("enable.auto.commit", "true")
                     .set("auto.commit.interval.ms", ms.to_string());
             }
@@ -603,9 +616,26 @@ impl RdkafkaKafkaSource {
 
     /// Commit consumer group offsets up to the last successfully read message.
     ///
-    /// Call this after the downstream sink has acknowledged the corresponding
-    /// output, advancing the committed watermark and preventing re-processing
-    /// of already-delivered messages on restart.
+    /// **Must only be called after the downstream state has been durably
+    /// persisted** (e.g. after `state_backend.snapshot()` succeeds). Calling
+    /// before the snapshot creates a window where the committed offset advances
+    /// past unsnapshotted state — messages would be skipped on restart (C7).
+    pub fn commit_offsets(&self) {
+        use rdkafka::consumer::Consumer;
+        if let Err(e) = self
+            .consumer
+            .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
+        {
+            tracing::warn!(
+                topic = %self.topic,
+                error = %e,
+                "rdkafka offset commit failed"
+            );
+        }
+    }
+
+    /// Deprecated alias for [`commit_offsets`].
+    #[deprecated(since = "0.1.0", note = "use commit_offsets() instead")]
     pub fn commit_watermark(&self) {
         use rdkafka::consumer::Consumer;
         if let Err(e) = self

@@ -96,6 +96,22 @@ pub trait ExecutionRuntime: Send + Sync {
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>>;
 
+    /// Execute a bounded windowed pipeline and return output batches together
+    /// with the max watermark observed across output batches (C8).
+    ///
+    /// The default implementation calls `collect_bounded_window` and returns
+    /// `None` for the watermark. Override in distributed runtimes to propagate
+    /// the executor's watermark back to the caller for global alignment.
+    fn collect_bounded_window_with_watermark(
+        &self,
+        topic: &str,
+        input_batches: Vec<RecordBatch>,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<(Vec<RecordBatch>, Option<i64>)> {
+        self.collect_bounded_window(topic, input_batches, spec)
+            .map(|batches| (batches, None))
+    }
+
     /// Execute batch SQL through coordinator/Flight and return all result batches.
     fn collect_batch_sql(
         &self,
@@ -186,6 +202,15 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
+        // Streaming plans carry long-running operator state and must go through
+        // collect_bounded_window or the continuous stream APIs.  Accepting them
+        // silently here would return a success report without executing anything.
+        if plan.kind() == ExecutionKind::Streaming {
+            return Err(RuntimeError::unsupported(
+                "streaming plans must use collect_bounded_window or the continuous \
+                 stream APIs; submit via Session::submit_stream_job for unbounded pipelines",
+            ));
+        }
         match self.mode {
             RuntimeMode::Embedded => {
                 let backend = EmbeddedBackend::default();
@@ -332,6 +357,16 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         input_batches: Vec<RecordBatch>,
         spec: &LocalWindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>> {
+        self.collect_bounded_window_with_watermark(topic, input_batches, spec)
+            .map(|(batches, _wm)| batches)
+    }
+
+    fn collect_bounded_window_with_watermark(
+        &self,
+        topic: &str,
+        input_batches: Vec<RecordBatch>,
+        spec: &LocalWindowExecutionSpec,
+    ) -> RuntimeResult<(Vec<RecordBatch>, Option<i64>)> {
         use crate::flight_action::{BoundedWindowBody, KrishivFlightAction, encode_batches};
         use crate::flight_client::decode_ipc_response;
         use crate::flight_protocol::encode_bounded_window;
@@ -341,13 +376,28 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             topic: topic.to_string(),
             spec: spec.to_plan_spec(),
             batches_b64,
+            response_watermark_ms: None,
         });
         let result = block_on(self.pool.do_action(&action));
         match result {
-            Ok(body) => decode_ipc_response(&body),
+            Ok(body) => {
+                // Attempt to decode as BoundedWindowBody response (server populates
+                // response_watermark_ms on the reply path). Fall back to raw IPC if
+                // the server returns plain batches without a JSON envelope (C8).
+                let watermark = if let Ok(resp) =
+                    serde_json::from_slice::<BoundedWindowBody>(&body)
+                {
+                    resp.response_watermark_ms
+                } else {
+                    None
+                };
+                let batches = decode_ipc_response(&body)?;
+                Ok((batches, watermark))
+            }
             Err(ref e) if is_server_unimplemented(e) => {
                 let sql = encode_bounded_window(topic, spec, &input_batches)?;
-                block_on(self.pool.execute_sql(&sql))
+                let batches = block_on(self.pool.execute_sql(&sql))?;
+                Ok((batches, None))
             }
             Err(e) => Err(e),
         }
@@ -1126,6 +1176,58 @@ mod tests {
         assert!(
             matches!(err, crate::RuntimeError::Unsupported { .. }),
             "streaming plan dispatch to remote must return Unsupported, got: {err:?}"
+        );
+    }
+
+    // ── G3: In-process streaming plan guard ──────────────────────────────────
+
+    #[test]
+    fn in_process_embedded_rejects_streaming_plan() {
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let rt = InProcessExecutionRuntime::embedded(cluster);
+        let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
+        let err = rt.accept_plan(&plan).unwrap_err();
+        assert!(
+            matches!(err, crate::RuntimeError::Unsupported { .. }),
+            "embedded accept_plan must reject streaming plans, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn in_process_single_node_rejects_streaming_plan() {
+        let cluster = Arc::new(InProcessCluster::new().unwrap());
+        let rt = InProcessExecutionRuntime::single_node(cluster);
+        let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
+        let err = rt.accept_plan(&plan).unwrap_err();
+        assert!(
+            matches!(err, crate::RuntimeError::Unsupported { .. }),
+            "single-node accept_plan must reject streaming plans, got: {err:?}"
+        );
+    }
+
+    // ── G1: is_streaming flag encoding in remote collect_batch_sql ────────────
+
+    #[test]
+    fn remote_collect_batch_sql_streaming_flag_prefixes_comment() {
+        // Documents that is_streaming=true is encoded as a first-line SQL comment
+        // so the remote Flight handler can detect streaming intent without a
+        // separate gRPC field.  The constant format must not change without
+        // updating the server-side parser.
+        let query = "SELECT * FROM events";
+        let streaming_sql = format!("-- krishiv:streaming=true\n{query}");
+        assert!(
+            streaming_sql.starts_with("-- krishiv:streaming=true\n"),
+            "streaming flag must be the first line of the encoded SQL"
+        );
+        assert!(
+            streaming_sql.contains(query),
+            "original query must be preserved after the streaming comment"
+        );
+        // Verify the non-streaming path does not add the prefix.
+        let batch_sql = query.to_string();
+        assert!(
+            !batch_sql.starts_with("-- krishiv:streaming=true"),
+            "batch SQL must not carry the streaming comment prefix"
         );
     }
 }

@@ -768,6 +768,16 @@ impl Coordinator {
         self.config
     }
 
+    /// Return all currently tracked job ids (active and recently-terminal).
+    /// Used by the shuffle orphan-cleanup loop to determine which job directories
+    /// on disk are legitimately owned vs. abandoned (C4).
+    pub fn active_job_ids(&self) -> std::collections::HashSet<String> {
+        self.job_coordinators
+            .keys()
+            .map(|jid| jid.as_str().to_string())
+            .collect()
+    }
+
     pub fn coordinator_tick(&mut self) -> SchedulerResult<()> {
         self.advance_heartbeat_clock(1)?;
         let job_ids: Vec<JobId> = self.job_coordinators.keys().cloned().collect();

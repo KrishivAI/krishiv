@@ -1410,10 +1410,11 @@ mod executor_tests {
         }
 
         // Start the Arrow IPC shuffle flight server.
-        let store = Arc::new(LocalDiskShuffleStore::new(&shuffle_dir).unwrap());
+        let disk_store = Arc::new(LocalDiskShuffleStore::new(&shuffle_dir).unwrap());
+        let store = Arc::new(krishiv_shuffle::ShuffleBackend::Local(Arc::clone(&disk_store)));
         let flight_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (flight_local_addr, flight_handle) =
-            match krishiv_shuffle::flight::serve(flight_addr, Arc::clone(&store)).await {
+            match krishiv_shuffle::flight::serve(flight_addr, Arc::clone(&disk_store)).await {
                 Ok(pair) => pair,
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     eprintln!("skipping tpch shuffle test: loopback sockets denied");
@@ -1506,6 +1507,7 @@ mod executor_tests {
         let s0_inbox = ExecutorAssignmentInbox::new();
         let shuffle_ctx = ShuffleContext {
             store: Arc::clone(&store),
+            local_dir: shuffle_dir.clone(),
             flight_endpoint: flight_endpoint.clone(),
         };
         let s0_runner = ExecutorTaskRunner::new(s0_inbox.clone()).with_shuffle(shuffle_ctx);
@@ -2547,7 +2549,8 @@ mod executor_tests {
 
         let store = Arc::new(InMemoryShuffleStore::new());
         let inbox = ExecutorAssignmentInbox::new();
-        let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(Arc::clone(&store));
+        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::clone(&store)));
+        let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(backend);
 
         let num_partitions = 3usize;
         let write_cfg = ShuffleWriteConfig {
@@ -2631,7 +2634,8 @@ mod executor_tests {
             .unwrap();
 
         let inbox = ExecutorAssignmentInbox::new();
-        let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(Arc::clone(&store));
+        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::clone(&store)));
+        let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(backend);
 
         let read_cfg = ShuffleReadConfig {
             stage_id: StageId::try_new("stage-sr").unwrap(),

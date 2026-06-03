@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec,
+    Volume, VolumeMount, HostPathVolumeSource,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;
@@ -233,6 +234,11 @@ impl PodLifecycleManager {
             },
             args: Some(executor_args(&self.coordinator_endpoint)),
             env: Some(env_vars),
+            volume_mounts: Some(vec![VolumeMount {
+                name: "krishiv-src".to_owned(),
+                mount_path: "/home/code/krishiv".to_owned(),
+                ..Default::default()
+            }]),
             ..Default::default()
         };
 
@@ -253,6 +259,14 @@ impl PodLifecycleManager {
             spec: Some(PodSpec {
                 containers: vec![container],
                 restart_policy: Some(restart_policy),
+                volumes: Some(vec![Volume {
+                    name: "krishiv-src".to_owned(),
+                    host_path: Some(HostPathVolumeSource {
+                        path: "/home/code/krishiv".to_owned(),
+                        type_: Some("DirectoryOrCreate".to_owned()),
+                    }),
+                    ..Default::default()
+                }]),
                 ..Default::default()
             }),
             ..Default::default()

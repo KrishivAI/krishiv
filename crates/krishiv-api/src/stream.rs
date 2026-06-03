@@ -1,7 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use krishiv_plan::{ExecutionKind, PhysicalPlan};
 use krishiv_runtime::ExecutionRuntime;
 
 use crate::error::{KrishivError, Result};
@@ -106,8 +105,6 @@ impl Stream {
             ));
         }
 
-        let plan = PhysicalPlan::new(&self.name, ExecutionKind::Streaming);
-        self.runtime.accept_plan(&plan)?;
         Ok(self.batches.clone())
     }
 
@@ -126,9 +123,6 @@ impl Stream {
                 "unbounded stream mapping requires a streaming runtime",
             ));
         }
-
-        let plan = PhysicalPlan::new(format!("{}:map", self.name), ExecutionKind::Streaming);
-        self.runtime.accept_plan(&plan)?;
 
         Ok(Self::for_session(
             self.name.clone(),
@@ -151,9 +145,6 @@ impl Stream {
                 "unbounded stream filtering requires a streaming runtime",
             ));
         }
-
-        let plan = PhysicalPlan::new(format!("{}:filter", self.name), ExecutionKind::Streaming);
-        self.runtime.accept_plan(&plan)?;
 
         Ok(Self::for_session(
             self.name.clone(),

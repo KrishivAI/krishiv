@@ -23,6 +23,7 @@ pub struct EtcdMetadataStore {
     client: Mutex<Client>,
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
+    executor_descriptors: Vec<krishiv_proto::ExecutorDescriptor>,
 }
 
 impl EtcdMetadataStore {
@@ -52,6 +53,7 @@ impl EtcdMetadataStore {
             client: Mutex::new(client),
             events,
             jobs,
+            executor_descriptors: vec![],
         })
     }
 
@@ -118,6 +120,29 @@ impl MetadataStore for EtcdMetadataStore {
 
     fn jobs(&self) -> &[JobRecord] {
         &self.jobs
+    }
+
+    fn save_executor(&mut self, descriptor: &krishiv_proto::ExecutorDescriptor) -> SchedulerResult<()> {
+        if let Some(pos) = self
+            .executor_descriptors
+            .iter()
+            .position(|e| e.executor_id() == descriptor.executor_id())
+        {
+            self.executor_descriptors[pos] = descriptor.clone();
+        } else {
+            self.executor_descriptors.push(descriptor.clone());
+        }
+        self.persist()
+    }
+
+    fn executors(&self) -> Vec<krishiv_proto::ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
+    fn remove_executor(&mut self, executor_id: &krishiv_proto::ExecutorId) -> SchedulerResult<()> {
+        self.executor_descriptors
+            .retain(|e| e.executor_id() != executor_id);
+        self.persist()
     }
 }
 

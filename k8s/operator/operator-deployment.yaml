@@ -32,25 +32,13 @@ spec:
             - $(KRISHIV_NAMESPACE)
             - --coordinator-id
             - $(KRISHIV_COORDINATOR_ID)
-            - --bootstrap-executor-slots
-            - "2"
-            - --status-addr
-            - 0.0.0.0:8080
             - --executor-grpc-addr
             - 0.0.0.0:9090
           ports:
-            - name: http
-              containerPort: 8080
             - name: grpc
               containerPort: 9090
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: http
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            - name: http
+              containerPort: 8080
           env:
             - name: KRISHIV_COORDINATOR_ID
               valueFrom:
@@ -62,3 +50,11 @@ spec:
                   fieldPath: metadata.namespace
             - name: KRISHIV_ALLOW_ANONYMOUS
               value: "true"
+          volumeMounts:
+            - name: tpch-data
+              mountPath: /home/code/krishiv/tpch_sf10
+      volumes:
+        - name: tpch-data
+          hostPath:
+            path: /home/code/krishiv/tpch_sf10
+            type: Directory

@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: krishiv-python-client
+  namespace: krishiv-system
+spec:
+  containers:
+  - name: python
+    image: python:3.9
+    command: ["sleep", "infinity"]
+    volumeMounts:
+    - name: code
+      mountPath: /home/code/krishiv
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    readinessProbe:
+      exec:
+        command: ["/bin/sh", "-c", "python -c 'import sys; sys.exit(0)'"]
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    livenessProbe:
+      exec:
+        command: ["/bin/sh", "-c", "python -c 'import sys; sys.exit(0)'"]
+      initialDelaySeconds: 15
+      periodSeconds: 30
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+  securityContext:
+    fsGroup: 1000
+  volumes:
+  - name: code
+    hostPath:
+      path: /home/code/krishiv

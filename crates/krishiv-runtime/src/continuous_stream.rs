@@ -11,12 +11,27 @@ use krishiv_plan::window::WindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
 
 /// One continuous streaming job registered on the session cluster.
-#[derive(Debug)]
+///
+/// Input and executor are guarded by independent `Mutex`es so that
+/// `push_input` / `pending_batch_depth` only contend with each other and
+/// never block while `drain_job` is running the (potentially slow) window
+/// computation.
 struct ContinuousJobEntry {
+    /// Immutable after registration; no lock required.
     spec: WindowExecutionSpec,
-    executor: ContinuousWindowExecutor,
-    pending_input: VecDeque<RecordBatch>,
-    pending_output: VecDeque<RecordBatch>,
+    /// Guarded separately so producers can push without waiting for drain.
+    input: Mutex<VecDeque<RecordBatch>>,
+    /// Locked only during `drain_job` for the window computation itself.
+    executor: Mutex<ContinuousWindowExecutor>,
+}
+
+impl std::fmt::Debug for ContinuousJobEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContinuousJobEntry")
+            .field("spec", &self.spec)
+            .field("input_queue_len", &self.input.lock().map(|q| q.len()).unwrap_or(0))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Default maximum pending input batches per job before backpressure kicks in.
@@ -25,7 +40,7 @@ const DEFAULT_MAX_PENDING_BATCHES: usize = 1024;
 /// Registry for long-running streaming jobs (session-scoped).
 #[derive(Debug)]
 pub struct ContinuousStreamRegistry {
-    jobs: DashMap<String, Arc<Mutex<ContinuousJobEntry>>>,
+    jobs: DashMap<String, Arc<ContinuousJobEntry>>,
     /// Maximum number of pending (not yet drained) input batches per job.
     /// `push_input` returns [`RuntimeError::InvalidState`] when this limit is
     /// reached so callers can apply backpressure instead of silently filling
@@ -70,15 +85,21 @@ impl ContinuousStreamRegistry {
             .map_err(|e| RuntimeError::transport(e.to_string()))?;
         self.jobs.insert(
             job_id.into(),
-            Arc::new(Mutex::new(ContinuousJobEntry {
+            Arc::new(ContinuousJobEntry {
                 spec,
-                executor,
-                pending_input: VecDeque::new(),
-                pending_output: VecDeque::new(),
-            })),
+                input: Mutex::new(VecDeque::new()),
+                executor: Mutex::new(executor),
+            }),
         );
         Ok(())
     }
+
+    /// Maximum input batches consumed by a single [`drain_job_up_to`] call.
+    ///
+    /// Limits the amount of memory allocated by one drain cycle. Callers that
+    /// need to drain more than this many batches should call `drain_job_up_to`
+    /// in a loop until [`pending_batch_depth`] returns 0.
+    pub const DEFAULT_MAX_DRAIN_BATCHES: usize = 256;
 
     /// Enqueue input batches for a continuous job.
     ///
@@ -91,22 +112,25 @@ impl ContinuousStreamRegistry {
             .jobs
             .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("unknown continuous stream job '{job_id}'"),
+                message: format!("continuous job '{job_id}': not found"),
             })?;
-        let mut guard = entry
+        let mut queue = entry
+            .input
             .lock()
-            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
-        let current_depth = guard.pending_input.len();
+            .map_err(|_| RuntimeError::transport(
+                format!("continuous job '{job_id}' input lock poisoned during push_input")
+            ))?;
+        let current_depth = queue.len();
         if current_depth >= self.max_pending_batches {
             return Err(RuntimeError::InvalidState {
                 message: format!(
-                    "continuous job '{job_id}' input queue is full ({current_depth} batches \
+                    "continuous job '{job_id}': input queue is full ({current_depth} batches \
                      pending, limit {limit}); call drain_job before pushing more data",
                     limit = self.max_pending_batches,
                 ),
             });
         }
-        guard.pending_input.extend(batches);
+        queue.extend(batches);
         Ok(())
     }
 
@@ -117,37 +141,67 @@ impl ContinuousStreamRegistry {
             .jobs
             .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("unknown continuous stream job '{job_id}'"),
+                message: format!("continuous job '{job_id}': not found"),
             })?;
-        let guard = entry
+        let queue = entry
+            .input
             .lock()
-            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
-        Ok(guard.pending_input.len())
+            .map_err(|_| RuntimeError::transport(
+                format!("continuous job '{job_id}' input lock poisoned during pending_batch_depth")
+            ))?;
+        Ok(queue.len())
     }
 
-    /// Drain pending input through the window operator and return newly emitted batches.
-    pub fn drain_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+    /// Drain up to `max_input_batches` pending input batches through the window
+    /// operator and return newly emitted output batches.
+    ///
+    /// Limiting the number of input batches consumed per call prevents unbounded
+    /// memory spikes when the input queue is large (B6). Call in a loop until
+    /// [`pending_batch_depth`] returns 0 to fully drain.
+    pub fn drain_job_up_to(
+        &self,
+        job_id: &str,
+        max_input_batches: usize,
+    ) -> RuntimeResult<Vec<RecordBatch>> {
         let entry = self
             .jobs
             .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("unknown continuous stream job '{job_id}'"),
+                message: format!("continuous job '{job_id}': not found"),
             })?;
-        let mut guard = entry
-            .lock()
-            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
-        let input: Vec<RecordBatch> = guard.pending_input.drain(..).collect();
+        // Steal at most `max_input_batches` entries with a short critical section,
+        // then release the input lock before acquiring the executor lock.
+        let input: Vec<RecordBatch> = {
+            let mut queue = entry
+                .input
+                .lock()
+                .map_err(|_| RuntimeError::transport(
+                    format!("continuous job '{job_id}' input lock poisoned during drain_job")
+                ))?;
+            let take = queue.len().min(max_input_batches);
+            queue.drain(..take).collect()
+        };
         if input.is_empty() {
-            let output: Vec<RecordBatch> = guard.pending_output.drain(..).collect();
-            return Ok(output);
+            return Ok(Vec::new());
         }
-        let emitted = guard
+        // Window computation runs under the executor lock only — producers are
+        // not blocked during this (potentially slow) aggregation step.
+        let mut exec = entry
             .executor
-            .drain(input)
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
-        guard.pending_output.extend(emitted.iter().cloned());
-        let output: Vec<RecordBatch> = guard.pending_output.drain(..).collect();
-        Ok(output)
+            .lock()
+            .map_err(|_| RuntimeError::transport(
+                format!("continuous job '{job_id}' executor lock poisoned during drain_job")
+            ))?;
+        exec.drain(input).map_err(|e| RuntimeError::transport(e.to_string()))
+    }
+
+    /// Drain ALL pending input batches through the window operator.
+    ///
+    /// Equivalent to calling [`drain_job_up_to`] with `usize::MAX`. For large
+    /// input queues, prefer `drain_job_up_to(job_id, DEFAULT_MAX_DRAIN_BATCHES)`
+    /// in a loop to avoid memory spikes.
+    pub fn drain_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        self.drain_job_up_to(job_id, usize::MAX)
     }
 
     /// Borrow the window spec for coordinator fragment encoding.
@@ -156,12 +210,14 @@ impl ContinuousStreamRegistry {
             .jobs
             .get(job_id)
             .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("unknown continuous stream job '{job_id}'"),
+                message: format!("continuous job '{job_id}': not found"),
             })?;
-        let guard = entry
-            .lock()
-            .map_err(|_| RuntimeError::transport("continuous entry lock poisoned"))?;
-        Ok(guard.spec.clone())
+        Ok(entry.spec.clone())
+    }
+
+    /// Returns `true` if a job with this id has been registered.
+    pub fn has_job(&self, job_id: &str) -> bool {
+        self.jobs.contains_key(job_id)
     }
 
     /// List all registered job ids.
@@ -422,15 +478,62 @@ mod tests {
     }
 
     #[test]
-    fn drain_pending_output_accumulates() {
-        let registry = ContinuousStreamRegistry::new();
+    fn drain_job_up_to_respects_max_input_batches() {
+        // 10-second tumbling window. First 9 batches are inside [0,10000),
+        // batch at 11_000 crosses into the next window and triggers output.
+        let registry = ContinuousStreamRegistry::new_unbounded();
         registry
-            .register_job("j1", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job("j-up-to", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
             .unwrap();
-        registry.push_input("j1", vec![batch(1_000)]).unwrap();
-        let _ = registry.drain_job("j1").unwrap();
-        registry.push_input("j1", vec![batch(11_000)]).unwrap();
-        let out1 = registry.drain_job("j1").unwrap();
-        assert!(!out1.is_empty());
+        for i in 0_i64..9 {
+            registry
+                .push_input("j-up-to", vec![batch(i * 1_000 + 1_000)])
+                .unwrap();
+        }
+        // 10th batch crosses the window boundary.
+        registry.push_input("j-up-to", vec![batch(11_000)]).unwrap();
+        assert_eq!(registry.pending_batch_depth("j-up-to").unwrap(), 10);
+        // Drain at most 3 — the remaining 7 must still be pending; no window
+        // closes yet because batch[11_000] is not consumed.
+        let partial = registry.drain_job_up_to("j-up-to", 3).unwrap();
+        assert_eq!(
+            registry.pending_batch_depth("j-up-to").unwrap(),
+            7,
+            "drain_job_up_to(3) must leave 7 batches pending"
+        );
+        // No window boundary in first 3 batches (all ts < 10000).
+        assert!(partial.is_empty(), "no window closed in first 3 batches");
+        // Drain the rest — the window-boundary batch (11_000) is now consumed.
+        let final_out = registry.drain_job_up_to("j-up-to", usize::MAX).unwrap();
+        assert!(
+            !final_out.is_empty(),
+            "draining the window-boundary batch must emit output"
+        );
+        assert_eq!(registry.pending_batch_depth("j-up-to").unwrap(), 0);
     }
+
+    #[test]
+    fn drain_job_up_to_usize_max_drains_all_and_emits_output() {
+        // Two batches that cross a 5-second window boundary; drain must consume
+        // both and return the closed window's output rows.
+        let registry = ContinuousStreamRegistry::new_unbounded();
+        registry
+            .register_job("j-all", WindowExecutionSpec::tumbling("user_id", "ts", 5_000))
+            .unwrap();
+        // batch at 1_000 → inside [0, 5000); batch at 6_000 → closes it.
+        registry
+            .push_input("j-all", vec![batch(1_000), batch(6_000)])
+            .unwrap();
+        let out = registry.drain_job_up_to("j-all", usize::MAX).unwrap();
+        assert_eq!(
+            registry.pending_batch_depth("j-all").unwrap(),
+            0,
+            "drain_job_up_to(usize::MAX) must drain all batches"
+        );
+        assert!(
+            !out.is_empty(),
+            "closed window must produce output batches"
+        );
+    }
+
 }

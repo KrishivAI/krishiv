@@ -230,8 +230,11 @@ impl PyWindowedStream {
         Ok(new_windowed_stream(self.pipeline.with_aggregations(aggs)))
     }
 
-    pub fn collect(&self, _py: Python<'_>) -> PyResult<Vec<PyBatch>> {
-        self.ensure_collected()?;
+    pub fn collect(&self, py: Python<'_>) -> PyResult<Vec<PyBatch>> {
+        // G5: Release the GIL during the blocking windowed computation so other
+        // Python threads and async tasks can run without stalling.
+        // pyo3 0.28 uses `detach` instead of the older `allow_threads`.
+        py.detach(|| self.ensure_collected())?;
         Ok(self.cached.lock().unwrap().clone().unwrap_or_default())
     }
 

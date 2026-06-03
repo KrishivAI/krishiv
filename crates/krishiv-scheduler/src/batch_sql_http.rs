@@ -21,7 +21,7 @@ pub struct BatchSqlRequest {
 
 // ── Async submit / poll ────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BatchSqlSubmitResponse {
     pub job_id: String,
 }

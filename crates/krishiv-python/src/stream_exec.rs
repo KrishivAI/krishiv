@@ -154,7 +154,10 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
 pub(crate) fn execute_pipeline(pipeline: &StreamPipeline) -> PyResult<Vec<PyBatch>> {
     let spec = spec_from_pipeline(pipeline)?;
     let input = block_on_async(resolve_input_batches(pipeline)).map_err(map_krishiv_error)?;
-    let output = krishiv_api::execute_windowed_stream(input, &spec)
+    let output = pipeline
+        .session
+        .execution_runtime()
+        .collect_bounded_window(&pipeline.source_id, input, &spec)
         .map_err(|e| map_krishiv_error(krishiv_api::KrishivError::from(e)))?;
     Ok(output.into_iter().map(PyBatch::from_record_batch).collect())
 }

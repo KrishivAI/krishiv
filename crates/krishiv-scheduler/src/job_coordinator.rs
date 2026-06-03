@@ -21,21 +21,21 @@ impl JobCoordinator {
 
     /// Synchronous read access to the underlying JobRecord.
     pub fn read_record(&self) -> std::sync::RwLockReadGuard<'_, JobRecord> {
-        self.inner.read().expect("JobCoordinator RwLock poisoned")
+        self.inner.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Synchronous write access to the underlying JobRecord.
     pub fn write_record(&self) -> std::sync::RwLockWriteGuard<'_, JobRecord> {
-        self.inner.write().expect("JobCoordinator RwLock poisoned")
+        self.inner.write().unwrap_or_else(|p| p.into_inner())
     }
 
     pub async fn snapshot(&self) -> crate::job::JobSnapshot {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.snapshot()
     }
 
     pub async fn current_state(&self) -> krishiv_proto::JobState {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.state
     }
 
@@ -43,7 +43,7 @@ impl JobCoordinator {
         &self,
         update: krishiv_proto::TaskStatusUpdate,
     ) -> crate::SchedulerResult<crate::TaskUpdateOutcome> {
-        let mut job = self.inner.write().expect("poisoned");
+        let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let outcome = job.apply_task_update(update);
         outcome
     }
@@ -53,22 +53,22 @@ impl JobCoordinator {
         executor_id: &krishiv_proto::ExecutorId,
         ts_ms: u64,
     ) {
-        let job = self.inner.write().expect("poisoned");
+        let job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let _ = (executor_id, ts_ms, job.resource_usage().clone());
     }
 
     pub async fn running_task_count(&self) -> usize {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.running_task_count()
     }
 
     pub async fn stage_count(&self) -> usize {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.stages().len()
     }
 
     pub async fn has_in_flight_tasks(&self) -> bool {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.running_task_count() > 0 || job.failed_task_count() > 0
     }
 
@@ -76,7 +76,7 @@ impl JobCoordinator {
         &self,
         executor_id: &krishiv_proto::ExecutorId,
     ) {
-        let mut job = self.inner.write().expect("poisoned");
+        let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         for stage in job.stages_mut() {
             for task in stage.tasks_mut() {
                 if task.assigned_executor.as_ref() == Some(executor_id) {
@@ -88,12 +88,12 @@ impl JobCoordinator {
     }
 
     pub async fn udf_execution_time_cap_ms(&self) -> Option<u64> {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.udf_execution_time_cap_ms()
     }
 
     pub async fn udf_memory_limit_bytes(&self) -> Option<u64> {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.udf_memory_limit_bytes()
     }
 
@@ -104,7 +104,7 @@ impl JobCoordinator {
     }
 
     pub async fn should_consider_for_launch(&self) -> bool {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         !job.state().is_terminal() && (job.running_task_count() == 0 || job.failed_task_count() > 0)
     }
 
@@ -112,7 +112,7 @@ impl JobCoordinator {
         &self,
         executor_id: &krishiv_proto::ExecutorId,
     ) -> usize {
-        let mut job = self.inner.write().expect("poisoned");
+        let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let mut count = 0;
         for stage in job.stages_mut() {
             for task in stage.tasks_mut() {
@@ -127,7 +127,7 @@ impl JobCoordinator {
     }
 
     pub async fn handle_executor_loss(&self, executor_id: &krishiv_proto::ExecutorId) -> usize {
-        let mut job = self.inner.write().expect("poisoned");
+        let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let mut affected = 0;
         for stage in job.stages_mut() {
             for task in stage.tasks_mut() {
@@ -142,7 +142,7 @@ impl JobCoordinator {
     }
 
     pub async fn get_launch_work_summary(&self) -> (usize, usize) {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let mut eligible = 0;
         let mut stages_with_work = 0;
 
@@ -166,13 +166,13 @@ impl JobCoordinator {
         executor_id: &krishiv_proto::ExecutorId,
         ts_ms: u64,
     ) -> bool {
-        let _job = self.inner.write().expect("poisoned");
+        let _job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let _ = (executor_id, ts_ms);
         false
     }
 
     pub async fn has_tasks_eligible_for_launch(&self) -> bool {
-        let job = self.inner.read().expect("poisoned");
+        let job = self.inner.read().unwrap_or_else(|p| p.into_inner());
         job.running_task_count() == 0 && job.failed_task_count() > 0
     }
 }

@@ -13,11 +13,12 @@ harness = false
 name = "nexmark"
 harness = false
 
-[dev-dependencies]
+[dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 krishiv-sql = { path = "../krishiv-sql" }
 krishiv-api = { path = "../krishiv-api" }
 arrow = { workspace = true }
+parquet = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]

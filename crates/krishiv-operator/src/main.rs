@@ -108,14 +108,12 @@ async fn run_controller_with_servers(
     let status_listener = match status_addr {
         Some(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            println!(
-                "Krishiv operator status API listening on http://{}/ui",
-                listener.local_addr()?
-            );
+            println!("Krishiv UI/status HTTP listening on {}", listener.local_addr()?);
             Some(listener)
         }
         None => None,
     };
+
     let grpc_listener = match executor_grpc_addr {
         Some(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -128,48 +126,42 @@ async fn run_controller_with_servers(
         None => None,
     };
 
-    match (status_listener, grpc_listener) {
-        (Some(status_listener), Some(grpc_listener)) => {
-            let status_coordinator = runtime.coordinator();
-            let grpc_coordinator = runtime.coordinator().clone();
-            tokio::select! {
-                result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
-                    result?;
-                }
-                result = serve_status(status_listener, status_coordinator) => {
-                    result?;
-                }
-                result = serve_coordinator_executor_grpc_with_listener(grpc_listener, grpc_coordinator) => {
-                    result?;
-                }
+    let http_listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    let http_coordinator = runtime.coordinator().clone();
+    let http_router = krishiv_scheduler::coordinator_http_router(http_coordinator);
+    let coordinator = runtime.coordinator().clone();
+
+    tokio::select! {
+        result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
+            result?;
+        }
+        result = axum::serve(http_listener, http_router) => {
+            result.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+        }
+        result = async {
+            if let Some(l) = grpc_listener {
+                serve_coordinator_executor_grpc_with_listener(l, coordinator.clone()).await
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)
+            } else {
+                let _ = std::future::pending::<()>().await;
+                Ok::<(), Box<dyn Error>>(())
             }
-        }
-        (Some(status_listener), None) => {
-            let status_coordinator = runtime.coordinator();
-            tokio::select! {
-                result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
-                    result?;
-                }
-                result = serve_status(status_listener, status_coordinator) => {
-                    result?;
-                }
+        } => { result?; }
+        result = async {
+            #[cfg(all(feature = "k8s", feature = "ui"))]
+            if let Some(l) = status_listener {
+                serve_status(l, coordinator.clone()).await
+                    .map_err(|e| Box::new(e) as Box<dyn Error>)
+            } else {
+                let _ = std::future::pending::<()>().await;
+                Ok::<(), Box<dyn Error>>(())
             }
-        }
-        (None, Some(grpc_listener)) => {
-            let grpc_coordinator = runtime.coordinator().clone();
-            tokio::select! {
-                result = run_kubernetes_controller_runtime_with_client(client, controller_config, runtime) => {
-                    result?;
-                }
-                result = serve_coordinator_executor_grpc_with_listener(grpc_listener, grpc_coordinator) => {
-                    result?;
-                }
+            #[cfg(not(all(feature = "k8s", feature = "ui")))]
+            {
+                let _ = std::future::pending::<()>().await;
+                Ok::<(), Box<dyn Error>>(())
             }
-        }
-        (None, None) => {
-            run_kubernetes_controller_runtime_with_client(client, controller_config, runtime)
-                .await?;
-        }
+        } => { result?; }
     }
 
     Ok(())

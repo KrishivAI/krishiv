@@ -15,6 +15,49 @@ use crate::in_process::BatchSqlTable;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
 
+/// Retry delays (ms) for transient Flight connection failures.
+const RETRY_DELAYS_MS: &[u64] = &[100, 500, 2_000];
+
+/// Returns `true` for tonic status codes that indicate a transient failure
+/// worth retrying (e.g. network blip, server briefly overloaded).
+fn is_transient_status(e: &RuntimeError) -> bool {
+    let msg = match e {
+        RuntimeError::Transport { message } => message.as_str(),
+        _ => return false,
+    };
+    // tonic encodes the gRPC status code name into the error string.
+    msg.contains("Unavailable")
+        || msg.contains("DeadlineExceeded")
+        || msg.contains("Cancelled")
+        || msg.contains("connection refused")
+        || msg.contains("connect failed")
+}
+
+/// Execute `f` up to `1 + RETRY_DELAYS_MS.len()` times, waiting between
+/// attempts for transient errors.  Permanent errors are returned immediately.
+async fn with_retry<F, Fut, T>(mut f: F) -> RuntimeResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = RuntimeResult<T>>,
+{
+    let mut last_err = None;
+    for (attempt, &delay_ms) in
+        std::iter::once(&0u64).chain(RETRY_DELAYS_MS.iter()).enumerate()
+    {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < RETRY_DELAYS_MS.len() && is_transient_status(&e) => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("loop always sets last_err before reaching here"))
+}
+
 /// Map a physical plan to a SQL statement understood by the Krishiv Flight SQL service.
 pub fn plan_to_sql(plan: &PhysicalPlan) -> String {
     let name = plan.name();
@@ -59,11 +102,15 @@ async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlService
 }
 
 async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
-    Endpoint::from_shared(endpoint.to_string())
-        .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))
+    let ep = endpoint.to_string();
+    with_retry(|| async {
+        Endpoint::from_shared(ep.clone())
+            .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
+            .connect()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))
+    })
+    .await
 }
 
 /// Lazily-connected gRPC channel reused across remote Flight calls.
@@ -124,6 +171,9 @@ impl FlightClientPool {
                         % self.endpoints.len(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                // Clear the stale cached channel so the next get_channel()
+                // connects to the new endpoint rather than reusing the dead one (C2).
+                *self.channel.write().await = None;
                 Err(e)
             }
             Err(e) => Err(e),
@@ -135,62 +185,99 @@ impl FlightClientPool {
         action: &crate::flight_action::KrishivFlightAction,
     ) -> RuntimeResult<Vec<u8>> {
         use futures::StreamExt;
-        let channel = self.get_channel().await?;
-        let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+        // Serialise action body once; reused across retry attempts.
         let body = action.to_action_body()?;
-        let req = arrow_flight::Action {
-            r#type: action.action_type(),
-            body: body.into(),
-        };
-        let mut stream = client
-            .do_action(tonic::Request::new(req))
-            .await
-            .map_err(|e| RuntimeError::transport(format!("do_action: {e}")))?
-            .into_inner();
-
-        let mut buf = Vec::new();
-        while let Some(item) = stream.next().await {
-            let part =
-                item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
-            buf.extend_from_slice(&part.body);
-        }
-        Ok(buf)
+        let action_type = action.action_type();
+        with_retry(|| async {
+            let channel = self.get_channel().await?;
+            let mut client =
+                arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+            let req = arrow_flight::Action {
+                r#type: action_type.clone(),
+                body: body.clone().into(),
+            };
+            let mut stream = client
+                .do_action(tonic::Request::new(req))
+                .await
+                .map_err(|e| RuntimeError::transport(format!("do_action: {e}")))?
+                .into_inner();
+            let mut buf = Vec::new();
+            while let Some(item) = stream.next().await {
+                let part = item
+                    .map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
+                buf.extend_from_slice(&part.body);
+            }
+            Ok(buf)
+        })
+        .await
     }
 
     pub async fn execute_sql(
         &self,
         sql: &str,
     ) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+        let sql = sql.to_string();
+        with_retry(|| async {
+            let channel = self.get_channel().await?;
+            let mut client = FlightSqlServiceClient::new(channel);
+
+            let flight_info = client
+                .execute(sql.clone(), None)
+                .await
+                .map_err(|e| RuntimeError::transport(format!("flight execute failed: {e}")))?;
+
+            let ticket = flight_info
+                .endpoint
+                .first()
+                .and_then(|ep| ep.ticket.clone())
+                .ok_or_else(|| {
+                    RuntimeError::transport("flight response had no ticket endpoint")
+                })?;
+
+            let mut stream = client
+                .do_get(Ticket {
+                    ticket: ticket.ticket,
+                })
+                .await
+                .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
+
+            let mut batches = Vec::new();
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
+            {
+                batches.push(batch);
+            }
+            Ok(batches)
+        })
+        .await
+    }
+
+    /// Stream SQL results lazily — returns batches one at a time without
+    /// buffering the full result set (R8). Useful for large result sets where
+    /// `execute_sql` would exhaust coordinator memory.
+    pub async fn stream_sql(
+        &self,
+        sql: &str,
+    ) -> RuntimeResult<impl futures::Stream<Item = RuntimeResult<arrow::record_batch::RecordBatch>>>
+    {
         let channel = self.get_channel().await?;
         let mut client = FlightSqlServiceClient::new(channel);
-
         let flight_info = client
             .execute(sql.to_string(), None)
             .await
             .map_err(|e| RuntimeError::transport(format!("flight execute failed: {e}")))?;
-
         let ticket = flight_info
             .endpoint
             .first()
             .and_then(|ep| ep.ticket.clone())
             .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
-
-        let mut stream = client
-            .do_get(Ticket {
-                ticket: ticket.ticket,
-            })
+        let stream = client
+            .do_get(Ticket { ticket: ticket.ticket })
             .await
             .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
-
-        let mut batches = Vec::new();
-        while let Some(batch) = stream
-            .try_next()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
-        {
-            batches.push(batch);
-        }
-        Ok(batches)
+        Ok(stream.map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}"))))
     }
 }
 
@@ -373,6 +460,7 @@ pub async fn execute_remote_bounded_window(
         topic: topic.to_string(),
         spec: spec.to_plan_spec(),
         batches_b64,
+        response_watermark_ms: None,
     });
     match do_action(flight_url, &action).await {
         Ok(body) => decode_ipc_response(&body),

@@ -7,7 +7,6 @@ use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
 use krishiv_governance::{AuthProvider, PolicyHook};
-use krishiv_plan::ExecutionKind;
 use krishiv_runtime::{
     BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
     LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
@@ -273,7 +272,12 @@ impl SessionBuilder {
         self
     }
 
-    /// gRPC coordinator address (control plane), separate from the Flight SQL URL.
+    /// gRPC coordinator address (control-plane), separate from the Flight SQL URL.
+    ///
+    /// The coordinator exposes two protocols: Arrow Flight SQL (data-plane, set via
+    /// [`with_coordinator`]) and gRPC (control-plane, set here). Both must point to
+    /// the **same coordinator host** — `build()` returns an error if the hostnames
+    /// differ (R12).
     #[must_use]
     pub fn with_coordinator_grpc(mut self, url: impl Into<String>) -> Self {
         self.local_cluster_grpc = Some(url.into());
@@ -296,6 +300,39 @@ impl SessionBuilder {
 
     /// Build a session.
     pub fn build(self) -> Result<Session> {
+        // R12: Validate that coordinator_url and local_cluster_grpc point to the
+        // same coordinator when both are set. The two fields serve different
+        // protocols (Flight SQL vs. gRPC control-plane) but must target the same
+        // physical host; mismatches cause silent routing failures.
+        if let (Some(flight_url), Some(grpc_url)) =
+            (&self.coordinator_url, &self.local_cluster_grpc)
+        {
+            fn extract_host(url: &str) -> Option<String> {
+                // Cheap host extraction without a full URL parser dependency:
+                // strip scheme, split on '/', take the host:port part.
+                let after_scheme = url
+                    .find("://")
+                    .map(|i| &url[i + 3..])
+                    .unwrap_or(url);
+                let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+                // Strip port if present (we only compare hostnames).
+                Some(host_port.split(':').next().unwrap_or(host_port).to_string())
+            }
+            let flight_host = extract_host(flight_url);
+            let grpc_host = extract_host(grpc_url);
+            if flight_host.is_some()
+                && grpc_host.is_some()
+                && flight_host != grpc_host
+            {
+                return Err(KrishivError::unsupported(format!(
+                    "coordinator Flight URL host ('{}') and gRPC URL host ('{}') must match; \
+                     both must point to the same coordinator process",
+                    flight_host.unwrap_or_default(),
+                    grpc_host.unwrap_or_default(),
+                )));
+            }
+        }
+
         let udf_registry = Arc::new(RwLock::new(UdfRegistry::new()));
         let sql_engine = SqlEngine::new().with_udf_registry(Arc::clone(&udf_registry));
         let policy_engine = match (self.auth, self.policy) {
@@ -507,13 +544,6 @@ impl Session {
         spec: LocalWindowExecutionSpec,
     ) -> Result<String> {
         let name = name.into();
-        let plan = krishiv_plan::PhysicalPlan::new(
-            format!("stream:continuous:{name}"),
-            ExecutionKind::Streaming,
-        );
-        self.runtime
-            .accept_plan(&plan)
-            .map_err(KrishivError::from)?;
         self.runtime
             .register_continuous_stream(&name, &spec)
             .map_err(KrishivError::from)?;

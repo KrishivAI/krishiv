@@ -9,7 +9,7 @@ use krishiv_common::async_util::block_on;
 use krishiv_executor::{
     ContinuousJobDrainer, ExecutorAssignmentInbox, ExecutorTaskOutputKind, ExecutorTaskRunner,
 };
-use krishiv_plan::window::{WindowExecutionSpec, encode_stream_fragment};
+use krishiv_plan::window::WindowExecutionSpec;
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorId, InputPartition, InputPartitionDescriptor, JobId,
     JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
@@ -21,15 +21,24 @@ use krishiv_scheduler::{
 use tokio::sync::RwLock;
 
 use crate::continuous_stream::{ContinuousStreamRegistry, SharedContinuousStreamRegistry};
-use crate::in_process_cluster::plan_spec_to_local;
 use crate::local_streaming::LocalWindowExecutionSpec;
-use crate::stream_kafka::encode_stream_kafka_partition;
 use crate::{RuntimeError, RuntimeResult};
 
 /// Process-global counter used to give every [`InProcessStreamingRuntime`]
 /// a unique numeric suffix.  This avoids two concurrent embedded sessions
 /// colliding on coordinator id (C1, C2).
 static CLUSTER_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum coordinator-tick cycles per job. Each cycle corresponds to one
+/// stage of a multi-stage query graph. Exceeding this limit indicates an
+/// infinite streaming loop or misconfigured multi-stage plan.
+/// For unbounded queries use the streaming API (`submit_stream_job`,
+/// `drain_continuous_job`).
+const MAX_STAGE_ITERATIONS: usize = 1024;
+
+/// Sentinel returned by uninitialized streaming windows (`i64::MIN`).
+/// Watermarks equal to this value are never propagated to downstream stages.
+pub(crate) const WATERMARK_UNSET: i64 = i64::MIN;
 
 fn next_cluster_suffix() -> u64 {
     CLUSTER_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -74,6 +83,29 @@ impl InProcessStreamingRuntime {
     pub fn with_continuous_registry(
         registry: SharedContinuousStreamRegistry,
     ) -> RuntimeResult<Self> {
+        Self::build(registry, Arc::new(dashmap::DashMap::new()))
+    }
+
+    /// Create a runtime that shares an existing parquet-file-footer cache.
+    ///
+    /// Multiple sessions that process the same parquet files can share one
+    /// `Arc<DashMap<String, ()>>` obtained from [`parquet_cache`] on a prior
+    /// session, eliminating redundant footer reads across session boundaries.
+    pub fn with_parquet_cache(
+        cache: Arc<dashmap::DashMap<String, ()>>,
+    ) -> RuntimeResult<Self> {
+        Self::build(Arc::new(ContinuousStreamRegistry::new()), cache)
+    }
+
+    /// Expose the parquet-cache handle so it can be shared with new sessions.
+    pub fn parquet_cache(&self) -> Arc<dashmap::DashMap<String, ()>> {
+        Arc::clone(self.runner.registered_parquet_cache())
+    }
+
+    fn build(
+        registry: SharedContinuousStreamRegistry,
+        parquet_cache: Arc<dashmap::DashMap<String, ()>>,
+    ) -> RuntimeResult<Self> {
         let suffix = next_cluster_suffix();
         // Each in-process cluster gets a process-unique coordinator and
         // executor id so multiple sessions sharing the same process do not
@@ -88,7 +120,7 @@ impl InProcessStreamingRuntime {
         {
             let mut coord = coordinator
                 .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during executor registration"))?;
             coord
                 .register_executor(descriptor)
                 .map_err(|e| RuntimeError::transport(e.to_string()))?;
@@ -101,7 +133,7 @@ impl InProcessStreamingRuntime {
         ) = {
             let coord = coordinator
                 .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during bridge inner-state extraction"))?;
             let (checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) =
                 coord.checkpoint_inner_parts();
             (
@@ -121,8 +153,11 @@ impl InProcessStreamingRuntime {
         };
         let inbox = ExecutorAssignmentInbox::new();
         let drainer = Arc::new(RegistryDrainer(Arc::clone(&registry)));
-        let runner =
-            Arc::new(ExecutorTaskRunner::new(inbox.clone()).with_continuous_drainer(drainer));
+        let runner = Arc::new(
+            ExecutorTaskRunner::new(inbox.clone())
+                .with_continuous_drainer(drainer)
+                .with_shared_parquet_cache(parquet_cache),
+        );
         let bridge = InProcessCoordinatorBridge::new(
             Arc::clone(&coordinator),
             executor_inner,
@@ -169,6 +204,24 @@ impl InProcessStreamingRuntime {
         self.continuous_registry.push_input(job_id, batches)
     }
 
+    /// Deregister a streaming source and clear any matching parquet-cache entries.
+    ///
+    /// Wraps [`SqlEngine::deregister_streaming_source`] and additionally removes
+    /// all `registered_parquet_cache` entries whose key starts with `"{name}:"`,
+    /// preventing stale "table not found" errors if the same name is later
+    /// re-registered as a parquet table (N2).
+    pub fn deregister_streaming_source(&self, name: &str) -> RuntimeResult<()> {
+        self.runner
+            .sql_engine()
+            .deregister_streaming_source(name)
+            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+        let prefix = format!("{name}:");
+        self.runner
+            .registered_parquet_cache()
+            .retain(|key, _| !key.starts_with(&prefix));
+        Ok(())
+    }
+
     /// Check if a query is streaming.
     pub fn is_streaming_query(&self, query: &str) -> RuntimeResult<bool> {
         self.runner
@@ -183,14 +236,30 @@ impl InProcessStreamingRuntime {
     /// queries. Eliminates 6+ Mutex lock/unlock pairs of coordinator overhead.
     fn execute_inline_sql(&self, query: &str, tables: &[BatchSqlTable]) -> RuntimeResult<Vec<RecordBatch>> {
         let engine = Arc::clone(self.runner.sql_engine());
-        let tables_owned: Vec<BatchSqlTable> = tables.to_vec();
+        // Owned copies are required by async move. Clone is O(n_tables * n_fields);
+        // the common case (no parquet tables) pays only one empty-Vec allocation.
+        let query = query.to_owned();
+        let tables = tables.to_vec();
+        let parquet_cache = Arc::clone(self.runner.registered_parquet_cache());
         block_on(async move {
             // Register any parquet tables supplied for this query.
-            for table in &tables_owned {
-                engine
-                    .register_parquet(&table.table_name, &table.path)
-                    .await
-                    .map_err(|e| RuntimeError::transport(e.to_string()))?;
+            // Skip tables already registered in a previous inline call to avoid
+            // redundant DataFusion re-registration (file footer re-read).
+            for table in &tables {
+                let cache_key = format!("{}:{}", table.table_name, table.path.display());
+                // Atomic check-and-insert via DashMap entry API prevents the TOCTOU
+                // race where two concurrent threads both see contains_key==false,
+                // both call register_parquet, and the second call fails.
+                match parquet_cache.entry(cache_key) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => {}
+                    dashmap::mapref::entry::Entry::Vacant(v) => {
+                        engine
+                            .register_parquet(&table.table_name, &table.path)
+                            .await
+                            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                        v.insert(());
+                    }
+                }
             }
             let df = engine
                 .sql(query)
@@ -202,14 +271,27 @@ impl InProcessStreamingRuntime {
         })
     }
 
-    /// Returns `true` when the query is safe to run inline (not a streaming query).
-    /// Falls back to `false` on parse error so the coordinator path handles it.
-    fn can_execute_inline(&self, query: &str) -> bool {
-        self.runner
-            .sql_engine()
-            .is_streaming_query(query)
-            .map(|streaming| !streaming)
-            .unwrap_or(false)
+    /// Returns `true` when the query is safe to run inline (bypassing coordinator).
+    ///
+    /// Only pure `SELECT` queries are eligible. DDL, mutations, and EXPLAIN must
+    /// go through the coordinator so job lifecycle, retries, and barriers apply.
+    pub(crate) fn can_execute_inline(&self, query: &str, is_streaming: bool) -> bool {
+        if is_streaming {
+            return false;
+        }
+        // Case-insensitive prefix check without allocating an uppercase String.
+        let trimmed = query.trim_start();
+        // Any statement that mutates state or requires coordinator lifecycle must
+        // not bypass it. EXPLAIN output differs between paths; route via coordinator.
+        const NON_INLINE_PREFIXES: &[&str] = &[
+            "EXPLAIN", "CREATE", "DROP", "ALTER",
+            "INSERT", "UPDATE", "DELETE", "TRUNCATE",
+            "COPY", "MERGE",
+        ];
+        !NON_INLINE_PREFIXES.iter().any(|p| {
+            trimmed.len() >= p.len()
+                && trimmed[..p.len()].eq_ignore_ascii_case(p)
+        })
     }
 
     pub fn execute_batch_sql(
@@ -222,7 +304,7 @@ impl InProcessStreamingRuntime {
         // batch queries. The coordinator was designed for distributed job
         // lifecycle; routing in-process single-stage SQL through it adds
         // 6+ Mutex lock/unlock pairs per query with no functional benefit.
-        if !is_streaming && self.can_execute_inline(query) {
+        if self.can_execute_inline(query, is_streaming) {
             return self.execute_inline_sql(query, tables);
         }
         let fragment = format!("sql: {query}");
@@ -230,8 +312,19 @@ impl InProcessStreamingRuntime {
         self.run_terminal_task(&fragment, kind, tables, Vec::new())
     }
 
-    /// Drain a continuous streaming job through coordinator → executor.
+    /// Drain a continuous streaming job and return newly emitted batches.
+    ///
+    /// Fast path: when the job is registered in the local registry, drains
+    /// directly through the registry's split-mutex executor without touching
+    /// the coordinator (eliminates submit_job → task-assignment → run_next_with
+    /// → coordinator_tick → evict = 6 mutex acquisitions per call).
+    ///
+    /// Falls through to the coordinator path only when the job is absent from
+    /// the local registry (distributed mode where batches arrive via InlineIpc).
     pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
+        if self.continuous_registry.has_job(job_id) {
+            return self.continuous_registry.drain_job(job_id);
+        }
         let fragment = format!("stream:continuous:{job_id}");
         self.run_terminal_task(&fragment, JobKind::Streaming, &[], Vec::new())
     }
@@ -257,7 +350,7 @@ impl InProcessStreamingRuntime {
             let mut coord = self
                 .coordinator
                 .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during job submission"))?;
             match coord.submit_job(job_spec) {
                 Ok(SubmitOutcome::Accepted) | Ok(SubmitOutcome::Queued { .. }) => {}
                 Err(e) => return Err(RuntimeError::transport(e.to_string())),
@@ -290,40 +383,40 @@ impl InProcessStreamingRuntime {
         let mut output_batches = Vec::new();
         let mut iter_count = 0usize;
         let mut first_iteration_partitions = Some(initial_partitions);
-        const MAX_STAGE_ITERATIONS: usize = 1024;
+        // G1: Track the max watermark from the previous stage so it can be
+        // injected as a WatermarkHint into the first assignment of the next stage.
+        let mut stage_watermark_ms: Option<i64> = None;
 
         block_on(async {
             loop {
-                if iter_count > MAX_STAGE_ITERATIONS {
+                if iter_count >= MAX_STAGE_ITERATIONS {
                     return Err(RuntimeError::transport(format!(
-                        "in-process runtime exceeded {MAX_STAGE_ITERATIONS} stage iterations for job {job_id}"
+                        "in-process runtime exceeded {MAX_STAGE_ITERATIONS} stage iterations \
+                         for job {job_id}; for unbounded queries use the streaming API"
                     )));
                 }
                 iter_count += 1;
 
-                let mut assignments = {
+                // O4: Merge launch_assigned_task_assignments + job_snapshot into
+                // one lock acquisition (previously two separate locks per iteration).
+                // coordinator_tick is kept after task execution below.
+                let (mut assignments, is_terminal) = {
                     let mut coord = self
                         .coordinator
                         .lock()
-                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
-                    coord
+                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned during task assignment launch"))?;
+                    let assignments = coord
                         .launch_assigned_task_assignments(&job_id)
-                        .map_err(|e| RuntimeError::transport(e.to_string()))?
+                        .map_err(|e| RuntimeError::transport(e.to_string()))?;
+                    let is_terminal = coord
+                        .job_snapshot(&job_id)
+                        .map(|s| s.state().is_terminal())
+                        .unwrap_or(false);
+                    (assignments, is_terminal)
                 };
 
                 if assignments.is_empty() {
-                    // Check if the job has reached a terminal state.
-                    let terminal = {
-                        let coord = self
-                            .coordinator
-                            .lock()
-                            .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
-                        coord
-                            .job_snapshot(&job_id)
-                            .map(|snap| snap.state().is_terminal())
-                            .unwrap_or(false)
-                    };
-                    if terminal {
+                    if is_terminal {
                         return Ok(());
                     }
                     // First iteration: coordinator never produced assignments.
@@ -337,6 +430,31 @@ impl InProcessStreamingRuntime {
                     // the coordinator bridge already updated state — the job is
                     // effectively done from the in-process executor's perspective.
                     return Ok(());
+                }
+
+                // G1: Inject the upstream stage's watermark as a WatermarkHint
+                // partition so downstream streaming stages start at the correct
+                // watermark baseline rather than i64::MIN.
+                if let Some(wm) = stage_watermark_ms.take() {
+                    // Only inject if the next stage is a streaming fragment; batch
+                    // stages ignore the hint (O6). Guard against empty assignments (G5).
+                    let next_is_streaming = assignments
+                        .first()
+                        .map(|a| a.plan_fragment().description().contains("stream:"))
+                        .unwrap_or(false);
+                    if next_is_streaming && !assignments.is_empty() {
+                        let hint = InputPartition::new("watermark-hint", String::new())
+                            .with_descriptor(InputPartitionDescriptor::WatermarkHint {
+                                watermark_ms: wm,
+                            });
+                        let first = assignments.remove(0);
+                        let mut new_parts = vec![hint];
+                        new_parts.extend(first.input_partitions().to_vec());
+                        assignments.insert(0, first.with_input_partitions(new_parts));
+                    } else {
+                        // Restore for the next iteration when assignments arrive.
+                        stage_watermark_ms = Some(wm);
+                    }
                 }
 
                 // Attach caller-supplied input partitions to the FIRST assignment
@@ -371,55 +489,64 @@ impl InProcessStreamingRuntime {
                     ) {
                         output_batches.extend(report.output().record_batches().to_vec());
                     }
+                    // G1: Collect watermark from streaming stages for the next stage.
+                    // Skip i64::MIN (WATERMARK_UNSET) — it is the uninitialized sentinel
+                    // returned by windows that have not yet processed any events (B3/A4).
+                    if let Some(wm) = report.output().watermark_ms() {
+                        if wm > WATERMARK_UNSET {
+                            stage_watermark_ms =
+                                Some(stage_watermark_ms.map_or(wm, |prev: i64| prev.max(wm)));
+                        }
+                    }
                 }
 
                 // Drive a coordinator tick after each stage's tasks complete.
-                // This advances the coordinator state machine: marks the completed
-                // stage as Succeeded, makes the next stage's tasks eligible for
-                // assignment, and handles any barrier dispatch needed for
-                // multi-stage plans (e.g. shuffle → reduce).
+                // This advances the state machine: marks the completed stage as
+                // Succeeded and makes the next stage's tasks eligible for assignment.
                 {
                     let mut coord = self
                         .coordinator
                         .lock()
-                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned"))?;
+                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned during coordinator tick"))?;
                     let _ = coord.coordinator_tick();
                 }
             }
         })?;
+
+        // Evict the completed job from the coordinator's in-memory registry.
+        // The embedded runtime has no background GC loop; without this, every
+        // drain_continuous_job / execute_batch_sql call would leave a terminal
+        // JobCoordinator entry growing unboundedly, and coordinator_tick would
+        // iterate over all of them on every subsequent call.
+        {
+            let mut coord = self
+                .coordinator
+                .lock()
+                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during job eviction"))?;
+            coord.evict_completed_job(&job_id);
+        }
 
         Ok(output_batches)
     }
 
     pub fn execute_windowed(
         &self,
-        topic: &str,
+        _topic: &str,
         input_batches: Vec<RecordBatch>,
         spec: &WindowExecutionSpec,
     ) -> RuntimeResult<Vec<RecordBatch>> {
         if input_batches.is_empty() {
             return Ok(Vec::new());
         }
-        let fragment = encode_stream_fragment(spec);
-        let local = plan_spec_to_local(spec);
-        let value_column = sum_value_column_from_aggs(&local);
-        let partitions: Vec<InputPartition> = input_batches
-            .iter()
-            .enumerate()
-            .map(|(idx, batch)| {
-                let desc = encode_stream_kafka_partition(
-                    topic,
-                    idx as u32,
-                    0,
-                    batch,
-                    &spec.key_column,
-                    &spec.event_time_column,
-                    value_column.as_deref(),
-                )?;
-                Ok(InputPartition::new(format!("stream-kafka-{idx}"), desc))
-            })
-            .collect::<RuntimeResult<Vec<_>>>()?;
-        self.run_terminal_task(&fragment, JobKind::Streaming, &[], partitions)
+        // Fast path: call execute_bounded_window directly, bypassing the coordinator
+        // state machine (submit_job → task-assignment → run_next_with → InMemory
+        // partition deserialization → coordinator_tick → evict = 6 mutex acquisitions).
+        // execute_bounded_window is a pure stateless function that takes Arrow batches
+        // and a window spec; the coordinator path added no value for this operation.
+        // The `topic` argument was only used to name the InMemory partition — irrelevant
+        // for the computation itself, so it is intentionally unused here.
+        krishiv_exec::execute_bounded_window(input_batches, spec)
+            .map_err(|e| RuntimeError::transport(e.to_string()))
     }
 
     /// Stable identity for session-scoped coordinator reuse tests.
@@ -438,16 +565,6 @@ impl InProcessStreamingRuntime {
     }
 }
 
-fn sum_value_column_from_aggs(spec: &LocalWindowExecutionSpec) -> Option<String> {
-    use krishiv_exec::AggFunction;
-    spec.agg_exprs.iter().find_map(|a| {
-        if a.function == AggFunction::Sum && !a.input_column.is_empty() {
-            Some(a.input_column.clone())
-        } else {
-            None
-        }
-    })
-}
 
 /// Run windowed aggregation via a session-scoped cluster (preferred).
 pub fn execute_windowed_in_process(
@@ -460,6 +577,7 @@ pub fn execute_windowed_in_process(
 }
 
 /// Legacy entry: creates an ephemeral in-process cluster (tests only).
+#[cfg(test)]
 pub fn execute_windowed_in_process_ephemeral(
     topic: &str,
     input_batches: Vec<RecordBatch>,
@@ -521,7 +639,7 @@ mod tests {
     fn streaming_query_bypasses_inline_path() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
         // Register a streaming source so is_streaming_query returns true.
-        runtime.runner.sql_engine().register_streaming_source_name("stream_t");
+        runtime.runner.sql_engine().register_streaming_source_name("stream_t").unwrap();
         // is_streaming=true forces coordinator path regardless.
         let result = runtime.execute_batch_sql("SELECT 1", &[], true);
         // Just verify it doesn't panic (returns Ok or coordinator error).
@@ -679,5 +797,84 @@ mod tests {
         runtime.push_continuous_input("j2", vec![batch]).unwrap();
         let _ = runtime.drain_continuous_job("j1").unwrap();
         let _ = runtime.drain_continuous_job("j2").unwrap();
+    }
+
+    // ── New N-series fixes ────────────────────────────────────────────────────
+
+    #[test]
+    fn ddl_queries_bypass_inline_path() {
+        // CREATE, DROP, INSERT, EXPLAIN etc. must never go through execute_inline_sql.
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        let ddl_queries = [
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE IF EXISTS t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET id = 2",
+            "DELETE FROM t WHERE id = 1",
+            "EXPLAIN SELECT 1",
+            "ALTER TABLE t ADD COLUMN x INT",
+        ];
+        for q in &ddl_queries {
+            assert!(
+                !runtime.can_execute_inline(q, false),
+                "DDL must not be inline-eligible: {q}"
+            );
+        }
+        // Plain SELECT must remain eligible.
+        assert!(
+            runtime.can_execute_inline("SELECT 1", false),
+            "plain SELECT must be inline-eligible"
+        );
+    }
+
+    #[test]
+    fn shared_parquet_cache_is_reused_across_sessions() {
+        let rt1 = InProcessStreamingRuntime::new().unwrap();
+        let cache = rt1.parquet_cache();
+        // Pre-populate the cache as if rt1 had registered a parquet table.
+        cache.insert("events:/data/events.parquet".to_string(), ());
+        // rt2 shares the same cache.
+        let rt2 = InProcessStreamingRuntime::with_parquet_cache(Arc::clone(&cache)).unwrap();
+        assert!(
+            rt2.parquet_cache().contains_key("events:/data/events.parquet"),
+            "shared cache must be visible in the new session"
+        );
+    }
+
+    #[test]
+    fn deregister_streaming_source_clears_parquet_cache_entries() {
+        let runtime = InProcessStreamingRuntime::new().unwrap();
+        runtime
+            .runner
+            .sql_engine()
+            .register_streaming_source_name("topic")
+            .unwrap();
+        // Manually insert a cache entry simulating a prior parquet registration
+        // under the same table name (hybrid scenario, N2).
+        runtime
+            .runner
+            .registered_parquet_cache()
+            .insert("topic:/data/snapshot.parquet".to_string(), ());
+        runtime.deregister_streaming_source("topic").unwrap();
+        assert!(
+            !runtime
+                .runner
+                .registered_parquet_cache()
+                .contains_key("topic:/data/snapshot.parquet"),
+            "deregister must clear parquet cache entries for the table"
+        );
+        // An unrelated entry must be untouched.
+        runtime
+            .runner
+            .registered_parquet_cache()
+            .insert("other:/data/other.parquet".to_string(), ());
+        runtime.deregister_streaming_source("topic").unwrap(); // idempotent
+        assert!(
+            runtime
+                .runner
+                .registered_parquet_cache()
+                .contains_key("other:/data/other.parquet"),
+            "unrelated cache entries must not be cleared"
+        );
     }
 }

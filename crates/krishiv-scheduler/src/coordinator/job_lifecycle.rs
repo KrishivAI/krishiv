@@ -358,8 +358,37 @@ impl Coordinator {
     ///
     /// The coordinator binary's tick loop should call this, then asynchronously
     /// delete partitions for each returned job id via the shuffle store.
+    /// S3: Also evicts each job from `job_coordinators` to prevent unbounded map
+    /// growth. Eviction happens here (not in `apply_task_update`) so that the job
+    /// snapshot remains queryable until the GC cycle runs.
     pub fn take_gc_ready_jobs(&mut self) -> Vec<JobId> {
-        std::mem::take(&mut self.gc_ready_jobs)
+        let jobs = std::mem::take(&mut self.gc_ready_jobs);
+        for job_id in &jobs {
+            self.evict_completed_job(job_id);
+        }
+        jobs
+    }
+
+    /// Remove a single completed job from the in-memory registry.
+    ///
+    /// Only safe to call after the job has reached a terminal state (Succeeded,
+    /// Failed, or Cancelled). Cleans up `job_coordinators`, associated input
+    /// partitions, batch-SQL tables, and checkpoint state. Used by the embedded
+    /// in-process runtime which has no background GC loop.
+    pub fn evict_completed_job(&mut self, job_id: &JobId) {
+        if let Some(jc) = self.job_coordinators.get(job_id) {
+            if !jc.read_record().state().is_terminal() {
+                return;
+            }
+        } else {
+            return;
+        }
+        self.job_coordinators.remove(job_id);
+        self.job_input_partitions.remove(job_id);
+        self.batch_sql_job_tables.remove(job_id);
+        self.checkpoint_coordinators.remove(job_id);
+        self.gc_ready_jobs.retain(|id| id != job_id);
+        self.streaming_task_index.retain(|_, (jid, _)| jid != job_id);
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

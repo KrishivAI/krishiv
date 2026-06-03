@@ -91,14 +91,32 @@ spec:
           protocol: UDP
 
 ---
+# ── Coordinator persistent storage (R1) ───────────────────────────────────────
+# emptyDir would lose all job state on pod restart. Use a PVC instead so that
+# the coordinator can recover in-flight jobs after a restart.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: krishiv-coordinator-data
+  namespace: krishiv-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
 # ── Coordinator ────────────────────────────────────────────────────────────────
+# For HA: set replicas: 3, --metadata-backend etcd, and set env var
+# KRISHIV_ETCD_ENDPOINTS. The etcd leader election and metadata backends are
+# already implemented (feature = "etcd") — only config changes are needed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: coordinator
   namespace: krishiv-system
 spec:
-  replicas: 1
+  replicas: 1  # Increase to 3+ for HA with etcd leader election
   selector:
     matchLabels:
       app: krishiv-coordinator
@@ -157,7 +175,8 @@ spec:
             failureThreshold: 3
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: krishiv-coordinator-data
 
 ---
 apiVersion: v1
@@ -215,6 +234,17 @@ spec:
         app: krishiv-executor
     spec:
       serviceAccountName: krishiv-executor
+      # Spread executor replicas across nodes so a single node failure
+      # does not take down the entire compute layer (O5).
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: krishiv-executor
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: executor
           image: localhost/krishiv:local
@@ -268,6 +298,16 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3
+          # Graceful shutdown: ask the executor to stop accepting new tasks and
+          # drain in-flight work before SIGTERM is sent (C5).
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "curl -sf -X POST http://localhost:8080/internal/drain || sleep 5"
+      terminationGracePeriodSeconds: 60
 
 ---
 # ── Flight Server ─────────────────────────────────────────────────────────────

@@ -105,16 +105,20 @@ pub(crate) async fn execute_batch_fragment(
             // session-scoped cache. Avoids reading parquet file footers on every
             // repeated query against the same files.
             let cache_key = format!("{}:{}", partition.table_name(), partition.path().display());
-            if runner.registered_parquet_cache.contains_key(&cache_key) {
-                continue;
+            // Atomic check-and-insert prevents the TOCTOU race where two concurrent
+            // tasks both miss the cache and both call register_parquet.
+            match runner.registered_parquet_cache.entry(cache_key) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {}
+                dashmap::mapref::entry::Entry::Vacant(v) => {
+                    engine
+                        .register_parquet(partition.table_name(), partition.path())
+                        .await
+                        .map_err(|error| ExecutorError::LocalExecution {
+                            message: error.to_string(),
+                        })?;
+                    v.insert(());
+                }
             }
-            engine
-                .register_parquet(partition.table_name(), partition.path())
-                .await
-                .map_err(|error| ExecutorError::LocalExecution {
-                    message: error.to_string(),
-                })?;
-            runner.registered_parquet_cache.insert(cache_key, ());
         }
         for (table_name, batches) in
             read_connector_parquet_partitions(assignment.input_partitions()).await?
@@ -443,7 +447,7 @@ async fn execute_inmem_shuffle_write(
     engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
-    store: &std::sync::Arc<dyn krishiv_shuffle::ShuffleStore>,
+    store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -580,7 +584,7 @@ async fn execute_inmem_shuffle_write(
 async fn execute_inmem_shuffle_read(
     assignment: &ExecutorTaskAssignment,
     read_cfg: &krishiv_proto::ShuffleReadConfig,
-    store: &std::sync::Arc<dyn krishiv_shuffle::ShuffleStore>,
+    store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{PartitionId, ShuffleStore as _};
 
