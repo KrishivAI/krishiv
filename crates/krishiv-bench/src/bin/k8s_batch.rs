@@ -8,10 +8,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_coordinator("http://127.0.0.1:30051") // Use Flight server address
         .with_remote_execution(true)
         .build()?;
-    
+
     // Register table via remote SQL
     session.execute_remote_async("CREATE EXTERNAL TABLE lineitem STORED AS PARQUET LOCATION '/home/code/krishiv/tpch_sf10/lineitem.parquet'").await?;
-    
+
     let q1 = "
     select
         l_returnflag,
@@ -35,13 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         l_returnflag,
         l_linestatus
     ";
-    
+
     let start = Instant::now();
     let result = session.execute_remote_async(q1).await?.collect()?;
     let duration = start.elapsed();
-    
+
     println!("{}", result.pretty()?);
-    println!("Distributed Batch Execution Time: {:.4} seconds", duration.as_secs_f64());
-    
+    println!(
+        "Distributed Batch Execution Time: {:.4} seconds",
+        duration.as_secs_f64()
+    );
+
     Ok(())
 }

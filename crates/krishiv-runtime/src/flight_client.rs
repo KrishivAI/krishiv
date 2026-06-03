@@ -46,8 +46,9 @@ where
     Fut: std::future::Future<Output = RuntimeResult<T>>,
 {
     let mut last_err = None;
-    for (attempt, &delay_ms) in
-        std::iter::once(&0u64).chain(RETRY_DELAYS_MS.iter()).enumerate()
+    for (attempt, &delay_ms) in std::iter::once(&0u64)
+        .chain(RETRY_DELAYS_MS.iter())
+        .enumerate()
     {
         if delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -138,8 +139,7 @@ impl FlightClientPool {
         let url = flight_url.into();
         // Normalize eagerly so a bad URL fails at construction rather than
         // surfacing as an opaque tonic error on the first request.
-        let endpoint = normalize_flight_endpoint(&url)
-            .unwrap_or_else(|_| url.trim().to_string());
+        let endpoint = normalize_flight_endpoint(&url).unwrap_or_else(|_| url.trim().to_string());
         Self {
             endpoints: vec![endpoint],
             current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -219,8 +219,7 @@ impl FlightClientPool {
         let action_type = action.action_type();
         with_retry(|| async {
             let channel = self.get_channel().await?;
-            let mut client =
-                arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+            let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
             let req = arrow_flight::Action {
                 r#type: action_type.clone(),
                 body: body.clone().into(),
@@ -230,7 +229,9 @@ impl FlightClientPool {
                 .await
                 .map_err(|s| {
                     if s.code() == tonic::Code::Unimplemented {
-                        RuntimeError::ServerUnimplemented { message: s.message().to_string() }
+                        RuntimeError::ServerUnimplemented {
+                            message: s.message().to_string(),
+                        }
                     } else {
                         RuntimeError::transport(format!("do_action: {s}"))
                     }
@@ -238,8 +239,8 @@ impl FlightClientPool {
                 .into_inner();
             let mut buf = Vec::new();
             while let Some(item) = stream.next().await {
-                let part = item
-                    .map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
+                let part =
+                    item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
                 buf.extend_from_slice(&part.body);
             }
             Ok(buf)
@@ -265,9 +266,7 @@ impl FlightClientPool {
                 .endpoint
                 .first()
                 .and_then(|ep| ep.ticket.clone())
-                .ok_or_else(|| {
-                    RuntimeError::transport("flight response had no ticket endpoint")
-                })?;
+                .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
 
             let mut stream = client
                 .do_get(Ticket {
@@ -311,8 +310,7 @@ impl FlightClientPool {
         let action_type = action.action_type();
         with_retry(|| async {
             let channel = connect_flight_channel(&endpoint).await?;
-            let mut client =
-                arrow_flight::flight_service_client::FlightServiceClient::new(channel);
+            let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
             let req = arrow_flight::Action {
                 r#type: action_type.clone(),
                 body: body.clone().into(),
@@ -354,7 +352,9 @@ impl FlightClientPool {
             .and_then(|ep| ep.ticket.clone())
             .ok_or_else(|| RuntimeError::transport("flight response had no ticket endpoint"))?;
         let stream = client
-            .do_get(Ticket { ticket: ticket.ticket })
+            .do_get(Ticket {
+                ticket: ticket.ticket,
+            })
             .await
             .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
         Ok(stream.map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}"))))
@@ -595,7 +595,9 @@ pub(crate) async fn do_action(
         .await
         .map_err(|s| {
             if s.code() == tonic::Code::Unimplemented {
-                RuntimeError::ServerUnimplemented { message: s.message().to_string() }
+                RuntimeError::ServerUnimplemented {
+                    message: s.message().to_string(),
+                }
             } else {
                 RuntimeError::transport(format!("do_action: {s}"))
             }
@@ -767,7 +769,9 @@ mod tests {
 
     #[test]
     fn is_unimplemented_matches_server_unimplemented_variant() {
-        let err = RuntimeError::ServerUnimplemented { message: "action not supported".into() };
+        let err = RuntimeError::ServerUnimplemented {
+            message: "action not supported".into(),
+        };
         assert!(is_unimplemented(&err));
     }
 

@@ -239,9 +239,12 @@ pub async fn run_kubernetes_controller_runtime_with_client(
     while let Some(event) = events.next().await {
         match event? {
             WatchEvent::Apply(object) | WatchEvent::InitApply(object) => {
-                if let Err(e) = reconcile_dynamic_object_with_runtime(&jobs, &runtime, object).await {
+                if let Err(e) = reconcile_dynamic_object_with_runtime(&jobs, &runtime, object).await
+                {
                     if e.to_string().contains("InactiveCoordinator") {
-                        tracing::debug!("skipping reconcile because coordinator is inactive (standby mode)");
+                        tracing::debug!(
+                            "skipping reconcile because coordinator is inactive (standby mode)"
+                        );
                     } else {
                         return Err(e);
                     }

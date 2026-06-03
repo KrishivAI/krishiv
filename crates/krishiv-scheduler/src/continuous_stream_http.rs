@@ -39,8 +39,8 @@ pub async fn api_continuous_register(
     // Use stream:continuous: prefix so the executor reads input from the
     // InlineIpc partitions registered via api_continuous_push.
     let fragment = format!("stream:continuous:{}", body.job_id);
-    let stage =
-        StageSpec::new(stage_id, "continuous-streaming").with_task(TaskSpec::new(task_id, fragment));
+    let stage = StageSpec::new(stage_id, "continuous-streaming")
+        .with_task(TaskSpec::new(task_id, fragment));
     let spec =
         JobSpec::new(job_id.clone(), "continuous-streaming", JobKind::Streaming).with_stage(stage);
 
@@ -178,12 +178,9 @@ mod tests {
             job_id: "cs-test-job".to_string(),
             spec: tumbling_spec(),
         };
-        let response = api_continuous_register(
-            State(coordinator.clone()),
-            Json(register_req),
-        )
-        .await
-        .unwrap();
+        let response = api_continuous_register(State(coordinator.clone()), Json(register_req))
+            .await
+            .unwrap();
         assert!(response.0.success, "register must succeed");
 
         // Drain before any push — should return empty, not error.

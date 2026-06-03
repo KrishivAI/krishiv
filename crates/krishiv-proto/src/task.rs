@@ -779,9 +779,7 @@ pub enum InputPartitionDescriptor {
     /// downstream stage's window operators. The executor reads this hint and
     /// applies it as the initial `prev_watermark_ms` so late-event detection
     /// is accurate from the very first batch.
-    WatermarkHint {
-        watermark_ms: i64,
-    },
+    WatermarkHint { watermark_ms: i64 },
 }
 
 impl InputPartitionDescriptor {
@@ -827,7 +825,10 @@ impl InputPartitionDescriptor {
             } => {
                 format!("inline-ipc:{table_name}:{}b", ipc_bytes.len())
             }
-            Self::InMemory { table_name, batches } => {
+            Self::InMemory {
+                table_name,
+                batches,
+            } => {
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 format!("in-memory:{table_name}:{rows}rows")
             }

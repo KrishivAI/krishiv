@@ -310,20 +310,14 @@ impl SessionBuilder {
             fn extract_host(url: &str) -> Option<String> {
                 // Cheap host extraction without a full URL parser dependency:
                 // strip scheme, split on '/', take the host:port part.
-                let after_scheme = url
-                    .find("://")
-                    .map(|i| &url[i + 3..])
-                    .unwrap_or(url);
+                let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
                 let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
                 // Strip port if present (we only compare hostnames).
                 Some(host_port.split(':').next().unwrap_or(host_port).to_string())
             }
             let flight_host = extract_host(flight_url);
             let grpc_host = extract_host(grpc_url);
-            if flight_host.is_some()
-                && grpc_host.is_some()
-                && flight_host != grpc_host
-            {
+            if flight_host.is_some() && grpc_host.is_some() && flight_host != grpc_host {
                 return Err(KrishivError::unsupported(format!(
                     "coordinator Flight URL host ('{}') and gRPC URL host ('{}') must match; \
                      both must point to the same coordinator process",
@@ -662,8 +656,13 @@ impl Session {
     /// any SQL that references `name`.  The registration is visible to all
     /// clones of this session because the underlying set is shared via
     /// `Arc<RwLock<>>`.
-    pub fn register_unbounded(&self, name: &str, schema: arrow::datatypes::SchemaRef) -> Result<()> {
-        let tx = self.sql_engine
+    pub fn register_unbounded(
+        &self,
+        name: &str,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Result<()> {
+        let tx = self
+            .sql_engine
             .register_streaming_table(name, schema)
             .map_err(KrishivError::from)?;
         self.unbounded_streams.insert(name.to_string(), tx);
@@ -793,7 +792,9 @@ impl Session {
             .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
         let is_streaming = self.sql_engine.is_streaming_query(query).unwrap_or(false);
-        let batches = runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, is_streaming).await?;
+        let batches =
+            runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, is_streaming)
+                .await?;
         Ok(DataFrame::from_batches(
             self.mode,
             batches,
@@ -831,9 +832,17 @@ impl Session {
             .iter()
             .map(|entry| BatchTableRegistration::new(entry.key().clone(), entry.value().clone()))
             .collect::<Vec<_>>();
-        let is_streaming = self.sql_engine.is_streaming_query(&effective_sql).unwrap_or(false);
-        let batches =
-            runtime_collect_batch_sql(Arc::clone(&self.runtime), &effective_sql, &tables, is_streaming).await?;
+        let is_streaming = self
+            .sql_engine
+            .is_streaming_query(&effective_sql)
+            .unwrap_or(false);
+        let batches = runtime_collect_batch_sql(
+            Arc::clone(&self.runtime),
+            &effective_sql,
+            &tables,
+            is_streaming,
+        )
+        .await?;
         let masked = engine
             .mask_result_batches(&principal, query_str, batches)
             .map_err(KrishivError::from)?;

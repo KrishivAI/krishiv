@@ -604,7 +604,12 @@ impl RdkafkaKafkaSource {
     /// Create a source from a [`crate::cdc::KafkaCdcConfig`] (manual commit mode).
     #[cfg(feature = "kafka")]
     pub fn from_cdc_config(config: &crate::cdc::KafkaCdcConfig) -> Result<Self, String> {
-        Self::new(&config.bootstrap_servers, &config.group_id, &config.topic, None)
+        Self::new(
+            &config.bootstrap_servers,
+            &config.group_id,
+            &config.topic,
+            None,
+        )
     }
 
     /// Override the per-poll timeout (default: 100 ms).
@@ -661,6 +666,22 @@ impl RdkafkaKafkaSource {
                 partition,
                 offset: offset + 1, // Kafka convention: committed offset = next to read
             })
+    }
+
+    /// Partition IDs currently assigned to this consumer by the broker's group
+    /// coordinator (C6).
+    ///
+    /// rdkafka handles partition assignment automatically via the consumer group
+    /// rebalance protocol — each partition in the topic is assigned to exactly
+    /// one consumer in the group, preventing duplicate reads across executors.
+    /// This accessor exposes which partitions this instance currently owns,
+    /// derived from the set of partitions from which messages have been received.
+    /// Partitions are added on first message receipt and are never removed
+    /// (offsets remain valid for offset tracking across restarts).
+    pub fn assigned_partitions(&self) -> Vec<i32> {
+        let mut partitions: Vec<i32> = self.partition_offsets.keys().copied().collect();
+        partitions.sort_unstable();
+        partitions
     }
 
     /// All per-partition offsets read so far — correct for multi-partition topics.
@@ -755,8 +776,18 @@ impl Source for RdkafkaKafkaSource {
                 message: format!("rdkafka receive error: {e}"),
             }),
             Ok(Ok(msg)) => {
-                // Track offset per partition so multi-partition topics are correct.
+                // C6: Track offset per partition. Log when a new partition is
+                // first assigned — this happens after a consumer group rebalance
+                // and surfaces which partitions each executor instance owns.
+                let new_partition = !self.partition_offsets.contains_key(&msg.partition());
                 self.partition_offsets.insert(msg.partition(), msg.offset());
+                if new_partition {
+                    tracing::info!(
+                        topic = %self.topic,
+                        partition = msg.partition(),
+                        "Kafka partition assigned to this consumer via group rebalance"
+                    );
+                }
 
                 let payload = match msg.payload_view::<str>() {
                     Some(Ok(s)) => s,
@@ -1030,7 +1061,8 @@ mod tests {
     async fn rdkafka_kafka_source_constructor_fails_gracefully_without_broker() {
         // Connecting to an unreachable broker should fail with a descriptive
         // error rather than panicking.
-        let result = super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic", None);
+        let result =
+            super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic", None);
         // rdkafka validates config synchronously; creation may succeed or fail
         // depending on platform.  Both are acceptable — we only assert no panic.
         let _ = result;

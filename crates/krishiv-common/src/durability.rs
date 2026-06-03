@@ -253,7 +253,10 @@ mod tests {
     #[test]
     fn single_node_durable_is_restart_safe_but_not_multi_node() {
         let spec = DurabilityProfile::SingleNodeDurable.spec();
-        assert!(spec.restart_durable, "SingleNodeDurable must survive restarts");
+        assert!(
+            spec.restart_durable,
+            "SingleNodeDurable must survive restarts"
+        );
         assert!(
             !spec.multi_node_safe,
             "SingleNodeDurable must not claim multi-node safety"

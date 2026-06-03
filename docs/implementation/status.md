@@ -1,5 +1,45 @@
 # Krishiv Implementation Status
 
+## Stable Release Hardening Pass (2026-06-03)
+
+Code-grounded full-feature audit across all deployment modes (Embedded, SingleNode, Distributed K8s/BareMetal) from SQL/Rust/Python API perspectives. 13 targeted fixes across 8 files, no architectural rewrites.
+
+**P0 — Crash/Hang:**
+- `flight_client.rs`: Added `FLIGHT_CONNECT_TIMEOUT_SECS=10s` + `FLIGHT_REQUEST_TIMEOUT_SECS=30s` to `connect_flight_client` and `connect_flight_channel`. Distributed mode no longer hangs indefinitely when coordinator is unreachable.
+- `recovery.rs`: Removed redundant second `job_coordinators.clear()` and duplicate `JobCoordinator::new` + insert. Each recovered job was being allocated twice; second insert silently overwrote the first.
+
+**P1 — Correctness:**
+- `store.rs` (`truncate_events_log`): Replaced `std::fs::write(path, b"")` with `set_len(0)` + `sync_all()`. Crash between snapshot write and log truncation no longer replays stale events.
+- `recovery.rs`: Executor re-registration failures now warn instead of silent `let _ =`.
+- `recovery.rs`: Checkpoint epoch recovery failures now warn instead of silent `let _ =`.
+- `coordinator_http_client.rs`: Added `.timeout(60s)` to reqwest `ClientBuilder`. Individual HTTP requests no longer hang indefinitely inside the 300s poll deadline.
+
+**P2 — Reliability:**
+- `coordinator_http_client.rs`: Extracted shared `poll_batch_sql_job` helper (replaces duplicate loops in both batch-sql functions). Added ±25% jitter from job_id byte hash (no `rand` dep) to prevent thundering herd.
+- `flight_client.rs`: Failover `AtomicUsize` ordering upgraded from `Relaxed` to `Acquire`/`Release` with explanatory comment.
+
+**P3 — Quality:**
+- `host.rs`: `is_streaming_query()` errors now log a `tracing::warn!` instead of swallowing with `.unwrap_or(false)`.
+- `flight_protocol.rs`: `CONTINUOUS_DRAIN` parse guard consolidated from two-step `strip_prefix` into single pattern.
+- `flight_client.rs` (`with_alternate`): Invalid alternate URLs now produce a `tracing::warn!` instead of silent drop.
+- `session.rs` (Python): `Session.connect()` now accepts optional `grpc_url` kwarg (threads to `with_coordinator_grpc`).
+- `create_function_ddl.rs`: UDTF stub now returns `UdfError::Execution` with a clear "not yet implemented" message instead of silently returning empty batches.
+- `cep_sql.rs`: MATCH_RECOGNIZE error on streaming sources updated to be more user-facing.
+
+**Validation:**
+```bash
+cargo check -p krishiv-flight-sql -p krishiv-runtime -p krishiv-scheduler \
+            -p krishiv-sql -p krishiv-python  # 0 errors, warnings only (pre-existing)
+cargo test  -p krishiv-flight-sql -p krishiv-runtime -p krishiv-scheduler \
+            -p krishiv-sql -p krishiv-python  # (in progress)
+```
+
+**Known pre-existing issues (not introduced here):** `krishiv-bench` fails to compile due to missing `datafusion` dep and removed `krishiv_api::Batch` / `from_bounded_stream` APIs.
+
+**Out-of-scope for 1.0:** UDTF body execution, MATCH_RECOGNIZE on unbounded streams, CDC schema registry, admission control as default, log rotation.
+
+---
+
 ## Distributed Mode Fixes — All Tiers (K8s + Bare-Metal)
 
 **C1** K8s service selector: `component: operator → coordinator` (`coordinator-service.yaml`).
@@ -773,6 +813,16 @@ Output recorded from the run:
 +--------------+--------------+--------------+------------------+--------------------+----------------------+-----------+--------------+----------+-------------+
 Distributed Batch Execution Time: 8.4718 seconds
 ```
+
+---
+
+## Embedded Mode Bugfix
+
+### Achievements
+- Fixed an architectural bug in `krishiv-runtime` where `InProcessExecutionRuntime` was prematurely rejecting streaming plans in embedded mode.
+- Updated `EmbeddedBackend` to properly delegate streaming execution to `SingleNodeBackend` while retaining batch queries for `SqlEngine`, fully implementing ADR-12.5.
+- Resolved dead-code warnings for the `single_node` backend field.
+- Updated internal validation tests to assert that streaming plan delegation is properly accepted.
 ---
 
 ## K8s TPC-H 10GB Benchmarking Session

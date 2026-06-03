@@ -108,7 +108,10 @@ async fn run_controller_with_servers(
     let status_listener = match status_addr {
         Some(addr) => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            println!("Krishiv UI/status HTTP listening on {}", listener.local_addr()?);
+            println!(
+                "Krishiv UI/status HTTP listening on {}",
+                listener.local_addr()?
+            );
             Some(listener)
         }
         None => None,

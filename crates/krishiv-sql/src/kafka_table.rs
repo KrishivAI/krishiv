@@ -1,18 +1,18 @@
-use std::sync::Arc;
-use async_trait::async_trait;
-use arrow::record_batch::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use datafusion::catalog::TableProviderFactory;
+use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
+use datafusion::catalog::TableProviderFactory;
 use datafusion::catalog::streaming::StreamingTable;
+use std::sync::Arc;
 
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::CreateExternalTable;
-use datafusion::error::{Result as DataFusionResult, DataFusionError};
-use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::PartitionStream;
 use krishiv_connectors::Source;
-use krishiv_connectors::kafka::{KafkaSource, KafkaConfig};
+use krishiv_connectors::kafka::{KafkaConfig, KafkaSource};
 
 // Auto-commit interval used for the streaming SQL path (at-least-once delivery).
 const STREAMING_AUTO_COMMIT_MS: u64 = 1_000;
@@ -86,7 +86,10 @@ impl PartitionStream for KafkaPartitionStream {
         });
 
         let recv_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), recv_stream))
+        Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            recv_stream,
+        ))
     }
 }
 
@@ -135,8 +138,7 @@ pub fn create_kafka_streaming_table(
     config: KafkaConfig,
 ) -> DataFusionResult<Arc<dyn TableProvider>> {
     let config = config.with_auto_commit(STREAMING_AUTO_COMMIT_MS);
-    let source = KafkaSource::new(config)
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let source = KafkaSource::new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
     let table = StreamingTable::try_new(schema, vec![partition])?;
     Ok(Arc::new(table))
@@ -184,8 +186,8 @@ impl TableProviderFactory for KafkaTableFactory {
             auto_commit_interval_ms: Some(STREAMING_AUTO_COMMIT_MS),
         };
 
-        let source = KafkaSource::new(config)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let source =
+            KafkaSource::new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
         let table = StreamingTable::try_new(schema, vec![partition])?;
 

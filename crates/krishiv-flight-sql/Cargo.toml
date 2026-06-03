@@ -22,6 +22,7 @@ dashmap = { workspace = true }
 lru = "0.12"
 sha2 = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

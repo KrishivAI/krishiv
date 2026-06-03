@@ -257,11 +257,9 @@ impl PyWindowedStream {
             // being permanently blocked. When no tokio runtime is active, fall
             // back to blocking_recv directly.
             let res = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        rx.recv().await
-                    })
-                }),
+                Ok(handle) => {
+                    tokio::task::block_in_place(|| handle.block_on(async { rx.recv().await }))
+                }
                 Err(_) => rx.blocking_recv(),
             };
             match res {

@@ -19,8 +19,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec,
-    Volume, VolumeMount, HostPathVolumeSource,
+    Container, EnvVar, EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, Pod, PodSpec,
+    PodTemplateSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;

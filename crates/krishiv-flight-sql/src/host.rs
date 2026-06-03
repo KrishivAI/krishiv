@@ -20,7 +20,9 @@ use tonic::Status;
 ///
 /// These tables are scoped to a single `execute_sql` call so concurrent callers
 /// cannot see each other's in-flight data.
-fn collect_ipc_tables(directives: &[FlightDirective]) -> Vec<krishiv_scheduler::BatchSqlInlineTable> {
+fn collect_ipc_tables(
+    directives: &[FlightDirective],
+) -> Vec<krishiv_scheduler::BatchSqlInlineTable> {
     directives
         .iter()
         .filter_map(|d| {
@@ -84,7 +86,10 @@ impl FlightExecutionHost {
     pub fn with_coordinator_http(coordinator_http: Option<String>) -> Result<Self, Status> {
         let (cluster, continuous) = if coordinator_http.is_none() {
             let c = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
-            (Some(Arc::new(c)), Some(Arc::new(ContinuousStreamRegistry::new())))
+            (
+                Some(Arc::new(c)),
+                Some(Arc::new(ContinuousStreamRegistry::new())),
+            )
         } else {
             (None, None)
         };
@@ -129,15 +134,18 @@ impl FlightExecutionHost {
             // — the coordinator's handler ignores this hint for non-streaming SQL.
             let is_streaming = false;
             return krishiv_runtime::execute_coordinator_batch_sql_inline(
-                http_base, &sql, &ipc_tables, is_streaming,
+                http_base,
+                &sql,
+                &ipc_tables,
+                is_streaming,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()));
         }
 
-        let cluster = self.cluster().ok_or_else(|| {
-            Status::internal("embedded cluster unavailable")
-        })?;
+        let cluster = self
+            .cluster()
+            .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
         let is_streaming = match cluster.is_streaming_query(&sql) {
             Ok(v) => v,
             Err(e) => {
@@ -185,13 +193,20 @@ impl FlightExecutionHost {
                 }
                 FlightDirective::ContinuousRegister { job_id, spec } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
-                        krishiv_runtime::execute_coordinator_continuous_register(http_base, &job_id, &spec)
-                            .await
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        krishiv_runtime::execute_coordinator_continuous_register(
+                            http_base, &job_id, &spec,
+                        )
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
                         continue;
                     }
-                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
-                    let continuous = self.continuous.clone().ok_or_else(|| Status::internal("continuous registry unavailable"))?;
+                    let cluster = self
+                        .cluster()
+                        .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
+                    let continuous = self
+                        .continuous
+                        .clone()
+                        .ok_or_else(|| Status::internal("continuous registry unavailable"))?;
                     let local = plan_spec_to_local(&spec);
                     let job_id = job_id.clone();
                     let spec = spec.clone();
@@ -202,13 +217,20 @@ impl FlightExecutionHost {
                 }
                 FlightDirective::ContinuousPush { job_id, batches } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
-                        krishiv_runtime::execute_coordinator_continuous_push(http_base, &job_id, &batches)
-                            .await
-                            .map_err(|e| Status::internal(e.to_string()))?;
+                        krishiv_runtime::execute_coordinator_continuous_push(
+                            http_base, &job_id, &batches,
+                        )
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
                         continue;
                     }
-                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
-                    let continuous = self.continuous.clone().ok_or_else(|| Status::internal("continuous registry unavailable"))?;
+                    let cluster = self
+                        .cluster()
+                        .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
+                    let continuous = self
+                        .continuous
+                        .clone()
+                        .ok_or_else(|| Status::internal("continuous registry unavailable"))?;
                     let job_id = job_id.clone();
                     run_blocking(move || {
                         cluster.push_continuous_input(&job_id, batches.clone())?;
@@ -217,23 +239,36 @@ impl FlightExecutionHost {
                 }
                 FlightDirective::ContinuousDrain { job_id } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
-                        return krishiv_runtime::execute_coordinator_continuous_drain(http_base, &job_id)
-                            .await
-                            .map_err(|e| Status::internal(e.to_string()));
-                    }
-                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
-                    let job_id = job_id.clone();
-                    return run_blocking(move || cluster.drain_continuous_job(&job_id));
-                }
-                FlightDirective::BoundedWindow { topic, spec, input_batches } => {
-                    if let Some(http_base) = self.coordinator_http.as_deref() {
-                        return krishiv_runtime::execute_coordinator_bounded_window(
-                            http_base, &topic, &spec, &input_batches,
+                        return krishiv_runtime::execute_coordinator_continuous_drain(
+                            http_base, &job_id,
                         )
                         .await
                         .map_err(|e| Status::internal(e.to_string()));
                     }
-                    let cluster = self.cluster().ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
+                    let cluster = self
+                        .cluster()
+                        .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
+                    let job_id = job_id.clone();
+                    return run_blocking(move || cluster.drain_continuous_job(&job_id));
+                }
+                FlightDirective::BoundedWindow {
+                    topic,
+                    spec,
+                    input_batches,
+                } => {
+                    if let Some(http_base) = self.coordinator_http.as_deref() {
+                        return krishiv_runtime::execute_coordinator_bounded_window(
+                            http_base,
+                            &topic,
+                            &spec,
+                            &input_batches,
+                        )
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()));
+                    }
+                    let cluster = self
+                        .cluster()
+                        .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
                     let local = plan_spec_to_local(&spec);
                     let topic = topic.clone();
                     let input_batches = input_batches.clone();
@@ -266,8 +301,7 @@ impl FlightExecutionHost {
 fn run_blocking<T>(
     f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError>,
 ) -> Result<T, Status> {
-    tokio::task::block_in_place(f)
-        .map_err(|e| Status::internal(e.to_string()))
+    tokio::task::block_in_place(f).map_err(|e| Status::internal(e.to_string()))
 }
 
 fn explain_batch(text: &str) -> Result<RecordBatch, Status> {

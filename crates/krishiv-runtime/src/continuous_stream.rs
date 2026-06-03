@@ -29,7 +29,10 @@ impl std::fmt::Debug for ContinuousJobEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContinuousJobEntry")
             .field("spec", &self.spec)
-            .field("input_queue_len", &self.input.lock().map(|q| q.len()).unwrap_or(0))
+            .field(
+                "input_queue_len",
+                &self.input.lock().map(|q| q.len()).unwrap_or(0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -114,12 +117,11 @@ impl ContinuousStreamRegistry {
             .ok_or_else(|| RuntimeError::InvalidState {
                 message: format!("continuous job '{job_id}': not found"),
             })?;
-        let mut queue = entry
-            .input
-            .lock()
-            .map_err(|_| RuntimeError::transport(
-                format!("continuous job '{job_id}' input lock poisoned during push_input")
-            ))?;
+        let mut queue = entry.input.lock().map_err(|_| {
+            RuntimeError::transport(format!(
+                "continuous job '{job_id}' input lock poisoned during push_input"
+            ))
+        })?;
         let current_depth = queue.len();
         if current_depth >= self.max_pending_batches {
             return Err(RuntimeError::InvalidState {
@@ -143,12 +145,11 @@ impl ContinuousStreamRegistry {
             .ok_or_else(|| RuntimeError::InvalidState {
                 message: format!("continuous job '{job_id}': not found"),
             })?;
-        let queue = entry
-            .input
-            .lock()
-            .map_err(|_| RuntimeError::transport(
-                format!("continuous job '{job_id}' input lock poisoned during pending_batch_depth")
-            ))?;
+        let queue = entry.input.lock().map_err(|_| {
+            RuntimeError::transport(format!(
+                "continuous job '{job_id}' input lock poisoned during pending_batch_depth"
+            ))
+        })?;
         Ok(queue.len())
     }
 
@@ -172,12 +173,11 @@ impl ContinuousStreamRegistry {
         // Steal at most `max_input_batches` entries with a short critical section,
         // then release the input lock before acquiring the executor lock.
         let input: Vec<RecordBatch> = {
-            let mut queue = entry
-                .input
-                .lock()
-                .map_err(|_| RuntimeError::transport(
-                    format!("continuous job '{job_id}' input lock poisoned during drain_job")
-                ))?;
+            let mut queue = entry.input.lock().map_err(|_| {
+                RuntimeError::transport(format!(
+                    "continuous job '{job_id}' input lock poisoned during drain_job"
+                ))
+            })?;
             let take = queue.len().min(max_input_batches);
             queue.drain(..take).collect()
         };
@@ -186,13 +186,13 @@ impl ContinuousStreamRegistry {
         }
         // Window computation runs under the executor lock only — producers are
         // not blocked during this (potentially slow) aggregation step.
-        let mut exec = entry
-            .executor
-            .lock()
-            .map_err(|_| RuntimeError::transport(
-                format!("continuous job '{job_id}' executor lock poisoned during drain_job")
-            ))?;
-        exec.drain(input).map_err(|e| RuntimeError::transport(e.to_string()))
+        let mut exec = entry.executor.lock().map_err(|_| {
+            RuntimeError::transport(format!(
+                "continuous job '{job_id}' executor lock poisoned during drain_job"
+            ))
+        })?;
+        exec.drain(input)
+            .map_err(|e| RuntimeError::transport(e.to_string()))
     }
 
     /// Drain ALL pending input batches through the window operator.
@@ -218,6 +218,67 @@ impl ContinuousStreamRegistry {
     /// Returns `true` if a job with this id has been registered.
     pub fn has_job(&self, job_id: &str) -> bool {
         self.jobs.contains_key(job_id)
+    }
+
+    /// C9: Serialize a job's window state to bytes for cross-session persistence.
+    ///
+    /// Calls `checkpoint()` on the executor (writes to the in-memory backend),
+    /// then extracts the snapshot bytes. Store them externally (file, etcd, object
+    /// store) and pass to `restore_job_from_snapshot` on the next session to resume
+    /// from where the previous executor left off.
+    pub fn snapshot_job(&self, job_id: &str) -> RuntimeResult<Vec<u8>> {
+        let entry = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| RuntimeError::InvalidState {
+                message: format!("continuous job '{job_id}': not found"),
+            })?;
+        let mut exec = entry.executor.lock().map_err(|_| {
+            RuntimeError::transport(format!(
+                "continuous job '{job_id}' executor lock poisoned during snapshot"
+            ))
+        })?;
+        exec.snapshot()
+            .map_err(|e| RuntimeError::transport(format!("snapshot failed: {e}")))
+    }
+
+    /// C9: Register a job and immediately restore its window state from a prior
+    /// snapshot.
+    ///
+    /// Use this instead of `register_job` when resuming a job on a new executor
+    /// session. The window state (open partials, committed offsets) is restored
+    /// from `snapshot_bytes` before the first `push_input`/`drain_job` call.
+    pub fn register_job_from_snapshot(
+        &self,
+        job_id: impl Into<String>,
+        spec: WindowExecutionSpec,
+        snapshot_bytes: &[u8],
+    ) -> RuntimeResult<()> {
+        use krishiv_exec::ContinuousWindowExecutor;
+        let job_id = job_id.into();
+        let mut executor = ContinuousWindowExecutor::new(spec.clone())
+            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+        // Restore window state from the snapshot before accepting new input.
+        let wm = executor.last_watermark_ms();
+        if !snapshot_bytes.is_empty() {
+            executor
+                .restore_from_snapshot(snapshot_bytes)
+                .map_err(|e| {
+                    RuntimeError::transport(format!(
+                        "continuous job '{job_id}' snapshot restore failed: {e}"
+                    ))
+                })?;
+        }
+        let _ = wm; // watermark is embedded in restored state
+        self.jobs.insert(
+            job_id,
+            std::sync::Arc::new(ContinuousJobEntry {
+                spec,
+                input: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                executor: std::sync::Mutex::new(executor),
+            }),
+        );
+        Ok(())
     }
 
     /// List all registered job ids.
@@ -416,7 +477,10 @@ mod tests {
         // Create a registry with a tiny queue limit of 2 batches per job.
         let registry = ContinuousStreamRegistry::with_max_pending_batches(2);
         registry
-            .register_job("j-bp", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job(
+                "j-bp",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
             .unwrap();
 
         // First two pushes succeed.
@@ -441,21 +505,31 @@ mod tests {
         // Verify that draining frees space so subsequent pushes succeed.
         let registry = ContinuousStreamRegistry::with_max_pending_batches(1);
         registry
-            .register_job("j-drain-bp", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job(
+                "j-drain-bp",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
             .unwrap();
 
-        registry.push_input("j-drain-bp", vec![batch(1_000)]).unwrap();
+        registry
+            .push_input("j-drain-bp", vec![batch(1_000)])
+            .unwrap();
         // Queue is full — drain first.
         let _ = registry.drain_job("j-drain-bp").unwrap();
         // After drain, pushing again must succeed.
-        registry.push_input("j-drain-bp", vec![batch(2_000)]).unwrap();
+        registry
+            .push_input("j-drain-bp", vec![batch(2_000)])
+            .unwrap();
     }
 
     #[test]
     fn new_unbounded_has_no_backpressure() {
         let registry = ContinuousStreamRegistry::new_unbounded();
         registry
-            .register_job("j-unb", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job(
+                "j-unb",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
             .unwrap();
         for i in 0..2000 {
             registry
@@ -468,10 +542,15 @@ mod tests {
     fn pending_batch_depth_tracks_pushes_and_drains() {
         let registry = ContinuousStreamRegistry::new_unbounded();
         registry
-            .register_job("j-depth", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job(
+                "j-depth",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
             .unwrap();
         assert_eq!(registry.pending_batch_depth("j-depth").unwrap(), 0);
-        registry.push_input("j-depth", vec![batch(1_000), batch(2_000)]).unwrap();
+        registry
+            .push_input("j-depth", vec![batch(1_000), batch(2_000)])
+            .unwrap();
         assert_eq!(registry.pending_batch_depth("j-depth").unwrap(), 2);
         let _ = registry.drain_job("j-depth").unwrap();
         assert_eq!(registry.pending_batch_depth("j-depth").unwrap(), 0);
@@ -483,7 +562,10 @@ mod tests {
         // batch at 11_000 crosses into the next window and triggers output.
         let registry = ContinuousStreamRegistry::new_unbounded();
         registry
-            .register_job("j-up-to", WindowExecutionSpec::tumbling("user_id", "ts", 10_000))
+            .register_job(
+                "j-up-to",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
             .unwrap();
         for i in 0_i64..9 {
             registry
@@ -518,7 +600,10 @@ mod tests {
         // both and return the closed window's output rows.
         let registry = ContinuousStreamRegistry::new_unbounded();
         registry
-            .register_job("j-all", WindowExecutionSpec::tumbling("user_id", "ts", 5_000))
+            .register_job(
+                "j-all",
+                WindowExecutionSpec::tumbling("user_id", "ts", 5_000),
+            )
             .unwrap();
         // batch at 1_000 → inside [0, 5000); batch at 6_000 → closes it.
         registry
@@ -530,10 +615,6 @@ mod tests {
             0,
             "drain_job_up_to(usize::MAX) must drain all batches"
         );
-        assert!(
-            !out.is_empty(),
-            "closed window must produce output batches"
-        );
+        assert!(!out.is_empty(), "closed window must produce output batches");
     }
-
 }

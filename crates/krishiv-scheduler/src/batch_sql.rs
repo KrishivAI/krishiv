@@ -143,7 +143,11 @@ pub async fn submit_batch_sql_job(
 
     let fragment = format!("sql: {query}");
     let stage = StageSpec::new(stage_id, "batch-sql").with_task(TaskSpec::new(task_id, fragment));
-    let job_kind = if is_streaming { JobKind::Streaming } else { JobKind::Batch };
+    let job_kind = if is_streaming {
+        JobKind::Streaming
+    } else {
+        JobKind::Batch
+    };
     let spec = JobSpec::new(job_id.clone(), "batch-sql", job_kind).with_stage(stage);
 
     // OPTIMIZATION OPPORTUNITY: In the embedded in-process path, the caller
@@ -160,7 +164,10 @@ pub async fn submit_batch_sql_job(
         let ipc_bytes = base64::engine::general_purpose::STANDARD
             .decode(t.ipc_b64.as_bytes())
             .map_err(|e| SchedulerError::InvalidJob {
-                message: format!("inline partition {idx} ({}) base64 decode failed: {e}", t.table_name),
+                message: format!(
+                    "inline partition {idx} ({}) base64 decode failed: {e}",
+                    t.table_name
+                ),
             })?;
         let limit = {
             let coord = coordinator.read().await;

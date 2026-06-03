@@ -9,6 +9,11 @@ license.workspace = true
 path = "src/lib.rs"
 
 [features]
+# kafka is default so production builds include the real Kafka connector without
+# requiring an explicit feature flag. O1: rdkafka is already in [dependencies]
+# as optional; enabling it by default has no API surface change for users who
+# never call KafkaSource/KafkaSink.
+default = ["kafka"]
 kafka = ["dep:rdkafka"]
 state = ["dep:krishiv-state"]
 

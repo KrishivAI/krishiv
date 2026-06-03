@@ -331,23 +331,35 @@ mod watermark_tests {
             key_column: "k".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
-            agg_exprs: vec![AggExpr { function: crate::AggFunction::Count, input_column: String::new(), output_column: "count".into() }],
+            agg_exprs: vec![AggExpr {
+                function: crate::AggFunction::Count,
+                input_column: String::new(),
+                output_column: "count".into(),
+            }],
         };
         let mut op = TumblingWindowOperator::new(spec);
 
         // First batch advances watermark to 5000.
-        let b1 = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
-            Arc::new(Int64Array::from(vec![5_000_i64])) as _,
-        ]).unwrap();
+        let b1 = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![5_000_i64])) as _,
+            ],
+        )
+        .unwrap();
         let _ = op.process_batch(&b1, 5_000);
         assert_eq!(op.late_events_dropped, 0, "no late events yet");
 
         // Second batch has an event at t=1000 which is below watermark=5000.
-        let b2 = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
-            Arc::new(Int64Array::from(vec![1_000_i64])) as _,
-        ]).unwrap();
+        let b2 = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])) as _,
+                Arc::new(Int64Array::from(vec![1_000_i64])) as _,
+            ],
+        )
+        .unwrap();
         let _ = op.process_batch(&b2, 5_000);
         assert_eq!(op.late_events_dropped, 1, "one late event must be counted");
     }
@@ -368,13 +380,21 @@ mod watermark_tests {
             key_column: "k".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
-            agg_exprs: vec![AggExpr { function: crate::AggFunction::Count, input_column: String::new(), output_column: "count".into() }],
+            agg_exprs: vec![AggExpr {
+                function: crate::AggFunction::Count,
+                input_column: String::new(),
+                output_column: "count".into(),
+            }],
         };
         let mut op = TumblingWindowOperator::new(spec);
-        let b = arrow::record_batch::RecordBatch::try_new(schema, vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])) as _,
-            Arc::new(Int64Array::from(vec![1_000_i64, 2_000, 3_000])) as _,
-        ]).unwrap();
+        let b = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])) as _,
+                Arc::new(Int64Array::from(vec![1_000_i64, 2_000, 3_000])) as _,
+            ],
+        )
+        .unwrap();
         let _ = op.process_batch(&b, 3_000);
         assert_eq!(op.late_events_dropped, 0, "no events should be late");
     }

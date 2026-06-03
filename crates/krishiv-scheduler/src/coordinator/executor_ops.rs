@@ -150,7 +150,10 @@ impl Coordinator {
                 ),
                 applied,
             };
-            let log_bucket = self.adaptive_decision_log.entry(job_id.clone()).or_default();
+            let log_bucket = self
+                .adaptive_decision_log
+                .entry(job_id.clone())
+                .or_default();
             const MAX_LOG_PER_JOB: usize = 100;
             if log_bucket.len() >= MAX_LOG_PER_JOB {
                 log_bucket.pop_front(); // O(1) with VecDeque
@@ -177,7 +180,8 @@ impl Coordinator {
                 // available executor slots rather than concentrating it on the
                 // bucket that hashes to the hot key.
                 let buckets = self.executors.list().len().max(2) as u32;
-                self.skew_repartition_overrides.insert(job_id.clone(), buckets);
+                self.skew_repartition_overrides
+                    .insert(job_id.clone(), buckets);
             }
         }
         throttles

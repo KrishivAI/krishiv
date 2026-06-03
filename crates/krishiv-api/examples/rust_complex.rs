@@ -15,7 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Execute a complex shuffle: Distributed Hash Aggregate
-    let df = session.sql(r#"
+    let df = session
+        .sql(
+            r#"
         SELECT 
             mod(id, 50) as cohort, 
             COUNT(id) as cohort_size,
@@ -24,7 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         GROUP BY mod(id, 50)
         ORDER BY cohort_size DESC
         LIMIT 5
-    "#).await?;
+    "#,
+        )
+        .await?;
 
     // Trigger execution
     let result = df.collect().await?;

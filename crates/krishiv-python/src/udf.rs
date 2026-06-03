@@ -61,18 +61,15 @@ impl krishiv_udf::ScalarUdf for PythonScalarUdf {
 
             if is_arrow_native {
                 let py_batch = pyo3_arrow::PyRecordBatch::new(batch.clone());
-                let result =
-                    self.callable
-                        .call1(py, (py_batch,))
-                        .map_err(|e| krishiv_udf::UdfError::Execution {
-                            message: format!("arrow-native UDF call failed: {e}"),
-                        })?;
+                let result = self.callable.call1(py, (py_batch,)).map_err(|e| {
+                    krishiv_udf::UdfError::Execution {
+                        message: format!("arrow-native UDF call failed: {e}"),
+                    }
+                })?;
                 let out_batch: RecordBatch = result
                     .extract::<pyo3_arrow::PyRecordBatch>(py)
                     .map_err(|e| krishiv_udf::UdfError::Execution {
-                        message: format!(
-                            "arrow-native UDF must return a pyarrow.RecordBatch: {e}"
-                        ),
+                        message: format!("arrow-native UDF must return a pyarrow.RecordBatch: {e}"),
                     })?
                     .into_inner();
                 if out_batch.num_columns() == 0 {

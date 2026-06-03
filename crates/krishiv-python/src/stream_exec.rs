@@ -49,11 +49,14 @@ async fn resolve_input_stream(
     pipeline: &StreamPipeline,
 ) -> Result<krishiv_plan::SendableRecordBatchStream, krishiv_api::KrishivError> {
     if let Some(name) = pipeline.source_id.strip_prefix("memory:") {
-        let batches = pipeline.session.memory_stream_batches(name).ok_or_else(|| {
-            krishiv_api::KrishivError::unsupported(format!(
-                "memory stream '{name}' is not registered on this session"
-            ))
-        })?;
+        let batches = pipeline
+            .session
+            .memory_stream_batches(name)
+            .ok_or_else(|| {
+                krishiv_api::KrishivError::unsupported(format!(
+                    "memory stream '{name}' is not registered on this session"
+                ))
+            })?;
         let stream = futures::stream::iter(batches.into_iter().map(Ok));
         return Ok(Box::pin(stream));
     }
@@ -167,7 +170,7 @@ pub(crate) fn spawn_pipeline_stream(
 ) -> PyResult<tokio::sync::mpsc::Receiver<PyResult<PyBatch>>> {
     let spec = spec_from_pipeline(&pipeline)?;
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
@@ -179,34 +182,46 @@ pub(crate) fn spawn_pipeline_stream(
                     return;
                 }
             };
-            
+
             use futures::StreamExt;
-            let mapped_input_stream = input_stream.map(|res| res.map_err(|e| krishiv_exec::ExecError::InvalidWindowConfig(e)));
-            
-            let output_res = krishiv_api::execute_streaming_window(Box::pin(mapped_input_stream), &spec);
+            let mapped_input_stream = input_stream
+                .map(|res| res.map_err(|e| krishiv_exec::ExecError::InvalidWindowConfig(e)));
+
+            let output_res =
+                krishiv_api::execute_streaming_window(Box::pin(mapped_input_stream), &spec);
             let mut output_stream = match output_res {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tx.send(Err(map_krishiv_error(krishiv_api::KrishivError::from(e)))).await;
+                    let _ = tx
+                        .send(Err(map_krishiv_error(krishiv_api::KrishivError::from(e))))
+                        .await;
                     return;
                 }
             };
-            
+
             while let Some(batch_res) = output_stream.next().await {
                 match batch_res {
                     Ok(batch) => {
-                        if tx.send(Ok(PyBatch::from_record_batch(batch))).await.is_err() {
+                        if tx
+                            .send(Ok(PyBatch::from_record_batch(batch)))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(map_krishiv_error(krishiv_api::KrishivError::unsupported(e.to_string())))).await;
+                        let _ = tx
+                            .send(Err(map_krishiv_error(
+                                krishiv_api::KrishivError::unsupported(e.to_string()),
+                            )))
+                            .await;
                         break;
                     }
                 }
             }
         });
     });
-    
+
     Ok(rx)
 }

@@ -257,10 +257,7 @@ impl DataFrame {
         // Callers should use .stream().execute_stream_async() instead.
         if self.logical_plan.kind() == ExecutionKind::Streaming {
             self.update_job(&job_id, "local-dataframe", JobState::Failed);
-            let query_hint = self
-                .sql_query
-                .as_deref()
-                .unwrap_or("<streaming query>");
+            let query_hint = self.sql_query.as_deref().unwrap_or("<streaming query>");
             return Err(KrishivError::unsupported(format!(
                 "collect() on streaming query '{}' would block forever on an unbounded source; \
                  use .stream() / .execute_stream_async() to consume the stream incrementally",
@@ -279,9 +276,14 @@ impl DataFrame {
                     BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
                 })
                 .collect::<Vec<_>>();
-            crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, false)
-                .await
-                .map(QueryResult::new)
+            crate::session::runtime_collect_batch_sql(
+                Arc::clone(&self.runtime),
+                query,
+                &tables,
+                false,
+            )
+            .await
+            .map(QueryResult::new)
         } else if let Some(dataframe) = &self.sql_dataframe {
             dataframe
                 .collect()
@@ -324,7 +326,13 @@ impl DataFrame {
                     BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
                 })
                 .collect::<Vec<_>>();
-            let batches = crate::session::runtime_collect_batch_sql(Arc::clone(&self.runtime), query, &tables, false).await?;
+            let batches = crate::session::runtime_collect_batch_sql(
+                Arc::clone(&self.runtime),
+                query,
+                &tables,
+                false,
+            )
+            .await?;
             let stream = futures::stream::iter(batches.into_iter().map(Ok));
             Ok(Box::pin(stream) as krishiv_plan::SendableRecordBatchStream)
         } else if let Some(dataframe) = &self.sql_dataframe {
@@ -336,10 +344,7 @@ impl DataFrame {
                     ))
                     .map_err(KrishivError::from)?;
             }
-            dataframe
-                .execute_stream()
-                .await
-                .map_err(Into::into)
+            dataframe.execute_stream().await.map_err(Into::into)
         } else {
             self.runtime
                 .accept_plan(&PhysicalPlan::new(

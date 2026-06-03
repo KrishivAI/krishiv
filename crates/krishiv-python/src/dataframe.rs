@@ -51,11 +51,17 @@ impl PyDataFrame {
 
     pub fn execute_stream_async(&self, py: Python<'_>) -> PyResult<PyDataFrameStream> {
         let inner = self.inner.clone();
-        let stream = py.detach(move || {
-            crate::session::block_on_async(async move {
-                inner.execute_stream_async().await.map_err(|e| krishiv_api::KrishivError::Runtime { message: e.to_string() })
+        let stream = py
+            .detach(move || {
+                crate::session::block_on_async(async move {
+                    inner.execute_stream_async().await.map_err(|e| {
+                        krishiv_api::KrishivError::Runtime {
+                            message: e.to_string(),
+                        }
+                    })
+                })
             })
-        }).map_err(map_krishiv_error)?;
+            .map_err(map_krishiv_error)?;
         Ok(PyDataFrameStream {
             stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
         })
@@ -104,13 +110,15 @@ impl PyDataFrameStream {
 
     fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let stream = self.stream.clone();
-        let next_item = py.detach(move || {
-            crate::session::block_on_async(async move {
-                use futures::StreamExt;
-                let mut stream = stream.lock().await;
-                Ok::<_, krishiv_api::KrishivError>(stream.next().await)
+        let next_item = py
+            .detach(move || {
+                crate::session::block_on_async(async move {
+                    use futures::StreamExt;
+                    let mut stream = stream.lock().await;
+                    Ok::<_, krishiv_api::KrishivError>(stream.next().await)
+                })
             })
-        }).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         match next_item {
             Some(Ok(batch)) => Ok(Some(

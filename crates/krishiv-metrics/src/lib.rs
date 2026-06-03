@@ -1653,10 +1653,13 @@ mod tests {
         // When no explicit config is given, the function reads the env var or
         // falls back to "unknown". We verify the documented fallback chain
         // without mutating the environment (unsafe_code is workspace-forbidden).
-        let config = MetricsConfig { deployment_target: None, ..MetricsConfig::default() };
+        let config = MetricsConfig {
+            deployment_target: None,
+            ..MetricsConfig::default()
+        };
         let result = config.resolved_deployment_target();
-        let expected = std::env::var("KRISHIV_DEPLOYMENT_TARGET")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let expected =
+            std::env::var("KRISHIV_DEPLOYMENT_TARGET").unwrap_or_else(|_| "unknown".to_string());
         assert_eq!(
             result, expected,
             "resolved value must match the env var when set, or 'unknown' when absent"
@@ -1705,7 +1708,9 @@ mod tests {
         // Force flush to drain the processor.
         let _ = handle.tracer_provider.force_flush();
 
-        let spans = exporter.get_finished_spans().expect("get_finished_spans must succeed");
+        let spans = exporter
+            .get_finished_spans()
+            .expect("get_finished_spans must succeed");
         assert!(
             !spans.is_empty(),
             "at least one span must be captured by InMemory exporter after init()"
@@ -1718,7 +1723,6 @@ mod tests {
             "captured span must have the expected name"
         );
     }
-
 
     #[ignore = "requires live OTLP collector at OTEL_EXPORTER_OTLP_ENDPOINT"]
     async fn otlp_integration_exports_span() {

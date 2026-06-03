@@ -6,7 +6,25 @@ use crate::{NodeOp, PlanNode};
 const PLAN_OP_PREFIX: &str = "planop:";
 
 /// Encode a plan node as the executor task fragment description.
+///
+/// S2: When `node.broadcast_eligible()` is `true` and the node carries a
+/// `Hash` Exchange, the partitioning is promoted to `Broadcast` so the
+/// physical plan builder honour the flag set by the optimizer / user.
 pub fn encode_task_fragment(node: &PlanNode) -> String {
+    // S2: Honour broadcast_eligible flag — override Hash Exchange → Broadcast.
+    if node.broadcast_eligible() {
+        if let Some(crate::NodeOp::Exchange {
+            partitioning: crate::Partitioning::Hash { .. } | crate::Partitioning::RoundRobin { .. },
+        }) = node.op()
+        {
+            let broadcast_op = crate::NodeOp::Exchange {
+                partitioning: crate::Partitioning::Broadcast,
+            };
+            if let Ok(json) = serde_json::to_string(&broadcast_op) {
+                return format!("{PLAN_OP_PREFIX}{json}");
+            }
+        }
+    }
     if let Some(fragment) = node.op().and_then(node_op_to_fragment) {
         return fragment;
     }

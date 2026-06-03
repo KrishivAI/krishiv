@@ -258,7 +258,9 @@ pub async fn spawn_coordinator_sidecars(
                     tokio::task::spawn_blocking(move || {
                         match krishiv_shuffle::orphan::cleanup_orphans(&dir, &active) {
                             Ok(n) if n > 0 => {
-                                eprintln!("shuffle orphan GC: removed {n} orphaned partition files");
+                                eprintln!(
+                                    "shuffle orphan GC: removed {n} orphaned partition files"
+                                );
                             }
                             Ok(_) => {}
                             Err(e) => eprintln!("shuffle orphan GC failed: {e}"),
@@ -1161,11 +1163,11 @@ mod parse_tests {
 
     #[tokio::test]
     async fn circuit_breaker_reset_endpoint_returns_ok() {
+        use crate::coordinator_http_router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use krishiv_proto::{ExecutorDescriptor, ExecutorId};
         use tower::ServiceExt;
-        use crate::coordinator_http_router;
 
         crate::auth::set_allow_anonymous();
 
@@ -1183,7 +1185,11 @@ mod parse_tests {
             .unwrap();
 
         // Simulate consecutive task failures so the circuit breaker has state to reset.
-        let threshold = coordinator.read().await.config().circuit_breaker_failure_threshold();
+        let threshold = coordinator
+            .read()
+            .await
+            .config()
+            .circuit_breaker_failure_threshold();
         for _ in 0..threshold {
             coordinator
                 .write()
@@ -1223,6 +1229,9 @@ mod parse_tests {
             .find(|s| s.executor_id() == &exec_id)
             .map(|s| s.consecutive_task_failures)
             .unwrap_or(1);
-        assert_eq!(failures, 0, "circuit breaker counter must be zero after reset");
+        assert_eq!(
+            failures, 0,
+            "circuit breaker counter must be zero after reset"
+        );
     }
 }

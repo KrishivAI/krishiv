@@ -94,7 +94,12 @@ pub struct BoundedWindowBody {
 impl BoundedWindowBody {
     /// Create a request body (response_watermark_ms is None for requests).
     pub fn request(topic: String, spec: WindowExecutionSpec, batches_b64: String) -> Self {
-        Self { topic, spec, batches_b64, response_watermark_ms: None }
+        Self {
+            topic,
+            spec,
+            batches_b64,
+            response_watermark_ms: None,
+        }
     }
 }
 
@@ -610,7 +615,7 @@ mod tests {
                 topic: "t".into(),
                 spec: WindowExecutionSpec::tumbling("k", "ts", 1_000),
                 batches_b64: String::new(),
-            response_watermark_ms: None,
+                response_watermark_ms: None,
             }),
             KrishivFlightAction::Explain(ExplainBody {
                 sql: "SELECT 1".into(),

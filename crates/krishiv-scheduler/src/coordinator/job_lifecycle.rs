@@ -388,7 +388,11 @@ impl Coordinator {
         self.batch_sql_job_tables.remove(job_id);
         self.checkpoint_coordinators.remove(job_id);
         self.gc_ready_jobs.retain(|id| id != job_id);
-        self.streaming_task_index.retain(|_, (jid, _)| jid != job_id);
+        self.streaming_task_index
+            .retain(|_, (jid, _)| jid != job_id);
+        // S4: Evict adaptive decision log entries for the completed job to
+        // prevent unbounded HashMap growth on long-running coordinators.
+        self.adaptive_decision_log.remove(job_id);
     }
 
     /// Convert and submit a Krishiv logical DAG through the R2 scheduler.

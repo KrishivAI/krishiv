@@ -143,11 +143,8 @@ mod tests {
     use super::*;
 
     fn make_table(suffix: &str) -> PyLiveTable {
-        create_live_table(
-            format!("test_table_{suffix}"),
-            "SELECT 1 AS n".to_string(),
-        )
-        .expect("create_live_table must succeed")
+        create_live_table(format!("test_table_{suffix}"), "SELECT 1 AS n".to_string())
+            .expect("create_live_table must succeed")
     }
 
     #[test]
@@ -167,9 +164,14 @@ mod tests {
     #[test]
     fn live_table_ingest_row_and_change_feed() {
         let table = make_table("ingest");
-        table.ingest_row(42, "insert").expect("ingest_row insert must succeed");
+        table
+            .ingest_row(42, "insert")
+            .expect("ingest_row insert must succeed");
         let mut feed = table.change_feed().expect("change_feed must succeed");
-        let entry = feed.entries.next().expect("change_feed must yield one entry");
+        let entry = feed
+            .entries
+            .next()
+            .expect("change_feed must yield one entry");
         assert_eq!(
             entry.op,
             DeltaOp::Insert,

@@ -91,9 +91,7 @@ impl InProcessStreamingRuntime {
     /// Multiple sessions that process the same parquet files can share one
     /// `Arc<DashMap<String, ()>>` obtained from [`parquet_cache`] on a prior
     /// session, eliminating redundant footer reads across session boundaries.
-    pub fn with_parquet_cache(
-        cache: Arc<dashmap::DashMap<String, ()>>,
-    ) -> RuntimeResult<Self> {
+    pub fn with_parquet_cache(cache: Arc<dashmap::DashMap<String, ()>>) -> RuntimeResult<Self> {
         Self::build(Arc::new(ContinuousStreamRegistry::new()), cache)
     }
 
@@ -118,9 +116,9 @@ impl InProcessStreamingRuntime {
         let descriptor = ExecutorDescriptor::new(executor_id.clone(), "localhost", 8)
             .with_task_endpoint(IN_PROCESS_TASK_ENDPOINT);
         {
-            let mut coord = coordinator
-                .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during executor registration"))?;
+            let mut coord = coordinator.lock().map_err(|_| {
+                RuntimeError::transport("coordinator lock poisoned during executor registration")
+            })?;
             coord
                 .register_executor(descriptor)
                 .map_err(|e| RuntimeError::transport(e.to_string()))?;
@@ -131,9 +129,11 @@ impl InProcessStreamingRuntime {
             Arc<RwLock<ExecutorInner>>,
             Arc<RwLock<CheckpointInner>>,
         ) = {
-            let coord = coordinator
-                .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during bridge inner-state extraction"))?;
+            let coord = coordinator.lock().map_err(|_| {
+                RuntimeError::transport(
+                    "coordinator lock poisoned during bridge inner-state extraction",
+                )
+            })?;
             let (checkpoint_coordinators, checkpoint_notify_sent, barrier_dispatch_sent) =
                 coord.checkpoint_inner_parts();
             (
@@ -234,7 +234,11 @@ impl InProcessStreamingRuntime {
     /// Execute a SQL query directly via the SQL engine, bypassing the coordinator
     /// state machine entirely. Only valid for non-streaming, single-stage batch
     /// queries. Eliminates 6+ Mutex lock/unlock pairs of coordinator overhead.
-    fn execute_inline_sql(&self, query: &str, tables: &[BatchSqlTable]) -> RuntimeResult<Vec<RecordBatch>> {
+    fn execute_inline_sql(
+        &self,
+        query: &str,
+        tables: &[BatchSqlTable],
+    ) -> RuntimeResult<Vec<RecordBatch>> {
         let engine = Arc::clone(self.runner.sql_engine());
         // Owned copies are required by async move. Clone is O(n_tables * n_fields);
         // the common case (no parquet tables) pays only one empty-Vec allocation.
@@ -284,14 +288,12 @@ impl InProcessStreamingRuntime {
         // Any statement that mutates state or requires coordinator lifecycle must
         // not bypass it. EXPLAIN output differs between paths; route via coordinator.
         const NON_INLINE_PREFIXES: &[&str] = &[
-            "EXPLAIN", "CREATE", "DROP", "ALTER",
-            "INSERT", "UPDATE", "DELETE", "TRUNCATE",
-            "COPY", "MERGE",
+            "EXPLAIN", "CREATE", "DROP", "ALTER", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "COPY",
+            "MERGE",
         ];
-        !NON_INLINE_PREFIXES.iter().any(|p| {
-            trimmed.len() >= p.len()
-                && trimmed[..p.len()].eq_ignore_ascii_case(p)
-        })
+        !NON_INLINE_PREFIXES
+            .iter()
+            .any(|p| trimmed.len() >= p.len() && trimmed[..p.len()].eq_ignore_ascii_case(p))
     }
 
     pub fn execute_batch_sql(
@@ -308,7 +310,11 @@ impl InProcessStreamingRuntime {
             return self.execute_inline_sql(query, tables);
         }
         let fragment = format!("sql: {query}");
-        let kind = if is_streaming { JobKind::Streaming } else { JobKind::Batch };
+        let kind = if is_streaming {
+            JobKind::Streaming
+        } else {
+            JobKind::Batch
+        };
         self.run_terminal_task(&fragment, kind, tables, Vec::new())
     }
 
@@ -347,10 +353,9 @@ impl InProcessStreamingRuntime {
         );
 
         {
-            let mut coord = self
-                .coordinator
-                .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during job submission"))?;
+            let mut coord = self.coordinator.lock().map_err(|_| {
+                RuntimeError::transport("coordinator lock poisoned during job submission")
+            })?;
             match coord.submit_job(job_spec) {
                 Ok(SubmitOutcome::Accepted) | Ok(SubmitOutcome::Queued { .. }) => {}
                 Err(e) => return Err(RuntimeError::transport(e.to_string())),
@@ -401,10 +406,11 @@ impl InProcessStreamingRuntime {
                 // one lock acquisition (previously two separate locks per iteration).
                 // coordinator_tick is kept after task execution below.
                 let (mut assignments, is_terminal) = {
-                    let mut coord = self
-                        .coordinator
-                        .lock()
-                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned during task assignment launch"))?;
+                    let mut coord = self.coordinator.lock().map_err(|_| {
+                        RuntimeError::transport(
+                            "coordinator lock poisoned during task assignment launch",
+                        )
+                    })?;
                     let assignments = coord
                         .launch_assigned_task_assignments(&job_id)
                         .map_err(|e| RuntimeError::transport(e.to_string()))?;
@@ -504,10 +510,9 @@ impl InProcessStreamingRuntime {
                 // This advances the state machine: marks the completed stage as
                 // Succeeded and makes the next stage's tasks eligible for assignment.
                 {
-                    let mut coord = self
-                        .coordinator
-                        .lock()
-                        .map_err(|_| RuntimeError::transport("coordinator lock poisoned during coordinator tick"))?;
+                    let mut coord = self.coordinator.lock().map_err(|_| {
+                        RuntimeError::transport("coordinator lock poisoned during coordinator tick")
+                    })?;
                     let _ = coord.coordinator_tick();
                 }
             }
@@ -519,10 +524,9 @@ impl InProcessStreamingRuntime {
         // JobCoordinator entry growing unboundedly, and coordinator_tick would
         // iterate over all of them on every subsequent call.
         {
-            let mut coord = self
-                .coordinator
-                .lock()
-                .map_err(|_| RuntimeError::transport("coordinator lock poisoned during job eviction"))?;
+            let mut coord = self.coordinator.lock().map_err(|_| {
+                RuntimeError::transport("coordinator lock poisoned during job eviction")
+            })?;
             coord.evict_completed_job(&job_id);
         }
 
@@ -564,7 +568,6 @@ impl InProcessStreamingRuntime {
         self.execute_windowed(topic, input_batches, &local_spec_to_plan_spec(spec))
     }
 }
-
 
 /// Run windowed aggregation via a session-scoped cluster (preferred).
 pub fn execute_windowed_in_process(
@@ -615,7 +618,9 @@ mod tests {
     #[test]
     fn inline_fast_path_simple_select_returns_correct_result() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        let batches = runtime.execute_batch_sql("SELECT 42 AS n", &[], false).unwrap();
+        let batches = runtime
+            .execute_batch_sql("SELECT 42 AS n", &[], false)
+            .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
         let col = batches[0]
@@ -639,7 +644,11 @@ mod tests {
     fn streaming_query_bypasses_inline_path() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
         // Register a streaming source so is_streaming_query returns true.
-        runtime.runner.sql_engine().register_streaming_source_name("stream_t").unwrap();
+        runtime
+            .runner
+            .sql_engine()
+            .register_streaming_source_name("stream_t")
+            .unwrap();
         // is_streaming=true forces coordinator path regardless.
         let result = runtime.execute_batch_sql("SELECT 1", &[], true);
         // Just verify it doesn't panic (returns Ok or coordinator error).
@@ -769,7 +778,9 @@ mod tests {
     #[test]
     fn batch_sql_with_empty_tables() {
         let runtime = InProcessStreamingRuntime::new().unwrap();
-        let result = runtime.execute_batch_sql("SELECT 1 AS n", &[], false).unwrap();
+        let result = runtime
+            .execute_batch_sql("SELECT 1 AS n", &[], false)
+            .unwrap();
         assert_eq!(result[0].num_rows(), 1);
     }
 
@@ -836,7 +847,8 @@ mod tests {
         // rt2 shares the same cache.
         let rt2 = InProcessStreamingRuntime::with_parquet_cache(Arc::clone(&cache)).unwrap();
         assert!(
-            rt2.parquet_cache().contains_key("events:/data/events.parquet"),
+            rt2.parquet_cache()
+                .contains_key("events:/data/events.parquet"),
             "shared cache must be visible in the new session"
         );
     }

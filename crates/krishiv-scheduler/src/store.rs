@@ -3,14 +3,20 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use krishiv_proto::{
-    AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec, JobState, StageId,
-    StageSpec, StageState, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
+    AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec,
+    JobState, StageId, StageSpec, StageState, TaskId, TaskOutputMetadata, TaskSpec, TaskState,
 };
 use serde::{Deserialize, Serialize};
 
 use krishiv_shuffle::{ShuffleMetadata, ShufflePath};
 
 use crate::{JobRecord, ResourceUsage, SchedulerError, SchedulerResult, StageRecord, TaskRecord};
+
+/// Rotate the events NDJSON log once it exceeds this size (default 64 MiB).
+/// Long-running streaming jobs can accumulate many task-state events between
+/// `save_job` calls; rotation takes a full snapshot and clears the log to
+/// prevent unbounded disk growth.
+const MAX_EVENTS_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Events written to the durable job event log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,10 +211,7 @@ impl JsonFileMetadataStore {
                     ),
                 })?;
             file.set_len(0).map_err(|e| SchedulerError::Transport {
-                message: format!(
-                    "failed to truncate event log '{}': {e}",
-                    log_path.display()
-                ),
+                message: format!("failed to truncate event log '{}': {e}", log_path.display()),
             })?;
             file.sync_all().map_err(|e| SchedulerError::Transport {
                 message: format!(
@@ -318,7 +321,11 @@ impl JsonFileMetadataStore {
             store_kind: String::from("krishiv.scheduler.metadata"),
             events: self.events.iter().map(PersistedEvent::from).collect(),
             jobs: self.jobs.iter().map(PersistedJobRecord::from).collect(),
-            executor_descriptors: self.executor_descriptors.iter().map(PersistedExecutorDescriptor::from).collect(),
+            executor_descriptors: self
+                .executor_descriptors
+                .iter()
+                .map(PersistedExecutorDescriptor::from)
+                .collect(),
         };
         let bytes =
             serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
@@ -373,6 +380,23 @@ impl MetadataStore for JsonFileMetadataStore {
         // Append-only: write just this event to the NDJSON log (no full rewrite).
         self.append_event_to_log(&event)?;
         self.events.push(event);
+        // Size-based rotation: if the log exceeds MAX_EVENTS_LOG_BYTES, write a
+        // full snapshot that captures all current events (including the one we
+        // just pushed) and then truncate the log file.  This bounds disk usage
+        // for streaming jobs that accumulate many task-state events between
+        // periodic save_job() calls.
+        let log_path = self.events_log_path();
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() > MAX_EVENTS_LOG_BYTES {
+                tracing::info!(
+                    log_bytes = meta.len(),
+                    threshold_bytes = MAX_EVENTS_LOG_BYTES,
+                    "events log exceeded rotation threshold; writing snapshot and truncating"
+                );
+                self.persist()?;
+                self.truncate_events_log()?;
+            }
+        }
         Ok(())
     }
 
@@ -618,11 +642,10 @@ impl From<&ExecutorDescriptor> for PersistedExecutorDescriptor {
 impl TryFrom<PersistedExecutorDescriptor> for ExecutorDescriptor {
     type Error = SchedulerError;
     fn try_from(p: PersistedExecutorDescriptor) -> SchedulerResult<Self> {
-        let executor_id = ExecutorId::try_new(p.executor_id).map_err(|e| {
-            SchedulerError::Transport {
+        let executor_id =
+            ExecutorId::try_new(p.executor_id).map_err(|e| SchedulerError::Transport {
                 message: format!("invalid executor_id in metadata store: {e}"),
-            }
-        })?;
+            })?;
         let mut d = ExecutorDescriptor::new(executor_id, p.host, p.slots);
         if let Some(ep) = p.task_endpoint {
             d = d.with_task_endpoint(ep);

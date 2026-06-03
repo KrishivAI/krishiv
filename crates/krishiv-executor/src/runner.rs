@@ -520,22 +520,31 @@ impl TaskRunner {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
                 match state_backend.snapshot() {
-                    Ok(bytes) => { result = Some(bytes); break; }
-                    Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => {
-                        result = Some(Vec::new()); break;
+                    Ok(bytes) => {
+                        result = Some(bytes);
+                        break;
                     }
-                    Err(e) => { last_err = Some(e); }
+                    Err(krishiv_state::StateError::SnapshotUnsupported { .. }) => {
+                        result = Some(Vec::new());
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
                 }
             }
             match result {
                 Some(bytes) => bytes,
-                None => return Err(ExecutorError::LocalExecution {
-                    message: format!(
-                        "checkpoint snapshot failed after 3 attempts for task {} at epoch {}: {}",
-                        self.task_id, req.epoch,
-                        last_err.map(|e| e.to_string()).unwrap_or_default()
-                    ),
-                }),
+                None => {
+                    return Err(ExecutorError::LocalExecution {
+                        message: format!(
+                            "checkpoint snapshot failed after 3 attempts for task {} at epoch {}: {}",
+                            self.task_id,
+                            req.epoch,
+                            last_err.map(|e| e.to_string()).unwrap_or_default()
+                        ),
+                    });
+                }
             }
         };
 
@@ -791,10 +800,7 @@ impl ExecutorTaskRunner {
     ///
     /// By default each [`ExecutorTaskRunner`] creates a fresh private cache.
     /// Call this builder with a shared `Arc` to enable cross-session reuse.
-    pub fn with_shared_parquet_cache(
-        mut self,
-        cache: Arc<dashmap::DashMap<String, ()>>,
-    ) -> Self {
+    pub fn with_shared_parquet_cache(mut self, cache: Arc<dashmap::DashMap<String, ()>>) -> Self {
         self.registered_parquet_cache = cache;
         self
     }
@@ -1199,7 +1205,8 @@ impl ExecutorTaskRunner {
         // DashMap shard lock is now fully released.
 
         let ack = tokio::task::spawn_blocking(move || {
-            task_runner.handle_initiate_checkpoint(req, state_backend.as_ref(), storage.as_ref())
+            task_runner
+                .handle_initiate_checkpoint(req, state_backend.as_ref(), storage.as_ref())
                 .map(|ack| (ack, task_runner))
         })
         .await
@@ -1269,7 +1276,7 @@ impl ExecutorTaskRunner {
                 PlanFragment::new("checkpoint"),
                 OutputContract::new(OutputContractKind::InlineRecordBatches, "checkpoint"),
             );
-            
+
             let sb_clone = Arc::clone(&state_backend);
             let s_clone = Arc::clone(&storage);
             let coord_clone = coordinator.clone();
@@ -1318,7 +1325,7 @@ impl ExecutorTaskRunner {
                 epoch: barrier.epoch,
                 fencing_token,
             };
-            
+
             let sb_clone = Arc::clone(&state_backend);
             let s_clone = Arc::clone(&storage);
             let coord_clone = coordinator.clone();

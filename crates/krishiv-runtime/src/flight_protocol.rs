@@ -280,12 +280,11 @@ fn parse_comment(comment: &str) -> Option<FlightDirective> {
             batches,
         });
     }
-    if comment.strip_prefix(CONTINUOUS_DRAIN) == Some("") {
-        return None;
-    }
     if let Some(rest) = comment.strip_prefix(CONTINUOUS_DRAIN) {
-        let job_id = rest.strip_prefix(':')?;
-        if !is_safe_identifier(job_id) {
+        // Require a colon separator followed by a non-empty safe identifier.
+        // A bare prefix with no colon (rest == "") is rejected here too.
+        let job_id = rest.strip_prefix(':').unwrap_or("").trim();
+        if job_id.is_empty() || !is_safe_identifier(job_id) {
             return None;
         }
         return Some(FlightDirective::ContinuousDrain {

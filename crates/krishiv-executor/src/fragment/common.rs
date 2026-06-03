@@ -345,8 +345,10 @@ pub(crate) fn read_inline_ipc_partitions(
     let mut result = Vec::new();
     for partition in partitions {
         // Handle zero-copy InMemory partitions directly — no IPC decode needed.
-        if let Some(InputPartitionDescriptor::InMemory { table_name, batches }) =
-            partition.descriptor()
+        if let Some(InputPartitionDescriptor::InMemory {
+            table_name,
+            batches,
+        }) = partition.descriptor()
         {
             let owned: Vec<_> = batches.iter().map(|b| (**b).clone()).collect();
             result.push((table_name.clone(), owned));

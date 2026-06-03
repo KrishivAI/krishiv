@@ -23,7 +23,7 @@ use tokio::sync::{Notify, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, ExecutorHeartbeatEffects,
 };
-use crate::admission::{InMemoryQueueManager, QueueManager};
+use crate::admission::{QueueManager, QuotaPolicy, QuotaQueueManager};
 use crate::barrier_dispatch::drive_barrier_dispatches;
 use crate::checkpoint::{CheckpointCoordinator, CheckpointCoordinatorState};
 use crate::config::CoordinatorConfig;
@@ -620,6 +620,22 @@ impl Drop for OrchestratorHandles {
     }
 }
 
+/// Build a `QuotaPolicy` from environment variables.
+///
+/// Reads `KRISHIV_MAX_CONCURRENT_JOBS` (integer) and returns an all-unlimited
+/// policy when the variable is absent or invalid.  This is called once at
+/// coordinator construction so all limits are static for the lifetime of the
+/// process; operators must restart to pick up new env var values.
+fn quota_policy_from_env() -> QuotaPolicy {
+    let max_jobs = std::env::var("KRISHIV_MAX_CONCURRENT_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    QuotaPolicy {
+        max_concurrent_jobs: max_jobs,
+        ..QuotaPolicy::default()
+    }
+}
+
 impl Coordinator {
     /// Create an active R2 coordinator.
     pub fn active(coordinator_id: CoordinatorId) -> Self {
@@ -642,7 +658,14 @@ impl Coordinator {
             ),
             store: None,
             checkpoint_coordinators: HashMap::new(),
-            queue_manager: Arc::new(InMemoryQueueManager),
+            // Default to QuotaQueueManager with all-unlimited policy — identical
+            // admission behaviour to InMemoryQueueManager but allows operators to
+            // set real limits via with_queue_manager() without a code change.
+            // KRISHIV_MAX_CONCURRENT_JOBS env var is honoured at daemon startup;
+            // other limits require explicit CoordinatorConfig::with_queue_manager().
+            queue_manager: Arc::new(QuotaQueueManager::with_default(
+                quota_policy_from_env(),
+            )),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,
@@ -823,9 +846,10 @@ impl Coordinator {
                                 "resetting stalled task (no progress for >30 min)"
                             );
                             task.state = krishiv_proto::TaskState::Failed;
-                            task.last_failure_reason =
-                                Some(format!("task stalled: no progress for {} min",
-                                    now_ms.saturating_sub(assigned_ms) / 60_000));
+                            task.last_failure_reason = Some(format!(
+                                "task stalled: no progress for {} min",
+                                now_ms.saturating_sub(assigned_ms) / 60_000
+                            ));
                             task.launch_in_flight = false;
                             task.assigned_at_ms = None;
                         }

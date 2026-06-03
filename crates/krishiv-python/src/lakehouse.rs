@@ -129,11 +129,11 @@ pub struct PySchemaRegistryConfig {
     pub(crate) inner: krishiv_schema_registry::SchemaRegistryConfig,
 }
 
-use std::sync::Arc;
 use krishiv_catalog::iceberg_rest::{
-    GlueRestCatalog, IcebergCatalogClient, IcebergTableId, NessieCatalog, GenericRestCatalog,
+    GenericRestCatalog, GlueRestCatalog, IcebergCatalogClient, IcebergTableId, NessieCatalog,
     RestCatalogConfig,
 };
+use std::sync::Arc;
 
 /// AWS Glue Iceberg catalog (R18 S3.1).
 ///
@@ -149,9 +149,16 @@ pub struct PyGlueCatalog {
 impl PyGlueCatalog {
     #[new]
     #[pyo3(signature = (region, database, rest_url, timeout_ms=None))]
-    pub fn new(region: String, database: String, rest_url: String, timeout_ms: Option<u64>) -> PyResult<Self> {
+    pub fn new(
+        region: String,
+        database: String,
+        rest_url: String,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Self> {
         Ok(Self {
-            inner: Arc::new(GlueRestCatalog::with_timeout(region, database, rest_url, timeout_ms)),
+            inner: Arc::new(GlueRestCatalog::with_timeout(
+                region, database, rest_url, timeout_ms,
+            )),
         })
     }
 
@@ -167,7 +174,10 @@ impl PyGlueCatalog {
 
     /// Load table metadata for `namespace.table_name` as a JSON string.
     pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
-        let table_id = IcebergTableId { namespace, name: table_name };
+        let table_id = IcebergTableId {
+            namespace,
+            name: table_name,
+        };
         RUNTIME
             .block_on(self.inner.load_table_metadata(&table_id))
             .map(|v| v.to_string())
@@ -206,7 +216,10 @@ impl PyNessieCatalog {
 
     /// Load table metadata for `namespace.table_name` as a JSON string.
     pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
-        let table_id = IcebergTableId { namespace, name: table_name };
+        let table_id = IcebergTableId {
+            namespace,
+            name: table_name,
+        };
         RUNTIME
             .block_on(self.inner.load_table_metadata(&table_id))
             .map(|v| v.to_string())
@@ -253,7 +266,10 @@ impl PyIcebergRestCatalog {
 
     /// Load table metadata for `namespace.table_name` as a JSON string.
     pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
-        let table_id = IcebergTableId { namespace, name: table_name };
+        let table_id = IcebergTableId {
+            namespace,
+            name: table_name,
+        };
         RUNTIME
             .block_on(self.inner.load_table_metadata(&table_id))
             .map(|v| v.to_string())
@@ -288,15 +304,19 @@ mod catalog_tests {
 
     #[test]
     fn iceberg_rest_catalog_new_succeeds() {
-        let cat =
-            PyIcebergRestCatalog::new("http://catalog.example.com".into(), Some("my_warehouse".into()), None)
-                .unwrap();
+        let cat = PyIcebergRestCatalog::new(
+            "http://catalog.example.com".into(),
+            Some("my_warehouse".into()),
+            None,
+        )
+        .unwrap();
         let _ = cat;
     }
 
     #[test]
     fn iceberg_rest_catalog_new_without_warehouse_succeeds() {
-        let cat = PyIcebergRestCatalog::new("http://catalog.example.com".into(), None, None).unwrap();
+        let cat =
+            PyIcebergRestCatalog::new("http://catalog.example.com".into(), None, None).unwrap();
         let _ = cat;
     }
 
@@ -322,8 +342,7 @@ mod catalog_tests {
 
     #[test]
     fn nessie_catalog_list_tables_returns_err_on_unreachable_server() {
-        let cat =
-            PyNessieCatalog::new("http://127.0.0.1:19999".into(), "main", None).unwrap();
+        let cat = PyNessieCatalog::new("http://127.0.0.1:19999".into(), "main", None).unwrap();
         let result = cat.list_tables("warehouse".into());
         assert!(
             result.is_err(),
@@ -333,8 +352,7 @@ mod catalog_tests {
 
     #[test]
     fn iceberg_rest_catalog_list_tables_returns_err_on_unreachable_server() {
-        let cat =
-            PyIcebergRestCatalog::new("http://127.0.0.1:19999".into(), None, None).unwrap();
+        let cat = PyIcebergRestCatalog::new("http://127.0.0.1:19999".into(), None, None).unwrap();
         let result = cat.list_tables("default".into());
         assert!(
             result.is_err(),

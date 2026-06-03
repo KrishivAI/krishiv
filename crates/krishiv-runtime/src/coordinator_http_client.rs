@@ -1,6 +1,5 @@
 //! HTTP client for the cluster control plane APIs.
 
-use base64::Engine as _;
 use krishiv_scheduler::decode_inline_record_batches;
 use std::sync::OnceLock;
 
@@ -35,6 +34,10 @@ fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
         }
     }
     let client = builder
+        // Per-request timeout caps individual HTTP calls at 60 s.
+        // The job-level poll loop enforces a separate 300 s deadline,
+        // so this guards against TCP-level stalls within a single request.
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))?;
     let _ = COORDINATOR_HTTP_CLIENT.set(client.clone()); // ignore if another thread won the race
@@ -83,6 +86,71 @@ struct BatchSqlResponseBody {
     error: Option<String>,
 }
 
+/// Shared poll loop for batch-SQL jobs.
+///
+/// First poll is immediate; subsequent non-terminal responses back off
+/// exponentially (50 ms → 500 ms) with ±25 % jitter derived from
+/// `job_id` bytes so clients started simultaneously don't synchronise
+/// their retries on a coordinator restart.
+async fn poll_batch_sql_job(
+    client: &reqwest::Client,
+    poll_url: &str,
+    job_id: &str,
+    deadline: tokio::time::Instant,
+) -> RuntimeResult<Vec<arrow::record_batch::RecordBatch>> {
+    // Deterministic jitter seed: xor-fold of job_id bytes avoids rand dep.
+    let seed: u64 = job_id
+        .as_bytes()
+        .iter()
+        .fold(0u64, |acc, &b| acc ^ (acc << 5).wrapping_add(b as u64));
+
+    let mut backoff_ms: Option<u64> = None;
+    loop {
+        if let Some(ms) = backoff_ms {
+            // Apply ±25 % jitter; minimum 10 ms.
+            let jitter_pct = (seed.wrapping_add(ms) % 51) as i64 - 25; // [-25, 25]
+            let jittered = ((ms as i64) + (ms as i64) * jitter_pct / 100).max(10) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(jittered)).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RuntimeError::transport(format!(
+                "batch-sql job {job_id} timed out after 300s"
+            )));
+        }
+        let poll_resp = client
+            .get(poll_url)
+            .send()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("batch-sql poll failed: {e}")))?;
+        if !poll_resp.status().is_success() {
+            return Err(RuntimeError::transport(format!(
+                "batch-sql poll HTTP {} from {poll_url}",
+                poll_resp.status()
+            )));
+        }
+        let payload: BatchSqlResponseBody = poll_resp
+            .json()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("batch-sql poll decode failed: {e}")))?;
+        match payload.state.as_str() {
+            "Succeeded" => {
+                return decode_inline_record_batches(&payload.inline_record_batch_ipc)
+                    .map_err(RuntimeError::transport);
+            }
+            "Failed" | "Cancelled" => {
+                return Err(RuntimeError::transport(format!(
+                    "batch-sql job {job_id} finished in state {}{}",
+                    payload.state,
+                    payload.error.map(|e| format!(": {e}")).unwrap_or_default()
+                )));
+            }
+            _ => {
+                backoff_ms = Some(backoff_ms.map_or(50, |prev| (prev * 2).min(500)));
+            }
+        }
+    }
+}
+
 /// Execute batch SQL via the coordinator using an async submit-then-poll pattern.
 ///
 /// 1. `POST /api/v1/batch-sql/submit` — submits the job, returns `job_id` immediately.
@@ -103,23 +171,20 @@ pub async fn execute_coordinator_batch_sql(
     // parquet_file_to_ipc_b64 is CPU/IO-bound; run it on the blocking thread pool so
     // the async executor is not stalled while reading and encoding the files.
     let tables_owned: Vec<_> = tables.to_vec();
-    let inline_tables: Vec<BatchSqlInlineTableJson> =
-        tokio::task::spawn_blocking(move || {
-            tables_owned
-                .iter()
-                .map(|t| {
-                    let ipc_b64 = parquet_file_to_ipc_b64(&t.path)?;
-                    Ok(BatchSqlInlineTableJson {
-                        table_name: t.table_name.clone(),
-                        ipc_b64,
-                    })
+    let inline_tables: Vec<BatchSqlInlineTableJson> = tokio::task::spawn_blocking(move || {
+        tables_owned
+            .iter()
+            .map(|t| {
+                let ipc_b64 = parquet_file_to_ipc_b64(&t.path)?;
+                Ok(BatchSqlInlineTableJson {
+                    table_name: t.table_name.clone(),
+                    ipc_b64,
                 })
-                .collect::<RuntimeResult<_>>()
-        })
-        .await
-        .map_err(|e| {
-            RuntimeError::transport(format!("parquet-to-ipc blocking task failed: {e}"))
-        })??;
+            })
+            .collect::<RuntimeResult<_>>()
+    })
+    .await
+    .map_err(|e| RuntimeError::transport(format!("parquet-to-ipc blocking task failed: {e}")))??;
 
     let submit_body = BatchSqlRequestBody {
         query: query.to_owned(),
@@ -153,58 +218,10 @@ pub async fn execute_coordinator_batch_sql(
         .map_err(|e| RuntimeError::transport(format!("batch-sql submit decode failed: {e}")))?
         .job_id;
 
-    // Step 2: poll until terminal state (timeout matches coordinator-side deadline).
-    // First poll is immediate (no initial sleep) so sub-50ms jobs don't pay a
-    // gratuitous delay. Subsequent polls use exponential backoff up to 500ms.
+    // Step 2: poll until terminal state.
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-    let mut backoff_ms: Option<u64> = None; // None = poll immediately on first iteration
-    loop {
-        if let Some(ms) = backoff_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err(RuntimeError::transport(format!(
-                "batch-sql job {job_id} timed out after 300s"
-            )));
-        }
-
-        let poll_resp = client
-            .get(&poll_url)
-            .send()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("batch-sql poll failed: {e}")))?;
-
-        if !poll_resp.status().is_success() {
-            return Err(RuntimeError::transport(format!(
-                "batch-sql poll HTTP {} from {poll_url}",
-                poll_resp.status()
-            )));
-        }
-
-        let payload: BatchSqlResponseBody = poll_resp
-            .json()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("batch-sql poll decode failed: {e}")))?;
-
-        match payload.state.as_str() {
-            "Succeeded" => {
-                return decode_inline_record_batches(&payload.inline_record_batch_ipc)
-                    .map_err(RuntimeError::transport);
-            }
-            "Failed" | "Cancelled" => {
-                return Err(RuntimeError::transport(format!(
-                    "batch-sql job {job_id} finished in state {}{}",
-                    payload.state,
-                    payload.error.map(|e| format!(": {e}")).unwrap_or_default()
-                )));
-            }
-            _ => {
-                backoff_ms = Some(backoff_ms.map_or(50, |prev| (prev * 2).min(500)));
-            }
-        }
-    }
+    poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 
 /// Execute batch SQL via the coordinator with **pre-encoded inline IPC** tables.
@@ -260,46 +277,7 @@ pub async fn execute_coordinator_batch_sql_inline(
 
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-    let mut backoff_ms = 50u64;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(RuntimeError::transport(format!(
-                "batch-sql job {job_id} timed out after 300s"
-            )));
-        }
-        let poll_resp = client
-            .get(&poll_url)
-            .send()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("batch-sql poll failed: {e}")))?;
-        if !poll_resp.status().is_success() {
-            return Err(RuntimeError::transport(format!(
-                "batch-sql poll HTTP {} from {poll_url}",
-                poll_resp.status()
-            )));
-        }
-        let payload: BatchSqlResponseBody = poll_resp
-            .json()
-            .await
-            .map_err(|e| RuntimeError::transport(format!("batch-sql poll decode failed: {e}")))?;
-        match payload.state.as_str() {
-            "Succeeded" => {
-                return decode_inline_record_batches(&payload.inline_record_batch_ipc)
-                    .map_err(RuntimeError::transport);
-            }
-            "Failed" | "Cancelled" => {
-                return Err(RuntimeError::transport(format!(
-                    "batch-sql job {job_id} finished in state {}{}",
-                    payload.state,
-                    payload.error.map(|e| format!(": {e}")).unwrap_or_default()
-                )));
-            }
-            _ => {
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(500);
-            }
-        }
-    }
+    poll_batch_sql_job(&client, &poll_url, &job_id, deadline).await
 }
 
 // ── Bounded Window ─────────────────────────────────────────────────────────────
@@ -438,12 +416,10 @@ pub async fn execute_coordinator_continuous_register(
     let body = ContinuousRegisterRequest { job_id, spec };
 
     let client = coordinator_http_client()?;
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("continuous-register request failed: {e}")))?;
+    let response =
+        client.post(&url).json(&body).send().await.map_err(|e| {
+            RuntimeError::transport(format!("continuous-register request failed: {e}"))
+        })?;
 
     if !response.status().is_success() {
         return Err(RuntimeError::transport(format!(
@@ -511,12 +487,10 @@ pub async fn execute_coordinator_continuous_drain(
     let body = ContinuousDrainRequest { job_id };
 
     let client = coordinator_http_client()?;
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| RuntimeError::transport(format!("continuous-drain request failed: {e}")))?;
+    let response =
+        client.post(&url).json(&body).send().await.map_err(|e| {
+            RuntimeError::transport(format!("continuous-drain request failed: {e}"))
+        })?;
 
     if !response.status().is_success() {
         return Err(RuntimeError::transport(format!(

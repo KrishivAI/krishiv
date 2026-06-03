@@ -286,7 +286,7 @@ pub(crate) async fn execute_streaming_fragment(
     //   4. <default>          — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
         let engine = std::sync::Arc::clone(&runner.sql_engine);
-        
+
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
         let dataframe = engine
             .sql(query)
@@ -294,34 +294,51 @@ pub(crate) async fn execute_streaming_fragment(
             .map_err(|error| ExecutorError::LocalExecution {
                 message: error.to_string(),
             })?;
-            
-        let mut stream = dataframe.execute_stream().await.map_err(|error| {
-            ExecutorError::LocalExecution { message: error.to_string() }
-        })?;
-        
+
+        let mut stream =
+            dataframe
+                .execute_stream()
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
+
         use tokio_stream::StreamExt;
         let mut total_rows = 0;
         let mut total_batches = 0;
         let mut column_count = 0;
-        
+
         while let Some(batch_res) = stream.next().await {
-            let batch = batch_res.map_err(|error| {
-                ExecutorError::LocalExecution { message: error.to_string() }
+            let batch = batch_res.map_err(|error| ExecutorError::LocalExecution {
+                message: error.to_string(),
             })?;
-            
+
             column_count = batch.num_columns();
-            
+
             if assignment.output_contract().kind() == krishiv_proto::OutputContractKind::Sink
-                && assignment.output_contract().description().trim().starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX)
+                && assignment
+                    .output_contract()
+                    .description()
+                    .trim()
+                    .starts_with(crate::runner::OBJECT_PARQUET_SINK_PREFIX)
             {
-                crate::fragment::common::write_object_parquet_sink(assignment.output_contract(), &[batch.clone()]).await?;
+                crate::fragment::common::write_object_parquet_sink(
+                    assignment.output_contract(),
+                    &[batch.clone()],
+                )
+                .await?;
             }
-            
+
             total_rows += batch.num_rows();
             total_batches += 1;
         }
-        
-        return Ok(ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, vec![]));
+
+        return Ok(ExecutorTaskOutput::streaming_window(
+            total_rows,
+            total_batches,
+            column_count,
+            vec![],
+        ));
     }
 
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
@@ -473,13 +490,15 @@ async fn execute_streaming_with_batches(
     spec: WindowExecutionSpec,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
-    let collected = execute_bounded_window(batches, &spec).map_err(|e| ExecutorError::LocalExecution {
-        message: e.to_string(),
-    })?;
+    let collected =
+        execute_bounded_window(batches, &spec).map_err(|e| ExecutorError::LocalExecution {
+            message: e.to_string(),
+        })?;
     let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected.len();
     let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);
-    let mut output = ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, collected);
+    let mut output =
+        ExecutorTaskOutput::streaming_window(total_rows, total_batches, column_count, collected);
     if let Some(wm) = observed_watermark_ms {
         output = output.with_watermark_ms(wm);
     }

@@ -122,7 +122,10 @@ impl MetadataStore for EtcdMetadataStore {
         &self.jobs
     }
 
-    fn save_executor(&mut self, descriptor: &krishiv_proto::ExecutorDescriptor) -> SchedulerResult<()> {
+    fn save_executor(
+        &mut self,
+        descriptor: &krishiv_proto::ExecutorDescriptor,
+    ) -> SchedulerResult<()> {
         if let Some(pos) = self
             .executor_descriptors
             .iter()

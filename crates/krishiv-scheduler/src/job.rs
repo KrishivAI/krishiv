@@ -768,6 +768,11 @@ pub struct TaskRecord {
     /// Last committed source offset reported by the executor for this streaming task.
     /// Connector-specific encoding; `None` for batch tasks.
     pub(crate) last_source_offset: Option<Vec<u8>>,
+    /// Wall-clock timestamp (ms since UNIX epoch) when the task most recently
+    /// transitioned to Running state. Used by the coordinator stall-detection
+    /// loop (R5) to identify tasks that have been in-flight for too long without
+    /// completing, which may indicate a deadlocked or hung operator.
+    pub(crate) assigned_at_ms: Option<u64>,
 }
 
 impl TaskRecord {
@@ -784,6 +789,7 @@ impl TaskRecord {
             executor_loss_count: 0,
             last_watermark_ms: None,
             last_source_offset: None,
+            assigned_at_ms: None,
         }
     }
 
@@ -904,6 +910,14 @@ impl TaskRecord {
         }
         if self.state == TaskState::Failed {
             self.last_failure_reason = update.message().map(ToOwned::to_owned);
+        }
+        // R5: Record assignment time when the task starts running so the
+        // coordinator stall-detection loop can identify hung tasks.
+        if self.state == TaskState::Running {
+            self.assigned_at_ms =
+                Some(u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0));
+        } else if self.state.is_terminal() {
+            self.assigned_at_ms = None;
         }
         Ok(TaskUpdateOutcome::Applied)
     }

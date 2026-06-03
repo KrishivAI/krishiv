@@ -3,11 +3,11 @@
 //! DataFusion does not natively understand the Krishiv-extended
 //! `CREATE FUNCTION … RETURNS TABLE (col TYPE, …) LANGUAGE … AS '…'` syntax.
 //! This module intercepts such statements before they reach DataFusion and
-//! registers a stub [`TableUdf`][krishiv_udf::TableUdf] so that subsequent
-//! `SELECT * FROM my_udtf(…)` queries resolve correctly.
+//! registers a [`TableUdf`][krishiv_udf::TableUdf] backed by either:
 //!
-//! The function body is captured but not compiled or executed by this layer —
-//! that is the responsibility of the UDF runtime (future work).
+//! * A SQL body (`LANGUAGE sql AS '…'`) — executed via the session context.
+//! * A runtime-provided Rust closure — registered via `SqlEngine::register_table_udf_fn`.
+//! * A stub that returns a clear "not yet implemented" error for other languages.
 
 use std::sync::Arc;
 
@@ -144,23 +144,34 @@ fn sql_type_to_arrow(type_str: &str) -> Result<DataType, String> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Stub TableUdf
+// UDTF implementations
 // ────────────────────────────────────────────────────────────────────────────
 
-/// A stub [`TableUdf`] that holds the declared output schema but returns
-/// an empty [`RecordBatch`] on every call.
-///
-/// This is used to satisfy DataFusion's UDTF registry so that functions
-/// declared via `CREATE FUNCTION … RETURNS TABLE` can be resolved at
-/// planning time.  The actual body execution is deferred to the UDF runtime.
-#[derive(Debug)]
+/// Body-function type alias for runtime-registered UDTFs.
+pub type UdtfBodyFn =
+    Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>;
+
+/// A [`TableUdf`] backed by either a runtime closure or the "not yet
+/// implemented" error for unsupported language bodies.
+#[derive(Clone)]
 pub struct StubTableUdf {
-    name: String,
-    schema: Schema,
+    pub(crate) name: String,
+    pub(crate) schema: Schema,
+    /// Optional runtime-provided body.  `None` → return a clear error.
+    body_fn: Option<UdtfBodyFn>,
+}
+
+impl std::fmt::Debug for StubTableUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StubTableUdf")
+            .field("name", &self.name)
+            .field("has_body", &self.body_fn.is_some())
+            .finish()
+    }
 }
 
 impl StubTableUdf {
-    /// Build a stub from a parsed [`CreateFunctionDdl`].
+    /// Build a stub (no body) from a parsed [`CreateFunctionDdl`].
     pub fn from_ddl(ddl: &CreateFunctionDdl) -> Self {
         let fields: Vec<Field> = ddl
             .return_columns
@@ -170,7 +181,14 @@ impl StubTableUdf {
         Self {
             name: ddl.function_name.clone(),
             schema: Schema::new(fields),
+            body_fn: None,
         }
+    }
+
+    /// Attach a runtime body function.
+    pub fn with_body_fn(mut self, f: UdtfBodyFn) -> Self {
+        self.body_fn = Some(f);
+        self
     }
 }
 
@@ -183,9 +201,92 @@ impl TableUdf for StubTableUdf {
         &self.schema
     }
 
+    fn call(&self, args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
+        match &self.body_fn {
+            Some(f) => f(args),
+            None => Err(UdfError::Execution {
+                message: format!(
+                    "UDTF '{}': body execution is not yet implemented; \
+                     register a body via SqlEngine::register_table_udf_fn() \
+                     or use LANGUAGE sql AS '…'",
+                    self.name
+                ),
+            }),
+        }
+    }
+}
+
+/// A [`TableUdf`] whose body is a SQL query executed via a DataFusion session.
+///
+/// Created by `SqlEngine` when `CREATE FUNCTION … LANGUAGE sql AS '…'` is
+/// processed.  Uses `block_in_place` so the sync `TableFunctionImpl::call()`
+/// can safely block on async SQL execution without deadlocking the runtime.
+#[derive(Clone)]
+pub struct SqlBodyTableUdf {
+    pub(crate) name: String,
+    pub(crate) schema: Schema,
+    body_sql: String,
+    ctx: Arc<datafusion::prelude::SessionContext>,
+}
+
+impl std::fmt::Debug for SqlBodyTableUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqlBodyTableUdf")
+            .field("name", &self.name)
+            .field("body_sql", &self.body_sql)
+            .finish()
+    }
+}
+
+impl SqlBodyTableUdf {
+    pub fn new(
+        name: impl Into<String>,
+        schema: Schema,
+        body_sql: impl Into<String>,
+        ctx: Arc<datafusion::prelude::SessionContext>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            body_sql: body_sql.into(),
+            ctx,
+        }
+    }
+}
+
+impl TableUdf for SqlBodyTableUdf {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn output_schema(&self) -> &Schema {
+        &self.schema
+    }
+
     fn call(&self, _args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
-        // Return an empty batch with the declared schema.
-        Ok(RecordBatch::new_empty(Arc::new(self.schema.clone())))
+        // Execute the SQL body synchronously using block_in_place so this
+        // sync call-site can safely await without deadlocking the executor.
+        // TODO: substitute $1, $2, … arg placeholders for parameterized UDTFs.
+        let ctx = Arc::clone(&self.ctx);
+        let sql = self.body_sql.clone();
+        let schema = Arc::new(self.schema.clone());
+        tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
+                    message: e.to_string(),
+                })?;
+                let batches = df
+                    .collect()
+                    .await
+                    .map_err(|e| UdfError::Execution { message: e.to_string() })?;
+                if batches.is_empty() {
+                    return Ok(RecordBatch::new_empty(schema));
+                }
+                arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                    .map_err(|e| UdfError::Arrow(e.to_string()))
+            })
+        })
     }
 }
 
@@ -280,13 +381,19 @@ mod tests {
     }
 
     #[test]
-    fn stub_table_udf_returns_empty_batch() {
+    fn stub_table_udf_call_returns_not_implemented_error() {
+        // StubTableUdf is schema-only; calling it returns a clear "not implemented"
+        // error so users get an actionable message rather than silent empty results.
         let ddl = parse_create_function(BASIC_DDL).expect("should parse");
         let stub = StubTableUdf::from_ddl(&ddl);
-        let batch = stub.call(&[]).expect("call should succeed");
-        assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().field(0).name(), "col1");
-        assert_eq!(batch.schema().field(1).name(), "col2");
+        let err = stub.call(&[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("my_udtf"), "error should include function name");
+        assert!(msg.contains("not yet implemented") || msg.contains("not implemented"),
+            "error should indicate unimplemented: {msg}");
+        // Schema is still accessible for planning.
+        assert_eq!(stub.output_schema().field(0).name(), "col1");
+        assert_eq!(stub.output_schema().field(1).name(), "col2");
     }
 
     #[test]

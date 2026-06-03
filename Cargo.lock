@@ -4098,6 +4098,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tonic 0.14.6",
+ "tracing",
  "uuid",
 ]
 

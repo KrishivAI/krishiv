@@ -3134,7 +3134,10 @@ mod tests {
         // Simulate restart by creating a fresh storage pointing at the same dir.
         let storage2 = LocalFsCheckpointStorage::new(dir.path()).unwrap();
         let epochs = list_valid_epochs(&storage2, "restart-job").unwrap();
-        assert!(epochs.contains(&1), "epoch 1 must survive storage recreate (restart)");
+        assert!(
+            epochs.contains(&1),
+            "epoch 1 must survive storage recreate (restart)"
+        );
         let latest = latest_valid_epoch(&storage2, "restart-job").unwrap();
         assert_eq!(latest, 1, "latest_valid_epoch must return 1 after restart");
     }

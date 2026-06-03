@@ -16,7 +16,8 @@ use crate::dataframe::DataFrame;
 use crate::error::{KrishivError, Result};
 
 /// Alias for the inner stream error type used by the window runtime.
-type ExecStream = Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_exec::ExecError>> + Send>>;
+type ExecStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_exec::ExecError>> + Send>>;
 
 pub type KrishivStream = krishiv_plan::SendableRecordBatchStream;
 
@@ -120,9 +121,7 @@ impl StreamingDataFrame {
         })?;
 
         let key_column = self.key_column.ok_or_else(|| {
-            KrishivError::unsupported(
-                "streaming aggregations require a key column (use .key_by())",
-            )
+            KrishivError::unsupported("streaming aggregations require a key column (use .key_by())")
         })?;
 
         let window_kind = self.window_kind.unwrap_or(LocalWindowKind::Tumbling);
@@ -168,8 +167,12 @@ impl StreamingDataFrame {
             Box::pin(df_stream.map(|res| res.map_err(krishiv_exec::ExecError::InvalidWindowConfig)))
         };
 
-        let windowed = krishiv_runtime::execute_streaming_window(input_stream, &spec)
-            .map_err(|e| KrishivError::Runtime { message: e.to_string() })?;
+        let windowed =
+            krishiv_runtime::execute_streaming_window(input_stream, &spec).map_err(|e| {
+                KrishivError::Runtime {
+                    message: e.to_string(),
+                }
+            })?;
 
         let mapped_output_stream = windowed.map(|res| res.map_err(|e| e.to_string()));
         Ok(Box::pin(mapped_output_stream))
@@ -184,7 +187,10 @@ fn filter_on_time_rows(
     watermark_lag_ms: u64,
 ) -> Option<RecordBatch> {
     let col_idx = batch.schema().index_of(&router.event_time_column).ok()?;
-    let ts_col = batch.column(col_idx).as_any().downcast_ref::<Int64Array>()?;
+    let ts_col = batch
+        .column(col_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()?;
     // Build a per-call watermark from the max event time in this batch.
     let mut wm = WatermarkState::new(watermark_lag_ms);
     for i in 0..ts_col.len() {
@@ -194,7 +200,11 @@ fn filter_on_time_rows(
     }
     let keep: Vec<u32> = (0..batch.num_rows() as u32)
         .filter(|&i| {
-            let et = if ts_col.is_null(i as usize) { 0 } else { ts_col.value(i as usize) };
+            let et = if ts_col.is_null(i as usize) {
+                0
+            } else {
+                ts_col.value(i as usize)
+            };
             !router.is_late(&wm, et)
         })
         .collect();
@@ -234,7 +244,9 @@ pub fn temporal_join(
         let ver_idx = snap
             .schema()
             .index_of(&spec.table_version_col)
-            .map_err(|e| KrishivError::Runtime { message: e.to_string() })?;
+            .map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
         let ver_col = snap
             .column(ver_idx)
             .as_any()
@@ -257,7 +269,9 @@ pub fn temporal_join(
         let time_idx = stream_batch
             .schema()
             .index_of(&spec.stream_time_col)
-            .map_err(|e| KrishivError::Runtime { message: e.to_string() })?;
+            .map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
         let time_col = stream_batch
             .column(time_idx)
             .as_any()
@@ -304,7 +318,9 @@ pub fn interval_join(
         let idx = batch
             .schema()
             .index_of(col)
-            .map_err(|e| KrishivError::Runtime { message: e.to_string() })?;
+            .map_err(|e| KrishivError::Runtime {
+                message: e.to_string(),
+            })?;
         let arr = batch
             .column(idx)
             .as_any()
@@ -312,7 +328,9 @@ pub fn interval_join(
             .ok_or_else(|| KrishivError::Runtime {
                 message: format!("event time column '{col}' must be Int64"),
             })?;
-        Ok((0..arr.len()).map(|i| if arr.is_null(i) { 0 } else { arr.value(i) }).collect())
+        Ok((0..arr.len())
+            .map(|i| if arr.is_null(i) { 0 } else { arr.value(i) })
+            .collect())
     };
 
     for batch in left_batches {
@@ -341,8 +359,8 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use krishiv_exec::temporal_join::TemporalJoinSpec;
     use krishiv_exec::interval_join::IntervalJoinSpec;
+    use krishiv_exec::temporal_join::TemporalJoinSpec;
 
     use super::{interval_join, temporal_join};
 
@@ -415,7 +433,11 @@ mod tests {
         };
 
         let pairs = temporal_join(&[stream], &[table], &spec, 60_000).unwrap();
-        assert_eq!(pairs.len(), 1, "one stream event must produce one output pair");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "one stream event must produce one output pair"
+        );
         assert!(pairs[0].1.is_some(), "should find a matching table version");
         // Matched version should be t=100, not t=500
         let matched_batch = pairs[0].1.as_ref().unwrap();
@@ -441,7 +463,10 @@ mod tests {
         };
 
         let pairs = temporal_join(&[stream], &[table], &spec, 60_000).unwrap();
-        assert!(pairs.is_empty(), "inner join must exclude rows with no table match");
+        assert!(
+            pairs.is_empty(),
+            "inner join must exclude rows with no table match"
+        );
     }
 
     #[test]
@@ -458,7 +483,10 @@ mod tests {
 
         let pairs = temporal_join(&[stream], &[table], &spec, 60_000).unwrap();
         assert_eq!(pairs.len(), 1);
-        assert!(pairs[0].1.is_none(), "left join must include row with None table match");
+        assert!(
+            pairs[0].1.is_none(),
+            "left join must include row with None table match"
+        );
     }
 
     #[test]
@@ -467,7 +495,10 @@ mod tests {
         let left = interval_batch(&[100], &[1]);
         let right = interval_batch(&[150], &[2]);
 
-        let spec = IntervalJoinSpec { lower_bound_ms: 0, upper_bound_ms: 100 };
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 100,
+        };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         assert_eq!(pairs.len(), 1, "events within window should match");
     }
@@ -478,7 +509,10 @@ mod tests {
         let left = interval_batch(&[100], &[1]);
         let right = interval_batch(&[300], &[2]);
 
-        let spec = IntervalJoinSpec { lower_bound_ms: 0, upper_bound_ms: 100 };
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 100,
+        };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty(), "events outside window must not match");
     }
@@ -489,7 +523,10 @@ mod tests {
         let left = interval_batch(&[1000], &[1]);
         let right = interval_batch(&[1050, 1080, 2000], &[10, 20, 30]);
 
-        let spec = IntervalJoinSpec { lower_bound_ms: 0, upper_bound_ms: 200 };
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 200,
+        };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         // 1050-1000=50 ✓, 1080-1000=80 ✓, 2000-1000=1000 ✗
         assert_eq!(pairs.len(), 2);
@@ -497,7 +534,10 @@ mod tests {
 
     #[test]
     fn interval_join_empty_inputs_returns_empty() {
-        let spec = IntervalJoinSpec { lower_bound_ms: 0, upper_bound_ms: 1000 };
+        let spec = IntervalJoinSpec {
+            lower_bound_ms: 0,
+            upper_bound_ms: 1000,
+        };
         let pairs = interval_join(&[], &[], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty());
     }

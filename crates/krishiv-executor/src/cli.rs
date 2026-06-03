@@ -317,7 +317,9 @@ async fn heartbeat_loop(
             flight_endpoint: endpoint,
         });
     }
-    let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(InMemoryShuffleStore::new())));
+    let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(
+        InMemoryShuffleStore::new(),
+    )));
     runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
 
     // Streaming progress buffer (GAP-OB-04): shared between runner tasks
@@ -359,7 +361,11 @@ async fn heartbeat_loop(
                 // Drain any pending barriers from the gRPC injector before
                 // picking up the next task assignment.
                 runner_loop
-                    .drain_pending_barriers(Arc::clone(&backend) as Arc<dyn krishiv_state::StateBackend>, Arc::clone(&storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>, coord.as_ref().clone())
+                    .drain_pending_barriers(
+                        Arc::clone(&backend) as Arc<dyn krishiv_state::StateBackend>,
+                        Arc::clone(&storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>,
+                        coord.as_ref().clone(),
+                    )
                     .await;
 
                 match runner_loop.run_next_with(coord.as_ref()).await {

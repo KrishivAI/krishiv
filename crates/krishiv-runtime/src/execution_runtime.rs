@@ -202,7 +202,6 @@ impl ExecutionRuntime for InProcessExecutionRuntime {
     }
 
     fn accept_plan(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-
         match self.mode {
             RuntimeMode::Embedded => {
                 let backend = EmbeddedBackend::default();
@@ -316,16 +315,22 @@ fn shard_batches_by_key(
     for batch in batches {
         // Clone the Arc<dyn Array> so that `keys` doesn't borrow `batch`,
         // allowing `filter_record_batch(batch, …)` later in the same scope.
-        let key_col_opt = batch.schema().index_of(key_column).ok()
+        let key_col_opt = batch
+            .schema()
+            .index_of(key_column)
+            .ok()
             .filter(|&idx| batch.column(idx).as_any().is::<StringArray>())
             .map(|idx| Arc::clone(batch.column(idx)));
 
         if let Some(key_col) = key_col_opt {
-            let keys = key_col.as_any().downcast_ref::<StringArray>()
+            let keys = key_col
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .expect("type already verified above");
             // Build one boolean mask per shard.
-            let mut masks: Vec<BooleanBuilder> =
-                (0..num_shards).map(|_| BooleanBuilder::with_capacity(batch.num_rows())).collect();
+            let mut masks: Vec<BooleanBuilder> = (0..num_shards)
+                .map(|_| BooleanBuilder::with_capacity(batch.num_rows()))
+                .collect();
             for i in 0..batch.num_rows() {
                 let shard = if keys.is_null(i) {
                     0
@@ -448,9 +453,8 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                             .ok()
                             .and_then(|r| r.response_watermark_ms);
                         if let Some(wm) = wm {
-                            global_watermark = Some(
-                                global_watermark.map_or(wm, |prev: i64| prev.min(wm)),
-                            );
+                            global_watermark =
+                                Some(global_watermark.map_or(wm, |prev: i64| prev.min(wm)));
                         }
                         all_batches.extend(decode_ipc_response(&body)?);
                     }
@@ -711,7 +715,10 @@ mod tests {
         assert_eq!(embedded.placement(), ExecutionPlacement::LocalInProcess);
         assert!(!embedded.uses_remote_execution());
         assert_eq!(
-            embedded.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap()[0].num_rows(),
+            embedded
+                .collect_batch_sql("SELECT 1 AS n", &[], false)
+                .unwrap()[0]
+                .num_rows(),
             1
         );
 
@@ -1085,7 +1092,9 @@ mod tests {
         // Verifies that batch SQL works end-to-end under the default durability profile.
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
-        let batches = rt.collect_batch_sql("SELECT 42 AS answer", &[], false).unwrap();
+        let batches = rt
+            .collect_batch_sql("SELECT 42 AS answer", &[], false)
+            .unwrap();
         assert_eq!(batches.len(), 1);
         let col = batches[0]
             .column(0)
@@ -1127,7 +1136,8 @@ mod tests {
         )
         .unwrap();
 
-        rt.push_continuous_stream_input("durable-j1", vec![batch]).unwrap();
+        rt.push_continuous_stream_input("durable-j1", vec![batch])
+            .unwrap();
         let first_drain = rt.drain_continuous_stream("durable-j1").unwrap();
 
         // Second drain with no new input must return empty (results consumed once).
@@ -1279,7 +1289,9 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::embedded(cluster);
         let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
-        let report = rt.accept_plan(&plan).expect("embedded accept_plan should delegate streaming plans");
+        let report = rt
+            .accept_plan(&plan)
+            .expect("embedded accept_plan should delegate streaming plans");
         assert_eq!(report.backend(), "single-node"); // Embedded mode delegates to SingleNode
     }
 
@@ -1288,7 +1300,9 @@ mod tests {
         let cluster = Arc::new(InProcessCluster::new().unwrap());
         let rt = InProcessExecutionRuntime::single_node(cluster);
         let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
-        let report = rt.accept_plan(&plan).expect("single-node accept_plan should handle streaming plans");
+        let report = rt
+            .accept_plan(&plan)
+            .expect("single-node accept_plan should handle streaming plans");
         assert_eq!(report.backend(), "single-node");
     }
 

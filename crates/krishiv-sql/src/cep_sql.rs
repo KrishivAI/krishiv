@@ -138,8 +138,9 @@ pub fn execute_match_recognize(
 
     if source_is_streaming {
         return Err(crate::SqlError::Unsupported {
-            feature: "MATCH_RECOGNIZE source must be bounded; \
-                      streaming sources are not supported — use a batch table or LIMIT"
+            feature: "MATCH_RECOGNIZE on unbounded streaming sources (e.g. Kafka) is not \
+                      supported in this release — use a bounded batch table, a windowed \
+                      sub-query, or add a LIMIT clause to cap the input size"
                 .into(),
         });
     }
@@ -150,9 +151,14 @@ pub fn execute_match_recognize(
 
     // Locate key and event-time column indices.
     let schema = source_batches[0].schema();
-    let key_idx = schema.index_of(&stmt.key_column).map_err(|_| SqlError::Unsupported {
-        feature: format!("MATCH_RECOGNIZE: key column '{}' not found", stmt.key_column),
-    })?;
+    let key_idx = schema
+        .index_of(&stmt.key_column)
+        .map_err(|_| SqlError::Unsupported {
+            feature: format!(
+                "MATCH_RECOGNIZE: key column '{}' not found",
+                stmt.key_column
+            ),
+        })?;
     let time_idx = schema
         .index_of(&stmt.event_time_column)
         .map_err(|_| SqlError::Unsupported {
@@ -182,7 +188,11 @@ pub fn execute_match_recognize(
         let key_str = key_col.as_any().downcast_ref::<StringArray>();
         for i in 0..batch.num_rows() {
             let key = if let Some(k) = key_str {
-                if k.is_null(i) { continue; } else { k.value(i).to_string() }
+                if k.is_null(i) {
+                    continue;
+                } else {
+                    k.value(i).to_string()
+                }
             } else {
                 i.to_string()
             };
@@ -199,7 +209,12 @@ pub fn execute_match_recognize(
     let mut key_states: HashMap<String, CepKeyState> = HashMap::new();
     let mut output: Vec<RecordBatch> = Vec::new();
 
-    let stage_names: Vec<&str> = stmt.pattern.stages.iter().map(|s| s.name.as_str()).collect();
+    let stage_names: Vec<&str> = stmt
+        .pattern
+        .stages
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
 
     for (key, event_time, batch_idx, row_idx) in &events {
         // Materialise the single-row slice only for the matcher call — still
@@ -211,8 +226,10 @@ pub fn execute_match_recognize(
         // new partial starts AND restarts-after-expiry (where stage_index stays
         // at 0 but start_time changes). Break as soon as state changes so each
         // event is consumed by exactly one stage.
-        let partial_key_before =
-            state.partial.as_ref().map(|p| (p.stage_index, p.start_time_ms));
+        let partial_key_before = state
+            .partial
+            .as_ref()
+            .map(|p| (p.stage_index, p.start_time_ms));
         for &stage in &stage_names {
             let completed = matcher.process_event(state, stage, row.clone(), *event_time);
             if !completed.is_empty() {
@@ -225,8 +242,10 @@ pub fn execute_match_recognize(
             }
             // Stop trying further stage names once the partial match state
             // changed (started, advanced, or reset-and-restarted).
-            let partial_key_after =
-                state.partial.as_ref().map(|p| (p.stage_index, p.start_time_ms));
+            let partial_key_after = state
+                .partial
+                .as_ref()
+                .map(|p| (p.stage_index, p.start_time_ms));
             if partial_key_after != partial_key_before {
                 break;
             }
@@ -319,9 +338,9 @@ mod tests {
     use super::*;
 
     fn make_batch_with_key_ts(keys: &[&str], times: &[i64]) -> arrow::record_batch::RecordBatch {
-        use std::sync::Arc;
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
             Field::new("ts", DataType::Int64, false),
@@ -338,8 +357,8 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_three_stage_pattern_produces_match() {
-        use std::time::Duration;
         use krishiv_cep::Pattern;
+        use std::time::Duration;
         let pattern = Pattern::begin("A")
             .followed_by("B")
             .followed_by("C")
@@ -355,20 +374,22 @@ mod tests {
         };
 
         // Three events for "u1" (one per stage) and one unrelated event for "u2".
-        let batch = make_batch_with_key_ts(
-            &["u1", "u1", "u1", "u2"],
-            &[1_000, 2_000, 3_000, 9_000],
-        );
+        let batch =
+            make_batch_with_key_ts(&["u1", "u1", "u1", "u2"], &[1_000, 2_000, 3_000, 9_000]);
 
         let result = execute_match_recognize(stmt, &[batch], false).unwrap();
         assert_eq!(result.len(), 1, "expected one completed A→B→C match for u1");
-        assert_eq!(result[0].num_rows(), 3, "match should span all three stage events");
+        assert_eq!(
+            result[0].num_rows(),
+            3,
+            "match should span all three stage events"
+        );
     }
 
     #[test]
     fn execute_match_recognize_no_match_when_window_expired() {
-        use std::time::Duration;
         use krishiv_cep::Pattern;
+        use std::time::Duration;
         let pattern = Pattern::begin("A")
             .followed_by("B")
             .within(Duration::from_millis(100))
@@ -390,8 +411,8 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_empty_source_returns_empty() {
-        use std::time::Duration;
         use krishiv_cep::Pattern;
+        use std::time::Duration;
         let pattern = Pattern::begin("A")
             .followed_by("B")
             .within(Duration::from_secs(10))
@@ -409,11 +430,11 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_two_keys_both_complete() {
-        use std::sync::Arc;
-        use std::time::Duration;
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use krishiv_cep::Pattern;
+        use std::sync::Arc;
+        use std::time::Duration;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
@@ -444,7 +465,11 @@ mod tests {
         };
 
         let result = execute_match_recognize(stmt, &[batch], false).unwrap();
-        assert_eq!(result.len(), 2, "both u1 and u2 must independently complete the A→B pattern");
+        assert_eq!(
+            result.len(),
+            2,
+            "both u1 and u2 must independently complete the A→B pattern"
+        );
         for matched in &result {
             assert_eq!(
                 matched.num_rows(),
@@ -458,11 +483,11 @@ mod tests {
     fn execute_match_recognize_boundary_event_at_exact_window_matches() {
         // An event arriving at exactly start_time + window_ms must still match
         // because the expiry check is strict greater-than (not >=).
-        use std::sync::Arc;
-        use std::time::Duration;
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use krishiv_cep::Pattern;
+        use std::sync::Arc;
+        use std::time::Duration;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
@@ -501,11 +526,11 @@ mod tests {
 
     #[test]
     fn execute_match_recognize_one_ms_past_window_does_not_match() {
-        use std::sync::Arc;
-        use std::time::Duration;
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use krishiv_cep::Pattern;
+        use std::sync::Arc;
+        use std::time::Duration;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
@@ -546,7 +571,9 @@ mod tests {
         // SqlEngine guards CEP against unbounded streaming sources.
         // This test exercises that guard via the engine-level sql() path.
         let engine = crate::SqlEngine::new();
-        engine.register_streaming_source_name("live_events").unwrap();
+        engine
+            .register_streaming_source_name("live_events")
+            .unwrap();
         // We can't easily make the async sql() call here synchronously, so just
         // verify is_streaming_source returns true (the guard relies on this).
         assert!(

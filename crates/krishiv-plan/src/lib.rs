@@ -24,7 +24,9 @@ pub use task_fragment::{
 };
 
 pub type SendableRecordBatchStream = std::pin::Pin<
-    Box<dyn futures::stream::Stream<Item = Result<arrow::record_batch::RecordBatch, String>> + Send>,
+    Box<
+        dyn futures::stream::Stream<Item = Result<arrow::record_batch::RecordBatch, String>> + Send,
+    >,
 >;
 
 /// Errors returned by plan encoding, decoding, and validation operations.

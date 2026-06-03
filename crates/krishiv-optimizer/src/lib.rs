@@ -2968,7 +2968,9 @@ mod tests {
     fn join_node(id: &str, left: &str, right: &str) -> PlanNode {
         PlanNode::new(id, "join", ExecutionKind::Batch)
             .with_inputs(vec![left.to_string(), right.to_string()])
-            .with_op(NodeOp::Join { join_type: krishiv_plan::JoinType::Inner })
+            .with_op(NodeOp::Join {
+                join_type: krishiv_plan::JoinType::Inner,
+            })
     }
 
     #[test]
@@ -2991,7 +2993,11 @@ mod tests {
 
         let result = PredicatePushdownRule.apply(&plan).unwrap();
 
-        let users_scan = result.nodes().iter().find(|n| n.id() == "scan-users").unwrap();
+        let users_scan = result
+            .nodes()
+            .iter()
+            .find(|n| n.id() == "scan-users")
+            .unwrap();
         if let Some(NodeOp::Scan { filters, .. }) = users_scan.op() {
             assert!(
                 !filters.is_empty(),
@@ -3005,7 +3011,11 @@ mod tests {
             panic!("scan-users must have NodeOp::Scan");
         }
 
-        let orders_scan = result.nodes().iter().find(|n| n.id() == "scan-orders").unwrap();
+        let orders_scan = result
+            .nodes()
+            .iter()
+            .find(|n| n.id() == "scan-orders")
+            .unwrap();
         if let Some(NodeOp::Scan { filters, .. }) = orders_scan.op() {
             assert!(
                 filters.is_empty(),
@@ -3019,11 +3029,7 @@ mod tests {
         // Filter(ts > 0 AND order_id > 100): ts on left, order_id on right.
         // Both single-side conjuncts are pushed into their respective scans.
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema(
-                "su",
-                "users",
-                &[("ts", FieldType::Int64)],
-            ))
+            .with_node(scan_with_schema("su", "users", &[("ts", FieldType::Int64)]))
             .with_node(scan_with_schema(
                 "so",
                 "orders",

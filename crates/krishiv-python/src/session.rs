@@ -91,14 +91,28 @@ impl PySession {
     }
 
     #[classmethod]
+    #[pyo3(signature = (url, *, grpc_url = None))]
     /// Create a session connected to a remote coordinator.
     ///
     /// All SQL queries are routed to the remote coordinator. Use
     /// `Session.embedded()` or `Session.local()` for local execution.
-    pub fn connect(_cls: &Bound<'_, PyType>, url: String) -> PyResult<Self> {
-        krishiv_api::SessionBuilder::new()
+    ///
+    /// ``grpc_url`` is an optional separate gRPC control-plane address
+    /// (e.g. ``"http://host:9090"``) used for job status and operator
+    /// introspection.  When omitted, the Flight SQL ``url`` serves both
+    /// data-plane and control-plane traffic.
+    pub fn connect(
+        _cls: &Bound<'_, PyType>,
+        url: String,
+        grpc_url: Option<String>,
+    ) -> PyResult<Self> {
+        let mut builder = krishiv_api::SessionBuilder::new()
             .with_coordinator(url)
-            .with_remote_execution(true)
+            .with_remote_execution(true);
+        if let Some(g) = grpc_url {
+            builder = builder.with_coordinator_grpc(g);
+        }
+        builder
             .build()
             .map(|s| Self {
                 inner: Arc::new(s),
@@ -230,7 +244,11 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
-    pub fn register_unbounded(&self, name: String, schema: &pyo3::Bound<'_, pyo3::PyAny>) -> PyResult<()> {
+    pub fn register_unbounded(
+        &self,
+        name: String,
+        schema: &pyo3::Bound<'_, pyo3::PyAny>,
+    ) -> PyResult<()> {
         let py_schema: pyo3_arrow::PySchema = schema.extract()?;
         let schema_ref = py_schema.into_inner();
         self.inner
@@ -438,7 +456,6 @@ impl PySession {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use krishiv_api::{ExecutionMode, SessionBuilder};
@@ -484,7 +501,10 @@ mod tests {
             arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, false),
         ]));
         let result = session.register_unbounded("stream_src", schema);
-        assert!(result.is_ok(), "register_unbounded must succeed for embedded session");
+        assert!(
+            result.is_ok(),
+            "register_unbounded must succeed for embedded session"
+        );
     }
 
     #[test]
@@ -493,7 +513,10 @@ mod tests {
         // (unsafe env mutation is workspace-forbidden). The test passes regardless
         // of which mode is inferred from the environment; what matters is no panic.
         let result = krishiv_api::Session::from_env();
-        assert!(result.is_ok(), "Session::from_env must succeed in default env: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Session::from_env must succeed in default env: {result:?}"
+        );
     }
 
     #[test]
@@ -505,7 +528,9 @@ mod tests {
             assert!(
                 matches!(
                     mode,
-                    ExecutionMode::Embedded | ExecutionMode::SingleNode | ExecutionMode::Distributed
+                    ExecutionMode::Embedded
+                        | ExecutionMode::SingleNode
+                        | ExecutionMode::Distributed
                 ),
                 "from_env must produce a valid execution mode, got {mode:?}"
             );

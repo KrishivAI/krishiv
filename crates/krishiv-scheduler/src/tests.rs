@@ -77,7 +77,8 @@ mod scheduler_tests {
         async fn drain_continuous_output(
             &self,
             _request: tonic::Request<wire::v1::DrainContinuousOutputRequest>,
-        ) -> Result<tonic::Response<wire::v1::DrainContinuousOutputResponse>, tonic::Status> {
+        ) -> Result<tonic::Response<wire::v1::DrainContinuousOutputResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("not used in tests"))
         }
     }
@@ -5867,7 +5868,11 @@ mod scheduler_tests {
         let assignments = coordinator
             .launch_assigned_task_assignments(&job_id)
             .unwrap();
-        assert_eq!(assignments.len(), 1, "single-task job must produce one assignment");
+        assert_eq!(
+            assignments.len(),
+            1,
+            "single-task job must produce one assignment"
+        );
         let assigned_exec = assignments[0].executor_id().clone();
 
         // The task is in-flight on `assigned_exec`. Simulate that executor going lost.
@@ -5890,8 +5895,7 @@ mod scheduler_tests {
         const MAX_LOSSES: u32 = 5;
         let exec_id = ExecutorId::try_new("loss-exec").unwrap();
         let job_id = JobId::try_new("loss-job").unwrap();
-        let mut coordinator =
-            Coordinator::active(CoordinatorId::try_new("loss-coord").unwrap());
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("loss-coord").unwrap());
 
         coordinator
             .register_executor(ExecutorDescriptor::new(exec_id.clone(), "pod-loss", 4))
@@ -5956,11 +5960,7 @@ mod scheduler_tests {
     #[cfg(feature = "etcd")]
     #[test]
     fn etcd_lease_simulation_new_is_not_leader() {
-        let election = crate::EtcdLeaseElection::new(
-            "/krishiv/test/leader",
-            "test-holder",
-            15,
-        );
+        let election = crate::EtcdLeaseElection::new("/krishiv/test/leader", "test-holder", 15);
         assert!(
             !election.is_leader(),
             "simulation mode must start with is_leader=false"
@@ -5971,14 +5971,13 @@ mod scheduler_tests {
     #[tokio::test]
     async fn etcd_lease_simulation_try_acquire_makes_leader() {
         use crate::LeaderElection;
-        let election = crate::EtcdLeaseElection::new(
-            "/krishiv/test/leader",
-            "test-holder",
-            15,
-        );
+        let election = crate::EtcdLeaseElection::new("/krishiv/test/leader", "test-holder", 15);
         assert!(!election.is_leader());
         let became_leader = election.try_acquire().await;
-        assert!(became_leader, "simulation mode must always grant leadership");
+        assert!(
+            became_leader,
+            "simulation mode must always grant leadership"
+        );
         assert!(election.is_leader());
     }
 
@@ -5986,11 +5985,7 @@ mod scheduler_tests {
     #[tokio::test]
     async fn etcd_lease_simulation_release_clears_leader() {
         use crate::LeaderElection;
-        let election = crate::EtcdLeaseElection::new(
-            "/krishiv/test/leader",
-            "test-holder",
-            15,
-        );
+        let election = crate::EtcdLeaseElection::new("/krishiv/test/leader", "test-holder", 15);
         election.try_acquire().await;
         assert!(election.is_leader());
         election.release().await;
@@ -6005,10 +6000,8 @@ mod scheduler_tests {
         // a real etcd instance. To run:
         //   cargo test -p krishiv-scheduler --lib --features etcd -- \
         //       coordinator_with_etcd_metadata_backend_roundtrip --ignored
-        let result = crate::EtcdMetadataStore::connect(vec![
-            "http://localhost:2379".to_string(),
-        ])
-        .await;
+        let result =
+            crate::EtcdMetadataStore::connect(vec!["http://localhost:2379".to_string()]).await;
         assert!(
             result.is_ok(),
             "EtcdMetadataStore::connect must succeed with live etcd"
@@ -6020,8 +6013,7 @@ mod scheduler_tests {
     #[test]
     fn submit_job_without_executors_queues_as_pending() {
         allow_anonymous_for_tests();
-        let mut coordinator =
-            Coordinator::active(CoordinatorId::try_new("coord-defer").unwrap());
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-defer").unwrap());
 
         // Submit with NO executors registered.
         let job_id = JobId::try_new("deferred-job").unwrap();
@@ -6049,8 +6041,7 @@ mod scheduler_tests {
     #[test]
     fn deferred_job_assigned_after_executor_registers() {
         allow_anonymous_for_tests();
-        let mut coordinator =
-            Coordinator::active(CoordinatorId::try_new("coord-defer2").unwrap());
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-defer2").unwrap());
 
         // Submit before any executor is registered.
         let job_id = JobId::try_new("deferred-job-2").unwrap();

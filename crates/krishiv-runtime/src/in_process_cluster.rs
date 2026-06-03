@@ -359,9 +359,13 @@ mod tests {
     #[test]
     fn collect_batch_sql_multiple_queries() {
         let cluster = InProcessCluster::new().expect("cluster");
-        let b1 = cluster.collect_batch_sql("SELECT 1 AS n", &[], false).unwrap();
+        let b1 = cluster
+            .collect_batch_sql("SELECT 1 AS n", &[], false)
+            .unwrap();
         assert_eq!(b1[0].num_rows(), 1);
-        let b2 = cluster.collect_batch_sql("SELECT 2 AS n", &[], false).unwrap();
+        let b2 = cluster
+            .collect_batch_sql("SELECT 2 AS n", &[], false)
+            .unwrap();
         assert_eq!(b2[0].num_rows(), 1);
         assert_eq!(
             b2[0]

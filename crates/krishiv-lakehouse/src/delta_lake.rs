@@ -175,10 +175,7 @@ impl DeltaObjectStoreReader {
     /// List available Delta log versions sorted ascending.
     async fn list_versions(&self) -> LakehouseResult<Vec<u64>> {
         use futures::StreamExt as _;
-        let log_prefix = object_store::path::Path::from(format!(
-            "{}/_delta_log",
-            self.prefix
-        ));
+        let log_prefix = object_store::path::Path::from(format!("{}/_delta_log", self.prefix));
         let mut stream = self.store.list(Some(&log_prefix));
         let mut versions = Vec::new();
         while let Some(meta) = stream.next().await {
@@ -747,9 +744,8 @@ mod tests {
         version: u64,
         parquet_path: &str,
     ) {
-        let log_path = object_store::path::Path::from(format!(
-            "{prefix}/_delta_log/{version:020}.json"
-        ));
+        let log_path =
+            object_store::path::Path::from(format!("{prefix}/_delta_log/{version:020}.json"));
         let log_entry = format!(r#"{{"add":{{"path":"{parquet_path}","size":100}}}}"#);
         store
             .put_opts(
@@ -819,14 +815,30 @@ mod tests {
         write_parquet_to_store(store.as_ref(), "ow", "part-0.parquet", &old_batch).await;
         let log_v0 = r#"{"add":{"path":"part-0.parquet","size":100}}"#;
         let log_v0_path = object_store::path::Path::from("ow/_delta_log/00000000000000000000.json");
-        store.as_ref().put_opts(&log_v0_path, bytes::Bytes::from(log_v0).into(), Default::default()).await.unwrap();
+        store
+            .as_ref()
+            .put_opts(
+                &log_v0_path,
+                bytes::Bytes::from(log_v0).into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
 
         // Version 1: remove part-0, add part-1 (1 row) — simulates an overwrite
         let new_batch = sample_batch(&[99], &["new"]);
         write_parquet_to_store(store.as_ref(), "ow", "part-1.parquet", &new_batch).await;
         let log_v1 = "{\"remove\":{\"path\":\"part-0.parquet\",\"dataChange\":true}}\n{\"add\":{\"path\":\"part-1.parquet\",\"size\":50}}";
         let log_v1_path = object_store::path::Path::from("ow/_delta_log/00000000000000000001.json");
-        store.as_ref().put_opts(&log_v1_path, bytes::Bytes::from(log_v1).into(), Default::default()).await.unwrap();
+        store
+            .as_ref()
+            .put_opts(
+                &log_v1_path,
+                bytes::Bytes::from(log_v1).into(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
 
         let reader = DeltaObjectStoreReader::new(std::sync::Arc::clone(&store), "ow");
         let batches = reader.scan_batches().await.unwrap();

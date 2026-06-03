@@ -21,15 +21,14 @@ pub use delta::RdkafkaDeltaStore;
 pub use delta::{
     DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore,
 };
+pub use delta_lake::DeltaObjectStoreReader;
 pub use delta_lake::{
     DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, remove_merge_key_column,
     write_delta,
 };
-pub use delta_lake::DeltaObjectStoreReader;
 pub use hudi::{
-    HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType,
-    HudiSnapshotReader, HudiWriteResult, write_hudi_cow_append, write_hudi_cow_fixture,
-    write_hudi_cow_upsert,
+    HudiCowWriter, HudiObjectStoreReader, HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader,
+    HudiWriteResult, write_hudi_cow_append, write_hudi_cow_fixture, write_hudi_cow_upsert,
 };
 pub use iceberg_fs::IcebergFsTable;
 pub use partition_spec::{PartitionField, PartitionSpecResolver, PartitionSpecVersion};
@@ -861,6 +860,9 @@ mod tests {
 
         // Without max_snapshot_layers, all 20 layers must exist.
         let layer_count = table.state.lock().await.layers.len();
-        assert_eq!(layer_count, 20, "no compaction should occur without max_snapshot_layers");
+        assert_eq!(
+            layer_count, 20,
+            "no compaction should occur without max_snapshot_layers"
+        );
     }
 }

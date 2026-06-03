@@ -225,8 +225,8 @@ mod tests {
 
     #[test]
     fn execute_live_table_ddl_create_populates_registry_and_returns_streaming_plan() {
-        use std::sync::Mutex;
         use krishiv_plan::ExecutionKind;
+        use std::sync::Mutex;
 
         let registry = Mutex::new(LiveTableRegistry::new());
         let plan = execute_live_table_ddl(
@@ -258,11 +258,7 @@ mod tests {
         use std::sync::Mutex;
 
         let registry = Mutex::new(LiveTableRegistry::new());
-        execute_live_table_ddl(
-            &registry,
-            "CREATE LIVE TABLE to_drop AS SELECT 1 AS n",
-        )
-        .unwrap();
+        execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_drop AS SELECT 1 AS n").unwrap();
         assert!(registry.lock().unwrap().contains("to_drop"));
 
         execute_live_table_ddl(&registry, "DROP LIVE TABLE to_drop").unwrap();
@@ -277,15 +273,14 @@ mod tests {
         use std::sync::Mutex;
 
         let registry = Mutex::new(LiveTableRegistry::new());
-        execute_live_table_ddl(
-            &registry,
-            "CREATE LIVE TABLE to_refresh AS SELECT 1 AS x",
-        )
-        .unwrap();
+        execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_refresh AS SELECT 1 AS x").unwrap();
         let plan = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE to_refresh")
             .unwrap()
             .expect("REFRESH must return a plan");
-        assert!(!plan.nodes().is_empty(), "REFRESH plan must have at least one node");
+        assert!(
+            !plan.nodes().is_empty(),
+            "REFRESH plan must have at least one node"
+        );
     }
 
     #[test]

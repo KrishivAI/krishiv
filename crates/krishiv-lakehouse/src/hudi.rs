@@ -507,8 +507,12 @@ fn batch_to_parquet_bytes(batch: &RecordBatch) -> LakehouseResult<bytes::Bytes> 
     let mut buf = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
         .map_err(|e| LakehouseError::Io(e.to_string()))?;
-    writer.write(batch).map_err(|e| LakehouseError::Io(e.to_string()))?;
-    writer.close().map_err(|e| LakehouseError::Io(e.to_string()))?;
+    writer
+        .write(batch)
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
+    writer
+        .close()
+        .map_err(|e| LakehouseError::Io(e.to_string()))?;
     Ok(bytes::Bytes::from(buf))
 }
 
@@ -589,7 +593,10 @@ impl HudiObjectStoreReader {
                 let begin = self.begin_instant.as_deref().ok_or_else(|| {
                     LakehouseError::Io("incremental query requires begin_instant".into())
                 })?;
-                all_commits.into_iter().filter(|c| c.as_str() > begin).collect()
+                all_commits
+                    .into_iter()
+                    .filter(|c| c.as_str() > begin)
+                    .collect()
             }
         };
 
@@ -641,10 +648,8 @@ impl HudiObjectStoreWriter {
     pub async fn append(&self, batch: RecordBatch) -> LakehouseResult<HudiWriteResult> {
         let instant = next_instant();
         let parquet_bytes = batch_to_parquet_bytes(&batch)?;
-        let data_path = object_store::path::Path::from(format!(
-            "{}/{}/part-0.parquet",
-            self.prefix, instant
-        ));
+        let data_path =
+            object_store::path::Path::from(format!("{}/{}/part-0.parquet", self.prefix, instant));
         self.store
             .put_opts(&data_path, parquet_bytes.into(), Default::default())
             .await
@@ -1157,7 +1162,10 @@ mod tests {
         let reader = HudiObjectStoreReader::new(Arc::clone(&store), "test/table");
         let batches = reader.scan_batches().await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2, "object-store Hudi round-trip must return all written rows");
+        assert_eq!(
+            total_rows, 2,
+            "object-store Hudi round-trip must return all written rows"
+        );
     }
 
     #[tokio::test]
@@ -1170,7 +1178,10 @@ mod tests {
         let reader = HudiObjectStoreReader::new(Arc::clone(&store), "multi/table");
         let batches = reader.scan_batches().await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 3, "all rows across two commits must be readable");
+        assert_eq!(
+            total_rows, 3,
+            "all rows across two commits must be readable"
+        );
     }
 
     #[tokio::test]
@@ -1178,7 +1189,10 @@ mod tests {
         let store = make_inmemory_store();
         let reader = HudiObjectStoreReader::new(Arc::clone(&store), "empty/table");
         let batches = reader.scan_batches().await.unwrap();
-        assert!(batches.is_empty(), "empty object store must return no batches");
+        assert!(
+            batches.is_empty(),
+            "empty object store must return no batches"
+        );
     }
 
     #[tokio::test]

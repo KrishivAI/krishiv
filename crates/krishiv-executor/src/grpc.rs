@@ -1,8 +1,8 @@
 //! gRPC service types for the executor task assignment protocol.
 
 use krishiv_proto::{
-    ExecutorTaskAssignment, ExecutorTaskService, TaskStatusResponse,
-    TransportDisposition, TransportVersion, wire,
+    ExecutorTaskAssignment, ExecutorTaskService, TaskStatusResponse, TransportDisposition,
+    TransportVersion, wire,
 };
 
 use crate::{ExecutorAssignmentInbox, ExecutorError};
@@ -96,15 +96,18 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
     async fn drain_continuous_output(
         &self,
         request: tonic::Request<krishiv_proto::task::DrainContinuousOutputRequest>,
-    ) -> Result<tonic::Response<krishiv_proto::task::DrainContinuousOutputResponse>, tonic::Status> {
+    ) -> Result<tonic::Response<krishiv_proto::task::DrainContinuousOutputResponse>, tonic::Status>
+    {
         let _request = request.into_inner();
         // Output is returned via the coordinator's task-result path, not polled from
         // the executor directly. Satisfies the proto interface; never called in practice.
-        Ok(tonic::Response::new(krishiv_proto::task::DrainContinuousOutputResponse {
-            version: TransportVersion::CURRENT,
-            disposition: TransportDisposition::Accepted,
-            ipc_bytes: vec![],
-        }))
+        Ok(tonic::Response::new(
+            krishiv_proto::task::DrainContinuousOutputResponse {
+                version: TransportVersion::CURRENT,
+                disposition: TransportDisposition::Accepted,
+                ipc_bytes: vec![],
+            },
+        ))
     }
 }
 
@@ -189,9 +192,9 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
             .drain_continuous_output(tonic::Request::new(request))
             .await?
             .into_inner();
-        Ok(tonic::Response::new(wire::drain_continuous_output_response_to_wire(
-            response,
-        )))
+        Ok(tonic::Response::new(
+            wire::drain_continuous_output_response_to_wire(response),
+        ))
     }
 }
 

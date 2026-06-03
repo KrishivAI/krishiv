@@ -243,6 +243,24 @@ fn krishiv_scalar_to_datafusion(
     }
 }
 
+/// Register a single table UDF directly with DataFusion (used by
+/// `SqlEngine` when registering a `LANGUAGE sql` UDTF at DDL time).
+pub fn register_single_table_udf(
+    ctx: &datafusion::prelude::SessionContext,
+    udf: Arc<dyn krishiv_udf::TableUdf>,
+) -> Result<(), DataFusionError> {
+    let udf_name = udf.name().to_string();
+    let output_schema = udf.output_schema().clone();
+    ctx.register_udtf(
+        &udf_name,
+        Arc::new(KrishivTableFunctionImpl {
+            inner: udf,
+            schema: output_schema,
+        }),
+    );
+    Ok(())
+}
+
 /// Register table UDFs from `registry` with DataFusion (P1-21).
 pub fn sync_table_udfs(
     ctx: &datafusion::prelude::SessionContext,
@@ -277,14 +295,43 @@ struct KrishivTableFunctionImpl {
 impl TableFunctionImpl for KrishivTableFunctionImpl {
     fn call(
         &self,
-        _args: &[datafusion::logical_expr::Expr],
+        args: &[datafusion::logical_expr::Expr],
     ) -> datafusion::error::Result<Arc<dyn TableProvider>> {
+        // Extract literal scalar values from the DataFusion Expr arguments and
+        // pass them to the UDTF body.  Non-literal (computed) args are passed
+        // as Null — full expression evaluation requires async and would require
+        // a deeper DataFusion integration.
+        let scalar_args: Vec<krishiv_udf::ScalarValue> =
+            args.iter().map(expr_to_scalar).collect();
         let batch = self
             .inner
-            .call(&[])
+            .call(&scalar_args)
             .map_err(|e| DataFusionError::External(e.to_string().into()))?;
         let table = MemTable::try_new(Arc::new(self.schema.clone()), vec![vec![batch]])?;
         Ok(Arc::new(table))
+    }
+}
+
+/// Extract a [`krishiv_udf::ScalarValue`] from a DataFusion literal expression.
+/// Non-literal expressions are mapped to `ScalarValue::Null`.
+fn expr_to_scalar(expr: &datafusion::logical_expr::Expr) -> krishiv_udf::ScalarValue {
+    use datafusion::logical_expr::Expr;
+    use datafusion::scalar::ScalarValue as DfScalar;
+    match expr {
+        Expr::Literal(DfScalar::Int8(Some(v))) => krishiv_udf::ScalarValue::Int32(*v as i32),
+        Expr::Literal(DfScalar::Int16(Some(v))) => krishiv_udf::ScalarValue::Int32(*v as i32),
+        Expr::Literal(DfScalar::Int32(Some(v))) => krishiv_udf::ScalarValue::Int32(*v),
+        Expr::Literal(DfScalar::Int64(Some(v))) => krishiv_udf::ScalarValue::Int64(*v),
+        Expr::Literal(DfScalar::Float32(Some(v))) => {
+            krishiv_udf::ScalarValue::Float64(*v as f64)
+        }
+        Expr::Literal(DfScalar::Float64(Some(v))) => krishiv_udf::ScalarValue::Float64(*v),
+        Expr::Literal(DfScalar::Utf8(Some(v)))
+        | Expr::Literal(DfScalar::LargeUtf8(Some(v))) => {
+            krishiv_udf::ScalarValue::Utf8(v.clone())
+        }
+        Expr::Literal(DfScalar::Boolean(Some(v))) => krishiv_udf::ScalarValue::Boolean(*v),
+        _ => krishiv_udf::ScalarValue::Null,
     }
 }
 

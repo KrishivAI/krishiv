@@ -178,6 +178,24 @@ impl WindowOperatorState {
             Self::Session(op) => op.checkpoint(),
         }
     }
+
+    /// C9: Serialize state backend contents to portable bytes.
+    fn snapshot_state_bytes(&self) -> krishiv_state::StateResult<Vec<u8>> {
+        match self {
+            Self::Tumbling(op) => op.snapshot_state_bytes(),
+            Self::Sliding(op) => op.snapshot_state_bytes(),
+            Self::Session(op) => op.snapshot_state_bytes(),
+        }
+    }
+
+    /// C9: Restore state backend from bytes produced by `snapshot_state_bytes`.
+    fn load_snapshot_bytes(&mut self, bytes: &[u8]) -> krishiv_state::StateResult<()> {
+        match self {
+            Self::Tumbling(op) => op.load_snapshot_bytes(bytes),
+            Self::Sliding(op) => op.load_snapshot_bytes(bytes),
+            Self::Session(op) => op.load_snapshot_bytes(bytes),
+        }
+    }
 }
 
 // ── StreamQualityHook ─────────────────────────────────────────────────────────
@@ -281,7 +299,11 @@ impl ContinuousWindowExecutor {
         for batch in &input_batches {
             let wm = self.watermark.advance(batch)?;
             // G4: Warn when the watermark stalls so operators can detect idle sources.
-            if self.watermark.multi.is_stalled(std::time::Duration::from_secs(60)) {
+            if self
+                .watermark
+                .multi
+                .is_stalled(std::time::Duration::from_secs(60))
+            {
                 if let Some(dur) = self.watermark.multi.stall_duration() {
                     tracing::warn!(
                         stall_secs = dur.as_secs(),
@@ -323,6 +345,40 @@ impl ContinuousWindowExecutor {
     /// windows survive executor restarts.
     pub fn checkpoint(&mut self) -> ExecResult<()> {
         self.operator.checkpoint()
+    }
+
+    /// C9: Serialize the current window state to bytes for cross-session
+    /// persistence.
+    ///
+    /// Calls `checkpoint()` first (writes to the in-memory state backend),
+    /// then extracts the state backend's snapshot bytes. The bytes can be
+    /// stored externally (file, etcd, object store) and later restored via
+    /// [`restore_from_snapshot`] on a new executor.
+    pub fn snapshot(&mut self) -> ExecResult<Vec<u8>> {
+        self.operator.checkpoint()?;
+        self.operator
+            .snapshot_state_bytes()
+            .map_err(|e| ExecError::InvalidWindowConfig(format!("snapshot failed: {e}")))
+    }
+
+    /// Most recently observed watermark, used to restore `last_watermark_ms`
+    /// after a snapshot/restore cycle.
+    pub fn last_watermark_ms(&self) -> i64 {
+        self.last_watermark_ms
+    }
+
+    /// C9: Replace the current window state with the contents of a snapshot
+    /// previously produced by [`snapshot`].
+    ///
+    /// The watermark is reset to `i64::MIN` (the executor will advance it on
+    /// the first batch). Call this immediately after [`new`] and before any
+    /// [`drain`] calls when resuming an executor from a checkpoint.
+    pub fn restore_from_snapshot(&mut self, bytes: &[u8]) -> ExecResult<()> {
+        self.operator
+            .load_snapshot_bytes(bytes)
+            .map_err(|e| ExecError::InvalidWindowConfig(format!("restore failed: {e}")))?;
+        self.last_watermark_ms = i64::MIN;
+        Ok(())
     }
 }
 

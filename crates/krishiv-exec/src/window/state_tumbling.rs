@@ -77,6 +77,22 @@ macro_rules! state_backed_window_op {
             pub fn set_watermark(&mut self, watermark_ms: i64) {
                 self.state.set_watermark(watermark_ms);
             }
+
+            /// C9: Serialize window state to bytes for cross-session persistence.
+            /// The bytes can be stored externally and later loaded via `load_snapshot`.
+            pub fn snapshot_state_bytes(&self) -> StateResult<Vec<u8>> {
+                self.state.snapshot()
+            }
+
+            /// C9: Restore window state from bytes previously returned by
+            /// `snapshot_state_bytes`. Called before first `process_batch` on a new executor.
+            pub fn load_snapshot_bytes(&mut self, bytes: &[u8]) -> StateResult<()> {
+                // Load bytes into the state backend, then refresh the in-memory
+                // operator state from it using restore_from_state.
+                self.state.load_snapshot(bytes)?;
+                self.inner.restore_from_state(self.state.as_ref(), &self.namespace)?;
+                Ok(())
+            }
         }
     };
 }

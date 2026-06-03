@@ -256,7 +256,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
     async fn read_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShufflePartition>> {
         let id = id.clone();
         let stream_opt = self.stream_partition(&id).await?;
-        let Some(mut stream) = stream_opt else { return Ok(None) };
+        let Some(mut stream) = stream_opt else {
+            return Ok(None);
+        };
         let mut batches = Vec::new();
         use futures::StreamExt;
         while let Some(batch_res) = stream.batches.next().await {
@@ -269,10 +271,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         }))
     }
 
-    async fn stream_partition(
-        &self,
-        id: &PartitionId,
-    ) -> ShuffleResult<Option<ShuffleStream>> {
+    async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         let path = self.partition_path(id)?;
         let id = id.clone();
         let id_clone = id.clone();
@@ -284,7 +283,12 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let raw_bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(io_err(format!("failed to read partition file '{}': {e}", path.display()))),
+                Err(e) => {
+                    return Err(io_err(format!(
+                        "failed to read partition file '{}': {e}",
+                        path.display()
+                    )));
+                }
             };
 
             let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
@@ -304,9 +308,10 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes_frozen)
                 .map_err(|e| io_err(format!("failed to build Parquet reader: {e}")))?;
             let schema = builder.schema().clone();
-            let reader = builder.build()
+            let reader = builder
+                .build()
                 .map_err(|e| io_err(format!("failed to build Parquet batch reader: {e}")))?;
-            
+
             Ok::<_, ShuffleError>(Some((schema, reader)))
         })
         .await
@@ -320,11 +325,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let mut reader = reader_opt?;
             let res = tokio::task::spawn_blocking(move || {
                 reader.next().map(|batch_res| (batch_res, reader))
-            }).await;
-            
+            })
+            .await;
+
             match res {
                 Ok(Some((Ok(batch), reader))) => Some((Ok(batch), Some(reader))),
-                Ok(Some((Err(e), reader))) => Some((Err(io_err(format!("error reading Parquet batch: {e}"))), Some(reader))),
+                Ok(Some((Err(e), reader))) => Some((
+                    Err(io_err(format!("error reading Parquet batch: {e}"))),
+                    Some(reader),
+                )),
                 Ok(None) => None,
                 Err(e) => Some((Err(io_err(format!("spawn_blocking error: {e}"))), None)),
             }

@@ -55,7 +55,11 @@ struct PlanCache {
 
 impl PlanCache {
     fn new(max: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), max }
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            max,
+        }
     }
 
     fn get(&self, key: &str) -> Option<&datafusion::logical_expr::LogicalPlan> {
@@ -293,11 +297,16 @@ impl SqlEngine {
         name: &str,
         schema: arrow::datatypes::SchemaRef,
     ) -> SqlResult<tokio::sync::mpsc::UnboundedSender<RecordBatch>> {
-        let (table, tx) = crate::streaming::create_continuous_table(schema)
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        let (table, tx) = crate::streaming::create_continuous_table(schema).map_err(|e| {
+            SqlError::DataFusion {
+                message: e.to_string(),
+            }
+        })?;
         self.context
             .register_table(name, table)
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
         self.streaming_sources
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -339,14 +348,27 @@ impl SqlEngine {
             // Enable at-least-once delivery for the streaming SQL path.
             auto_commit_interval_ms: Some(1_000),
         };
-        let table = crate::kafka_table::create_kafka_streaming_table(schema, config)
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
-        if self.context.table_exist(table_name).map_err(SqlError::from)? {
-            let _ = self.context.deregister_table(table_name).map_err(SqlError::from)?;
+        let table =
+            crate::kafka_table::create_kafka_streaming_table(schema, config).map_err(|e| {
+                SqlError::DataFusion {
+                    message: e.to_string(),
+                }
+            })?;
+        if self
+            .context
+            .table_exist(table_name)
+            .map_err(SqlError::from)?
+        {
+            let _ = self
+                .context
+                .deregister_table(table_name)
+                .map_err(SqlError::from)?;
         }
         self.context
             .register_table(table_name, table)
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
         self.streaming_sources
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -381,8 +403,9 @@ impl SqlEngine {
             group_id: "krishiv-sql-writer".into(),
             auto_commit_interval_ms: None,
         };
-        let mut sink = KafkaSink::new(config)
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        let mut sink = KafkaSink::new(config).map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
 
         let df = self.sql(sql.as_ref()).await?;
         let mut stream = df.execute_stream().await?;
@@ -394,12 +417,14 @@ impl SqlEngine {
                 total_rows += batch.num_rows() as u64;
                 sink.write_batch(batch)
                     .await
-                    .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             }
         }
-        sink.flush()
-            .await
-            .map_err(|e| SqlError::DataFusion { message: e.to_string() })?;
+        sink.flush().await.map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
         Ok(total_rows)
     }
 
@@ -427,10 +452,7 @@ impl SqlEngine {
     /// broker connection. Useful for unit tests where a live Kafka broker is not
     /// available and rdkafka's log subsystem is not initialised.
     /// Returns [`SqlError::EmptyTableName`] if `table_name` is blank.
-    pub fn register_streaming_source_name(
-        &self,
-        table_name: impl Into<String>,
-    ) -> SqlResult<()> {
+    pub fn register_streaming_source_name(&self, table_name: impl Into<String>) -> SqlResult<()> {
         let name: String = table_name.into();
         if name.trim().is_empty() {
             return Err(SqlError::EmptyTableName);
@@ -453,7 +475,10 @@ impl SqlEngine {
             return Err(SqlError::EmptyTableName);
         }
         // Idempotent: ignore the Option return (None when table wasn't registered).
-        let _ = self.context.deregister_table(name).map_err(SqlError::from)?;
+        let _ = self
+            .context
+            .deregister_table(name)
+            .map_err(SqlError::from)?;
         {
             let mut sources = self
                 .streaming_sources
@@ -469,6 +494,62 @@ impl SqlEngine {
             self.invalidate_plan_cache();
         }
         Ok(())
+    }
+
+    /// Register a table UDF backed by a Rust closure.
+    ///
+    /// The closure receives the arguments passed by the SQL caller (as
+    /// `ScalarValue` literals; non-literal args are `ScalarValue::Null`) and
+    /// returns an Arrow `RecordBatch`.  `schema` describes the output columns.
+    ///
+    /// # Example
+    /// ```ignore
+    /// engine.register_table_udf_fn(
+    ///     "generate_ints",
+    ///     Schema::new(vec![Field::new("n", DataType::Int64, false)]),
+    ///     |args| {
+    ///         let count = match args.first() {
+    ///             Some(ScalarValue::Int32(n)) => *n as i64,
+    ///             _ => 10,
+    ///         };
+    ///         let arr = Int64Array::from((0..count).collect::<Vec<_>>());
+    ///         Ok(RecordBatch::try_from_iter([("n", Arc::new(arr) as _)])?)
+    ///     },
+    /// )?;
+    /// ```
+    pub fn register_table_udf_fn(
+        &self,
+        name: impl Into<String>,
+        schema: arrow::datatypes::Schema,
+        f: impl Fn(&[krishiv_udf::ScalarValue]) -> Result<arrow::record_batch::RecordBatch, krishiv_udf::UdfError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> SqlResult<()> {
+        let stub = create_function_ddl::StubTableUdf::from_ddl(
+            &create_function_ddl::CreateFunctionDdl {
+                function_name: name.into(),
+                return_columns: schema
+                    .fields()
+                    .iter()
+                    .map(|f| create_function_ddl::ColumnDef {
+                        name: f.name().clone(),
+                        data_type: f.data_type().clone(),
+                    })
+                    .collect(),
+                language: None,
+                body: None,
+            },
+        )
+        .with_body_fn(std::sync::Arc::new(f));
+        if let Some(registry) = &self.udf_registry {
+            let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+            guard.register_table(std::sync::Arc::new(stub.clone()));
+        }
+        udf::register_single_table_udf(&self.context, std::sync::Arc::new(stub))
+            .map_err(SqlError::from)
     }
 
     /// Returns `true` if any table referenced in `sql` is a registered streaming source.
@@ -765,7 +846,8 @@ impl SqlEngine {
             let last = self.udf_last_synced_version.load(Ordering::Relaxed);
             if current != last {
                 self.sync_all_udfs().await?;
-                self.udf_last_synced_version.store(current, Ordering::Release);
+                self.udf_last_synced_version
+                    .store(current, Ordering::Release);
             }
         }
 
@@ -774,35 +856,43 @@ impl SqlEngine {
         // here, register a stub UDTF, and return a trivial empty DataFrame so
         // callers see a successful DDL result rather than a parse error.
         if create_function_ddl::is_create_function_returns_table(query) {
-            // Register in the Krishiv UDF registry if one is attached.
-            let _ddl = if let Some(registry) = &self.udf_registry {
+            let ddl = create_function_ddl::parse_create_function(query)
+                .map_err(|e| SqlError::DataFusion { message: e })?;
+            let udf: std::sync::Arc<dyn krishiv_udf::TableUdf> =
+                if ddl.language.as_deref() == Some("sql") {
+                    if let Some(ref body) = ddl.body {
+                        // LANGUAGE sql: execute the body via the session context.
+                        let fields: Vec<_> = ddl
+                            .return_columns
+                            .iter()
+                            .map(|c| arrow::datatypes::Field::new(
+                                &c.name,
+                                c.data_type.clone(),
+                                true,
+                            ))
+                            .collect();
+                        let schema = arrow::datatypes::Schema::new(fields);
+                        std::sync::Arc::new(create_function_ddl::SqlBodyTableUdf::new(
+                            &ddl.function_name,
+                            schema,
+                            body.clone(),
+                            std::sync::Arc::clone(&self.context),
+                        ))
+                    } else {
+                        std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))
+                    }
+                } else {
+                    std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))
+                };
+            if let Some(registry) = &self.udf_registry {
                 let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
                 })?;
-                create_function_ddl::register_udtf_from_sql(query, &mut guard)
-                    .map_err(|e| SqlError::DataFusion { message: e })?
-            } else {
-                // No shared registry — parse, build a temporary one, and sync
-                // the stub directly into the DataFusion context.
-                let ddl = create_function_ddl::parse_create_function(query)
-                    .map_err(|e| SqlError::DataFusion { message: e })?;
-                let mut tmp_registry = krishiv_udf::UdfRegistry::new();
-                let stub = create_function_ddl::StubTableUdf::from_ddl(&ddl);
-                tmp_registry.register_table(std::sync::Arc::new(stub));
-                udf::sync_table_udfs(&self.context, &tmp_registry).map_err(SqlError::from)?;
-                ddl
-            };
-            // If a shared registry is attached, sync the new UDTF into DataFusion.
-            if self.udf_registry.is_some() {
-                self.sync_table_udfs().await?;
+                guard.register_table(std::sync::Arc::clone(&udf));
             }
-            // UDTFs are stubs and not yet implemented — return an explicit error to prevent silent data loss.
-            return Err(SqlError::Unsupported {
-                feature: "CREATE FUNCTION RETURNS TABLE is not yet implemented — \
-                          the function body is captured but not executed. \
-                          Calling this function will fail until UDTF execution is added."
-                    .to_string(),
-            });
+            udf::register_single_table_udf(&self.context, udf).map_err(SqlError::from)?;
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(SqlDataFrame::new("create-function", empty).with_query(query));
         }
 
         if query
@@ -837,22 +927,24 @@ impl SqlEngine {
                         ),
                     });
                 }
-                let source_df = self.context.sql(&format!("SELECT * FROM {}", stmt.source_table)).await?;
+                let source_df = self
+                    .context
+                    .sql(&format!("SELECT * FROM {}", stmt.source_table))
+                    .await?;
                 let source_batches = source_df.collect().await?;
                 let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
-                lakehouse::register_scan_batches(
-                    &self.context,
-                    "_krishiv_cep_result",
-                    results,
-                )
-                .await?;
-                let dataframe = self.context.sql("SELECT * FROM _krishiv_cep_result").await?;
+                lakehouse::register_scan_batches(&self.context, "_krishiv_cep_result", results)
+                    .await?;
+                let dataframe = self
+                    .context
+                    .sql("SELECT * FROM _krishiv_cep_result")
+                    .await?;
                 return Ok(SqlDataFrame::new("cep", dataframe).with_query(query));
             }
         }
 
-        let (rewritten, as_ofs) = lakehouse::preprocess_as_of_sql(query)
-            .unwrap_or_else(|_| (query.to_string(), vec![]));
+        let (rewritten, as_ofs) =
+            lakehouse::preprocess_as_of_sql(query).unwrap_or_else(|_| (query.to_string(), vec![]));
         lakehouse::apply_as_of_refs(&self.context, &as_ofs).await?;
 
         // ── Plan cache ────────────────────────────────────────────────────────
@@ -1702,9 +1794,13 @@ mod udtf_ddl_tests {
     #[test]
     fn register_streaming_source_name_marks_table_as_streaming() {
         let engine = SqlEngine::new();
-        engine.register_streaming_source_name("stream_events").unwrap();
+        engine
+            .register_streaming_source_name("stream_events")
+            .unwrap();
         assert!(
-            engine.is_streaming_query("SELECT * FROM stream_events").unwrap(),
+            engine
+                .is_streaming_query("SELECT * FROM stream_events")
+                .unwrap(),
             "register_streaming_source_name must make the query streaming"
         );
     }
@@ -1714,7 +1810,9 @@ mod udtf_ddl_tests {
         let engine = SqlEngine::new();
         engine.register_streaming_source_name("my_stream").unwrap();
         assert!(
-            !engine.is_streaming_query("SELECT * FROM other_table").unwrap(),
+            !engine
+                .is_streaming_query("SELECT * FROM other_table")
+                .unwrap(),
             "only the registered table name must be streaming"
         );
     }
@@ -1752,7 +1850,9 @@ mod udtf_ddl_tests {
     #[test]
     fn is_streaming_query_true_for_table_alias() {
         let engine = SqlEngine::new();
-        engine.register_streaming_source_name("kafka_source").unwrap();
+        engine
+            .register_streaming_source_name("kafka_source")
+            .unwrap();
         // visit_relations must return the base table name, not the alias.
         assert!(
             engine

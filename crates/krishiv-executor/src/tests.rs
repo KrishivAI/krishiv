@@ -1411,7 +1411,9 @@ mod executor_tests {
 
         // Start the Arrow IPC shuffle flight server.
         let disk_store = Arc::new(LocalDiskShuffleStore::new(&shuffle_dir).unwrap());
-        let store = Arc::new(krishiv_shuffle::ShuffleBackend::Local(Arc::clone(&disk_store)));
+        let store = Arc::new(krishiv_shuffle::ShuffleBackend::Local(Arc::clone(
+            &disk_store,
+        )));
         let flight_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (flight_local_addr, flight_handle) =
             match krishiv_shuffle::flight::serve(flight_addr, Arc::clone(&disk_store)).await {
@@ -2390,8 +2392,7 @@ mod executor_tests {
     async fn checkpoint_ack_delivered() {
         use std::sync::{Arc, Mutex};
 
-        #[derive(Default)]
-        #[derive(Clone)]
+        #[derive(Default, Clone)]
         struct RecordingCoordinator {
             acks: Arc<Mutex<Vec<CheckpointAckRequest>>>,
         }
@@ -2468,7 +2469,13 @@ mod executor_tests {
         };
 
         let response = runner
-            .initiate_checkpoint_and_deliver_ack(&assignment, req, Arc::new(backend), Arc::new(storage), coordinator.clone())
+            .initiate_checkpoint_and_deliver_ack(
+                &assignment,
+                req,
+                Arc::new(backend),
+                Arc::new(storage),
+                coordinator.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(response, CheckpointAckResponse::Accepted);
@@ -2549,7 +2556,9 @@ mod executor_tests {
 
         let store = Arc::new(InMemoryShuffleStore::new());
         let inbox = ExecutorAssignmentInbox::new();
-        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::clone(&store)));
+        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::clone(
+            &store,
+        )));
         let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(backend);
 
         let num_partitions = 3usize;
@@ -2634,7 +2643,9 @@ mod executor_tests {
             .unwrap();
 
         let inbox = ExecutorAssignmentInbox::new();
-        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::clone(&store)));
+        let backend = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::clone(
+            &store,
+        )));
         let runner = ExecutorTaskRunner::new(inbox.clone()).with_inmem_shuffle(backend);
 
         let read_cfg = ShuffleReadConfig {

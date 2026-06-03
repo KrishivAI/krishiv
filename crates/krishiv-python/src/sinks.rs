@@ -62,9 +62,9 @@ impl PyKafkaSink {
     pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
         #[cfg(feature = "kafka")]
         {
+            use krishiv_common::async_util::block_on;
             use krishiv_connectors::kafka::{KafkaConfig, KafkaSink};
             use krishiv_connectors::sink::Sink as _;
-            use krishiv_common::async_util::block_on;
 
             let records: Vec<arrow::record_batch::RecordBatch> =
                 batches.into_iter().map(|b| b.into_inner()).collect();
@@ -144,9 +144,9 @@ impl PyIcebergSink {
     pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
         #[cfg(feature = "iceberg")]
         {
-            use std::path::PathBuf;
-            use krishiv_lakehouse::IcebergFsTable;
             use krishiv_common::async_util::block_on;
+            use krishiv_lakehouse::IcebergFsTable;
+            use std::path::PathBuf;
 
             let records: Vec<arrow::record_batch::RecordBatch> =
                 batches.into_iter().map(|b| b.into_inner()).collect();

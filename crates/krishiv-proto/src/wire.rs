@@ -832,11 +832,15 @@ fn input_partition_descriptor_to_wire(
         // InMemory and WatermarkHint are in-process only; they must never
         // cross the wire. Serialise them as empty/noop InlineIpc entries so
         // the proto schema doesn't need to change for these internal variants.
-        InputPartitionDescriptor::InMemory { table_name, batches } => {
+        InputPartitionDescriptor::InMemory {
+            table_name,
+            batches,
+        } => {
             use arrow::ipc::writer::StreamWriter;
-            let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| {
-                std::sync::Arc::new(arrow::datatypes::Schema::empty())
-            });
+            let schema = batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
             let mut buf = Vec::new();
             if let Ok(mut writer) = StreamWriter::try_new(&mut buf, &schema) {
                 for b in batches.iter() {
@@ -851,14 +855,12 @@ fn input_partition_descriptor_to_wire(
                 ..Default::default()
             }
         }
-        InputPartitionDescriptor::WatermarkHint { watermark_ms } => {
-            v1::InputPartitionDescriptor {
-                kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
-                table_name: format!("__watermark_hint_{watermark_ms}"),
-                ipc_bytes: vec![],
-                ..Default::default()
-            }
-        }
+        InputPartitionDescriptor::WatermarkHint { watermark_ms } => v1::InputPartitionDescriptor {
+            kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
+            table_name: format!("__watermark_hint_{watermark_ms}"),
+            ipc_bytes: vec![],
+            ..Default::default()
+        },
     }
 }
 
@@ -1278,7 +1280,9 @@ impl WireError {
     }
 }
 
-pub fn push_continuous_input_request_to_wire(value: crate::task::PushContinuousInputRequest) -> v1::PushContinuousInputRequest {
+pub fn push_continuous_input_request_to_wire(
+    value: crate::task::PushContinuousInputRequest,
+) -> v1::PushContinuousInputRequest {
     v1::PushContinuousInputRequest {
         version: Some(transport_version_to_wire(value.version)),
         job_id: value.job_id.as_str().to_owned(),
@@ -1287,7 +1291,9 @@ pub fn push_continuous_input_request_to_wire(value: crate::task::PushContinuousI
     }
 }
 
-pub fn push_continuous_input_request_from_wire(value: v1::PushContinuousInputRequest) -> WireResult<crate::task::PushContinuousInputRequest> {
+pub fn push_continuous_input_request_from_wire(
+    value: v1::PushContinuousInputRequest,
+) -> WireResult<crate::task::PushContinuousInputRequest> {
     Ok(crate::task::PushContinuousInputRequest {
         version: transport_version_from_wire(required(value.version, "version")?)?,
         job_id: crate::ids::JobId::try_new(value.job_id).map_err(WireError::from_id)?,
@@ -1296,7 +1302,9 @@ pub fn push_continuous_input_request_from_wire(value: v1::PushContinuousInputReq
     })
 }
 
-pub fn drain_continuous_output_request_to_wire(value: crate::task::DrainContinuousOutputRequest) -> v1::DrainContinuousOutputRequest {
+pub fn drain_continuous_output_request_to_wire(
+    value: crate::task::DrainContinuousOutputRequest,
+) -> v1::DrainContinuousOutputRequest {
     v1::DrainContinuousOutputRequest {
         version: Some(transport_version_to_wire(value.version)),
         job_id: value.job_id.as_str().to_owned(),
@@ -1304,7 +1312,9 @@ pub fn drain_continuous_output_request_to_wire(value: crate::task::DrainContinuo
     }
 }
 
-pub fn drain_continuous_output_request_from_wire(value: v1::DrainContinuousOutputRequest) -> WireResult<crate::task::DrainContinuousOutputRequest> {
+pub fn drain_continuous_output_request_from_wire(
+    value: v1::DrainContinuousOutputRequest,
+) -> WireResult<crate::task::DrainContinuousOutputRequest> {
     Ok(crate::task::DrainContinuousOutputRequest {
         version: transport_version_from_wire(required(value.version, "version")?)?,
         job_id: crate::ids::JobId::try_new(value.job_id).map_err(WireError::from_id)?,
@@ -1312,7 +1322,9 @@ pub fn drain_continuous_output_request_from_wire(value: v1::DrainContinuousOutpu
     })
 }
 
-pub fn drain_continuous_output_response_to_wire(value: crate::task::DrainContinuousOutputResponse) -> v1::DrainContinuousOutputResponse {
+pub fn drain_continuous_output_response_to_wire(
+    value: crate::task::DrainContinuousOutputResponse,
+) -> v1::DrainContinuousOutputResponse {
     v1::DrainContinuousOutputResponse {
         version: Some(transport_version_to_wire(value.version)),
         disposition: transport_disposition_to_wire(value.disposition) as i32,
@@ -1320,7 +1332,9 @@ pub fn drain_continuous_output_response_to_wire(value: crate::task::DrainContinu
     }
 }
 
-pub fn drain_continuous_output_response_from_wire(value: v1::DrainContinuousOutputResponse) -> WireResult<crate::task::DrainContinuousOutputResponse> {
+pub fn drain_continuous_output_response_from_wire(
+    value: v1::DrainContinuousOutputResponse,
+) -> WireResult<crate::task::DrainContinuousOutputResponse> {
     Ok(crate::task::DrainContinuousOutputResponse {
         version: transport_version_from_wire(required(value.version, "version")?)?,
         disposition: transport_disposition_from_wire(value.disposition)?,

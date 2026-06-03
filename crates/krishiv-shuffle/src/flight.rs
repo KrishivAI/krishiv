@@ -12,11 +12,11 @@
 //! * No bespoke 4-byte length-prefix parser that previously capped partitions
 //!   at 256 MiB and offered no resume.
 
+use futures::StreamExt;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use futures::StreamExt;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -143,7 +143,9 @@ impl FlightService for ShuffleFlightService {
             .ok_or_else(|| Status::not_found(format!("partition {id:?} not found")))?;
 
         let schema: SchemaRef = partition_data.schema;
-        let stream = partition_data.batches.map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)));
+        let stream = partition_data
+            .batches
+            .map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)));
 
         let encoder = FlightDataEncoderBuilder::new()
             .with_schema(schema)

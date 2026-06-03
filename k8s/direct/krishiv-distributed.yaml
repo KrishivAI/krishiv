@@ -261,6 +261,11 @@ spec:
             - "2"
             - --http-addr
             - 0.0.0.0:8080
+            # S5: Use local disk for shuffle data so multi-stage queries (GROUP BY,
+            # JOIN) don't exhaust executor pod memory. The emptyDir is node-local
+            # and fast; it is cleaned up when the pod terminates.
+            - --shuffle-dir
+            - /tmp/krishiv-shuffle
           ports:
             - name: health
               containerPort: 8080

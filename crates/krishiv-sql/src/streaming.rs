@@ -1,15 +1,15 @@
-use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::streaming::StreamingTable;
-use datafusion::physical_plan::streaming::PartitionStream;
+use datafusion::error::DataFusionError;
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::execution::TaskContext;
-use datafusion::error::DataFusionError;
+use datafusion::physical_plan::streaming::PartitionStream;
 use futures::StreamExt;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use core::fmt;
@@ -43,9 +43,12 @@ impl PartitionStream for ChannelPartitionStream {
     }
 
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-        let mut rx_guard = self.receiver.try_lock().expect("Partition executed multiple times or concurrently");
+        let mut rx_guard = self
+            .receiver
+            .try_lock()
+            .expect("Partition executed multiple times or concurrently");
         let rx = rx_guard.take().expect("Partition stream already consumed");
-        
+
         let stream = UnboundedReceiverStream::new(rx).map(Ok::<RecordBatch, DataFusionError>);
         Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
     }
