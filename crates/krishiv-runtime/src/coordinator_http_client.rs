@@ -2,30 +2,43 @@
 
 use base64::Engine as _;
 use krishiv_scheduler::decode_inline_record_batches;
+use std::sync::OnceLock;
 
+use crate::flight_protocol::parquet_file_to_ipc_b64;
 use crate::in_process::BatchSqlTable;
 use crate::{RuntimeError, RuntimeResult};
 
-/// Build a `reqwest::Client` with bundled Mozilla root certificates.
+/// Process-global `reqwest::Client` shared across all coordinator HTTP calls.
 ///
-/// Using `reqwest::Client::new()` with the `rustls` feature calls
-/// `rustls-platform-verifier`, which reads from the OS certificate store.
-/// In minimal containers (scratch, Alpine without ca-certificates, air-gapped
-/// environments) the store may be empty and the call panics.
+/// `reqwest::Client` holds an internal connection pool — creating a new one on
+/// every call throws away pooled TCP connections and pays the TLS handshake cost
+/// on every request. Using a single shared client lets the pool reuse connections
+/// across `execute_coordinator_batch_sql`, `execute_coordinator_continuous_push`,
+/// etc.
 ///
-/// This helper loads Mozilla's trusted CA roots at compile time via
-/// `webpki-root-certs` so the binary is self-contained and the client never
-/// panics due to a missing system cert store.
+/// `reqwest::Client::clone()` is cheap (Arc-backed). In the extremely unlikely
+/// case of a concurrent cold start, two clients may be built; the `set` loser is
+/// dropped and its clone is returned — both clients are valid.
+static COORDINATOR_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
+    if let Some(client) = COORDINATOR_HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    // Load Mozilla's trusted CA roots at compile time via `webpki-root-certs`
+    // so the binary is self-contained and never panics in containers that lack
+    // a system certificate store (scratch, Alpine without ca-certificates, etc.).
     let mut builder = reqwest::ClientBuilder::new();
     for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
         if let Ok(cert) = reqwest::Certificate::from_der(der) {
             builder = builder.add_root_certificate(cert);
         }
     }
-    builder
+    let client = builder
         .build()
-        .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))
+        .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))?;
+    let _ = COORDINATOR_HTTP_CLIENT.set(client.clone()); // ignore if another thread won the race
+    Ok(COORDINATOR_HTTP_CLIENT.get().unwrap_or(&client).clone())
 }
 
 fn normalize_http_base(url: &str) -> RuntimeResult<String> {
@@ -70,54 +83,6 @@ struct BatchSqlResponseBody {
     error: Option<String>,
 }
 
-/// Convert a local Parquet file to Arrow IPC bytes (base64-encoded).
-///
-/// Called before sending to the coordinator so executor pods need no access
-/// to the client's local filesystem — the data travels inline in the task
-/// assignment.
-fn parquet_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
-    use arrow::ipc::writer::StreamWriter;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    let file = std::fs::File::open(path).map_err(|e| {
-        RuntimeError::transport(format!("failed to open parquet '{}': {e}", path.display()))
-    })?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-        RuntimeError::transport(format!(
-            "failed to build parquet reader for '{}': {e}",
-            path.display()
-        ))
-    })?;
-    let reader = builder
-        .build()
-        .map_err(|e| RuntimeError::transport(format!("parquet reader build failed: {e}")))?;
-
-    let batches: Vec<_> = reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| RuntimeError::transport(format!("parquet read failed: {e}")))?;
-
-    if batches.is_empty() {
-        return Ok(String::new());
-    }
-
-    let schema = batches[0].schema();
-    let mut buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, &schema)
-            .map_err(|e| RuntimeError::transport(format!("ipc writer failed: {e}")))?;
-        for batch in &batches {
-            writer
-                .write(batch)
-                .map_err(|e| RuntimeError::transport(format!("ipc write failed: {e}")))?;
-        }
-        writer
-            .finish()
-            .map_err(|e| RuntimeError::transport(format!("ipc finish failed: {e}")))?;
-    }
-
-    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
-}
-
 /// Execute batch SQL via the coordinator using an async submit-then-poll pattern.
 ///
 /// 1. `POST /api/v1/batch-sql/submit` — submits the job, returns `job_id` immediately.
@@ -135,7 +100,7 @@ pub async fn execute_coordinator_batch_sql(
     let base = normalize_http_base(coordinator_http)?;
 
     // Step 1: convert local parquet files to inline IPC and submit.
-    // parquet_to_ipc_b64 is CPU/IO-bound; run it on the blocking thread pool so
+    // parquet_file_to_ipc_b64 is CPU/IO-bound; run it on the blocking thread pool so
     // the async executor is not stalled while reading and encoding the files.
     let tables_owned: Vec<_> = tables.to_vec();
     let inline_tables: Vec<BatchSqlInlineTableJson> =
@@ -143,7 +108,7 @@ pub async fn execute_coordinator_batch_sql(
             tables_owned
                 .iter()
                 .map(|t| {
-                    let ipc_b64 = parquet_to_ipc_b64(&t.path)?;
+                    let ipc_b64 = parquet_file_to_ipc_b64(&t.path)?;
                     Ok(BatchSqlInlineTableJson {
                         table_name: t.table_name.clone(),
                         ipc_b64,
@@ -189,10 +154,16 @@ pub async fn execute_coordinator_batch_sql(
         .job_id;
 
     // Step 2: poll until terminal state (timeout matches coordinator-side deadline).
+    // First poll is immediate (no initial sleep) so sub-50ms jobs don't pay a
+    // gratuitous delay. Subsequent polls use exponential backoff up to 500ms.
     let poll_url = format!("{base}/api/v1/batch-sql/{job_id}");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
-    let mut backoff_ms = 50u64;
+    let mut backoff_ms: Option<u64> = None; // None = poll immediately on first iteration
     loop {
+        if let Some(ms) = backoff_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+
         if tokio::time::Instant::now() >= deadline {
             return Err(RuntimeError::transport(format!(
                 "batch-sql job {job_id} timed out after 300s"
@@ -230,9 +201,7 @@ pub async fn execute_coordinator_batch_sql(
                 )));
             }
             _ => {
-                // Still running — back off then retry.
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(500);
+                backoff_ms = Some(backoff_ms.map_or(50, |prev| (prev * 2).min(500)));
             }
         }
     }

@@ -97,7 +97,10 @@ pub fn encode_batch_sql(query: &str, tables: &[BatchSqlTable]) -> String {
 }
 
 /// Read a local parquet file and return base64-encoded Arrow IPC bytes.
-fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
+///
+/// Shared by the Flight SQL comment protocol and the coordinator HTTP submit
+/// path — both need to inline parquet data before sending to the remote server.
+pub(crate) fn parquet_file_to_ipc_b64(path: &std::path::Path) -> RuntimeResult<String> {
     use arrow::ipc::writer::StreamWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

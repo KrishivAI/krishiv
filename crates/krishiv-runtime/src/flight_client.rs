@@ -127,7 +127,10 @@ pub struct FlightClientPool {
 impl FlightClientPool {
     pub fn new(flight_url: impl Into<String>) -> Self {
         let url = flight_url.into();
-        let endpoint = normalize_flight_endpoint(&url).unwrap_or_else(|_| String::new());
+        // Normalize eagerly so a bad URL fails at construction rather than
+        // surfacing as an opaque tonic error on the first request.
+        let endpoint = normalize_flight_endpoint(&url)
+            .unwrap_or_else(|_| url.trim().to_string());
         Self {
             endpoints: vec![endpoint],
             current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -149,6 +152,7 @@ impl FlightClientPool {
     }
 
     pub async fn get_channel(&self) -> RuntimeResult<Channel> {
+        // Fast path: channel already connected.
         {
             let guard = self.channel.read().await;
             if let Some(ref ch) = *guard {
@@ -156,12 +160,18 @@ impl FlightClientPool {
             }
         }
 
-        let endpoint = self.flight_url();
-        let result = connect_flight_channel(&endpoint).await;
+        // Slow path: acquire write lock and double-check before connecting.
+        // The write lock is held for the duration of the connection attempt,
+        // preventing concurrent cold-start calls from each opening their own
+        // TCP connection and racing to overwrite the cached channel.
+        let mut guard = self.channel.write().await;
+        if let Some(ref ch) = *guard {
+            return Ok(ch.clone()); // another waiter already connected
+        }
 
-        match result {
+        let endpoint = self.flight_url().to_string();
+        match connect_flight_channel(&endpoint).await {
             Ok(ch) => {
-                let mut guard = self.channel.write().await;
                 *guard = Some(ch.clone());
                 Ok(ch)
             }
@@ -171,9 +181,7 @@ impl FlightClientPool {
                         % self.endpoints.len(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                // Clear the stale cached channel so the next get_channel()
-                // connects to the new endpoint rather than reusing the dead one (C2).
-                *self.channel.write().await = None;
+                // Channel is already None (we never set it); no need to clear.
                 Err(e)
             }
             Err(e) => Err(e),

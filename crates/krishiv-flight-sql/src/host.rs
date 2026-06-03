@@ -219,8 +219,13 @@ impl FlightExecutionHost {
                     spec,
                     input_batches,
                 } => {
-                    // SQL-encoded fallback — route through coordinator in proxy mode,
-                    // local cluster otherwise.
+                    if let Some(http_base) = self.coordinator_http.as_deref() {
+                        return krishiv_runtime::execute_coordinator_bounded_window(
+                            http_base, &topic, &spec, &input_batches,
+                        )
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()));
+                    }
                     let local = plan_spec_to_local(&spec);
                     let cluster = self.cluster();
                     let topic = topic.clone();
