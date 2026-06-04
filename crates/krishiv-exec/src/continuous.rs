@@ -64,9 +64,43 @@ impl WatermarkTracker {
     }
 }
 
+/// Open or create a state backend for a window operator.
+///
+/// `state_dir` drives the durability profile:
+/// - `None` → `FjallStateBackend::ephemeral()` (dev-local, in-memory via tempdir)
+/// - `Some(dir)` → `FjallStateBackend::open(dir/tag)` (single-node-durable or distributed)
+///
+/// The `tag` suffix distinguishes multiple operators sharing the same state dir
+/// (e.g. `tumbling`, `sliding`, `session`).
+fn open_state_backend(
+    state_dir: Option<&std::path::Path>,
+    tag: &str,
+    ttl_ms: Option<u64>,
+) -> ExecResult<Box<dyn StateBackend>> {
+    let backend = match state_dir {
+        None => FjallStateBackend::ephemeral()
+            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
+        Some(dir) => {
+            let path = dir.join(tag);
+            std::fs::create_dir_all(&path)
+                .map_err(|e| ExecError::InvalidWindowConfig(
+                    format!("failed to create state dir '{}': {e}", path.display())
+                ))?;
+            FjallStateBackend::open(&path)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?
+        }
+    };
+    if let Some(ms) = ttl_ms {
+        Ok(Box::new(TtlStateBackend::new(backend, TtlConfig::new(ms))))
+    } else {
+        Ok(Box::new(backend))
+    }
+}
+
 fn build_operator(
     spec: &WindowExecutionSpec,
     agg_exprs: &[AggExpr],
+    state_dir: Option<&std::path::Path>,
 ) -> ExecResult<WindowOperatorState> {
     match spec.window_kind {
         WindowKind::Tumbling => {
@@ -76,17 +110,9 @@ fn build_operator(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            let inner = FjallStateBackend::ephemeral().unwrap();
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(inner)
-            };
+            let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let op = StateBackedTumblingWindowOperator::new(
-                tw_spec,
-                state,
-                "continuous-window",
-                "tumbling",
+                tw_spec, state, "continuous-window", "tumbling",
             )
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Tumbling(Box::new(op)))
@@ -100,17 +126,9 @@ fn build_operator(
                 slide_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            let inner = FjallStateBackend::ephemeral().unwrap();
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(inner)
-            };
+            let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let op = StateBackedSlidingWindowOperator::new(
-                sw_spec,
-                state,
-                "continuous-window",
-                "sliding",
+                sw_spec, state, "continuous-window", "sliding",
             )
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Sliding(Box::new(op)))
@@ -123,17 +141,9 @@ fn build_operator(
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            let inner = FjallStateBackend::ephemeral().unwrap();
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(inner)
-            };
+            let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let op = StateBackedSessionWindowOperator::new(
-                sess_spec,
-                state,
-                "continuous-window",
-                "session",
+                sess_spec, state, "continuous-window", "session",
             )
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Session(Box::new(op)))
@@ -233,8 +243,23 @@ pub struct ContinuousWindowExecutor {
 }
 
 impl ContinuousWindowExecutor {
-    /// Create a new continuous executor for `spec`.
+    /// Create a new continuous executor for `spec` using ephemeral (in-memory) state.
+    ///
+    /// Correct for `DevLocal` / embedded execution. For single-node-durable or distributed
+    /// deployments use [`new_with_state_dir`] so window state survives executor restarts.
     pub fn new(spec: WindowExecutionSpec) -> ExecResult<Self> {
+        Self::new_with_state_dir(spec, None)
+    }
+
+    /// Create a new continuous executor with an optional persistent state directory.
+    ///
+    /// - `state_dir = None` → ephemeral (dev-local, same as [`new`])
+    /// - `state_dir = Some(path)` → file-backed Fjall state under `path/` (single-node-durable
+    ///   or distributed-durable); survives executor restart
+    pub fn new_with_state_dir(
+        spec: WindowExecutionSpec,
+        state_dir: Option<&std::path::Path>,
+    ) -> ExecResult<Self> {
         if spec.agg_exprs.is_empty() {
             return Err(ExecError::InvalidWindowConfig(
                 "window execution requires at least one aggregate".into(),
@@ -243,7 +268,7 @@ impl ContinuousWindowExecutor {
         let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
         Ok(Self {
             watermark: WatermarkTracker::new(&spec),
-            operator: build_operator(&spec, &agg_exprs)?,
+            operator: build_operator(&spec, &agg_exprs, state_dir)?,
             quality_hook: None,
             last_watermark_ms: i64::MIN,
         })

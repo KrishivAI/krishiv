@@ -712,6 +712,11 @@ pub struct ExecutorTaskRunner {
     /// when the same file is queried repeatedly in a session.
     /// Invalidated when `deregister_table` is called on the engine.
     pub(crate) registered_parquet_cache: Arc<DashMap<String, ()>>,
+
+    /// Root directory for durable window operator state (single-node-durable
+    /// and distributed-durable profiles). Each continuous job gets a sub-directory
+    /// `<state_dir>/<job_id>/`. `None` → ephemeral (dev-local) state.
+    pub(crate) state_dir: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for ExecutorTaskRunner {
@@ -771,7 +776,18 @@ impl ExecutorTaskRunner {
             source_throttle_limits: crate::source_throttle::SourceThrottleTable::new(),
             progress_callback: Arc::new(NoOpProgressCallback),
             registered_parquet_cache: Arc::new(DashMap::new()),
+            state_dir: None,
         }
+    }
+
+    /// Set the root directory for durable window operator state.
+    ///
+    /// When set, continuous window operators use `FjallStateBackend::open(state_dir/job_id/)`
+    /// instead of `ephemeral()`, making state survive executor restarts.
+    /// Corresponds to the `single-node-durable` and `distributed-durable` profiles.
+    pub fn with_state_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
     }
 
     /// Attach a shared lease handle so checkpoint-fanout RPCs stamp the live

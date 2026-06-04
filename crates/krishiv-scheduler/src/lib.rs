@@ -102,7 +102,7 @@ pub use job_coordinator::JobCoordinator;
 pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
 pub use store::{
-    EventLogEvent, InMemoryMetadataStore, JsonFileMetadataStore, MetadataStore,
+    EventLogEvent, InMemoryMetadataStore, MetadataStore,
     NonBlockingStoreHandle,
 };
 pub use transport::CoordinatorExecutorTransport;

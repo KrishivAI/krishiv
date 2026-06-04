@@ -480,13 +480,13 @@ mod scheduler_tests {
         );
     }
 
+    #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "full JSON store recovery not yet implemented; use --features redb for durable metadata"]
     async fn tonic_service_register_executor_persists_descriptor() {
         allow_anonymous_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.json");
-        let store = crate::store::JsonFileMetadataStore::open(&path).unwrap();
+        let store = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
         let shared = SharedCoordinator::new(
             Coordinator::active(CoordinatorId::try_new("coord-persist").unwrap()).with_store(store),
         );
@@ -503,7 +503,7 @@ mod scheduler_tests {
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
 
-        let reopened = crate::store::JsonFileMetadataStore::open(&path).unwrap();
+        let reopened = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
         let executors = reopened.executors();
         assert_eq!(executors.len(), 1);
         assert_eq!(executors[0].executor_id(), &executor_id);
@@ -2341,15 +2341,15 @@ mod scheduler_tests {
         assert_eq!(snap.job_id(), &job_id);
     }
 
+    #[cfg(feature = "redb")]
     #[test]
-    #[ignore = "full JSON store recovery not yet implemented; use --features redb for durable metadata"]
-    fn json_file_metadata_store_recovers_after_reopen() {
+    fn redb_metadata_store_recovers_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata.json");
         let job_id = JobId::try_new("job-json-recover").unwrap();
 
         {
-            let store = crate::store::JsonFileMetadataStore::open(&path).unwrap();
+            let store = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
             let mut coordinator =
                 Coordinator::active(CoordinatorId::try_new("coord-json-1").unwrap())
                     .with_store(store);
@@ -2373,7 +2373,7 @@ mod scheduler_tests {
         assert_eq!(metadata_json["schema_version"], 1);
         assert_eq!(metadata_json["store_kind"], "krishiv.scheduler.metadata");
 
-        let reopened = crate::store::JsonFileMetadataStore::open(&path).unwrap();
+        let reopened = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
         assert_eq!(reopened.events().len(), 1);
         let mut recovered = Coordinator::active(CoordinatorId::try_new("coord-json-2").unwrap());
         recovered.recover_from_store(&reopened).unwrap();
@@ -2382,28 +2382,6 @@ mod scheduler_tests {
         assert_eq!(snapshot.assigned_task_count(), 1);
     }
 
-    #[test]
-    #[ignore = "schema-version validation is not yet implemented in JsonFileMetadataStore"]
-    fn json_file_metadata_store_rejects_newer_schema_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("future-metadata.json");
-        std::fs::write(
-            &path,
-            r#"{
-              "schema_version": 999,
-              "store_kind": "krishiv.scheduler.metadata",
-              "events": [],
-              "jobs": []
-            }"#,
-        )
-        .unwrap();
-
-        let err = crate::store::JsonFileMetadataStore::open(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("schema version 999"),
-            "expected newer schema version error, got {err}"
-        );
-    }
 
     // --- Slice 3: Executor crash detection + task reassignment ---
 

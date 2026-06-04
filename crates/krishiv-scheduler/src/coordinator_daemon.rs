@@ -23,7 +23,7 @@ use crate::{
     SharedCoordinator, SingleNodeLeader, scheduler_metrics,
     serve_coordinator_executor_grpc_with_listener,
 };
-use crate::{InMemoryMetadataStore, JsonFileMetadataStore};
+use crate::InMemoryMetadataStore;
 
 #[cfg(feature = "redb")]
 use crate::RedbMetadataStore;
@@ -153,18 +153,22 @@ pub fn build_shared_coordinator_sync(
             return Err("--metadata-backend redb requires --metadata-path".into());
         }
         (backend, Some(path)) => {
-            // Default durable backend: JSON file store.
-            let _ = backend; // future: add sqlite, etc.
-            let store = JsonFileMetadataStore::open(path)
-                .map_err(|e| format!("json store '{}': {e}", path.display()))?;
-            coord
-                .recover_from_store(&store)
-                .map_err(|e| format!("coordinator recovery failed: {e}"))?;
-            SharedCoordinator::new(coord.with_store(store))
+            // A path was given but no backend was specified or the backend name
+            // is unknown. The only correct durable backends are redb and etcd;
+            // the JSON store is intentionally not available because it does not
+            // persist or recover job state correctly.
+            let backend = backend.unwrap_or("(none)");
+            return Err(format!(
+                "cannot use --metadata-path '{path}' with backend '{backend}'; \
+                 for durable single-node storage use: \
+                 --metadata-backend redb (requires --features redb). \
+                 For distributed HA use: --metadata-backend etcd (requires --features etcd).",
+                path = path.display(),
+            ).into());
         }
         (Some(unknown), _) => {
             return Err(format!(
-                "unknown --metadata-backend '{unknown}'; supported: memory, json, etcd"
+                "unknown --metadata-backend '{unknown}'; supported: memory, redb, etcd"
             )
             .into());
         }
@@ -711,10 +715,21 @@ fn validate_durability_profile_config(
     match config.durability_profile {
         DurabilityProfile::DevLocal => Ok(()),
         DurabilityProfile::SingleNodeDurable => {
+            // Only redb gives real crash-recovery for coordinator metadata.
+            // json was removed because it silently lost state on restart.
             match config.metadata_backend.as_deref() {
-                Some("json" | "redb") => {}
-                _ => {
-                    return Err("single-node-durable requires --metadata-backend json|redb".into());
+                Some("redb") => {}
+                Some(other) => {
+                    return Err(format!(
+                        "single-node-durable requires --metadata-backend redb \
+                         (--features redb); got '{other}'"
+                    ).into());
+                }
+                None => {
+                    return Err(
+                        "single-node-durable requires --metadata-backend redb \
+                         (--features redb) and --metadata-path <path>".into()
+                    );
                 }
             }
             if config.metadata_path.is_none() {
@@ -1146,13 +1161,14 @@ mod parse_tests {
 
     #[test]
     fn parses_single_node_durable_profile_with_required_local_storage() {
+        // single-node-durable requires redb (not json) for crash-recovery.
         let config = parse_coordinator_daemon_config([
             String::from("--durability-profile"),
             String::from("single-node-durable"),
             String::from("--metadata-backend"),
-            String::from("json"),
+            String::from("redb"),
             String::from("--metadata-path"),
-            String::from("/tmp/krishiv-metadata.json"),
+            String::from("/tmp/krishiv-metadata.redb"),
             String::from("--shuffle-dir"),
             String::from("/tmp/krishiv-shuffle"),
         ])
@@ -1162,9 +1178,26 @@ mod parse_tests {
             config.durability_profile,
             DurabilityProfile::SingleNodeDurable
         );
-        assert_eq!(config.metadata_backend.as_deref(), Some("json"));
+        assert_eq!(config.metadata_backend.as_deref(), Some("redb"));
         assert!(config.metadata_path.is_some());
         assert!(config.shuffle_dir.is_some());
+    }
+
+    #[test]
+    fn rejects_single_node_durable_with_json_metadata_backend() {
+        // json was removed because it silently loses state on restart.
+        let err = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("single-node-durable"),
+            String::from("--metadata-backend"),
+            String::from("json"),
+            String::from("--metadata-path"),
+            String::from("/tmp/krishiv-metadata.json"),
+            String::from("--shuffle-dir"),
+            String::from("/tmp/krishiv-shuffle"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("redb"), "error: {err}");
     }
 
     #[test]
@@ -1173,13 +1206,13 @@ mod parse_tests {
             String::from("--durability-profile"),
             String::from("single-node-durable"),
             String::from("--metadata-backend"),
-            String::from("json"),
+            String::from("redb"),
             String::from("--shuffle-dir"),
             String::from("/tmp/krishiv-shuffle"),
         ])
         .unwrap_err();
 
-        assert!(err.to_string().contains("metadata-path"));
+        assert!(err.to_string().contains("metadata-path"), "error: {err}");
     }
 
     #[test]

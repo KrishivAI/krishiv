@@ -19,6 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
+use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
 use krishiv_state::FjallStateBackend;
@@ -41,7 +42,12 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
     let http_addr = config.http_addr;
     let task_grpc_addr = config.task_grpc_addr;
     let barrier_grpc_addr = config.barrier_grpc_addr;
-    let shuffle_dir = config.shuffle_dir.clone();
+    let durability_profile = config.durability_profile;
+
+    // Apply profile-driven backend defaults when explicit flags were not given.
+    // The profile acts as a policy; explicit flags always win.
+    let shuffle_dir = apply_shuffle_default(config.shuffle_dir.clone(), durability_profile)?;
+    let state_dir  = apply_state_default(config.state_dir.clone(), durability_profile)?;
     let checkpoint_uri = config.checkpoint_uri.clone();
     let slots = config.slots;
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
@@ -73,6 +79,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
                 task_grpc_addr,
                 barrier_grpc_addr,
                 shuffle_dir,
+                state_dir,
                 checkpoint_uri,
                 slots,
             )
@@ -190,6 +197,7 @@ async fn heartbeat_loop(
     task_grpc_addr: Option<SocketAddr>,
     barrier_grpc_addr: Option<SocketAddr>,
     shuffle_dir: Option<std::path::PathBuf>,
+    state_dir: Option<std::path::PathBuf>,
     checkpoint_uri: String,
     slots: usize,
 ) -> crate::ExecutorResult<()> {
@@ -276,7 +284,9 @@ async fn heartbeat_loop(
         });
     }
 
-    // Checkpoint storage and state backend.  Both honor explicit URIs from the CLI/env.
+    // Checkpoint storage and state backend.
+    // The per-task state backend (used by checkpoint RPCs) is always ephemeral; durable
+    // window-operator state is managed per-job via `runner.state_dir` (see streaming.rs).
     let checkpoint_storage: Arc<dyn CheckpointStorage> =
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
@@ -294,11 +304,11 @@ async fn heartbeat_loop(
         .with_barrier_injector(barrier_injector)
         .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts)
-        // Track E: Apply default limits for now. In full job execution, this will
-        // be populated from the job's JCP / JobRecord using the raw accessors
-        // (udf_execution_time_cap_ms + udf_memory_limit_bytes) or a full
-        // ResourceLimits built from the JobSpec.
         .with_udf_limits(krishiv_udf::ResourceLimits::default());
+    // Wire durable state dir so stream:loop: window operators use file-backed state.
+    if let Some(ref dir) = state_dir {
+        runner_builder = runner_builder.with_state_dir(dir.clone());
+    }
     if let Some(dir) = &shuffle_dir {
         let disk = Arc::new(
             LocalDiskShuffleStore::new(dir)
@@ -523,9 +533,17 @@ struct ExecutorCliConfig {
     /// Local on-disk shuffle store directory; if set, the shuffle Flight
     /// server is started and the runner is wired for `shuffle-write:` fragments (B5).
     shuffle_dir: Option<std::path::PathBuf>,
+    /// Root directory for durable window operator state.
+    /// When set, continuous window operators use file-backed Fjall state instead
+    /// of ephemeral (in-memory) state, surviving executor restarts.
+    /// Reads `KRISHIV_STATE_DIR` env var; set automatically for durable profiles.
+    state_dir: Option<std::path::PathBuf>,
     /// Checkpoint storage URI (filesystem path or `s3://`, `memory://`, …).
     /// Defaults to `KRISHIV_CHECKPOINT_STORAGE` then `file:///tmp/krishiv-checkpoints`.
     checkpoint_uri: String,
+    /// Durability profile — controls which backends are required/auto-selected.
+    /// Reads `KRISHIV_DURABILITY_PROFILE` env var; default is `dev-local`.
+    durability_profile: DurabilityProfile,
     help: bool,
 }
 
@@ -572,8 +590,15 @@ impl ExecutorCliConfig {
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
+            state_dir: env::var("KRISHIV_STATE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
             checkpoint_uri: env::var("KRISHIV_CHECKPOINT_STORAGE")
                 .unwrap_or_else(|_| String::from("file:///tmp/krishiv-checkpoints")),
+            durability_profile: env::var("KRISHIV_DURABILITY_PROFILE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_default(),
             help: false,
         };
         let mut args = args.into_iter();
@@ -647,6 +672,23 @@ impl ExecutorCliConfig {
                 }
                 "--checkpoint-uri" => {
                     config.checkpoint_uri = next_arg(&mut args, "--checkpoint-uri")?;
+                }
+                "--state-dir" => {
+                    let value = next_arg(&mut args, "--state-dir")?;
+                    config.state_dir = if value.is_empty() { None } else {
+                        Some(std::path::PathBuf::from(value))
+                    };
+                }
+                "--durability-profile" => {
+                    let value = next_arg(&mut args, "--durability-profile")?;
+                    config.durability_profile = value.parse().map_err(|_| {
+                        crate::ExecutorError::LocalExecution {
+                            message: format!(
+                                "unknown --durability-profile '{value}'; supported: dev-local, \
+                                 single-node-durable, distributed-durable"
+                            ),
+                        }
+                    })?;
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => {
@@ -730,6 +772,72 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
     args.next()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+/// Apply shuffle-dir defaults driven by the durability profile.
+///
+/// | Profile             | Explicit flag | Result                          |
+/// |---------------------|---------------|---------------------------------|
+/// | DevLocal            | any           | use as-is (None = in-memory OK) |
+/// | SingleNodeDurable   | None          | auto: `/tmp/krishiv-shuffle`    |
+/// | DistributedDurable  | None          | **error** — must be explicit    |
+fn apply_shuffle_default(
+    explicit: Option<std::path::PathBuf>,
+    profile: DurabilityProfile,
+) -> crate::ExecutorResult<Option<std::path::PathBuf>> {
+    match (explicit, profile) {
+        (Some(dir), _) => Ok(Some(dir)),
+        (None, DurabilityProfile::DevLocal) => Ok(None),
+        (None, DurabilityProfile::SingleNodeDurable) => {
+            let dir = std::path::PathBuf::from("/tmp/krishiv-shuffle");
+            tracing::info!(
+                path = %dir.display(),
+                "single-node-durable: auto-selecting shuffle dir (set --shuffle-dir to override)"
+            );
+            Ok(Some(dir))
+        }
+        (None, DurabilityProfile::DistributedDurable) => {
+            Err(crate::ExecutorError::LocalExecution {
+                message: String::from(
+                    "durability-profile=distributed-durable requires --shuffle-dir \
+                     (set KRISHIV_SHUFFLE_DIR or pass --shuffle-dir <path>)"
+                ),
+            })
+        }
+    }
+}
+
+/// Apply state-dir defaults driven by the durability profile.
+///
+/// | Profile             | Explicit flag | Result                          |
+/// |---------------------|---------------|---------------------------------|
+/// | DevLocal            | any           | use as-is (None = ephemeral OK) |
+/// | SingleNodeDurable   | None          | auto: `/tmp/krishiv-state`      |
+/// | DistributedDurable  | None          | **error** — must be explicit    |
+fn apply_state_default(
+    explicit: Option<std::path::PathBuf>,
+    profile: DurabilityProfile,
+) -> crate::ExecutorResult<Option<std::path::PathBuf>> {
+    match (explicit, profile) {
+        (Some(dir), _) => Ok(Some(dir)),
+        (None, DurabilityProfile::DevLocal) => Ok(None),
+        (None, DurabilityProfile::SingleNodeDurable) => {
+            let dir = std::path::PathBuf::from("/tmp/krishiv-state");
+            tracing::info!(
+                path = %dir.display(),
+                "single-node-durable: auto-selecting state dir (set --state-dir to override)"
+            );
+            Ok(Some(dir))
+        }
+        (None, DurabilityProfile::DistributedDurable) => {
+            Err(crate::ExecutorError::LocalExecution {
+                message: String::from(
+                    "durability-profile=distributed-durable requires --state-dir \
+                     (set KRISHIV_STATE_DIR or pass --state-dir <path>)"
+                ),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

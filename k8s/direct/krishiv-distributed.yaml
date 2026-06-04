@@ -141,10 +141,18 @@ spec:
             - 0.0.0.0:9090
             - --http-addr
             - 0.0.0.0:18080
-            - --metadata-backend
-            - json
-            - --metadata-path
-            - /data/coordinator-meta.json
+            # dev-local: volatile in-memory metadata, safe for single-node dev/test.
+            # For production (single-node-durable) replace with:
+            #   --durability-profile single-node-durable
+            #   --metadata-backend redb  (requires --features redb build)
+            #   --metadata-path /data/coordinator-meta.redb
+            # For HA (distributed-durable) replace with:
+            #   --durability-profile distributed-durable
+            #   --metadata-backend etcd
+            #   --leader-backend etcd
+            #   --etcd-endpoints http://etcd:2379
+            - --durability-profile
+            - dev-local
           ports:
             - name: grpc
               containerPort: 9090
@@ -273,9 +281,14 @@ spec:
             - "2"
             - --http-addr
             - 0.0.0.0:8080
-            # S5: Use local disk for shuffle data so multi-stage queries (GROUP BY,
-            # JOIN) don't exhaust executor pod memory. The emptyDir is node-local
-            # and fast; it is cleaned up when the pod terminates.
+            # dev-local profile: ephemeral window state + explicit shuffle dir.
+            # For single-node-durable (survives restart):
+            #   --durability-profile single-node-durable
+            #   (shuffle-dir and state-dir are auto-selected from /tmp defaults)
+            - --durability-profile
+            - dev-local
+            # S5: Explicit shuffle dir overrides the dev-local default (in-memory)
+            # so multi-stage queries don't exhaust executor pod memory.
             - --shuffle-dir
             - /tmp/krishiv-shuffle
           ports:

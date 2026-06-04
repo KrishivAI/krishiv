@@ -4,6 +4,34 @@ use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
 use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
+/// Open or create a state backend for a bounded-window operator.
+///
+/// Mirrors the same function in `continuous.rs` for the bounded execution path.
+fn open_state_backend(
+    state_dir: Option<&std::path::Path>,
+    tag: &str,
+    ttl_ms: Option<u64>,
+) -> ExecResult<Box<dyn StateBackend>> {
+    let backend = match state_dir {
+        None => FjallStateBackend::ephemeral()
+            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
+        Some(dir) => {
+            let path = dir.join(tag);
+            std::fs::create_dir_all(&path)
+                .map_err(|e| ExecError::InvalidWindowConfig(
+                    format!("failed to create state dir '{}': {e}", path.display())
+                ))?;
+            FjallStateBackend::open(&path)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?
+        }
+    };
+    if let Some(ms) = ttl_ms {
+        Ok(Box::new(TtlStateBackend::new(backend, TtlConfig::new(ms))))
+    } else {
+        Ok(Box::new(backend))
+    }
+}
+
 use crate::watermark_util::advance_effective_watermark;
 use crate::window::MultiSourceWatermarkState;
 use crate::{
@@ -60,13 +88,7 @@ pub fn execute_bounded_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            let redb = FjallStateBackend::ephemeral()
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(redb)
-            };
+            let state = open_state_backend(None, "tumbling", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -93,13 +115,7 @@ pub fn execute_bounded_window(
                 slide_ms,
                 agg_exprs,
             };
-            let redb = FjallStateBackend::ephemeral()
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(redb)
-            };
+            let state = open_state_backend(None, "sliding", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -125,13 +141,7 @@ pub fn execute_bounded_window(
                 session_gap_ms: gap_ms,
                 agg_exprs,
             };
-            let redb = FjallStateBackend::ephemeral()
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(redb)
-            };
+            let state = open_state_backend(None, "session", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -174,13 +184,7 @@ pub fn execute_streaming_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            let redb = FjallStateBackend::ephemeral()
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(redb)
-            };
+            let state = open_state_backend(None, "tumbling", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -245,13 +249,7 @@ pub fn execute_streaming_window(
                 slide_ms,
                 agg_exprs,
             };
-            let redb = FjallStateBackend::ephemeral()
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(redb)
-            };
+            let state = open_state_backend(None, "sliding", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -315,13 +313,7 @@ pub fn execute_streaming_window(
                 session_gap_ms,
                 agg_exprs,
             };
-            let redb = FjallStateBackend::ephemeral()
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
-            let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
-                Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
-            } else {
-                Box::new(redb)
-            };
+            let state = open_state_backend(None, "session", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;

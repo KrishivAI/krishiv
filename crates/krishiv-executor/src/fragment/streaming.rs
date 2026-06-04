@@ -220,7 +220,13 @@ fn execute_loop_fragment(
             // Normalise column names for Kafka-style data (same as bounded path).
             plan_spec.key_column = String::from("key");
             plan_spec.event_time_column = String::from("ts");
-            let exec = ContinuousWindowExecutor::new(plan_spec).map_err(|e| {
+            // Use durable state dir when the runner is configured for
+            // single-node-durable or distributed-durable profiles.
+            let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
+            let exec = ContinuousWindowExecutor::new_with_state_dir(
+                plan_spec,
+                job_state_dir.as_deref(),
+            ).map_err(|e| {
                 ExecutorError::InvalidAssignment {
                     message: format!("stream:loop failed to create window executor: {e}"),
                 }
