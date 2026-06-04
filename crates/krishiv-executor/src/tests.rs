@@ -43,8 +43,8 @@ mod executor_tests {
 
     use crate::{
         ExecutorAssignmentInbox, ExecutorConfig, ExecutorError, ExecutorRuntime,
-        ExecutorTaskInboxService, ExecutorTaskOutputKind, ExecutorTaskRunner,
-        serve_executor_task_grpc_with_listener,
+        ExecutorTaskAuthConfig, ExecutorTaskGrpcService, ExecutorTaskInboxService,
+        ExecutorTaskOutputKind, ExecutorTaskRunner, serve_executor_task_grpc_with_listener,
     };
 
     struct AcceptingCoordinatorService;
@@ -429,6 +429,28 @@ mod executor_tests {
     }
 
     #[tokio::test]
+    async fn task_inbox_service_reports_duplicate_assignment() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let service = ExecutorTaskInboxService::new(inbox.clone());
+        let assignment = demo_assignment("task-dup-service");
+
+        let first = service
+            .assign_task(tonic::Request::new(assignment.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let duplicate = service
+            .assign_task(tonic::Request::new(assignment))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(first.disposition(), TransportDisposition::Accepted);
+        assert_eq!(duplicate.disposition(), TransportDisposition::Duplicate);
+        assert_eq!(inbox.len().unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn task_assignment_flows_over_network_to_executor_inbox() {
         let inbox = ExecutorAssignmentInbox::new();
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -469,6 +491,62 @@ mod executor_tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn executor_task_grpc_requires_configured_bearer_token() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let service =
+            ExecutorTaskGrpcService::new(inbox.clone()).with_required_bearer_token("task-secret");
+
+        let err = wire::v1::executor_task_server::ExecutorTask::assign_task(
+            &service,
+            tonic::Request::new(wire::executor_task_assignment_to_wire(demo_assignment(
+                "task-auth-missing",
+            ))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(inbox.len().unwrap(), 0);
+
+        let mut request = tonic::Request::new(wire::executor_task_assignment_to_wire(
+            demo_assignment("task-auth-ok"),
+        ));
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::from_static("Bearer task-secret"),
+        );
+        let response = wire::v1::executor_task_server::ExecutorTask::assign_task(&service, request)
+            .await
+            .unwrap()
+            .into_inner();
+        let response = wire::task_status_response_from_wire(response).unwrap();
+
+        assert_eq!(response.disposition(), TransportDisposition::Accepted);
+        assert_eq!(inbox.len().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_task_grpc_rejects_when_required_auth_has_no_token() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let service = ExecutorTaskGrpcService::with_auth_config(
+            inbox.clone(),
+            ExecutorTaskAuthConfig::new(true, None),
+        );
+
+        let err = wire::v1::executor_task_server::ExecutorTask::assign_task(
+            &service,
+            tonic::Request::new(wire::executor_task_assignment_to_wire(demo_assignment(
+                "task-auth-misconfigured",
+            ))),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH"));
+        assert_eq!(inbox.len().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2155,7 +2233,7 @@ mod executor_tests {
 
     use krishiv_checkpoint::{CheckpointStorage, LocalFsCheckpointStorage, snapshot_path};
     use krishiv_proto::InitiateCheckpointRequest;
-    use krishiv_state::{InMemoryStateBackend, StateBackend};
+    use krishiv_state::{FjallStateBackend, StateBackend};
 
     use crate::runner::TaskRunner;
 
@@ -2225,7 +2303,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-cp-1").unwrap();
         let mut runner = TaskRunner::new(task_id.clone());
 
-        let mut backend = InMemoryStateBackend::new();
+        let mut backend = FjallStateBackend::ephemeral().unwrap();
         let ns = krishiv_state::Namespace::new("operator-task-cp-1", "my-state");
         backend
             .put(&ns, b"key1".to_vec(), b"value1".to_vec())
@@ -2261,7 +2339,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-cp-path").unwrap();
         let mut runner = TaskRunner::new(task_id.clone());
 
-        let mut backend_with_state = InMemoryStateBackend::new();
+        let mut backend_with_state = FjallStateBackend::ephemeral().unwrap();
         let ns = krishiv_state::Namespace::new("operator-task-cp-path", "data");
         backend_with_state
             .put(&ns, b"k".to_vec(), b"v".to_vec())
@@ -2295,7 +2373,7 @@ mod executor_tests {
         let task_id = TaskId::try_new("task-cp-offset").unwrap();
         let job_id = JobId::try_new("job-cp-offset").unwrap();
         let mut runner = TaskRunner::new(task_id.clone()).with_kafka_offset(42);
-        let backend = InMemoryStateBackend::new();
+        let backend = FjallStateBackend::ephemeral().unwrap();
 
         let req = InitiateCheckpointRequest {
             job_id: job_id.clone(),
@@ -2329,7 +2407,7 @@ mod executor_tests {
         let task_id = TaskId::try_new("task-cp-stale").unwrap();
         let job_id = JobId::try_new("job-cp-stale").unwrap();
         let mut runner = TaskRunner::new(task_id.clone());
-        let backend = InMemoryStateBackend::new();
+        let backend = FjallStateBackend::ephemeral().unwrap();
 
         let req5 = InitiateCheckpointRequest {
             job_id: job_id.clone(),
@@ -2366,7 +2444,7 @@ mod executor_tests {
         let job_id = JobId::try_new("job-cp-write-fail").unwrap();
         let mut runner = TaskRunner::new(TaskId::try_new("task-cp-write-fail").unwrap());
 
-        let mut backend = InMemoryStateBackend::new();
+        let mut backend = FjallStateBackend::ephemeral().unwrap();
         let ns = krishiv_state::Namespace::new("operator-task-cp-write-fail", "state");
         backend.put(&ns, b"k".to_vec(), b"v".to_vec()).unwrap();
 
@@ -2447,7 +2525,7 @@ mod executor_tests {
         }
 
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
-        let backend = InMemoryStateBackend::new();
+        let backend = FjallStateBackend::ephemeral().unwrap();
         let coordinator = RecordingCoordinator::default();
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
         let assignment = ExecutorTaskAssignment::new(
@@ -2483,6 +2561,211 @@ mod executor_tests {
         assert_eq!(acks.len(), 1);
         assert_eq!(acks[0].epoch, 3);
         assert_eq!(acks[0].task_id.as_str(), "task-ack");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ack_delivery_retries_transient_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default, Clone)]
+        struct FlakyCoordinator {
+            calls: Arc<AtomicUsize>,
+            acks: Arc<Mutex<Vec<CheckpointAckRequest>>>,
+        }
+
+        #[tonic::async_trait]
+        impl CoordinatorExecutorService for FlakyCoordinator {
+            async fn register_executor(
+                &self,
+                request: tonic::Request<RegisterExecutorRequest>,
+            ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+                let request = request.into_inner();
+                Ok(tonic::Response::new(RegisterExecutorResponse::new(
+                    request.descriptor().executor_id().clone(),
+                    LeaseGeneration::initial(),
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn deregister_executor(
+                &self,
+                _request: tonic::Request<DeregisterExecutorRequest>,
+            ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not needed"))
+            }
+
+            async fn executor_heartbeat(
+                &self,
+                request: tonic::Request<ExecutorHeartbeatRequest>,
+            ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+                Ok(tonic::Response::new(ExecutorHeartbeatResponse::new(
+                    request.into_inner().lease_generation(),
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn task_status(
+                &self,
+                _request: tonic::Request<TaskStatusRequest>,
+            ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+                Ok(tonic::Response::new(TaskStatusResponse::new(
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn checkpoint_ack(
+                &self,
+                request: tonic::Request<CheckpointAckRequest>,
+            ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Err(tonic::Status::unavailable(
+                        "temporary coordinator ack failure",
+                    ));
+                }
+                self.acks.lock().unwrap().push(request.into_inner());
+                Ok(tonic::Response::new(CheckpointAckResponse::Accepted))
+            }
+        }
+
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let backend = FjallStateBackend::ephemeral().unwrap();
+        let coordinator = FlakyCoordinator::default();
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-ack-retry").unwrap(),
+                StageId::try_new("stage-ack-retry").unwrap(),
+                TaskId::try_new("task-ack-retry").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-ack-retry").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        );
+        let req = InitiateCheckpointRequest {
+            job_id: JobId::try_new("job-ack-retry").unwrap(),
+            epoch: 4,
+            fencing_token: FencingToken::initial(),
+        };
+
+        let response = runner
+            .initiate_checkpoint_and_deliver_ack(
+                &assignment,
+                req,
+                Arc::new(backend),
+                Arc::new(storage),
+                coordinator.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response, CheckpointAckResponse::Accepted);
+        assert_eq!(coordinator.calls.load(Ordering::SeqCst), 2);
+        let acks = coordinator.acks.lock().unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].epoch, 4);
+        assert_eq!(acks[0].task_id.as_str(), "task-ack-retry");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_fanout_uses_running_attempts_without_preexisting_task_runner() {
+        use dashmap::DashMap;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default, Clone)]
+        struct RecordingCoordinator {
+            acks: Arc<Mutex<Vec<CheckpointAckRequest>>>,
+        }
+
+        #[tonic::async_trait]
+        impl CoordinatorExecutorService for RecordingCoordinator {
+            async fn register_executor(
+                &self,
+                request: tonic::Request<RegisterExecutorRequest>,
+            ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
+                let request = request.into_inner();
+                Ok(tonic::Response::new(RegisterExecutorResponse::new(
+                    request.descriptor().executor_id().clone(),
+                    LeaseGeneration::initial(),
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn deregister_executor(
+                &self,
+                _request: tonic::Request<DeregisterExecutorRequest>,
+            ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not needed"))
+            }
+
+            async fn executor_heartbeat(
+                &self,
+                request: tonic::Request<ExecutorHeartbeatRequest>,
+            ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
+                Ok(tonic::Response::new(ExecutorHeartbeatResponse::new(
+                    request.into_inner().lease_generation(),
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn task_status(
+                &self,
+                _request: tonic::Request<TaskStatusRequest>,
+            ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
+                Ok(tonic::Response::new(TaskStatusResponse::new(
+                    TransportDisposition::Accepted,
+                )))
+            }
+
+            async fn checkpoint_ack(
+                &self,
+                request: tonic::Request<CheckpointAckRequest>,
+            ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
+                self.acks.lock().unwrap().push(request.into_inner());
+                Ok(tonic::Response::new(CheckpointAckResponse::Accepted))
+            }
+        }
+
+        let job_id = JobId::try_new("job-fanout").unwrap();
+        let task_id = TaskId::try_new("task-fanout").unwrap();
+        let attempt = TaskAttemptRef::new(
+            job_id.clone(),
+            StageId::try_new("stage-fanout").unwrap(),
+            task_id.clone(),
+            AttemptId::initial(),
+        );
+        let running_attempts = Arc::new(DashMap::new());
+        running_attempts.insert(task_id.as_str().to_string(), attempt);
+
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let backend = FjallStateBackend::ephemeral().unwrap();
+        let coordinator = RecordingCoordinator::default();
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+            .with_running_attempts(running_attempts);
+        let req = InitiateCheckpointRequest {
+            job_id,
+            epoch: 7,
+            fencing_token: FencingToken::initial(),
+        };
+
+        runner
+            .initiate_checkpoint_for_job(
+                &req,
+                Arc::new(backend) as Arc<dyn StateBackend>,
+                Arc::new(storage) as Arc<dyn CheckpointStorage>,
+                coordinator.clone(),
+            )
+            .await
+            .unwrap();
+
+        let acks = coordinator.acks.lock().unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].epoch, 7);
+        assert_eq!(acks[0].task_id, task_id);
+        assert_eq!(runner.checkpoint_runners.len(), 1);
     }
 
     #[tokio::test]

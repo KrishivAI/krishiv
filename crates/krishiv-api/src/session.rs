@@ -643,7 +643,17 @@ impl Session {
         Ok(())
     }
 
-    /// Register a Parquet file as a bounded (batch) SQL table.
+    /// Register a Parquet file as an unbounded (streaming) SQL table.
+    ///
+    /// This causes the engine to process the file as an unbounded stream
+    /// via the `ExecutionKind::Streaming` paths.
+    pub fn register_parquet_stream(&self, name: &str, path: &Path) -> Result<()> {
+        self.register_parquet(name, path)?;
+        self.sql_engine
+            .register_streaming_source_name(name)
+            .map_err(KrishivError::from)?;
+        Ok(())
+    }
     ///
     /// Alias for [`register_parquet`] that matches the `register_unbounded` naming.
     pub fn register_bounded(&self, name: &str, path: &Path) -> Result<()> {

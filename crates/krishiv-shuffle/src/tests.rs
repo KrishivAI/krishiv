@@ -768,7 +768,7 @@ mod shuffle_tests {
     // ── ObjectStoreShuffleStore ───────────────────────────────────────────
 
     use crate::ObjectStoreShuffleStore;
-    use object_store::memory::InMemory;
+    use object_store::{ObjectStoreExt as _, memory::InMemory};
 
     fn make_object_store_partition(
         job_id: &str,
@@ -806,6 +806,30 @@ mod shuffle_tests {
         let read = store.read_partition(&id).await.unwrap().unwrap();
         assert_eq!(read.batches.len(), 1);
         assert_eq!(read.batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_detects_tampered_ipc_bytes() {
+        let inner = Arc::new(InMemory::new());
+        let store = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-test");
+
+        let partition = make_object_store_partition("job-os-tamper", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 0).await.unwrap();
+
+        inner
+            .put(
+                &object_store::path::Path::from("shuffle-test/job-os-tamper/s0/0.ipc"),
+                bytes::Bytes::from_static(b"not-arrow-ipc").into(),
+            )
+            .await
+            .unwrap();
+
+        let err = store.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for tampered object-store bytes, got {err}"
+        );
     }
 
     #[tokio::test]

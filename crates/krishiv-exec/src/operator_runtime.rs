@@ -2,7 +2,7 @@
 
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
-use krishiv_state::{RedbStateBackend, StateBackend, TtlConfig, TtlStateBackend};
+use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::watermark_util::advance_effective_watermark;
 use crate::window::MultiSourceWatermarkState;
@@ -60,7 +60,7 @@ pub fn execute_bounded_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            let redb = RedbStateBackend::ephemeral()
+            let redb = FjallStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
@@ -93,7 +93,7 @@ pub fn execute_bounded_window(
                 slide_ms,
                 agg_exprs,
             };
-            let redb = RedbStateBackend::ephemeral()
+            let redb = FjallStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
@@ -125,7 +125,7 @@ pub fn execute_bounded_window(
                 session_gap_ms: gap_ms,
                 agg_exprs,
             };
-            let redb = RedbStateBackend::ephemeral()
+            let redb = FjallStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
@@ -174,7 +174,7 @@ pub fn execute_streaming_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            let redb = RedbStateBackend::ephemeral()
+            let redb = FjallStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
@@ -245,7 +245,7 @@ pub fn execute_streaming_window(
                 slide_ms,
                 agg_exprs,
             };
-            let redb = RedbStateBackend::ephemeral()
+            let redb = FjallStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))
@@ -315,7 +315,7 @@ pub fn execute_streaming_window(
                 session_gap_ms,
                 agg_exprs,
             };
-            let redb = RedbStateBackend::ephemeral()
+            let redb = FjallStateBackend::ephemeral()
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(redb, TtlConfig::new(ttl_ms)))

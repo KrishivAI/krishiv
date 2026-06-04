@@ -7,13 +7,13 @@ impl Coordinator {
         descriptor: ExecutorDescriptor,
     ) -> SchedulerResult<LeaseGeneration> {
         self.ensure_active()?;
+        // Persist before admitting into the in-memory registry so a metadata
+        // failure does not leave a worker accepted only until process restart.
+        if let Some(ref store) = self.store {
+            store.save_executor(&descriptor);
+        }
         let res = self.executors.register(descriptor.clone());
         if res.is_ok() {
-            // R10: Persist the descriptor so the executor is recognised on
-            // coordinator restart without requiring a fresh registration RPC.
-            if let Some(ref store) = self.store {
-                store.save_executor(&descriptor);
-            }
             self.assign_pending_tasks_for_schedulable_jobs();
             self.notify.notify_waiters();
         }

@@ -9,8 +9,9 @@ use std::time::Duration;
 use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
-    ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector, SharedKeyGroupRanges,
-    ShuffleContext, executor_barrier_grpc_server, serve_executor_task_grpc_with_listener,
+    ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector,
+    SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
+    serve_executor_task_grpc_with_listener,
 };
 use axum::Router;
 use axum::http::header::CONTENT_TYPE;
@@ -20,7 +21,7 @@ use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
 use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
-use krishiv_state::RedbStateBackend;
+use krishiv_state::FjallStateBackend;
 use krishiv_udf;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -33,6 +34,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         print!("{}", ExecutorCliConfig::help());
         return Ok(());
     }
+    config.validate_task_auth_startup(&ExecutorTaskAuthConfig::from_env())?;
 
     let mode = config.mode;
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
@@ -279,7 +281,7 @@ async fn heartbeat_loop(
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
     let state_backend =
-        Arc::new(RedbStateBackend::ephemeral().map_err(|e| format!("state backend: {e}"))?);
+        Arc::new(FjallStateBackend::ephemeral().map_err(|e| format!("state backend: {e}"))?);
 
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
     // operators that exchange partitions between executors (B5).  When no
@@ -443,14 +445,22 @@ async fn heartbeat_loop(
                                     epoch: cmd.epoch,
                                     fencing_token: cmd.fencing_token,
                                 };
-                                let _ = runner
+                                if let Err(error) = runner
                                     .initiate_checkpoint_for_job(
                                         &req,
                                         Arc::clone(&state_backend) as Arc<dyn krishiv_state::StateBackend>,
                                         Arc::clone(&checkpoint_storage) as Arc<dyn krishiv_checkpoint::CheckpointStorage>,
                                         coord_service.as_ref().clone(),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        job_id = %cmd.job_id,
+                                        epoch = cmd.epoch,
+                                        error = %error,
+                                        "checkpoint command failed"
+                                    );
+                                }
                             }
                         }
                         // R7.2: Apply source throttle limits from the coordinator heartbeat
@@ -671,6 +681,16 @@ impl ExecutorCliConfig {
         Ok(cfg)
     }
 
+    fn validate_task_auth_startup(
+        &self,
+        auth: &ExecutorTaskAuthConfig,
+    ) -> crate::ExecutorResult<()> {
+        if self.task_grpc_addr.is_some() {
+            auth.validate_required()?;
+        }
+        Ok(())
+    }
+
     fn set_mode(&mut self, mode: ExecutorMode) -> crate::ExecutorResult<()> {
         if self.mode != ExecutorMode::DryRun && self.mode != mode {
             return Err(crate::ExecutorError::LocalExecution {
@@ -699,6 +719,9 @@ impl ExecutorCliConfig {
            --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:50056; use 'off' to disable)\n\
            --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
            --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE or file:///tmp/krishiv-checkpoints)\n\
+           \n\
+         Security:\n\
+           Set KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH=true and non-empty KRISHIV_EXECUTOR_TASK_BEARER_TOKEN for distributed task-control gRPC.\n\
            -h, --help                   Show help\n"
     }
 }
@@ -716,7 +739,7 @@ mod tests {
         apply_successful_reregister_lease,
     };
     use crate::grpc_client::SharedLeaseGeneration;
-    use crate::{ExecutorConfig, ExecutorRuntime};
+    use crate::{ExecutorConfig, ExecutorRuntime, ExecutorTaskAuthConfig};
     use krishiv_proto::{
         ExecutorHeartbeatResponse, ExecutorId, LeaseGeneration, RegisterExecutorResponse,
         TransportDisposition,
@@ -890,6 +913,51 @@ mod tests {
             ExecutorCliConfig::parse([String::from("--task-grpc-addr"), String::from("off")])
                 .unwrap();
         assert!(config.task_grpc_addr.is_none());
+    }
+
+    #[test]
+    fn required_task_auth_rejects_exposed_task_grpc_without_token() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--connect"),
+            String::from("--task-grpc-addr"),
+            String::from("0.0.0.0:50055"),
+        ])
+        .unwrap();
+        let auth = ExecutorTaskAuthConfig::new(true, None);
+
+        let err = config.validate_task_auth_startup(&auth).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH")
+        );
+        assert!(
+            err.to_string()
+                .contains("KRISHIV_EXECUTOR_TASK_BEARER_TOKEN")
+        );
+    }
+
+    #[test]
+    fn required_task_auth_accepts_exposed_task_grpc_with_token() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--connect"),
+            String::from("--task-grpc-addr"),
+            String::from("0.0.0.0:50055"),
+        ])
+        .unwrap();
+        let auth = ExecutorTaskAuthConfig::new(true, Some(String::from("task-secret")));
+
+        config.validate_task_auth_startup(&auth).unwrap();
+    }
+
+    #[test]
+    fn required_task_auth_allows_disabled_task_grpc_without_token() {
+        let config =
+            ExecutorCliConfig::parse([String::from("--task-grpc-addr"), String::from("off")])
+                .unwrap();
+        let auth = ExecutorTaskAuthConfig::new(true, None);
+
+        config.validate_task_auth_startup(&auth).unwrap();
     }
 
     #[test]

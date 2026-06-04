@@ -6,6 +6,8 @@
 use krishiv_proto::wire::v1::coordinator_management_client::CoordinatorManagementClient;
 use tonic::transport::Channel;
 
+const COORDINATOR_BEARER_TOKEN_ENV: &str = "KRISHIV_COORDINATOR_BEARER_TOKEN";
+
 /// Error type for remote coordinator calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteClientError(pub String);
@@ -76,14 +78,23 @@ impl RemoteCoordinatorClient {
             .ok_or_else(|| RemoteClientError("failed to initialize gRPC client".into()))
     }
 
+    fn request<T>(&self, message: T) -> Result<tonic::Request<T>, RemoteClientError> {
+        let mut request = tonic::Request::new(message);
+        if let Some(token) = configured_coordinator_bearer_token() {
+            inject_coordinator_bearer_token(&mut request, &token)?;
+        }
+        Ok(request)
+    }
+
     /// Trigger a savepoint for the given job on the remote coordinator.
     pub async fn trigger_savepoint(&mut self, job_id: &str) -> Result<(), RemoteClientError> {
         let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
             job_id: job_id.to_owned(),
             label: String::new(),
         };
+        let request = self.request(req)?;
         self.client()?
-            .trigger_savepoint(tonic::Request::new(req))
+            .trigger_savepoint(request)
             .await
             .map_err(RemoteClientError::from)?;
         Ok(())
@@ -99,9 +110,10 @@ impl RemoteCoordinatorClient {
             job_id: job_id.to_owned(),
             label: label.to_owned(),
         };
+        let request = self.request(req)?;
         let resp = self
             .client()?
-            .trigger_savepoint(tonic::Request::new(req))
+            .trigger_savepoint(request)
             .await
             .map_err(RemoteClientError::from)?;
         Ok(resp.into_inner().epoch)
@@ -119,9 +131,10 @@ impl RemoteCoordinatorClient {
             epoch,
             storage_path: storage_path.to_owned(),
         };
+        let request = self.request(req)?;
         let resp = self
             .client()?
-            .restore_job(tonic::Request::new(req))
+            .restore_job(request)
             .await
             .map_err(RemoteClientError::from)?;
         let inner = resp.into_inner();
@@ -139,9 +152,10 @@ impl RemoteCoordinatorClient {
         let req = krishiv_proto::wire::v1::ListCheckpointsRequest {
             job_id: job_id.to_owned(),
         };
+        let request = self.request(req)?;
         let resp = self
             .client()?
-            .list_checkpoints(tonic::Request::new(req))
+            .list_checkpoints(request)
             .await
             .map_err(RemoteClientError::from)?;
         let epochs = resp
@@ -175,9 +189,10 @@ impl RemoteCoordinatorClient {
             job_id: job_id.to_owned(),
             operator_id: operator_id.to_owned(),
         };
+        let request = self.request(req)?;
         let resp = self
             .client()?
-            .inspect_state(tonic::Request::new(req))
+            .inspect_state(request)
             .await
             .map_err(RemoteClientError::from)?;
         let snapshots = resp
@@ -191,6 +206,27 @@ impl RemoteCoordinatorClient {
             .collect();
         Ok(snapshots)
     }
+}
+
+fn configured_coordinator_bearer_token() -> Option<String> {
+    std::env::var(COORDINATOR_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+fn inject_coordinator_bearer_token<T>(
+    request: &mut tonic::Request<T>,
+    token: &str,
+) -> Result<(), RemoteClientError> {
+    let header = format!("Bearer {}", token.trim());
+    let value = tonic::metadata::MetadataValue::try_from(header.as_str()).map_err(|_| {
+        RemoteClientError(format!(
+            "{COORDINATOR_BEARER_TOKEN_ENV} contains characters that are invalid for gRPC metadata"
+        ))
+    })?;
+    request.metadata_mut().insert("authorization", value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -215,5 +251,18 @@ mod tests {
         let status = tonic::Status::not_found("job not found");
         let e = RemoteClientError::from(status);
         assert!(e.to_string().contains("not_found") || e.to_string().contains("job not found"));
+    }
+
+    #[test]
+    fn inject_coordinator_bearer_token_adds_authorization_metadata() {
+        let mut request = tonic::Request::new(());
+
+        inject_coordinator_bearer_token(&mut request, " coord-secret ").unwrap();
+
+        let auth = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(auth, Some("Bearer coord-secret"));
     }
 }

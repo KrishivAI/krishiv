@@ -4,7 +4,8 @@ use etcd_client::Client;
 use tokio::sync::Mutex;
 
 use crate::store::{
-    EventLogEvent, MetadataStore, decode_metadata_snapshot, encode_metadata_snapshot,
+    EventLogEvent, MetadataStore, decode_metadata_snapshot_with_executors,
+    encode_metadata_snapshot_with_executors,
 };
 use crate::{JobRecord, SchedulerError, SchedulerResult};
 
@@ -35,25 +36,28 @@ impl EtcdMetadataStore {
                 .map_err(|e| SchedulerError::Transport {
                     message: format!("etcd metadata connect failed: {e}"),
                 })?;
-        let (events, jobs) = match client.get(METADATA_SNAPSHOT_KEY, None).await {
-            Ok(resp) => {
-                let value = resp.kvs().first().map(|kv| kv.value());
-                match value {
-                    Some(bytes) if !bytes.is_empty() => decode_metadata_snapshot(bytes)?,
-                    _ => (Vec::new(), Vec::new()),
+        let (events, jobs, executor_descriptors) =
+            match client.get(METADATA_SNAPSHOT_KEY, None).await {
+                Ok(resp) => {
+                    let value = resp.kvs().first().map(|kv| kv.value());
+                    match value {
+                        Some(bytes) if !bytes.is_empty() => {
+                            decode_metadata_snapshot_with_executors(bytes)?
+                        }
+                        _ => (Vec::new(), Vec::new(), Vec::new()),
+                    }
                 }
-            }
-            Err(e) => {
-                return Err(SchedulerError::Transport {
-                    message: format!("etcd metadata snapshot read failed: {e}"),
-                });
-            }
-        };
+                Err(e) => {
+                    return Err(SchedulerError::Transport {
+                        message: format!("etcd metadata snapshot read failed: {e}"),
+                    });
+                }
+            };
         Ok(Self {
             client: Mutex::new(client),
             events,
             jobs,
-            executor_descriptors: vec![],
+            executor_descriptors,
         })
     }
 
@@ -62,7 +66,7 @@ impl EtcdMetadataStore {
         // persisted to etcd. This prevents the snapshot from growing with
         // every event append and keeps the etcd key size bounded by the
         // number of active jobs rather than the total event log length.
-        let bytes = encode_metadata_snapshot(&[], &self.jobs)?;
+        let bytes = encode_etcd_snapshot(&self.jobs, &self.executor_descriptors)?;
         // etcd default max value size is 1.5 MiB.
         // Hard limit at 1.4 MiB leaves 100 KiB headroom; return an error
         // rather than silently attempting a write that etcd will reject.
@@ -97,6 +101,13 @@ impl EtcdMetadataStore {
         })??;
         Ok(())
     }
+}
+
+fn encode_etcd_snapshot(
+    jobs: &[JobRecord],
+    executors: &[krishiv_proto::ExecutorDescriptor],
+) -> SchedulerResult<Vec<u8>> {
+    encode_metadata_snapshot_with_executors(&[], jobs, executors)
 }
 
 impl MetadataStore for EtcdMetadataStore {
@@ -153,15 +164,17 @@ impl MetadataStore for EtcdMetadataStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{EventLogEvent, encode_metadata_snapshot};
+    use crate::store::{
+        EventLogEvent, decode_metadata_snapshot, decode_metadata_snapshot_with_executors,
+        encode_metadata_snapshot,
+    };
+    use krishiv_proto::{ExecutorDescriptor, ExecutorId, JobId};
 
     #[test]
     fn etcd_snapshot_does_not_include_events() {
         // Verify that events are excluded from etcd persistence: a snapshot with
         // 1 000 events + 5 jobs must encode to the same size as one with 0 events
         // + 5 jobs.  This confirms the snapshot only grows with job count.
-        use crate::store::decode_metadata_snapshot;
-
         let jobs: Vec<JobRecord> = (0..5)
             .map(|i| {
                 let job_id = JobId::try_new(format!("job-{i}")).unwrap();
@@ -180,23 +193,36 @@ mod tests {
             })
             .collect();
 
-        let bytes_with_events = encode_metadata_snapshot(&many_events, &jobs).unwrap();
-        let bytes_no_events = encode_metadata_snapshot(&[], &jobs).unwrap();
+        let normal_snapshot_with_events = encode_metadata_snapshot(&many_events, &jobs).unwrap();
+        let etcd_snapshot = encode_etcd_snapshot(&jobs, &[]).unwrap();
 
-        assert_eq!(
-            bytes_with_events.len(),
-            bytes_no_events.len(),
+        assert!(
+            normal_snapshot_with_events.len() > etcd_snapshot.len(),
             "etcd snapshot size must not depend on event count; \
              events are audit-only and must not be serialised"
         );
 
         // Round-trip: the decoded snapshot must only contain jobs.
-        let (decoded_events, decoded_jobs) = decode_metadata_snapshot(&bytes_with_events).unwrap();
+        let (decoded_events, decoded_jobs) = decode_metadata_snapshot(&etcd_snapshot).unwrap();
         assert!(
             decoded_events.is_empty(),
             "decoded snapshot must have no events (they are not persisted)"
         );
         assert_eq!(decoded_jobs.len(), 5);
+    }
+
+    #[test]
+    fn etcd_snapshot_persists_executor_descriptors() {
+        let executor =
+            ExecutorDescriptor::new(ExecutorId::try_new("exec-a").unwrap(), "worker-a", 4)
+                .with_task_endpoint("http://worker-a:9010")
+                .with_barrier_endpoint("http://worker-a:9011");
+
+        let bytes = encode_etcd_snapshot(&[], std::slice::from_ref(&executor)).unwrap();
+        let (_, jobs, executors) = decode_metadata_snapshot_with_executors(&bytes).unwrap();
+
+        assert!(jobs.is_empty());
+        assert_eq!(executors, vec![executor]);
     }
 
     #[test]
@@ -210,7 +236,6 @@ mod tests {
         // Produce a snapshot that encodes to more than 1.4 MiB by using many
         // JobSubmitted events with long IDs.  Verify the encoded bytes exceed the
         // hard limit so that EtcdMetadataStore::persist() would reject it.
-        use crate::store::decode_metadata_snapshot;
         const HARD_LIMIT: usize = 1_400_000;
         let events: Vec<EventLogEvent> = (0..15_000)
             .map(|i| EventLogEvent::JobSubmitted {
@@ -231,7 +256,6 @@ mod tests {
 
     #[test]
     fn encode_small_snapshot_is_under_hard_limit() {
-        use crate::store::decode_metadata_snapshot;
         const HARD_LIMIT: usize = 1_400_000;
         let events = vec![EventLogEvent::JobSubmitted {
             job_id: JobId::try_new("small-job").unwrap(),

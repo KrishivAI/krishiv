@@ -22,12 +22,12 @@ use kube::Client;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider();
-    configure_grpc_auth_from_env();
     let config = OperatorCliConfig::parse(std::env::args().skip(1))?;
     if config.help {
         print!("{}", OperatorCliConfig::help());
         return Ok(());
     }
+    configure_grpc_auth_for_startup(config.executor_grpc_addr.is_some())?;
 
     let controller_config = config.clone().into_controller_config()?;
     let runtime = KubernetesControllerRuntime::new(&controller_config)?;
@@ -68,13 +68,25 @@ fn install_rustls_crypto_provider() {
 }
 
 #[cfg(feature = "k8s")]
-fn configure_grpc_auth_from_env() {
+fn configure_grpc_auth_for_startup(exposes_coordinator_grpc: bool) -> Result<(), Box<dyn Error>> {
     if std::env::var("KRISHIV_ALLOW_ANONYMOUS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
         krishiv_scheduler::set_allow_anonymous();
+        return Ok(());
     }
+    if krishiv_scheduler::configure_grpc_auth_provider_from_env() {
+        return Ok(());
+    }
+    if exposes_coordinator_grpc {
+        return Err(format!(
+            "--executor-grpc-addr requires {} unless KRISHIV_ALLOW_ANONYMOUS=true",
+            krishiv_scheduler::COORDINATOR_BEARER_TOKEN_ENV
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "k8s"))]

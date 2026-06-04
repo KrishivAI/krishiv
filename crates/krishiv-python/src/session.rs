@@ -244,6 +244,12 @@ impl PySession {
             .map_err(map_krishiv_error)
     }
 
+    pub fn register_parquet_stream(&self, name: String, path: String) -> PyResult<()> {
+        self.inner
+            .register_parquet_stream(&name, path.as_ref())
+            .map_err(map_krishiv_error)
+    }
+
     pub fn register_unbounded(
         &self,
         name: String,

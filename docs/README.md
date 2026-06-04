@@ -101,6 +101,9 @@ Distributed:
 - Uses remote coordinator/executor transport.
 - Requires an explicit Flight coordinator URL; local fallback is rejected at
   session build/runtime construction.
+- Production coordinator and executor task-control gRPC require bearer-token
+  auth via `KRISHIV_COORDINATOR_BEARER_TOKEN` and
+  `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN`; anonymous gRPC is for dev-local only.
 - Kubernetes manifests and CRDs live in `k8s/`.
 - Bare-metal/VM operation is process-managed: run coordinator and executors
   directly and point clients at the configured endpoints.
@@ -120,7 +123,7 @@ Rust `krishiv` facade feature presets:
 | `minimal` | Smallest facade surface; no optional deployment capabilities. |
 | `local` | Default developer build; embedded plus single-node capabilities. |
 | `embedded` | In-process API use; intentionally has no optional dependencies. |
-| `single-node` | Local daemon/in-process cluster support with Flight SQL, shuffle, and SQLite metadata. |
+| `single-node` | Local daemon/in-process cluster support with Flight SQL, shuffle, and Redb metadata. |
 | `distributed` | Bare remote cluster support with Flight SQL, shuffle, and etcd metadata. |
 | `bare-metal` | Alias for distributed process-managed deployments. |
 | `cluster` | Compatibility alias for `distributed`. |
@@ -134,7 +137,7 @@ Rust optional integration features:
 | `flight-sql` | Arrow Flight SQL transport/server support. |
 | `shuffle` | Shuffle service/store support. |
 | `etcd` | etcd-backed scheduler metadata and coordination. |
-| `sqlite` | SQLite scheduler metadata option. |
+| `redb` | Redb scheduler metadata option. |
 | `kafka` | Kafka connector support. |
 | `state` | Connector/state integration. |
 | `iceberg` | Iceberg lakehouse support. |

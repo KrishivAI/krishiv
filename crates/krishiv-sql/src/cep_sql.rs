@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
-use krishiv_cep::{CepKeyState, CompiledPattern, Pattern, SequentialPatternMatcher};
+use krishiv_cep::{
+    CepKeyState, CompiledPattern, PartitionedCepMatcher, Pattern, SequentialPatternMatcher,
+};
 use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
 
 use crate::{SqlError, SqlResult};
@@ -136,14 +138,10 @@ pub fn execute_match_recognize(
     use arrow::array::Int64Array;
     use std::collections::HashMap;
 
-    if source_is_streaming {
-        return Err(crate::SqlError::Unsupported {
-            feature: "MATCH_RECOGNIZE on unbounded streaming sources (e.g. Kafka) is not \
-                      supported in this release — use a bounded batch table, a windowed \
-                      sub-query, or add a LIMIT clause to cap the input size"
-                .into(),
-        });
-    }
+    // Streaming sources are handled via execute_streaming_match_recognize; this
+    // function only accepts pre-collected bounded batches.  Callers that pass
+    // source_is_streaming=true should use the streaming variant instead.
+    let _ = source_is_streaming; // both paths now go through execute_match_recognize
 
     if source_batches.is_empty() {
         return Ok(Vec::new());
@@ -250,6 +248,114 @@ pub fn execute_match_recognize(
                 break;
             }
         }
+    }
+
+    Ok(output)
+}
+
+/// Incrementally apply a `MATCH_RECOGNIZE` pattern to a new batch of events
+/// from a streaming source, updating `state` in place.
+///
+/// Unlike [`execute_match_recognize`], this function does **not** require all
+/// source rows upfront — it feeds only the events in `new_batches` to the
+/// per-key matcher state and returns any pattern completions produced by this
+/// batch.  The caller owns `state` and passes the same instance on every call,
+/// accumulating pattern state across many batches.
+///
+/// Keys whose last event is older than `within_ms` × 2 are evicted from
+/// `state` to prevent unbounded memory growth for high-cardinality key spaces.
+pub fn execute_streaming_match_recognize(
+    stmt: &MatchRecognizeStatement,
+    new_batches: &[RecordBatch],
+    state: &mut PartitionedCepMatcher<String>,
+) -> SqlResult<Vec<RecordBatch>> {
+    use arrow::array::Int64Array;
+
+    if new_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schema = new_batches[0].schema();
+    let key_idx = schema
+        .index_of(&stmt.key_column)
+        .map_err(|_| SqlError::Unsupported {
+            feature: format!(
+                "MATCH_RECOGNIZE: key column '{}' not found",
+                stmt.key_column
+            ),
+        })?;
+    let time_idx = schema
+        .index_of(&stmt.event_time_column)
+        .map_err(|_| SqlError::Unsupported {
+            feature: format!(
+                "MATCH_RECOGNIZE: event time column '{}' not found",
+                stmt.event_time_column
+            ),
+        })?;
+
+    // Collect and sort all events in the incoming batches by event time.
+    let mut events: Vec<(String, i64, usize, usize)> = Vec::new();
+    for (batch_idx, batch) in new_batches.iter().enumerate() {
+        let key_col = batch.column(key_idx);
+        let time_col = batch
+            .column(time_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: format!(
+                    "MATCH_RECOGNIZE: event time column '{}' must be Int64",
+                    stmt.event_time_column
+                ),
+            })?;
+        let key_str = key_col.as_any().downcast_ref::<StringArray>();
+        for i in 0..batch.num_rows() {
+            let key = if let Some(k) = key_str {
+                if k.is_null(i) {
+                    continue;
+                }
+                k.value(i).to_string()
+            } else {
+                i.to_string()
+            };
+            if time_col.is_null(i) {
+                continue;
+            }
+            events.push((key, time_col.value(i), batch_idx, i));
+        }
+    }
+    events.sort_by_key(|(_, t, _, _)| *t);
+
+    let stage_names: Vec<&str> = stmt
+        .pattern
+        .stages
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+
+    let mut output: Vec<RecordBatch> = Vec::new();
+    let mut max_event_time: Option<i64> = None;
+
+    for (key, event_time, batch_idx, row_idx) in &events {
+        max_event_time = Some(max_event_time.unwrap_or(*event_time).max(*event_time));
+        let row = new_batches[*batch_idx].slice(*row_idx, 1);
+        for &stage in &stage_names {
+            let completed = state.process_event(key.clone(), stage, row.clone(), *event_time);
+            if !completed.is_empty() {
+                for matched_rows in completed {
+                    if let Ok(concat) = arrow::compute::concat_batches(&schema, &matched_rows) {
+                        output.push(concat);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // TTL eviction: remove keys whose last event is older than 2× the window
+    // to prevent unbounded state growth for high-cardinality key spaces.
+    if let Some(max_ts) = max_event_time {
+        let evict_before = max_ts - 2 * stmt.pattern.window_ms as i64;
+        state.evict_keys_before(evict_before);
     }
 
     Ok(output)
@@ -586,6 +692,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn parses_match_recognize_subset() {
         let stmt = parse_match_recognize(
             "SELECT * FROM events MATCH_RECOGNIZE (PARTITION BY user_id ORDER BY ts PATTERN (A B) WITHIN 10 SECONDS)",

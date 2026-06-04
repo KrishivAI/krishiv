@@ -4,6 +4,15 @@ use std::sync::{Arc, RwLock};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_proto::ExecutorTaskAssignment;
 
+/// Result of pushing an assignment into the executor inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentPushOutcome {
+    /// The assignment was queued for execution.
+    Enqueued,
+    /// The same `(job, task, attempt)` was already received.
+    Duplicate,
+}
+
 /// In-memory receiver queue for task assignments delivered to an executor.
 ///
 /// Supports bounded capacity for backpressure (PRR Phase 1/2).
@@ -75,6 +84,15 @@ impl ExecutorAssignmentInbox {
     /// if this assignment was already received. Returns `Err(AssignmentQueueFull)`
     /// when at capacity — the backpressure signal to the coordinator.
     pub fn push(&self, assignment: ExecutorTaskAssignment) -> ExecutorResult<()> {
+        self.push_with_outcome(assignment).map(|_| ())
+    }
+
+    /// Store one received assignment and report whether it was newly queued or
+    /// already present.
+    pub fn push_with_outcome(
+        &self,
+        assignment: ExecutorTaskAssignment,
+    ) -> ExecutorResult<AssignmentPushOutcome> {
         let key = (
             assignment.job_id().clone(),
             assignment.task_id().clone(),
@@ -86,7 +104,7 @@ impl ExecutorAssignmentInbox {
                 .write()
                 .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
             if !seen.insert(key.clone()) {
-                return Ok(()); // Duplicate assignment — already received
+                return Ok(AssignmentPushOutcome::Duplicate);
             }
         }
 
@@ -111,7 +129,7 @@ impl ExecutorAssignmentInbox {
         }
 
         q.push_back(assignment);
-        Ok(())
+        Ok(AssignmentPushOutcome::Enqueued)
     }
 
     /// Remove the next received assignment in FIFO order.
@@ -133,9 +151,29 @@ impl ExecutorAssignmentInbox {
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
         let before = assignments.len();
-        assignments.retain(|assignment| assignment.task_id() != task_id);
+        let mut removed_keys = Vec::new();
+        assignments.retain(|assignment| {
+            let remove = assignment.task_id() == task_id;
+            if remove {
+                removed_keys.push((
+                    assignment.job_id().clone(),
+                    assignment.task_id().clone(),
+                    assignment.attempt_id(),
+                ));
+            }
+            !remove
+        });
         let removed = assignments.len() != before;
         drop(assignments);
+        if !removed_keys.is_empty() {
+            let mut seen = self
+                .seen
+                .write()
+                .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+            for key in removed_keys {
+                seen.remove(&key);
+            }
+        }
         self.cancelled_tasks
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?
@@ -331,6 +369,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(inbox.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn duplicate_task_attempt_reports_duplicate_without_requeue() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let first = make_assignment("task-dup");
+        let duplicate = first.clone();
+
+        assert_eq!(
+            inbox.push_with_outcome(first).unwrap(),
+            AssignmentPushOutcome::Enqueued
+        );
+        assert_eq!(
+            inbox.push_with_outcome(duplicate).unwrap(),
+            AssignmentPushOutcome::Duplicate
+        );
+        assert_eq!(inbox.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn cancel_queued_task_allows_same_attempt_to_be_requeued() {
+        let inbox = ExecutorAssignmentInbox::new();
+        let assignment = make_assignment("task-cancel-retry");
+        let task_id = assignment.task_id().clone();
+        inbox.push(assignment.clone()).unwrap();
+
+        assert!(inbox.cancel_task(&task_id).unwrap());
+        assert_eq!(
+            inbox.push_with_outcome(assignment).unwrap(),
+            AssignmentPushOutcome::Enqueued
+        );
+        assert_eq!(inbox.len().unwrap(), 1);
     }
 
     #[test]

@@ -7,6 +7,8 @@ use krishiv_proto::{LeaseGeneration, wire};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
+pub const COORDINATOR_BEARER_TOKEN_ENV: &str = "KRISHIV_COORDINATOR_BEARER_TOKEN";
+
 /// Shared, atomically-updated lease generation handle.  The executor binary
 /// owns one of these for the entire process; every component that sends a
 /// coordinator RPC reads the live generation from it before transmitting so
@@ -46,6 +48,38 @@ type InterceptedCoordinatorClient =
             fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
         >,
     >;
+
+fn configured_coordinator_bearer_token() -> Option<String> {
+    std::env::var(COORDINATOR_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+pub(crate) fn inject_coordinator_bearer_token(
+    mut req: tonic::Request<()>,
+    token: &str,
+) -> Result<tonic::Request<()>, tonic::Status> {
+    let header = format!("Bearer {}", token.trim());
+    let value = tonic::metadata::MetadataValue::try_from(header.as_str()).map_err(|_| {
+        tonic::Status::internal(format!(
+            "{COORDINATOR_BEARER_TOKEN_ENV} contains characters that are invalid for gRPC metadata"
+        ))
+    })?;
+    req.metadata_mut().insert("authorization", value);
+    Ok(req)
+}
+
+fn inject_coordinator_request_context(
+    req: tonic::Request<()>,
+) -> Result<tonic::Request<()>, tonic::Status> {
+    let req = krishiv_metrics::grpc::inject_trace_context(req)?;
+    if let Some(token) = configured_coordinator_bearer_token() {
+        inject_coordinator_bearer_token(req, &token)
+    } else {
+        Ok(req)
+    }
+}
 
 /// Reuses one coordinator gRPC channel across RPCs and stamps the live lease
 /// onto every outgoing executor-originated request.
@@ -102,7 +136,7 @@ impl CoordinatorGrpcPool {
         let client =
             wire::v1::coordinator_executor_client::CoordinatorExecutorClient::with_interceptor(
                 channel,
-                krishiv_metrics::grpc::inject_trace_context
+                inject_coordinator_request_context
                     as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
             );
         // Re-lock and store if still empty (another task may have connected first).
@@ -126,5 +160,22 @@ impl CoordinatorGrpcPool {
 
     pub fn set_lease_generation(&self, lease: LeaseGeneration) {
         self.lease.set(lease);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_coordinator_bearer_token_adds_authorization_metadata() {
+        let request =
+            inject_coordinator_bearer_token(tonic::Request::new(()), " coord-secret ").unwrap();
+
+        let auth = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(auth, Some("Bearer coord-secret"));
     }
 }

@@ -9,7 +9,7 @@ use krishiv_checkpoint::{
     write_operator_snapshot,
 };
 use krishiv_state::{
-    InMemoryStateBackend, Namespace, RedbStateBackend, StateBackend, TtlConfig, TtlStateBackend,
+    Namespace, FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend,
     migration::{SharedStateMigrationRegistry, StateMigrationRegistry},
 };
 
@@ -69,7 +69,7 @@ fn now_ms() -> i64 {
 
 #[test]
 fn integration_in_memory_put_get_delete_snapshot_load() {
-    let mut backend = InMemoryStateBackend::new();
+    let mut backend = FjallStateBackend::ephemeral().unwrap();
     let n = ns("window-op", "counts");
 
     // put + get
@@ -88,20 +88,20 @@ fn integration_in_memory_put_get_delete_snapshot_load() {
     assert!(!snap.is_empty());
 
     // load into fresh backend
-    let mut loaded = InMemoryStateBackend::new();
+    let mut loaded = FjallStateBackend::ephemeral().unwrap();
     loaded.load_snapshot(&snap).unwrap();
 
     // verify
     assert!(loaded.get(&n, b"user-a").unwrap().is_none());
     assert_eq!(loaded.get(&n, b"user-b").unwrap(), Some(b"17".to_vec()));
-    assert_eq!(loaded.key_count(), 1);
+    assert_eq!(loaded.list_keys(&n).unwrap().len(), 1);
 }
 
 // ── 2. Redb state: put → get → delete → snapshot → load → verify ──────────
 
 #[test]
 fn integration_redb_put_get_delete_snapshot_load() {
-    let mut backend = RedbStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
     let n = ns("agg-op", "state");
 
     // put + get
@@ -120,7 +120,7 @@ fn integration_redb_put_get_delete_snapshot_load() {
     assert!(!snap.is_empty());
 
     // load into fresh backend
-    let mut loaded = RedbStateBackend::in_memory().expect("in-memory redb");
+    let mut loaded = FjallStateBackend::in_memory().expect("in-memory redb");
     loaded.load_snapshot(&snap).unwrap();
 
     // verify
@@ -132,7 +132,7 @@ fn integration_redb_put_get_delete_snapshot_load() {
 
 #[test]
 fn integration_ttl_put_expiry_verify() {
-    let inner = InMemoryStateBackend::new();
+    let inner = FjallStateBackend::ephemeral().unwrap();
     let mut ttl = TtlStateBackend::new(inner, TtlConfig::new(60_000));
     let n = ns("session-op", "session");
 
@@ -442,7 +442,7 @@ fn integration_state_checkpoint_restore_roundtrip() {
     let n = ns("window-op", "user-counts");
 
     // 1. Write state
-    let mut backend = InMemoryStateBackend::new();
+    let mut backend = FjallStateBackend::ephemeral().unwrap();
     backend.put(&n, b"alice".to_vec(), b"10".to_vec()).unwrap();
     backend.put(&n, b"bob".to_vec(), b"20".to_vec()).unwrap();
 
@@ -465,7 +465,7 @@ fn integration_state_checkpoint_restore_roundtrip() {
             .unwrap();
 
     // 6. Load into fresh state backend
-    let mut restored = InMemoryStateBackend::new();
+    let mut restored = FjallStateBackend::ephemeral().unwrap();
     restored.load_snapshot(&restored_snap).unwrap();
 
     // 7. Verify restored state matches original
@@ -480,7 +480,7 @@ fn integration_redb_state_checkpoint_restore_roundtrip() {
     let n = ns("agg-op", "metrics");
 
     // Write state in Redb backend
-    let mut backend = RedbStateBackend::in_memory().expect("in-memory redb");
+    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
     backend
         .put(&n, b"metric-1".to_vec(), b"100".to_vec())
         .unwrap();
@@ -498,7 +498,7 @@ fn integration_redb_state_checkpoint_restore_roundtrip() {
             .unwrap()
             .unwrap();
 
-    let mut restored = RedbStateBackend::in_memory().expect("in-memory redb");
+    let mut restored = FjallStateBackend::in_memory().expect("in-memory redb");
     restored.load_snapshot(&restored_snap).unwrap();
 
     assert_eq!(
@@ -518,7 +518,7 @@ fn integration_cross_backend_inmemory_to_redb_via_snapshot() {
     let n = ns("cross-op", "migrate-state");
 
     // Populate InMemory state
-    let mut src = InMemoryStateBackend::new();
+    let mut src = FjallStateBackend::ephemeral().unwrap();
     src.put(&n, b"k1".to_vec(), b"v1".to_vec()).unwrap();
     src.put(&n, b"k2".to_vec(), b"v2".to_vec()).unwrap();
     src.put(&n, b"k3".to_vec(), b"v3".to_vec()).unwrap();
@@ -528,7 +528,7 @@ fn integration_cross_backend_inmemory_to_redb_via_snapshot() {
     assert!(!snap.is_empty());
 
     // Load into Redb (cross-backend migration)
-    let mut dst = RedbStateBackend::in_memory().expect("in-memory redb");
+    let mut dst = FjallStateBackend::in_memory().expect("in-memory redb");
     dst.load_snapshot(&snap).unwrap();
 
     // Verify all entries survived the cross-backend transfer
@@ -538,7 +538,7 @@ fn integration_cross_backend_inmemory_to_redb_via_snapshot() {
 
     // Reverse: Redb → InMemory
     let snap2 = dst.snapshot().unwrap();
-    let mut dst2 = InMemoryStateBackend::new();
+    let mut dst2 = FjallStateBackend::ephemeral().unwrap();
     dst2.load_snapshot(&snap2).unwrap();
     assert_eq!(dst2.get(&n, b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(dst2.get(&n, b"k2").unwrap(), Some(b"v2".to_vec()));
@@ -554,7 +554,7 @@ fn integration_cross_backend_redb_file_persist_snapshot() {
 
     // Write to file-backed Redb, snapshot, store in checkpoint, restore to InMemory
     {
-        let mut backend = RedbStateBackend::open(&path).expect("open redb");
+        let mut backend = FjallStateBackend::open(&path).expect("open redb");
         backend.put(&n, b"pk1".to_vec(), b"pv1".to_vec()).unwrap();
         backend.put(&n, b"pk2".to_vec(), b"pv2".to_vec()).unwrap();
         let snap = backend.snapshot().unwrap();
@@ -566,7 +566,7 @@ fn integration_cross_backend_redb_file_persist_snapshot() {
             krishiv_checkpoint::read_operator_snapshot(&*storage, "job-cross", 1, "op-0", "task-0")
                 .unwrap()
                 .unwrap();
-        let mut mem = InMemoryStateBackend::new();
+        let mut mem = FjallStateBackend::ephemeral().unwrap();
         mem.load_snapshot(&restored_snap).unwrap();
         assert_eq!(mem.get(&n, b"pk1").unwrap(), Some(b"pv1".to_vec()));
         assert_eq!(mem.get(&n, b"pk2").unwrap(), Some(b"pv2".to_vec()));
@@ -581,7 +581,7 @@ fn integration_checkpoint_multi_epoch_progression() {
     let job_id = "job-prog";
 
     // Epoch 1
-    let mut backend = InMemoryStateBackend::new();
+    let mut backend = FjallStateBackend::ephemeral().unwrap();
     let n = ns("op", "counts");
     backend.put(&n, b"a".to_vec(), b"1".to_vec()).unwrap();
     let snap1 = backend.snapshot().unwrap();
@@ -604,7 +604,7 @@ fn integration_checkpoint_multi_epoch_progression() {
     let snap_r1 = krishiv_checkpoint::read_operator_snapshot(&storage, job_id, 1, "op-0", "task-0")
         .unwrap()
         .unwrap();
-    let mut r1 = InMemoryStateBackend::new();
+    let mut r1 = FjallStateBackend::ephemeral().unwrap();
     r1.load_snapshot(&snap_r1).unwrap();
     assert_eq!(r1.get(&n, b"a").unwrap(), Some(b"1".to_vec()));
     assert!(r1.get(&n, b"b").unwrap().is_none());
@@ -613,7 +613,7 @@ fn integration_checkpoint_multi_epoch_progression() {
     let snap_r3 = krishiv_checkpoint::read_operator_snapshot(&storage, job_id, 3, "op-0", "task-0")
         .unwrap()
         .unwrap();
-    let mut r3 = InMemoryStateBackend::new();
+    let mut r3 = FjallStateBackend::ephemeral().unwrap();
     r3.load_snapshot(&snap_r3).unwrap();
     assert!(r3.get(&n, b"a").unwrap().is_none());
     assert_eq!(r3.get(&n, b"b").unwrap(), Some(b"2".to_vec()));
@@ -640,7 +640,7 @@ fn integration_checkpoint_delete_epoch_preserves_others() {
 
 #[test]
 fn integration_ttl_snapshot_preserves_across_redb() {
-    let inner1 = InMemoryStateBackend::new();
+    let inner1 = FjallStateBackend::ephemeral().unwrap();
     let mut ttl1 = TtlStateBackend::new(inner1, TtlConfig::new(60_000));
     let n = ns("ttl-op", "session");
 
@@ -652,7 +652,7 @@ fn integration_ttl_snapshot_preserves_across_redb() {
     let snap = ttl1.snapshot().unwrap();
 
     // Load into TTL-wrapped Redb
-    let inner2 = RedbStateBackend::in_memory().expect("in-memory redb");
+    let inner2 = FjallStateBackend::in_memory().expect("in-memory redb");
     let mut ttl2 = TtlStateBackend::new(inner2, TtlConfig::new(60_000));
     ttl2.load_snapshot(&snap).unwrap();
 
@@ -668,7 +668,7 @@ fn integration_state_inspector_after_checkpoint_restore() {
     let job_id = "job-inspect";
     let epoch = 1u64;
 
-    let mut backend = InMemoryStateBackend::new();
+    let mut backend = FjallStateBackend::ephemeral().unwrap();
     let n1 = ns("op1", "window");
     let n2 = ns("op2", "counts");
     backend.put(&n1, b"k1".to_vec(), b"v1".to_vec()).unwrap();
@@ -684,7 +684,7 @@ fn integration_state_inspector_after_checkpoint_restore() {
         krishiv_checkpoint::read_operator_snapshot(&storage, job_id, epoch, "op-0", "task-0")
             .unwrap()
             .unwrap();
-    let mut restored = InMemoryStateBackend::new();
+    let mut restored = FjallStateBackend::ephemeral().unwrap();
     restored.load_snapshot(&restored_snap).unwrap();
 
     // Inspect restored state

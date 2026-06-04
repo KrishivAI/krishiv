@@ -663,9 +663,7 @@ impl Coordinator {
             // set real limits via with_queue_manager() without a code change.
             // KRISHIV_MAX_CONCURRENT_JOBS env var is honoured at daemon startup;
             // other limits require explicit CoordinatorConfig::with_queue_manager().
-            queue_manager: Arc::new(QuotaQueueManager::with_default(
-                quota_policy_from_env(),
-            )),
+            queue_manager: Arc::new(QuotaQueueManager::with_default(quota_policy_from_env())),
             gc_ready_jobs: Vec::new(),
             ticks_since_restart: u64::MAX,
             recovering: false,

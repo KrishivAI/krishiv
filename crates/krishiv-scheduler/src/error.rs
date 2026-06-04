@@ -75,4 +75,7 @@ pub enum SchedulerError {
     /// Executor endpoint is unavailable for task dispatch.
     #[error("executor endpoint {endpoint} unavailable: {reason}")]
     ExecutorUnavailable { endpoint: String, reason: String },
+    /// Storage/persistence backend failed.
+    #[error("store error: {message}")]
+    Store { message: String },
 }

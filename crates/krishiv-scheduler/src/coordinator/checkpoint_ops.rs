@@ -106,6 +106,7 @@ impl Coordinator {
     /// Returns the savepoint epoch number.  Fails if no `CheckpointCoordinator`
     /// exists for this job (i.e. the job was not submitted with checkpoint config).
     pub fn savepoint_job(&mut self, job_id: &JobId, label: Option<String>) -> SchedulerResult<u64> {
+        self.ensure_active()?;
         let running = self.running_task_count_for_job(job_id);
         let res = match self.checkpoint_coordinators.get_mut(job_id) {
             None => Err(SchedulerError::InvalidJob {

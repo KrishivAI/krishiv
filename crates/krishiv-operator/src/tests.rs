@@ -47,7 +47,7 @@ mod operator_tests {
     }
 
     #[test]
-    fn reconcile_waits_for_executors_without_failing_resource() {
+    fn reconcile_submits_and_waits_for_executors_without_failing_resource() {
         let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
         let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
         let mut coordinator = Coordinator::active(coordinator_id);
@@ -56,15 +56,13 @@ mod operator_tests {
             .reconcile(&mut coordinator, &sample_resource())
             .unwrap();
 
-        assert_eq!(outcome.action(), ReconcileAction::WaitingForExecutors);
+        assert_eq!(outcome.action(), ReconcileAction::Submitted);
         assert_eq!(outcome.status().phase, KrishivJobPhase::Accepted);
-        assert_eq!(
-            outcome.status().conditions[0].status,
-            ConditionStatus::False
-        );
+        assert_eq!(outcome.status().tasks.assigned, 0);
+        assert_eq!(outcome.status().conditions[0].status, ConditionStatus::True);
         assert_eq!(
             outcome.status().conditions[0].reason.as_deref(),
-            Some("NoExecutors")
+            Some("SchedulerObserved")
         );
     }
 
@@ -189,6 +187,47 @@ mod operator_tests {
                 String::from("1"),
             ]
         );
+    }
+
+    #[test]
+    fn executor_pod_template_requires_task_auth_secret() {
+        let resource = sample_resource();
+        let template = build_executor_pod_template(&resource, "http://krishiv-coordinator:9090");
+        let spec = template.spec.expect("pod template spec");
+        let container = spec.containers.first().expect("executor container");
+        let env = container.env.as_ref().expect("executor env");
+
+        let require_auth = env
+            .iter()
+            .find(|var| var.name == "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH")
+            .expect("require auth env");
+        assert_eq!(require_auth.value.as_deref(), Some("true"));
+
+        let coordinator_token = env
+            .iter()
+            .find(|var| var.name == "KRISHIV_COORDINATOR_BEARER_TOKEN")
+            .expect("coordinator token env");
+        let coordinator_secret = coordinator_token
+            .value_from
+            .as_ref()
+            .and_then(|source| source.secret_key_ref.as_ref())
+            .expect("coordinator auth secret ref");
+        assert_eq!(coordinator_secret.name, "krishiv-coordinator-auth");
+        assert_eq!(coordinator_secret.key, "token");
+        assert_eq!(coordinator_secret.optional, Some(false));
+
+        let token = env
+            .iter()
+            .find(|var| var.name == "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN")
+            .expect("task auth token env");
+        let secret = token
+            .value_from
+            .as_ref()
+            .and_then(|source| source.secret_key_ref.as_ref())
+            .expect("task auth secret ref");
+        assert_eq!(secret.name, "krishiv-executor-task-auth");
+        assert_eq!(secret.key, "token");
+        assert_eq!(secret.optional, Some(false));
     }
 
     #[test]

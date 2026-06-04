@@ -53,10 +53,9 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let descriptor = request.descriptor().clone();
         let executor_id = descriptor.executor_id().clone();
 
-        // Phase 1: register under dedicated executor inner lock (H2 sharding).
         let response = {
-            let mut executor_inner = self.coordinator.executor_inner.write().await;
-            match executor_inner.register_executor(descriptor) {
+            let mut coordinator = self.coordinator.write().await;
+            match coordinator.register_executor(descriptor) {
                 Ok(lease_generation) => RegisterExecutorResponse::new(
                     executor_id.clone(),
                     lease_generation,
@@ -74,11 +73,18 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             }
         };
 
-        // Phase 2: sync executor state from inner → outer coordinator.
+        // Keep the sharded executor snapshot consistent after the durable
+        // coordinator mutation above.
         {
-            let inner = self.coordinator.executor_inner.read().await;
-            let mut coordinator = self.coordinator.write().await;
-            coordinator.executors.clone_from(&inner.executors);
+            let coordinator = self.coordinator.read().await;
+            let mut executor_inner = self.coordinator.executor_inner.write().await;
+            crate::coordinator_sharded::sync_executor_to_inner(
+                &coordinator.executors,
+                coordinator.state,
+                coordinator.executors.current_tick,
+                coordinator.recovering,
+                &mut executor_inner,
+            );
         }
 
         Ok(tonic::Response::new(response))
@@ -280,6 +286,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
         let auth = extract_auth_context(request.metadata());
         validate_grpc_auth(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
+        ensure_shared_coordinator_active(&self.coordinator).await?;
         let ack = request.into_inner();
         let job_id = ack.job_id.clone();
         let ack_epoch = ack.epoch;
@@ -332,6 +339,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<TriggerSavepointRequest>,
     ) -> Result<tonic::Response<TriggerSavepointResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
+        tracing::debug!(subject = %auth.subject(), "trigger_savepoint");
         let req = request.into_inner();
         let label = if req.label.is_empty() {
             None
@@ -341,7 +351,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         let mut coordinator = self.coordinator.write().await;
         let epoch = coordinator
             .savepoint_job(&req.job_id, label)
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+            .map_err(status_from_scheduler_error)?;
         Ok(tonic::Response::new(TriggerSavepointResponse { epoch }))
     }
 
@@ -349,6 +359,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<RestoreJobRequest>,
     ) -> Result<tonic::Response<RestoreJobResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
+        tracing::debug!(subject = %auth.subject(), "restore_job");
         let req = request.into_inner();
         let coordinator = self.coordinator.read().await;
         match coordinator.restore_job_from_checkpoint(&req.job_id, req.epoch, &req.storage_path) {
@@ -370,6 +383,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<ListCheckpointsRequest>,
     ) -> Result<tonic::Response<ListCheckpointsResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
+        tracing::debug!(subject = %auth.subject(), "list_checkpoints");
         let req = request.into_inner();
         let (epoch_nums, storage): (Vec<u64>, Option<Arc<dyn CheckpointStorage>>) = {
             let checkpoint_inner = self.coordinator.checkpoint_inner.read().await;
@@ -419,6 +435,9 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         &self,
         request: tonic::Request<InspectStateRequest>,
     ) -> Result<tonic::Response<InspectStateResponse>, tonic::Status> {
+        let auth = extract_auth_context(request.metadata());
+        validate_grpc_auth(&auth)?;
+        tracing::debug!(subject = %auth.subject(), "inspect_state");
         let req = request.into_inner();
         // Collect snapshot paths for the requested operator from the checkpoint coordinator.
         let checkpoint_inner = self.coordinator.checkpoint_inner.read().await;
@@ -469,11 +488,12 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         &self,
         request: tonic::Request<wire::v1::RegisterExecutorRequest>,
     ) -> Result<tonic::Response<wire::v1::RegisterExecutorResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let request = wire::register_executor_request_from_wire(request.into_inner())
             .map_err(status_from_wire_error)?;
         let response = self
             .inner
-            .register_executor(tonic::Request::new(request))
+            .register_executor(request_with_metadata(request, metadata))
             .await?
             .into_inner();
         Ok(tonic::Response::new(
@@ -485,11 +505,12 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         &self,
         request: tonic::Request<wire::v1::DeregisterExecutorRequest>,
     ) -> Result<tonic::Response<wire::v1::DeregisterExecutorResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let request = wire::deregister_executor_request_from_wire(request.into_inner())
             .map_err(status_from_wire_error)?;
         let response = self
             .inner
-            .deregister_executor(tonic::Request::new(request))
+            .deregister_executor(request_with_metadata(request, metadata))
             .await?
             .into_inner();
         Ok(tonic::Response::new(
@@ -501,11 +522,12 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         &self,
         request: tonic::Request<wire::v1::ExecutorHeartbeatRequest>,
     ) -> Result<tonic::Response<wire::v1::ExecutorHeartbeatResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let request = wire::executor_heartbeat_request_from_wire(request.into_inner())
             .map_err(status_from_wire_error)?;
         let response = self
             .inner
-            .executor_heartbeat(tonic::Request::new(request))
+            .executor_heartbeat(request_with_metadata(request, metadata))
             .await?
             .into_inner();
         Ok(tonic::Response::new(
@@ -517,11 +539,12 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         &self,
         request: tonic::Request<wire::v1::TaskStatusRequest>,
     ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let request = wire::task_status_request_from_wire(request.into_inner())
             .map_err(status_from_wire_error)?;
         let response = self
             .inner
-            .task_status(tonic::Request::new(request))
+            .task_status(request_with_metadata(request, metadata))
             .await?
             .into_inner();
         Ok(tonic::Response::new(wire::task_status_response_to_wire(
@@ -533,17 +556,37 @@ impl wire::v1::coordinator_executor_server::CoordinatorExecutor for CoordinatorE
         &self,
         request: tonic::Request<wire::v1::CheckpointAckRequest>,
     ) -> Result<tonic::Response<wire::v1::CheckpointAckResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let request = wire::checkpoint_ack_request_from_wire(request.into_inner())
             .map_err(status_from_wire_error)?;
         let response = self
             .inner
-            .checkpoint_ack(tonic::Request::new(request))
+            .checkpoint_ack(request_with_metadata(request, metadata))
             .await?
             .into_inner();
         Ok(tonic::Response::new(wire::checkpoint_ack_response_to_wire(
             response,
         )))
     }
+}
+
+fn request_with_metadata<T>(
+    message: T,
+    metadata: tonic::metadata::MetadataMap,
+) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    *request.metadata_mut() = metadata;
+    request
+}
+
+async fn ensure_shared_coordinator_active(
+    coordinator: &SharedCoordinator,
+) -> Result<(), tonic::Status> {
+    coordinator
+        .read()
+        .await
+        .ensure_active()
+        .map_err(status_from_scheduler_error)
 }
 
 /// gRPC adapter exposing the coordinator management service (GAP-RT-04).
@@ -571,6 +614,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         &self,
         request: tonic::Request<wire::v1::TriggerSavepointRequest>,
     ) -> Result<tonic::Response<wire::v1::TriggerSavepointResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let w = request.into_inner();
         let job_id = JobId::try_new(w.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
@@ -580,7 +624,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         };
         let resp = CoordinatorManagementService::trigger_savepoint(
             &self.inner,
-            tonic::Request::new(domain),
+            request_with_metadata(domain, metadata),
         )
         .await?
         .into_inner();
@@ -594,6 +638,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         &self,
         request: tonic::Request<wire::v1::RestoreJobRequest>,
     ) -> Result<tonic::Response<wire::v1::RestoreJobResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let w = request.into_inner();
         let job_id = JobId::try_new(w.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
@@ -602,10 +647,12 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
             epoch: w.epoch,
             storage_path: w.storage_path,
         };
-        let resp =
-            CoordinatorManagementService::restore_job(&self.inner, tonic::Request::new(domain))
-                .await?
-                .into_inner();
+        let resp = CoordinatorManagementService::restore_job(
+            &self.inner,
+            request_with_metadata(domain, metadata),
+        )
+        .await?
+        .into_inner();
         Ok(tonic::Response::new(wire::v1::RestoreJobResponse {
             accepted: resp.accepted,
             message: resp.message,
@@ -616,13 +663,14 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         &self,
         request: tonic::Request<wire::v1::ListCheckpointsRequest>,
     ) -> Result<tonic::Response<wire::v1::ListCheckpointsResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let w = request.into_inner();
         let job_id = JobId::try_new(w.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
         let domain = ListCheckpointsRequest { job_id };
         let resp = CoordinatorManagementService::list_checkpoints(
             &self.inner,
-            tonic::Request::new(domain),
+            request_with_metadata(domain, metadata),
         )
         .await?
         .into_inner();
@@ -644,6 +692,7 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
         &self,
         request: tonic::Request<wire::v1::InspectStateRequest>,
     ) -> Result<tonic::Response<wire::v1::InspectStateResponse>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let w = request.into_inner();
         let job_id = JobId::try_new(w.job_id)
             .map_err(|e| tonic::Status::invalid_argument(format!("invalid job_id: {e}")))?;
@@ -651,10 +700,12 @@ impl wire::v1::coordinator_management_server::CoordinatorManagement
             job_id,
             operator_id: w.operator_id,
         };
-        let resp =
-            CoordinatorManagementService::inspect_state(&self.inner, tonic::Request::new(domain))
-                .await?
-                .into_inner();
+        let resp = CoordinatorManagementService::inspect_state(
+            &self.inner,
+            request_with_metadata(domain, metadata),
+        )
+        .await?
+        .into_inner();
         let snapshots = resp
             .snapshots
             .into_iter()
@@ -753,6 +804,28 @@ fn status_from_wire_error(error: wire::WireError) -> tonic::Status {
     tonic::Status::invalid_argument(error.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::request_with_metadata;
+
+    #[test]
+    fn request_with_metadata_preserves_authorization_header() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            "authorization",
+            tonic::metadata::MetadataValue::from_static("Bearer coord-secret"),
+        );
+
+        let request = request_with_metadata((), metadata);
+
+        let auth = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(auth, Some("Bearer coord-secret"));
+    }
+}
+
 pub(crate) fn status_from_scheduler_error(error: SchedulerError) -> tonic::Status {
     match error {
         SchedulerError::InactiveCoordinator { .. } => {
@@ -771,8 +844,8 @@ pub(crate) fn status_from_scheduler_error(error: SchedulerError) -> tonic::Statu
         SchedulerError::NoExecutors
         | SchedulerError::InvalidJob { .. }
         | SchedulerError::InvalidPlan { .. } => tonic::Status::invalid_argument(error.to_string()),
-        SchedulerError::Transport { .. } | SchedulerError::ExecutorUnavailable { .. } => {
-            tonic::Status::unavailable(error.to_string())
-        }
+        SchedulerError::Transport { .. }
+        | SchedulerError::ExecutorUnavailable { .. }
+        | SchedulerError::Store { .. } => tonic::Status::unavailable(error.to_string()),
     }
 }

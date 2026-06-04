@@ -25,10 +25,11 @@ spec:
         - name: coordinator
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["krishiv-coordinator"]
+          command: ["/usr/local/bin/krishiv"]
           args:
-            - "--listen=0.0.0.0:{{ .Values.coordinator.port }}"
-            - "--lease-duration={{ .Values.leaderElection.leaseDurationSeconds }}"
+            - "coordinator"
+            - "--grpc-addr"
+            - "0.0.0.0:{{ .Values.coordinator.port }}"
           ports:
             - name: grpc
               containerPort: {{ .Values.coordinator.port }}
@@ -36,6 +37,16 @@ spec:
           env:
             - name: KRISHIV_SERVICE_NAME
               value: {{ .Values.observability.serviceName | quote }}
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinatorAuth.secretName | quote }}
+                  key: {{ .Values.coordinatorAuth.secretKey | quote }}
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.executorTaskAuth.secretName | quote }}
+                  key: {{ .Values.executorTaskAuth.secretKey | quote }}
             {{- if .Values.observability.otlpEndpoint }}
             - name: KRISHIV_OTLP_ENDPOINT
               value: {{ .Values.observability.otlpEndpoint | quote }}
@@ -51,12 +62,12 @@ spec:
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
           readinessProbe:
-            grpc:
+            tcpSocket:
               port: {{ .Values.coordinator.port }}
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            grpc:
+            tcpSocket:
               port: {{ .Values.coordinator.port }}
             initialDelaySeconds: 15
             periodSeconds: 30

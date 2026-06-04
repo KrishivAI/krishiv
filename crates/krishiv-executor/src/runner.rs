@@ -35,6 +35,7 @@ pub(crate) const DEFAULT_BATCH_TASK_TIMEOUT_SECS: u64 = 3600;
 /// would block forever without this guard (R6). Operators that legitimately
 /// need longer windows should set `task_timeout_secs` explicitly.
 pub(crate) const DEFAULT_STREAMING_TASK_TIMEOUT_SECS: u64 = 300;
+const MAX_CHECKPOINT_ACK_RETRIES: u8 = 3;
 
 /// Maximum bytes used in the failure message sent to the coordinator.  Larger
 /// messages are truncated with `…` so they cannot blow past gRPC payload limits.
@@ -1173,6 +1174,49 @@ impl ExecutorTaskRunner {
         }
     }
 
+    async fn send_checkpoint_ack_with_retries<S>(
+        &self,
+        ack: CheckpointAckRequest,
+        coordinator: S,
+    ) -> Result<CheckpointAckResponse, tonic::Status>
+    where
+        S: CoordinatorExecutorService + Clone + 'static,
+    {
+        let mut attempt = 0;
+        loop {
+            let result = coordinator
+                .clone()
+                .checkpoint_ack(tonic::Request::new(ack.clone()))
+                .await
+                .map(tonic::Response::into_inner);
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let is_retryable = matches!(
+                        error.code(),
+                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                    );
+                    if is_retryable && attempt < MAX_CHECKPOINT_ACK_RETRIES - 1 {
+                        attempt += 1;
+                        let backoff_ms = 100u64 * (1u64 << attempt);
+                        tracing::warn!(
+                            job_id = %ack.job_id,
+                            task_id = %ack.task_id,
+                            epoch = ack.epoch,
+                            attempt,
+                            error = %error,
+                            "checkpoint ack delivery failed transiently; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     fn clear_running_attempt(&self, assignment: &ExecutorTaskAssignment) {
         if let Some(running_map) = &self.running_attempts {
             running_map.remove(assignment.task_id().as_str());
@@ -1218,10 +1262,8 @@ impl ExecutorTaskRunner {
         // Re-insert the updated runner (last_acked_epoch was updated).
         self.checkpoint_runners.insert(task_id, task_runner);
 
-        coordinator
-            .checkpoint_ack(tonic::Request::new(ack))
+        self.send_checkpoint_ack_with_retries(ack, coordinator)
             .await
-            .map(tonic::Response::into_inner)
     }
 
     /// Fan out checkpoint initiation to all known task runners for a job (heartbeat path).
@@ -1248,21 +1290,29 @@ impl ExecutorTaskRunner {
         // most-recently seen token instead of always stamping FencingToken::initial().
         self.cached_coordinator_fencing_token
             .store(req.fencing_token.as_u64(), Ordering::SeqCst);
-        for entry in self.checkpoint_runners.iter() {
-            let task_id = entry.key().clone();
-            // Skip tasks that are no longer running; they don't contribute to
-            // the checkpoint quorum and cannot be validated by the coordinator.
-            let attempt = match self
-                .running_attempts
-                .as_ref()
-                .and_then(|map| map.get(task_id.as_str()))
-            {
-                Some(a) => a.clone(),
-                None => {
-                    tracing::debug!(task_id = %task_id, "task not running; skipping checkpoint ack");
-                    continue;
-                }
-            };
+        let running_attempts = self.running_attempts.as_ref().ok_or_else(|| {
+            tonic::Status::failed_precondition(
+                "executor checkpoint fanout requires running attempt tracking",
+            )
+        })?;
+
+        let attempts: Vec<TaskAttemptRef> = running_attempts
+            .iter()
+            .filter_map(|entry| {
+                let attempt = entry.value();
+                (attempt.job_id() == &req.job_id).then(|| attempt.clone())
+            })
+            .collect();
+
+        if attempts.is_empty() {
+            return Err(tonic::Status::failed_precondition(format!(
+                "no running attempts for checkpoint job {}",
+                req.job_id
+            )));
+        }
+
+        for attempt in attempts {
+            let task_id = attempt.task_id().clone();
             let stage_id = attempt.stage_id().clone();
             let attempt_id = attempt.attempt_id();
             // Get the real executor ID from a synthesised assignment for the ack path.
@@ -1596,7 +1646,7 @@ mod runner_tests {
             epoch: 3,
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
-        let state_backend = krishiv_state::RedbStateBackend::ephemeral().unwrap();
+        let state_backend = krishiv_state::FjallStateBackend::ephemeral().unwrap();
         let storage = krishiv_checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
             .handle_initiate_checkpoint(req, &state_backend, &storage)
@@ -1614,7 +1664,7 @@ mod runner_tests {
             epoch: 1,
             fencing_token: krishiv_proto::FencingToken::initial(),
         };
-        let state_backend = krishiv_state::RedbStateBackend::ephemeral().unwrap();
+        let state_backend = krishiv_state::FjallStateBackend::ephemeral().unwrap();
         let storage = krishiv_checkpoint::LocalFsCheckpointStorage::ephemeral().unwrap();
         let ack = runner
             .handle_initiate_checkpoint(req, &state_backend, &storage)

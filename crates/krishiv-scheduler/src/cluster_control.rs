@@ -204,6 +204,8 @@ impl ClusterControlPlane {
                 tracing::error!(error = %e, "failed to promote to active");
             }
             orchestration_handles = Some(self.spawn_orchestration_loops());
+        } else if let Err(e) = self.demote_to_standby().await {
+            tracing::error!(error = %e, "failed to demote to standby after failed acquisition");
         }
 
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -248,6 +250,24 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
+    struct NeverLeader;
+
+    #[async_trait::async_trait]
+    impl LeaderElection for NeverLeader {
+        fn is_leader(&self) -> bool {
+            false
+        }
+
+        async fn try_acquire(&self) -> bool {
+            false
+        }
+
+        async fn renew(&self) -> bool {
+            false
+        }
+    }
+
     #[tokio::test]
     async fn ccp_submit_and_job_coordinator_scope() {
         let id = CoordinatorId::try_new("ccp").unwrap();
@@ -264,5 +284,39 @@ mod tests {
         ccp.submit_job(spec).await.unwrap();
         let jcp = ccp.job_coordinator(job_id);
         assert_eq!(jcp.job_id(), &JobId::try_new("job-1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn leader_loop_demotes_active_coordinator_when_acquire_fails() {
+        let id = CoordinatorId::try_new("ccp-standby").unwrap();
+        let shared = SharedCoordinator::new(Coordinator::active(id.clone()));
+        let ccp = Arc::new(ClusterControlPlane::from_shared_with_leader(
+            id,
+            shared.clone(),
+            Arc::new(NeverLeader),
+        ));
+
+        let ccp_loop = Arc::clone(&ccp);
+        let handle = tokio::spawn(async move {
+            ccp_loop.run_leader_loop().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if shared.read().await.state() == krishiv_proto::CoordinatorState::Standby {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(
+            shared.read().await.state(),
+            krishiv_proto::CoordinatorState::Standby
+        );
     }
 }

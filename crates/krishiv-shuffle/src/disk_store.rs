@@ -1,6 +1,5 @@
 use crate::{
-    DurabilityProfile, PartitionId, PartitionState, ShuffleError, ShufflePartition, ShufflePath,
-    ShuffleResult, ShuffleStore, ShuffleStream,
+    PartitionId, ShuffleError, ShufflePartition, ShuffleResult, ShuffleStore, ShuffleStream,
     compression::{ShuffleCompression, parquet_writer_properties},
     error::{io_err, shuffle_write_lock},
     store::LeaseMap,

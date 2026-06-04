@@ -98,6 +98,7 @@ impl SemanticDedup {
                 .collect()
         };
         let mut drop: HashSet<usize> = HashSet::new();
+
         for (i, j) in pairs {
             match self.config.strategy {
                 DedupStrategy::KeepFirst => {
@@ -126,6 +127,25 @@ impl SemanticDedup {
     pub fn dedup_indices_unscored(&self, embeddings: &[Vec<f32>]) -> Vec<usize> {
         let scores = vec![0.0f32; embeddings.len()];
         self.dedup_indices(embeddings, &scores)
+    }
+
+    /// Run `dedup_indices` safely isolated in a blocking threadpool.
+    pub async fn dedup_indices_async(
+        &self,
+        embeddings: Vec<Vec<f32>>,
+        scores: Vec<f32>,
+    ) -> Result<Vec<usize>, tokio::task::JoinError> {
+        let dedup = self.clone();
+        tokio::task::spawn_blocking(move || dedup.dedup_indices(&embeddings, &scores)).await
+    }
+
+    /// Run `dedup_indices_unscored` safely isolated in a blocking threadpool.
+    pub async fn dedup_indices_unscored_async(
+        &self,
+        embeddings: Vec<Vec<f32>>,
+    ) -> Result<Vec<usize>, tokio::task::JoinError> {
+        let dedup = self.clone();
+        tokio::task::spawn_blocking(move || dedup.dedup_indices_unscored(&embeddings)).await
     }
 }
 

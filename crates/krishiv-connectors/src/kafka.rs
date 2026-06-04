@@ -189,7 +189,7 @@ impl KafkaSource {
     /// Commit the current watermark offset for all partitions read so far.
     /// No-op if no messages have been read yet.
     pub fn commit_current_offset(&self) {
-        self.inner.commit_watermark();
+        self.inner.commit_offsets();
     }
 
     /// All per-partition offsets read so far (suitable for checkpoint storage).
@@ -1109,8 +1109,8 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        /// Property test: KafkaOffset round-trip encode/decode
-        /// Ensures arbitrary offsets can be serialized and deserialized without loss.
+        // Property test: KafkaOffset round-trip encode/decode.
+        // Ensures arbitrary offsets can be serialized and deserialized without loss.
         proptest! {
             #[test]
             fn kafka_offset_roundtrip(
@@ -1124,8 +1124,8 @@ mod tests {
                 prop_assert_eq!(original, decoded);
             }
 
-            /// Property test: KafkaOffset encode is stable
-            /// Same offset always produces the same bytes.
+            // Property test: KafkaOffset encode is stable.
+            // Same offset always produces the same bytes.
             #[test]
             fn kafka_offset_encode_stable(
                 topic in "[a-z]{1,32}",

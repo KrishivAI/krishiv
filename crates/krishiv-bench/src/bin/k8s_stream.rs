@@ -1,6 +1,4 @@
-use arrow::record_batch::RecordBatch;
-use krishiv_api::Batch;
-use krishiv_api::SessionBuilder;
+use krishiv_api::{SessionBuilder, StreamBatch};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::fs::File;
 use std::time::Instant;
@@ -20,10 +18,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut batches = Vec::new();
     let mut rows_read = 0;
+    let mut sequence = 0;
     while let Some(batch) = reader.next() {
         let batch = batch?;
         rows_read += batch.num_rows();
-        batches.push(Batch::new(batch));
+        batches.push(StreamBatch::new(sequence, batch));
+        sequence += 1;
         if rows_read >= 1_000_000 {
             break;
         }
@@ -31,21 +31,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Read {} batches ({} rows)", batches.len(), rows_read);
 
-    let stream =
-        session.from_bounded_stream("sensor_stream", batches, "timestamp".to_string(), 1000)?;
-
+    let stream = session.memory_stream("sensor_stream", batches)?;
     let windowed = stream
-        .key_by(vec!["device_id".to_string()])?
-        .tumbling_window(1000)?;
+        .key_by("device_id")
+        .with_event_time("timestamp")
+        .tumbling_window(1000);
 
     let start = Instant::now();
-    let result = windowed.collect().await?;
+    let result = windowed.collect()?;
     let duration = start.elapsed();
 
     println!(
         "Streaming Execution Time (1M rows): {:.4} seconds",
         duration.as_secs_f64()
     );
+    println!("Output batches: {}", result.len());
 
     Ok(())
 }

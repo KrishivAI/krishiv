@@ -301,8 +301,7 @@ impl TableFunctionImpl for KrishivTableFunctionImpl {
         // pass them to the UDTF body.  Non-literal (computed) args are passed
         // as Null — full expression evaluation requires async and would require
         // a deeper DataFusion integration.
-        let scalar_args: Vec<krishiv_udf::ScalarValue> =
-            args.iter().map(expr_to_scalar).collect();
+        let scalar_args: Vec<krishiv_udf::ScalarValue> = args.iter().map(expr_to_scalar).collect();
         let batch = self
             .inner
             .call(&scalar_args)
@@ -318,19 +317,19 @@ fn expr_to_scalar(expr: &datafusion::logical_expr::Expr) -> krishiv_udf::ScalarV
     use datafusion::logical_expr::Expr;
     use datafusion::scalar::ScalarValue as DfScalar;
     match expr {
-        Expr::Literal(DfScalar::Int8(Some(v))) => krishiv_udf::ScalarValue::Int32(*v as i32),
-        Expr::Literal(DfScalar::Int16(Some(v))) => krishiv_udf::ScalarValue::Int32(*v as i32),
-        Expr::Literal(DfScalar::Int32(Some(v))) => krishiv_udf::ScalarValue::Int32(*v),
-        Expr::Literal(DfScalar::Int64(Some(v))) => krishiv_udf::ScalarValue::Int64(*v),
-        Expr::Literal(DfScalar::Float32(Some(v))) => {
+        Expr::Literal(DfScalar::Int8(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v as i64),
+        Expr::Literal(DfScalar::Int16(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v as i64),
+        Expr::Literal(DfScalar::Int32(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v as i64),
+        Expr::Literal(DfScalar::Int64(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v),
+        Expr::Literal(DfScalar::Float32(Some(v)), _) => {
             krishiv_udf::ScalarValue::Float64(*v as f64)
         }
-        Expr::Literal(DfScalar::Float64(Some(v))) => krishiv_udf::ScalarValue::Float64(*v),
-        Expr::Literal(DfScalar::Utf8(Some(v)))
-        | Expr::Literal(DfScalar::LargeUtf8(Some(v))) => {
+        Expr::Literal(DfScalar::Float64(Some(v)), _) => krishiv_udf::ScalarValue::Float64(*v),
+        Expr::Literal(DfScalar::Utf8(Some(v)), _)
+        | Expr::Literal(DfScalar::LargeUtf8(Some(v)), _) => {
             krishiv_udf::ScalarValue::Utf8(v.clone())
         }
-        Expr::Literal(DfScalar::Boolean(Some(v))) => krishiv_udf::ScalarValue::Boolean(*v),
+        Expr::Literal(DfScalar::Boolean(Some(v)), _) => krishiv_udf::ScalarValue::Boolean(*v),
         _ => krishiv_udf::ScalarValue::Null,
     }
 }

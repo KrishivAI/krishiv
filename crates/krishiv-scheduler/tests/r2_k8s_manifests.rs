@@ -1,15 +1,21 @@
 #![forbid(unsafe_code)]
 
 const CRD: &str = include_str!("../../../k8s/crds/krishivjobs.yaml");
-const KUSTOMIZATION: &str = include_str!("../../../k8s/manifests/kustomization.yaml");
-const NETWORK_POLICY: &str = include_str!("../../../k8s/manifests/network-policy.yaml");
-const COORDINATOR_SERVICE: &str = include_str!("../../../k8s/manifests/coordinator-service.yaml");
-const EXECUTOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/executor-deployment.yaml");
-const OPERATOR_DEPLOYMENT: &str = include_str!("../../../k8s/manifests/operator-deployment.yaml");
-const RBAC: &str = include_str!("../../../k8s/manifests/rbac.yaml");
-const SAMPLE_JOB: &str = include_str!("../../../k8s/manifests/sample-krishivjob.yaml");
+const KUSTOMIZATION: &str = include_str!("../../../k8s/operator/kustomization.yaml");
+const NETWORK_POLICY: &str = include_str!("../../../k8s/operator/network-policy.yaml");
+const COORDINATOR_SERVICE: &str = include_str!("../../../k8s/operator/coordinator-service.yaml");
+const EXECUTOR_DEPLOYMENT: &str = include_str!("../../../k8s/operator/executor-deployment.yaml");
+const OPERATOR_DEPLOYMENT: &str = include_str!("../../../k8s/operator/operator-deployment.yaml");
+const RBAC: &str = include_str!("../../../k8s/operator/rbac.yaml");
+const SAMPLE_JOB: &str = include_str!("../../../k8s/operator/samples/krishivjob-batch.yaml");
 const SAMPLE_STREAMING_JOB: &str =
-    include_str!("../../../k8s/manifests/sample-streaming-krishivjob.yaml");
+    include_str!("../../../k8s/operator/samples/krishivjob-streaming.yaml");
+const DIRECT_DISTRIBUTED: &str = include_str!("../../../k8s/direct/krishiv-distributed.yaml");
+const HELM_VALUES: &str = include_str!("../../../k8s/helm/krishiv/values.yaml");
+const HELM_COORDINATOR_DEPLOYMENT: &str =
+    include_str!("../../../k8s/helm/krishiv/templates/coordinator-deployment.yaml");
+const HELM_EXECUTOR_DEPLOYMENT: &str =
+    include_str!("../../../k8s/helm/krishiv/templates/executor-deployment.yaml");
 const K8S_README: &str = include_str!("../../../k8s/README.md");
 const COORDINATOR_DAEMON: &str = include_str!("../src/coordinator_daemon.rs");
 
@@ -48,15 +54,15 @@ fn kustomization_references_all_r2_manifests() {
     assert_contains_all(
         KUSTOMIZATION,
         &[
-            "../crds/krishivjobs.yaml",
+            "../crds",
             "namespace.yaml",
             "serviceaccount.yaml",
             "rbac.yaml",
             "operator-deployment.yaml",
             "coordinator-service.yaml",
             "executor-deployment.yaml",
-            "sample-krishivjob.yaml",
-            "sample-streaming-krishivjob.yaml",
+            "samples/krishivjob-batch.yaml",
+            "samples/krishivjob-streaming.yaml",
             "network-policy.yaml",
         ],
     );
@@ -86,19 +92,21 @@ fn operator_manifest_runs_one_active_coordinator_runtime() {
             "kind: Deployment",
             "name: krishiv-operator",
             "app.kubernetes.io/component: operator",
-            "replicas: 2",
+            "replicas: 1",
             "serviceAccountName: krishiv-controller",
             "- krishiv-operator",
-            "--status-addr",
             "--executor-grpc-addr",
-            "0.0.0.0:8080",
             "0.0.0.0:9090",
             "name: grpc",
-            "readinessProbe:",
-            "livenessProbe:",
+            "name: http",
+            "KRISHIV_COORDINATOR_BEARER_TOKEN",
+            "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN",
+            "krishiv-coordinator-auth",
+            "krishiv-executor-task-auth",
             "KRISHIV_COORDINATOR_ID",
         ],
     );
+    assert!(!OPERATOR_DEPLOYMENT.contains("KRISHIV_ALLOW_ANONYMOUS"));
 }
 
 #[test]
@@ -109,13 +117,11 @@ fn operator_manifest_watches_jobs_and_patches_status() {
             "kind: Deployment",
             "name: krishiv-operator",
             "app.kubernetes.io/component: operator",
-            "replicas: 2",
+            "replicas: 1",
             "serviceAccountName: krishiv-controller",
             "- krishiv-operator",
             "--namespace",
             "--coordinator-id",
-            "--bootstrap-executor-slots",
-            "--status-addr",
             "--executor-grpc-addr",
             "KRISHIV_COORDINATOR_ID",
             "KRISHIV_NAMESPACE",
@@ -130,7 +136,7 @@ fn coordinator_service_exposes_operator_owned_status_runtime() {
         &[
             "kind: Service",
             "name: krishiv-coordinator",
-            "app.kubernetes.io/component: operator",
+            "app.kubernetes.io/component: coordinator",
             "name: http",
             "port: 8080",
             "targetPort: http",
@@ -153,11 +159,78 @@ fn executor_manifest_declares_replaceable_executors() {
             "krishiv-executor",
             "KRISHIV_EXECUTOR_ID",
             "KRISHIV_TASK_SLOTS",
+            "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH",
+            "KRISHIV_COORDINATOR_BEARER_TOKEN",
+            "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN",
+            "krishiv-coordinator-auth",
+            "krishiv-executor-task-auth",
             "http://krishiv-coordinator.krishiv-system.svc:9090",
             "--connect",
             "--heartbeat-interval-secs",
         ],
     );
+}
+
+#[test]
+fn direct_distributed_manifest_requires_executor_task_auth_secret() {
+    assert_contains_all(
+        DIRECT_DISTRIBUTED,
+        &[
+            "krishiv-executor-task-auth",
+            "krishiv-coordinator-auth",
+            "KRISHIV_COORDINATOR_BEARER_TOKEN",
+            "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN",
+            "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH",
+            "secretKeyRef:",
+            "key: token",
+            "Secret krishiv-system/krishiv-executor-task-auth",
+        ],
+    );
+    assert!(!DIRECT_DISTRIBUTED.contains("--insecure"));
+}
+
+#[test]
+fn helm_chart_uses_current_daemon_flags_and_task_auth_secret() {
+    assert_contains_all(
+        HELM_VALUES,
+        &[
+            "coordinatorAuth:",
+            "executorTaskAuth:",
+            "secretName:",
+            "secretKey:",
+        ],
+    );
+    assert_contains_all(
+        HELM_COORDINATOR_DEPLOYMENT,
+        &[
+            "/usr/local/bin/krishiv",
+            "coordinator",
+            "--grpc-addr",
+            "KRISHIV_COORDINATOR_BEARER_TOKEN",
+            "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN",
+            "secretKeyRef:",
+            "tcpSocket:",
+        ],
+    );
+    assert_contains_all(
+        HELM_EXECUTOR_DEPLOYMENT,
+        &[
+            "/usr/local/bin/krishiv",
+            "executor",
+            "--coordinator",
+            "--connect",
+            "--task-grpc-addr",
+            "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH",
+            "KRISHIV_COORDINATOR_BEARER_TOKEN",
+            "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN",
+            "secretKeyRef:",
+            "POD_IP",
+            "tcpSocket:",
+        ],
+    );
+    assert!(!HELM_COORDINATOR_DEPLOYMENT.contains("--listen"));
+    assert!(!HELM_EXECUTOR_DEPLOYMENT.contains("--listen"));
+    assert!(!HELM_COORDINATOR_DEPLOYMENT.contains("--insecure"));
 }
 
 #[test]
@@ -221,9 +294,11 @@ fn deployment_conformance_k8s_kind_and_bare_metal_process_modes_are_declared() {
             "kind",
             "KRISHIV_KIND_E2E=1",
             "cargo test -p krishiv-operator --test r2_kind_smoke",
-            "krishiv-coordinator",
-            "port 9090",
-            "Executor pods run `krishiv-executor --connect`",
+            "kubectl apply -k k8s/operator",
+            "kubectl apply -f k8s/direct/krishiv-dev.yaml",
+            "helm install krishiv k8s/helm/krishiv",
+            "kubectl create secret generic krishiv-coordinator-auth",
+            "kubectl create secret generic krishiv-executor-task-auth",
         ],
     );
     assert_contains_all(

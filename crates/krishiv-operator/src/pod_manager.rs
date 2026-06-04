@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, Pod, PodSpec,
-    PodTemplateSpec, Volume, VolumeMount,
+    PodTemplateSpec, SecretKeySelector, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;
@@ -45,6 +45,24 @@ const ENV_JOB_ID: &str = "KRISHIV_JOB_ID";
 const ENV_TASK_SLOTS: &str = "KRISHIV_TASK_SLOTS";
 /// Pod IP used by executors when advertising task/barrier gRPC endpoints.
 const ENV_POD_IP: &str = "POD_IP";
+/// Opt-in fail-closed switch for executor task-control gRPC auth.
+const ENV_REQUIRE_EXECUTOR_TASK_AUTH: &str = "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH";
+/// Bearer token used by executors when calling coordinator gRPC.
+const ENV_COORDINATOR_BEARER_TOKEN: &str = "KRISHIV_COORDINATOR_BEARER_TOKEN";
+/// Bearer token consumed by executor task-control gRPC auth.
+const ENV_EXECUTOR_TASK_BEARER_TOKEN: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
+/// Secret name used for the coordinator gRPC bearer token.
+const ENV_COORDINATOR_AUTH_SECRET_NAME: &str = "KRISHIV_COORDINATOR_AUTH_SECRET_NAME";
+/// Secret key used for the coordinator gRPC bearer token.
+const ENV_COORDINATOR_AUTH_SECRET_KEY: &str = "KRISHIV_COORDINATOR_AUTH_SECRET_KEY";
+/// Secret name used for the executor task-control bearer token.
+const ENV_EXECUTOR_TASK_AUTH_SECRET_NAME: &str = "KRISHIV_EXECUTOR_TASK_AUTH_SECRET_NAME";
+/// Secret key used for the executor task-control bearer token.
+const ENV_EXECUTOR_TASK_AUTH_SECRET_KEY: &str = "KRISHIV_EXECUTOR_TASK_AUTH_SECRET_KEY";
+const DEFAULT_COORDINATOR_AUTH_SECRET_NAME: &str = "krishiv-coordinator-auth";
+const DEFAULT_COORDINATOR_AUTH_SECRET_KEY: &str = "token";
+const DEFAULT_EXECUTOR_TASK_AUTH_SECRET_NAME: &str = "krishiv-executor-task-auth";
+const DEFAULT_EXECUTOR_TASK_AUTH_SECRET_KEY: &str = "token";
 
 /// Manages the lifecycle of executor Pods spawned for a `KrishivJob`.
 #[derive(Clone)]
@@ -73,11 +91,45 @@ impl PodLifecycleManager {
     ) -> OperatorResult<Vec<String>> {
         let namespace = resource.metadata.namespace_or_default();
         let job_name = &resource.metadata.name;
-        let parallelism = resource.spec.effective_parallelism();
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
-        let mut executor_ids = Vec::with_capacity(parallelism);
-        for idx in 0..parallelism {
+        let max_parallelism = resource.spec.effective_parallelism();
+        let mut target_parallelism = max_parallelism;
+
+        // Plumb HPA (Horizontal Pod Autoscaling) metrics directly into the operator runtime.
+        if resource.spec.mode == crate::crd::job::KrishivJobMode::Streaming {
+            let job_id = resource.metadata.scheduler_job_id();
+            let mut max_lag: i64 = 0;
+
+            // Collect maximum backlog across all partitions for this streaming job
+            krishiv_metrics::global_metrics()
+                .source_offset_lag
+                .iter()
+                .for_each(|entry| {
+                    if entry.key().starts_with(&job_id) {
+                        let lag = entry.value().load(std::sync::atomic::Ordering::Relaxed);
+                        if lag > max_lag {
+                            max_lag = lag;
+                        }
+                    }
+                });
+
+            // Scale out based on data backlogs
+            if max_lag > 50_000 {
+                target_parallelism = max_parallelism;
+            } else if max_lag > 10_000 {
+                target_parallelism = std::cmp::max(1, max_parallelism / 2);
+            } else if max_lag > 1_000 {
+                target_parallelism = std::cmp::max(1, max_parallelism / 4);
+            } else {
+                target_parallelism = 1; // Minimum 1 executor when mostly idle
+            }
+        }
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let mut executor_ids = Vec::with_capacity(target_parallelism);
+
+        // Scale UP / Maintain
+        for idx in 0..target_parallelism {
             let executor_id = format!("{job_name}-exec-{idx}");
             let pod_name = format!("{job_name}-exec-{idx}");
             let job_id = resource.metadata.scheduler_job_id();
@@ -90,12 +142,11 @@ impl PodLifecycleManager {
                         job = job_name,
                         pod = pod_name,
                         executor_id,
-                        "created executor pod"
+                        "created executor pod (scaled up)"
                     );
                     executor_ids.push(executor_id);
                 }
                 Err(kube::Error::Api(err)) if err.code == 409 => {
-                    // Pod already exists — idempotent, still track the executor id.
                     info!(
                         job = job_name,
                         pod = pod_name,
@@ -112,6 +163,27 @@ impl PodLifecycleManager {
                 }
             }
         }
+
+        // Scale DOWN / Cleanup excess pods based on HPA target
+        for idx in target_parallelism..max_parallelism {
+            let pod_name = format!("{job_name}-exec-{idx}");
+            match pods.delete(&pod_name, &DeleteParams::default()).await {
+                Ok(_) => {
+                    info!(
+                        job = job_name,
+                        pod = pod_name,
+                        "deleted executor pod (scaled down)"
+                    );
+                }
+                Err(kube::Error::Api(err)) if err.code == 404 => {
+                    // Already gone
+                }
+                Err(err) => {
+                    warn!(job = job_name, pod = pod_name, error = %err, "failed to delete excess executor pod");
+                }
+            }
+        }
+
         Ok(executor_ids)
     }
 
@@ -215,6 +287,9 @@ impl PodLifecycleManager {
             if let Some((k, v)) = arg.split_once('=')
                 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && !k.is_empty()
+                && k != ENV_REQUIRE_EXECUTOR_TASK_AUTH
+                && k != ENV_COORDINATOR_BEARER_TOKEN
+                && k != ENV_EXECUTOR_TASK_BEARER_TOKEN
             {
                 env_vars.push(EnvVar {
                     name: k.to_owned(),
@@ -223,6 +298,9 @@ impl PodLifecycleManager {
                 });
             }
         }
+        env_vars.push(executor_task_auth_required_env_var());
+        env_vars.push(coordinator_bearer_token_env_var());
+        env_vars.push(executor_task_bearer_token_env_var());
 
         let container = Container {
             name: "executor".to_owned(),
@@ -311,6 +389,9 @@ pub fn build_executor_pod_template(
                 value: Some("1".to_owned()),
                 ..Default::default()
             },
+            executor_task_auth_required_env_var(),
+            coordinator_bearer_token_env_var(),
+            executor_task_bearer_token_env_var(),
         ]),
         ..Default::default()
     };
@@ -354,4 +435,75 @@ fn pod_ip_env_var() -> EnvVar {
         }),
         ..Default::default()
     }
+}
+
+fn executor_task_auth_required_env_var() -> EnvVar {
+    EnvVar {
+        name: ENV_REQUIRE_EXECUTOR_TASK_AUTH.to_owned(),
+        value: Some("true".to_owned()),
+        ..Default::default()
+    }
+}
+
+fn coordinator_bearer_token_env_var() -> EnvVar {
+    secret_env_var(
+        ENV_COORDINATOR_BEARER_TOKEN,
+        coordinator_auth_secret_name(),
+        coordinator_auth_secret_key(),
+    )
+}
+
+fn executor_task_bearer_token_env_var() -> EnvVar {
+    secret_env_var(
+        ENV_EXECUTOR_TASK_BEARER_TOKEN,
+        executor_task_auth_secret_name(),
+        executor_task_auth_secret_key(),
+    )
+}
+
+fn secret_env_var(name: &str, secret_name: String, secret_key: String) -> EnvVar {
+    EnvVar {
+        name: name.to_owned(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: secret_name,
+                key: secret_key,
+                optional: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn coordinator_auth_secret_name() -> String {
+    std::env::var(ENV_COORDINATOR_AUTH_SECRET_NAME)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_COORDINATOR_AUTH_SECRET_NAME.to_owned())
+}
+
+fn coordinator_auth_secret_key() -> String {
+    std::env::var(ENV_COORDINATOR_AUTH_SECRET_KEY)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_COORDINATOR_AUTH_SECRET_KEY.to_owned())
+}
+
+fn executor_task_auth_secret_name() -> String {
+    std::env::var(ENV_EXECUTOR_TASK_AUTH_SECRET_NAME)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_EXECUTOR_TASK_AUTH_SECRET_NAME.to_owned())
+}
+
+fn executor_task_auth_secret_key() -> String {
+    std::env::var(ENV_EXECUTOR_TASK_AUTH_SECRET_KEY)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_EXECUTOR_TASK_AUTH_SECRET_KEY.to_owned())
 }

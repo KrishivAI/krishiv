@@ -99,6 +99,7 @@ impl SchemaRegistryClient {
 }
 
 /// Avro deserializer (Confluent wire format + registry fetch).
+#[derive(Clone)]
 pub struct AvroDeserializer {
     client: SchemaRegistryClient,
 }
@@ -625,6 +626,38 @@ fn avro_values_to_column(values: &[&Value], data_type: &DataType) -> ArrayRef {
                 .map(|v| Some(format!("{:?}", unwrap_value(v))))
                 .collect();
             Arc::new(arr)
+        }
+    }
+}
+
+impl SchemaRegistryClient {
+    /// Decode a Kafka payload, auto-detecting the format:
+    ///
+    /// * Confluent magic byte `0x00` → Avro wire format (schema fetched from registry).
+    /// * Otherwise → plain JSON payload.
+    ///
+    /// This is the entry point for CDC pipelines that don't know the format ahead
+    /// of time but have a registry URL configured.
+    pub async fn decode_any(
+        &self,
+        payload: &[u8],
+    ) -> SchemaRegistryResult<(
+        arrow::datatypes::SchemaRef,
+        Vec<arrow::record_batch::RecordBatch>,
+    )> {
+        if payload.first() == Some(&0x00) {
+            // Confluent binary wire format — try Avro.
+            let deserializer = AvroDeserializer {
+                client: self.clone(),
+            };
+            deserializer.decode(payload).await
+        } else {
+            // Plain JSON payload.
+            let text = std::str::from_utf8(payload)
+                .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
+            let batch = json_payload_batch(text)?;
+            let schema = batch.schema();
+            Ok((schema, vec![batch]))
         }
     }
 }

@@ -144,6 +144,13 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
             heartbeat = heartbeat.with_active_task_count(count);
         }
 
+        {
+            let coordinator = lock_coord(&self.coordinator)?;
+            coordinator
+                .ensure_active()
+                .map_err(status_from_scheduler_error)?;
+        }
+
         let lease_generation = {
             let mut inner = self.executor_inner.write().await;
             let lg = inner
@@ -236,6 +243,13 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         let request = request.into_inner();
         let job_id = request.job_id.clone();
         let ack_epoch = request.epoch;
+
+        {
+            let coordinator = lock_coord(&self.coordinator)?;
+            coordinator
+                .ensure_active()
+                .map_err(status_from_scheduler_error)?;
+        }
 
         // Phase 1: extract commit data under the lock (in-memory only, no I/O).
         let (response, pending_commit, require_finalize) = {

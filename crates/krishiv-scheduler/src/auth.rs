@@ -3,7 +3,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use krishiv_governance::{Role, StaticApiKeyAuthProvider};
+
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
+
+pub const COORDINATOR_BEARER_TOKEN_ENV: &str = "KRISHIV_COORDINATOR_BEARER_TOKEN";
+const COORDINATOR_AUTH_SUBJECT: &str = "coordinator-control-plane";
 
 static GRPC_AUTH_PROVIDER: std::sync::OnceLock<Arc<dyn krishiv_governance::AuthProvider>> =
     std::sync::OnceLock::new();
@@ -18,6 +23,41 @@ static ALLOW_ANONYMOUS: AtomicBool = AtomicBool::new(false);
 /// Install a process-wide auth provider for coordinator gRPC (optional).
 pub fn set_grpc_auth_provider(provider: Arc<dyn krishiv_governance::AuthProvider>) {
     let _ = GRPC_AUTH_PROVIDER.set(provider);
+}
+
+/// Build the static coordinator gRPC auth provider from a bearer token.
+pub fn static_grpc_auth_provider_from_bearer_token(
+    token: impl AsRef<str>,
+) -> Option<Arc<dyn krishiv_governance::AuthProvider>> {
+    let token = token.as_ref().trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(Arc::new(StaticApiKeyAuthProvider::new([(
+        token.to_owned(),
+        COORDINATOR_AUTH_SUBJECT.to_owned(),
+        Role::Admin,
+    )])))
+}
+
+/// Read the configured coordinator bearer token from process environment.
+pub fn configured_coordinator_bearer_token() -> Option<String> {
+    std::env::var(COORDINATOR_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+/// Install coordinator gRPC auth from `KRISHIV_COORDINATOR_BEARER_TOKEN`.
+pub fn configure_grpc_auth_provider_from_env() -> bool {
+    let Some(provider) = configured_coordinator_bearer_token()
+        .as_deref()
+        .and_then(static_grpc_auth_provider_from_bearer_token)
+    else {
+        return false;
+    };
+    set_grpc_auth_provider(provider);
+    true
 }
 
 /// Allow anonymous gRPC access when no auth provider is configured.
@@ -138,4 +178,25 @@ pub fn extract_auth_context(metadata: &tonic::metadata::MetadataMap) -> AuthCont
         }
     }
     AuthContext::Anonymous
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_provider_accepts_configured_bearer_token() {
+        let provider = static_grpc_auth_provider_from_bearer_token("coord-secret").unwrap();
+
+        let principal = provider.authenticate("coord-secret").unwrap();
+
+        assert_eq!(principal.subject, COORDINATOR_AUTH_SUBJECT);
+        assert_eq!(principal.role, Role::Admin);
+        assert!(provider.authenticate("wrong-secret").is_none());
+    }
+
+    #[test]
+    fn static_provider_rejects_empty_token() {
+        assert!(static_grpc_auth_provider_from_bearer_token(" ").is_none());
+    }
 }

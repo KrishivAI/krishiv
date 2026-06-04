@@ -34,6 +34,14 @@ executor:
       cpu: "4"
       memory: "8Gi"
 
+coordinatorAuth:
+  secretName: "krishiv-coordinator-auth"
+  secretKey: "token"
+
+executorTaskAuth:
+  secretName: "krishiv-executor-task-auth"
+  secretKey: "token"
+
 operator:
   enabled: true
   replicas: 1

@@ -33,7 +33,9 @@ pub mod streaming;
 mod udf;
 mod window_functions;
 
-pub use cep_sql::{MatchRecognizeStatement, execute_streaming_match_recognize, parse_match_recognize};
+pub use cep_sql::{
+    MatchRecognizeStatement, execute_streaming_match_recognize, parse_match_recognize,
+};
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 pub use policy::PolicyEnforcingSqlEngine;
 
@@ -81,6 +83,7 @@ impl PlanCache {
         self.order.clear();
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -521,13 +524,15 @@ impl SqlEngine {
         &self,
         name: impl Into<String>,
         schema: arrow::datatypes::Schema,
-        f: impl Fn(&[krishiv_udf::ScalarValue]) -> Result<arrow::record_batch::RecordBatch, krishiv_udf::UdfError>
-            + Send
-            + Sync
-            + 'static,
+        f: impl Fn(
+            &[krishiv_udf::ScalarValue],
+        ) -> Result<arrow::record_batch::RecordBatch, krishiv_udf::UdfError>
+        + Send
+        + Sync
+        + 'static,
     ) -> SqlResult<()> {
-        let stub = create_function_ddl::StubTableUdf::from_ddl(
-            &create_function_ddl::CreateFunctionDdl {
+        let stub =
+            create_function_ddl::StubTableUdf::from_ddl(&create_function_ddl::CreateFunctionDdl {
                 function_name: name.into(),
                 return_columns: schema
                     .fields()
@@ -539,9 +544,8 @@ impl SqlEngine {
                     .collect(),
                 language: None,
                 body: None,
-            },
-        )
-        .with_body_fn(std::sync::Arc::new(f));
+            })
+            .with_body_fn(std::sync::Arc::new(f));
         if let Some(registry) = &self.udf_registry {
             let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
@@ -1753,7 +1757,6 @@ mod udf_sql_tests {
 #[cfg(test)]
 mod udtf_ddl_tests {
     use super::SqlEngine;
-    use super::SqlError;
 
     /// All `CREATE FUNCTION … RETURNS TABLE` DDL succeeds — the stub is registered
     /// for plan-time schema resolution regardless of language. Execution errors for
@@ -1771,7 +1774,10 @@ mod udtf_ddl_tests {
                  AS 'fn stub() {}'",
             )
             .await;
-        assert!(rust_result.is_ok(), "LANGUAGE RUST DDL should succeed, got {rust_result:?}");
+        assert!(
+            rust_result.is_ok(),
+            "LANGUAGE RUST DDL should succeed, got {rust_result:?}"
+        );
 
         // SQL language: inline body registered, also returns empty DataFrame on DDL.
         let sql_result = engine
@@ -1782,7 +1788,10 @@ mod udtf_ddl_tests {
                  AS 'SELECT ''hello'' AS msg'",
             )
             .await;
-        assert!(sql_result.is_ok(), "LANGUAGE SQL DDL should succeed, got {sql_result:?}");
+        assert!(
+            sql_result.is_ok(),
+            "LANGUAGE SQL DDL should succeed, got {sql_result:?}"
+        );
     }
 
     // ── Streaming source registration (broker-free path) ─────────────────────

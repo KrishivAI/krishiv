@@ -23,7 +23,8 @@ thiserror = { workspace = true }
 k8s-openapi = { workspace = true, optional = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-proto = { path = "../krishiv-proto" }
-krishiv-scheduler = { path = "../krishiv-scheduler" }
+krishiv-metrics = { path = "../krishiv-metrics" }
+krishiv-scheduler = { path = "../krishiv-scheduler", features = ["redb"] }
 axum = "0.8"
 krishiv-ui = { path = "../krishiv-ui", optional = true }
 kube = { workspace = true, optional = true }

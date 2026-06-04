@@ -25,7 +25,7 @@ pub mod transport;
 mod tests;
 
 // Re-export the public API at the crate root for source compatibility.
-pub use assignment_inbox::ExecutorAssignmentInbox;
+pub use assignment_inbox::{AssignmentPushOutcome, ExecutorAssignmentInbox};
 pub use error::{ExecutorError, ExecutorResult, ExecutorTransportResult};
 pub use execution_model::ExecutionModel;
 
@@ -35,7 +35,10 @@ pub use barrier_grpc::{ExecutorBarrierService, executor_barrier_grpc_server};
 pub use barrier_transport::{
     BarrierInjector, SharedBarrierInjector, SharedKeyGroupRanges, make_checkpoint_barrier,
 };
-pub use grpc::{ExecutorTaskGrpcService, ExecutorTaskInboxService, executor_task_grpc_server};
+pub use grpc::{
+    ExecutorTaskAuthConfig, ExecutorTaskGrpcService, ExecutorTaskInboxService,
+    executor_task_grpc_server,
+};
 pub use runner::{
     ContinuousJobDrainer, ExecutorTaskOutput, ExecutorTaskOutputKind, ExecutorTaskRunReport,
     ExecutorTaskRunner, ShuffleContext, TaskRunner,

@@ -486,7 +486,7 @@ mod tests {
     use super::{
         DistributedBackend, EmbeddedBackend, ExecutionBackend, ExecutionReport, JobId, JobState,
         JobStatus, LocalJobRegistry, RuntimeError, SingleNodeBackend, TaskReport, TaskSpec,
-        accept_local_plan, is_streaming_plan,
+        accept_local_plan,
     };
 
     #[test]

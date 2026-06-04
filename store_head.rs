@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use krishiv_proto::{
@@ -59,7 +60,12 @@ pub enum EventLogEvent {
     JobCancelled { job_id: JobId },
 }
 
-
+/// Durable store for coordinator restart-recovery state and the event log.
+///
+/// `InMemoryMetadataStore` is used for tests and single-process deployments.
+/// `JsonFileMetadataStore` is the R3.1 durable local backend for bare-metal / VM
+/// recovery tests. `SqliteMetadataStore` and `KubernetesMetadataStore` are
+/// deferred to later releases.
 pub trait MetadataStore: Send + Sync {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
     fn events(&self) -> &[EventLogEvent];
@@ -80,14 +86,12 @@ pub trait MetadataStore: Send + Sync {
     fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()>;
 }
 
-// ── InMemoryMetadataStore ─────────────────────────────────────────────────────
-
-/// In-memory metadata store for tests and embedded single-process deployments.
+/// In-memory metadata store for tests and single-process deployments.
 #[derive(Debug, Default)]
 pub struct InMemoryMetadataStore {
     events: Vec<EventLogEvent>,
     jobs: Vec<JobRecord>,
-    executors: Vec<ExecutorDescriptor>,
+    executor_descriptors: Vec<ExecutorDescriptor>,
 }
 
 impl MetadataStore for InMemoryMetadataStore {
@@ -95,110 +99,522 @@ impl MetadataStore for InMemoryMetadataStore {
         self.events.push(event);
         Ok(())
     }
-    fn events(&self) -> &[EventLogEvent] { &self.events }
+
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
+
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
-        if let Some(e) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
-            *e = record.clone();
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
+            *existing = record.clone();
         } else {
             self.jobs.push(record.clone());
         }
         Ok(())
     }
-    fn jobs(&self) -> &[JobRecord] { &self.jobs }
+
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
+
     fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
         let id = descriptor.executor_id();
-        if let Some(e) = self.executors.iter_mut().find(|d| d.executor_id() == id) {
-            *e = descriptor.clone();
+        if let Some(existing) = self
+            .executor_descriptors
+            .iter_mut()
+            .find(|d| d.executor_id() == id)
+        {
+            *existing = descriptor.clone();
         } else {
-            self.executors.push(descriptor.clone());
+            self.executor_descriptors.push(descriptor.clone());
         }
         Ok(())
     }
-    fn executors(&self) -> Vec<ExecutorDescriptor> { self.executors.clone() }
+
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
     fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
-        self.executors.retain(|d| d.executor_id() != executor_id);
-        Ok(())
-    }
-}
-
-// ── JsonFileMetadataStore ─────────────────────────────────────────────────────
-
-/// JSON-file metadata store for durable bare-metal / single-node deployments.
-#[derive(Debug)]
-pub struct JsonFileMetadataStore {
-    path: std::path::PathBuf,
-    events: Vec<EventLogEvent>,
-    jobs: Vec<JobRecord>,
-    executors: Vec<ExecutorDescriptor>,
-}
-
-impl JsonFileMetadataStore {
-    /// Open or create a JSON metadata store at `path`.
-    pub fn open(path: impl AsRef<std::path::Path>) -> SchedulerResult<Self> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| SchedulerError::Transport {
-                message: format!("failed to create metadata dir '{}': {e}", parent.display()),
-            })?;
-        }
-        Ok(Self { path, events: Vec::new(), jobs: Vec::new(), executors: Vec::new() })
-    }
-
-    fn persist(&self) -> SchedulerResult<()> {
-        use std::io::Write as _;
-        // Append event log entry; full job state recovery is via redb/etcd.
-        let payload = serde_json::json!({ "job_count": self.jobs.len() });
-        let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| SchedulerError::Transport {
-            message: format!("metadata store encode: {e}"),
-        })?;
-        let tmp = self.path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut f = std::fs::File::create(&tmp).map_err(|e| SchedulerError::Transport {
-            message: format!("metadata store write '{}': {e}", tmp.display()),
-        })?;
-        f.write_all(&bytes).map_err(|e| SchedulerError::Transport {
-            message: format!("metadata store write: {e}"),
-        })?;
-        f.sync_all().ok();
-        std::fs::rename(&tmp, &self.path).map_err(|e| SchedulerError::Transport {
-            message: format!("metadata store rename: {e}"),
-        })
-    }
-}
-
-impl MetadataStore for JsonFileMetadataStore {
-    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
-        self.events.push(event);
-        Ok(())
-    }
-    fn events(&self) -> &[EventLogEvent] { &self.events }
-    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
-        if let Some(e) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
-            *e = record.clone();
-        } else {
-            self.jobs.push(record.clone());
-        }
-        let _ = self.persist();
-        Ok(())
-    }
-    fn jobs(&self) -> &[JobRecord] { &self.jobs }
-    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
-        let id = descriptor.executor_id();
-        if let Some(e) = self.executors.iter_mut().find(|d| d.executor_id() == id) {
-            *e = descriptor.clone();
-        } else {
-            self.executors.push(descriptor.clone());
-        }
-        Ok(())
-    }
-    fn executors(&self) -> Vec<ExecutorDescriptor> { self.executors.clone() }
-    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
-        self.executors.retain(|d| d.executor_id() != executor_id);
+        self.executor_descriptors
+            .retain(|d| d.executor_id() != executor_id);
         Ok(())
     }
 }
 
 const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
 
+/// JSON-file metadata store for durable local coordinator recovery.
+///
+/// Uses two files:
+/// - `{path}` — full snapshot (jobs + events), written on `save_job` and `open`.
+/// - `{path}.events.ndjson` — append-only newline-delimited JSON event log.
+///
+/// On `append_event`, the event is appended to the `.events.ndjson` log (fast,
+/// no full rewrite).  On `save_job`, the full snapshot is rewritten and the
+/// `.events.ndjson` log is truncated (it's now captured in the snapshot).
+/// On `open`, both files are read and events are merged.
+#[derive(Debug)]
+pub struct JsonFileMetadataStore {
+    path: PathBuf,
+    events: Vec<EventLogEvent>,
+    jobs: Vec<JobRecord>,
+    executor_descriptors: Vec<ExecutorDescriptor>,
+}
+
+impl JsonFileMetadataStore {
+    fn events_log_path(&self) -> PathBuf {
+        let mut p = self.path.as_os_str().to_owned();
+        p.push(".events.ndjson");
+        PathBuf::from(p)
+    }
+
+    /// Append a single event to the events NDJSON log (fast, no full rewrite).
+    fn append_event_to_log(&self, event: &EventLogEvent) -> SchedulerResult<()> {
+        let log_path = self.events_log_path();
+        let persisted = PersistedEvent::from(event);
+        let line = serde_json::to_string(&persisted).map_err(|e| SchedulerError::Transport {
+            message: format!("failed to serialize event: {e}"),
+        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("failed to open event log '{}': {e}", log_path.display()),
+            })?;
+        use std::io::Write as IoWrite;
+        writeln!(file, "{}", line).map_err(|e| SchedulerError::Transport {
+            message: format!("failed to write event log: {e}"),
+        })?;
+        file.sync_all().map_err(|e| SchedulerError::Transport {
+            message: format!("failed to fsync event log: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Truncate the events NDJSON log (called after a full snapshot rewrite).
+    ///
+    /// Uses explicit open + set_len(0) + sync_all so that a crash between the
+    /// snapshot write and the truncation does not leave stale events replaying
+    /// on the next recovery.
+    fn truncate_events_log(&self) -> SchedulerResult<()> {
+        let log_path = self.events_log_path();
+        if log_path.exists() {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log_path)
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!(
+                        "failed to open event log '{}' for truncation: {e}",
+                        log_path.display()
+                    ),
+                })?;
+            file.set_len(0).map_err(|e| SchedulerError::Transport {
+                message: format!("failed to truncate event log '{}': {e}", log_path.display()),
+            })?;
+            file.sync_all().map_err(|e| SchedulerError::Transport {
+                message: format!(
+                    "failed to fsync event log '{}' after truncation: {e}",
+                    log_path.display()
+                ),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Load events from the NDJSON log file (called during `open`).
+    fn load_events_from_log(path: &Path) -> Vec<EventLogEvent> {
+        let log_path = {
+            let mut p = path.as_os_str().to_owned();
+            p.push(".events.ndjson");
+            PathBuf::from(p)
+        };
+        if !log_path.exists() {
+            return Vec::new();
+        }
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<PersistedEvent>(l).ok())
+            .filter_map(|pe| EventLogEvent::try_from(pe).ok())
+            .collect()
+    }
+
+    /// Open or create a JSON-file metadata store at `path`.
+    pub fn open(path: impl AsRef<Path>) -> SchedulerResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let store = Self {
+                    path: path.clone(),
+                    events: vec![],
+                    jobs: vec![],
+                    executor_descriptors: vec![],
+                };
+                store.persist()?;
+                return Ok(store);
+            }
+            Err(e) => {
+                return Err(SchedulerError::Transport {
+                    message: format!("failed to read metadata store '{}': {e}", path.display()),
+                });
+            }
+        };
+        if bytes.is_empty() {
+            return Err(SchedulerError::Transport {
+                message: format!(
+                    "metadata store '{}' is empty; refusing to treat a torn write as an empty store",
+                    path.display()
+                ),
+            });
+        }
+        let persisted: PersistedMetadata =
+            serde_json::from_slice(&bytes).map_err(|error| SchedulerError::InvalidJob {
+                message: format!(
+                    "failed to decode metadata store '{}': {error}",
+                    path.display()
+                ),
+            })?;
+        persisted.validate_schema_version()?;
+        // Load snapshot events then merge any extra events from the NDJSON log.
+        let mut events: Vec<EventLogEvent> = persisted
+            .events
+            .into_iter()
+            .map(EventLogEvent::try_from)
+            .collect::<SchedulerResult<Vec<_>>>()?;
+        let extra_events = Self::load_events_from_log(&path);
+        events.extend(extra_events);
+        let executor_descriptors: Vec<ExecutorDescriptor> = persisted
+            .executor_descriptors
+            .into_iter()
+            .filter_map(|p| ExecutorDescriptor::try_from(p).ok())
+            .collect();
+        Ok(Self {
+            path,
+            events,
+            jobs: persisted
+                .jobs
+                .into_iter()
+                .map(JobRecord::try_from)
+                .collect::<SchedulerResult<Vec<_>>>()?,
+            executor_descriptors,
+        })
+    }
+
+    fn persist(&self) -> SchedulerResult<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to create metadata store dir '{}': {error}",
+                    parent.display()
+                ),
+            })?;
+        }
+        let persisted = PersistedMetadata {
+            schema_version: JSON_METADATA_SCHEMA_VERSION,
+            store_kind: String::from("krishiv.scheduler.metadata"),
+            events: self.events.iter().map(PersistedEvent::from).collect(),
+            jobs: self.jobs.iter().map(PersistedJobRecord::from).collect(),
+            executor_descriptors: self
+                .executor_descriptors
+                .iter()
+                .map(PersistedExecutorDescriptor::from)
+                .collect(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
+                message: format!("failed to encode metadata store: {error}"),
+            })?;
+        let tmp_path = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        let mut file =
+            std::fs::File::create(&tmp_path).map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to create temporary metadata store '{}': {error}",
+                    tmp_path.display()
+                ),
+            })?;
+        file.write_all(&bytes)
+            .map_err(|error| SchedulerError::Transport {
+                message: format!(
+                    "failed to write temporary metadata store '{}': {error}",
+                    tmp_path.display()
+                ),
+            })?;
+        file.sync_all().map_err(|error| SchedulerError::Transport {
+            message: format!(
+                "failed to fsync temporary metadata store '{}': {error}",
+                tmp_path.display()
+            ),
+        })?;
+        drop(file);
+        std::fs::rename(&tmp_path, &self.path).map_err(|error| SchedulerError::Transport {
+            message: format!(
+                "failed to atomically replace metadata store '{}': {error}",
+                self.path.display()
+            ),
+        })?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| SchedulerError::Transport {
+                    message: format!(
+                        "failed to fsync metadata store directory '{}': {error}",
+                        parent.display()
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl MetadataStore for JsonFileMetadataStore {
+    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        // Append-only: write just this event to the NDJSON log (no full rewrite).
+        self.append_event_to_log(&event)?;
+        self.events.push(event);
+        // Size-based rotation: if the log exceeds MAX_EVENTS_LOG_BYTES, write a
+        // full snapshot that captures all current events (including the one we
+        // just pushed) and then truncate the log file.  This bounds disk usage
+        // for streaming jobs that accumulate many task-state events between
+        // periodic save_job() calls.
+        let log_path = self.events_log_path();
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            if meta.len() > MAX_EVENTS_LOG_BYTES {
+                tracing::info!(
+                    log_bytes = meta.len(),
+                    threshold_bytes = MAX_EVENTS_LOG_BYTES,
+                    "events log exceeded rotation threshold; writing snapshot and truncating"
+                );
+                self.persist()?;
+                self.truncate_events_log()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
+
+    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
+            *existing = record.clone();
+        } else {
+            self.jobs.push(record.clone());
+        }
+        // Full snapshot rewrite on save_job (less frequent than append_event).
+        self.persist()?;
+        // After snapshot, the events log is captured; truncate it.
+        self.truncate_events_log()?;
+        Ok(())
+    }
+
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
+
+    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
+        if let Some(pos) = self
+            .executor_descriptors
+            .iter()
+            .position(|e| e.executor_id() == descriptor.executor_id())
+        {
+            self.executor_descriptors[pos] = descriptor.clone();
+        } else {
+            self.executor_descriptors.push(descriptor.clone());
+        }
+        self.persist()
+    }
+
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
+    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        self.executor_descriptors
+            .retain(|e| e.executor_id() != executor_id);
+        self.persist()
+    }
+}
+
+// ── SqliteMetadataStore ───────────────────────────────────────────────────────
+
+/// SQLite-backed metadata store for durable coordinator recovery.
+///
+/// Feature-gated behind `--features sqlite`.  Uses a bundled SQLite binary so
+/// no system library is required.  Records are serialized as JSON blobs in the
+/// `events` and `jobs` tables and loaded into memory on `open`; subsequent
+/// `save_job`/`append_event` calls update both the in-memory cache and the
+/// on-disk database atomically via transactions.
+#[cfg(feature = "sqlite")]
+pub struct SqliteMetadataStore {
+    conn: std::sync::Mutex<rusqlite::Connection>,
+    events: Vec<EventLogEvent>,
+    jobs: Vec<JobRecord>,
+    executor_descriptors: Vec<ExecutorDescriptor>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteMetadataStore {
+    /// Open (or create) a SQLite metadata store at `path`.
+    pub fn open(path: impl AsRef<std::path::Path>) -> SchedulerResult<Self> {
+        let conn = rusqlite::Connection::open(path).map_err(|e| SchedulerError::Transport {
+            message: format!("sqlite open error: {e}"),
+        })?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS jobs   (job_id TEXT PRIMARY KEY, payload TEXT NOT NULL);",
+        )
+        .map_err(|e| SchedulerError::Transport {
+            message: format!("sqlite schema init error: {e}"),
+        })?;
+
+        // Load existing events.
+        let events = {
+            let mut stmt = conn
+                .prepare("SELECT payload FROM events ORDER BY id")
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite events query error: {e}"),
+                })?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite events iter error: {e}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite events row error: {e}"),
+                })?
+                .into_iter()
+                .map(|json| {
+                    let pe: PersistedEvent =
+                        serde_json::from_str(&json).map_err(|e| SchedulerError::InvalidJob {
+                            message: format!("sqlite event decode error: {e}"),
+                        })?;
+                    EventLogEvent::try_from(pe)
+                })
+                .collect::<SchedulerResult<Vec<_>>>()?
+        };
+
+        // Load existing jobs.
+        let jobs = {
+            let mut stmt = conn.prepare("SELECT payload FROM jobs").map_err(|e| {
+                SchedulerError::Transport {
+                    message: format!("sqlite jobs query error: {e}"),
+                }
+            })?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite jobs iter error: {e}"),
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("sqlite jobs row error: {e}"),
+                })?
+                .into_iter()
+                .map(|json| {
+                    let pj: PersistedJobRecord =
+                        serde_json::from_str(&json).map_err(|e| SchedulerError::InvalidJob {
+                            message: format!("sqlite job decode error: {e}"),
+                        })?;
+                    JobRecord::try_from(pj)
+                })
+                .collect::<SchedulerResult<Vec<_>>>()?
+        };
+
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            events,
+            jobs,
+            executor_descriptors: vec![],
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl MetadataStore for SqliteMetadataStore {
+    fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        let json = serde_json::to_string(&PersistedEvent::from(&event)).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("sqlite event encode error: {e}"),
+            }
+        })?;
+        self.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute("INSERT INTO events (payload) VALUES (?1)", [&json])
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("sqlite event insert error: {e}"),
+            })?;
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
+
+    fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
+        let job_id = record.job_id().to_string();
+        let json = serde_json::to_string(&PersistedJobRecord::from(record)).map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("sqlite job encode error: {e}"),
+            }
+        })?;
+        self.conn
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute(
+                "INSERT INTO jobs (job_id, payload) VALUES (?1, ?2)
+                 ON CONFLICT(job_id) DO UPDATE SET payload = excluded.payload",
+                rusqlite::params![job_id, json],
+            )
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("sqlite job upsert error: {e}"),
+            })?;
+        if let Some(existing) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
+            *existing = record.clone();
+        } else {
+            self.jobs.push(record.clone());
+        }
+        Ok(())
+    }
+
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
+
+    fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
+        if let Some(pos) = self
+            .executor_descriptors
+            .iter()
+            .position(|e| e.executor_id() == descriptor.executor_id())
+        {
+            self.executor_descriptors[pos] = descriptor.clone();
+        } else {
+            self.executor_descriptors.push(descriptor.clone());
+        }
+        // Sqlite backend currently does not persist executors across restarts.
+        Ok(())
+    }
+
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executor_descriptors.clone()
+    }
+
+    fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
+        self.executor_descriptors
+            .retain(|e| e.executor_id() != executor_id);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedExecutorDescriptor {

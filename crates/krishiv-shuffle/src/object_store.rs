@@ -39,27 +39,8 @@ impl ObjectStoreShuffleStore {
         }
     }
 
-    fn compute_content_hash(partition: &ShufflePartition) -> [u8; 32] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        partition.id.job_id.hash(&mut hasher);
-        partition.id.stage_id.hash(&mut hasher);
-        partition.id.partition.hash(&mut hasher);
-        partition.batches.len().hash(&mut hasher);
-        // Hash first few bytes of first batch for light determinism signal
-        if let Some(first) = partition.batches.first()
-            && let Some(col) = first.columns().first()
-        {
-            let len = col.len().min(8);
-            for _ in 0..len {
-                (col.len() as u64).hash(&mut hasher); // stable proxy
-            }
-        }
-        let h = hasher.finish();
-        let mut out = [0u8; 32];
-        out[..8].copy_from_slice(&h.to_le_bytes());
-        out
+    fn compute_content_hash(data: &[u8]) -> [u8; 32] {
+        *blake3::hash(data).as_bytes()
     }
 
     /// Set the IPC compression codec for written partitions.
@@ -174,6 +155,8 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             .finish()
             .map_err(|e| crate::error::io_err(e.to_string()))?;
 
+        let hash = Self::compute_content_hash(&buf);
+
         self.store
             .put(
                 &self.object_path(&partition.id)?,
@@ -182,8 +165,7 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             .await
             .map_err(|e| crate::error::io_err(e.to_string()))?;
 
-        // Store content hash for strict verification on subsequent reads
-        let hash = Self::compute_content_hash(&partition);
+        // Store byte-level content hash for strict verification on subsequent reads.
         self.content_hashes.insert(key, hash);
         Ok(())
     }
@@ -201,6 +183,19 @@ impl ShuffleStore for ObjectStoreShuffleStore {
                     .bytes()
                     .await
                     .map_err(|e| crate::error::io_err(e.to_string()))?;
+                let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+                if let Some(stored_ref) = self.content_hashes.get(&key) {
+                    let stored = *stored_ref;
+                    let computed = Self::compute_content_hash(data.as_ref());
+                    if computed != stored {
+                        return Err(ShuffleError::ContentHashMismatch {
+                            partition: format!("{:?}", key),
+                            expected: format!("{:02x?}", stored),
+                            actual: format!("{:02x?}", computed),
+                        });
+                    }
+                }
+
                 let cursor = std::io::Cursor::new(data.as_ref());
                 let mut reader = StreamReader::try_new(cursor, None)
                     .map_err(|e| crate::error::io_err(e.to_string()))?;
@@ -216,19 +211,6 @@ impl ShuffleStore for ObjectStoreShuffleStore {
                     batches,
                 };
 
-                // Strict content-hash verification (uniform with memory/disk stores)
-                let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-                if let Some(stored_ref) = self.content_hashes.get(&key) {
-                    let stored = *stored_ref;
-                    let computed = Self::compute_content_hash(&partition);
-                    if computed != stored {
-                        return Err(ShuffleError::ContentHashMismatch {
-                            partition: format!("{:?}", key),
-                            expected: format!("{:02x?}", stored),
-                            actual: format!("{:02x?}", computed),
-                        });
-                    }
-                }
                 Ok(Some(partition))
             }
         }

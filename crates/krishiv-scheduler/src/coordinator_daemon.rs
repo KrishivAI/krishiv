@@ -18,16 +18,21 @@ use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
-#[cfg(feature = "sqlite")]
-use crate::SqliteMetadataStore;
 use crate::{
-    ClusterControlPlane, Coordinator, InMemoryMetadataStore, JsonFileMetadataStore, LeaderElection,
+    ClusterControlPlane, Coordinator, LeaderElection,
     SharedCoordinator, SingleNodeLeader, scheduler_metrics,
     serve_coordinator_executor_grpc_with_listener,
 };
+use crate::{InMemoryMetadataStore, JsonFileMetadataStore};
+
+#[cfg(feature = "redb")]
+use crate::RedbMetadataStore;
 
 #[cfg(feature = "etcd")]
 use crate::{EtcdLeaseElection, EtcdMetadataStore};
+
+const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
+const COORDINATOR_BEARER_TOKEN_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKEN_ENV;
 
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +112,7 @@ pub fn build_shared_coordinator_sync(
     let mut coord = Coordinator::active(coordinator_id);
     let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {
         (Some("memory"), _) | (None, None) => {
+            // InMemoryMetadataStore is the correct default for embedded/test use.
             SharedCoordinator::new(coord.with_store(InMemoryMetadataStore::default()))
         }
         #[cfg(feature = "etcd")]
@@ -132,37 +138,33 @@ pub fn build_shared_coordinator_sync(
                 "etcd metadata requires building krishiv-scheduler with feature `etcd`".into(),
             );
         }
-        (backend, Some(path)) => {
+        #[cfg(feature = "redb")]
+        (Some("redb"), Some(path)) => {
             let path = path.to_string_lossy();
-            match backend.unwrap_or("json") {
-                #[cfg(feature = "sqlite")]
-                "sqlite" => {
-                    let store = SqliteMetadataStore::open(path.as_ref())
-                        .map_err(|e| format!("sqlite store '{path}': {e}"))?;
-                    coord
-                        .recover_from_store(&store)
-                        .map_err(|e| format!("coordinator recovery failed: {e}"))?;
-                    SharedCoordinator::new(coord.with_store(store))
-                }
-                _ => {
-                    let store = JsonFileMetadataStore::open(path.as_ref())
-                        .map_err(|e| format!("json store '{path}': {e}"))?;
-                    coord
-                        .recover_from_store(&store)
-                        .map_err(|e| format!("coordinator recovery failed: {e}"))?;
-                    SharedCoordinator::new(coord.with_store(store))
-                }
-            }
+            let store = RedbMetadataStore::open(path.as_ref())
+                .map_err(|e| format!("redb store '{path}': {e}"))?;
+            coord
+                .recover_from_store(&store)
+                .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+            SharedCoordinator::new(coord.with_store(store))
         }
-        (Some("sqlite"), None) => {
-            return Err("--metadata-backend sqlite requires --metadata-path".into());
+        #[cfg(feature = "redb")]
+        (Some("redb"), None) => {
+            return Err("--metadata-backend redb requires --metadata-path".into());
         }
-        (Some("json"), None) => {
-            return Err("--metadata-backend json requires --metadata-path".into());
+        (backend, Some(path)) => {
+            // Default durable backend: JSON file store.
+            let _ = backend; // future: add sqlite, etc.
+            let store = JsonFileMetadataStore::open(path)
+                .map_err(|e| format!("json store '{}': {e}", path.display()))?;
+            coord
+                .recover_from_store(&store)
+                .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+            SharedCoordinator::new(coord.with_store(store))
         }
         (Some(unknown), _) => {
             return Err(format!(
-                "unknown --metadata-backend '{unknown}'; supported: memory, json, sqlite, etcd"
+                "unknown --metadata-backend '{unknown}'; supported: memory, json, etcd"
             )
             .into());
         }
@@ -175,14 +177,10 @@ pub async fn run_cluster_control_plane(
     ccp: Arc<ClusterControlPlane>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn Error>> {
-    // Store handles so the orchestration loops live until this function returns.
-    let _orchestrator_handles = ccp.spawn_orchestration_loops();
-    let leader = Arc::clone(ccp.leader());
     let ccp_loop = Arc::clone(&ccp);
-    tokio::spawn(async move {
+    let leader_task = tokio::spawn(async move {
         ccp_loop.run_leader_loop().await;
     });
-    let _ = leader;
 
     let coordinator = ccp.shared_coordinator().clone();
     let grpc_serve = serve_coordinator_executor_grpc_with_listener(listener, coordinator.clone());
@@ -204,6 +202,9 @@ pub async fn run_cluster_control_plane(
         }
     }
 
+    leader_task.abort();
+    let _ = leader_task.await;
+
     // Brief drain window before demoting: allows in-flight gRPC handlers
     // (heartbeats, task updates) to complete so the new leader doesn't see
     // stale state. A full RPC-drain barrier would require tracking active
@@ -216,6 +217,7 @@ pub async fn run_cluster_control_plane(
         coord.demote_to_standby();
         tracing::info!("coordinator demoted to standby on shutdown");
     }
+    ccp.leader().release().await;
 
     Ok(())
 }
@@ -710,11 +712,9 @@ fn validate_durability_profile_config(
         DurabilityProfile::DevLocal => Ok(()),
         DurabilityProfile::SingleNodeDurable => {
             match config.metadata_backend.as_deref() {
-                Some("json" | "sqlite") => {}
+                Some("json" | "redb") => {}
                 _ => {
-                    return Err(
-                        "single-node-durable requires --metadata-backend json|sqlite".into(),
-                    );
+                    return Err("single-node-durable requires --metadata-backend json|redb".into());
                 }
             }
             if config.metadata_path.is_none() {
@@ -743,6 +743,50 @@ fn validate_durability_profile_config(
             }
             Ok(())
         }
+    }
+}
+
+fn validate_runtime_security_config(
+    config: &CoordinatorDaemonConfig,
+    executor_task_bearer_token_configured: bool,
+    coordinator_bearer_token_configured: bool,
+) -> Result<(), Box<dyn Error>> {
+    if config.durability_profile == DurabilityProfile::DistributedDurable {
+        if config.insecure {
+            return Err("distributed-durable rejects --insecure coordinator gRPC".into());
+        }
+        if !coordinator_bearer_token_configured {
+            return Err(format!(
+                "distributed-durable requires non-empty {COORDINATOR_BEARER_TOKEN_ENV} so coordinator gRPC is authenticated"
+            )
+            .into());
+        }
+        if !executor_task_bearer_token_configured {
+            return Err(format!(
+                "distributed-durable requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV} so executor task-control gRPC is authenticated"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn executor_task_bearer_token_configured() -> bool {
+    env::var(EXECUTOR_TASK_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn coordinator_bearer_token_configured() -> bool {
+    crate::auth::configured_coordinator_bearer_token().is_some()
+}
+
+fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) {
+    if config.insecure {
+        crate::auth::set_allow_anonymous();
+    } else {
+        crate::auth::configure_grpc_auth_provider_from_env();
     }
 }
 
@@ -784,8 +828,8 @@ pub fn coordinator_daemon_help() -> &'static str {
        --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
-       --metadata-backend <TYPE>   memory | json | sqlite | etcd\n\
-       --metadata-path <PATH>      Durable metadata path (required for json/sqlite)\n\
+       --metadata-backend <TYPE>   memory | json | redb | etcd\n\
+       --metadata-path <PATH>      Durable metadata path (required for json/redb)\n\
        --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
        --etcd-endpoints <HOSTS>    Comma-separated etcd URLs (KRISHIV_ETCD_ENDPOINTS)\n\
         --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
@@ -798,9 +842,12 @@ pub fn coordinator_daemon_help() -> &'static str {
 pub async fn run_standalone_coordinator(
     config: CoordinatorDaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
-    if config.insecure {
-        crate::auth::set_allow_anonymous();
-    }
+    configure_coordinator_grpc_auth(&config);
+    validate_runtime_security_config(
+        &config,
+        executor_task_bearer_token_configured(),
+        coordinator_bearer_token_configured(),
+    )?;
     let coordinator = build_shared_coordinator(&config)?;
     spawn_coordinator_sidecars(&coordinator, &config).await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
@@ -844,9 +891,12 @@ pub async fn run_standalone_coordinator(
 
 /// Cluster control plane daemon (`krishiv-clusterd`).
 pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
-    if config.insecure {
-        crate::auth::set_allow_anonymous();
-    }
+    configure_coordinator_grpc_auth(&config);
+    validate_runtime_security_config(
+        &config,
+        executor_task_bearer_token_configured(),
+        coordinator_bearer_token_configured(),
+    )?;
     let shared = build_shared_coordinator(&config)?;
     let leader = build_leader_election(&config).await?;
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
@@ -1040,8 +1090,13 @@ pub async fn run_job_coordinator_daemon(
 
 #[cfg(test)]
 mod parse_tests {
-    use super::{parse_coordinator_daemon_config, render_metrics_body};
+    use super::{
+        coordinator_daemon_help, parse_coordinator_daemon_config, render_metrics_body,
+        validate_runtime_security_config,
+    };
     use crate::{Coordinator, SharedCoordinator};
+    #[cfg(feature = "redb")]
+    use crate::RedbMetadataStore;
     use krishiv_common::durability::DurabilityProfile;
     use krishiv_proto::CoordinatorId;
 
@@ -1148,6 +1203,99 @@ mod parse_tests {
         assert_eq!(config.metadata_backend.as_deref(), Some("etcd"));
         assert_eq!(config.leader_backend, "etcd");
         assert_eq!(config.etcd_endpoints, vec!["http://127.0.0.1:2379"]);
+    }
+
+    #[test]
+    fn distributed_durable_runtime_requires_coordinator_token() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("distributed-durable"),
+            String::from("--metadata-backend"),
+            String::from("etcd"),
+            String::from("--leader-backend"),
+            String::from("etcd"),
+            String::from("--etcd-endpoints"),
+            String::from("http://127.0.0.1:2379"),
+        ])
+        .unwrap();
+
+        let error = validate_runtime_security_config(&config, true, false).unwrap_err();
+
+        assert!(error.to_string().contains("distributed-durable"));
+        assert!(
+            error
+                .to_string()
+                .contains("KRISHIV_COORDINATOR_BEARER_TOKEN")
+        );
+    }
+
+    #[test]
+    fn distributed_durable_runtime_requires_executor_task_token() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("distributed-durable"),
+            String::from("--metadata-backend"),
+            String::from("etcd"),
+            String::from("--leader-backend"),
+            String::from("etcd"),
+            String::from("--etcd-endpoints"),
+            String::from("http://127.0.0.1:2379"),
+        ])
+        .unwrap();
+
+        let error = validate_runtime_security_config(&config, false, true).unwrap_err();
+
+        assert!(error.to_string().contains("distributed-durable"));
+        assert!(
+            error
+                .to_string()
+                .contains("KRISHIV_EXECUTOR_TASK_BEARER_TOKEN")
+        );
+    }
+
+    #[test]
+    fn distributed_durable_runtime_rejects_insecure_grpc() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("distributed-durable"),
+            String::from("--metadata-backend"),
+            String::from("etcd"),
+            String::from("--leader-backend"),
+            String::from("etcd"),
+            String::from("--etcd-endpoints"),
+            String::from("http://127.0.0.1:2379"),
+            String::from("--insecure"),
+        ])
+        .unwrap();
+
+        let error = validate_runtime_security_config(&config, true, true).unwrap_err();
+
+        assert!(error.to_string().contains("--insecure"));
+    }
+
+    #[test]
+    fn distributed_durable_runtime_accepts_required_tokens() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("distributed-durable"),
+            String::from("--metadata-backend"),
+            String::from("etcd"),
+            String::from("--leader-backend"),
+            String::from("etcd"),
+            String::from("--etcd-endpoints"),
+            String::from("http://127.0.0.1:2379"),
+        ])
+        .unwrap();
+
+        validate_runtime_security_config(&config, true, true).unwrap();
+    }
+
+    #[test]
+    fn daemon_help_lists_redb_metadata_backend() {
+        let help = coordinator_daemon_help();
+
+        assert!(help.contains("memory | json | redb | etcd"));
+        assert!(!help.contains("sqlite | etcd"));
     }
 
     #[tokio::test]

@@ -302,7 +302,7 @@ pub struct KrishivMetrics {
     /// Executor slots used per executor (gauge).
     executor_slots_used: dashmap::DashMap<String, AtomicU64>,
     /// Source offset lag (broker_offset - consumer_offset) per (job_id, source_id).
-    source_offset_lag: dashmap::DashMap<String, AtomicI64>,
+    pub source_offset_lag: dashmap::DashMap<String, AtomicI64>,
     /// Streaming rows emitted per (job_id, task_id) (counter).
     streaming_rows: dashmap::DashMap<String, AtomicU64>,
     /// State backend key count per job_id (gauge).
@@ -1724,6 +1724,7 @@ mod tests {
         );
     }
 
+    #[tokio::test]
     #[ignore = "requires live OTLP collector at OTEL_EXPORTER_OTLP_ENDPOINT"]
     async fn otlp_integration_exports_span() {
         let endpoint = match std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {

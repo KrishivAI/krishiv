@@ -148,6 +148,19 @@ where
         }
         result
     }
+
+    /// Remove all keys whose most recent event time is strictly before
+    /// `cutoff_ms`.  Called by the streaming CEP path after each batch to
+    /// bound memory for high-cardinality key spaces.
+    pub fn evict_keys_before(&mut self, cutoff_ms: i64) {
+        self.states
+            .retain(|_, (_, state)| state.last_event_ms >= cutoff_ms);
+    }
+
+    /// Number of currently tracked partition keys.
+    pub fn partition_count(&self) -> usize {
+        self.states.len()
+    }
 }
 
 #[cfg(test)]

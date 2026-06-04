@@ -12,7 +12,6 @@
 //! * No bespoke 4-byte length-prefix parser that previously capped partitions
 //!   at 256 MiB and offered no resume.
 
-use futures::StreamExt;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;

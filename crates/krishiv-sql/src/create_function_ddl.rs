@@ -148,8 +148,7 @@ fn sql_type_to_arrow(type_str: &str) -> Result<DataType, String> {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Body-function type alias for runtime-registered UDTFs.
-pub type UdtfBodyFn =
-    Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>;
+pub type UdtfBodyFn = Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>;
 
 /// A [`TableUdf`] backed by either a runtime closure or the "not yet
 /// implemented" error for unsupported language bodies.
@@ -276,10 +275,9 @@ impl TableUdf for SqlBodyTableUdf {
                 let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
                     message: e.to_string(),
                 })?;
-                let batches = df
-                    .collect()
-                    .await
-                    .map_err(|e| UdfError::Execution { message: e.to_string() })?;
+                let batches = df.collect().await.map_err(|e| UdfError::Execution {
+                    message: e.to_string(),
+                })?;
                 if batches.is_empty() {
                     return Ok(RecordBatch::new_empty(schema));
                 }
@@ -388,9 +386,14 @@ mod tests {
         let stub = StubTableUdf::from_ddl(&ddl);
         let err = stub.call(&[]).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("my_udtf"), "error should include function name");
-        assert!(msg.contains("not yet implemented") || msg.contains("not implemented"),
-            "error should indicate unimplemented: {msg}");
+        assert!(
+            msg.contains("my_udtf"),
+            "error should include function name"
+        );
+        assert!(
+            msg.contains("not yet implemented") || msg.contains("not implemented"),
+            "error should indicate unimplemented: {msg}"
+        );
         // Schema is still accessible for planning.
         assert_eq!(stub.output_schema().field(0).name(), "col1");
         assert_eq!(stub.output_schema().field(1).name(), "col2");

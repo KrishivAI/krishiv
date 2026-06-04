@@ -206,7 +206,7 @@ mod tests {
             job_id: "cs-push-job".to_string(),
             spec: tumbling_spec(),
         };
-        api_continuous_register(State(coordinator.clone()), Json(register_req))
+        let _ = api_continuous_register(State(coordinator.clone()), Json(register_req))
             .await
             .unwrap();
 

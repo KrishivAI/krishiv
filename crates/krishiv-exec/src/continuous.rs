@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
-use krishiv_state::{InMemoryStateBackend, StateBackend, TtlConfig, TtlStateBackend};
+use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::operator_runtime::window_agg_to_expr;
 use crate::watermark_util::advance_effective_watermark;
@@ -76,7 +76,7 @@ fn build_operator(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            let inner = InMemoryStateBackend::new();
+            let inner = FjallStateBackend::ephemeral().unwrap();
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
             } else {
@@ -100,7 +100,7 @@ fn build_operator(
                 slide_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            let inner = InMemoryStateBackend::new();
+            let inner = FjallStateBackend::ephemeral().unwrap();
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
             } else {
@@ -123,7 +123,7 @@ fn build_operator(
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),
             };
-            let inner = InMemoryStateBackend::new();
+            let inner = FjallStateBackend::ephemeral().unwrap();
             let state: Box<dyn StateBackend> = if let Some(ttl_ms) = spec.state_ttl_ms {
                 Box::new(TtlStateBackend::new(inner, TtlConfig::new(ttl_ms)))
             } else {

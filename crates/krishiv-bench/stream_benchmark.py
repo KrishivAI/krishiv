@@ -8,7 +8,7 @@ from pyspark.sql.functions import window, col
 import numpy as np
 
 NUM_ROWS = 10_000_000
-DATA_FILE = "stream_data.parquet"
+DATA_FILE = "/home/code/krishiv/tpch_sf10/stream_data.parquet"
 
 def generate_data():
     if os.path.exists(DATA_FILE):

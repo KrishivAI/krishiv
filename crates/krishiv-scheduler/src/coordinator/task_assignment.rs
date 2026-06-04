@@ -1,5 +1,95 @@
 use super::*;
 
+pub(crate) const MAX_CONCURRENT_ASSIGNMENT_RPCS: usize = 64;
+const MAX_ASSIGNMENT_DELIVERY_ATTEMPTS: usize = 3;
+const ASSIGNMENT_DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
+
+fn configured_executor_task_bearer_token() -> Option<String> {
+    std::env::var(EXECUTOR_TASK_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+fn inject_executor_task_request_context(
+    req: tonic::Request<()>,
+) -> Result<tonic::Request<()>, tonic::Status> {
+    let mut req = krishiv_metrics::grpc::inject_trace_context(req)?;
+    if let Some(token) = configured_executor_task_bearer_token() {
+        let header = format!("Bearer {token}");
+        let value = tonic::metadata::MetadataValue::try_from(header.as_str()).map_err(|_| {
+            tonic::Status::internal(format!(
+                "{EXECUTOR_TASK_BEARER_TOKEN_ENV} contains characters that are invalid for gRPC metadata"
+            ))
+        })?;
+        req.metadata_mut().insert("authorization", value);
+    }
+    Ok(req)
+}
+
+pub(crate) fn round_robin_assignment_targets(
+    targets: Vec<(String, ExecutorTaskAssignment)>,
+) -> Vec<(String, ExecutorTaskAssignment)> {
+    let total = targets.len();
+    let mut by_endpoint: std::collections::BTreeMap<
+        String,
+        std::collections::VecDeque<ExecutorTaskAssignment>,
+    > = std::collections::BTreeMap::new();
+    for (endpoint, assignment) in targets {
+        by_endpoint
+            .entry(endpoint)
+            .or_default()
+            .push_back(assignment);
+    }
+
+    let mut queues: Vec<_> = by_endpoint.into_iter().collect();
+    let mut ordered = Vec::with_capacity(total);
+    while ordered.len() < total {
+        let mut progressed = false;
+        for (endpoint, queue) in &mut queues {
+            if let Some(assignment) = queue.pop_front() {
+                ordered.push((endpoint.clone(), assignment));
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    ordered
+}
+
+pub(crate) async fn collect_bounded_assignment_futures<T, E, Fut, It>(
+    futures: It,
+) -> Result<Vec<T>, E>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+    It: IntoIterator<Item = Fut>,
+{
+    use futures::StreamExt;
+
+    let mut stream =
+        futures::stream::iter(futures).buffer_unordered(MAX_CONCURRENT_ASSIGNMENT_RPCS);
+    let mut responses = Vec::new();
+    while let Some(result) = stream.next().await {
+        responses.push(result?);
+    }
+    Ok(responses)
+}
+
+fn is_retryable_assignment_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    )
+}
+
+async fn assignment_retry_backoff(attempt_idx: usize) {
+    let backoff_ms = 100u64.saturating_mul(1u64 << attempt_idx.min(4));
+    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+}
+
 impl Coordinator {
     /// Re-assign all `Pending` tasks in a job to available executors.
     ///
@@ -150,8 +240,6 @@ impl Coordinator {
         channels: Arc<DashMap<String, tonic::transport::Channel>>,
         targets: Vec<(String, ExecutorTaskAssignment)>,
     ) -> SchedulerResult<Vec<(ExecutorTaskAssignment, TaskStatusResponse)>> {
-        use futures::stream::{FuturesUnordered, StreamExt};
-
         // Inbox-backed in-process targets do not have a gRPC endpoint: they are
         // delivered directly via `InProcessCoordinatorBridge` (see F4 / the
         // `inprocess://` sentinel).  Logging would create noise; the in-process
@@ -166,42 +254,108 @@ impl Coordinator {
             );
         }
 
-        let mut futures = FuturesUnordered::new();
-        for (endpoint, assignment) in remote {
-            let channels = Arc::clone(&channels);
-            futures.push(async move {
-                let channel = Self::get_or_connect_channel_on_map(&channels, &endpoint).await?;
-                let mut client =
-                    wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
-                        channel,
-                        krishiv_metrics::grpc::inject_trace_context
-                            as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+        let futures =
+            round_robin_assignment_targets(remote)
+                .into_iter()
+                .map(|(endpoint, assignment)| {
+                    let channels = Arc::clone(&channels);
+                    async move {
+                        Self::deliver_assignment_target_with_retries(
+                            &channels, endpoint, assignment,
+                        )
+                        .await
+                    }
+                });
+
+        collect_bounded_assignment_futures(futures).await
+    }
+
+    async fn deliver_assignment_target_with_retries(
+        channels: &Arc<DashMap<String, tonic::transport::Channel>>,
+        endpoint: String,
+        assignment: ExecutorTaskAssignment,
+    ) -> SchedulerResult<(ExecutorTaskAssignment, TaskStatusResponse)> {
+        for attempt_idx in 0..MAX_ASSIGNMENT_DELIVERY_ATTEMPTS {
+            let final_attempt = attempt_idx + 1 == MAX_ASSIGNMENT_DELIVERY_ATTEMPTS;
+            let channel = match Self::get_or_connect_channel_on_map(channels, &endpoint).await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    if final_attempt {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        task_id = %assignment.task_id(),
+                        attempt = attempt_idx + 1,
+                        error = %error,
+                        "assignment channel connect failed; retrying"
                     );
-                let response = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client.assign_task(wire::executor_task_assignment_to_wire(assignment.clone())),
-                )
-                .await
-                .map_err(|_| SchedulerError::Transport {
-                    message: format!("assign_task to {endpoint} timed out after 30s"),
-                })?
-                .map_err(|error| SchedulerError::Transport {
-                    message: format!("assign_task to {endpoint}: {error}"),
-                })?
-                .into_inner();
-                wire::task_status_response_from_wire(response)
-                    .map(|decoded| (assignment, decoded))
-                    .map_err(|error| SchedulerError::Transport {
-                        message: format!("wire decode from {endpoint}: {error}"),
-                    })
-            });
+                    assignment_retry_backoff(attempt_idx).await;
+                    continue;
+                }
+            };
+
+            let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
+                channel,
+                inject_executor_task_request_context
+                    as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+            );
+            let response = tokio::time::timeout(
+                ASSIGNMENT_DELIVERY_TIMEOUT,
+                client.assign_task(wire::executor_task_assignment_to_wire(assignment.clone())),
+            )
+            .await;
+
+            match response {
+                Ok(Ok(response)) => {
+                    let response = response.into_inner();
+                    return wire::task_status_response_from_wire(response)
+                        .map(|decoded| (assignment, decoded))
+                        .map_err(|error| SchedulerError::Transport {
+                            message: format!("wire decode from {endpoint}: {error}"),
+                        });
+                }
+                Ok(Err(status)) if is_retryable_assignment_status(&status) && !final_attempt => {
+                    channels.remove(&endpoint);
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        task_id = %assignment.task_id(),
+                        attempt = attempt_idx + 1,
+                        code = ?status.code(),
+                        error = %status,
+                        "assign_task rpc failed transiently; retrying"
+                    );
+                    assignment_retry_backoff(attempt_idx).await;
+                }
+                Ok(Err(status)) => {
+                    return Err(SchedulerError::Transport {
+                        message: format!("assign_task to {endpoint}: {status}"),
+                    });
+                }
+                Err(_elapsed) if !final_attempt => {
+                    channels.remove(&endpoint);
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        task_id = %assignment.task_id(),
+                        attempt = attempt_idx + 1,
+                        "assign_task rpc timed out; retrying"
+                    );
+                    assignment_retry_backoff(attempt_idx).await;
+                }
+                Err(_elapsed) => {
+                    return Err(SchedulerError::Transport {
+                        message: format!(
+                            "assign_task to {endpoint} timed out after {}s",
+                            ASSIGNMENT_DELIVERY_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+            }
         }
 
-        let mut responses = Vec::new();
-        while let Some(result) = futures.next().await {
-            responses.push(result?);
-        }
-        Ok(responses)
+        Err(SchedulerError::Transport {
+            message: format!("assign_task to {endpoint}: retry loop exhausted"),
+        })
     }
 
     /// Launch assigned tasks and push them to executor-owned task endpoints.
@@ -304,7 +458,7 @@ impl Coordinator {
                 };
                 let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
                     channel,
-                    krishiv_metrics::grpc::inject_trace_context
+                    inject_executor_task_request_context
                         as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
                 );
                 if let Err(err) = client
@@ -450,5 +604,107 @@ impl Coordinator {
                 Ok(ch)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use krishiv_proto::{
+        AttemptId, ExecutorId, JobId, LeaseGeneration, OutputContract, OutputContractKind,
+        PlanFragment, StageId, TaskAttemptRef, TaskId,
+    };
+
+    use super::*;
+
+    fn test_assignment(task_id: &str, executor_id: &str) -> ExecutorTaskAssignment {
+        ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-fair").unwrap(),
+                StageId::try_new("stage-fair").unwrap(),
+                TaskId::try_new(task_id).unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new(executor_id).unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select 1"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline"),
+        )
+    }
+
+    #[tokio::test]
+    async fn bounded_assignment_collector_limits_concurrency() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let futures = (0..(MAX_CONCURRENT_ASSIGNMENT_RPCS + 8)).map(|_| {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, SchedulerError>(())
+            }
+        });
+
+        let responses = collect_bounded_assignment_futures(futures).await.unwrap();
+
+        assert_eq!(responses.len(), MAX_CONCURRENT_ASSIGNMENT_RPCS + 8);
+        assert!(
+            max_active.load(Ordering::SeqCst) <= MAX_CONCURRENT_ASSIGNMENT_RPCS,
+            "assignment dispatch must not exceed the configured concurrency cap"
+        );
+    }
+
+    #[test]
+    fn round_robin_assignment_targets_interleaves_executor_endpoints() {
+        let targets = vec![
+            (
+                "http://exec-a".to_owned(),
+                test_assignment("task-a1", "exec-a"),
+            ),
+            (
+                "http://exec-a".to_owned(),
+                test_assignment("task-a2", "exec-a"),
+            ),
+            (
+                "http://exec-a".to_owned(),
+                test_assignment("task-a3", "exec-a"),
+            ),
+            (
+                "http://exec-b".to_owned(),
+                test_assignment("task-b1", "exec-b"),
+            ),
+            (
+                "http://exec-c".to_owned(),
+                test_assignment("task-c1", "exec-c"),
+            ),
+            (
+                "http://exec-c".to_owned(),
+                test_assignment("task-c2", "exec-c"),
+            ),
+        ];
+
+        let ordered = round_robin_assignment_targets(targets);
+        let endpoint_order: Vec<_> = ordered
+            .iter()
+            .map(|(endpoint, _)| endpoint.as_str())
+            .collect();
+
+        assert_eq!(
+            endpoint_order,
+            vec![
+                "http://exec-a",
+                "http://exec-b",
+                "http://exec-c",
+                "http://exec-a",
+                "http://exec-c",
+                "http://exec-a",
+            ]
+        );
     }
 }

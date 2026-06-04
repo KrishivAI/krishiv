@@ -22,7 +22,7 @@ path = "src/main.rs"
 #
 # What features DO control:
 #   embedded    → no extra deps (baseline API surface, always compiles)
-#   single-node → pulls in Flight SQL server, shuffle service, SQLite metadata
+#   single-node → pulls in Flight SQL server, shuffle service, Redb metadata
 #   distributed → pulls in Flight SQL server, shuffle service, etcd metadata
 #   k8s         → distributed + Kubernetes operator CRD + reconciler
 #
@@ -39,7 +39,7 @@ full    = ["single-node", "distributed", "k8s", "ui", "kafka", "iceberg", "delta
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
-single-node = ["flight-sql", "shuffle", "sqlite"]               # local daemon + SQLite metadata
+single-node = ["flight-sql", "shuffle", "redb"]               # local daemon + Redb metadata
 distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster + etcd metadata
 bare-metal  = ["distributed"]                                    # alias: process-managed cluster
 cluster     = ["distributed"]                                    # alias: distributed
@@ -51,7 +51,7 @@ flight-sql = ["dep:krishiv-flight-sql"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
 kafka = ["krishiv-connectors/kafka"]
-sqlite = ["krishiv-scheduler/sqlite"]
+redb = ["krishiv-scheduler/redb"]
 state = ["krishiv-connectors/state"]
 iceberg = ["krishiv-lakehouse/iceberg"]
 delta = ["krishiv-lakehouse/delta"]
@@ -87,5 +87,4 @@ krishiv-runtime = { path = "../krishiv-runtime" }
 krishiv-udf = { path = "../krishiv-udf" }
 parquet = { workspace = true }
 tempfile = { workspace = true }
-
 

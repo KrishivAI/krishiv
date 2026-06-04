@@ -240,11 +240,6 @@ impl MemoryLakehouseTableState {
             .collect()
     }
 
-    /// Iterate all batches by reference without cloning.
-    fn all_batches_ref(&self) -> impl Iterator<Item = &RecordBatch> {
-        self.layers.iter().flat_map(|layer| layer.batches.iter())
-    }
-
     fn append_layer(&mut self, batches: Vec<RecordBatch>) -> i64 {
         self.last_snapshot_id += 1;
         let snapshot_id = self.last_snapshot_id;

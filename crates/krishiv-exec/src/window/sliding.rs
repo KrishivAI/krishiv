@@ -233,7 +233,7 @@ mod sliding_state_tests {
     use super::*;
     use crate::aggregate::AggFunction;
     use arrow::datatypes::{DataType, Field, Schema};
-    use krishiv_state::{InMemoryStateBackend, Namespace};
+    use krishiv_state::{FjallStateBackend, Namespace};
 
     #[test]
     fn sliding_state_persist_and_restore_roundtrip() {
@@ -266,7 +266,7 @@ mod sliding_state_tests {
         op.process_batch(&batch, 100).expect("process");
         assert!(op.open_window_count() > 0);
 
-        let mut backend = InMemoryStateBackend::new();
+        let mut backend = FjallStateBackend::ephemeral().unwrap();
         let ns = Namespace::new("op-sliding", "windows");
         op.persist_to_state(&mut backend, &ns).expect("persist");
 

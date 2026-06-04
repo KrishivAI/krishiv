@@ -38,6 +38,21 @@ k8s/
 
 ## Operator path (production)
 
+Create control-plane tokens before deploying. Executors use the coordinator
+token for executor-to-coordinator gRPC, and coordinators/operators use the
+executor task token for scheduler-to-executor assignment RPCs. Production pods
+refuse anonymous control traffic when these Secrets are missing or empty.
+
+```bash
+kubectl create namespace krishiv-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret generic krishiv-coordinator-auth \
+  -n krishiv-system \
+  --from-literal=token="$(openssl rand -base64 32)"
+kubectl create secret generic krishiv-executor-task-auth \
+  -n krishiv-system \
+  --from-literal=token="$(openssl rand -base64 32)"
+```
+
 Install CRDs + operator in one command:
 
 ```bash
@@ -81,6 +96,12 @@ No operator or CRDs required. Runs coordinator + executors as plain Deployments.
 kubectl apply -f k8s/direct/krishiv-dev.yaml
 
 # Full multi-node deployment
+kubectl create secret generic krishiv-coordinator-auth \
+  -n krishiv-system \
+  --from-literal=token="$(openssl rand -base64 32)"
+kubectl create secret generic krishiv-executor-task-auth \
+  -n krishiv-system \
+  --from-literal=token="$(openssl rand -base64 32)"
 kubectl apply -f k8s/direct/krishiv-distributed.yaml
 ```
 
@@ -122,6 +143,9 @@ BOOTSTRAP=localhost:9092 cargo run --bin kafka_streaming_sql
 ---
 
 ## Helm
+
+Create the same `krishiv-coordinator-auth` and `krishiv-executor-task-auth`
+Secrets in the target namespace before installing the chart.
 
 ```bash
 helm install krishiv k8s/helm/krishiv \

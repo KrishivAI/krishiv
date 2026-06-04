@@ -265,7 +265,7 @@ pub(crate) fn build_window_record_batch(
 mod state_tests {
     use super::*;
     use crate::aggregate::AggFunction;
-    use krishiv_state::{InMemoryStateBackend, Namespace};
+    use krishiv_state::{FjallStateBackend, Namespace};
 
     #[test]
     fn tumbling_state_persist_and_restore_roundtrip() {
@@ -297,7 +297,7 @@ mod state_tests {
         op.process_batch(&batch, 100).expect("process");
         assert_eq!(op.open_window_count(), 1);
 
-        let mut backend = InMemoryStateBackend::new();
+        let mut backend = FjallStateBackend::ephemeral().unwrap();
         let ns = Namespace::new("op-1", "windows");
         op.persist_to_state(&mut backend, &ns).expect("persist");
 

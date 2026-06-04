@@ -46,6 +46,18 @@ spec:
                   fieldPath: metadata.name
             - name: KRISHIV_TASK_SLOTS
               value: "1"
+            - name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH
+              value: "true"
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: token
+            - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-executor-task-auth
+                  key: token
           volumeMounts:
             - name: tpch-data
               mountPath: /home/code/krishiv/tpch_sf10

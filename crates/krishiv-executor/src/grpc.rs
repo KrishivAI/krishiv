@@ -1,11 +1,14 @@
 //! gRPC service types for the executor task assignment protocol.
 
+pub const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
+pub const REQUIRE_EXECUTOR_TASK_AUTH_ENV: &str = "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH";
+
 use krishiv_proto::{
     ExecutorTaskAssignment, ExecutorTaskService, TaskStatusResponse, TransportDisposition,
     TransportVersion, wire,
 };
 
-use crate::{ExecutorAssignmentInbox, ExecutorError};
+use crate::{AssignmentPushOutcome, ExecutorAssignmentInbox, ExecutorError};
 
 /// Executor-side task assignment service backed by an in-memory inbox.
 #[derive(Debug, Clone)]
@@ -25,6 +28,94 @@ impl ExecutorTaskInboxService {
     }
 }
 
+/// Authentication settings for the executor task-control gRPC API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorTaskAuthConfig {
+    require_auth: bool,
+    bearer_token: Option<String>,
+}
+
+impl ExecutorTaskAuthConfig {
+    /// Build auth config from process environment.
+    pub fn from_env() -> Self {
+        Self {
+            require_auth: parse_bool_env(REQUIRE_EXECUTOR_TASK_AUTH_ENV),
+            bearer_token: configured_executor_task_bearer_token(),
+        }
+    }
+
+    /// Build auth config directly for tests and embedders.
+    pub fn new(require_auth: bool, bearer_token: Option<String>) -> Self {
+        Self {
+            require_auth,
+            bearer_token: bearer_token
+                .map(|token| token.trim().to_owned())
+                .filter(|token| !token.is_empty()),
+        }
+    }
+
+    /// Whether the process must fail closed if no bearer token is configured.
+    pub fn require_auth(&self) -> bool {
+        self.require_auth
+    }
+
+    /// Whether a non-empty bearer token is configured.
+    pub fn has_bearer_token(&self) -> bool {
+        self.bearer_token.is_some()
+    }
+
+    /// Validate the required-auth startup contract.
+    pub fn validate_required(&self) -> crate::ExecutorResult<()> {
+        if self.require_auth && self.bearer_token.is_none() {
+            return Err(crate::ExecutorError::LocalExecution {
+                message: format!(
+                    "{REQUIRE_EXECUTOR_TASK_AUTH_ENV}=true requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn required_bearer_token(&self) -> Option<String> {
+        self.bearer_token.clone()
+    }
+
+    fn misconfiguration_message(&self) -> Option<String> {
+        (self.require_auth && self.bearer_token.is_none()).then(|| {
+            format!(
+                "{REQUIRE_EXECUTOR_TASK_AUTH_ENV}=true requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV}"
+            )
+        })
+    }
+}
+
+fn parse_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn configured_executor_task_bearer_token() -> Option<String> {
+    std::env::var(EXECUTOR_TASK_BEARER_TOKEN_ENV)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+fn bearer_token_from_metadata(metadata: &tonic::metadata::MetadataMap) -> Option<&str> {
+    metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
 #[tonic::async_trait]
 impl ExecutorTaskService for ExecutorTaskInboxService {
     async fn assign_task(
@@ -40,10 +131,13 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
             )));
         }
 
-        match self.inbox.push(assignment) {
-            Ok(()) => Ok(tonic::Response::new(TaskStatusResponse::new(
-                TransportDisposition::Accepted,
-            ))),
+        match self.inbox.push_with_outcome(assignment) {
+            Ok(AssignmentPushOutcome::Enqueued) => Ok(tonic::Response::new(
+                TaskStatusResponse::new(TransportDisposition::Accepted),
+            )),
+            Ok(AssignmentPushOutcome::Duplicate) => Ok(tonic::Response::new(
+                TaskStatusResponse::new(TransportDisposition::Duplicate),
+            )),
             Err(ExecutorError::AssignmentQueueFull { current, max }) => {
                 // Proper backpressure signal to the coordinator.
                 Err(tonic::Status::resource_exhausted(format!(
@@ -115,19 +209,55 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
 #[derive(Debug, Clone)]
 pub struct ExecutorTaskGrpcService {
     inner: ExecutorTaskInboxService,
+    required_bearer_token: Option<String>,
+    auth_misconfiguration: Option<String>,
 }
 
 impl ExecutorTaskGrpcService {
     /// Create a networked executor task service.
     pub fn new(inbox: ExecutorAssignmentInbox) -> Self {
+        Self::with_auth_config(inbox, ExecutorTaskAuthConfig::from_env())
+    }
+
+    /// Create a networked executor task service with explicit auth config.
+    pub fn with_auth_config(inbox: ExecutorAssignmentInbox, auth: ExecutorTaskAuthConfig) -> Self {
         Self {
             inner: ExecutorTaskInboxService::new(inbox),
+            required_bearer_token: auth.required_bearer_token(),
+            auth_misconfiguration: auth.misconfiguration_message(),
         }
+    }
+
+    /// Require a bearer token for network task-control RPCs.
+    #[must_use]
+    pub fn with_required_bearer_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.required_bearer_token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
+        self.auth_misconfiguration = None;
+        self
     }
 
     /// Assignment inbox backing this service.
     pub fn inbox(&self) -> &ExecutorAssignmentInbox {
         self.inner.inbox()
+    }
+
+    fn validate_auth(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), tonic::Status> {
+        if let Some(message) = &self.auth_misconfiguration {
+            return Err(tonic::Status::unauthenticated(message.clone()));
+        }
+        let Some(expected) = &self.required_bearer_token else {
+            return Ok(());
+        };
+        match bearer_token_from_metadata(metadata) {
+            Some(actual) if actual == expected => Ok(()),
+            Some(_) => Err(tonic::Status::unauthenticated(
+                "invalid executor task bearer token",
+            )),
+            None => Err(tonic::Status::unauthenticated(
+                "missing executor task bearer token",
+            )),
+        }
     }
 }
 
@@ -137,6 +267,7 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
         &self,
         request: tonic::Request<wire::v1::ExecutorTaskAssignment>,
     ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+        self.validate_auth(request.metadata())?;
         let request = wire::executor_task_assignment_from_wire(request.into_inner())
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let response = self
@@ -153,6 +284,7 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
         &self,
         request: tonic::Request<wire::v1::TaskCancellationRequest>,
     ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+        self.validate_auth(request.metadata())?;
         let request = wire::task_cancellation_request_from_wire(request.into_inner())
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let response = self
@@ -169,6 +301,7 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
         &self,
         request: tonic::Request<wire::v1::PushContinuousInputRequest>,
     ) -> Result<tonic::Response<wire::v1::TaskStatusResponse>, tonic::Status> {
+        self.validate_auth(request.metadata())?;
         let request = wire::push_continuous_input_request_from_wire(request.into_inner())
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let response = self
@@ -185,6 +318,7 @@ impl wire::v1::executor_task_server::ExecutorTask for ExecutorTaskGrpcService {
         &self,
         request: tonic::Request<wire::v1::DrainContinuousOutputRequest>,
     ) -> Result<tonic::Response<wire::v1::DrainContinuousOutputResponse>, tonic::Status> {
+        self.validate_auth(request.metadata())?;
         let request = wire::drain_continuous_output_request_from_wire(request.into_inner())
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let response = self

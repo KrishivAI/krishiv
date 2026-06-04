@@ -57,8 +57,13 @@ pub struct CdcEvent {
 /// Raw CDC source record plus its source offset identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawCdcRecord {
-    /// Raw Debezium JSON payload.
+    /// Raw Debezium JSON payload (UTF-8).  Always set; may be empty when
+    /// `raw_bytes` carries the authoritative payload instead.
     pub payload: String,
+    /// Raw binary payload bytes as received from Kafka.  Set by sources that
+    /// provide Confluent wire-format (Avro/Protobuf) records for schema-registry
+    /// decoding.  `None` for JSON / plain-text sources.
+    pub raw_bytes: Option<Vec<u8>>,
     /// Kafka partition the record came from.
     pub partition_id: u32,
     /// Kafka offset of the record.
@@ -70,10 +75,32 @@ impl RawCdcRecord {
     pub fn new(payload: impl Into<String>, partition_id: u32, offset: i64) -> Self {
         Self {
             payload: payload.into(),
+            raw_bytes: None,
             partition_id,
             offset,
         }
     }
+
+    /// Create a record carrying binary payload for schema-registry sources.
+    pub fn with_bytes(bytes: Vec<u8>, partition_id: u32, offset: i64) -> Self {
+        Self {
+            payload: String::new(),
+            raw_bytes: Some(bytes),
+            partition_id,
+            offset,
+        }
+    }
+}
+
+/// Parse a slice of raw CDC records as Debezium JSON envelopes.
+fn parse_debezium_records(raw: &[RawCdcRecord]) -> Result<Vec<CdcEvent>, String> {
+    raw.iter()
+        .enumerate()
+        .map(|(i, record)| {
+            parse_debezium_envelope_result(&record.payload, record.partition_id, record.offset)
+                .map_err(|e| format!("Debezium parse error at batch index {i}: {e}"))
+        })
+        .collect()
 }
 
 /// Error returned when a Debezium JSON envelope cannot be parsed.
@@ -346,6 +373,18 @@ impl CdcToLakehousePipeline {
     {
         self.validate()?;
         let mut schema_state = CdcSchemaEvolutionState::default();
+
+        // Build a schema-registry deserializer if a URL is configured.
+        // When present, records with raw_bytes are decoded via the registry
+        // instead of being parsed as Debezium JSON.
+        #[cfg(feature = "schema-registry")]
+        let registry_client = self
+            .schema_registry_url
+            .as_deref()
+            .map(|url| krishiv_schema_registry::SchemaRegistryClient::new(url));
+        #[cfg(not(feature = "schema-registry"))]
+        let _ = &self.schema_registry_url; // suppress unused warning
+
         loop {
             if *shutdown.borrow() {
                 break;
@@ -359,23 +398,59 @@ impl CdcToLakehousePipeline {
                     break;
                 }
             }
-            let events: Vec<CdcEvent> = raw
-                .iter()
-                .enumerate()
-                .map(|(i, record)| {
-                    parse_debezium_envelope_result(
-                        &record.payload,
-                        record.partition_id,
-                        record.offset,
-                    )
-                    .map_err(|e| format!("Debezium parse error at batch index {i}: {e}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if events.is_empty() {
-                continue;
-            }
-            let mut batch =
-                build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))?;
+
+            // Decode records: use schema-registry when raw_bytes are present and
+            // a registry URL is configured; otherwise fall back to Debezium JSON.
+            #[cfg(feature = "schema-registry")]
+            let batch_result: Result<RecordBatch, String> = {
+                if let Some(ref client) = registry_client {
+                    // Check whether this batch carries binary payloads.
+                    let has_bytes = raw.iter().any(|r| r.raw_bytes.is_some());
+                    if has_bytes {
+                        // Decode all records via schema registry and concatenate.
+                        let mut batches = Vec::with_capacity(raw.len());
+                        for (i, record) in raw.iter().enumerate() {
+                            let bytes = record
+                                .raw_bytes
+                                .as_deref()
+                                .unwrap_or(record.payload.as_bytes());
+                            let (_schema, decoded) =
+                                client.decode_any(bytes).await.map_err(|e| {
+                                    format!("schema-registry decode error at index {i}: {e}")
+                                })?;
+                            batches.extend(decoded);
+                        }
+                        if batches.is_empty() {
+                            continue;
+                        }
+                        arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                            .map_err(|e| format!("concat error: {e}"))
+                    } else {
+                        // No binary payloads — fall through to Debezium JSON path.
+                        let events = parse_debezium_records(&raw)?;
+                        if events.is_empty() {
+                            continue;
+                        }
+                        build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))
+                    }
+                } else {
+                    let events = parse_debezium_records(&raw)?;
+                    if events.is_empty() {
+                        continue;
+                    }
+                    build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))
+                }
+            };
+            #[cfg(not(feature = "schema-registry"))]
+            let batch_result: Result<RecordBatch, String> = {
+                let events = parse_debezium_records(&raw)?;
+                if events.is_empty() {
+                    continue;
+                }
+                build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))
+            };
+
+            let mut batch = batch_result?;
             if self.schema_evolution {
                 batch = schema_state.normalize(batch)?;
             }
