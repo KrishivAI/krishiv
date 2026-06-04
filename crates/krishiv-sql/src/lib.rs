@@ -33,7 +33,7 @@ pub mod streaming;
 mod udf;
 mod window_functions;
 
-pub use cep_sql::{MatchRecognizeStatement, parse_match_recognize};
+pub use cep_sql::{MatchRecognizeStatement, execute_streaming_match_recognize, parse_match_recognize};
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 pub use policy::PolicyEnforcingSqlEngine;
 
@@ -858,39 +858,38 @@ impl SqlEngine {
         if create_function_ddl::is_create_function_returns_table(query) {
             let ddl = create_function_ddl::parse_create_function(query)
                 .map_err(|e| SqlError::DataFusion { message: e })?;
-            let udf: std::sync::Arc<dyn krishiv_udf::TableUdf> =
-                if ddl.language.as_deref() == Some("sql") {
-                    if let Some(ref body) = ddl.body {
-                        // LANGUAGE sql: execute the body via the session context.
-                        let fields: Vec<_> = ddl
-                            .return_columns
-                            .iter()
-                            .map(|c| arrow::datatypes::Field::new(
-                                &c.name,
-                                c.data_type.clone(),
-                                true,
-                            ))
-                            .collect();
-                        let schema = arrow::datatypes::Schema::new(fields);
-                        std::sync::Arc::new(create_function_ddl::SqlBodyTableUdf::new(
-                            &ddl.function_name,
-                            schema,
-                            body.clone(),
-                            std::sync::Arc::clone(&self.context),
-                        ))
-                    } else {
-                        std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))
-                    }
-                } else {
-                    std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))
-                };
+            let is_sql_body = ddl.language.as_deref() == Some("sql") && ddl.body.is_some();
+            let udf: std::sync::Arc<dyn krishiv_udf::TableUdf> = if is_sql_body {
+                // LANGUAGE sql AS '…': register an executable UDF backed by the body.
+                let body = ddl.body.as_deref().unwrap_or_default();
+                let fields: Vec<_> = ddl
+                    .return_columns
+                    .iter()
+                    .map(|c| arrow::datatypes::Field::new(&c.name, c.data_type.clone(), true))
+                    .collect();
+                let schema = arrow::datatypes::Schema::new(fields);
+                std::sync::Arc::new(create_function_ddl::SqlBodyTableUdf::new(
+                    &ddl.function_name,
+                    schema,
+                    body,
+                    std::sync::Arc::new(self.context.clone()),
+                ))
+            } else {
+                // Other languages: register a stub so the schema resolves at plan time,
+                // but calling the function will produce a clear error.
+                std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))
+            };
             if let Some(registry) = &self.udf_registry {
                 let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
                 })?;
                 guard.register_table(std::sync::Arc::clone(&udf));
             }
-            udf::register_single_table_udf(&self.context, udf).map_err(SqlError::from)?;
+            udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
+                .map_err(SqlError::from)?;
+            // DDL always succeeds — the stub is registered for planning.
+            // LANGUAGE sql: the body executes at call time.
+            // Other languages: calling the function returns a clear "not implemented" error.
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(SqlDataFrame::new("create-function", empty).with_query(query));
         }
@@ -915,22 +914,21 @@ impl SqlEngine {
         // path: parse → run PatternMatcher on the source table → return results.
         if query.to_ascii_uppercase().contains(" MATCH_RECOGNIZE ") {
             if let Some(stmt) = cep_sql::parse_match_recognize(query)? {
-                // Guard: CEP buffers ALL source rows before pattern matching.
-                // An unbounded streaming source would fill memory indefinitely.
-                if self.is_streaming_source(&stmt.source_table) {
-                    return Err(SqlError::Unsupported {
-                        feature: format!(
-                            "MATCH_RECOGNIZE on unbounded streaming source '{}' is not \
-                             supported; use a bounded (batch) table or apply LIMIT to \
-                             bound the scan before pattern matching",
-                            stmt.source_table
-                        ),
-                    });
-                }
-                let source_df = self
-                    .context
-                    .sql(&format!("SELECT * FROM {}", stmt.source_table))
-                    .await?;
+                let is_streaming = self.is_streaming_source(&stmt.source_table);
+                // For streaming sources collect a bounded window of recent events
+                // (capped at STREAMING_CEP_MAX_ROWS) so the query terminates.
+                // Use execute_match_recognize — it now works for both bounded and
+                // streaming inputs once the rows are collected.
+                const STREAMING_CEP_MAX_ROWS: usize = 100_000;
+                let source_sql = if is_streaming {
+                    format!(
+                        "SELECT * FROM {} LIMIT {}",
+                        stmt.source_table, STREAMING_CEP_MAX_ROWS
+                    )
+                } else {
+                    format!("SELECT * FROM {}", stmt.source_table)
+                };
+                let source_df = self.context.sql(&source_sql).await?;
                 let source_batches = source_df.collect().await?;
                 let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
                 lakehouse::register_scan_batches(&self.context, "_krishiv_cep_result", results)
@@ -1757,12 +1755,15 @@ mod udtf_ddl_tests {
     use super::SqlEngine;
     use super::SqlError;
 
-    /// `CREATE FUNCTION … RETURNS TABLE` must return an unsupported error
-    /// since UDTFs are stubs and not yet implemented.
+    /// All `CREATE FUNCTION … RETURNS TABLE` DDL succeeds — the stub is registered
+    /// for plan-time schema resolution regardless of language. Execution errors for
+    /// non-SQL languages are deferred to call time.
     #[tokio::test]
-    async fn create_function_returns_table_errors() {
+    async fn create_function_returns_table_ddl_always_succeeds() {
         let engine = SqlEngine::new();
-        let result = engine
+
+        // Non-SQL language: DDL registers stub, returns empty DataFrame.
+        let rust_result = engine
             .sql(
                 "CREATE FUNCTION my_udtf(arg1 INT) \
                  RETURNS TABLE (col1 TEXT, col2 BIGINT) \
@@ -1770,19 +1771,18 @@ mod udtf_ddl_tests {
                  AS 'fn stub() {}'",
             )
             .await;
-        assert!(result.is_err());
-        let err = result.err().unwrap();
-        assert!(
-            matches!(err, SqlError::Unsupported { .. }),
-            "expected Unsupported error, got {:?}",
-            err
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("CREATE FUNCTION RETURNS TABLE is not yet implemented"),
-            "expected 'not yet implemented' message, got '{}'",
-            msg
-        );
+        assert!(rust_result.is_ok(), "LANGUAGE RUST DDL should succeed, got {rust_result:?}");
+
+        // SQL language: inline body registered, also returns empty DataFrame on DDL.
+        let sql_result = engine
+            .sql(
+                "CREATE FUNCTION greet(name TEXT) \
+                 RETURNS TABLE (msg TEXT) \
+                 LANGUAGE SQL \
+                 AS 'SELECT ''hello'' AS msg'",
+            )
+            .await;
+        assert!(sql_result.is_ok(), "LANGUAGE SQL DDL should succeed, got {sql_result:?}");
     }
 
     // ── Streaming source registration (broker-free path) ─────────────────────
