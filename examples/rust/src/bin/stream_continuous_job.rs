@@ -31,23 +31,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Field::new("timestamp", DataType::Int64, false),
         Field::new("user_id", DataType::Utf8, false),
     ]));
-    let batch = RecordBatch::try_new(
+
+    // First batch: two events within the [0, 10_000ms) window.
+    let batch1 = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(vec![1000, 2000])),
+            Arc::new(Int64Array::from(vec![1_000, 2_000])),
             Arc::new(StringArray::from(vec!["Alice", "Bob"])),
         ],
     )?;
 
-    println!("Pushing live input batch...");
-    session.push_stream_job_input(&job_id, vec![batch])?;
+    // Second batch: an event at 15_000ms — this advances the watermark past
+    // the first window boundary (10_000ms), causing the engine to close and
+    // emit that window before continuing.
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![15_000])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+        ],
+    )?;
 
-    // 3. Poll/drain any emitted window results asynchronously
+    println!("Pushing first input batch (in-window events)...");
+    session.push_stream_job_input(&job_id, vec![batch1])?;
+
+    println!("Pushing second batch (window-crossing event at 15s)...");
+    session.push_stream_job_input(&job_id, vec![batch2])?;
+
+    // 3. Poll/drain emitted window results. The window-crossing event above
+    //    should have closed the [0, 10s) window and emitted its aggregation.
     println!("Polling emitted window results...");
     let results = session.poll_stream_job(&job_id).await?;
     println!("Polled {} batches from continuous pipeline.", results.len());
 
-    if !results.is_empty() {
+    if results.is_empty() {
+        println!("(No windows closed yet — window may need more data to advance watermark)");
+    } else {
         println!("{}", QueryResult::new(results).pretty()?);
     }
 

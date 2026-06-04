@@ -172,11 +172,20 @@ impl PyKeyedStream {
         ))
     }
 
+    /// Tumbling window in seconds. Prefer `tumbling_window_ms` for explicit milliseconds.
     pub fn tumbling_window(&self, window_secs: u64) -> PyResult<PyWindowedStream> {
         let stream = PyStream {
             pipeline: self.pipeline.clone(),
         };
         stream.tumbling_window(window_secs)
+    }
+
+    /// Tumbling window in milliseconds — consistent with `DataFrame.tumbling_window(ms)`.
+    pub fn tumbling_window_ms(&self, window_ms: u64) -> PyResult<PyWindowedStream> {
+        let stream = PyStream {
+            pipeline: self.pipeline.clone(),
+        };
+        stream.tumbling_window_ms(window_ms)
     }
 
     pub fn __repr__(&self) -> String {

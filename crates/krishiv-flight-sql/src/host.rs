@@ -79,20 +79,19 @@ impl FlightExecutionHost {
 
     /// Create a host with an optional coordinator HTTP base URL.
     ///
-    /// - `Some(url)` → proxy mode: all execution forwarded to the coordinator.
-    ///   No `InProcessCluster` is created — avoids the coordinator/executor
-    ///   allocation overhead in pure proxy deployments.
+    /// - `Some(url)` → proxy mode: batch SQL is forwarded to the coordinator;
+    ///   an `InProcessCluster` is still created for continuous streaming jobs
+    ///   because window state is session-local and does not need coordinator routing.
     /// - `None` → embedded mode: all operations run on the local cluster.
     pub fn with_coordinator_http(coordinator_http: Option<String>) -> Result<Self, Status> {
-        let (cluster, continuous) = if coordinator_http.is_none() {
-            let c = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
-            (
-                Some(Arc::new(c)),
-                Some(Arc::new(ContinuousStreamRegistry::new())),
-            )
-        } else {
-            (None, None)
-        };
+        // Always create the in-process cluster and continuous registry.
+        // Batch SQL is proxied to the coordinator when coordinator_http is set;
+        // continuous job operations always run locally in the flight-server process.
+        let c = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
+        let (cluster, continuous) = (
+            Some(Arc::new(c)),
+            Some(Arc::new(ContinuousStreamRegistry::new())),
+        );
         Ok(Self {
             cluster,
             continuous,

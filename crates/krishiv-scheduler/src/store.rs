@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 use krishiv_proto::{
     AttemptId, ConnectorCapabilityFlags, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec,
@@ -15,6 +14,7 @@ use crate::{JobRecord, ResourceUsage, SchedulerError, SchedulerResult, StageReco
 /// Long-running streaming jobs can accumulate many task-state events between
 /// `save_job` calls; rotation takes a full snapshot and clears the log to
 /// prevent unbounded disk growth.
+#[allow(dead_code)]
 const MAX_EVENTS_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Events written to the durable job event log.
@@ -832,12 +832,21 @@ pub(crate) fn encode_metadata_snapshot(
     events: &[EventLogEvent],
     jobs: &[JobRecord],
 ) -> SchedulerResult<Vec<u8>> {
+    encode_metadata_snapshot_with_executors(events, jobs, &[])
+}
+
+/// Like [`encode_metadata_snapshot`] but also includes executor descriptors (R10).
+pub(crate) fn encode_metadata_snapshot_with_executors(
+    events: &[EventLogEvent],
+    jobs: &[JobRecord],
+    executors: &[krishiv_proto::ExecutorDescriptor],
+) -> SchedulerResult<Vec<u8>> {
     let persisted = PersistedMetadata {
         schema_version: JSON_METADATA_SCHEMA_VERSION,
         store_kind: String::from("krishiv.scheduler.metadata"),
         events: events.iter().map(PersistedEvent::from).collect(),
         jobs: jobs.iter().map(PersistedJobRecord::from).collect(),
-        executor_descriptors: vec![],
+        executor_descriptors: executors.iter().map(PersistedExecutorDescriptor::from).collect(),
     };
     serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
         message: format!("failed to encode metadata snapshot: {error}"),
@@ -1047,8 +1056,16 @@ impl NonBlockingStoreHandle {
 pub(crate) fn decode_metadata_snapshot(
     bytes: &[u8],
 ) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {
+    let (events, jobs, _executors) = decode_metadata_snapshot_with_executors(bytes)?;
+    Ok((events, jobs))
+}
+
+/// Like [`decode_metadata_snapshot`] but also restores executor descriptors (R10).
+pub(crate) fn decode_metadata_snapshot_with_executors(
+    bytes: &[u8],
+) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>, Vec<krishiv_proto::ExecutorDescriptor>)> {
     if bytes.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     let persisted: PersistedMetadata =
         serde_json::from_slice(bytes).map_err(|error| SchedulerError::InvalidJob {
@@ -1065,5 +1082,10 @@ pub(crate) fn decode_metadata_snapshot(
         .into_iter()
         .map(JobRecord::try_from)
         .collect::<SchedulerResult<Vec<_>>>()?;
-    Ok((events, jobs))
+    let executors = persisted
+        .executor_descriptors
+        .into_iter()
+        .filter_map(|p| krishiv_proto::ExecutorDescriptor::try_from(p).ok())
+        .collect();
+    Ok((events, jobs, executors))
 }
