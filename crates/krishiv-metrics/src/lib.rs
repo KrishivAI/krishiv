@@ -109,8 +109,11 @@ impl MetricsHandle {
 
 impl Drop for MetricsHandle {
     fn drop(&mut self) {
-        // Ignore shutdown errors — best-effort flush.
-        let _ = self.tracer_provider.shutdown();
+        // Best-effort shutdown; log the error so observability failures are
+        // visible instead of silently dropping the last batch of spans.
+        if let Err(error) = self.tracer_provider.shutdown() {
+            tracing::debug!(error = %error, "metrics tracer provider shutdown failed");
+        }
     }
 }
 

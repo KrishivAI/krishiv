@@ -47,7 +47,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
     // Apply profile-driven backend defaults when explicit flags were not given.
     // The profile acts as a policy; explicit flags always win.
     let shuffle_dir = apply_shuffle_default(config.shuffle_dir.clone(), durability_profile)?;
-    let state_dir  = apply_state_default(config.state_dir.clone(), durability_profile)?;
+    let state_dir = apply_state_default(config.state_dir.clone(), durability_profile)?;
     let checkpoint_uri = config.checkpoint_uri.clone();
     let slots = config.slots;
     let mut runtime = ExecutorRuntime::new(config.into_executor_config()?);
@@ -675,20 +675,23 @@ impl ExecutorCliConfig {
                 }
                 "--state-dir" => {
                     let value = next_arg(&mut args, "--state-dir")?;
-                    config.state_dir = if value.is_empty() { None } else {
+                    config.state_dir = if value.is_empty() {
+                        None
+                    } else {
                         Some(std::path::PathBuf::from(value))
                     };
                 }
                 "--durability-profile" => {
                     let value = next_arg(&mut args, "--durability-profile")?;
-                    config.durability_profile = value.parse().map_err(|_| {
-                        crate::ExecutorError::LocalExecution {
-                            message: format!(
-                                "unknown --durability-profile '{value}'; supported: dev-local, \
+                    config.durability_profile =
+                        value
+                            .parse()
+                            .map_err(|_| crate::ExecutorError::LocalExecution {
+                                message: format!(
+                                    "unknown --durability-profile '{value}'; supported: dev-local, \
                                  single-node-durable, distributed-durable"
-                            ),
-                        }
-                    })?;
+                                ),
+                            })?;
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => {
@@ -800,7 +803,7 @@ fn apply_shuffle_default(
             Err(crate::ExecutorError::LocalExecution {
                 message: String::from(
                     "durability-profile=distributed-durable requires --shuffle-dir \
-                     (set KRISHIV_SHUFFLE_DIR or pass --shuffle-dir <path>)"
+                     (set KRISHIV_SHUFFLE_DIR or pass --shuffle-dir <path>)",
                 ),
             })
         }
@@ -833,7 +836,7 @@ fn apply_state_default(
             Err(crate::ExecutorError::LocalExecution {
                 message: String::from(
                     "durability-profile=distributed-durable requires --state-dir \
-                     (set KRISHIV_STATE_DIR or pass --state-dir <path>)"
+                     (set KRISHIV_STATE_DIR or pass --state-dir <path>)",
                 ),
             })
         }

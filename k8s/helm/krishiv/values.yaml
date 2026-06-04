@@ -37,6 +37,9 @@ executor:
 coordinatorAuth:
   secretName: "krishiv-coordinator-auth"
   secretKey: "token"
+  rotationSecretKey: "tokens"
+  mountPath: "/var/run/krishiv/coordinator-auth"
+  reloadIntervalSeconds: 30
 
 executorTaskAuth:
   secretName: "krishiv-executor-task-auth"

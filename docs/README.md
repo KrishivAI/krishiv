@@ -104,6 +104,13 @@ Distributed:
 - Production coordinator and executor task-control gRPC require bearer-token
   auth via `KRISHIV_COORDINATOR_BEARER_TOKEN` and
   `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN`; anonymous gRPC is for dev-local only.
+- Coordinators may accept a startup-time rotation window of comma/newline
+  separated server tokens via `KRISHIV_COORDINATOR_BEARER_TOKENS`; clients still
+  send the active `KRISHIV_COORDINATOR_BEARER_TOKEN`.
+- Long-lived coordinator servers can also reload mounted token files using
+  `KRISHIV_COORDINATOR_BEARER_TOKEN_FILE`,
+  `KRISHIV_COORDINATOR_BEARER_TOKENS_FILE`, and a positive
+  `KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS`.
 - Kubernetes manifests and CRDs live in `k8s/`.
 - Bare-metal/VM operation is process-managed: run coordinator and executors
   directly and point clients at the configured endpoints.

@@ -6,11 +6,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = SessionBuilder::new().build()?;
 
     // 1. Register a parquet table as a streaming source
+    let data_path = std::env::var("KRISHIV_TPCH_DATA_DIR")
+        .map(|dir| format!("{dir}/stream_data.parquet"))
+        .unwrap_or_else(|_| "/home/code/krishiv/tpch_sf10/stream_data.parquet".to_string());
     session
-        .register_parquet_stream(
-            "stream_data",
-            std::path::Path::new("/home/code/krishiv/tpch_sf10/stream_data.parquet"),
-        )
+        .register_parquet_stream("stream_data", std::path::Path::new(&data_path))
         .unwrap();
 
     let is_streaming = session

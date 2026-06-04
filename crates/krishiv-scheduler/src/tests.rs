@@ -19,11 +19,11 @@ mod scheduler_tests {
     use crate::{
         AdaptiveDecisionKind, AdaptiveOverrideConfig, CheckpointCoordinator,
         CheckpointCoordinatorState, ConfigFileQueueManager, Coordinator, CoordinatorConfig,
-        CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, 
-        InMemoryQueueManager, InProcessCoordinatorBridge,  LeaderElection,
-        MetadataStore, NamespaceQuotaSnapshot, QueueManager, QuotaPolicy, QuotaQueueManager,
-        SchedulerError, SharedCoordinator, SingleNodeElection, StaticScheduler, SubmitOutcome,
-        TaskUpdateOutcome, job_spec_from_logical_plan, job_spec_from_physical_plan,
+        CoordinatorExecutorTonicService, EventLogEvent, ExecutorRegistry, InMemoryQueueManager,
+        InProcessCoordinatorBridge, LeaderElection, MetadataStore, NamespaceQuotaSnapshot,
+        QueueManager, QuotaPolicy, QuotaQueueManager, SchedulerError, SharedCoordinator,
+        SingleNodeElection, StaticScheduler, SubmitOutcome, TaskUpdateOutcome,
+        job_spec_from_logical_plan, job_spec_from_physical_plan,
         serve_coordinator_executor_grpc_with_listener,
     };
 
@@ -1072,6 +1072,48 @@ mod scheduler_tests {
         assert_eq!(duplicate.disposition(), TransportDisposition::Duplicate);
     }
 
+    #[tokio::test]
+    async fn in_process_bridge_reports_duplicate_task_status() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-1").unwrap());
+        let job = demo_job();
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+        let ids = TaskAttemptRef::new(job_id.clone(), stage_id, task_id, AttemptId::initial());
+
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+        let bridge = in_process_bridge_for(coordinator);
+
+        let accepted = bridge
+            .task_status(tonic::Request::new(TaskStatusRequest::new(
+                ids.clone(),
+                executor_id.clone(),
+                LeaseGeneration::initial(),
+                TaskState::Running,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        let duplicate = bridge
+            .task_status(tonic::Request::new(TaskStatusRequest::new(
+                ids,
+                executor_id,
+                LeaseGeneration::initial(),
+                TaskState::Running,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(accepted.disposition(), TransportDisposition::Accepted);
+        assert_eq!(duplicate.disposition(), TransportDisposition::Duplicate);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_reports_stale_task_attempt_as_domain_response() {
         allow_anonymous_for_tests();
@@ -1190,6 +1232,46 @@ mod scheduler_tests {
                 .unwrap()
                 .succeeded_task_count(),
             1
+        );
+    }
+
+    #[test]
+    fn duplicate_failed_task_status_does_not_replay_circuit_breaker_side_effects() {
+        let executor_id = ExecutorId::try_new("exec-1").unwrap();
+        let config = CoordinatorConfig::new(0, 2);
+        let failure_threshold = config.circuit_breaker_failure_threshold();
+        let mut coordinator =
+            Coordinator::active_with_config(CoordinatorId::try_new("coord-1").unwrap(), config);
+        let job = single_task_job(JobId::try_new("job-duplicate-failure").unwrap());
+        let job_id = job.job_id().clone();
+        let stage_id = job.stages()[0].stage_id().clone();
+        let task_id = job.stages()[0].tasks()[0].task_id().clone();
+
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+        coordinator.submit_job(job).unwrap();
+        coordinator.launch_assigned_tasks(&job_id).unwrap();
+
+        let update =
+            TaskStatusUpdate::new(job_id, stage_id, task_id, executor_id, TaskState::Failed, 1);
+        assert_eq!(
+            coordinator.apply_task_update(update.clone()).unwrap(),
+            TaskUpdateOutcome::Applied
+        );
+        for _ in 1..failure_threshold {
+            assert_eq!(
+                coordinator.apply_task_update(update.clone()).unwrap(),
+                TaskUpdateOutcome::Duplicate
+            );
+        }
+
+        assert!(
+            coordinator
+                .executors
+                .executors_over_failure_threshold(failure_threshold)
+                .is_empty(),
+            "duplicate failed task reports must not advance executor circuit-breaker counters"
         );
     }
 
@@ -2235,8 +2317,8 @@ mod scheduler_tests {
         let store = crate::store::InMemoryMetadataStore::default();
         let store_arc = std::sync::Arc::new(std::sync::Mutex::new(store));
 
-        let mut coordinator =
-            Coordinator::active(coord_id).with_store(crate::store::InMemoryMetadataStore::default());
+        let mut coordinator = Coordinator::active(coord_id)
+            .with_store(crate::store::InMemoryMetadataStore::default());
         // Attach our observable arc separately via explicit field — use with_store builder path.
         // We use a fresh store here and verify via the coordinator's write-through.
         coordinator
@@ -2263,8 +2345,8 @@ mod scheduler_tests {
         let coord_id = CoordinatorId::try_new("coord-ms2").unwrap();
         let job_id = JobId::try_new("job-ms2").unwrap();
 
-        let mut coordinator =
-            Coordinator::active(coord_id).with_store(crate::store::InMemoryMetadataStore::default());
+        let mut coordinator = Coordinator::active(coord_id)
+            .with_store(crate::store::InMemoryMetadataStore::default());
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
         let lease = coordinator
             .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
@@ -2381,7 +2463,6 @@ mod scheduler_tests {
         assert_eq!(snapshot.task_count(), 1);
         assert_eq!(snapshot.assigned_task_count(), 1);
     }
-
 
     // --- Slice 3: Executor crash detection + task reassignment ---
 

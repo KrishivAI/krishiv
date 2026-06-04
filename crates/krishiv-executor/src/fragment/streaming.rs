@@ -223,14 +223,11 @@ fn execute_loop_fragment(
             // Use durable state dir when the runner is configured for
             // single-node-durable or distributed-durable profiles.
             let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
-            let exec = ContinuousWindowExecutor::new_with_state_dir(
-                plan_spec,
-                job_state_dir.as_deref(),
-            ).map_err(|e| {
-                ExecutorError::InvalidAssignment {
+            let exec =
+                ContinuousWindowExecutor::new_with_state_dir(plan_spec, job_state_dir.as_deref())
+                    .map_err(|e| ExecutorError::InvalidAssignment {
                     message: format!("stream:loop failed to create window executor: {e}"),
-                }
-            })?;
+                })?;
             Ok::<_, ExecutorError>(Arc::new(Mutex::new(exec)))
         })?;
     let executor_arc = executor_entry.value().clone();

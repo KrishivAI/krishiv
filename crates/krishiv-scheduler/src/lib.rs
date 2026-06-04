@@ -51,9 +51,14 @@ pub use admission::{
     ConfigFileQueueManager, InMemoryQueueManager, QueueManager, QuotaPolicy, QuotaQueueManager,
 };
 pub use auth::{
-    AuthContext, COORDINATOR_BEARER_TOKEN_ENV, configure_grpc_auth_provider_from_env,
-    configured_coordinator_bearer_token, extract_auth_context, set_allow_anonymous,
-    set_grpc_auth_provider, validate_grpc_auth,
+    AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,
+    COORDINATOR_BEARER_TOKEN_FILE_ENV, COORDINATOR_BEARER_TOKENS_ENV,
+    COORDINATOR_BEARER_TOKENS_FILE_ENV, configure_grpc_auth_provider_from_env,
+    configured_coordinator_bearer_token, configured_coordinator_bearer_tokens,
+    coordinator_bearer_auth_configured, extract_auth_context, reload_grpc_auth_provider_from_env,
+    set_allow_anonymous, set_grpc_auth_provider, spawn_grpc_auth_reload_task_from_env,
+    try_configured_coordinator_bearer_tokens, validate_grpc_admin, validate_grpc_auth,
+    validate_grpc_auth_for_role, validate_grpc_writer,
 };
 pub use barrier_dispatch::{BarrierDispatchPlan, drive_barrier_dispatches};
 pub use barrier_tracker::CheckpointBarrierTracker;
@@ -79,8 +84,6 @@ pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
 pub use etcd_metadata::EtcdMetadataStore;
 #[cfg(feature = "redb")]
 mod redb_metadata;
-#[cfg(feature = "redb")]
-pub use redb_metadata::RedbMetadataStore;
 pub use grpc::{
     CoordinatorExecutorGrpcService, CoordinatorExecutorTonicService,
     CoordinatorManagementGrpcService, coordinator_executor_grpc_server,
@@ -101,10 +104,9 @@ pub use job::{
 pub use job_coordinator::JobCoordinator;
 pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
-pub use store::{
-    EventLogEvent, InMemoryMetadataStore, MetadataStore,
-    NonBlockingStoreHandle,
-};
+#[cfg(feature = "redb")]
+pub use redb_metadata::RedbMetadataStore;
+pub use store::{EventLogEvent, InMemoryMetadataStore, MetadataStore, NonBlockingStoreHandle};
 pub use transport::CoordinatorExecutorTransport;
 
 #[cfg(test)]

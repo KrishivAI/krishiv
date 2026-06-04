@@ -18,12 +18,11 @@ use krishiv_shuffle::{LocalDiskShuffleStore, ShuffleStore as _};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
-use crate::{
-    ClusterControlPlane, Coordinator, LeaderElection,
-    SharedCoordinator, SingleNodeLeader, scheduler_metrics,
-    serve_coordinator_executor_grpc_with_listener,
-};
 use crate::InMemoryMetadataStore;
+use crate::{
+    ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
+    scheduler_metrics, serve_coordinator_executor_grpc_with_listener,
+};
 
 #[cfg(feature = "redb")]
 use crate::RedbMetadataStore;
@@ -33,6 +32,7 @@ use crate::{EtcdLeaseElection, EtcdMetadataStore};
 
 const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
 const COORDINATOR_BEARER_TOKEN_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKEN_ENV;
+const COORDINATOR_BEARER_TOKENS_ENV: &str = crate::auth::COORDINATOR_BEARER_TOKENS_ENV;
 
 /// CLI configuration for coordinator-family binaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,10 @@ pub fn build_shared_coordinator_sync(
 ) -> Result<SharedCoordinator, Box<dyn Error>> {
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
         .map_err(|error| format!("invalid coordinator id: {error}"))?;
+    // `mut` is required when the `redb` or `etcd` features are enabled so the
+    // `recover_from_store` arm can take `&mut self`; in the default in-memory
+    // build the binding is read-only.
+    #[allow(unused_mut)]
     let mut coord = Coordinator::active(coordinator_id);
     let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {
         (Some("memory"), _) | (None, None) => {
@@ -164,7 +168,8 @@ pub fn build_shared_coordinator_sync(
                  --metadata-backend redb (requires --features redb). \
                  For distributed HA use: --metadata-backend etcd (requires --features etcd).",
                 path = path.display(),
-            ).into());
+            )
+            .into());
         }
         (Some(unknown), _) => {
             return Err(format!(
@@ -723,13 +728,13 @@ fn validate_durability_profile_config(
                     return Err(format!(
                         "single-node-durable requires --metadata-backend redb \
                          (--features redb); got '{other}'"
-                    ).into());
+                    )
+                    .into());
                 }
                 None => {
-                    return Err(
-                        "single-node-durable requires --metadata-backend redb \
-                         (--features redb) and --metadata-path <path>".into()
-                    );
+                    return Err("single-node-durable requires --metadata-backend redb \
+                         (--features redb) and --metadata-path <path>"
+                        .into());
                 }
             }
             if config.metadata_path.is_none() {
@@ -772,7 +777,8 @@ fn validate_runtime_security_config(
         }
         if !coordinator_bearer_token_configured {
             return Err(format!(
-                "distributed-durable requires non-empty {COORDINATOR_BEARER_TOKEN_ENV} so coordinator gRPC is authenticated"
+                "distributed-durable requires non-empty {COORDINATOR_BEARER_TOKEN_ENV} \
+                 or {COORDINATOR_BEARER_TOKENS_ENV} so coordinator gRPC is authenticated"
             )
             .into());
         }
@@ -794,14 +800,15 @@ fn executor_task_bearer_token_configured() -> bool {
 }
 
 fn coordinator_bearer_token_configured() -> bool {
-    crate::auth::configured_coordinator_bearer_token().is_some()
+    crate::auth::coordinator_bearer_auth_configured()
 }
 
-fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) {
+fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bool {
     if config.insecure {
         crate::auth::set_allow_anonymous();
+        false
     } else {
-        crate::auth::configure_grpc_auth_provider_from_env();
+        crate::auth::configure_grpc_auth_provider_from_env()
     }
 }
 
@@ -843,8 +850,8 @@ pub fn coordinator_daemon_help() -> &'static str {
        --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (optional)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
-       --metadata-backend <TYPE>   memory | json | redb | etcd\n\
-       --metadata-path <PATH>      Durable metadata path (required for json/redb)\n\
+       --metadata-backend <TYPE>   memory | redb | etcd\n\
+       --metadata-path <PATH>      Durable metadata path (required for redb)\n\
        --leader-backend <TYPE>     single (default) | etcd (clusterd HA; feature etcd)\n\
        --etcd-endpoints <HOSTS>    Comma-separated etcd URLs (KRISHIV_ETCD_ENDPOINTS)\n\
         --etcd-lease-key <KEY>      Leader key (default /krishiv/ccp/leader)\n\
@@ -857,12 +864,17 @@ pub fn coordinator_daemon_help() -> &'static str {
 pub async fn run_standalone_coordinator(
     config: CoordinatorDaemonConfig,
 ) -> Result<(), Box<dyn Error>> {
-    configure_coordinator_grpc_auth(&config);
+    let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
     validate_runtime_security_config(
         &config,
         executor_task_bearer_token_configured(),
         coordinator_bearer_token_configured(),
     )?;
+    let _auth_reload_task = if grpc_auth_configured {
+        crate::auth::spawn_grpc_auth_reload_task_from_env()
+    } else {
+        None
+    };
     let coordinator = build_shared_coordinator(&config)?;
     spawn_coordinator_sidecars(&coordinator, &config).await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
@@ -906,12 +918,17 @@ pub async fn run_standalone_coordinator(
 
 /// Cluster control plane daemon (`krishiv-clusterd`).
 pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
-    configure_coordinator_grpc_auth(&config);
+    let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
     validate_runtime_security_config(
         &config,
         executor_task_bearer_token_configured(),
         coordinator_bearer_token_configured(),
     )?;
+    let _auth_reload_task = if grpc_auth_configured {
+        crate::auth::spawn_grpc_auth_reload_task_from_env()
+    } else {
+        None
+    };
     let shared = build_shared_coordinator(&config)?;
     let leader = build_leader_election(&config).await?;
     let coordinator_id = CoordinatorId::try_new(&config.coordinator_id)
@@ -1109,9 +1126,9 @@ mod parse_tests {
         coordinator_daemon_help, parse_coordinator_daemon_config, render_metrics_body,
         validate_runtime_security_config,
     };
-    use crate::{Coordinator, SharedCoordinator};
     #[cfg(feature = "redb")]
     use crate::RedbMetadataStore;
+    use crate::{Coordinator, SharedCoordinator};
     use krishiv_common::durability::DurabilityProfile;
     use krishiv_proto::CoordinatorId;
 
@@ -1327,7 +1344,8 @@ mod parse_tests {
     fn daemon_help_lists_redb_metadata_backend() {
         let help = coordinator_daemon_help();
 
-        assert!(help.contains("memory | json | redb | etcd"));
+        assert!(help.contains("memory | redb | etcd"));
+        assert!(!help.contains("memory | json | redb | etcd"));
         assert!(!help.contains("sqlite | etcd"));
     }
 

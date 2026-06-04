@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/krishiv",
+    "crates/krishiv-ai",
     "crates/krishiv-api",
     "crates/krishiv-catalog",
     "crates/krishiv-common",
@@ -14,6 +15,7 @@ members = [
     "crates/krishiv-operator",
     "crates/krishiv-runtime",
     "crates/krishiv-scheduler",
+    "crates/krishiv-schema-registry",
     "crates/krishiv-shuffle",
     "crates/krishiv-sql",
     "crates/krishiv-state",
@@ -31,6 +33,7 @@ members = [
 ]
 default-members = [
     "crates/krishiv",
+    "crates/krishiv-ai",
     "crates/krishiv-api",
     "crates/krishiv-common",
     "crates/krishiv-catalog",
@@ -44,6 +47,7 @@ default-members = [
     "crates/krishiv-operator",
     "crates/krishiv-runtime",
     "crates/krishiv-scheduler",
+    "crates/krishiv-schema-registry",
     "crates/krishiv-shuffle",
     "crates/krishiv-sql",
     "crates/krishiv-state",

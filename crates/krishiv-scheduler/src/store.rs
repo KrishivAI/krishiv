@@ -59,7 +59,6 @@ pub enum EventLogEvent {
     JobCancelled { job_id: JobId },
 }
 
-
 pub trait MetadataStore: Send + Sync {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()>;
     fn events(&self) -> &[EventLogEvent];
@@ -95,7 +94,9 @@ impl MetadataStore for InMemoryMetadataStore {
         self.events.push(event);
         Ok(())
     }
-    fn events(&self) -> &[EventLogEvent] { &self.events }
+    fn events(&self) -> &[EventLogEvent] {
+        &self.events
+    }
     fn save_job(&mut self, record: &JobRecord) -> SchedulerResult<()> {
         if let Some(e) = self.jobs.iter_mut().find(|j| j.job_id() == record.job_id()) {
             *e = record.clone();
@@ -104,7 +105,9 @@ impl MetadataStore for InMemoryMetadataStore {
         }
         Ok(())
     }
-    fn jobs(&self) -> &[JobRecord] { &self.jobs }
+    fn jobs(&self) -> &[JobRecord] {
+        &self.jobs
+    }
     fn save_executor(&mut self, descriptor: &ExecutorDescriptor) -> SchedulerResult<()> {
         let id = descriptor.executor_id();
         if let Some(e) = self.executors.iter_mut().find(|d| d.executor_id() == id) {
@@ -114,7 +117,9 @@ impl MetadataStore for InMemoryMetadataStore {
         }
         Ok(())
     }
-    fn executors(&self) -> Vec<ExecutorDescriptor> { self.executors.clone() }
+    fn executors(&self) -> Vec<ExecutorDescriptor> {
+        self.executors.clone()
+    }
     fn remove_executor(&mut self, executor_id: &ExecutorId) -> SchedulerResult<()> {
         self.executors.retain(|d| d.executor_id() != executor_id);
         Ok(())
@@ -122,7 +127,6 @@ impl MetadataStore for InMemoryMetadataStore {
 }
 
 const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedExecutorDescriptor {
@@ -846,7 +850,10 @@ pub(crate) fn encode_metadata_snapshot_with_executors(
         store_kind: String::from("krishiv.scheduler.metadata"),
         events: events.iter().map(PersistedEvent::from).collect(),
         jobs: jobs.iter().map(PersistedJobRecord::from).collect(),
-        executor_descriptors: executors.iter().map(PersistedExecutorDescriptor::from).collect(),
+        executor_descriptors: executors
+            .iter()
+            .map(PersistedExecutorDescriptor::from)
+            .collect(),
     };
     serde_json::to_vec_pretty(&persisted).map_err(|error| SchedulerError::Transport {
         message: format!("failed to encode metadata snapshot: {error}"),
@@ -1063,7 +1070,11 @@ pub(crate) fn decode_metadata_snapshot(
 /// Like [`decode_metadata_snapshot`] but also restores executor descriptors (R10).
 pub(crate) fn decode_metadata_snapshot_with_executors(
     bytes: &[u8],
-) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>, Vec<krishiv_proto::ExecutorDescriptor>)> {
+) -> SchedulerResult<(
+    Vec<EventLogEvent>,
+    Vec<JobRecord>,
+    Vec<krishiv_proto::ExecutorDescriptor>,
+)> {
     if bytes.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     }

@@ -149,6 +149,26 @@ impl SqlPlan {
 /// object-store connector layer.
 /// Maximum number of query plans stored in the plan cache before random eviction.
 const PLAN_CACHE_MAX_ENTRIES: usize = 256;
+const STREAMING_CEP_MAX_ROWS_DEFAULT: usize = 100_000;
+
+/// Resolve the streaming MATCH_RECOGNIZE row cap from a raw env var value.
+/// `None` and unparseable values fall back to the documented default of
+/// 100_000. Zero is rejected because it would mean "scan zero rows".
+pub fn resolve_streaming_match_recognize_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(STREAMING_CEP_MAX_ROWS_DEFAULT)
+}
+
+/// Resolve the streaming MATCH_RECOGNIZE row cap from the
+/// `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT` environment variable.
+pub fn streaming_match_recognize_limit_from_env() -> usize {
+    resolve_streaming_match_recognize_limit(
+        std::env::var("KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Build the DataFusion session config.
 ///
@@ -920,20 +940,35 @@ impl SqlEngine {
             if let Some(stmt) = cep_sql::parse_match_recognize(query)? {
                 let is_streaming = self.is_streaming_source(&stmt.source_table);
                 // For streaming sources collect a bounded window of recent events
-                // (capped at STREAMING_CEP_MAX_ROWS) so the query terminates.
-                // Use execute_match_recognize — it now works for both bounded and
-                // streaming inputs once the rows are collected.
-                const STREAMING_CEP_MAX_ROWS: usize = 100_000;
+                // (capped at the configured limit) so the query terminates. The
+                // cap is configurable through `KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT`
+                // (default 100_000) so users can raise it for high-rate streams
+                // or lower it to bound memory on small executors. The truncation
+                // is logged at warn level because the result is no longer a
+                // complete match over the unbounded stream.
+                let streaming_limit = streaming_match_recognize_limit_from_env();
                 let source_sql = if is_streaming {
                     format!(
                         "SELECT * FROM {} LIMIT {}",
-                        stmt.source_table, STREAMING_CEP_MAX_ROWS
+                        stmt.source_table, streaming_limit
                     )
                 } else {
                     format!("SELECT * FROM {}", stmt.source_table)
                 };
                 let source_df = self.context.sql(&source_sql).await?;
                 let source_batches = source_df.collect().await?;
+                if is_streaming {
+                    tracing::warn!(
+                        source = %stmt.source_table,
+                        limit = streaming_limit,
+                        collected_rows = source_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                        "MATCH_RECOGNIZE executed against a streaming source under \
+                         bounded materialisation; results only cover the first {0} rows \
+                         of the source. Set KRISHIV_MATCH_RECOGNIZE_STREAMING_LIMIT to a \
+                         larger value if your executor has the memory budget.",
+                        streaming_limit
+                    );
+                }
                 let results = cep_sql::execute_match_recognize(stmt, &source_batches, false)?;
                 lakehouse::register_scan_batches(&self.context, "_krishiv_cep_result", results)
                     .await?;
@@ -1940,6 +1975,40 @@ mod udtf_ddl_tests {
             !engine.plan_cache.lock().unwrap().is_empty(),
             "cache must refill after re-query"
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_match_recognize_limit_tests {
+    use crate::resolve_streaming_match_recognize_limit;
+
+    #[test]
+    fn default_when_unset() {
+        assert_eq!(resolve_streaming_match_recognize_limit(None), 100_000);
+    }
+
+    #[test]
+    fn default_when_empty() {
+        assert_eq!(resolve_streaming_match_recognize_limit(Some("")), 100_000);
+    }
+
+    #[test]
+    fn parses_valid_value() {
+        assert_eq!(resolve_streaming_match_recognize_limit(Some("42")), 42);
+    }
+
+    #[test]
+    fn falls_back_on_unparseable() {
+        assert_eq!(
+            resolve_streaming_match_recognize_limit(Some("not-a-number")),
+            100_000
+        );
+    }
+
+    #[test]
+    fn rejects_zero() {
+        // 0 would mean "scan zero rows" which is meaningless.
+        assert_eq!(resolve_streaming_match_recognize_limit(Some("0")), 100_000);
     }
 }
 pub mod kafka_table;

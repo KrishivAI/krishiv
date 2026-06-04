@@ -421,7 +421,7 @@ impl JobRecord {
         }
 
         // If the task succeeded with shuffle output, record partition availability.
-        if !shuffle_partitions.is_empty() {
+        if outcome != TaskUpdateOutcome::Duplicate && !shuffle_partitions.is_empty() {
             let meta = self.shuffle_output.entry(stage_id.clone()).or_default();
             for p in &shuffle_partitions {
                 let path = ShufflePath {

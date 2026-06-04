@@ -1,6 +1,15 @@
 use super::*;
 
 impl Coordinator {
+    #[tracing::instrument(
+        level = "info",
+        skip(self, spec),
+        fields(
+            job_id = %spec.job_id(),
+            namespace = spec.namespace_id().as_deref().unwrap_or("default"),
+            job_kind = ?spec.kind(),
+        )
+    )]
     pub fn submit_job(&mut self, spec: JobSpec) -> SchedulerResult<SubmitOutcome> {
         self.ensure_active()?;
         validate_job(&spec)?;
@@ -124,6 +133,7 @@ impl Coordinator {
     }
 
     /// Cancel a job and mark non-terminal stages/tasks cancelled.
+    #[tracing::instrument(level = "info", skip(self), fields(job_id = %job_id))]
     pub fn cancel_job(&mut self, job_id: &JobId) -> SchedulerResult<()> {
         self.ensure_active()?;
         let (job_name, namespace) = {
@@ -206,6 +216,19 @@ impl Coordinator {
         let terminal_state = update.state();
         let executor_id_for_circuit = update.executor_id().clone();
         let outcome = self.find_job_mut(&job_id)?.apply_task_update(update)?;
+
+        if outcome == TaskUpdateOutcome::Duplicate {
+            tracing::debug!(
+                job_id = %job_id,
+                stage_id = %stage_id,
+                task_id = %task_id,
+                attempt,
+                state = ?terminal_state,
+                executor = %executor_id_for_circuit,
+                "duplicate task status update ignored without replaying side effects"
+            );
+            return Ok(outcome);
+        }
 
         // IMM-2 (Circuit Breaker Strengthening):
         // Record failure and, if the executor is now bad, clear the assignment

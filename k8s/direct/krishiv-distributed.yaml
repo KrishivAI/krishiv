@@ -12,6 +12,8 @@
 #   - Namespace krishiv-system must exist
 #   - Container image localhost/krishiv:local must be imported into k3s containerd
 #   - Secret krishiv-system/krishiv-coordinator-auth with key `token` must exist
+#     (optional key `tokens` may hold comma/newline separated rotation tokens;
+#      coordinator pods reload the mounted Secret every 30 seconds)
 #   - Secret krishiv-system/krishiv-executor-task-auth with key `token` must exist
 #   - For multi-node: replace hostPath /tmp with a PVC or object-store data path
 
@@ -164,12 +166,27 @@ spec:
                 secretKeyRef:
                   name: krishiv-coordinator-auth
                   key: token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: tokens
+                  optional: true
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN_FILE
+              value: /var/run/krishiv/coordinator-auth/token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS_FILE
+              value: /var/run/krishiv/coordinator-auth/tokens
+            - name: KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS
+              value: "30"
             - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: krishiv-executor-task-auth
                   key: token
           volumeMounts:
+            - name: coordinator-auth
+              mountPath: /var/run/krishiv/coordinator-auth
+              readOnly: true
             - name: data
               mountPath: /data
           resources:
@@ -194,6 +211,9 @@ spec:
             periodSeconds: 15
             failureThreshold: 3
       volumes:
+        - name: coordinator-auth
+          secret:
+            secretName: krishiv-coordinator-auth
         - name: data
           persistentVolumeClaim:
             claimName: krishiv-coordinator-data

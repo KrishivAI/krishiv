@@ -2,6 +2,11 @@ use super::*;
 
 impl Coordinator {
     /// Register an executor with the active coordinator.
+    #[tracing::instrument(
+        level = "info",
+        skip(self, descriptor),
+        fields(executor_id = %descriptor.executor_id(), host = %descriptor.host(), slots = descriptor.slots())
+    )]
     pub fn register_executor(
         &mut self,
         descriptor: ExecutorDescriptor,

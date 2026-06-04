@@ -17,10 +17,12 @@ fn open_state_backend(
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
         Some(dir) => {
             let path = dir.join(tag);
-            std::fs::create_dir_all(&path)
-                .map_err(|e| ExecError::InvalidWindowConfig(
-                    format!("failed to create state dir '{}': {e}", path.display())
-                ))?;
+            std::fs::create_dir_all(&path).map_err(|e| {
+                ExecError::InvalidWindowConfig(format!(
+                    "failed to create state dir '{}': {e}",
+                    path.display()
+                ))
+            })?;
             FjallStateBackend::open(&path)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?
         }

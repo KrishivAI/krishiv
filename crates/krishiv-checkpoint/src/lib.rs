@@ -1148,8 +1148,16 @@ impl std::ops::DerefMut for EphemeralCheckpointStorage {
 
 impl Drop for EphemeralCheckpointStorage {
     fn drop(&mut self) {
-        // Best-effort cleanup; ignore errors (e.g. already removed).
-        let _ = std::fs::remove_dir_all(&self.path);
+        // Best-effort cleanup; ignore errors (e.g. already removed) but log
+        // unexpected failures so a half-cleaned test scratch dir is visible
+        // to the operator instead of silently leaking.
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            tracing::debug!(
+                path = %self.path.display(),
+                error = %error,
+                "ephemeral checkpoint storage cleanup failed (best-effort)",
+            );
+        }
     }
 }
 

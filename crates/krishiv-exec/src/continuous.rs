@@ -82,10 +82,12 @@ fn open_state_backend(
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
         Some(dir) => {
             let path = dir.join(tag);
-            std::fs::create_dir_all(&path)
-                .map_err(|e| ExecError::InvalidWindowConfig(
-                    format!("failed to create state dir '{}': {e}", path.display())
-                ))?;
+            std::fs::create_dir_all(&path).map_err(|e| {
+                ExecError::InvalidWindowConfig(format!(
+                    "failed to create state dir '{}': {e}",
+                    path.display()
+                ))
+            })?;
             FjallStateBackend::open(&path)
                 .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?
         }
@@ -112,7 +114,10 @@ fn build_operator(
             };
             let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let op = StateBackedTumblingWindowOperator::new(
-                tw_spec, state, "continuous-window", "tumbling",
+                tw_spec,
+                state,
+                "continuous-window",
+                "tumbling",
             )
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Tumbling(Box::new(op)))
@@ -128,7 +133,10 @@ fn build_operator(
             };
             let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let op = StateBackedSlidingWindowOperator::new(
-                sw_spec, state, "continuous-window", "sliding",
+                sw_spec,
+                state,
+                "continuous-window",
+                "sliding",
             )
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Sliding(Box::new(op)))
@@ -143,7 +151,10 @@ fn build_operator(
             };
             let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let op = StateBackedSessionWindowOperator::new(
-                sess_spec, state, "continuous-window", "session",
+                sess_spec,
+                state,
+                "continuous-window",
+                "session",
             )
             .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             Ok(WindowOperatorState::Session(Box::new(op)))

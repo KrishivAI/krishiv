@@ -27,7 +27,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         print!("{}", OperatorCliConfig::help());
         return Ok(());
     }
-    configure_grpc_auth_for_startup(config.executor_grpc_addr.is_some())?;
+    let grpc_auth_configured =
+        configure_grpc_auth_for_startup(config.executor_grpc_addr.is_some())?;
+    let _auth_reload_task = if grpc_auth_configured {
+        krishiv_scheduler::spawn_grpc_auth_reload_task_from_env()
+    } else {
+        None
+    };
 
     let controller_config = config.clone().into_controller_config()?;
     let runtime = KubernetesControllerRuntime::new(&controller_config)?;
@@ -68,25 +74,26 @@ fn install_rustls_crypto_provider() {
 }
 
 #[cfg(feature = "k8s")]
-fn configure_grpc_auth_for_startup(exposes_coordinator_grpc: bool) -> Result<(), Box<dyn Error>> {
+fn configure_grpc_auth_for_startup(exposes_coordinator_grpc: bool) -> Result<bool, Box<dyn Error>> {
     if std::env::var("KRISHIV_ALLOW_ANONYMOUS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
         krishiv_scheduler::set_allow_anonymous();
-        return Ok(());
+        return Ok(false);
     }
     if krishiv_scheduler::configure_grpc_auth_provider_from_env() {
-        return Ok(());
+        return Ok(true);
     }
     if exposes_coordinator_grpc {
         return Err(format!(
-            "--executor-grpc-addr requires {} unless KRISHIV_ALLOW_ANONYMOUS=true",
-            krishiv_scheduler::COORDINATOR_BEARER_TOKEN_ENV
+            "--executor-grpc-addr requires {} or {} unless KRISHIV_ALLOW_ANONYMOUS=true",
+            krishiv_scheduler::COORDINATOR_BEARER_TOKEN_ENV,
+            krishiv_scheduler::COORDINATOR_BEARER_TOKENS_ENV
         )
         .into());
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(not(feature = "k8s"))]

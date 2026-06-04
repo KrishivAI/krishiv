@@ -53,15 +53,33 @@ spec:
                 secretKeyRef:
                   name: krishiv-coordinator-auth
                   key: token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: krishiv-coordinator-auth
+                  key: tokens
+                  optional: true
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN_FILE
+              value: /var/run/krishiv/coordinator-auth/token
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS_FILE
+              value: /var/run/krishiv/coordinator-auth/tokens
+            - name: KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS
+              value: "30"
             - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: krishiv-executor-task-auth
                   key: token
           volumeMounts:
+            - name: coordinator-auth
+              mountPath: /var/run/krishiv/coordinator-auth
+              readOnly: true
             - name: tpch-data
               mountPath: /home/code/krishiv/tpch_sf10
       volumes:
+        - name: coordinator-auth
+          secret:
+            secretName: krishiv-coordinator-auth
         - name: tpch-data
           hostPath:
             path: /home/code/krishiv/tpch_sf10

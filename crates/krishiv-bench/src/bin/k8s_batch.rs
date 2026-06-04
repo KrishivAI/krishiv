@@ -4,13 +4,22 @@ use std::time::Instant;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Running Distributed Batch TPC-H Q1 (Rust) ---");
+    let coordinator = std::env::var("KRISHIV_COORDINATOR_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:30051".to_string());
+    let data_path = std::env::var("KRISHIV_TPCH_DATA_DIR")
+        .map(|dir| format!("{dir}/lineitem.parquet"))
+        .unwrap_or_else(|_| "/home/code/krishiv/tpch_sf10/lineitem.parquet".to_string());
     let session = SessionBuilder::new()
-        .with_coordinator("http://127.0.0.1:30051") // Use Flight server address
+        .with_coordinator(&coordinator)
         .with_remote_execution(true)
         .build()?;
 
     // Register table via remote SQL
-    session.execute_remote_async("CREATE EXTERNAL TABLE lineitem STORED AS PARQUET LOCATION '/home/code/krishiv/tpch_sf10/lineitem.parquet'").await?;
+    session
+        .execute_remote_async(&format!(
+            "CREATE EXTERNAL TABLE lineitem STORED AS PARQUET LOCATION '{data_path}'"
+        ))
+        .await?;
 
     let q1 = "
     select

@@ -61,19 +61,31 @@ fn select_local_http_addr(preferred: Option<&str>) -> Result<String, String> {
 fn kill_pid_or_group(pid: u32) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
+        // SIGTERM the whole process group so child executors don't outlive
+        // their parent. A non-zero exit is normal here (e.g. ESRCH if the
+        // process is already gone); only an actual I/O error from `Command`
+        // is worth logging.
+        if let Err(error) = Command::new("kill")
             .arg("-15")
             .arg(format!("-{pid}"))
-            .status();
+            .status()
+        {
+            tracing::warn!(pid, error = %error, "local_cluster: SIGTERM failed");
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = Command::new("kill")
+        if let Err(error) = Command::new("kill")
             .arg("-9")
             .arg(format!("-{pid}"))
-            .status();
+            .status()
+        {
+            tracing::warn!(pid, error = %error, "local_cluster: SIGKILL failed");
+        }
     }
     #[cfg(not(unix))]
     {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
+            tracing::warn!(pid, error = %error, "local_cluster: kill failed");
+        }
     }
 }
 
@@ -351,7 +363,13 @@ fn run_local_stop(args: &[&str]) -> CliResponse {
     if let Some(pid) = config.coordinator_pid {
         kill_pid_or_group(pid);
     }
-    let _ = fs::remove_file(LocalClusterConfig::path(&data_dir));
+    if let Err(error) = fs::remove_file(LocalClusterConfig::path(&data_dir)) {
+        tracing::warn!(
+            path = %LocalClusterConfig::path(&data_dir).display(),
+            error = %error,
+            "local_cluster: failed to remove config file (best-effort)",
+        );
+    }
     CliResponse::ok("Stopped local Krishiv cluster.\n".to_string())
 }
 

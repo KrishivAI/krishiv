@@ -30,7 +30,10 @@
 //!
 //! fn main() -> Result<()> {
 //!     let session = Session::builder().build()?;
-//!     let batch: RecordBatch = todo!("build your Arrow batch");
+//!     // Build the Arrow batch your workflow expects — for example read
+//!     // Parquet from object_store, fan in from a stream, or run a SQL
+//!     // query that returns RecordBatch.
+//!     let batch: RecordBatch = todo!();
 //!     let stream = session
 //!         .memory_stream("events", vec![StreamBatch::new(0, batch)])?
 //!         .key_by("user_id")

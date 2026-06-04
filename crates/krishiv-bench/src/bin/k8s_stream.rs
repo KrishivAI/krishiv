@@ -6,13 +6,18 @@ use std::time::Instant;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- Running Distributed Stream Window (Rust) ---");
+    let coordinator = std::env::var("KRISHIV_COORDINATOR_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:30051".to_string());
+    let data_path = std::env::var("KRISHIV_TPCH_DATA_DIR")
+        .map(|dir| format!("{dir}/stream_data.parquet"))
+        .unwrap_or_else(|_| "/home/code/krishiv/tpch_sf10/stream_data.parquet".to_string());
     let session = SessionBuilder::new()
-        .with_coordinator("http://127.0.0.1:30051") // Use Flight server address
+        .with_coordinator(&coordinator)
         .with_remote_execution(true)
         .build()?;
 
     // Read local stream data and send it!
-    let file = File::open("/home/code/krishiv/tpch_sf10/stream_data.parquet")?;
+    let file = File::open(&data_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mut reader = builder.with_batch_size(50_000).build()?;
 

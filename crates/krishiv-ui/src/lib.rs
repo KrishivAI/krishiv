@@ -12,6 +12,7 @@ use askama::Template;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -84,12 +85,31 @@ impl IntoResponse for UiError {
 }
 
 /// Build the R2 UI router.
+///
+/// `KRISHIV_UI_TOKEN` is consulted at router-construction time. When set, all
+/// `/api/v1/...` and `/ui/...` routes require a matching `Authorization:
+/// Bearer <token>` header. `/healthz`, `/readyz`, `/metrics`, `/assets/*`, and
+/// the root redirect stay anonymous so platform probes keep working without
+/// leaking snapshot data.
 pub fn router(state: UiState) -> Router {
-    Router::new()
-        .route("/", get(|| async { Redirect::temporary("/ui") }))
+    let token = std::env::var("KRISHIV_UI_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    router_with_token(state, token.as_deref())
+}
+
+/// Build the R2 UI router with an explicit auth token. When `Some`, the same
+/// routes as `router()` get wrapped in the bearer-token middleware. When
+/// `None`, the router behaves identically to a `KRISHIV_UI_TOKEN`-unset build.
+pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
+    let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/assets/krishiv.css", get(stylesheet));
+
+    let protected = Router::new()
+        .route("/", get(|| async { Redirect::temporary("/ui") }))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_detail))
         .route(
@@ -100,8 +120,45 @@ pub fn router(state: UiState) -> Router {
         .route("/api/v1/queues", get(api_queues))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
-        .route("/assets/krishiv.css", get(stylesheet))
+        .with_state(state.clone());
+
+    let protected = if let Some(expected) = token {
+        let expected = expected.to_string();
+        protected.layer(middleware::from_fn(move |req, next| {
+            let expected = expected.clone();
+            async move { require_bearer(req, next, &expected).await }
+        }))
+    } else {
+        protected
+    };
+
+    Router::new()
+        .merge(public)
+        .merge(protected)
         .with_state(state)
+}
+
+async fn require_bearer(request: axum::extract::Request, next: Next, expected: &str) -> Response {
+    let auth = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    match auth {
+        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => {
+            let token = &value[7..];
+            if token == expected {
+                next.run(request).await
+            } else {
+                (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response()
+            }
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [("WWW-Authenticate", "Bearer")],
+            "missing bearer token",
+        )
+            .into_response(),
+    }
 }
 
 /// Serve the R2 status API and Web UI with an existing listener.
@@ -684,7 +741,7 @@ mod tests {
     use krishiv_scheduler::{Coordinator, SharedCoordinator};
     use tower::ServiceExt;
 
-    use super::{UiState, demo_state, empty_state, router};
+    use super::{UiState, demo_state, empty_state, router, router_with_token};
     #[tokio::test]
     async fn health_route_reports_ok() {
         let response = router(empty_state().unwrap())
@@ -944,5 +1001,65 @@ mod tests {
             job["resource_usage"]["cpu_nanos"].is_number(),
             "resource_usage.cpu_nanos must be present"
         );
+    }
+
+    // ── KRISHIV_UI_TOKEN middleware tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn api_jobs_requires_bearer_token_when_token_set() {
+        let response = router_with_token(demo_state().unwrap(), Some("s3cret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_jobs_accepts_matching_bearer_token() {
+        let response = router_with_token(demo_state().unwrap(), Some("s3cret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_jobs_rejects_wrong_bearer_token() {
+        let response = router_with_token(demo_state().unwrap(), Some("s3cret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn healthz_stays_anonymous_even_when_token_set() {
+        let response = router_with_token(demo_state().unwrap(), Some("s3cret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

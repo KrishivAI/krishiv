@@ -42,6 +42,18 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.coordinatorAuth.secretName | quote }}
                   key: {{ .Values.coordinatorAuth.secretKey | quote }}
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coordinatorAuth.secretName | quote }}
+                  key: {{ .Values.coordinatorAuth.rotationSecretKey | quote }}
+                  optional: true
+            - name: KRISHIV_COORDINATOR_BEARER_TOKEN_FILE
+              value: {{ printf "%s/token" .Values.coordinatorAuth.mountPath | quote }}
+            - name: KRISHIV_COORDINATOR_BEARER_TOKENS_FILE
+              value: {{ printf "%s/tokens" .Values.coordinatorAuth.mountPath | quote }}
+            - name: KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS
+              value: {{ .Values.coordinatorAuth.reloadIntervalSeconds | quote }}
             - name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -59,6 +71,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+          volumeMounts:
+            - name: coordinator-auth
+              mountPath: {{ .Values.coordinatorAuth.mountPath | quote }}
+              readOnly: true
           resources:
             {{- toYaml .Values.coordinator.resources | nindent 12 }}
           readinessProbe:
@@ -71,3 +87,7 @@ spec:
               port: {{ .Values.coordinator.port }}
             initialDelaySeconds: 15
             periodSeconds: 30
+      volumes:
+        - name: coordinator-auth
+          secret:
+            secretName: {{ .Values.coordinatorAuth.secretName | quote }}

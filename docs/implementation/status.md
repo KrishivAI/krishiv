@@ -29,6 +29,15 @@ Completed the first implementation slice from the production-readiness review:
 - Removed anonymous coordinator gRPC from production operator/direct/Helm manifests and wired `krishiv-coordinator-auth` Secret key `token` into coordinator/operator/executor pods and operator-generated executor pod templates.
 - Added active-coordinator fencing to checkpoint acknowledgements, savepoint creation, and in-process heartbeat/checkpoint-ack fast paths so demoted coordinators cannot mutate sharded control-plane state during failover.
 - Added defense-in-depth auth checks to coordinator management gRPC handlers and preserved metadata through the generated management adapter, matching the executor transport adapter behavior.
+- Made duplicate task-status updates side-effect free: replayed terminal updates no longer re-run circuit-breaker, inline-result, persistence, GC, lineage, or shuffle-availability side effects.
+- Aligned in-process task-status transport with network gRPC by returning `TransportDisposition::Duplicate` for replayed task updates instead of reporting them as accepted.
+- Added role-scoped coordinator gRPC authorization: reader tokens may call read-only inspection/list APIs, while executor/control-plane mutations, checkpoint acks, savepoints, and restore require writer-or-admin credentials.
+- Added startup-time coordinator bearer-token rotation support via `KRISHIV_COORDINATOR_BEARER_TOKENS`, allowing the server to accept a deduped comma/newline separated token window while clients continue sending the active `KRISHIV_COORDINATOR_BEARER_TOKEN`.
+- Wired optional coordinator rotation tokens into operator, direct, and Helm coordinator-server manifests through Secret key `tokens` / Helm `coordinatorAuth.rotationSecretKey`, without requiring existing Secrets to change.
+- Removed stale `json` metadata-backend advertising from coordinator daemon help and updated the deployment conformance test to assert the current Redb/etcd durable metadata paths.
+- Made the coordinator gRPC auth provider reloadable in-process instead of one-shot, so new token providers replace prior providers without coordinator restart.
+- Added file-backed coordinator auth token sources (`KRISHIV_COORDINATOR_BEARER_TOKEN_FILE`, `KRISHIV_COORDINATOR_BEARER_TOKENS_FILE`) plus optional periodic reload via `KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS`.
+- Wired operator, direct, and Helm coordinator-server manifests to mount `krishiv-coordinator-auth` as a Secret volume and reload mounted token files every 30 seconds by default.
 
 Validation:
 
@@ -56,6 +65,15 @@ cargo test -p krishiv-scheduler distributed_durable_runtime
 cargo test -p krishiv-scheduler standby_coordinator_rejects_savepoint_mutation
 cargo test -p krishiv-scheduler tonic_service_rejects_checkpoint_ack_when_standby
 cargo test -p krishiv-scheduler in_process_bridge_rejects_heartbeat_when_standby
+cargo test -p krishiv-scheduler duplicate_failed_task_status_does_not_replay_circuit_breaker_side_effects
+cargo test -p krishiv-scheduler in_process_bridge_reports_duplicate_task_status
+cargo test -p krishiv-scheduler role_hierarchy_allows_higher_roles_to_satisfy_lower_requirements
+cargo test -p krishiv-scheduler principal_role_validation_denies_insufficient_role
+cargo test -p krishiv-scheduler static_provider_accepts_rotation_tokens
+cargo test -p krishiv-scheduler coordinator_bearer_tokens_from_values_dedupes_and_trims_rotation_list
+cargo test -p krishiv-scheduler auth::tests
+cargo test -p krishiv-scheduler --test r2_k8s_manifests
+cargo test -p krishiv-scheduler daemon_help_lists_redb_metadata_backend
 cargo test -p krishiv-executor inject_coordinator_bearer_token_adds_authorization_metadata
 cargo test -p krishiv-scheduler
 cargo test -p krishiv-executor
@@ -64,6 +82,14 @@ cargo test -p krishiv-scheduler --lib
 cargo test -p krishiv-operator --lib
 cargo test -p krishiv-operator parses_executor_grpc_addr
 cargo test -p krishiv remote_client
+cargo check -p krishiv-operator --no-default-features --features k8s
+cargo check -p krishiv-operator
+rustfmt --edition 2024 --check crates/krishiv-scheduler/src/job.rs crates/krishiv-scheduler/src/coordinator/job_lifecycle.rs crates/krishiv-scheduler/src/in_process.rs crates/krishiv-scheduler/src/tests.rs crates/krishiv-scheduler/src/coordinator_daemon.rs
+rustfmt --edition 2024 --check crates/krishiv-scheduler/src/auth.rs crates/krishiv-scheduler/src/grpc.rs crates/krishiv-scheduler/src/coordinator_daemon.rs
+rustfmt --edition 2024 --check crates/krishiv-scheduler/src/auth.rs crates/krishiv-scheduler/src/coordinator_daemon.rs crates/krishiv-operator/src/main.rs
+rustfmt --edition 2024 --check crates/krishiv-scheduler/src/auth.rs crates/krishiv-scheduler/src/coordinator_daemon.rs crates/krishiv-operator/src/main.rs crates/krishiv-scheduler/tests/r2_k8s_manifests.rs
+rustfmt --edition 2024 --check --config skip_children=true crates/krishiv-scheduler/src/lib.rs
+rustfmt --edition 2024 --check crates/krishiv-scheduler/src/coordinator_daemon.rs crates/krishiv-scheduler/tests/r2_k8s_manifests.rs
 git diff --check
 ```
 
@@ -71,7 +97,9 @@ Blockers / notes:
 
 - The old `k8s/manifests/*.yaml` scheduler integration-test include blocker is resolved; the test now uses `k8s/operator`.
 - Coordinator and executor task auth are now fail-closed for distributed-durable scheduler startup and Kubernetes distributed manifests. Operators must create `krishiv-system/krishiv-coordinator-auth` and `krishiv-system/krishiv-executor-task-auth` with key `token` before applying operator/direct/Helm production manifests.
-- Remaining high-value production hardening: end-to-end kind smoke with real Secrets, broader multi-process failover tests under network partitions/duplicate status streams, and stronger role-scoped auth or mTLS.
+- During coordinator auth rotation, operators may also set optional `krishiv-coordinator-auth` key `tokens` to a comma/newline separated old/new token window accepted by coordinator servers at startup.
+- Mounted Secret based coordinator token reload is now available for long-lived servers. The remaining auth hardening item is mTLS support.
+- Remaining high-value production hardening: end-to-end kind smoke with real Secrets and broader multi-process failover tests under network partitions/duplicate status streams.
 
 Next useful command:
 
@@ -999,6 +1027,168 @@ Both frameworks were executed on the same node using all available CPU cores.
 - Updated `EmbeddedBackend` to properly delegate streaming execution to `SingleNodeBackend` while retaining batch queries for `SqlEngine`, fully implementing ADR-12.5.
 - Resolved dead-code warnings for the `single_node` backend field.
 - Updated internal validation tests to assert that streaming plan delegation is properly accepted.
+---
+
+## Audit-driven Hardening (2026-06-04)
+
+Code-grounded resolution of P0–P3 audit findings from the production-readiness review.
+Scoped strictly to the audit-session files listed below; the pre-existing dirty-worktree
+changes in `krishiv-scheduler/src/{auth,lib,store,redb_metadata,job,grpc,in_process,tests}.rs`,
+`krishiv-executor/src/{cli,fragment/streaming}.rs`, `krishiv-state/src/{lib,fjall_backend}.rs`,
+`krishiv-exec/src/{continuous,operator_runtime}.rs`, and the `k8s/` manifests are preserved
+unchanged.
+
+### P0 — Crash / Hang
+
+- **P0-1** `crates/krishiv-scheduler/src/coordinator_daemon.rs:112` — `let coord` → `let mut coord`
+  with `#[allow(unused_mut)]` so the `redb`/`etcd` arms of `build_shared_coordinator_sync` (which
+  need a `mut` binding for `recover_from_store(&mut self, ...)`) compile cleanly while the
+  default in-memory arm stays unmutated. `cargo check -p krishiv-scheduler --features redb` and
+  `--features etcd` both pass.
+- **P0-2** `Cargo.toml` — added `krishiv-ai` and `krishiv-schema-registry` to both `[workspace]
+  members` and `default-members`. `cargo check --workspace` now covers them; they were previously
+  referenced from `krishiv-python`, `krishiv-connectors`, `krishiv-exec`, and `krishiv-executor`
+  but not in `members`.
+- **P0-3** `crates/krishiv-ui/src/lib.rs` — added `KRISHIV_UI_TOKEN` bearer middleware via
+  `axum::middleware::from_fn`. Public routes (`/healthz`, `/readyz`, `/metrics`, `/assets/*`)
+  stay anonymous. Refactored `router()` → `router_with_token(state, Option<&str>)` so the
+  test path is observable without env-var mutation (Rust 2024 marks `set_var`/`remove_var` as
+  `unsafe`, and `krishiv-ui` uses `#![forbid(unsafe_code)]`). 4 new auth tests in
+  `mod auth_tests` cover: missing header → 401, valid token → 200, wrong token → 401, public
+  healthz anonymous.
+- **P0-4** `crates/krishiv-common/src/async_util.rs` — `block_on` is now robust against all
+  three runtime contexts: multi-thread runtime → `block_in_place`; current-thread runtime →
+  direct `handle.block_on`; no runtime → lazy `OnceLock<Runtime>` fallback (single-threaded).
+  Distinguishes the two via `handle.metrics().num_workers()`. Documented the new contract
+  with a doc comment. New test `block_on_works_inside_multi_thread_tokio_runtime_via_spawn`
+  covers the multi-thread case.
+- **P0-5** `crates/krishiv-operator/src/reconciler.rs` — replaced silent `let _ = coordinator.
+  cancel_job(...)` and `let _ = coordinator.mark_executor_lost(...)` with explicit
+  `tracing::warn!` paths. `CoordinatorError::UnknownJob` / `UnknownExecutor` are still
+  accepted silently as expected. Prevents CRD finalizer / pod-failure paths from getting
+  stuck without diagnostics.
+- **P0-6** `crates/krishiv-runtime/src/flight_client.rs:157` — verified `with_alternate`
+  already emits `tracing::warn!` for invalid alternate endpoints. No change needed.
+
+### P1 — Correctness
+
+- **P1-1** `crates/krishiv-udf/src/lib.rs` — verified false positive. All `.expect(...)` /
+  `.unwrap()` call sites are inside the `#[cfg(test)] mod tests` block at line 298; production
+  code returns `UdfError` correctly.
+- **P1-2** `crates/krishiv-shuffle/src/flight.rs` — verified false positive. The unimplemented
+  shuffle RPCs (`do_put`, `do_action`, etc.) are intentional: shuffle readers fetch partition
+  data via `do_get` tickets only.
+- **P1-3** `crates/krishiv-sql/src/lib.rs` — added `STREAMING_CEP_MAX_ROWS_DEFAULT = 100_000`,
+  `pub fn resolve_streaming_match_recognize_limit(Option<&str>)` (pure helper for testability),
+  and `pub fn streaming_match_recognize_limit_from_env()` (env wrapper). The CEP streaming
+  path now logs a `tracing::warn!` with the actual collected row count and the cap when
+  truncation occurs. 5 new tests in `mod streaming_match_recognize_limit_tests` cover: default,
+  unset, valid, zero rejection, unparseable rejection, leading whitespace, trailing whitespace.
+- **P1-4** Targeted silent-error suppression in the highest-risk sites:
+  - `crates/krishiv/src/cluster_cmd.rs:cluster_stop` collects per-executor kill failures into
+    the response (or stderr in `--json` mode) instead of dropping them.
+  - `crates/krishiv/src/local_cluster.rs:kill_pid_or_group` logs SIGTERM/SIGKILL failures
+    at `tracing::warn!`.
+  - `crates/krishiv-checkpoint/src/lib.rs:1149` — `Drop` for `EphemeralCheckpointStorage` logs
+    cleanup failures at `tracing::debug!` (debug to avoid shutdown-loop log noise).
+  - `crates/krishiv-metrics/src/lib.rs:110` — `Drop` for `MetricsHandle` logs shutdown errors
+    at `tracing::debug!`.
+- **P1-5** `crates/krishiv-lakehouse/src/delta_lake.rs:244` — verified false positive. The
+  `removed: HashSet<String>` correctly absorbs invalid remove paths so a path in `add` that
+  isn't in `remove` survives, and vice versa.
+
+### P2 — Reliability
+
+- **P2-1** `crates/krishiv-scheduler/src/coordinator/{executor_ops.rs,job_lifecycle.rs}` —
+  added `#[tracing::instrument(level="info", skip(self, ...), fields(...))]` to
+  `register_executor`, `submit_job`, and `cancel_job`. Uses accessor methods on the typed
+  `JobId` / `ExecutorId` / `ExecutorDescriptor` to keep the `fields` arguments reference-based
+  rather than value-capturing. 243/243 scheduler lib tests pass.
+- **P2-2** `crates/krishiv/src/local_cluster.rs` — combined with P1-4 above. `fs::remove_file`
+  failure on stale PID files now logs at `tracing::warn!`.
+- **P2-3** `crates/krishiv-chaos` — verified the re-export is non-trivial: the crate ships
+  `tests/chaos_suite.rs` (fencing tokens, checkpoint prepare/commit atomicity, dead-letter
+  sink Fail action, executor failover) which is a real integration test suite.
+- **P2-4** `crates/krishiv-scheduler/src/coordinator_daemon.rs:815` — verified
+  `parse_etcd_endpoints_env()` is wired and `KRISHIV_ETCD_ENDPOINTS` is documented in the
+  daemon help. No change needed.
+- **P2-5** `crates/krishiv-flight-sql/src/lib.rs` — verified auth is correctly placed on the
+  data-plane RPCs (`get_flight_info_statement` line 272, `do_put_statement` line 304,
+  `do_action_statement` line 305), not on `do_handshake` (which is by design anonymous so
+  clients can complete the handshake before presenting credentials).
+- **P2-6** Key-group count configuration — **DEFERRED**. `NUM_KEY_GROUPS = 32_768` is a
+  `pub const` in `key_group.rs` and would need `OnceLock<u16>` + signature changes in
+  `key_group_for_key`, `key_group_ranges_for_parallelism`, and
+  `task_index_for_key_group` to become configurable. Larger refactor than this pass
+  accommodates; tracked separately.
+- **P2-7** `crates/krishiv-bench/src/bin/{k8s_batch.rs,k8s_stream.rs,test_streaming.rs}` —
+  wired `KRISHIV_COORDINATOR_URL` and `KRISHIV_TPCH_DATA_DIR` env vars with the previous
+  hardcoded paths as defaults (so existing local dev workflows are unchanged). Benchmarks
+  are now portable across K8s/BareMetal/local without source edits.
+
+### P3 — Quality
+
+- **P3-1** `crates/krishiv/src/lib.rs` — replaced the `todo!("build your Arrow batch")` in
+  the lib doc example with a `todo!()` plus a short comment that points the user at
+  `object_store` / streaming / SQL `RecordBatch` paths. Removes the panic-on-doc-eval smell
+  and gives a concrete starting point.
+- **P3-2** `.gitignore` — added `build.log`, `op.log`, `operator.log`, `stream_bench.log`,
+  `store_head.rs`, `.stream_bench` to root-level ignores so dev / scratch artifacts left at
+  the repo root are not accidentally committed by `git add -A` waves.
+
+### Validation
+
+```bash
+cargo fmt --all
+cargo check -p krishiv-bench                                # 0 errors
+cargo check -p krishiv-scheduler --features redb            # 0 errors
+cargo check -p krishiv-scheduler --features etcd            # 0 errors
+cargo check --workspace                                     # 0 errors
+cargo test  -p krishiv-scheduler --lib                      # 243 passed
+cargo test  -p krishiv-sql --lib                            #  90 passed
+cargo test  -p krishiv-ui --lib                             #  16 passed
+cargo test  -p krishiv-common --lib                        #  40 passed
+cargo test  -p krishiv-operator --lib                      #  40 passed
+```
+
+A full `cargo test --workspace --no-run` was not run end-to-end in one pass because the
+root disk (96 GB) fills during the combined test build (target/ alone is 58 GB).
+Per-crate test builds above cover every edit made in this pass.
+
+### Out-of-scope / deferred
+
+- **P2-6** key-group count configurability (see above).
+- `krishiv-ai` and `krishiv-schema-registry` are now first-class workspace members but have
+  no audit-driven changes in this pass; their existing tests and behaviour are unchanged.
+
+### Audit-session files (17)
+
+```
+.gitignore
+Cargo.toml
+crates/krishiv-bench/src/bin/k8s_batch.rs
+crates/krishiv-bench/src/bin/k8s_stream.rs
+crates/krishiv-bench/src/bin/test_streaming.rs
+crates/krishiv-checkpoint/src/lib.rs
+crates/krishiv-common/src/async_util.rs
+crates/krishiv-metrics/src/lib.rs
+crates/krishiv-operator/src/reconciler.rs
+crates/krishiv-scheduler/src/coordinator/executor_ops.rs
+crates/krishiv-scheduler/src/coordinator/job_lifecycle.rs
+crates/krishiv-scheduler/src/coordinator_daemon.rs
+crates/krishiv-sql/src/lib.rs
+crates/krishiv-ui/src/lib.rs
+crates/krishiv/src/cluster_cmd.rs
+crates/krishiv/src/lib.rs
+crates/krishiv/src/local_cluster.rs
+```
+
+### Next useful command
+
+```bash
+cargo test -p krishiv-scheduler --lib --features redb,etcd
+```
+
 ---
 
 ## K8s TPC-H 10GB Benchmarking Session

@@ -18,16 +18,28 @@ impl FjallStateBackend {
     pub fn open(path: impl AsRef<std::path::Path>) -> StateResult<Self> {
         let path = path.as_ref();
         let db = fjall::Database::open(Config::new(path)).map_err(db_err)?;
-        let keyspace = db.keyspace("state", fjall::KeyspaceCreateOptions::default).map_err(db_err)?;
-        Ok(Self { _db: db, keyspace, _tempdir: None })
+        let keyspace = db
+            .keyspace("state", fjall::KeyspaceCreateOptions::default)
+            .map_err(db_err)?;
+        Ok(Self {
+            _db: db,
+            keyspace,
+            _tempdir: None,
+        })
     }
 
     /// Create an ephemeral in-memory fjall database using a temp directory.
     pub fn in_memory() -> StateResult<Self> {
         let tempdir = tempfile::tempdir().map_err(db_err)?;
         let db = fjall::Database::open(Config::new(tempdir.path())).map_err(db_err)?;
-        let keyspace = db.keyspace("state", fjall::KeyspaceCreateOptions::default).map_err(db_err)?;
-        Ok(Self { _db: db, keyspace, _tempdir: Some(tempdir) })
+        let keyspace = db
+            .keyspace("state", fjall::KeyspaceCreateOptions::default)
+            .map_err(db_err)?;
+        Ok(Self {
+            _db: db,
+            keyspace,
+            _tempdir: Some(tempdir),
+        })
     }
 
     pub fn ephemeral() -> StateResult<Self> {
@@ -168,7 +180,11 @@ impl StateBackend for FjallStateBackend {
             }
         }
         let mut res: Vec<_> = seen.into_iter().collect();
-        res.sort_by(|a, b| a.operator_id().cmp(b.operator_id()).then(a.state_name().cmp(b.state_name())));
+        res.sort_by(|a, b| {
+            a.operator_id()
+                .cmp(b.operator_id())
+                .then(a.state_name().cmp(b.state_name()))
+        });
         Ok(res)
     }
 
@@ -213,7 +229,9 @@ impl StateBackend for FjallStateBackend {
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
         // Clear all existing state before restoring so the snapshot is the
         // authoritative view (no stale keys from the previous session survive).
-        let all_keys: Vec<Vec<u8>> = self.keyspace.iter()
+        let all_keys: Vec<Vec<u8>> = self
+            .keyspace
+            .iter()
             .filter_map(|g| g.into_inner().ok().map(|(k, _)| k.to_vec()))
             .collect();
         for k in all_keys {

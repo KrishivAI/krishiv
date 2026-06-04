@@ -21,11 +21,12 @@ pub struct RedbMetadataStore {
 }
 
 impl RedbMetadataStore {
-    
     pub fn in_memory() -> SchedulerResult<Self> {
-        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()).map_err(|e| SchedulerError::Store {
-            message: format!("failed to open in-memory redb: {e}"),
-        })?;
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| SchedulerError::Store {
+                message: format!("failed to open in-memory redb: {e}"),
+            })?;
 
         let events = Vec::new();
         let jobs = Vec::new();

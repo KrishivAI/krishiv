@@ -32,3 +32,11 @@ scheduler.log
 # Data directories
 tpch_sf1/
 tpch_sf10/
+
+# Untracked dev / scratch artifacts left at the repo root
+build.log
+op.log
+operator.log
+stream_bench.log
+store_head.rs
+.stream_bench

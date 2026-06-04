@@ -9,7 +9,7 @@ use krishiv_checkpoint::{
     write_operator_snapshot,
 };
 use krishiv_state::{
-    Namespace, FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend,
+    FjallStateBackend, Namespace, StateBackend, TtlConfig, TtlStateBackend,
     migration::{SharedStateMigrationRegistry, StateMigrationRegistry},
 };
 

@@ -24,10 +24,10 @@ pub mod migration;
 // Named modules
 pub mod backend;
 pub mod error;
+pub mod fjall_backend;
 pub mod inspector;
 pub mod namespace;
 pub mod processing_time;
-pub mod fjall_backend;
 pub mod snapshot;
 pub mod timer;
 pub mod ttl;
@@ -38,6 +38,7 @@ mod tests;
 // Re-export the full public API at crate root for source compatibility.
 pub use backend::StateBackend;
 pub use error::{StateError, StateResult};
+pub use fjall_backend::FjallStateBackend;
 pub use inspector::StateInspector;
 pub use krishiv_common::durability::{DurabilityProfile, StateDurability};
 pub use migration::{
@@ -47,7 +48,6 @@ pub use namespace::Namespace;
 pub use processing_time::{
     InMemoryProcessingTimeTimerService, ProcessingTimeTimerKey, ProcessingTimeTimerService,
 };
-pub use fjall_backend::FjallStateBackend;
 pub use snapshot::{SnapshotEntry, decode_snapshot_entries};
 pub use timer::{InMemoryTimerService, TimerKey, TimerService};
 pub use ttl::{TtlConfig, TtlStateBackend};

@@ -15,7 +15,7 @@ use krishiv_proto::{
     TransportVersion, TriggerSavepointRequest, TriggerSavepointResponse, wire,
 };
 
-use crate::auth::{extract_auth_context, validate_grpc_auth};
+use crate::auth::{extract_auth_context, validate_grpc_auth, validate_grpc_writer};
 use crate::checkpoint::CheckpointCoordinator;
 use crate::coordinator::SharedCoordinator;
 use crate::error::{SchedulerError, TaskUpdateOutcome};
@@ -45,7 +45,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<RegisterExecutorResponse>, tonic::Status> {
         // GAP-CP-08: Extract auth context for every handler.
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "register_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -96,7 +96,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<DeregisterExecutorResponse>, tonic::Status> {
         // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "deregister_executor");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -137,7 +137,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<ExecutorHeartbeatResponse>, tonic::Status> {
         // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "executor_heartbeat");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -221,7 +221,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
         // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "task_status");
         let request = request.into_inner();
         ensure_transport_version(request.version())?;
@@ -284,7 +284,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
     ) -> Result<tonic::Response<CheckpointAckResponse>, tonic::Status> {
         // defense-in-depth: redundant when server-level interceptor is active
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "checkpoint_ack");
         ensure_shared_coordinator_active(&self.coordinator).await?;
         let ack = request.into_inner();
@@ -340,7 +340,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<TriggerSavepointRequest>,
     ) -> Result<tonic::Response<TriggerSavepointResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "trigger_savepoint");
         let req = request.into_inner();
         let label = if req.label.is_empty() {
@@ -360,7 +360,7 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         request: tonic::Request<RestoreJobRequest>,
     ) -> Result<tonic::Response<RestoreJobResponse>, tonic::Status> {
         let auth = extract_auth_context(request.metadata());
-        validate_grpc_auth(&auth)?;
+        validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "restore_job");
         let req = request.into_inner();
         let coordinator = self.coordinator.read().await;

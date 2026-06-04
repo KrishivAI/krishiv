@@ -150,7 +150,19 @@ impl KrishivJobReconciler {
             // Resource is being deleted — cancel the scheduler job if it exists and
             // signal that the finalizer should be stripped so Kubernetes can proceed.
             let job_id = scheduler_job_id(resource)?;
-            let _ = coordinator.cancel_job(&job_id); // best-effort: ignore unknown job
+            if let Err(error) = coordinator.cancel_job(&job_id) {
+                // UnknownJob is expected when the coordinator restarted without
+                // durable state; surface anything else so the operator does
+                // not get stuck in Terminating.
+                if !matches!(error, SchedulerError::UnknownJob { .. }) {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "coordinator.cancel_job failed during finalizer cleanup; \
+                         CRD may stay in Terminating until next reconcile"
+                    );
+                }
+            }
             let status = match coordinator.job_snapshot(&job_id) {
                 Ok(snapshot) => status_from_snapshot(resource, &self.coordinator_id, &snapshot),
                 Err(_) => accepted_waiting_for_executors(resource, &self.coordinator_id),
@@ -163,7 +175,19 @@ impl KrishivJobReconciler {
 
         if let Some(failure) = pod_failure {
             if let Some(executor_id) = failure.executor_id.as_ref() {
-                let _ = coordinator.mark_executor_lost(executor_id);
+                if let Err(error) = coordinator.mark_executor_lost(executor_id) {
+                    // UnknownExecutor is expected when the scheduler has
+                    // never seen this executor; warn otherwise so a stale
+                    // pod does not silently linger in the cluster.
+                    if !matches!(error, SchedulerError::UnknownExecutor { .. }) {
+                        tracing::warn!(
+                            executor_id = %executor_id,
+                            error = %error,
+                            "coordinator.mark_executor_lost failed; \
+                             executor pod may keep running until next reconcile"
+                        );
+                    }
+                }
             }
             return Ok(ReconcileOutcome {
                 action: ReconcileAction::ExecutorPodLaunchFailed,

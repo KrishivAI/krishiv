@@ -229,19 +229,39 @@ fn cluster_stop(args: &[&str]) -> CliResponse {
         Ok(v) => v,
         Err(e) => return CliResponse::err(e, 2),
     };
+    let mut warnings: Vec<String> = Vec::new();
     if let Ok(cfg) = ClusterConfig::load(&data_dir) {
         if let Some(pid) = cfg.clusterd_pid {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
+            if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
+                warnings.push(format!("kill clusterd pid {pid} failed: {error}"));
+            }
         }
         for pid in cfg.executor_pids {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
+            if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
+                warnings.push(format!("kill executor pid {pid} failed: {error}"));
+            }
         }
         if let Some(pid) = cfg.ui_pid {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
+            if let Err(error) = Command::new("kill").arg(pid.to_string()).status() {
+                warnings.push(format!("kill ui pid {pid} failed: {error}"));
+            }
         }
-        let _ = fs::remove_file(ClusterConfig::path(&data_dir));
+        if let Err(error) = fs::remove_file(ClusterConfig::path(&data_dir)) {
+            warnings.push(format!(
+                "remove cluster config {}: {error}",
+                ClusterConfig::path(&data_dir).display()
+            ));
+        }
     }
-    CliResponse::ok(format!("Krishiv cluster stopped ({})", data_dir.display()))
+    if warnings.is_empty() {
+        CliResponse::ok(format!("Krishiv cluster stopped ({})", data_dir.display()))
+    } else {
+        CliResponse::ok(format!(
+            "Krishiv cluster stopped ({}). Warnings:\n  - {}",
+            data_dir.display(),
+            warnings.join("\n  - "),
+        ))
+    }
 }
 
 fn cluster_status(args: &[&str]) -> CliResponse {

@@ -213,8 +213,11 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         }
         let mut coordinator = lock_coord(&self.coordinator)?;
         let response = match coordinator.apply_task_update(update) {
-            Ok(TaskUpdateOutcome::Applied) | Ok(TaskUpdateOutcome::Duplicate) => {
+            Ok(TaskUpdateOutcome::Applied) => {
                 TaskStatusResponse::new(TransportDisposition::Accepted)
+            }
+            Ok(TaskUpdateOutcome::Duplicate) => {
+                TaskStatusResponse::new(TransportDisposition::Duplicate)
             }
             Err(SchedulerError::UnknownJob { .. }) => {
                 TaskStatusResponse::new(TransportDisposition::UnknownJob)
