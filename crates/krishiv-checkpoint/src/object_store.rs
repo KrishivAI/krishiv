@@ -43,9 +43,25 @@ impl ObjectStoreCheckpointStorage {
     }
 
     /// Async write — preferred for callers in a Tokio context (D4).
+    ///
+    /// Writes to a staging key first, then commits the final key so readers
+    /// never observe partial object-store payloads.
     pub async fn write_bytes_async_inner(&self, path: &str, data: &[u8]) -> CheckpointResult<()> {
+        let staging_path = format!("{path}.staging");
+        let object_staging = self.object_path(&staging_path);
         let object_path = self.object_path(path);
         let payload = bytes::Bytes::copy_from_slice(data);
+        tokio::time::timeout(
+            WRITE_TIMEOUT,
+            self.store.put(&object_staging, payload.clone().into()),
+        )
+        .await
+        .map_err(|_| CheckpointError::Storage {
+            message: "object store staging write timed out".into(),
+        })?
+        .map_err(|e| CheckpointError::Storage {
+            message: format!("object store staging put: {e}"),
+        })?;
         tokio::time::timeout(WRITE_TIMEOUT, self.store.put(&object_path, payload.into()))
             .await
             .map_err(|_| CheckpointError::Storage {
@@ -54,6 +70,7 @@ impl ObjectStoreCheckpointStorage {
             .map_err(|e| CheckpointError::Storage {
                 message: format!("object store put: {e}"),
             })?;
+        let _ = self.store.delete(&object_staging).await;
         Ok(())
     }
 

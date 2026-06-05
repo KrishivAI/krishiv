@@ -419,8 +419,9 @@ pub(crate) async fn execute_streaming_fragment(
     // RecordBatches rather than stream-kafka ASCII strings. Preserves all columns
     // so multi-aggregation windows work correctly.
     let inmem_batches = read_inmem_stream_batches(assignment.input_partitions());
+    let job_id = assignment.job_id().as_str();
     if !inmem_batches.is_empty() {
-        return execute_streaming_with_batches(inmem_batches, plan_spec).await;
+        return execute_streaming_with_batches(runner, job_id, inmem_batches, plan_spec).await;
     }
 
     let batches = parse_stream_kafka_partitions(assignment.input_partitions())?;
@@ -445,7 +446,10 @@ pub(crate) async fn execute_streaming_fragment(
     // track global low-watermark across all executor tasks.
     let observed_watermark_ms = compute_input_watermark(&batches, &plan_spec);
 
-    let collected_batches = execute_bounded_window(batches, &plan_spec, None).map_err(|e| {
+    let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
+
+    let collected_batches =
+        execute_bounded_window(batches, &plan_spec, job_state_dir.as_deref()).map_err(|e| {
         ExecutorError::LocalExecution {
             message: e.to_string(),
         }
@@ -493,11 +497,14 @@ fn read_inmem_stream_batches(
 ///
 /// Used by the InMemory partition fast path to skip stream-kafka ASCII parsing.
 async fn execute_streaming_with_batches(
+    runner: &ExecutorTaskRunner,
+    job_id: &str,
     batches: Vec<arrow::record_batch::RecordBatch>,
     spec: WindowExecutionSpec,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
-    let collected = execute_bounded_window(batches, &spec, None).map_err(|e| {
+    let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
+    let collected = execute_bounded_window(batches, &spec, job_state_dir.as_deref()).map_err(|e| {
         ExecutorError::LocalExecution {
             message: e.to_string(),
         }

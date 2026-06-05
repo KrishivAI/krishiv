@@ -9,6 +9,7 @@ license.workspace = true
 askama.workspace = true
 axum.workspace = true
 thiserror = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }

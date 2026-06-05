@@ -25,7 +25,7 @@ use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal};
+use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
 use krishiv_sql::SqlEngine;
 use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 
@@ -130,6 +130,11 @@ impl KrishivFlightSqlService {
     #[allow(clippy::result_large_err)]
     fn authenticate_request<B>(&self, req: &Request<B>) -> Result<Option<Principal>, Status> {
         let Some(auth) = &self.auth else {
+            if krishiv_common::is_production_mode() {
+                return Err(Status::unauthenticated(
+                    "Flight SQL auth is required in production mode; configure KRISHIV_API_KEYS",
+                ));
+            }
             return Ok(None);
         };
         let token = self.bearer_token(req)?.expect("auth is configured");
@@ -236,14 +241,21 @@ fn mask_batch(
 impl FlightSqlService for KrishivFlightSqlService {
     type FlightService = KrishivFlightSqlService;
 
-    // No-op handshake — anonymous auth for R8.1 beta
+    // Handshake requires auth when an AuthProvider is configured.
     async fn do_handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<
         Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
         Status,
     > {
+        if self.auth.is_some() {
+            self.authenticate_request(&request)?;
+        } else if krishiv_common::is_production_mode() {
+            return Err(Status::unauthenticated(
+                "Flight SQL auth is required in production mode; configure KRISHIV_API_KEYS",
+            ));
+        }
         let resp = HandshakeResponse {
             protocol_version: 0,
             payload: bytes::Bytes::new(),
@@ -371,8 +383,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
-        _request: Request<arrow_flight::Action>,
+        request: Request<arrow_flight::Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
+        self.authenticate_request(&request)?;
         let handle = Uuid::new_v4().to_string();
         self.prepared_statements
             .lock()
@@ -442,8 +455,9 @@ impl FlightSqlService for KrishivFlightSqlService {
     async fn do_action_close_prepared_statement(
         &self,
         query: ActionClosePreparedStatementRequest,
-        _request: Request<arrow_flight::Action>,
+        request: Request<arrow_flight::Action>,
     ) -> Result<(), Status> {
+        self.authenticate_request(&request)?;
         let handle = std::str::from_utf8(&query.prepared_statement_handle)
             .map_err(|e| {
                 Status::invalid_argument(format!("invalid prepared statement handle encoding: {e}"))
@@ -462,6 +476,7 @@ impl FlightSqlService for KrishivFlightSqlService {
         &self,
         request: Request<arrow_flight::Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        self.authenticate_request(&request)?;
         use krishiv_runtime::KrishivFlightAction;
         use krishiv_runtime::flight_action::strip_action_type;
 
@@ -676,9 +691,64 @@ fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionE
 /// **Beta API**: may change between minor releases.
 pub fn make_flight_sql_server()
 -> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService> {
+    let service = KrishivFlightSqlService::with_host(
+        FlightExecutionHost::from_env().expect("flight host"),
+    );
     arrow_flight::flight_service_server::FlightServiceServer::new(
-        KrishivFlightSqlService::with_host(FlightExecutionHost::from_env().expect("flight host")),
+        configure_flight_auth_from_env(service),
     )
+}
+
+/// Attach auth from `KRISHIV_API_KEYS` when configured; fail in production when absent.
+fn configure_flight_auth_from_env(
+    mut service: KrishivFlightSqlService,
+) -> KrishivFlightSqlService {
+    match auth_provider_from_env() {
+        Ok(Some(auth)) => service.with_auth(auth),
+        Ok(None) => service,
+        Err(message) => {
+            if krishiv_common::is_production_mode() {
+                panic!("{message}");
+            }
+            eprintln!("krishiv-flight-sql: {message}; serving anonymously (dev only)");
+            service
+        }
+    }
+}
+
+fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
+    let raw = match std::env::var("KRISHIV_API_KEYS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ if krishiv_common::is_production_mode() => {
+            return Err(String::from(
+                "KRISHIV_API_KEYS is required in production mode (format: key1=user:reader,...)",
+            ));
+        }
+        _ => return Ok(None),
+    };
+    let mut entries = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key, rest) = part
+            .split_once('=')
+            .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry: {part}"))?;
+        let (subject, role_str) = rest
+            .split_once(':')
+            .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}"))?;
+        let role = match role_str.trim().to_ascii_lowercase().as_str() {
+            "reader" => Role::Reader,
+            "writer" | "admin" => Role::Admin,
+            other => return Err(format!("unsupported role in KRISHIV_API_KEYS: {other}")),
+        };
+        entries.push((key.trim().to_owned(), subject.trim().to_owned(), role));
+    }
+    if entries.is_empty() {
+        return Err(String::from("KRISHIV_API_KEYS must list at least one key"));
+    }
+    Ok(Some(Arc::new(StaticApiKeyAuthProvider::new(entries))))
 }
 
 /// Run the Arrow Flight SQL server (env `KRISHIV_FLIGHT_ADDR`, default `127.0.0.1:50051`).

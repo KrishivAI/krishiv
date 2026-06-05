@@ -991,6 +991,15 @@ impl SqlEngine {
                     std::sync::Arc::new(self.context.clone()),
                 ))
             } else {
+                if krishiv_common::is_production_mode() {
+                    return Err(SqlError::DataFusion {
+                        message: format!(
+                            "CREATE FUNCTION '{}' with language {:?} is not supported in \
+                             production; only LANGUAGE sql AS '...' table functions are allowed",
+                            ddl.function_name, ddl.language
+                        ),
+                    });
+                }
                 // Other languages: register a stub so the schema resolves at plan time,
                 // but calling the function will produce a clear error.
                 std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))

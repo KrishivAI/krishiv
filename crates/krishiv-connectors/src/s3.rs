@@ -125,7 +125,9 @@ impl Source for S3Source {
 ///
 /// Batches are buffered in memory.  On [`Sink::flush`] all batches are
 /// serialised to a Parquet byte buffer and uploaded atomically via
-/// [`ObjectStore::put`].
+/// [`ObjectStore::put`]. Pending batches are capped to avoid unbounded memory.
+const MAX_PENDING_BATCHES: usize = 1_024;
+
 pub struct S3Sink {
     store: Arc<dyn ObjectStore>,
     path: Path,
@@ -160,6 +162,13 @@ impl Sink for S3Sink {
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
         if self.schema.is_none() {
             self.schema = Some(batch.schema());
+        }
+        if self.pending.len() >= MAX_PENDING_BATCHES {
+            return Err(ConnectorError::IoStr {
+                message: format!(
+                    "S3Sink pending batch limit ({MAX_PENDING_BATCHES}) exceeded; flush before writing more"
+                ),
+            });
         }
         self.pending.push(batch);
         Ok(())

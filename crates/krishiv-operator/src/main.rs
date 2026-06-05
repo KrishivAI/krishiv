@@ -150,7 +150,11 @@ async fn run_controller_with_servers(
 
     let http_listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     let http_coordinator = runtime.coordinator().clone();
-    let http_router = krishiv_scheduler::coordinator_http_router(http_coordinator);
+    let http_config = krishiv_scheduler::CoordinatorDaemonConfig::http_sidecar(
+        krishiv_checkpoint::DurabilityProfile::DistributedDurable,
+    );
+    let http_router =
+        krishiv_scheduler::coordinator_http_router(http_coordinator, &http_config);
     let coordinator = runtime.coordinator().clone();
 
     tokio::select! {

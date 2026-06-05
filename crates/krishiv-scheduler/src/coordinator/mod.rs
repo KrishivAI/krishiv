@@ -728,6 +728,19 @@ impl Coordinator {
         self
     }
 
+    /// Attach a metadata store with explicit fail-closed write semantics.
+    #[must_use]
+    pub fn with_store_fail_closed(
+        mut self,
+        store: impl MetadataStore + 'static,
+        fail_closed_writes: bool,
+    ) -> Self {
+        self.store = Some(
+            NonBlockingStoreHandle::new(store).with_fail_closed_writes(fail_closed_writes),
+        );
+        self
+    }
+
     /// Replace the default `InMemoryQueueManager` with a custom admission controller.
     ///
     /// R7.1 will use this to inject quota-aware and CRD-backed queue managers.

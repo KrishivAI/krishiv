@@ -46,6 +46,22 @@ impl FjallStateBackend {
         Self::in_memory()
     }
 
+    /// Open state storage appropriate for the durability profile.
+    pub fn open_for_profile(
+        profile: krishiv_common::DurabilityProfile,
+        path: Option<&std::path::Path>,
+    ) -> StateResult<Self> {
+        if krishiv_common::requires_file_backed_state(profile) {
+            let path = path.ok_or_else(|| StateError::BackendUnavailable {
+                message: "durable profile requires a file-backed state directory".into(),
+                source: None,
+            })?;
+            Self::open(path)
+        } else {
+            Self::ephemeral()
+        }
+    }
+
     /// Ergonomic alias for [`ephemeral`] — creates a temp-dir-backed instance
     /// suitable for unit tests and single-call embedded execution.
     pub fn new() -> StateResult<Self> {

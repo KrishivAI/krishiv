@@ -14,8 +14,21 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use krishiv_connectors::Source;
 use krishiv_connectors::kafka::{KafkaConfig, KafkaSource};
 
-// Auto-commit interval used for the streaming SQL path (at-least-once delivery).
+// Auto-commit interval for dev-local streaming SQL (at-least-once). Durable profiles
+// use manual commit aligned with checkpoint barriers.
 const STREAMING_AUTO_COMMIT_MS: u64 = 1_000;
+
+fn kafka_auto_commit_interval_ms() -> Option<u64> {
+    let profile = std::env::var("KRISHIV_DURABILITY_PROFILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(krishiv_common::DurabilityProfile::DevLocal);
+    if krishiv_common::requires_manual_kafka_commit(profile) {
+        None
+    } else {
+        Some(STREAMING_AUTO_COMMIT_MS)
+    }
+}
 
 pub struct KafkaPartitionStream {
     schema: SchemaRef,
@@ -137,7 +150,10 @@ pub fn create_kafka_streaming_table(
     schema: SchemaRef,
     config: KafkaConfig,
 ) -> DataFusionResult<Arc<dyn TableProvider>> {
-    let config = config.with_auto_commit(STREAMING_AUTO_COMMIT_MS);
+    let config = match kafka_auto_commit_interval_ms() {
+        Some(ms) => config.with_auto_commit(ms),
+        None => config,
+    };
     let source = KafkaSource::new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
     let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
     let table = StreamingTable::try_new(schema, vec![partition])?;
@@ -183,7 +199,7 @@ impl TableProviderFactory for KafkaTableFactory {
             bootstrap_servers,
             topic,
             group_id,
-            auto_commit_interval_ms: Some(STREAMING_AUTO_COMMIT_MS),
+            auto_commit_interval_ms: kafka_auto_commit_interval_ms(),
             security_protocol: None,
             ssl_ca_location: None,
             ssl_certificate_location: None,

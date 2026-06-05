@@ -1007,12 +1007,15 @@ pub struct NonBlockingStoreHandle {
     inner: std::sync::Arc<std::sync::Mutex<dyn MetadataStore + 'static>>,
     /// Bounded sender; `None` when no Tokio runtime was available at construction.
     tx: Option<tokio::sync::mpsc::Sender<StoreCommand>>,
+    /// When true, never drop writes on channel backpressure — fall back to sync write.
+    fail_closed_writes: bool,
 }
 
 impl std::fmt::Debug for NonBlockingStoreHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NonBlockingStoreHandle")
             .field("async_mode", &self.tx.is_some())
+            .field("fail_closed_writes", &self.fail_closed_writes)
             .finish_non_exhaustive()
     }
 }
@@ -1076,7 +1079,32 @@ impl NonBlockingStoreHandle {
             None
         };
 
-        Self { inner, tx }
+        Self {
+            inner,
+            tx,
+            fail_closed_writes: false,
+        }
+    }
+
+    /// Require that metadata writes are never dropped under backpressure.
+    #[must_use]
+    pub fn with_fail_closed_writes(mut self, fail_closed: bool) -> Self {
+        self.fail_closed_writes = fail_closed;
+        self
+    }
+
+    fn append_event_sync(&self, event: EventLogEvent) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = guard.append_event(event) {
+            tracing::error!(error = %e, "NonBlockingStoreHandle: append_event failed (sync fallback)");
+        }
+    }
+
+    fn save_job_sync(&self, record: &JobRecord) {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = guard.save_job(record) {
+            tracing::error!(error = %e, "NonBlockingStoreHandle: save_job failed (sync fallback)");
+        }
     }
 
     /// Access the underlying store for reads (blocks on mutex).
@@ -1086,34 +1114,66 @@ impl NonBlockingStoreHandle {
 
     /// Enqueue an event write (sync, uses `try_send`).
     ///
-    /// When the bounded channel is full, the event is dropped and a warning is
-    /// logged. Async callers should prefer [`Self::append_event_async`].
+    /// When the bounded channel is full and [`Self::with_fail_closed_writes`] is
+    /// enabled, the write is performed synchronously instead of being dropped.
+    /// Async callers should prefer [`Self::append_event_async`].
     pub fn append_event(&self, event: EventLogEvent) {
-        if let Some(ref tx) = self.tx {
-            if tx.try_send(StoreCommand::AppendEvent(event)).is_err() {
-                tracing::warn!(
-                    "NonBlockingStoreHandle: append_event dropped (channel full, {} pending)",
-                    tx.max_capacity()
-                );
-            }
+        match &self.tx {
+            Some(tx) => match tx.try_send(StoreCommand::AppendEvent(event)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(
+                    StoreCommand::AppendEvent(event),
+                )) => {
+                    if self.fail_closed_writes {
+                        tracing::warn!(
+                            "NonBlockingStoreHandle: channel full; performing synchronous append_event"
+                        );
+                        self.append_event_sync(event);
+                    } else {
+                        tracing::warn!(
+                            "NonBlockingStoreHandle: append_event dropped (channel full, {} pending)",
+                            tx.max_capacity()
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!("NonBlockingStoreHandle: store background task dropped");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            },
+            None => self.append_event_sync(event),
         }
     }
 
     /// Enqueue a job save (sync, uses `try_send`).
     ///
-    /// When the bounded channel is full, the save is dropped and a warning is
-    /// logged. Async callers should prefer [`Self::save_job_async`].
+    /// When the bounded channel is full and fail-closed mode is enabled, the
+    /// save is performed synchronously instead of being dropped.
     pub fn save_job(&self, record: &JobRecord) {
-        if let Some(ref tx) = self.tx {
-            if tx
-                .try_send(StoreCommand::SaveJob(Box::new(record.clone())))
-                .is_err()
-            {
-                tracing::warn!(
-                    "NonBlockingStoreHandle: save_job dropped (channel full, {} pending)",
-                    tx.max_capacity()
-                );
-            }
+        match &self.tx {
+            Some(tx) => match tx.try_send(StoreCommand::SaveJob(Box::new(record.clone()))) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(
+                    StoreCommand::SaveJob(record),
+                )) => {
+                    if self.fail_closed_writes {
+                        tracing::warn!(
+                            "NonBlockingStoreHandle: channel full; performing synchronous save_job"
+                        );
+                        self.save_job_sync(&record);
+                    } else {
+                        tracing::warn!(
+                            "NonBlockingStoreHandle: save_job dropped (channel full, {} pending)",
+                            tx.max_capacity()
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!("NonBlockingStoreHandle: store background task dropped");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            },
+            None => self.save_job_sync(record),
         }
     }
 
@@ -1126,7 +1186,7 @@ impl NonBlockingStoreHandle {
                 tracing::error!("NonBlockingStoreHandle: store background task dropped");
             }
         } else {
-            self.append_event(event);
+            self.append_event_sync(event);
         }
     }
 
@@ -1143,7 +1203,7 @@ impl NonBlockingStoreHandle {
                 tracing::error!("NonBlockingStoreHandle: store background task dropped");
             }
         } else {
-            self.save_job(record);
+            self.save_job_sync(record);
         }
     }
 

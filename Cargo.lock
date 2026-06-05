@@ -4253,6 +4253,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "futures",
+ "krishiv-common",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4469,6 +4470,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "axum 0.8.9",
+ "krishiv-common",
  "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",

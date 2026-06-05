@@ -13,6 +13,7 @@ arrow.workspace = true
 futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
 thiserror = { workspace = true }
 
 [lints]

@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
 use crate::InMemoryMetadataStore;
+use crate::store::MetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
     scheduler_metrics, serve_coordinator_executor_grpc_with_listener,
@@ -55,6 +56,27 @@ pub struct CoordinatorDaemonConfig {
     /// Allow anonymous gRPC (dev only; default: false).
     pub insecure: bool,
     pub help: bool,
+}
+
+impl CoordinatorDaemonConfig {
+    /// Minimal config for HTTP router construction when full daemon flags are unavailable.
+    pub fn http_sidecar(profile: DurabilityProfile) -> Self {
+        Self {
+            coordinator_id: String::from("coord-http"),
+            grpc_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            http_addr: Some("127.0.0.1:0".parse().expect("valid addr")),
+            shuffle_dir: None,
+            durability_profile: profile,
+            metadata_backend: None,
+            metadata_path: None,
+            leader_backend: String::from("single"),
+            etcd_endpoints: Vec::new(),
+            etcd_lease_key: String::from("/krishiv/ccp/leader"),
+            leader_lease_duration_s: 15,
+            insecure: false,
+            help: false,
+        }
+    }
 }
 
 /// Build the leader-election backend for clusterd from daemon flags.
@@ -104,6 +126,17 @@ pub fn build_shared_coordinator(
 }
 
 /// Synchronous entry used by binaries; etcd metadata uses a blocking connect.
+/// Attach metadata store with durability-aware fail-closed write semantics.
+fn attach_metadata_store(
+    coord: Coordinator,
+    store: impl MetadataStore + 'static,
+    config: &CoordinatorDaemonConfig,
+) -> Coordinator {
+    let fail_closed =
+        krishiv_common::profile_requires_fail_closed_metadata(config.durability_profile);
+    coord.with_store_fail_closed(store, fail_closed)
+}
+
 pub fn build_shared_coordinator_sync(
     config: &CoordinatorDaemonConfig,
 ) -> Result<SharedCoordinator, Box<dyn Error>> {
@@ -117,7 +150,11 @@ pub fn build_shared_coordinator_sync(
     let coordinator = match (config.metadata_backend.as_deref(), &config.metadata_path) {
         (Some("memory"), _) | (None, None) => {
             // InMemoryMetadataStore is the correct default for embedded/test use.
-            SharedCoordinator::new(coord.with_store(InMemoryMetadataStore::default()))
+            SharedCoordinator::new(attach_metadata_store(
+                coord,
+                InMemoryMetadataStore::default(),
+                config,
+            ))
         }
         #[cfg(feature = "etcd")]
         (Some("etcd"), _) => {
@@ -134,7 +171,7 @@ pub fn build_shared_coordinator_sync(
             coord
                 .recover_from_store(&store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;
-            SharedCoordinator::new(coord.with_store(store))
+            SharedCoordinator::new(attach_metadata_store(coord, store, config))
         }
         #[cfg(not(feature = "etcd"))]
         (Some("etcd"), _) => {
@@ -150,7 +187,7 @@ pub fn build_shared_coordinator_sync(
             coord
                 .recover_from_store(&store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;
-            SharedCoordinator::new(coord.with_store(store))
+            SharedCoordinator::new(attach_metadata_store(coord, store, config))
         }
         #[cfg(feature = "redb")]
         (Some("redb"), None) => {
@@ -290,8 +327,9 @@ pub async fn spawn_coordinator_sidecars(
             "Krishiv coordinator HTTP listening on {}",
             http_listener.local_addr()?
         );
+        let http_config = config.clone();
         tokio::spawn(async move {
-            let router = coordinator_http_router(http_coordinator);
+            let router = coordinator_http_router(http_coordinator, &http_config);
             let _ = axum::serve(http_listener, router).await;
         });
     }
@@ -303,14 +341,22 @@ pub async fn spawn_coordinator_sidecars(
     Ok(())
 }
 
-pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
+pub fn coordinator_http_router(
+    coordinator: SharedCoordinator,
+    config: &CoordinatorDaemonConfig,
+) -> Router {
+    use axum::middleware;
     use crate::federation_http::{
         federation_cancel_job, federation_job_status, federation_submit_job,
     };
-    Router::new()
+    use crate::http_auth::{require_coordinator_bearer, resolve_http_bearer_tokens};
+
+    let public = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
+        .route("/metrics", get(metrics));
+
+    let protected = Router::new()
         .route(
             "/",
             get(|| async { axum::response::Redirect::temporary("/ui") }),
@@ -352,7 +398,29 @@ pub fn coordinator_http_router(coordinator: SharedCoordinator) -> Router {
             "/federation/v1/jobs/{job_id}/cancel",
             post(federation_cancel_job),
         )
+        .with_state(coordinator.clone());
+
+    let protected = if http_auth_required(config) {
+        let tokens = resolve_http_bearer_tokens();
+        protected.layer(middleware::from_fn(move |req, next| {
+            let tokens = tokens.clone();
+            async move { require_coordinator_bearer(req, next, &tokens).await }
+        }))
+    } else {
+        protected
+    };
+
+    Router::new()
+        .merge(public)
+        .merge(protected)
         .with_state(coordinator)
+}
+
+fn http_auth_required(config: &CoordinatorDaemonConfig) -> bool {
+    if krishiv_common::allow_anonymous_http_override() {
+        return false;
+    }
+    krishiv_common::requires_http_auth(config.durability_profile)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -788,6 +856,19 @@ fn validate_runtime_security_config(
             )
             .into());
         }
+    }
+    if config.http_addr.is_some()
+        && http_auth_required(config)
+        && !coordinator_bearer_token_configured
+        && !krishiv_common::allow_anonymous_http_override()
+    {
+        return Err(format!(
+            "coordinator HTTP is enabled but no bearer tokens are configured; \
+             set {COORDINATOR_BEARER_TOKEN_ENV} or {COORDINATOR_BEARER_TOKENS_ENV} \
+             (or {} for dev-only bypass)",
+            krishiv_common::ALLOW_ANONYMOUS_HTTP_ENV,
+        )
+        .into());
     }
     Ok(())
 }
@@ -1361,6 +1442,7 @@ mod parse_tests {
     #[tokio::test]
     async fn circuit_breaker_reset_endpoint_returns_ok() {
         use crate::coordinator_http_router;
+        use crate::CoordinatorDaemonConfig;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use krishiv_proto::{ExecutorDescriptor, ExecutorId};
@@ -1395,7 +1477,8 @@ mod parse_tests {
                 .record_task_failure(&exec_id, threshold);
         }
 
-        let router = coordinator_http_router(coordinator.clone());
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator.clone(), &config);
 
         let response = router
             .oneshot(
