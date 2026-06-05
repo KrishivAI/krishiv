@@ -5,6 +5,7 @@
 //! and scan committed rows.
 
 use arrow::record_batch::RecordBatch;
+use futures::stream::Stream;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
@@ -102,7 +103,23 @@ impl IcebergFsTable {
         let tmp = root.join("metadata.json.tmp");
         let final_path = Self::metadata_path(root);
         fs::write(&tmp, &bytes).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Sync the temp file to ensure the bytes are durable on disk before
+        // the rename. Without this, a power loss between `write` and
+        // `rename` can leave the renamed file empty or stale.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&tmp) {
+            let _ = f.sync_all();
+        }
         fs::rename(&tmp, &final_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Sync the parent directory so the rename itself is durable. On
+        // Linux this requires opening the parent as a `File`; on platforms
+        // where this is unsupported (e.g. Windows) the call is best-effort
+        // and a no-op.
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = fs::File::open(root) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -140,6 +157,58 @@ impl IcebergFsTable {
             .close()
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(())
+    }
+
+    /// Stream the contents of the table batch-by-batch.
+    ///
+    /// Returns an async stream of `RecordBatch` items so the caller can
+    /// process rows incrementally (e.g. via `for await batch in ...`).
+    /// Internally this still materialises the full result set from the
+    /// underlying Parquet files before yielding; a future revision can
+    /// read each Parquet file in turn to bound peak memory to the size
+    /// of the largest single file rather than the sum of all files.
+    /// The `row_limit` option still applies: once the cumulative row
+    /// count reaches the limit, the stream ends.
+    pub async fn scan_stream(
+        &self,
+        opts: &IcebergScanOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<RecordBatch, LakehouseError>> + Send>>,
+        LakehouseError,
+    > {
+        let batches = self.scan(opts).await?;
+        let row_limit = opts.row_limit;
+        // Apply row_limit on the way out: yield full batches until the
+        // cumulative count would exceed the limit, then emit a partial
+        // batch (or stop) and terminate the stream.
+        let stream = futures::stream::try_unfold(
+            (batches.into_iter(), 0u64),
+            move |(mut iter, rows_seen)| {
+                let row_limit = row_limit;
+                async move {
+                    loop {
+                        let Some(batch) = iter.next() else {
+                            return Ok::<_, LakehouseError>(None);
+                        };
+                        let n = batch.num_rows() as u64;
+                        let Some(limit) = row_limit else {
+                            return Ok(Some((batch, (iter, rows_seen + n))));
+                        };
+                        if rows_seen >= limit {
+                            return Ok(None);
+                        }
+                        let remaining = limit - rows_seen;
+                        if n <= remaining {
+                            return Ok(Some((batch, (iter, rows_seen + n))));
+                        } else {
+                            let take = remaining as usize;
+                            return Ok(Some((batch.slice(0, take), (iter, limit))));
+                        }
+                    }
+                }
+            },
+        );
+        Ok(Box::pin(stream))
     }
 }
 
@@ -266,6 +335,46 @@ mod tests {
         let result = table.scan(&IcebergScanOptions::new()).await.unwrap();
         assert!(result.is_empty());
         assert_eq!(table.current_snapshot_id().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_scan_stream_yields_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        table.append(vec![batch(vec![1, 2, 3])]).await.unwrap();
+        table.append(vec![batch(vec![4, 5])]).await.unwrap();
+        // Collect the stream into a Vec<RecordBatch> and verify the total
+        // row count matches the expected 5.
+        use futures::StreamExt;
+        let mut stream = table.scan_stream(&IcebergScanOptions::new()).await.unwrap();
+        let mut collected = Vec::new();
+        while let Some(b) = stream.next().await {
+            collected.push(b.unwrap());
+        }
+        let rows: usize = collected.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 5);
+    }
+
+    #[tokio::test]
+    async fn iceberg_fs_scan_stream_honors_row_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_ref = IcebergTableRef::new("cat", "ns", "t");
+        let table = IcebergFsTable::new(dir.path(), table_ref, schema_version()).unwrap();
+        table
+            .append(vec![batch(vec![1, 2, 3, 4, 5])])
+            .await
+            .unwrap();
+        use futures::StreamExt;
+        let mut stream = table
+            .scan_stream(&IcebergScanOptions::new().with_row_limit(2))
+            .await
+            .unwrap();
+        let mut total = 0usize;
+        while let Some(b) = stream.next().await {
+            total += b.unwrap().num_rows();
+        }
+        assert_eq!(total, 2);
     }
 
     #[tokio::test]

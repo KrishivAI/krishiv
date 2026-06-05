@@ -44,6 +44,18 @@ pub type SqlResult<T> = Result<T, SqlError>;
 
 // ── Plan cache (single-lock, race-free) ──────────────────────────────────────
 
+/// Whether the [`SqlEngine`] internal builder should attempt to register the
+/// helper window UDFs (`tumble_start` / `tumble_end` / `hop_start` / `hop_end`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowFnRegistration {
+    /// Call `window_functions::register_window_functions`; propagate any error.
+    Register,
+    /// Skip registration entirely; infallible. Used as a fallback by
+    /// [`SqlEngine::new`] when `Register` fails so the engine is still usable
+    /// for non-window queries.
+    Skip,
+}
+
 /// Bounded query-plan cache keyed by query text.
 ///
 /// A single `Mutex<PlanCache>` replaces the previous two-structure approach
@@ -233,7 +245,53 @@ impl Default for SqlEngine {
 
 impl SqlEngine {
     /// Create a local SQL engine.
+    ///
+    /// Window helper UDFs (`tumble_start`, `tumble_end`, `hop_start`, `hop_end`)
+    /// are registered as part of construction. If registration fails the
+    /// engine is still returned — non-window queries work — and a
+    /// `tracing::warn!` is emitted. Use [`SqlEngine::try_new`] when callers
+    /// need to surface the registration error.
     pub fn new() -> Self {
+        match Self::build_local(None, WindowFnRegistration::Register) {
+            Ok(engine) => engine,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "SqlEngine::new: window helper UDF registration failed; \
+                     window SQL functions will be unavailable, other queries are unaffected"
+                );
+                Self::build_local(None, WindowFnRegistration::Skip)
+                    .expect("SqlEngine::build_local with WindowFnRegistration::Skip is infallible")
+            }
+        }
+    }
+
+    /// Create a local SQL engine, propagating window helper registration errors.
+    ///
+    /// Callers that need to abort startup when window functions cannot be
+    /// registered should use this constructor.
+    pub fn try_new() -> SqlResult<Self> {
+        Self::build_local(None, WindowFnRegistration::Register)
+    }
+
+    /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
+    pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self> {
+        Self::build_local(Some(catalog), WindowFnRegistration::Register)
+    }
+
+    /// Internal builder shared by the public constructors.
+    ///
+    /// `krishiv_catalog` is `Some(...)` when the engine should bridge to an
+    /// `InMemoryCatalog`; `None` for a default engine.
+    ///
+    /// `window_fn_registration` controls whether the helper UDFs
+    /// (`tumble_start` / `tumble_end` / `hop_start` / `hop_end`) are
+    /// registered. `Skip` is used as a fallback by [`SqlEngine::new`] when
+    /// `Register` fails; it is infallible.
+    fn build_local(
+        krishiv_catalog: Option<Arc<RwLock<InMemoryCatalog>>>,
+        window_fn_registration: WindowFnRegistration,
+    ) -> SqlResult<Self> {
         // Create streaming_sources first so it can be shared with KafkaTableFactory.
         // DDL-created Kafka tables (CREATE EXTERNAL TABLE … STORED AS KAFKA) then
         // correctly register in is_streaming_query.
@@ -256,53 +314,22 @@ impl SqlEngine {
             .with_table_factories(table_factories)
             .build();
         let context = SessionContext::new_with_state(state);
-        window_functions::register_window_functions(&context)
-            .expect("failed to register window functions");
-        Self {
-            context,
-            krishiv_catalog: None,
-            view_registry: None,
-            udf_registry: None,
-            streaming_sources,
-            has_streaming_sources: Arc::new(AtomicBool::new(false)),
-            udf_limits: None,
-            udf_registry_version: Arc::new(AtomicU64::new(0)),
-            udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
-            plan_cache: Arc::new(Mutex::new(PlanCache::new(PLAN_CACHE_MAX_ENTRIES))),
+        if let Some(catalog) = &krishiv_catalog {
+            context.register_catalog(
+                "krishiv",
+                Arc::new(DataFusionCatalogBridge::new(catalog.clone())),
+            );
         }
-    }
-
-    /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
-    pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self> {
-        let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
-            Arc::new(RwLock::new(std::collections::HashSet::new()));
-
-        let dummy_state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .build();
-        let mut table_factories = dummy_state.table_factories().clone();
-        table_factories.insert(
-            "KAFKA".to_string(),
-            Arc::new(crate::kafka_table::KafkaTableFactory {
-                streaming_sources: streaming_sources.clone(),
-            }),
-        );
-
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(build_single_node_session_config())
-            .with_table_factories(table_factories)
-            .build();
-        let context = SessionContext::new_with_state(state);
-        context.register_catalog(
-            "krishiv",
-            Arc::new(DataFusionCatalogBridge::new(catalog.clone())),
-        );
-        window_functions::register_window_functions(&context)
-            .expect("failed to register window functions");
+        if matches!(window_fn_registration, WindowFnRegistration::Register) {
+            window_functions::register_window_functions(&context).map_err(|e| {
+                SqlError::DataFusion {
+                    message: format!("failed to register window helper UDFs: {e}"),
+                }
+            })?;
+        }
         Ok(Self {
             context,
-            krishiv_catalog: Some(catalog),
+            krishiv_catalog,
             view_registry: None,
             udf_registry: None,
             streaming_sources,
@@ -314,17 +341,54 @@ impl SqlEngine {
         })
     }
 
-    /// Mark a table name as an unbounded streaming source, returning a sender to push batches into it.
+    /// Mark a table name as a bounded streaming source, returning a sender to push batches into it.
+    ///
+    /// The returned sender is a `tokio::sync::mpsc::Sender` with capacity
+    /// [`crate::streaming::CONTINUOUS_TABLE_CHANNEL_CAPACITY`]. When the
+    /// consumer (the DataFusion query plan) is slower than the producer,
+    /// `Sender::send(...).await` will backpressure (block) the producer,
+    /// and `Sender::try_send(...)` will return `TrySendError::Full`
+    /// rather than growing memory without limit. Use
+    /// [`register_streaming_table_with_capacity`] for a non-default
+    /// capacity.
     pub fn register_streaming_table(
         &self,
         name: &str,
         schema: arrow::datatypes::SchemaRef,
-    ) -> SqlResult<tokio::sync::mpsc::UnboundedSender<RecordBatch>> {
+    ) -> SqlResult<tokio::sync::mpsc::Sender<RecordBatch>> {
         let (table, tx) = crate::streaming::create_continuous_table(schema).map_err(|e| {
             SqlError::DataFusion {
                 message: e.to_string(),
             }
         })?;
+        self.context
+            .register_table(name, table)
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
+        self.streaming_sources
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+        self.has_streaming_sources.store(true, Ordering::Release);
+        self.invalidate_plan_cache();
+        Ok(tx)
+    }
+
+    /// Same as [`Self::register_streaming_table`] but with a caller-supplied
+    /// channel capacity. Useful for tests that want to exercise the
+    /// full/empty channel boundary without pushing
+    /// `CONTINUOUS_TABLE_CHANNEL_CAPACITY` (64) batches.
+    pub fn register_streaming_table_with_capacity(
+        &self,
+        name: &str,
+        schema: arrow::datatypes::SchemaRef,
+        capacity: usize,
+    ) -> SqlResult<tokio::sync::mpsc::Sender<RecordBatch>> {
+        let (table, tx) = crate::streaming::create_continuous_table_with_capacity(schema, capacity)
+            .map_err(|e| SqlError::DataFusion {
+                message: e.to_string(),
+            })?;
         self.context
             .register_table(name, table)
             .map_err(|e| SqlError::DataFusion {

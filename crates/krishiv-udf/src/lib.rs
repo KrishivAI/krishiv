@@ -1247,8 +1247,25 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
     ) -> Result<ArrayRef, UdfError> {
         let start = std::time::Instant::now();
 
-        // Explicit time enforcement wrapper.
-        let result = udf.call(batch)?;
+        // Catch panics in user-supplied UDF bodies so a buggy or hostile UDF
+        // cannot take down the DataFusion query plan (and the calling
+        // process). `UdfError::Panic` exists precisely for this case; the
+        // previous implementation let panics propagate and crash the worker.
+        // `AssertUnwindSafe` is sound here because we only re-throw through
+        // the typed error — we never observe the panic payload.
+        let result =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| udf.call(batch))) {
+                Ok(Ok(array)) => array,
+                Ok(Err(error)) => return Err(error),
+                Err(payload) => {
+                    let message = panic_message(&payload);
+                    return Err(UdfError::Panic(format!(
+                        "UDF '{}' panicked during execution: {}",
+                        udf.name(),
+                        message
+                    )));
+                }
+            };
 
         if let Some(max_ms) = limits.max_execution_time_ms
             && start.elapsed().as_millis() as u64 > max_ms
@@ -1289,6 +1306,16 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
         }
 
         Ok(result)
+    }
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 
@@ -1375,5 +1402,74 @@ mod memory_enforcement_tests {
             }
             other => panic!("expected Execution error, got {:?}", other),
         }
+    }
+
+    #[derive(Debug)]
+    struct PanickingUdf;
+
+    impl ScalarUdf for PanickingUdf {
+        fn name(&self) -> &str {
+            "panicking_udf"
+        }
+        fn input_schema(&self) -> &Schema {
+            static SCHEMA: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| Schema::new(vec![Field::new("x", DataType::Int64, true)]))
+        }
+        fn output_field(&self) -> &Field {
+            static FIELD: std::sync::OnceLock<Field> = std::sync::OnceLock::new();
+            FIELD.get_or_init(|| Field::new("x", DataType::Int64, true))
+        }
+        fn call(&self, _batch: &RecordBatch) -> Result<ArrayRef, UdfError> {
+            panic!("deliberate test panic: kaboom");
+        }
+    }
+
+    #[test]
+    fn default_sandboxed_executor_catches_udf_panic() {
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(PanickingUdf));
+        let executor = DefaultSandboxedExecutor;
+        let limits = ResourceLimits::default();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let err = registry
+            .execute_scalar_with_limits("panicking_udf", &batch, &limits, &executor)
+            .unwrap_err();
+
+        match err {
+            UdfError::Panic(message) => {
+                assert!(
+                    message.contains("panicking_udf"),
+                    "udf name in error: {message}"
+                );
+                assert!(
+                    message.contains("kaboom"),
+                    "panic message in error: {message}"
+                );
+            }
+            other => panic!("expected Panic error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panic_message_extracts_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("static str payload");
+        assert_eq!(panic_message(&payload), "static str payload");
+    }
+
+    #[test]
+    fn panic_message_extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned payload"));
+        assert_eq!(panic_message(&payload), "owned payload");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_unknown_payloads() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_message(&payload), "non-string panic payload");
     }
 }

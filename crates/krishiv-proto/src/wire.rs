@@ -451,6 +451,8 @@ pub fn executor_task_assignment_to_wire(
         key_group_range_start: value.key_group_range().start(),
         key_group_range_end: value.key_group_range().end(),
         has_key_group_range: true,
+        cpu_limit_nanos: value.cpu_limit_nanos().unwrap_or(0),
+        memory_limit_bytes: value.memory_limit_bytes().unwrap_or(0),
     }
 }
 
@@ -494,6 +496,12 @@ pub fn executor_task_assignment_from_wire(
             value.key_group_range_start,
             value.key_group_range_end,
         ));
+    }
+    if value.cpu_limit_nanos > 0 {
+        assignment = assignment.with_cpu_limit_nanos(value.cpu_limit_nanos);
+    }
+    if value.memory_limit_bytes > 0 {
+        assignment = assignment.with_memory_limit_bytes(value.memory_limit_bytes);
     }
     Ok(assignment)
 }

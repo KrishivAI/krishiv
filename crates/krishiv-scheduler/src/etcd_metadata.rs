@@ -90,12 +90,29 @@ impl EtcdMetadataStore {
         }
         let mut client = self.client.blocking_lock().clone();
         let handle = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
+            // Drive the async etcd put on a one-shot current-thread runtime
+            // rather than on the parent runtime's handle. The etcd client
+            // internally uses `tokio::spawn` to drive its gRPC stream, so
+            // calling `Handle::current().block_on(...)` from a blocking
+            // thread would never let those spawned tasks run, hanging the
+            // persist call. A fresh current-thread runtime isolates the
+            // async work from the parent runtime entirely.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!(
+                        "etcd metadata snapshot: failed to build one-shot runtime: {e}"
+                    ),
+                })?;
             rt.block_on(client.put(METADATA_SNAPSHOT_KEY, bytes, None))
                 .map_err(|e| SchedulerError::Transport {
                     message: format!("etcd metadata snapshot write failed: {e}"),
                 })
         });
+        // `persist` is called from sync trait methods that may or may not be
+        // inside an async context; use the shared `block_on` helper to drive
+        // the JoinHandle either on the current runtime or on the fallback.
         krishiv_common::async_util::block_on(handle).map_err(|e| SchedulerError::Transport {
             message: format!("spawn_blocking join failed: {e}"),
         })??;

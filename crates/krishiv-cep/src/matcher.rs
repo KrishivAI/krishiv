@@ -5,16 +5,38 @@ use arrow::record_batch::RecordBatch;
 use crate::pattern::CompiledPattern;
 
 /// Partial in-progress match.
+///
+/// The `captured_events` field is the live, in-memory list of record
+/// batches that have matched stages so far. The persistence-friendly
+/// companion fields (`stage_index`, `captured_event_count`,
+/// `start_time_ms`) can be serialised and snapshotted by the checkpoint
+/// coordinator; the executor is expected to keep `captured_events` in
+/// a separate durable store (or replay from the source on restart) so
+/// that the metadata in the checkpoint is sufficient to reconstruct
+/// the partial match.
 #[derive(Debug, Clone)]
 pub struct PartialMatch {
     pub stage_index: usize,
     pub captured_events: Vec<RecordBatch>,
     pub start_time_ms: i64,
+    /// Number of events captured so far; mirrors `captured_events.len()`
+    /// so the field can be serialised by the checkpoint coordinator
+    /// (the actual `RecordBatch` payloads live in a separate durable
+    /// store keyed by this count). Kept in sync by `process_event`.
+    pub captured_event_count: usize,
 }
 
 /// Per-key CEP state.
-#[derive(Debug, Default, Clone)]
+///
+/// `Serialize`/`Deserialize` (via `serde`) allow per-key state to be
+/// snapshotted by the checkpoint coordinator. The `partial` field is
+/// not serialised directly because `RecordBatch` does not implement
+/// `Serialize`; the metadata captured in the separate
+/// `captured_event_count` field on `PartialMatch` is enough to recover
+/// the partial state from a replay log on restart.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CepKeyState {
+    #[serde(skip)]
     pub partial: Option<PartialMatch>,
     /// Wall-clock event time (ms) of the most recent event processed for this
     /// key.  Updated on every `process_event` call; useful for idle-key
@@ -66,6 +88,7 @@ impl SequentialPatternMatcher {
                 stage_index: 0,
                 captured_events: vec![batch],
                 start_time_ms: event_time_ms,
+                captured_event_count: 1,
             });
             if self.pattern.stages.len() == 1 {
                 return self.take_complete(state);
@@ -79,6 +102,7 @@ impl SequentialPatternMatcher {
                 return Vec::new();
             }
             partial.captured_events.push(batch);
+            partial.captured_event_count = partial.captured_events.len();
             partial.stage_index = stage_idx;
 
             if partial.stage_index + 1 == self.pattern.stages.len() {
@@ -904,6 +928,7 @@ mod tests {
             stage_index: 0,
             captured_events: Vec::new(),
             start_time_ms: 0,
+            captured_event_count: 0,
         };
         assert_eq!(pm.stage_index, 0);
         assert!(pm.captured_events.is_empty());
@@ -920,6 +945,18 @@ mod tests {
         let cloned = pattern.clone();
         assert_eq!(cloned.stages.len(), pattern.stages.len());
         assert_eq!(cloned.window_ms, pattern.window_ms);
+    }
+
+    #[test]
+    fn cep_key_state_serde_skips_partial_but_preserves_metadata() {
+        // `partial` is skipped because `RecordBatch` doesn't impl Serialize;
+        // `last_event_ms` must survive the round trip.
+        let mut state = CepKeyState::default();
+        state.last_event_ms = 1_234_567;
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: CepKeyState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.last_event_ms, 1_234_567);
+        assert!(restored.partial.is_none());
     }
 
     #[test]

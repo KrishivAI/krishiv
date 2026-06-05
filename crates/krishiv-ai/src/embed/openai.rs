@@ -57,8 +57,18 @@ pub struct OpenAiEmbeddingModel {
 impl OpenAiEmbeddingModel {
     /// Create an OpenAI embedding client.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>, dimensions: usize) -> Self {
+        // 5 s connect / 60 s request budget per OpenAI embeddings call.
+        // Embedding batches over many texts can take tens of seconds, but
+        // we still cap the call to avoid hanging the embedding pipeline
+        // indefinitely on a stalled TCP connection. Falls back to
+        // `Client::new()` if the builder itself fails.
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             api_key: api_key.into(),
             model: model.into(),
             dimensions,

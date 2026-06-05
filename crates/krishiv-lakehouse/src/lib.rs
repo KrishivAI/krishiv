@@ -293,10 +293,27 @@ pub struct MemoryLakehouseTable {
 impl MemoryLakehouseTable {
     #[doc = "**Beta API**: may change between minor releases."]
     pub fn new(table_ref: IcebergTableRef, schema_version: SchemaVersion) -> Self {
+        Self::with_compaction_limit(table_ref, schema_version, None)
+    }
+
+    /// Construct a [`MemoryLakehouseTable`] with a snapshot-layer compaction limit.
+    ///
+    /// Streaming-write workloads should pass `Some(max)` to prevent unbounded
+    /// memory growth from continuous appends; tests and one-shot batch writes
+    /// can pass `None` (same as [`Self::new`]).
+    pub fn with_compaction_limit(
+        table_ref: IcebergTableRef,
+        schema_version: SchemaVersion,
+        max_snapshot_layers: Option<usize>,
+    ) -> Self {
+        let state = MemoryLakehouseTableState {
+            max_snapshot_layers,
+            ..MemoryLakehouseTableState::default()
+        };
         Self {
             table_ref,
             schema_version,
-            state: tokio::sync::Mutex::new(MemoryLakehouseTableState::default()),
+            state: tokio::sync::Mutex::new(state),
             partition_spec: tokio::sync::Mutex::new(PartitionSpecResolver::new(0)),
         }
     }
@@ -604,6 +621,29 @@ mod tests {
             assert!(snap1.is_some());
             assert!(snap2.is_some());
             assert!(snap2.unwrap() > snap1.unwrap());
+        });
+    }
+
+    #[test]
+    fn memory_table_with_compaction_limit_keeps_data() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Compact on the first layer — every append beyond the first
+            // merges the previous layer into one, so all rows are still
+            // readable.
+            let table = MemoryLakehouseTable::with_compaction_limit(
+                make_table_ref(),
+                make_schema_version(),
+                Some(1),
+            );
+
+            for i in 0i64..20 {
+                table.append(vec![make_batch(vec![i])]).await.unwrap();
+            }
+
+            let result = table.scan(&IcebergScanOptions::new()).await.unwrap();
+            let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 20, "compaction must preserve all rows");
         });
     }
 

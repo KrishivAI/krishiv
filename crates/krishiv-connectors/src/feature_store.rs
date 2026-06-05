@@ -190,9 +190,14 @@ impl FeatureStoreSink {
         writer
             .write(&batch)
             .map_err(|e| ConnectorError::Parquet(e.to_string()))?;
-        writer
-            .close()
+        let file = writer
+            .into_inner()
             .map_err(|e| ConnectorError::Parquet(e.to_string()))?;
+        // Durability: the Parquet writer buffers writes; into_inner() does not
+        // guarantee the bytes reached disk. `sync_all()` makes the fragment
+        // crash-safe so a power loss between close and the next checkpoint
+        // cannot lose the just-written feature batch.
+        file.sync_all().map_err(ConnectorError::Io)?;
         Ok(())
     }
 

@@ -18,6 +18,7 @@ use krishiv_proto::{
 };
 use krishiv_sql::SqlEngine;
 use krishiv_state::StateBackend;
+use krishiv_udf::ResourceLimits;
 
 use crate::{
     ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierInjector,
@@ -1009,6 +1010,12 @@ impl ExecutorTaskRunner {
         let model =
             crate::ExecutionModel::from_fragment(assignment.plan_fragment().description().trim());
 
+        // Build resource limits from assignment (propagated from job spec).
+        let udf_limits = krishiv_udf::ResourceLimits {
+            max_memory_bytes: assignment.memory_limit_bytes(),
+            max_execution_time_ms: assignment.cpu_limit_nanos().map(|n| (n / 1_000_000) as u64),
+        };
+
         let execute_result = match model {
             crate::ExecutionModel::Batch => {
                 // Batch tasks respect task_timeout_secs: they are expected to
@@ -1019,7 +1026,7 @@ impl ExecutorTaskRunner {
                     .unwrap_or(DEFAULT_BATCH_TASK_TIMEOUT_SECS);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_batch_fragment(self, &assignment),
+                    execute_batch_fragment(self, &assignment, udf_limits),
                 )
                 .await
                 {
@@ -1039,7 +1046,7 @@ impl ExecutorTaskRunner {
                     .unwrap_or(DEFAULT_STREAMING_TASK_TIMEOUT_SECS);
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    execute_streaming_fragment(self, &assignment),
+                    execute_streaming_fragment(self, &assignment, udf_limits.clone()),
                 )
                 .await
                 {
@@ -1121,8 +1128,9 @@ impl ExecutorTaskRunner {
     pub(crate) async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
+        udf_limits: ResourceLimits,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_batch_fragment(self, assignment).await
+        execute_batch_fragment(self, assignment, udf_limits).await
     }
 
     /// Execute a streaming (continuous) stage fragment.
@@ -1130,8 +1138,9 @@ impl ExecutorTaskRunner {
     pub(crate) async fn execute_streaming_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
+        udf_limits: ResourceLimits,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_streaming_fragment(self, assignment).await
+        execute_streaming_fragment(self, assignment, udf_limits).await
     }
 
     pub(crate) async fn send_task_status<S>(

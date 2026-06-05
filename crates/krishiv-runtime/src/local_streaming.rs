@@ -66,7 +66,7 @@ pub fn execute_windowed_stream(
     spec: &LocalWindowExecutionSpec,
 ) -> Result<Vec<RecordBatch>, RuntimeError> {
     let plan_spec = spec.to_plan_spec();
-    execute_bounded_window(input_batches, &plan_spec)
+    execute_bounded_window(input_batches, &plan_spec, None)
         .map_err(|e| RuntimeError::transport(e.to_string()))
 }
 
@@ -87,7 +87,7 @@ pub fn execute_streaming_window(
     RuntimeError,
 > {
     let plan_spec = spec.to_plan_spec();
-    krishiv_exec::execute_streaming_window(input, plan_spec)
+    krishiv_exec::execute_streaming_window(input, plan_spec, None)
         .map_err(|e| RuntimeError::transport(e.to_string()))
 }
 

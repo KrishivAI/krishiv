@@ -1063,6 +1063,11 @@ pub struct ExecutorTaskAssignment {
     /// This is the typed replacement for the old string heuristics
     /// ("stream:loop:", "stream:continuous:", etc.).
     requires_reattach: bool,
+
+    /// CPU time limit for this task in nanoseconds (from job spec).
+    cpu_limit_nanos: Option<u64>,
+    /// Memory limit for this task in bytes (from job spec).
+    memory_limit_bytes: Option<u64>,
 }
 
 impl ExecutorTaskAssignment {
@@ -1091,6 +1096,8 @@ impl ExecutorTaskAssignment {
             shuffle_read: None,
             key_group_range: KeyGroupRange::full(),
             requires_reattach: false,
+            cpu_limit_nanos: None,
+            memory_limit_bytes: None,
         }
     }
 
@@ -1229,6 +1236,30 @@ impl ExecutorTaskAssignment {
     /// Inclusive key-group range owned by this task.
     pub fn key_group_range(&self) -> KeyGroupRange {
         self.key_group_range
+    }
+
+    /// Attach CPU time limit for this task.
+    #[must_use]
+    pub fn with_cpu_limit_nanos(mut self, nanos: u64) -> Self {
+        self.cpu_limit_nanos = Some(nanos);
+        self
+    }
+
+    /// Attach memory limit for this task.
+    #[must_use]
+    pub fn with_memory_limit_bytes(mut self, bytes: u64) -> Self {
+        self.memory_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// CPU time limit for this task in nanoseconds, if set.
+    pub fn cpu_limit_nanos(&self) -> Option<u64> {
+        self.cpu_limit_nanos
+    }
+
+    /// Memory limit for this task in bytes, if set.
+    pub fn memory_limit_bytes(&self) -> Option<u64> {
+        self.memory_limit_bytes
     }
 }
 

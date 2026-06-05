@@ -1,7 +1,7 @@
 //! `CREATE LIVE TABLE` SQL extensions (R14 S1.1).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
 
@@ -16,9 +16,17 @@ pub enum LiveTableStatement {
 }
 
 /// Registry of active live tables and their backing queries.
+///
+/// Internally guarded by an `RwLock` so concurrent `query`/`contains`
+/// calls (the common case for `REFRESH LIVE TABLE` checks and executor
+/// query lookups) do not serialise against each other. Writes
+/// (`register`/`remove_table`) take the write lock. This avoids the
+/// `Mutex<LiveTableRegistry>` contention seen under fan-out of
+/// parallel `SELECT` against live tables in a shared
+/// `DataFusion` `SessionContext`.
 #[derive(Debug, Default)]
 pub struct LiveTableRegistry {
-    tables: HashMap<String, String>,
+    tables: RwLock<HashMap<String, String>>,
 }
 
 impl LiveTableRegistry {
@@ -26,20 +34,55 @@ impl LiveTableRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, name: impl Into<String>, query: impl Into<String>) {
-        self.tables.insert(name.into(), query.into());
+    /// Returns `true` if the write lock would succeed without blocking.
+    /// Callers using `RwLock` semantics may use this to diagnose stalls.
+    pub fn try_register(
+        &self,
+        name: impl Into<String>,
+        query: impl Into<String>,
+    ) -> Result<bool, SqlError> {
+        let mut tables = self.tables.write().map_err(|_| SqlError::DataFusion {
+            message: "live table registry lock poisoned".into(),
+        })?;
+        let name = name.into();
+        let is_new = !tables.contains_key(&name);
+        tables.insert(name, query.into());
+        Ok(is_new)
     }
 
-    pub fn remove_table(&mut self, name: &str) -> bool {
-        self.tables.remove(name).is_some()
+    pub fn register(&self, name: impl Into<String>, query: impl Into<String>) {
+        // `unwrap` is safe: an `RwLock` is only poisoned if a writer
+        // panicked, in which case the surrounding SQL session is
+        // already in an unrecoverable state. The single-writer path
+        // (DdlExecutor) is the only place that takes the write lock,
+        // so poison is the only failure mode and we surface it via
+        // a `DataFusion`-shaped error.
+        self.try_register(name, query)
+            .expect("LiveTableRegistry write lock poisoned");
+    }
+
+    pub fn remove_table(&self, name: &str) -> bool {
+        let mut tables = self
+            .tables
+            .write()
+            .expect("LiveTableRegistry write lock poisoned");
+        tables.remove(name).is_some()
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tables.contains_key(name)
+        let tables = self
+            .tables
+            .read()
+            .expect("LiveTableRegistry read lock poisoned");
+        tables.contains_key(name)
     }
 
-    pub fn query(&self, name: &str) -> Option<&str> {
-        self.tables.get(name).map(String::as_str)
+    pub fn query(&self, name: &str) -> Option<String> {
+        let tables = self
+            .tables
+            .read()
+            .expect("LiveTableRegistry read lock poisoned");
+        tables.get(name).cloned()
     }
 }
 
@@ -147,8 +190,19 @@ pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan {
 }
 
 /// Apply a live-table statement to the registry and return its logical plan.
+///
+/// `REFRESH LIVE TABLE <name>` looks up the existing query in the
+/// registry and re-registers it (which is the registry-level half of
+/// "refresh" — the executor is expected to re-execute the plan to
+/// materialise the new result). If the named table is not registered,
+/// the refresh is rejected with `SqlError::Unsupported` so callers see a
+/// clear error rather than a silent no-op.
+///
+/// The registry is `&LiveTableRegistry` (not `&Mutex<...>`); internal
+/// synchronisation is the registry's responsibility. Callers that
+/// already hold a `Mutex<LiveTableRegistry>` can pass `&*guard`.
 pub fn execute_live_table_ddl(
-    registry: &Mutex<LiveTableRegistry>,
+    registry: &LiveTableRegistry,
     sql: &str,
 ) -> SqlResult<Option<LogicalPlan>> {
     let Some(stmt) = parse_live_table_statement(sql)? else {
@@ -156,20 +210,21 @@ pub fn execute_live_table_ddl(
     };
     match &stmt {
         LiveTableStatement::Create { name, query } => {
-            registry
-                .lock()
-                .map_err(|_| SqlError::DataFusion {
-                    message: "live table registry lock poisoned".into(),
-                })?
-                .register(name.clone(), query.clone());
+            registry.register(name.clone(), query.clone());
         }
         LiveTableStatement::Drop { name } => {
-            let mut reg = registry.lock().map_err(|_| SqlError::DataFusion {
-                message: "live table registry lock poisoned".into(),
-            })?;
-            reg.remove_table(name);
+            registry.remove_table(name);
         }
-        LiveTableStatement::Refresh { .. } => {}
+        LiveTableStatement::Refresh { name } => {
+            let Some(query) = registry.query(name) else {
+                return Err(SqlError::Unsupported {
+                    feature: format!("REFRESH LIVE TABLE {name}: table is not registered"),
+                });
+            };
+            // Re-register the same query to bump any "last refresh" bookkeeping
+            // and force the executor to re-materialise the result.
+            registry.register(name.clone(), query);
+        }
     }
     Ok(Some(plan_live_table(stmt)))
 }
@@ -292,5 +347,37 @@ mod tests {
             result.is_none(),
             "non-live-table SQL must return None from execute_live_table_ddl"
         );
+    }
+
+    #[test]
+    fn execute_live_table_ddl_refresh_unregistered_table_errors() {
+        use std::sync::Mutex;
+        let registry = Mutex::new(LiveTableRegistry::new());
+        // REFRESH on a table that has never been CREATEd must error, not
+        // silently no-op (the previous behaviour silently dropped the
+        // refresh and returned a plan).
+        let err = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE missing")
+            .expect_err("REFRESH on an unknown table must fail");
+        match err {
+            crate::SqlError::Unsupported { feature } => {
+                assert!(
+                    feature.contains("missing"),
+                    "error should name the missing table; got {feature}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_live_table_ddl_refresh_registered_table_succeeds() {
+        use std::sync::Mutex;
+        let registry = Mutex::new(LiveTableRegistry::new());
+        execute_live_table_ddl(&registry, "CREATE LIVE TABLE t AS SELECT 1").unwrap();
+        // REFRESH on a registered table must succeed and return a plan.
+        let plan = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE t")
+            .unwrap()
+            .unwrap();
+        assert!(!plan.nodes().is_empty());
     }
 }

@@ -89,6 +89,13 @@ impl ExecutorAssignmentInbox {
 
     /// Store one received assignment and report whether it was newly queued or
     /// already present.
+    ///
+    /// Lock order: the `seen` set and `assignments` queue are both protected by
+    /// their own `RwLock`. We acquire `seen` *first* and hold it across the
+    /// capacity check + insert to prevent the TOCTOU race that the prior
+    /// implementation had: a duplicate `(job, task, attempt)` could observe
+    /// `seen.insert == true` and then be rejected on capacity, leaving the
+    /// `seen` set with a stale entry that blocks later legitimate re-pushes.
     pub fn push_with_outcome(
         &self,
         assignment: ExecutorTaskAssignment,
@@ -98,16 +105,16 @@ impl ExecutorAssignmentInbox {
             assignment.task_id().clone(),
             assignment.attempt_id(),
         );
-        {
-            let mut seen = self
-                .seen
-                .write()
-                .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
-            if !seen.insert(key.clone()) {
-                return Ok(AssignmentPushOutcome::Duplicate);
-            }
+        let mut seen = self
+            .seen
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+        if !seen.insert(key.clone()) {
+            return Ok(AssignmentPushOutcome::Duplicate);
         }
-
+        // Hold `seen` while we check capacity and insert. If capacity rejects
+        // the push, we MUST undo the `seen.insert` so the coordinator can retry
+        // — see the cleanup below.
         let mut q = self
             .assignments
             .write()
@@ -116,11 +123,11 @@ impl ExecutorAssignmentInbox {
         if let Some(max) = self.max_capacity
             && q.len() >= max
         {
-            // Remove from seen set on rejection so coordinator can retry.
-            let mut seen = self
-                .seen
-                .write()
-                .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
+            // Roll back the optimistic `seen.insert` so the coordinator can
+            // retry once capacity is available. The mutex ordering (seen →
+            // assignments → seen) means a concurrent caller cannot observe an
+            // inconsistent state where `seen` claims the key but the queue
+            // does not.
             seen.remove(&key);
             return Err(ExecutorError::AssignmentQueueFull {
                 current: q.len(),
@@ -145,7 +152,18 @@ impl ExecutorAssignmentInbox {
     ///
     /// Also marks the task id as cancelled so the runner can skip execution even
     /// if the task has already been popped from the queue.
+    ///
+    /// Lock order: `seen` → `assignments` → `cancelled_tasks`. This matches the
+    /// order used by [`push_with_outcome`] (`seen` → `assignments`), so a
+    /// concurrent `push` and `cancel_task` cannot deadlock via AB-BA. We hold
+    /// `seen`'s write-lock across the queue mutation so that no `push` can
+    /// observe a key already removed from `assignments` while still seeing it
+    /// in `seen` (which would block a legitimate re-push).
     pub fn cancel_task(&self, task_id: &krishiv_proto::TaskId) -> ExecutorResult<bool> {
+        let mut seen = self
+            .seen
+            .write()
+            .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
         let mut assignments = self
             .assignments
             .write()
@@ -163,17 +181,12 @@ impl ExecutorAssignmentInbox {
             }
             !remove
         });
+        for key in &removed_keys {
+            seen.remove(key);
+        }
         let removed = assignments.len() != before;
         drop(assignments);
-        if !removed_keys.is_empty() {
-            let mut seen = self
-                .seen
-                .write()
-                .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?;
-            for key in removed_keys {
-                seen.remove(&key);
-            }
-        }
+        drop(seen);
         self.cancelled_tasks
             .write()
             .map_err(|_| ExecutorError::AssignmentInboxPoisoned)?

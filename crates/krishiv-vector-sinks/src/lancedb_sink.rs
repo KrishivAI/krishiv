@@ -280,7 +280,19 @@ impl VectorSink for LanceDbSink {
             .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
         for id in ids {
             if let Some(path) = guard.remove(id) {
-                let _ = std::fs::remove_file(path);
+                // Filesystem deletes can fail transiently (file held open by
+                // a reader, NFS hiccup). Log at warn so the failure is
+                // observable; the in-memory index is already updated, so
+                // the next query will return the right results.
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        sink = "lancedb",
+                        id = %id,
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove Parquet fragment during delete_by_ids"
+                    );
+                }
             }
         }
         Ok(())

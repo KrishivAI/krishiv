@@ -5,6 +5,7 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::TryStreamExt;
 use krishiv_plan::{ExecutionKind, PhysicalPlan};
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::flight_protocol::{
@@ -22,6 +23,11 @@ const RETRY_DELAYS_MS: &[u64] = &[100, 500, 2_000];
 const FLIGHT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Per-request timeout for in-flight gRPC calls.
 const FLIGHT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Health check interval for Flight endpoints.
+const FLIGHT_HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
+/// Maximum consecutive health check failures before marking endpoint unhealthy.
+const FLIGHT_MAX_HEALTH_FAILURES: u32 = 3;
 
 /// Returns `true` for tonic status codes that indicate a transient failure
 /// worth retrying (e.g. network blip, server briefly overloaded).
@@ -132,6 +138,18 @@ pub struct FlightClientPool {
     endpoints: Vec<String>,
     current: Arc<std::sync::atomic::AtomicUsize>,
     channel: Arc<tokio::sync::RwLock<Option<Channel>>>,
+    /// Per-endpoint health state for failover decisions.
+    health_state: Arc<tokio::sync::RwLock<Vec<EndpointHealth>>>,
+    /// Background health check task handle.
+    health_check_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct EndpointHealth {
+    endpoint: String,
+    consecutive_failures: u32,
+    last_check: Option<std::time::Instant>,
+    is_healthy: bool,
 }
 
 impl FlightClientPool {
@@ -140,10 +158,18 @@ impl FlightClientPool {
         // Normalize eagerly so a bad URL fails at construction rather than
         // surfacing as an opaque tonic error on the first request.
         let endpoint = normalize_flight_endpoint(&url).unwrap_or_else(|_| url.trim().to_string());
+        let health = EndpointHealth {
+            endpoint: endpoint.clone(),
+            consecutive_failures: 0,
+            last_check: None,
+            is_healthy: true,
+        };
         Self {
             endpoints: vec![endpoint],
             current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             channel: Arc::new(tokio::sync::RwLock::new(None)),
+            health_state: Arc::new(tokio::sync::RwLock::new(vec![health])),
+            health_check_handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -151,7 +177,14 @@ impl FlightClientPool {
         let raw = url.into();
         match normalize_flight_endpoint(&raw) {
             Ok(endpoint) => {
-                self.endpoints.push(endpoint);
+                self.endpoints.push(endpoint.clone());
+                let health = EndpointHealth {
+                    endpoint,
+                    consecutive_failures: 0,
+                    last_check: None,
+                    is_healthy: true,
+                };
+                self.health_state.blocking_write().push(health);
             }
             Err(e) => {
                 tracing::warn!(
@@ -167,6 +200,119 @@ impl FlightClientPool {
     pub fn flight_url(&self) -> &str {
         let idx = self.current.load(std::sync::atomic::Ordering::Relaxed);
         self.endpoints.get(idx).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Start background health checks for all endpoints.
+    pub async fn start_health_checks(&self) {
+        let mut handle_guard = self.health_check_handle.lock().await;
+        if handle_guard.is_some() {
+            return; // Already running
+        }
+
+        let pool = self.clone();
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(FLIGHT_HEALTH_CHECK_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                pool.run_health_checks().await;
+            }
+        });
+        *handle_guard = Some(handle);
+    }
+
+    /// Stop background health checks.
+    pub async fn stop_health_checks(&self) {
+        let mut handle_guard = self.health_check_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+        }
+    }
+
+    async fn run_health_checks(&self) {
+        let endpoints: Vec<String> = {
+            let health = self.health_state.read().await;
+            health.iter().map(|h| h.endpoint.clone()).collect()
+        };
+
+        for endpoint in endpoints {
+            let is_healthy = Self::check_endpoint_health(&endpoint).await;
+            self.update_endpoint_health(&endpoint, is_healthy).await;
+        }
+
+        // If current endpoint is unhealthy, failover to next healthy
+        self.failover_if_needed().await;
+    }
+
+    async fn check_endpoint_health(endpoint: &str) -> bool {
+        // Simple health check: try to connect with short timeout
+        let endpoint_str = endpoint.to_string();
+        let connect_fut = async {
+            let ep = Endpoint::from_shared(endpoint_str)?;
+            ep.connect_timeout(Duration::from_secs(2)).connect().await
+        };
+        match tokio::time::timeout(Duration::from_secs(5), connect_fut).await {
+            Ok(Ok(_)) => true,
+            _ => false,
+        }
+    }
+
+    async fn update_endpoint_health(&self, endpoint: &str, is_healthy: bool) {
+        let mut health = self.health_state.write().await;
+        if let Some(h) = health.iter_mut().find(|h| h.endpoint == endpoint) {
+            h.last_check = Some(std::time::Instant::now());
+            if is_healthy {
+                h.consecutive_failures = 0;
+                h.is_healthy = true;
+            } else {
+                h.consecutive_failures = h.consecutive_failures.saturating_add(1);
+                if h.consecutive_failures >= FLIGHT_MAX_HEALTH_FAILURES {
+                    h.is_healthy = false;
+                    tracing::warn!(endpoint = %endpoint, "Flight endpoint marked unhealthy after {} consecutive failures", FLIGHT_MAX_HEALTH_FAILURES);
+                }
+            }
+        }
+    }
+
+    async fn failover_if_needed(&self) {
+        let current_idx = self.current.load(std::sync::atomic::Ordering::Acquire);
+        let should_failover = {
+            let health = self.health_state.read().await;
+            health
+                .get(current_idx)
+                .map(|h| !h.is_healthy)
+                .unwrap_or(false)
+        };
+
+        if should_failover {
+            let health = self.health_state.read().await;
+            let len = health.len();
+            for i in 1..len {
+                let next_idx = (current_idx + i) % len;
+                if health.get(next_idx).map(|h| h.is_healthy).unwrap_or(false) {
+                    self.current
+                        .store(next_idx, std::sync::atomic::Ordering::Release);
+                    // Clear cached channel so new connection is established
+                    let mut channel = self.channel.write().await;
+                    *channel = None;
+                    tracing::info!(
+                        from = current_idx,
+                        to = next_idx,
+                        "Flight client failover to healthy endpoint"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get the current endpoint health status.
+    pub async fn endpoint_health(&self) -> Vec<(String, bool, u32)> {
+        let health = self.health_state.read().await;
+        health
+            .iter()
+            .map(|h| (h.endpoint.clone(), h.is_healthy, h.consecutive_failures))
+            .collect()
     }
 
     pub async fn get_channel(&self) -> RuntimeResult<Channel> {
@@ -187,25 +333,59 @@ impl FlightClientPool {
             return Ok(ch.clone()); // another waiter already connected
         }
 
-        let endpoint = self.flight_url().to_string();
+        // Find a healthy endpoint to connect to
+        let endpoint = self.select_healthy_endpoint().await?;
         match connect_flight_channel(&endpoint).await {
             Ok(ch) => {
                 *guard = Some(ch.clone());
                 Ok(ch)
             }
-            Err(e) if self.endpoints.len() > 1 => {
-                // Two threads racing here both compute (current + 1) % len and
-                // write the same next-index value — no inconsistency is possible.
-                // AcqRel provides sequentially-consistent visibility across cores.
-                self.current.store(
-                    (self.current.load(std::sync::atomic::Ordering::Acquire) + 1)
-                        % self.endpoints.len(),
-                    std::sync::atomic::Ordering::Release,
-                );
-                // Channel is already None (we never set it); no need to clear.
+            Err(e) => {
+                // Mark this endpoint as unhealthy on connection failure
+                self.mark_endpoint_unhealthy(&endpoint).await;
+                // Try failover
+                if self.endpoints.len() > 1 {
+                    self.failover_if_needed().await;
+                }
                 Err(e)
             }
-            Err(e) => Err(e),
+        }
+    }
+
+    async fn select_healthy_endpoint(&self) -> RuntimeResult<String> {
+        let health = self.health_state.read().await;
+        let current_idx = self.current.load(std::sync::atomic::Ordering::Acquire);
+        let len = health.len();
+
+        // First try current endpoint if healthy
+        if let Some(h) = health.get(current_idx) {
+            if h.is_healthy {
+                return Ok(h.endpoint.clone());
+            }
+        }
+
+        // Search for any healthy endpoint
+        for i in 0..len {
+            let idx = (current_idx + i) % len;
+            if let Some(h) = health.get(idx) {
+                if h.is_healthy {
+                    return Ok(h.endpoint.clone());
+                }
+            }
+        }
+
+        // No healthy endpoints - return current anyway (will fail with clear error)
+        Ok(self.flight_url().to_string())
+    }
+
+    async fn mark_endpoint_unhealthy(&self, endpoint: &str) {
+        let mut health = self.health_state.write().await;
+        if let Some(h) = health.iter_mut().find(|h| h.endpoint == endpoint) {
+            h.consecutive_failures = h.consecutive_failures.saturating_add(1);
+            if h.consecutive_failures >= FLIGHT_MAX_HEALTH_FAILURES {
+                h.is_healthy = false;
+                tracing::warn!(endpoint = %endpoint, "Flight endpoint marked unhealthy on connection failure");
+            }
         }
     }
 
@@ -305,11 +485,11 @@ impl FlightClientPool {
     ) -> RuntimeResult<Vec<u8>> {
         use futures::StreamExt;
         let ep_idx = shard_idx % self.endpoints.len();
-        let endpoint = self.endpoints[ep_idx].clone();
+        let _endpoint = self.endpoints[ep_idx].clone();
         let body = action.to_action_body()?;
         let action_type = action.action_type();
         with_retry(|| async {
-            let channel = connect_flight_channel(&endpoint).await?;
+            let channel = self.get_shard_channel(ep_idx).await?;
             let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
             let req = arrow_flight::Action {
                 r#type: action_type.clone(),
@@ -330,6 +510,18 @@ impl FlightClientPool {
             Ok(buf)
         })
         .await
+    }
+
+    /// Get a channel for a specific shard endpoint with health tracking.
+    async fn get_shard_channel(&self, shard_idx: usize) -> RuntimeResult<Channel> {
+        let endpoint = self.endpoints[shard_idx].clone();
+        match connect_flight_channel(&endpoint).await {
+            Ok(ch) => Ok(ch),
+            Err(e) => {
+                self.mark_endpoint_unhealthy(&endpoint).await;
+                Err(e)
+            }
+        }
     }
 
     /// Stream SQL results lazily — returns batches one at a time without
@@ -358,6 +550,17 @@ impl FlightClientPool {
             .await
             .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
         Ok(stream.map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}"))))
+    }
+}
+
+impl Drop for FlightClientPool {
+    fn drop(&mut self) {
+        // Try to stop health checks - best effort
+        if let Ok(mut handle_guard) = self.health_check_handle.try_lock() {
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
     }
 }
 

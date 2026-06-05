@@ -138,6 +138,8 @@ message ExecutorTaskAssignment {
   uint32 key_group_range_start = 12;
   uint32 key_group_range_end = 13;
   bool has_key_group_range = 14;
+  uint64 cpu_limit_nanos = 15;
+  uint64 memory_limit_bytes = 16;
 }
 
 message InputPartition {

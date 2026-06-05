@@ -13,9 +13,18 @@ use crate::runner::{
 };
 use crate::{ExecutorError, ExecutorResult};
 
+/// Recognised SQL fragment prefixes.
+pub(crate) const SQL_FRAGMENT_PREFIX: &str = "sql:";
+
+/// Extract the SQL query from a `sql:<query>` fragment string.
+///
+/// The prefix must appear at the **start** of the fragment. Earlier versions
+/// used `split_once("sql:")` which mis-parsed SQL whose body contained the
+/// literal substring `sql:` (e.g. a string literal `'sql:abc'`); the prefix
+/// is now anchored to position 0 to make routing deterministic.
 pub(crate) fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
-    let (_, query) = fragment.split_once("sql:")?;
-    let query = query.trim();
+    let rest = fragment.strip_prefix(SQL_FRAGMENT_PREFIX)?;
+    let query = rest.trim();
     (!query.is_empty()).then_some(query)
 }
 

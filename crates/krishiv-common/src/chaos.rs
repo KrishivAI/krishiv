@@ -1,5 +1,18 @@
 #![forbid(unsafe_code)]
 
+/// Typed error returned by [`FaultInjector::apply`].
+#[derive(Debug, thiserror::Error)]
+pub enum ChaosError {
+    /// The chaos injector dropped the operation entirely (no `operation()`
+    /// call was made; the caller can decide whether to retry).
+    #[error("operation dropped by chaos injector")]
+    Dropped,
+    /// The chaos injector synthesised an error with the given message
+    /// instead of running the operation.
+    #[error("injected fault: {0}")]
+    Injected(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultMode {
     Delay { duration_ms: u64 },
@@ -31,10 +44,11 @@ impl FaultInjector {
         &self.faults[idx % self.faults.len()]
     }
 
+    /// Apply the next fault, returning a typed [`ChaosError`] on failure.
     pub fn apply<F, Fut, T>(
         &self,
         operation: F,
-    ) -> impl std::future::Future<Output = Result<T, String>>
+    ) -> impl std::future::Future<Output = Result<T, ChaosError>>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = T>,
@@ -47,8 +61,8 @@ impl FaultInjector {
                     tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
                     Ok(operation().await)
                 }
-                FaultMode::Error { message } => Err(message),
-                FaultMode::Drop => Err(String::from("operation dropped by chaos injector")),
+                FaultMode::Error { message } => Err(ChaosError::Injected(message)),
+                FaultMode::Drop => Err(ChaosError::Dropped),
             }
         }
     }

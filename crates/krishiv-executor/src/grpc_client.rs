@@ -27,10 +27,22 @@ impl SharedLeaseGeneration {
 
     pub fn get(&self) -> LeaseGeneration {
         let raw = self.inner.load(Ordering::Acquire);
-        // `LeaseGeneration::try_new` rejects 0 — `SharedLeaseGeneration` is
-        // initialized via `LeaseGeneration::initial()` (=1) and only ever
-        // monotonically increased, so this should always succeed.
-        LeaseGeneration::try_new(raw.max(1)).unwrap_or_else(|_| LeaseGeneration::initial())
+        // `LeaseGeneration::try_new` rejects 0. A coordinator that sends a
+        // 0-lease indicates "uninitialized" / "fence lost" — surface this as
+        // `LeaseGeneration::initial()` (the most conservative valid value)
+        // rather than silently coercing 0 → 1, which would let a fenced-off
+        // coordinator continue making progress.
+        match LeaseGeneration::try_new(raw) {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!(
+                    raw = raw,
+                    "SharedLeaseGeneration::get observed a zero raw value; \
+                     coercing to LeaseGeneration::initial() as a safe default"
+                );
+                LeaseGeneration::initial()
+            }
+        }
     }
 
     pub fn set(&self, lease: LeaseGeneration) {

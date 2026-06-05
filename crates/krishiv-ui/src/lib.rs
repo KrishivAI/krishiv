@@ -84,18 +84,55 @@ impl IntoResponse for UiError {
     }
 }
 
+/// Resolve the UI bearer token from `KRISHIV_UI_TOKEN` (inline) or
+/// `KRISHIV_UI_TOKEN_FILE` (path to a file containing the token).
+///
+/// The file-based variant is preferred in production because it lets
+/// operators mount a Secret as a file and rotate the token without
+/// restarting the process. If both are set, the inline `KRISHIV_UI_TOKEN`
+/// wins (back-compat). If the file is unreadable, an empty string is
+/// returned (treated as no token, i.e. anonymous router). Trimmed
+/// whitespace at the start/end of the file contents is stripped so a
+/// trailing newline in a Secret does not break the comparison.
+fn resolve_ui_token() -> Option<String> {
+    if let Ok(value) = std::env::var("KRISHIV_UI_TOKEN") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    if let Ok(path) = std::env::var("KRISHIV_UI_TOKEN_FILE") {
+        if path.is_empty() {
+            return None;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "krishiv-ui: KRISHIV_UI_TOKEN_FILE='{path}' could not be read: {e}; \
+                     falling back to anonymous router"
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Build the R2 UI router.
 ///
-/// `KRISHIV_UI_TOKEN` is consulted at router-construction time. When set, all
-/// `/api/v1/...` and `/ui/...` routes require a matching `Authorization:
-/// Bearer <token>` header. `/healthz`, `/readyz`, `/metrics`, `/assets/*`, and
-/// the root redirect stay anonymous so platform probes keep working without
-/// leaking snapshot data.
+/// `KRISHIV_UI_TOKEN` (inline) or `KRISHIV_UI_TOKEN_FILE` (path) is
+/// consulted at router-construction time. When set, all `/api/v1/...`
+/// and `/ui/...` routes require a matching `Authorization: Bearer
+/// <token>` header. `/healthz`, `/readyz`, `/metrics`, `/assets/*`, and
+/// the root redirect stay anonymous so platform probes keep working
+/// without leaking snapshot data.
 pub fn router(state: UiState) -> Router {
-    let token = std::env::var("KRISHIV_UI_TOKEN")
-        .ok()
-        .filter(|value| !value.is_empty());
-    router_with_token(state, token.as_deref())
+    router_with_token(state, resolve_ui_token().as_deref())
 }
 
 /// Build the R2 UI router with an explicit auth token. When `Some`, the same

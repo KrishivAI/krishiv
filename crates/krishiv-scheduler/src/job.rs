@@ -1254,6 +1254,48 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
             }
         }
     }
+    // Field-by-field validation: catch obviously bad inputs before they
+    // propagate into the executor or checkpoint store. The error messages
+    // include the offending field name so the caller can fix the spec
+    // rather than seeing an opaque runtime failure.
+    if spec.job_id().as_str().is_empty() {
+        return Err(SchedulerError::InvalidJob {
+            message: String::from("job_id must not be empty"),
+        });
+    }
+    if let Some(namespace) = spec.namespace_id() {
+        if namespace.is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from("namespace_id must not be empty when present"),
+            });
+        }
+        if namespace.len() > 253 {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "namespace_id '{}' exceeds 253 chars (DNS-1123 label limit)",
+                    namespace
+                ),
+            });
+        }
+    }
+    if let Some(interval) = spec.checkpoint_interval_ms() {
+        if interval == 0 {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from(
+                    "checkpoint_interval_ms must be > 0; use None to disable checkpointing",
+                ),
+            });
+        }
+    }
+    if let Some(path) = spec.checkpoint_storage_path() {
+        if path.is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from(
+                    "checkpoint_storage_path must not be empty when checkpoint_interval_ms is set",
+                ),
+            });
+        }
+    }
     Ok(())
 }
 

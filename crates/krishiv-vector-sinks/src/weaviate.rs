@@ -28,8 +28,17 @@ impl WeaviateSink {
     ) -> VectorSinkResult<Self> {
         let class_name = class_name.into();
         validate_identifier(&class_name)?;
+        // 5 s connect / 30 s request budget per Weaviate call. Without a
+        // request timeout, a stalled TCP connection or unresponsive Weaviate
+        // host would hang the vector-ingest pipeline indefinitely. Falls
+        // back to `Client::new()` if the builder itself fails.
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Ok(Self {
-            client: Client::new(),
+            client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             class_name,
             api_key,
@@ -94,11 +103,15 @@ impl VectorSink for WeaviateSink {
                 .send()
                 .await
                 .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
-            if !response.status().is_success()
-                && response.status() != reqwest::StatusCode::NOT_FOUND
-            {
-                return Err(VectorSinkError::Upsert(response.status().to_string()));
+            // 204 No Content is the success response for a Weaviate delete.
+            // 404 is acceptable: the object may have been deleted by a prior
+            // call. Anything else is a real error.
+            let status = response.status();
+            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                continue;
             }
+            let text = response.text().await.unwrap_or_default();
+            return Err(VectorSinkError::Delete(format!("{status}: {text}")));
         }
         Ok(())
     }

@@ -25,12 +25,24 @@ impl OpenAiLlmUdf {
     /// Create an OpenAI LLM UDF.
     pub fn new(api_key: impl Into<String>, config: LlmUdfConfig) -> Self {
         let rate_limiter = LlmRateLimiter::for_model(&config.model, config.rate_limit.clone());
+        // 5 s connect / 120 s request budget per OpenAI call. Without a
+        // request timeout, a stalled TCP connection or unresponsive API host
+        // would hang the LLM UDF pipeline indefinitely; the cache + rate
+        // limiter do not bound the actual call duration. 120 s is generous
+        // enough to cover large-context completions and tool-calling chains
+        // while still surfacing stalls as errors. Falls back to
+        // `Client::new()` if the builder itself fails.
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             api_key: api_key.into(),
             config,
             rate_limiter,
             cache: Arc::new(DashMap::new()),
-            client: Client::new(),
+            client,
             concurrency_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         }
     }
@@ -77,10 +89,24 @@ impl OpenAiLlmUdf {
                 .send()
                 .await
                 .map_err(|e| LlmError::Http(e.to_string()))?;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Retry on 429 (rate limit) and 5xx (server error). 4xx other than
+            // 429 is a client error (bad request, auth, etc.) and should fail
+            // fast — retrying would waste tokens and won't change the
+            // outcome. 5xx is typically a transient OpenAI outage.
+            let status = resp.status();
+            let should_retry =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            if should_retry {
                 attempt += 1;
                 if attempt > 4 {
-                    return Err(LlmError::RateLimit("429 retries exhausted".into()));
+                    let kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        "rate limit"
+                    } else {
+                        "server error"
+                    };
+                    return Err(LlmError::RateLimit(format!(
+                        "{kind} retries exhausted after {attempt} attempts (last status {status})"
+                    )));
                 }
                 // Exponential backoff: base_ms * 2^(attempt-1) + randomized jitter
                 let base = 500u64;
@@ -94,8 +120,8 @@ impl OpenAiLlmUdf {
                 tokio::time::sleep(sleep_duration).await;
                 continue;
             }
-            if !resp.status().is_success() {
-                return Err(LlmError::Http(resp.text().await.unwrap_or_default()));
+            if !status.is_success() {
+                return Err(LlmError::Http(status.to_string()));
             }
             #[derive(Deserialize)]
             struct Choice {

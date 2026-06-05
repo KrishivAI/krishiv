@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use krishiv_exec::ContinuousWindowExecutor;
+use krishiv_udf::ResourceLimits;
 
 use crate::fragment::common::task_fragment_body;
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
@@ -278,6 +279,7 @@ fn execute_loop_fragment(
 pub(crate) async fn execute_streaming_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
+    udf_limits: ResourceLimits,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment_body = task_fragment_body(assignment.plan_fragment().description());
     let fragment = fragment_body.as_str();
@@ -288,7 +290,8 @@ pub(crate) async fn execute_streaming_fragment(
     //   3. stream:continuous: — ContinuousStreamRegistry drain (session-scoped)
     //   4. <default>          — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
-        let engine = std::sync::Arc::clone(&runner.sql_engine);
+        // Create a new SQL engine with UDF limits for this task execution.
+        let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
 
         // Continuous SQL queries must use execute_stream to avoid blocking and buffering forever.
         let dataframe = engine
@@ -442,10 +445,11 @@ pub(crate) async fn execute_streaming_fragment(
     // track global low-watermark across all executor tasks.
     let observed_watermark_ms = compute_input_watermark(&batches, &plan_spec);
 
-    let collected_batches =
-        execute_bounded_window(batches, &plan_spec).map_err(|e| ExecutorError::LocalExecution {
+    let collected_batches = execute_bounded_window(batches, &plan_spec, None).map_err(|e| {
+        ExecutorError::LocalExecution {
             message: e.to_string(),
-        })?;
+        }
+    })?;
 
     let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected_batches.len();
@@ -493,10 +497,11 @@ async fn execute_streaming_with_batches(
     spec: WindowExecutionSpec,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
-    let collected =
-        execute_bounded_window(batches, &spec).map_err(|e| ExecutorError::LocalExecution {
+    let collected = execute_bounded_window(batches, &spec, None).map_err(|e| {
+        ExecutorError::LocalExecution {
             message: e.to_string(),
-        })?;
+        }
+    })?;
     let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected.len();
     let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);

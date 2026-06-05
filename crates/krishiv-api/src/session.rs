@@ -436,7 +436,7 @@ pub struct Session {
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
-    unbounded_streams: Arc<DashMap<String, tokio::sync::mpsc::UnboundedSender<RecordBatch>>>,
+    unbounded_streams: Arc<DashMap<String, tokio::sync::mpsc::Sender<RecordBatch>>>,
 }
 
 impl fmt::Debug for Session {
@@ -548,8 +548,24 @@ impl Session {
     pub fn push_stream_job_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> Result<()> {
         if let Some(tx) = self.unbounded_streams.get(job_id) {
             for batch in batches {
-                tx.send(batch).map_err(|e| KrishivError::Runtime {
-                    message: format!("Failed to push to stream {}: {}", job_id, e),
+                // Bounded channel (capacity = `CONTINUOUS_TABLE_CHANNEL_CAPACITY`).
+                // Use `try_send` to avoid blocking the API caller when the
+                // DataFusion consumer is slow. A full channel means the
+                // consumer cannot keep up; surface a typed error so the
+                // caller can decide to slow down rather than silently
+                // buffering unbounded memory.
+                tx.try_send(batch).map_err(|e| match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => KrishivError::Runtime {
+                        message: format!(
+                            "Stream consumer for job {} is too slow: channel full. \
+                             Slow down the producer or increase capacity via \
+                             register_streaming_table_with_capacity.",
+                            job_id
+                        ),
+                    },
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => KrishivError::Runtime {
+                        message: format!("Stream consumer for job {} has been dropped", job_id),
+                    },
                 })?;
             }
             return Ok(());

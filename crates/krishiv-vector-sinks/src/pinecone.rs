@@ -24,8 +24,17 @@ impl PineconeSink {
         api_key: impl Into<String>,
         namespace: Option<String>,
     ) -> Self {
+        // 5 s connect / 30 s request budget per Pinecone call. Without a
+        // request timeout, a stalled TCP connection or unresponsive API host
+        // would hang the vector-ingest pipeline indefinitely. Falls back to
+        // `Client::new()` if the builder itself fails (TLS init issues).
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             host: host.into(),
             api_key: api_key.into(),
             namespace,
@@ -91,14 +100,30 @@ impl VectorSink for PineconeSink {
         if let Some(ns) = &self.namespace {
             body["namespace"] = json!(ns);
         }
-        let url = format!("https://{}/vectors/delete", self.host);
-        self.client
+        let base = self.host.trim_end_matches('/');
+        let url = if base.starts_with("http://") || base.starts_with("https://") {
+            format!("{base}/vectors/delete")
+        } else {
+            format!("https://{base}/vectors/delete")
+        };
+        let response = self
+            .client
             .post(&url)
             .header("Api-Key", &self.api_key)
             .json(&body)
             .send()
             .await
             .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(VectorSinkError::RateLimit("pinecone rate limited".into()));
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(VectorSinkError::Delete(format!(
+                "pinecone delete returned {status}: {text}"
+            )));
+        }
         Ok(())
     }
 
@@ -125,6 +150,16 @@ impl VectorSink for PineconeSink {
             .send()
             .await
             .map_err(|e| VectorSinkError::Connection(e.to_string()))?;
+        // Surface non-2xx responses as a typed error with the HTTP status,
+        // rather than letting `response.json()` produce a confusing
+        // "missing field 'matches'" error for a 5xx body.
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(VectorSinkError::Query(format!(
+                "pinecone query returned {status}: {text}"
+            )));
+        }
         let payload: serde_json::Value = response
             .json()
             .await
@@ -175,5 +210,40 @@ mod tests {
         sink.upsert_batch(&batch).await.unwrap();
         sink.upsert_batch(&batch).await.unwrap();
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pinecone_delete_surfaces_non_2xx() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/vectors/delete")
+            .with_status(500)
+            .with_body("backend down")
+            .create_async()
+            .await;
+        let sink = PineconeSink::new(server.url(), "test-key", None);
+        let err = sink.delete_by_ids(&["id-1".into()]).await.unwrap_err();
+        m.assert_async().await;
+        match err {
+            VectorSinkError::Delete(message) => {
+                assert!(message.contains("500"));
+                assert!(message.contains("backend down"));
+            }
+            other => panic!("expected Delete error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pinecone_delete_surfaces_rate_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/vectors/delete")
+            .with_status(429)
+            .create_async()
+            .await;
+        let sink = PineconeSink::new(server.url(), "test-key", None);
+        let err = sink.delete_by_ids(&["id-1".into()]).await.unwrap_err();
+        m.assert_async().await;
+        assert!(matches!(err, VectorSinkError::RateLimit(_)));
     }
 }

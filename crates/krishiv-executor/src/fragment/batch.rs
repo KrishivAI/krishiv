@@ -8,6 +8,7 @@ use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
 use krishiv_sql::SqlEngine;
+use krishiv_udf::ResourceLimits;
 
 use super::common::{
     parse_local_parquet_partitions, read_connector_parquet_partitions, read_inline_ipc_partitions,
@@ -29,6 +30,7 @@ const WINDOW_PREFIX: &str = "window:";
 pub(crate) async fn execute_batch_fragment(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
+    udf_limits: ResourceLimits,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let fragment_body = task_fragment_body(assignment.plan_fragment().description());
     let fragment = fragment_body.as_str();
@@ -68,6 +70,7 @@ pub(crate) async fn execute_batch_fragment(
                 assignment,
                 shuffle_spec,
                 ctx,
+                udf_limits.clone(),
             )
             .await;
         } else {
@@ -87,6 +90,7 @@ pub(crate) async fn execute_batch_fragment(
                 assignment,
                 write_cfg,
                 store,
+                udf_limits.clone(),
             )
             .await;
         } else {
@@ -99,7 +103,9 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if let Some(query) = sql_query_from_fragment(fragment) {
-        let engine = Arc::clone(&runner.sql_engine);
+        // Create a new SQL engine with UDF limits for this task execution.
+        // This enforces per-task resource limits on UDF execution.
+        let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
             // Skip re-registration if this table+path combo is already in the
             // session-scoped cache. Avoids reading parquet file footers on every
@@ -244,7 +250,7 @@ async fn execute_window_fragment(
     let input_batches: Vec<_> = inline_tables.into_iter().flat_map(|(_, b)| b).collect();
 
     let output_batches = tokio::task::spawn_blocking(move || {
-        krishiv_exec::execute_bounded_window(input_batches, &plan_spec)
+        krishiv_exec::execute_bounded_window(input_batches, &plan_spec, None)
     })
     .await
     .map_err(|e| ExecutorError::LocalExecution {
@@ -264,10 +270,11 @@ async fn execute_window_fragment(
 
 /// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.
 async fn execute_shuffle_write_fragment(
-    engine: Arc<SqlEngine>,
+    _engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     spec: &str,
     ctx: &crate::runner::ShuffleContext,
+    udf_limits: ResourceLimits,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
@@ -309,8 +316,11 @@ async fn execute_shuffle_write_fragment(
             ),
         })?;
 
+    // Create a new SQL engine with UDF limits for this task execution.
+    let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
+
     for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
-        engine
+        limited_engine
             .register_parquet(partition.table_name(), partition.path())
             .await
             .map_err(|e| ExecutorError::LocalExecution {
@@ -320,7 +330,7 @@ async fn execute_shuffle_write_fragment(
     for (table_name, batches) in
         read_connector_parquet_partitions(assignment.input_partitions()).await?
     {
-        engine
+        limited_engine
             .register_record_batches(&table_name, batches)
             .await
             .map_err(|e| ExecutorError::LocalExecution {
@@ -330,7 +340,7 @@ async fn execute_shuffle_write_fragment(
     for (table_name, batches) in
         read_object_parquet_partitions(assignment.input_partitions()).await?
     {
-        engine
+        limited_engine
             .register_record_batches(&table_name, batches)
             .await
             .map_err(|e| ExecutorError::LocalExecution {
@@ -340,7 +350,7 @@ async fn execute_shuffle_write_fragment(
     for (table_name, batches) in
         read_shuffle_flight_partitions(assignment.input_partitions()).await?
     {
-        engine
+        limited_engine
             .register_record_batches(&table_name, batches)
             .await
             .map_err(|e| ExecutorError::LocalExecution {
@@ -348,7 +358,7 @@ async fn execute_shuffle_write_fragment(
             })?;
     }
 
-    let dataframe = engine
+    let dataframe = limited_engine
         .sql(query)
         .await
         .map_err(|e| ExecutorError::LocalExecution {
@@ -444,17 +454,20 @@ async fn execute_shuffle_write_fragment(
 
 /// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
 async fn execute_inmem_shuffle_write(
-    engine: Arc<SqlEngine>,
+    _engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
     store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
+    udf_limits: ResourceLimits,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
     let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    // Create a new SQL engine with UDF limits for this task execution.
+    let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
     let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
-            engine
+            limited_engine
                 .register_parquet(partition.table_name(), partition.path())
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
@@ -464,7 +477,7 @@ async fn execute_inmem_shuffle_write(
         for (table_name, tbl_batches) in
             read_connector_parquet_partitions(assignment.input_partitions()).await?
         {
-            engine
+            limited_engine
                 .register_record_batches(&table_name, tbl_batches)
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
@@ -474,7 +487,7 @@ async fn execute_inmem_shuffle_write(
         for (table_name, tbl_batches) in
             read_object_parquet_partitions(assignment.input_partitions()).await?
         {
-            engine
+            limited_engine
                 .register_record_batches(&table_name, tbl_batches)
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
@@ -484,14 +497,14 @@ async fn execute_inmem_shuffle_write(
         for (table_name, tbl_batches) in
             read_shuffle_flight_partitions(assignment.input_partitions()).await?
         {
-            engine
+            limited_engine
                 .register_record_batches(&table_name, tbl_batches)
                 .await
                 .map_err(|e| ExecutorError::LocalExecution {
                     message: e.to_string(),
                 })?;
         }
-        let dataframe = engine
+        let dataframe = limited_engine
             .sql(query)
             .await
             .map_err(|e| ExecutorError::LocalExecution {

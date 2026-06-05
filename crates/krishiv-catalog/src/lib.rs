@@ -532,6 +532,12 @@ pub mod datafusion_bridge {
     pub struct DataFusionCatalogBridge {
         catalog: Arc<RwLock<crate::InMemoryCatalog>>,
         schema_name: String,
+        /// MemTable cache shared across the inner `DataFusionSchemaBridge`
+        /// instances DataFusion requests. Avoids re-cloning the entire
+        /// `Vec<RecordBatch>` payload (which can be hundreds of MB) on
+        /// every DataFusion `table()` call. Keyed by table name; cleared
+        /// on `invalidate(name)`.
+        schema_cache: std::sync::Arc<dashmap::DashMap<String, Arc<MemTable>>>,
     }
 
     impl DataFusionCatalogBridge {
@@ -542,7 +548,22 @@ pub mod datafusion_bridge {
             Self {
                 catalog,
                 schema_name: "public".to_string(),
+                schema_cache: std::sync::Arc::new(dashmap::DashMap::new()),
             }
+        }
+
+        /// Invalidate the MemTable cache for `name`, forcing the next
+        /// `table()` call to rebuild the cached `MemTable` from the
+        /// catalog's batch store. Call this after `register_table_with_batches`
+        /// mutates the underlying catalog so the bridge does not serve
+        /// a stale `MemTable` referencing the previous batch payload.
+        ///
+        /// The `DashMap` cache is per-bridge and survives across DataFusion
+        /// `table()` calls; without this invalidation hook a second
+        /// `register_table_with_batches` for the same name would not be
+        /// visible to the DataFusion query plan.
+        pub fn invalidate(&self, name: &str) {
+            self.schema_cache.remove(name);
         }
     }
 
@@ -567,6 +588,7 @@ pub mod datafusion_bridge {
             if name == self.schema_name {
                 Some(Arc::new(DataFusionSchemaBridge {
                     catalog: self.catalog.clone(),
+                    cache: self.schema_cache.clone(),
                 }))
             } else {
                 None
@@ -578,6 +600,7 @@ pub mod datafusion_bridge {
 
     struct DataFusionSchemaBridge {
         catalog: Arc<RwLock<crate::InMemoryCatalog>>,
+        cache: std::sync::Arc<dashmap::DashMap<String, Arc<MemTable>>>,
     }
 
     impl fmt::Debug for DataFusionSchemaBridge {
@@ -602,6 +625,14 @@ pub mod datafusion_bridge {
             &self,
             name: &str,
         ) -> DfResult<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
+            // MemTable cache: if we built one for this table already, return
+            // the cached Arc. The cache is invalidated explicitly via
+            // `invalidate(name)` when the underlying catalog is mutated.
+            if let Some(cached) = self.cache.get(name) {
+                return Ok(Some(
+                    cached.clone() as Arc<dyn datafusion::datasource::TableProvider>
+                ));
+            }
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use crate::CatalogProvider as KrishivCatalogProvider;
             match catalog.get_table(name) {
@@ -610,8 +641,10 @@ pub mod datafusion_bridge {
                     let batches = catalog.table_batches(name);
                     let partitions = batches.map(|b| (*b).clone()).unwrap_or_default();
                     let mem = MemTable::try_new(arrow_schema, vec![partitions])?;
+                    let mem_arc = Arc::new(mem);
+                    self.cache.insert(name.to_string(), mem_arc.clone());
                     Ok(Some(
-                        Arc::new(mem) as Arc<dyn datafusion::datasource::TableProvider>
+                        mem_arc as Arc<dyn datafusion::datasource::TableProvider>,
                     ))
                 }
                 Err(_) => Ok(None),
@@ -757,6 +790,53 @@ mod tests {
         };
         assert!(schema_provider.table_exist("orders"));
         assert!(!schema_provider.table_exist("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn datafusion_bridge_memtable_cache_reuses_arc() {
+        use std::sync::Arc;
+
+        let catalog = Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
+        {
+            let mut cat = catalog.write().unwrap();
+            cat.register_table(TableMetadata::new("orders", make_schema()))
+                .unwrap();
+        }
+        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let schema_provider = {
+            use datafusion::catalog::CatalogProvider as DfCatalogProvider;
+            bridge.schema("public").unwrap()
+        };
+        let first = schema_provider.table("orders").await.unwrap().unwrap();
+        let second = schema_provider.table("orders").await.unwrap().unwrap();
+        // Cached: identical Arc pointer, no re-clone of batch payload.
+        let cached = Arc::ptr_eq(&first, &second);
+        assert!(cached, "expected cached MemTable Arc, got fresh allocation");
+    }
+
+    #[tokio::test]
+    async fn datafusion_bridge_invalidate_forces_rebuild() {
+        use std::sync::Arc;
+
+        let catalog = Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
+        {
+            let mut cat = catalog.write().unwrap();
+            cat.register_table(TableMetadata::new("orders", make_schema()))
+                .unwrap();
+        }
+        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let schema_provider = {
+            use datafusion::catalog::CatalogProvider as DfCatalogProvider;
+            bridge.schema("public").unwrap()
+        };
+        let first = schema_provider.table("orders").await.unwrap().unwrap();
+        bridge.invalidate("orders");
+        let second = schema_provider.table("orders").await.unwrap().unwrap();
+        // After invalidation, a new MemTable Arc is constructed.
+        assert!(!Arc::ptr_eq(&first, &second));
+        // A second call without further invalidation must hit the cache again.
+        let third = schema_provider.table("orders").await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&second, &third));
     }
 
     #[tokio::test]

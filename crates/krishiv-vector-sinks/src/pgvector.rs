@@ -120,7 +120,7 @@ mod imp {
                     .bind(id)
                     .execute(&self.pool)
                     .await
-                    .map_err(|e| VectorSinkError::Upsert(e.to_string()))?;
+                    .map_err(|e| VectorSinkError::Delete(e.to_string()))?;
             }
             Ok(())
         }

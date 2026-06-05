@@ -56,7 +56,24 @@ impl LlmRateLimiter {
     }
 
     /// Acquire capacity for one request using `token_estimate` tokens.
+    ///
+    /// If `token_estimate` exceeds the configured `tokens_per_minute` budget,
+    /// no amount of waiting can ever satisfy the request — the bucket can hold
+    /// at most `tokens_per_minute` tokens. In that case we emit a warning and
+    /// return immediately without consuming tokens or sleeping, so the caller
+    /// sees the misconfiguration in its request path (the embedded executor
+    /// treats the openai response itself as the real cap and reports an error
+    /// when the upstream API rejects the call).
     pub async fn acquire(&mut self, token_estimate: u64) {
+        if token_estimate > self.config.tokens_per_minute {
+            tracing::warn!(
+                token_estimate,
+                tokens_per_minute = self.config.tokens_per_minute,
+                "LLM rate limiter cannot satisfy request: token estimate exceeds configured per-minute budget; \
+                 skipping rate-limit wait so the caller can fail fast on the upstream API"
+            );
+            return;
+        }
         loop {
             let now = Self::now_ms();
             self.refill(now);
@@ -166,6 +183,25 @@ mod tests {
         rl.apply_throttle(50, 50_000);
         assert_eq!(rl.request_tokens, 50.0);
         assert_eq!(rl.token_tokens, 50_000.0);
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_immediately_when_estimate_exceeds_budget() {
+        let mut rl = LlmRateLimiter::new(RateLimitConfig {
+            requests_per_minute: 60,
+            tokens_per_minute: 1_000,
+        });
+        let start = std::time::Instant::now();
+        // Token estimate larger than the per-minute budget: must NOT spin
+        // forever waiting for tokens that can never accumulate.
+        rl.acquire(5_000).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(20),
+            "acquire must fail fast when estimate exceeds budget"
+        );
+        // Tokens should be untouched (we did not grant anything).
+        assert_eq!(rl.token_tokens, 1_000.0);
+        assert_eq!(rl.request_tokens, 60.0);
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub enum VectorSinkError {
     Connection(String),
     #[error("vector sink upsert error: {0}")]
     Upsert(String),
+    #[error("vector sink delete error: {0}")]
+    Delete(String),
     #[error("vector sink schema conflict: {0}")]
     SchemaConflict(String),
     #[error("vector sink rate limit: {0}")]

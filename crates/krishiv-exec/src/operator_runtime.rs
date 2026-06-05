@@ -63,9 +63,19 @@ pub(crate) fn window_agg_to_expr(agg: &WindowAgg) -> AggExpr {
 ///
 /// Watermark advances to the max event time per input batch, then the whole batch
 /// is passed to the window operator (see `streaming-execution-model.md`).
+///
+/// `state_dir` controls where the operator's window state is persisted:
+/// - `Some(dir)`: state lives under `dir/{window_kind}/` and survives process
+///   restarts. Required for exactly-once semantics across multiple bounded
+///   window invocations against the same key space (e.g. an executor's
+///   `state:store:` fragment).
+/// - `None`: state is ephemeral (in a `tempdir`) and lives only for the
+///   duration of this call. Suitable for one-shot batch SQL where the
+///   operator's state does not need to outlive the call.
 pub fn execute_bounded_window(
     input_batches: Vec<RecordBatch>,
     spec: &WindowExecutionSpec,
+    state_dir: Option<&std::path::Path>,
 ) -> ExecResult<Vec<RecordBatch>> {
     if input_batches.is_empty() {
         return Ok(Vec::new());
@@ -90,7 +100,7 @@ pub fn execute_bounded_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            let state = open_state_backend(None, "tumbling", spec.state_ttl_ms)?;
+            let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -117,7 +127,7 @@ pub fn execute_bounded_window(
                 slide_ms,
                 agg_exprs,
             };
-            let state = open_state_backend(None, "sliding", spec.state_ttl_ms)?;
+            let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -143,7 +153,7 @@ pub fn execute_bounded_window(
                 session_gap_ms: gap_ms,
                 agg_exprs,
             };
-            let state = open_state_backend(None, "session", spec.state_ttl_ms)?;
+            let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -169,6 +179,7 @@ pub fn execute_bounded_window(
 pub fn execute_streaming_window(
     mut input: Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>,
     spec: WindowExecutionSpec,
+    state_dir: Option<&std::path::Path>,
 ) -> ExecResult<Pin<Box<dyn Stream<Item = ExecResult<RecordBatch>> + Send>>> {
     if spec.agg_exprs.is_empty() {
         return Err(ExecError::InvalidWindowConfig(
@@ -186,7 +197,7 @@ pub fn execute_streaming_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
-            let state = open_state_backend(None, "tumbling", spec.state_ttl_ms)?;
+            let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -251,7 +262,7 @@ pub fn execute_streaming_window(
                 slide_ms,
                 agg_exprs,
             };
-            let state = open_state_backend(None, "sliding", spec.state_ttl_ms)?;
+            let state = open_state_backend(state_dir, "sliding", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSlidingWindowOperator::new(sw_spec, state, "window-exec", "sliding")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -315,7 +326,7 @@ pub fn execute_streaming_window(
                 session_gap_ms,
                 agg_exprs,
             };
-            let state = open_state_backend(None, "session", spec.state_ttl_ms)?;
+            let state = open_state_backend(state_dir, "session", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedSessionWindowOperator::new(sess_spec, state, "window-exec", "session")
                     .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
@@ -468,7 +479,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let out = execute_bounded_window(vec![batch], &spec).expect("execute");
+        let out = execute_bounded_window(vec![batch], &spec, None).expect("execute");
         assert!(!out.is_empty());
     }
 }

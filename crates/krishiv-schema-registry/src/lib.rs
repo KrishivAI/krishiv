@@ -65,7 +65,17 @@ impl SchemaRegistryClient {
         Self {
             base_url: url.into().trim_end_matches('/').to_string(),
             cache: Arc::new(DashMap::new()),
-            http: Client::new(),
+            // Apply explicit connect + per-request timeouts. Without these, a
+            // misbehaving registry (or a MITM holding the TCP connection
+            // open) can stall every Kafka payload decode indefinitely.
+            // The 5s connect / 10s request budget matches the Flight client
+            // defaults and is short enough that a caller retrying the batch
+            // can fail over to a backup registry within a few seconds.
+            http: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
         }
     }
 

@@ -2092,6 +2092,52 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn validate_job_rejects_empty_namespace() {
+        use crate::job::validate_job;
+        let job_id = JobId::try_new("job-empty-ns").unwrap();
+        let spec = JobSpec::new(job_id, "ns", JobKind::Batch)
+            .with_namespace("")
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "s")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t")),
+            );
+        let err = validate_job(&spec).expect_err("empty namespace must fail");
+        assert!(format!("{err:?}").contains("namespace_id"), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_job_rejects_oversized_namespace() {
+        use crate::job::validate_job;
+        let job_id = JobId::try_new("job-big-ns").unwrap();
+        let long_ns = "a".repeat(300);
+        let spec = JobSpec::new(job_id, "ns", JobKind::Batch)
+            .with_namespace(long_ns)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "s")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t")),
+            );
+        let err = validate_job(&spec).expect_err("oversized namespace must fail");
+        assert!(format!("{err:?}").contains("253"), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_job_rejects_zero_checkpoint_interval() {
+        use crate::job::validate_job;
+        let job_id = JobId::try_new("job-zero-cp").unwrap();
+        let spec = JobSpec::new(job_id, "ns", JobKind::Streaming)
+            .with_checkpoint(0, "/tmp/cp")
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "s")
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t")),
+            );
+        let err = validate_job(&spec).expect_err("zero checkpoint interval must fail");
+        assert!(
+            format!("{err:?}").contains("checkpoint_interval_ms"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn validate_job_accepts_valid_upstream_stage() {
         let job_id = JobId::try_new("job-2").unwrap();
         let spec = JobSpec::new(job_id, "good upstream", JobKind::Batch)

@@ -284,6 +284,12 @@ impl RemoteExecutionRuntime {
             placement,
         }
     }
+
+    /// Start background health checks for the Flight client pool.
+    /// Call this after construction when running inside a Tokio runtime.
+    pub async fn start_health_checks(&self) {
+        self.pool.start_health_checks().await;
+    }
 }
 
 /// Returns `true` only when `e` is a tonic `Status::Unimplemented` response

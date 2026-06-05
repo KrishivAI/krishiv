@@ -14,8 +14,75 @@ use crate::{JobRecord, ResourceUsage, SchedulerError, SchedulerResult, StageReco
 /// Long-running streaming jobs can accumulate many task-state events between
 /// `save_job` calls; rotation takes a full snapshot and clears the log to
 /// prevent unbounded disk growth.
-#[allow(dead_code)]
-const MAX_EVENTS_LOG_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EVENTS_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Approximate in-memory cost of a single [`EventLogEvent`] in bytes.
+///
+/// Used by the in-memory ring buffer to bound the events log. The number is a
+/// conservative upper bound: the variant discriminant plus the largest field
+/// (`TaskFailed::reason: String` heap allocation). The actual `String` content
+/// is counted separately via [`EventLogEvent::approx_heap_bytes`].
+const EVENT_BASE_BYTES: u64 = 96;
+
+impl EventLogEvent {
+    /// Approximate heap-allocated bytes owned by this event.
+    ///
+    /// `String` fields carry their own heap allocation that is not counted by
+    /// [`std::mem::size_of`]. We approximate the byte cost by summing the
+    /// UTF-8 length of every owned string plus the per-string allocation
+    /// overhead. This is an over-estimate by design so the ring buffer evicts
+    /// slightly before reaching the cap, not slightly after.
+    pub fn approx_heap_bytes(&self) -> u64 {
+        let str_cost = |s: &str| s.len() as u64 + 24;
+        match self {
+            EventLogEvent::JobSubmitted { job_id } => str_cost(job_id.as_str()),
+            EventLogEvent::StagePlanned { job_id, stage_id } => {
+                str_cost(job_id.as_str()) + str_cost(stage_id.as_str())
+            }
+            EventLogEvent::TaskAssigned {
+                job_id,
+                stage_id,
+                task_id,
+                executor_id,
+            } => {
+                str_cost(job_id.as_str())
+                    + str_cost(stage_id.as_str())
+                    + str_cost(task_id.as_str())
+                    + str_cost(executor_id.as_str())
+            }
+            EventLogEvent::TaskStarted {
+                job_id,
+                stage_id,
+                task_id,
+                ..
+            } => {
+                str_cost(job_id.as_str()) + str_cost(stage_id.as_str()) + str_cost(task_id.as_str())
+            }
+            EventLogEvent::TaskSucceeded {
+                job_id,
+                stage_id,
+                task_id,
+                ..
+            } => {
+                str_cost(job_id.as_str()) + str_cost(stage_id.as_str()) + str_cost(task_id.as_str())
+            }
+            EventLogEvent::TaskFailed {
+                job_id,
+                stage_id,
+                task_id,
+                reason,
+                ..
+            } => {
+                str_cost(job_id.as_str())
+                    + str_cost(stage_id.as_str())
+                    + str_cost(task_id.as_str())
+                    + str_cost(reason)
+            }
+            EventLogEvent::ExecutorLost { executor_id } => str_cost(executor_id.as_str()),
+            EventLogEvent::JobCancelled { job_id } => str_cost(job_id.as_str()),
+        }
+    }
+}
 
 /// Events written to the durable job event log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,15 +149,72 @@ pub trait MetadataStore: Send + Sync {
 // ── InMemoryMetadataStore ─────────────────────────────────────────────────────
 
 /// In-memory metadata store for tests and embedded single-process deployments.
-#[derive(Debug, Default)]
+///
+/// The event log is bounded by [`MAX_EVENTS_LOG_BYTES`]. When an append would
+/// push the total over the cap, the oldest events are evicted (FIFO) until
+/// the new event fits. Eviction is the in-memory analogue of the on-disk
+/// rotation that `JsonFileMetadataStore` performs: in both cases the events
+/// log stops growing unboundedly, and the durability of the snapshot
+/// (`save_job`/`save_executor`) is unaffected because those are kept in
+/// separate fields and are never evicted.
+///
+/// Eviction is O(n) per removed event (`Vec::remove(0)` shifts the tail) but
+/// is amortized O(1) per appended event because it only fires when the buffer
+/// is full (every ~[`MAX_EVENTS_LOG_BYTES`] / avg_event_size appends).
+#[derive(Debug)]
 pub struct InMemoryMetadataStore {
     events: Vec<EventLogEvent>,
+    events_byte_size: u64,
     jobs: Vec<JobRecord>,
     executors: Vec<ExecutorDescriptor>,
+    /// Number of events evicted by the ring buffer since the store was created.
+    /// Exposed via [`InMemoryMetadataStore::evicted_event_count`] for tests and
+    /// metrics.
+    evicted_event_count: u64,
+}
+
+impl Default for InMemoryMetadataStore {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            events_byte_size: 0,
+            jobs: Vec::new(),
+            executors: Vec::new(),
+            evicted_event_count: 0,
+        }
+    }
+}
+
+impl InMemoryMetadataStore {
+    /// Number of oldest events evicted by the ring buffer to keep the events
+    /// log under [`MAX_EVENTS_LOG_BYTES`].
+    pub fn evicted_event_count(&self) -> u64 {
+        self.evicted_event_count
+    }
+
+    /// Current approximate byte size of the in-memory events log.
+    pub fn events_byte_size(&self) -> u64 {
+        self.events_byte_size
+    }
+
+    fn evict_until_fits(&mut self, incoming_bytes: u64) {
+        while self.events_byte_size + incoming_bytes > MAX_EVENTS_LOG_BYTES
+            && !self.events.is_empty()
+        {
+            let oldest = self.events.remove(0);
+            self.events_byte_size = self
+                .events_byte_size
+                .saturating_sub(EVENT_BASE_BYTES + oldest.approx_heap_bytes());
+            self.evicted_event_count = self.evicted_event_count.wrapping_add(1);
+        }
+    }
 }
 
 impl MetadataStore for InMemoryMetadataStore {
     fn append_event(&mut self, event: EventLogEvent) -> SchedulerResult<()> {
+        let incoming = EVENT_BASE_BYTES + event.approx_heap_bytes();
+        self.evict_until_fits(incoming);
+        self.events_byte_size = self.events_byte_size.saturating_add(incoming);
         self.events.push(event);
         Ok(())
     }

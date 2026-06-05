@@ -375,7 +375,27 @@ impl HudiCowWriter {
             legacy_files: Vec::new(),
         };
         metadata.write(&self.table_path)?;
-        fs::write(timeline_marker, "").map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Durability: the timeline marker is the "commit succeeded" signal.
+        // A power loss between the metadata write and the marker write could
+        // leave the table with a metadata directory but no marker, which
+        // Hudi would interpret as a failed/aborted commit. fsync the marker
+        // (and on Unix, the parent directory entry) to make the commit
+        // atomic and crash-safe.
+        let marker_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&timeline_marker)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        marker_file
+            .sync_all()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        #[cfg(unix)]
+        if let Some(parent) = timeline_marker.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         Ok(HudiWriteResult {
             instant: instant.to_string(),
@@ -462,7 +482,24 @@ impl HudiCommitMetadata {
         if let Some(change_file) = &self.change_file {
             text.push_str(&format!("change_file:{change_file}\n"));
         }
-        fs::write(commit_dir.join("metadata"), text).map_err(|e| LakehouseError::Io(e.to_string()))
+        let meta_path = commit_dir.join("metadata");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&meta_path)
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        use std::io::Write as _;
+        file.write_all(text.as_bytes())
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // Durability: the Hudi commit metadata must be on disk before the
+        // timeline marker signals "commit succeeded" (the marker write above
+        // is in `write_commit`). Without this fsync, a power loss between
+        // the metadata write and the marker write would leave the marker
+        // pointing at a missing/stale metadata file.
+        file.sync_all()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -798,13 +835,41 @@ fn ensure_same_schema(left: SchemaRef, right: SchemaRef) -> LakehouseResult<()> 
 }
 
 fn validate_instant(instant: &str) -> LakehouseResult<()> {
-    if instant.is_empty()
-        || !instant
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    // Hudi instant format produced by `next_instant`:
+    //   YYYYMMDDHHMMSSfff-PPPPPPPPCCCCCCCC
+    //   ^ 17 digits     ^ '-' ^ 16 lowercase hex chars
+    // The timestamp prefix is 17 digits (millisecond precision); the
+    // separator is `-` (an `_` separator is also accepted for legacy
+    // compatibility with timestamps written by older callers); the suffix
+    // is 16 lowercase hex characters (PID + counter).
+    //
+    // Reject anything that does not match. Without this strict check, a
+    // Hudi timeline directory containing a malformed file (e.g. a partial
+    // commit) could be mistaken for a valid instant and pollute later
+    // `list_instant_times` results.
+    if instant.len() != 34 {
+        return Err(LakehouseError::Io(format!(
+            "invalid Hudi instant '{instant}': expected 34 chars (YYYYMMDDHHMMSSfff-<16hex>), got {}",
+            instant.len()
+        )));
+    }
+    let bytes = instant.as_bytes();
+    if !bytes[..17].iter().all(|b| b.is_ascii_digit()) {
+        return Err(LakehouseError::Io(format!(
+            "invalid Hudi instant '{instant}': first 17 chars must be digits (timestamp prefix)"
+        )));
+    }
+    if bytes[17] != b'-' && bytes[17] != b'_' {
+        return Err(LakehouseError::Io(format!(
+            "invalid Hudi instant '{instant}': separator at position 17 must be '-' or '_'"
+        )));
+    }
+    if !bytes[18..]
+        .iter()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
         return Err(LakehouseError::Io(format!(
-            "invalid Hudi instant '{instant}': only ASCII alphanumeric, '_' and '-' are allowed"
+            "invalid Hudi instant '{instant}': last 16 chars must be lowercase hex (process suffix)"
         )));
     }
     Ok(())
@@ -825,9 +890,31 @@ fn next_instant() -> String {
         }
     };
 
-    chrono::DateTime::from_timestamp_millis(unique_ms as i64)
+    // Append a process-unique suffix to the millisecond timestamp so two
+    // executors writing to the same Hudi timeline do not collide on the same
+    // instant. The suffix is a 16-char lowercase hex string derived from the
+    // process PID and a per-process counter; this keeps the canonical Hudi
+    // format (`%Y%m%d%H%M%S%3f-<suffix>`) but guarantees cross-process
+    // uniqueness.
+    let suffix = process_unique_suffix();
+    let ts = chrono::DateTime::from_timestamp_millis(unique_ms as i64)
         .map(|dt| dt.format("%Y%m%d%H%M%S%3f").to_string())
-        .unwrap_or_else(|| unique_ms.to_string())
+        .unwrap_or_else(|| unique_ms.to_string());
+    format!("{ts}-{suffix}")
+}
+
+/// Per-process identifier embedded into Hudi instants so that two executors
+/// writing to the same object store never produce the same `next_instant()`
+/// value. Combined with the monotonically increasing millisecond timestamp,
+/// the resulting instant is sortable (timestamp prefix) and unique
+/// cross-process (suffix).
+fn process_unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id() as u64;
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // 16 lowercase hex chars: 8 from pid, 8 from counter.
+    format!("{pid:08x}{counter:08x}")
 }
 
 #[cfg(test)]
@@ -874,14 +961,14 @@ mod tests {
         write_hudi_cow_fixture(
             dir.path(),
             &[
-                ("20240101120000", &[(1, "a")]),
-                ("20240102120000", &[(2, "b")]),
+                ("20240101120000123-0123456789abcdef", &[(1, "a")]),
+                ("20240102120000123-0123456789abcdef", &[(2, "b")]),
             ],
         )
         .unwrap();
         let reader = HudiSnapshotReader::open(dir.path())
             .with_query_type(HudiQueryType::Incremental)
-            .with_begin_instant("20240101120000");
+            .with_begin_instant("20240101120000123-0123456789abcdef");
         let batches = reader.scan_batches().unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1);
@@ -892,10 +979,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let writer = HudiCowWriter::open(dir.path());
         writer
-            .append_at("20240101120000", batch(&[(1, "a")]))
+            .append_at("20240101120000123-0123456789abcdef", batch(&[(1, "a")]))
             .unwrap();
         let result = writer
-            .append_at("20240102120000", batch(&[(2, "b")]))
+            .append_at("20240102120000123-0123456789abcdef", batch(&[(2, "b")]))
             .unwrap();
         assert_eq!(result.rows_inserted, 1);
         assert_eq!(result.snapshot_rows, 2);
@@ -905,7 +992,7 @@ mod tests {
 
         let incremental = HudiSnapshotReader::open(dir.path())
             .with_query_type(HudiQueryType::Incremental)
-            .with_begin_instant("20240101120000")
+            .with_begin_instant("20240101120000123-0123456789abcdef")
             .scan_batches()
             .unwrap();
         assert_eq!(incremental.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
@@ -917,10 +1004,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let writer = HudiCowWriter::open(dir.path());
         writer
-            .append_at("20240101120000", batch(&[(1, "a"), (2, "b")]))
+            .append_at(
+                "20240101120000123-0123456789abcdef",
+                batch(&[(1, "a"), (2, "b")]),
+            )
             .unwrap();
         let result = writer
-            .upsert_at("20240102120000", "id", batch(&[(2, "bb"), (3, "c")]))
+            .upsert_at(
+                "20240102120000123-0123456789abcdef",
+                "id",
+                batch(&[(2, "bb"), (3, "c")]),
+            )
             .unwrap();
         assert_eq!(result.rows_updated, 1);
         assert_eq!(result.rows_inserted, 1);
@@ -932,7 +1026,7 @@ mod tests {
 
         let incremental = HudiSnapshotReader::open(dir.path())
             .with_query_type(HudiQueryType::Incremental)
-            .with_begin_instant("20240101120000")
+            .with_begin_instant("20240101120000123-0123456789abcdef")
             .scan_batches()
             .unwrap();
         assert_eq!(names(&incremental[0]), vec!["bb", "c"]);
@@ -942,7 +1036,11 @@ mod tests {
     fn hudi_cow_upsert_rejects_missing_key() {
         let dir = tempdir().unwrap();
         let writer = HudiCowWriter::open(dir.path());
-        let err = writer.upsert_at("20240101120000", "missing", batch(&[(1, "a")]));
+        let err = writer.upsert_at(
+            "20240101120000123-0123456789abcdef",
+            "missing",
+            batch(&[(1, "a")]),
+        );
         assert!(matches!(err, Err(LakehouseError::Io(_))));
     }
 
@@ -1012,9 +1110,37 @@ mod tests {
 
     #[test]
     fn validate_instant_accepts_valid() {
-        assert!(validate_instant("20240101120000").is_ok());
-        assert!(validate_instant("20240101_120000").is_ok());
-        assert!(validate_instant("commit-123").is_ok());
+        // Canonical 34-char form: 17-digit ms timestamp + `-` + 16 hex chars
+        assert!(validate_instant("20240101120000123-0123456789abcdef").is_ok());
+        // Underscore separator (legacy tolerance)
+        assert!(validate_instant("20240101120000123_0123456789abcdef").is_ok());
+    }
+
+    #[test]
+    fn validate_instant_rejects_wrong_length() {
+        assert!(validate_instant("20240101120000").is_err()); // 14 chars
+        assert!(validate_instant("commit-123").is_err()); // 11 chars
+        assert!(validate_instant("20240101120000123-0123456789abcde").is_err()); // 33 chars
+    }
+
+    #[test]
+    fn validate_instant_rejects_bad_timestamp_prefix() {
+        // Non-digit in timestamp portion
+        assert!(validate_instant("2024010X120000123-0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn validate_instant_rejects_bad_separator() {
+        assert!(validate_instant("20240101120000123.0123456789abcdef").is_err());
+        assert!(validate_instant("20240101120000123 0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn validate_instant_rejects_non_hex_suffix() {
+        // 'g' is not a hex digit
+        assert!(validate_instant("20240101120000123-0123456789abcdeg").is_err());
+        // uppercase hex is rejected (canonical format is lowercase)
+        assert!(validate_instant("20240101120000123-0123456789ABCDEF").is_err());
     }
 
     // ------------------------------------------------------------------
@@ -1060,12 +1186,12 @@ mod tests {
     #[test]
     fn hudi_write_result_fields() {
         let result = HudiWriteResult {
-            instant: "20240101120000".to_string(),
+            instant: "20240101120000123-0123456789abcdef".to_string(),
             rows_inserted: 5,
             rows_updated: 3,
             snapshot_rows: 10,
         };
-        assert_eq!(result.instant, "20240101120000");
+        assert_eq!(result.instant, "20240101120000123-0123456789abcdef");
         assert_eq!(result.rows_inserted, 5);
         assert_eq!(result.rows_updated, 3);
         assert_eq!(result.snapshot_rows, 10);
@@ -1119,9 +1245,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let writer = HudiCowWriter::open(dir.path());
         writer
-            .append_at("20240101120000", batch(&[(1, "a")]))
+            .append_at("20240101120000123-0123456789abcdef", batch(&[(1, "a")]))
             .unwrap();
-        let err = writer.append_at("20240101120000", batch(&[(2, "b")]));
+        let err = writer.append_at("20240101120000123-0123456789abcdef", batch(&[(2, "b")]));
         assert!(matches!(err, Err(LakehouseError::Concurrency { .. })));
     }
 
@@ -1141,7 +1267,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = writer.upsert_at("20240101120000", "id", batch);
+        let err = writer.upsert_at("20240101120000123-0123456789abcdef", "id", batch);
         assert!(matches!(err, Err(LakehouseError::Io(_))));
     }
 

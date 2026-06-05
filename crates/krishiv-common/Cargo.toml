@@ -10,9 +10,10 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
+thiserror = { workspace = true, optional = true }
 
 [features]
-chaos = []
+chaos = ["dep:thiserror"]
 
 [lints]
 workspace = true
