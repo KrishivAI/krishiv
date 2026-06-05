@@ -1,5 +1,64 @@
 # Krishiv Implementation Status
 
+## Production Stabilization (2026-06-05)
+
+Completed first batch of P0/P1 production stabilization items from feature maturity review:
+
+### P0-1: Flight Pool Health Checks + Executor Failure Detection
+- `FlightClientPool` now tracks per-endpoint health state with `EndpointHealth` (consecutive_failures, is_healthy)
+- Background health check loop (30s interval, 3 failures → unhealthy, 5s timeout)
+- `get_channel` prefers healthy endpoints; auto-failover on connection failure
+- `do_action_on_shard` uses shared health tracking
+- `select_healthy_endpoint` scans all endpoints for first healthy candidate
+- `RemoteExecutionRuntime::start_health_checks()` async start method (tests try from sync context)
+- `Drop` impl aborts health check task
+- Existing tests adapted (RemoteExecutionRuntime no longer panics in sync test context)
+
+### P0-2: Task Resource Limits (memory/CPU) from Job Spec
+- Added `cpu_limit_nanos`, `memory_limit_bytes` fields to `ExecutorTaskAssignment` proto
+- Wire conversion `executor_task_assignment_to_wire` / `from_wire` propagates new fields
+- `ExecutorTaskRunner::run_assignment_with` builds `ResourceLimits` from assignment
+- Batch fragments use `SqlEngine::new().with_udf_limits(udf_limits)` for per-task enforcement
+- Streaming fragments also use limits via new `execute_streaming_fragment` signature
+- Shuffle write fragments (legacy and R4a in-memory) both use limited engines
+- Coordinator `launch_assigned_task_assignments` wires job spec limits to assignments
+
+### P0-3: Checkpoint Async Safety (Verified)
+- `run_blocking_on_tokio` already handles `current_thread` with clear error message
+- Async API already available; no code change needed
+
+### P0-5: InMemoryShuffleStore Eviction
+- Added default cap of 128 MiB (`DEFAULT_SHUFFLE_MEMORY_BYTES`) to `InMemoryShuffleStore::new()`
+- Added `new_unbounded()` for backward compat (tests, dev-local)
+- Configurable via `KRISHIV_SHUFFLE_MEMORY_BYTES` env var
+- Changed max_bytes-without-spill from hard error to warning (prevents breakage)
+
+### P1-1: Plan Cache Config
+- `PLAN_CACHE_MAX_ENTRIES` now reads from `KRISHIV_PLAN_CACHE_MAX_ENTRIES` env var
+- Default unchanged at 256 entries
+
+### P1-5: Task Timeout Config Per Job
+- Resource limits (`cpu_limit_nanos`, `memory_limit_bytes`) from `JobSpec` propagate to `ExecutorTaskAssignment`
+- Limits received by executor and enforced via `ResourceLimits` on SQL engine
+
+### Protobuf Changes
+- `ExecutorTaskAssignment` gets fields 15 (`cpu_limit_nanos`) and 16 (`memory_limit_bytes`)
+
+Validation:
+```bash
+cargo check -p krishiv-scheduler -p krishiv-executor -p krishiv-runtime -p krishiv-proto -p krishiv-shuffle -p krishiv-sql  # 0 errors
+```
+
+Blockers: none.
+
+Next useful commands:
+```bash
+cargo test -p krishiv-runtime --lib
+cargo test -p krishiv-executor --lib
+cargo test -p krishiv-scheduler --lib
+```
+
+---
 ## Distributed Control-Plane Hardening (2026-06-04)
 
 Completed the first implementation slice from the production-readiness review:

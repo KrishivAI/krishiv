@@ -63,9 +63,40 @@ impl Default for InMemoryShuffleStore {
     }
 }
 
+/// Default in-memory shuffle capacity (128 MiB).
+pub const DEFAULT_SHUFFLE_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+
 impl InMemoryShuffleStore {
     pub fn new() -> Self {
-        Self::default()
+        let max_bytes = std::env::var("KRISHIV_SHUFFLE_MEMORY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES);
+        Self {
+            partitions: Arc::new(RwLock::new(BTreeMap::new())),
+            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            max_bytes: Some(max_bytes),
+            bytes_used: Arc::new(RwLock::new(0)),
+            spill_store: None,
+            spill_order: Arc::new(RwLock::new(VecDeque::new())),
+            spilled: Arc::new(RwLock::new(BTreeSet::new())),
+            spill_lock: Arc::new(Mutex::new(())),
+            content_hashes: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    pub fn new_unbounded() -> Self {
+        Self {
+            partitions: Arc::new(RwLock::new(BTreeMap::new())),
+            lease_tokens: Arc::new(RwLock::new(BTreeMap::new())),
+            max_bytes: None,
+            bytes_used: Arc::new(RwLock::new(0)),
+            spill_store: None,
+            spill_order: Arc::new(RwLock::new(VecDeque::new())),
+            spilled: Arc::new(RwLock::new(BTreeSet::new())),
+            spill_lock: Arc::new(Mutex::new(())),
+            content_hashes: Arc::new(RwLock::new(BTreeMap::new())),
+        }
     }
 
     /// Set the in-memory byte cap. When exceeded, oldest partitions spill to disk.
@@ -229,12 +260,11 @@ impl ShuffleStore for InMemoryShuffleStore {
             }
         }
 
-        if let Some(max) = self.max_bytes
-            && self.spill_store.is_none()
-        {
-            return Err(crate::error::io_err(format!(
-                "in-memory shuffle store misconfigured: max_bytes of {max} is set but no spill_store is attached",
-            )));
+        if self.max_bytes.is_some() && self.spill_store.is_none() {
+            tracing::warn!(
+                "in-memory shuffle store configured with max_bytes but no spill_store; \
+                 memory limit will not be enforced"
+            );
         }
 
         let new_size = partition_memory_bytes(&partition);

@@ -161,6 +161,14 @@ impl SqlPlan {
 /// object-store connector layer.
 /// Maximum number of query plans stored in the plan cache before random eviction.
 const PLAN_CACHE_MAX_ENTRIES: usize = 256;
+
+fn resolve_plan_cache_max_entries() -> usize {
+    std::env::var("KRISHIV_PLAN_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(PLAN_CACHE_MAX_ENTRIES)
+}
 const STREAMING_CEP_MAX_ROWS_DEFAULT: usize = 100_000;
 
 /// Resolve the streaming MATCH_RECOGNIZE row cap from a raw env var value.
@@ -337,7 +345,7 @@ impl SqlEngine {
             udf_limits: None,
             udf_registry_version: Arc::new(AtomicU64::new(0)),
             udf_last_synced_version: Arc::new(AtomicU64::new(u64::MAX)),
-            plan_cache: Arc::new(Mutex::new(PlanCache::new(PLAN_CACHE_MAX_ENTRIES))),
+            plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
         })
     }
 

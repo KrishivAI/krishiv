@@ -372,6 +372,12 @@ impl JobRecord {
                     if let Some(secs) = task_timeout_secs {
                         assignment = assignment.with_task_timeout_secs(secs);
                     }
+                    if let Some(nanos) = self.spec.cpu_limit_nanos() {
+                        assignment = assignment.with_cpu_limit_nanos(nanos);
+                    }
+                    if let Some(bytes) = self.spec.memory_limit_bytes() {
+                        assignment = assignment.with_memory_limit_bytes(bytes);
+                    }
                     assignments.push(assignment);
                 }
             }
