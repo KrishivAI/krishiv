@@ -312,7 +312,7 @@ mod tests {
     fn should_consider_for_launch_ignores_terminal_jobs() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let jc = make_job_coordinator("terminal-test", 1);
-        jc.write_record().state = crate::job::JobState::Succeeded;
+        jc.write_record().state = krishiv_proto::JobState::Succeeded;
         rt.block_on(async {
             assert!(!jc.should_consider_for_launch().await);
         });
