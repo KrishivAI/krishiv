@@ -86,6 +86,7 @@ pub fn advance_effective_watermark(
         ExecError::InvalidWindowConfig("multi-source watermark requires source_id_column".into())
     })?;
     for (source_id, lag_ms) in source_watermark_lags {
+        multi.register_source(source_id);
         let max_ts = max_event_time_ms_for_source(batch, event_time_column, source_col, source_id)?;
         if max_ts > i64::MIN {
             let wm = max_ts.saturating_sub(*lag_ms as i64);
@@ -302,6 +303,49 @@ mod tests {
         // src-a: 1000 - 100 = 900, src-b: 2000 - 200 = 1800
         // effective = min(900, 1800) = 900
         assert_eq!(wm, 900);
+    }
+
+    #[test]
+    fn advance_watermark_multi_source_missing_configured_source_holds_min() {
+        let batch = multi_source_batch(vec![1000], vec!["src-a"]);
+        let mut lags = HashMap::new();
+        lags.insert("src-a".into(), 100u64);
+        lags.insert("src-b".into(), 200u64);
+        let mut single = crate::window::WatermarkState::new(0);
+        let mut multi = crate::window::MultiSourceWatermarkState::new();
+
+        let wm =
+            advance_effective_watermark(&batch, "ts", Some("src"), &lags, &mut single, &mut multi)
+                .unwrap();
+
+        assert_eq!(
+            wm,
+            i64::MIN,
+            "configured source src-b has not emitted, so it must hold back the effective watermark"
+        );
+        assert_eq!(multi.source_count(), 2);
+    }
+
+    #[test]
+    fn advance_watermark_multi_source_advances_after_all_configured_sources_seen() {
+        let mut lags = HashMap::new();
+        lags.insert("src-a".into(), 100u64);
+        lags.insert("src-b".into(), 200u64);
+        let mut single = crate::window::WatermarkState::new(0);
+        let mut multi = crate::window::MultiSourceWatermarkState::new();
+
+        let first = multi_source_batch(vec![1000], vec!["src-a"]);
+        let first_wm =
+            advance_effective_watermark(&first, "ts", Some("src"), &lags, &mut single, &mut multi)
+                .unwrap();
+        assert_eq!(first_wm, i64::MIN);
+
+        let second = multi_source_batch(vec![2000], vec!["src-b"]);
+        let second_wm =
+            advance_effective_watermark(&second, "ts", Some("src"), &lags, &mut single, &mut multi)
+                .unwrap();
+
+        assert_eq!(second_wm, 900);
     }
 
     #[test]

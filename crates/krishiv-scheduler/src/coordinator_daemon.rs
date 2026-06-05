@@ -1126,8 +1126,6 @@ mod parse_tests {
         coordinator_daemon_help, parse_coordinator_daemon_config, render_metrics_body,
         validate_runtime_security_config,
     };
-    #[cfg(feature = "redb")]
-    use crate::RedbMetadataStore;
     use crate::{Coordinator, SharedCoordinator};
     use krishiv_common::durability::DurabilityProfile;
     use krishiv_proto::CoordinatorId;

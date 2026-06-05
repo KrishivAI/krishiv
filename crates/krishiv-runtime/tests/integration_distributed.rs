@@ -18,7 +18,7 @@ use krishiv_runtime::execution_runtime::{
 use krishiv_runtime::in_process::BatchSqlTable;
 use krishiv_runtime::in_process_cluster::InProcessCluster;
 use krishiv_runtime::local_streaming::{LocalWindowExecutionSpec, LocalWindowKind};
-use krishiv_runtime::{DistributedBackend, ExecutionBackend, ExecutionRuntime};
+use krishiv_runtime::{DistributedBackend, ExecutionBackend};
 use krishiv_scheduler::Coordinator;
 use tonic::transport::Server;
 

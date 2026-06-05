@@ -1,5 +1,89 @@
 # Krishiv Implementation Status
 
+## Production Stabilization Slice: Watermarks And Schema Registry (2026-06-05)
+
+Completed the next production-stabilization slice from the code-grounded feature review:
+
+- Fixed streaming window fragment parsing so `srcs=id:lag` multi-source watermark values round-trip correctly instead of being split as top-level `:` fields.
+- Added deterministic multi-source fragment roundtrip and invalid-lag parser coverage.
+- Added explicit registration for configured multi-source watermark sources so sources that have not emitted yet participate in the effective watermark as `i64::MIN`.
+- Made multi-source watermark advancement register every configured source before computing the effective minimum, preventing windows from closing before a configured silent source appears.
+- Replaced Confluent Avro decoding from Avro object-container reader to schemaless datum decoding after the magic byte/schema id.
+- Fixed Avro UTF-8 value conversion so `Value::String` maps to the actual string rather than debug output.
+- Added protobuf `.proto` text parsing for scalar fields in the first message and logical Arrow typing for strings, bytes, booleans, integers, floats, and doubles.
+- Added Confluent Protobuf message-index stripping and single-message scalar wire decoding with schema/payload wire-type validation.
+
+Validation:
+
+```bash
+cargo check -p krishiv-plan --tests --locked
+cargo check -p krishiv-exec --tests --locked
+cargo check -p krishiv-schema-registry --tests --locked
+cargo test -p krishiv-plan window --locked
+cargo test -p krishiv-exec watermark --locked
+cargo test -p krishiv-schema-registry avro --locked
+cargo test -p krishiv-schema-registry proto --locked
+cargo check --workspace --tests --locked
+git diff --check
+```
+
+Blockers: none for this slice.
+
+Next useful command:
+
+```bash
+cargo test --workspace --lib --locked
+```
+
+---
+
+## Production Stabilization Slice: Storage, CDC, State, Executor, AI (2026-06-05)
+
+Completed the next production-stabilization slice from the code-grounded feature review:
+
+- Fixed `TokenAwareChunker` progress and overlap semantics: zero overlap no longer loops forever, overlap is taken from the previous chunk suffix, excessive overlap is capped, and UTF-8 boundaries are preserved.
+- Made Fjall snapshot restore decode first and apply replacement through one atomic Fjall write batch, preserving prior state on corrupt/truncated snapshots.
+- Fixed executor batch SQL local parquet registration so task-local `SqlEngine` instances always register their own input tables even if a shared runner cache contains the same table/path key.
+- Made CDC live `run()` fail closed because it has no durable sink argument; added `run_live_kafka_with_iceberg_sink` for the feature-gated certified Kafka → Iceberg path.
+- Tightened rdkafka CDC behavior so invalid UTF-8 payloads and offset commit failures surface as errors instead of being silently skipped/accepted.
+- Corrected Kafka connector capabilities: unavailable stubs advertise no runtime capability, and the normal rdkafka producer no longer claims transactional support.
+- Fixed local Delta overwrite semantics to write remove actions for active files without deleting old parquet files, preserving versioned reads.
+- Fixed Iceberg FS append ordering so data is written, fsynced, renamed, and directory-synced before metadata is published; committed metadata missing a data file now errors instead of silently dropping rows.
+- Updated live-table tests and Python bridge for the internally synchronized `LiveTableRegistry`.
+- Removed stale unused imports surfaced by workspace test-target checks.
+
+Validation:
+
+```bash
+cargo check -p krishiv-ai --tests --locked
+cargo check -p krishiv-state --tests --locked
+cargo check -p krishiv-executor --tests --locked
+cargo check -p krishiv-connectors --tests --locked
+cargo check -p krishiv-lakehouse --tests --locked
+cargo test -p krishiv-ai chunk::token --locked
+cargo test -p krishiv-state p0_7_redb_load_snapshot --locked
+cargo test -p krishiv-executor batch_sql_registers_local_parquet_even_when_shared_cache_contains_key --locked
+cargo test -p krishiv-connectors run_with_source --locked
+cargo test -p krishiv-connectors kafka_source_reports_unbounded_and_rewindable --locked
+cargo test -p krishiv-connectors run_returns_err_without_source --locked
+cargo test -p krishiv-lakehouse overwrite --locked
+cargo test -p krishiv-lakehouse iceberg_fs_data_files_on_disk --locked
+cargo test -p krishiv-lakehouse iceberg_fs_read_parquet_file_nonexistent_returns_error --locked
+cargo check -p krishiv-sql --tests --locked
+cargo check -p krishiv-python --tests --locked
+cargo check --workspace --tests --locked
+```
+
+Blockers: none for this slice.
+
+Next useful command:
+
+```bash
+cargo test --workspace --lib --locked
+```
+
+---
+
 ## Production Stabilization (2026-06-05)
 
 Completed first batch of P0/P1 production stabilization items from feature maturity review:

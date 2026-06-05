@@ -1688,7 +1688,7 @@ mod tests {
     fn inmemory_exporter_captures_spans_after_init() {
         // Verifies that TracerExporter::InMemory is correctly wired into init()
         // and that emitted spans reach the exporter's capture buffer.
-        use opentelemetry::trace::{Tracer as _, TracerProvider as _};
+        use opentelemetry::trace::Tracer as _;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
 
         let exporter = InMemorySpanExporter::default();

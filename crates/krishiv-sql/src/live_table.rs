@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn registry_register_and_drop() {
-        let mut reg = LiveTableRegistry::new();
+        let reg = LiveTableRegistry::new();
         reg.register("v", "SELECT 1");
         assert!(reg.contains("v"));
         reg.remove_table("v");
@@ -281,9 +281,8 @@ mod tests {
     #[test]
     fn execute_live_table_ddl_create_populates_registry_and_returns_streaming_plan() {
         use krishiv_plan::ExecutionKind;
-        use std::sync::Mutex;
 
-        let registry = Mutex::new(LiveTableRegistry::new());
+        let registry = LiveTableRegistry::new();
         let plan = execute_live_table_ddl(
             &registry,
             "CREATE LIVE TABLE summary AS SELECT id, SUM(val) FROM events GROUP BY id",
@@ -291,14 +290,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let guard = registry.lock().unwrap();
         assert!(
-            guard.contains("summary"),
+            registry.contains("summary"),
             "registry must contain the created live table"
         );
         assert_eq!(
-            guard.query("summary"),
-            Some("SELECT id, SUM(val) FROM events GROUP BY id"),
+            registry.query("summary"),
+            Some("SELECT id, SUM(val) FROM events GROUP BY id".to_string()),
             "registry must store the backing query"
         );
         assert_eq!(
@@ -310,24 +308,20 @@ mod tests {
 
     #[test]
     fn execute_live_table_ddl_drop_removes_from_registry() {
-        use std::sync::Mutex;
-
-        let registry = Mutex::new(LiveTableRegistry::new());
+        let registry = LiveTableRegistry::new();
         execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_drop AS SELECT 1 AS n").unwrap();
-        assert!(registry.lock().unwrap().contains("to_drop"));
+        assert!(registry.contains("to_drop"));
 
         execute_live_table_ddl(&registry, "DROP LIVE TABLE to_drop").unwrap();
         assert!(
-            !registry.lock().unwrap().contains("to_drop"),
+            !registry.contains("to_drop"),
             "dropped table must be removed from registry"
         );
     }
 
     #[test]
     fn execute_live_table_ddl_refresh_returns_plan_without_error() {
-        use std::sync::Mutex;
-
-        let registry = Mutex::new(LiveTableRegistry::new());
+        let registry = LiveTableRegistry::new();
         execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_refresh AS SELECT 1 AS x").unwrap();
         let plan = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE to_refresh")
             .unwrap()
@@ -340,8 +334,7 @@ mod tests {
 
     #[test]
     fn execute_live_table_ddl_non_live_table_sql_returns_none() {
-        use std::sync::Mutex;
-        let registry = Mutex::new(LiveTableRegistry::new());
+        let registry = LiveTableRegistry::new();
         let result = execute_live_table_ddl(&registry, "SELECT 1 AS n").unwrap();
         assert!(
             result.is_none(),
@@ -351,8 +344,7 @@ mod tests {
 
     #[test]
     fn execute_live_table_ddl_refresh_unregistered_table_errors() {
-        use std::sync::Mutex;
-        let registry = Mutex::new(LiveTableRegistry::new());
+        let registry = LiveTableRegistry::new();
         // REFRESH on a table that has never been CREATEd must error, not
         // silently no-op (the previous behaviour silently dropped the
         // refresh and returned a plan).
@@ -371,8 +363,7 @@ mod tests {
 
     #[test]
     fn execute_live_table_ddl_refresh_registered_table_succeeds() {
-        use std::sync::Mutex;
-        let registry = Mutex::new(LiveTableRegistry::new());
+        let registry = LiveTableRegistry::new();
         execute_live_table_ddl(&registry, "CREATE LIVE TABLE t AS SELECT 1").unwrap();
         // REFRESH on a registered table must succeed and return a plan.
         let plan = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE t")

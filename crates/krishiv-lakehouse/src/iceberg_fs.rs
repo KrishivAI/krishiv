@@ -26,7 +26,7 @@ struct FsTableMetadata {
     layers: Vec<FsLayerMeta>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FsLayer {
     snapshot_id: i64,
     path: PathBuf,
@@ -125,7 +125,10 @@ impl IcebergFsTable {
 
     fn read_parquet_file(path: &Path) -> Result<Vec<RecordBatch>, LakehouseError> {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Err(LakehouseError::Io(format!(
+                "committed Iceberg data file is missing: {}",
+                path.display()
+            )));
         }
         let file = File::open(path).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -153,8 +156,10 @@ impl IcebergFsTable {
                 .write(batch)
                 .map_err(|e| LakehouseError::Io(e.to_string()))?;
         }
-        writer
-            .close()
+        let file = writer
+            .into_inner()
+            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        file.sync_all()
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
         Ok(())
     }
@@ -263,12 +268,22 @@ impl LakehouseTable for IcebergFsTable {
         let path = self.root.join("data").join(&file_name);
         let tmp_path = self.root.join("data").join(format!(".{file_name}.tmp"));
         Self::write_parquet_file(&tmp_path, &batches)?;
-        layers.push(FsLayer {
+        fs::rename(&tmp_path, &path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = File::open(self.root.join("data")) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        let new_layer = FsLayer {
             snapshot_id: next_id,
             path: path.clone(),
-        });
-        Self::persist_metadata(&layers, &self.root)?;
-        fs::rename(&tmp_path, &path).map_err(|e| LakehouseError::Io(e.to_string()))?;
+        };
+        let mut next_layers = layers.clone();
+        next_layers.push(new_layer);
+        Self::persist_metadata(&next_layers, &self.root)?;
+        *layers = next_layers;
         Ok(())
     }
 
@@ -435,10 +450,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn iceberg_fs_read_parquet_file_nonexistent_returns_empty() {
+    async fn iceberg_fs_read_parquet_file_nonexistent_returns_error() {
         let path = PathBuf::from("/nonexistent/path/file.parquet");
-        let result = IcebergFsTable::read_parquet_file(&path).unwrap();
-        assert!(result.is_empty());
+        let err = IcebergFsTable::read_parquet_file(&path).unwrap_err();
+        assert!(err.to_string().contains("data file is missing"));
     }
 
     #[tokio::test]
@@ -489,5 +504,14 @@ mod tests {
         assert_eq!(files.len(), 1);
         let meta_path = dir.path().join("metadata.json");
         assert!(meta_path.exists());
+        let metadata: FsTableMetadata =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(metadata.layers.len(), 1);
+        for layer in metadata.layers {
+            assert!(
+                data_dir.join(layer.file).exists(),
+                "metadata must not reference a data file before it exists"
+            );
+        }
     }
 }

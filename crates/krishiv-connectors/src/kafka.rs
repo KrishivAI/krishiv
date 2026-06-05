@@ -1,9 +1,9 @@
-//! Kafka source and sink stubs.
+//! Kafka source and sink connectors.
 //!
-//! These stubs define the connector contracts and capability flags for
-//! Kafka-backed data pipelines.  The actual Kafka broker connection is gated
-//! behind a `kafka-runtime` feature that does not exist yet; all data methods
-//! return [`ConnectorError::Unsupported`] until that feature is enabled.
+//! Broker-backed implementations are gated behind the `kafka` feature. Without
+//! that feature, constructors remain available for configuration validation but
+//! data methods return [`ConnectorError::Unsupported`] and advertise no runtime
+//! capabilities.
 
 use std::any::Any;
 
@@ -147,8 +147,6 @@ impl KafkaSource {
 impl Source for KafkaSource {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_rewindable()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -228,7 +226,6 @@ impl Source for KafkaSource {
 /// it to the configured topic.  When the `kafka` feature is not enabled the
 /// sink returns `ConnectorError::Unsupported` on every data method.
 ///
-/// Capabilities: unbounded + transactional.
 #[cfg(not(feature = "kafka"))]
 pub struct KafkaSink {
     config: KafkaConfig,
@@ -251,8 +248,6 @@ impl KafkaSink {
 impl Sink for KafkaSink {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_transactional()
     }
 
     async fn write_batch(&mut self, _batch: RecordBatch) -> ConnectorResult<()> {
@@ -374,9 +369,7 @@ impl KafkaSink {
 #[cfg(feature = "kafka")]
 impl Sink for KafkaSink {
     fn capabilities(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::new()
-            .with_unbounded()
-            .with_transactional()
+        ConnectorCapabilities::new().with_unbounded()
     }
 
     async fn write_batch(&mut self, batch: RecordBatch) -> ConnectorResult<()> {
@@ -897,9 +890,11 @@ mod tests {
         #[cfg(feature = "kafka")]
         let source = KafkaSource::new(config).expect("kafka source");
         let caps = source.capabilities();
+        #[cfg(feature = "kafka")]
         assert!(caps.is_unbounded());
         #[cfg(not(feature = "kafka"))]
-        assert!(caps.is_rewindable());
+        assert!(!caps.is_unbounded());
+        assert!(!caps.is_rewindable());
         assert!(!caps.is_bounded());
         assert!(!caps.is_transactional());
         assert!(!caps.is_idempotent());
@@ -911,7 +906,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "kafka"))]
-    fn kafka_sink_reports_unbounded_and_transactional() {
+    fn kafka_sink_stub_reports_no_runtime_capabilities() {
         let config = KafkaConfig {
             bootstrap_servers: "localhost:9092".into(),
             topic: "events".into(),
@@ -920,8 +915,8 @@ mod tests {
         };
         let sink = KafkaSink::new(config);
         let caps = sink.capabilities();
-        assert!(caps.is_unbounded());
-        assert!(caps.is_transactional());
+        assert!(!caps.is_unbounded());
+        assert!(!caps.is_transactional());
         assert!(!caps.is_bounded());
         assert!(!caps.is_rewindable());
         assert!(!caps.is_idempotent());

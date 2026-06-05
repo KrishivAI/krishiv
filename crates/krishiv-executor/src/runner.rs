@@ -708,10 +708,12 @@ pub struct ExecutorTaskRunner {
     /// this to forward snapshots to the coordinator for metrics exposure.
     pub(crate) progress_callback: SharedProgressCallback,
 
-    /// Cache of `"table_name:path"` keys for parquet tables already registered
-    /// in the SQL engine. Prevents re-reading parquet file footers on every task
-    /// when the same file is queried repeatedly in a session.
-    /// Invalidated when `deregister_table` is called on the engine.
+    /// Auxiliary cache of `"table_name:path"` keys for callers that reuse this
+    /// runner's shared SQL engine outside task-local execution.
+    ///
+    /// Batch task execution creates a fresh SQL engine per assignment so UDF
+    /// limits and table registrations stay scoped to that task; those paths
+    /// intentionally do not consult this cache.
     pub(crate) registered_parquet_cache: Arc<DashMap<String, ()>>,
 
     /// Root directory for durable window operator state (single-node-durable
@@ -805,19 +807,16 @@ impl ExecutorTaskRunner {
 
     /// Access the registered-parquet cache (keyed by `"table_name:path"`).
     ///
-    /// Used by sibling crates (e.g. `krishiv-runtime`) to skip redundant
-    /// `register_parquet` calls for tables already registered in a previous
-    /// inline SQL execution.
+    /// This cache is only valid for callers that also reuse the same SQL engine
+    /// instance. Task-local SQL execution registers its own parquet inputs.
     pub fn registered_parquet_cache(&self) -> &Arc<dashmap::DashMap<String, ()>> {
         &self.registered_parquet_cache
     }
 
-    /// Inject a pre-existing parquet cache so multiple executor sessions can
-    /// share the same file-footer cache without re-reading the same files on
-    /// every new session (process-level cache sharing).
+    /// Inject a pre-existing parquet cache for code paths that reuse a shared
+    /// SQL engine instance.
     ///
     /// By default each [`ExecutorTaskRunner`] creates a fresh private cache.
-    /// Call this builder with a shared `Arc` to enable cross-session reuse.
     pub fn with_shared_parquet_cache(mut self, cache: Arc<dashmap::DashMap<String, ()>>) -> Self {
         self.registered_parquet_cache = cache;
         self
@@ -1128,9 +1127,8 @@ impl ExecutorTaskRunner {
     pub(crate) async fn execute_batch_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
-        udf_limits: ResourceLimits,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_batch_fragment(self, assignment, udf_limits).await
+        execute_batch_fragment(self, assignment, ResourceLimits::default()).await
     }
 
     /// Execute a streaming (continuous) stage fragment.
@@ -1138,9 +1136,8 @@ impl ExecutorTaskRunner {
     pub(crate) async fn execute_streaming_fragment(
         &self,
         assignment: &ExecutorTaskAssignment,
-        udf_limits: ResourceLimits,
     ) -> ExecutorResult<ExecutorTaskOutput> {
-        execute_streaming_fragment(self, assignment, udf_limits).await
+        execute_streaming_fragment(self, assignment, ResourceLimits::default()).await
     }
 
     pub(crate) async fn send_task_status<S>(

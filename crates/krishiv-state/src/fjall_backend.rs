@@ -227,22 +227,23 @@ impl StateBackend for FjallStateBackend {
     }
 
     fn load_snapshot(&mut self, bytes: &[u8]) -> StateResult<()> {
-        // Clear all existing state before restoring so the snapshot is the
-        // authoritative view (no stale keys from the previous session survive).
+        let entries = decode_snapshot_entries(bytes)?;
         let all_keys: Vec<Vec<u8>> = self
             .keyspace
             .iter()
-            .filter_map(|g| g.into_inner().ok().map(|(k, _)| k.to_vec()))
-            .collect();
+            .map(|g| g.into_inner().map(|(k, _)| k.to_vec()).map_err(db_err))
+            .collect::<StateResult<_>>()?;
+
+        let mut batch = self._db.batch();
         for k in all_keys {
-            self.keyspace.remove(k).map_err(db_err)?;
+            batch.remove(&self.keyspace, k);
         }
-        let entries = decode_snapshot_entries(bytes)?;
         for e in entries {
             let ns = Namespace::new(e.0, e.1);
             let fk = Self::fjall_key(&ns, &e.2);
-            self.keyspace.insert(fk, e.3).map_err(db_err)?;
+            batch.insert(&self.keyspace, fk, e.3);
         }
+        batch.commit().map_err(db_err)?;
         Ok(())
     }
 }

@@ -107,24 +107,12 @@ pub(crate) async fn execute_batch_fragment(
         // This enforces per-task resource limits on UDF execution.
         let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
         for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
-            // Skip re-registration if this table+path combo is already in the
-            // session-scoped cache. Avoids reading parquet file footers on every
-            // repeated query against the same files.
-            let cache_key = format!("{}:{}", partition.table_name(), partition.path().display());
-            // Atomic check-and-insert prevents the TOCTOU race where two concurrent
-            // tasks both miss the cache and both call register_parquet.
-            match runner.registered_parquet_cache.entry(cache_key) {
-                dashmap::mapref::entry::Entry::Occupied(_) => {}
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    engine
-                        .register_parquet(partition.table_name(), partition.path())
-                        .await
-                        .map_err(|error| ExecutorError::LocalExecution {
-                            message: error.to_string(),
-                        })?;
-                    v.insert(());
-                }
-            }
+            engine
+                .register_parquet(partition.table_name(), partition.path())
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: error.to_string(),
+                })?;
         }
         for (table_name, batches) in
             read_connector_parquet_partitions(assignment.input_partitions()).await?
@@ -504,12 +492,13 @@ async fn execute_inmem_shuffle_write(
                     message: e.to_string(),
                 })?;
         }
-        let dataframe = limited_engine
-            .sql(query)
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: e.to_string(),
-            })?;
+        let dataframe =
+            limited_engine
+                .sql(query)
+                .await
+                .map_err(|e| ExecutorError::LocalExecution {
+                    message: e.to_string(),
+                })?;
         dataframe
             .collect()
             .await

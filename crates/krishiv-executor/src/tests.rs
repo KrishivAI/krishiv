@@ -1069,6 +1069,50 @@ mod executor_tests {
     }
 
     #[tokio::test]
+    async fn batch_sql_registers_local_parquet_even_when_shared_cache_contains_key() {
+        allow_anonymous_for_tests();
+        let temp = tempdir().unwrap();
+        let parquet_path = temp.path().join("people.parquet");
+        write_people_parquet(&parquet_path);
+
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        runner
+            .registered_parquet_cache()
+            .insert(format!("people:{}", parquet_path.display()), ());
+
+        let assignment = ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new("job-local-parquet-cache").unwrap(),
+                StageId::try_new("stage-1").unwrap(),
+                TaskId::try_new("task-1").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-1").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new("sql: select id, name from people where id > 1 order by id"),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "inline result"),
+        )
+        .with_input_partitions(vec![InputPartition::new(
+            "people-part-1",
+            format!("local-parquet:people:{}", parquet_path.display()),
+        )]);
+
+        let report = runner
+            .run_assignment_with(assignment, &AcceptingCoordinatorService)
+            .await
+            .unwrap();
+
+        assert_eq!(report.output().kind(), ExecutorTaskOutputKind::Sql);
+        assert_eq!(report.output().row_count(), 2);
+        assert_eq!(report.output().batch_count(), 1);
+        assert_eq!(report.output().column_count(), 2);
+        assert_eq!(
+            report.terminal_disposition(),
+            TransportDisposition::Accepted
+        );
+    }
+
+    #[tokio::test]
     async fn executor_runs_parquet_task_via_connector_source() {
         allow_anonymous_for_tests();
         let temp = tempdir().unwrap();

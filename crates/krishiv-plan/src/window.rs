@@ -202,7 +202,7 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
     let mut source_id_column: Option<String> = None;
     let mut source_watermark_lags: HashMap<String, u64> = HashMap::new();
 
-    for part in payload.split(':') {
+    for part in split_stream_fields(payload) {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -344,6 +344,32 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
     })
 }
 
+const STREAM_FIELD_PREFIXES: &[&str] = &[
+    "key=", "time=", "win=", "lag=", "slide=", "gap=", "ttl=", "agg=", "col=", "srcid=", "srcs=",
+];
+
+fn split_stream_fields(payload: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut field_start = 0usize;
+
+    for (idx, ch) in payload.char_indices() {
+        if ch != ':' || idx == field_start {
+            continue;
+        }
+        let after_colon = &payload[idx + ch.len_utf8()..];
+        if STREAM_FIELD_PREFIXES
+            .iter()
+            .any(|prefix| after_colon.starts_with(prefix))
+        {
+            fields.push(&payload[field_start..idx]);
+            field_start = idx + ch.len_utf8();
+        }
+    }
+
+    fields.push(&payload[field_start..]);
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +403,56 @@ mod tests {
         let p = parse_stream_fragment(frag).expect("parse");
         assert_eq!(p.window_kind, WindowKind::Sliding);
         assert_eq!(p.slide_ms, Some(5000));
+    }
+
+    #[test]
+    fn roundtrip_multi_source_watermark_fragment() {
+        let mut source_watermark_lags = HashMap::new();
+        source_watermark_lags.insert("orders".to_string(), 1_000);
+        source_watermark_lags.insert("payments".to_string(), 2_500);
+        let spec = WindowExecutionSpec {
+            key_column: "customer_id".into(),
+            event_time_column: "event_ts".into(),
+            watermark_lag_ms: 100,
+            window_kind: WindowKind::Tumbling,
+            window_size_ms: 60_000,
+            slide_ms: None,
+            session_gap_ms: None,
+            agg_exprs: vec![WindowAgg::count("count")],
+            state_ttl_ms: Some(600_000),
+            source_watermark_lags,
+            source_id_column: Some("source_id".into()),
+        };
+
+        let fragment = encode_stream_fragment(&spec);
+        assert!(
+            fragment.contains("srcs=orders:1000,payments:2500"),
+            "multi-source encoding should remain deterministic: {fragment}"
+        );
+
+        let parsed = parse_stream_fragment(&fragment).expect("parse multi-source fragment");
+        assert_eq!(parsed.source_id_column.as_deref(), Some("source_id"));
+        assert_eq!(parsed.source_watermark_lags.get("orders"), Some(&1_000));
+        assert_eq!(parsed.source_watermark_lags.get("payments"), Some(&2_500));
+        assert_eq!(parsed.source_watermark_lags.len(), 2);
+    }
+
+    #[test]
+    fn parse_multi_source_watermark_with_colon_values() {
+        let fragment =
+            "stream:tw:key=k:time=ts:win=1000:lag=0:agg=count:srcid=source:srcs=a:10,b:20";
+        let parsed = parse_stream_fragment(fragment).expect("parse");
+        assert_eq!(parsed.source_watermark_lags.get("a"), Some(&10));
+        assert_eq!(parsed.source_watermark_lags.get("b"), Some(&20));
+    }
+
+    #[test]
+    fn parse_invalid_multi_source_lag_errors() {
+        let fragment = "stream:tw:key=k:time=ts:win=1000:lag=0:agg=count:srcs=a:not-a-number";
+        let err = parse_stream_fragment(fragment).expect_err("invalid lag should fail");
+        assert!(
+            err.to_string().contains("invalid lag in srcs entry"),
+            "unexpected error: {err}"
+        );
     }
 }

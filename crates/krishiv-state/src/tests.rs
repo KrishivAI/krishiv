@@ -731,15 +731,42 @@ fn p0_7_redb_load_snapshot_incomplete_returns_error() {
 }
 
 #[test]
-fn p0_7_redb_load_snapshot_failure_leaves_backend_empty() {
+fn p0_7_redb_load_snapshot_failure_preserves_existing_state() {
     let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
     let n = ns("op1", "pre");
     backend
         .put(&n, b"pre".to_vec(), b"exists".to_vec())
         .unwrap();
 
-    let _ = backend.load_snapshot(b"tooshort");
-    let _ = backend.get(&n, b"pre");
+    let result = backend.load_snapshot(b"tooshort");
+    assert!(result.is_err());
+    assert_eq!(backend.get(&n, b"pre").unwrap(), Some(b"exists".to_vec()));
+    assert_eq!(backend.key_count(), 1);
+}
+
+#[test]
+fn p0_7_redb_load_snapshot_truncated_failure_preserves_existing_state() {
+    let mut backend = FjallStateBackend::in_memory().expect("in-memory redb");
+    let existing = ns("op1", "pre");
+    backend
+        .put(&existing, b"pre".to_vec(), b"exists".to_vec())
+        .unwrap();
+
+    let mut src = FjallStateBackend::in_memory().expect("in-memory redb");
+    let replacement = ns("op1", "replacement");
+    src.put(&replacement, b"k1".to_vec(), b"v1".to_vec())
+        .unwrap();
+    let snap = src.snapshot().unwrap();
+    let truncated = &snap[..snap.len() / 2];
+
+    let result = backend.load_snapshot(truncated);
+    assert!(result.is_err());
+    assert_eq!(
+        backend.get(&existing, b"pre").unwrap(),
+        Some(b"exists".to_vec())
+    );
+    assert_eq!(backend.get(&replacement, b"k1").unwrap(), None);
+    assert_eq!(backend.key_count(), 1);
 }
 
 // ── P0.8: Clock underflow in unix_now_ms ──────────────────────────────────

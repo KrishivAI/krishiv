@@ -574,30 +574,36 @@ impl CdcToLakehousePipeline {
 
     /// Run the pipeline against a live Kafka cluster.
     ///
-    /// Requires a `CdcEventSource` implementation backed by a real Kafka
-    /// consumer (e.g. `rdkafka`). Use [`run_with_source`] directly with a
-    /// `KafkaCdcEventSource` once that feature is enabled.
+    /// This convenience method intentionally fails closed because it has no
+    /// durable sink argument. Use [`run_live_kafka_with_iceberg_sink`] or
+    /// [`run_with_source`] with a sink callback that durably commits the batch
+    /// before returning.
     pub async fn run(&self) -> Result<(), String> {
         self.validate()?;
-        #[cfg(feature = "kafka")]
-        {
-            let config = KafkaCdcConfig::new(
-                self.kafka_brokers.join(","),
-                format!("krishiv-cdc-{}", self.iceberg_table),
-                self.source_topic.clone(),
-            );
-            let source = RdkafkaCdcEventSource::new(&config)?;
-            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            self.run_with_source(source, |_batch| Ok(()), shutdown_rx)
-                .await
-        }
-        #[cfg(not(feature = "kafka"))]
-        {
-            Err(
-                "direct Kafka execution requires building krishiv-connectors with the `kafka` feature"
-                    .to_string(),
-            )
-        }
+        Err("CdcToLakehousePipeline::run() is disabled because it cannot prove downstream durability; use run_live_kafka_with_iceberg_sink or run_with_source with a durable sink callback".to_string())
+    }
+
+    /// Run CDC ingestion from live Kafka into an Iceberg two-phase sink.
+    ///
+    /// Source offsets are committed only after the Iceberg snapshot commit
+    /// succeeds and embeds the consumed offsets in snapshot metadata.
+    #[cfg(feature = "kafka")]
+    pub async fn run_live_kafka_with_iceberg_sink<I>(
+        &self,
+        iceberg: &I,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Vec<i64>, String>
+    where
+        I: krishiv_lakehouse::IcebergTwoPhaseCommit,
+    {
+        self.validate()?;
+        let config = KafkaCdcConfig::new(
+            self.kafka_brokers.join(","),
+            format!("krishiv-cdc-{}", self.iceberg_table),
+            self.source_topic.clone(),
+        );
+        let source = RdkafkaCdcEventSource::new(&config)?;
+        self.run_with_iceberg_sink(source, iceberg, shutdown).await
     }
 }
 
@@ -963,18 +969,12 @@ impl RdkafkaCdcEventSource {
 
     /// Commit consumer group offsets for the currently assigned partitions.
     ///
-    /// Called internally after a successful batch is handed to the pipeline.
-    /// On failure the error is logged but does not abort the pipeline (the
-    /// consumer will reprocess from the last committed offset on restart,
-    /// providing at-least-once semantics).
-    fn commit_offsets_inner(&self) {
+    /// Called internally after a successful downstream sink commit.
+    fn commit_offsets_inner(&self) -> Result<(), String> {
         use rdkafka::consumer::Consumer;
-        if let Err(e) = self
-            .consumer
+        self.consumer
             .commit_consumer_state(rdkafka::consumer::CommitMode::Sync)
-        {
-            tracing::warn!(error = %e, "rdkafka offset commit failed (at-least-once: will reprocess on restart)");
-        }
+            .map_err(|e| format!("rdkafka offset commit failed: {e}"))
     }
 }
 
@@ -1020,13 +1020,11 @@ impl CdcEventSource for RdkafkaCdcEventSource {
                     let payload = match msg.payload_view::<str>() {
                         Some(Ok(s)) => s.to_string(),
                         Some(Err(e)) => {
-                            tracing::warn!(
-                                error = ?e,
-                                partition = msg.partition(),
-                                offset = msg.offset(),
-                                "skipping message with invalid UTF-8 payload"
-                            );
-                            continue;
+                            return Err(format!(
+                                "rdkafka payload is not valid UTF-8 at partition {} offset {}: {e}",
+                                msg.partition(),
+                                msg.offset()
+                            ));
                         }
                         None => {
                             tracing::warn!(
@@ -1053,8 +1051,7 @@ impl CdcEventSource for RdkafkaCdcEventSource {
     }
 
     fn commit_offsets(&mut self) -> Result<(), String> {
-        self.commit_offsets_inner();
-        Ok(())
+        self.commit_offsets_inner()
     }
 }
 
@@ -1315,6 +1312,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_with_source_commits_offsets_after_successful_sink() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CommitCountingSource {
+            events: std::collections::VecDeque<String>,
+            commits: Arc<AtomicUsize>,
+        }
+
+        impl CdcEventSource for CommitCountingSource {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+                let n = max.min(self.events.len());
+                Ok(self.events.drain(..n).collect())
+            }
+
+            fn commit_offsets(&mut self) -> Result<(), String> {
+                self.commits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+        let commits = Arc::new(AtomicUsize::new(0));
+        let source = CommitCountingSource {
+            events: [
+                r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":"1"}}"#
+                    .to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            commits: Arc::clone(&commits),
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        pipeline
+            .run_with_source(source, |_| Ok(()), shutdown_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_with_source_does_not_commit_offsets_when_sink_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CommitCountingSource {
+            events: std::collections::VecDeque<String>,
+            commits: Arc<AtomicUsize>,
+        }
+
+        impl CdcEventSource for CommitCountingSource {
+            fn poll_events(&mut self, max: usize) -> Result<Vec<String>, String> {
+                let n = max.min(self.events.len());
+                Ok(self.events.drain(..n).collect())
+            }
+
+            fn commit_offsets(&mut self) -> Result<(), String> {
+                self.commits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders",
+            vec!["broker:9092".to_string()],
+            "my_catalog",
+            "warehouse.orders",
+            vec!["id".to_string()],
+        );
+        let commits = Arc::new(AtomicUsize::new(0));
+        let source = CommitCountingSource {
+            events: [
+                r#"{"op":"c","source":{"lsn":1,"ts_ms":1,"table":"orders"},"after":{"id":"1"}}"#
+                    .to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            commits: Arc::clone(&commits),
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let result = pipeline
+            .run_with_source(source, |_| Err("sink failed".to_string()), shutdown_rx)
+            .await;
+
+        assert_eq!(result.unwrap_err(), "sink failed");
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn run_with_source_errors_on_malformed_json() {
         let pipeline = CdcToLakehousePipeline::new(
             "orders",
@@ -1540,6 +1633,7 @@ mod tests {
             vec!["id".to_string()],
         );
         let result = pipeline.run().await;
-        assert!(result.is_err(), "run() without source must return Err");
+        let err = result.expect_err("run() without durable sink must return Err");
+        assert!(err.contains("cannot prove downstream durability"));
     }
 }

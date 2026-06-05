@@ -2,6 +2,7 @@
 //!
 //! Avoids linking `deltalake` against workspace Arrow 58 (deltalake pins Arrow 57).
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,12 +36,12 @@ fn next_version(root: &Path) -> LakehouseResult<u64> {
     Ok(max.map_or(0, |m| m + 1))
 }
 
-fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<PathBuf>> {
+fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<String>> {
     let dir = delta_log_dir(root);
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut files = Vec::new();
+    let mut active = BTreeSet::new();
     let mut versions: Vec<u64> = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
         let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -65,11 +66,23 @@ fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec
             if let Some(add) = value.get("add").and_then(|a| a.get("path"))
                 && let Some(rel) = add.as_str()
             {
-                files.push(root.join(rel));
+                active.insert(rel.to_string());
+            }
+            if let Some(remove) = value.get("remove").and_then(|a| a.get("path"))
+                && let Some(rel) = remove.as_str()
+            {
+                active.remove(rel);
             }
         }
     }
-    Ok(files)
+    Ok(active.into_iter().collect())
+}
+
+fn list_data_files(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<PathBuf>> {
+    Ok(active_data_file_paths(root, max_version)?
+        .into_iter()
+        .map(|rel| root.join(rel))
+        .collect())
 }
 
 pub fn read_table(path: &str, version: Option<u64>) -> LakehouseResult<Vec<RecordBatch>> {
@@ -96,19 +109,8 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     let root = Path::new(path);
     fs::create_dir_all(root).map_err(|e| LakehouseError::Io(e.to_string()))?;
     let mut removed_paths: Vec<String> = Vec::new();
-    if overwrite && root.exists() {
-        for entry in fs::read_dir(root).map_err(|e| LakehouseError::Io(e.to_string()))? {
-            let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
-            let p = entry.path();
-            if p.extension().is_some_and(|e| e == "parquet") {
-                let file_name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                removed_paths.push(file_name);
-                fs::remove_file(p).ok();
-            }
-        }
+    if overwrite {
+        removed_paths = active_data_file_paths(root, None)?;
     }
     let version = next_version(root)?;
     let file_name = format!("part-{version:05}.parquet");
@@ -169,4 +171,52 @@ pub fn table_schema(path: &str) -> LakehouseResult<SchemaRef> {
         .first()
         .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn batch(values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    #[test]
+    fn overwrite_uses_remove_actions_for_latest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        write_table(&path, vec![batch(&[1, 2, 3])], true).unwrap();
+        write_table(&path, vec![batch(&[10])], true).unwrap();
+
+        let latest = read_table(&path, None).unwrap();
+        let latest_rows: usize = latest.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(latest_rows, 1);
+
+        let version_zero = read_table(&path, Some(0)).unwrap();
+        let version_zero_rows: usize = version_zero.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(version_zero_rows, 3);
+    }
+
+    #[test]
+    fn overwrite_keeps_removed_data_files_for_time_travel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        write_table(&path, vec![batch(&[1, 2, 3])], true).unwrap();
+        let old_file = dir.path().join("part-00000.parquet");
+        assert!(old_file.exists());
+
+        write_table(&path, vec![batch(&[10])], true).unwrap();
+
+        assert!(
+            old_file.exists(),
+            "overwrite must tombstone old files in the log instead of deleting data needed for versioned reads"
+        );
+        let old_version = read_table(&path, Some(0)).unwrap();
+        assert_eq!(old_version.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
 }

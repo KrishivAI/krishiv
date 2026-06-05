@@ -119,6 +119,18 @@ impl MultiSourceWatermarkState {
         self
     }
 
+    /// Register an expected source without marking it as having produced data.
+    ///
+    /// Configured sources participate in the effective watermark immediately
+    /// with `i64::MIN`, so a source that has never emitted holds back window
+    /// closure until it produces data. This differs from [`update`], which also
+    /// records a last-update timestamp and is reserved for real source events.
+    pub fn register_source(&mut self, source_id: impl Into<String>) {
+        self.source_watermarks
+            .entry(source_id.into())
+            .or_insert(i64::MIN);
+    }
+
     /// Update the watermark for `source_id` (monotonic — decreasing values are ignored).
     pub fn update(&mut self, source_id: &str, watermark_ms: i64) {
         let entry = self
@@ -230,6 +242,27 @@ mod watermark_tests {
         let mut w = WatermarkState::new(1_000);
         w.advance(5_000);
         assert_eq!(w.current_watermark_ms(), 4_000);
+    }
+
+    #[test]
+    fn multi_source_register_source_participates_without_marking_event_seen() {
+        let mut state = MultiSourceWatermarkState::new().with_idle_source_policy(0, i64::MAX);
+        state.register_source("source-a");
+        state.update("source-b", 10_000);
+
+        assert_eq!(state.source_count(), 2);
+        assert_eq!(
+            state.effective_watermark_ms(),
+            i64::MIN,
+            "registered source-a has not emitted and must hold back the effective watermark"
+        );
+
+        state.apply_idle_source_policy();
+        assert_eq!(
+            state.effective_watermark_ms(),
+            i64::MIN,
+            "idle policy must not advance a registered source that has never emitted"
+        );
     }
 
     /// GAP-14: idle-source policy must NOT advance a watermark that is still

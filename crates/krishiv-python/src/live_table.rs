@@ -125,8 +125,8 @@ impl PyChangeFeedIter {
     }
 }
 
-static LIVE_TABLE_REGISTRY: std::sync::LazyLock<std::sync::Mutex<LiveTableRegistry>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(LiveTableRegistry::new()));
+static LIVE_TABLE_REGISTRY: std::sync::LazyLock<LiveTableRegistry> =
+    std::sync::LazyLock::new(LiveTableRegistry::new);
 
 pub fn create_live_table(name: String, query: String) -> PyResult<PyLiveTable> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
