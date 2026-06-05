@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+krishiv-common = { path = "../krishiv-common" }
 thiserror = { workspace = true }
 
 [lib]

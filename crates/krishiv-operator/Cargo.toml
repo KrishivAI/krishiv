@@ -22,6 +22,7 @@ futures.workspace = true
 thiserror = { workspace = true }
 k8s-openapi = { workspace = true, optional = true }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-scheduler = { path = "../krishiv-scheduler", features = ["redb"] }

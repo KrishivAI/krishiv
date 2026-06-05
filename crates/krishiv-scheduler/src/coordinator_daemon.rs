@@ -134,7 +134,9 @@ fn attach_metadata_store(
 ) -> Coordinator {
     let fail_closed =
         krishiv_common::profile_requires_fail_closed_metadata(config.durability_profile);
-    coord.with_store_fail_closed(store, fail_closed)
+    coord
+        .with_durability_profile(config.durability_profile)
+        .with_store_fail_closed(store, fail_closed)
 }
 
 pub fn build_shared_coordinator_sync(
@@ -839,17 +841,34 @@ fn validate_runtime_security_config(
     executor_task_bearer_token_configured: bool,
     coordinator_bearer_token_configured: bool,
 ) -> Result<(), Box<dyn Error>> {
-    if config.durability_profile == DurabilityProfile::DistributedDurable {
+    let durable = matches!(
+        config.durability_profile,
+        DurabilityProfile::SingleNodeDurable | DurabilityProfile::DistributedDurable
+    );
+    if durable {
         if config.insecure {
-            return Err("distributed-durable rejects --insecure coordinator gRPC".into());
-        }
-        if !coordinator_bearer_token_configured {
             return Err(format!(
-                "distributed-durable requires non-empty {COORDINATOR_BEARER_TOKEN_ENV} \
-                 or {COORDINATOR_BEARER_TOKENS_ENV} so coordinator gRPC is authenticated"
+                "{} rejects --insecure coordinator gRPC",
+                config.durability_profile
             )
             .into());
         }
+        if let Err(error) = crate::auth::validate_coordinator_bearer_token_sources() {
+            return Err(format!(
+                "failed to read coordinator bearer token configuration: {error}"
+            )
+            .into());
+        }
+        if !coordinator_bearer_token_configured {
+            return Err(format!(
+                "{} requires non-empty {COORDINATOR_BEARER_TOKEN_ENV} \
+                 or {COORDINATOR_BEARER_TOKENS_ENV} so coordinator gRPC is authenticated",
+                config.durability_profile
+            )
+            .into());
+        }
+    }
+    if config.durability_profile == DurabilityProfile::DistributedDurable {
         if !executor_task_bearer_token_configured {
             return Err(format!(
                 "distributed-durable requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV} so executor task-control gRPC is authenticated"
@@ -960,6 +979,9 @@ pub async fn run_standalone_coordinator(
         None
     };
     let coordinator = build_shared_coordinator(&config)?;
+    if config.durability_profile != DurabilityProfile::DevLocal {
+        coordinator.sync_leader_fencing_token(1);
+    }
     spawn_coordinator_sidecars(&coordinator, &config).await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
     let _handles = coordinator.spawn_orchestration_loops();
@@ -1335,6 +1357,30 @@ mod parse_tests {
         assert_eq!(config.metadata_backend.as_deref(), Some("etcd"));
         assert_eq!(config.leader_backend, "etcd");
         assert_eq!(config.etcd_endpoints, vec!["http://127.0.0.1:2379"]);
+    }
+
+    #[test]
+    fn single_node_durable_runtime_requires_coordinator_token() {
+        let config = parse_coordinator_daemon_config([
+            String::from("--durability-profile"),
+            String::from("single-node-durable"),
+            String::from("--metadata-backend"),
+            String::from("redb"),
+            String::from("--metadata-path"),
+            String::from("/tmp/krishiv-meta"),
+            String::from("--shuffle-dir"),
+            String::from("/tmp/krishiv-shuffle"),
+        ])
+        .unwrap();
+
+        let error = validate_runtime_security_config(&config, false, false).unwrap_err();
+
+        assert!(error.to_string().contains("single-node-durable"));
+        assert!(
+            error
+                .to_string()
+                .contains("KRISHIV_COORDINATOR_BEARER_TOKEN")
+        );
     }
 
     #[test]

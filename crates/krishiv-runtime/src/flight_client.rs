@@ -577,6 +577,9 @@ pub async fn execute_remote_plan(flight_url: &str, plan: &PhysicalPlan) -> Runti
     match do_action(flight_url, &action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
+            if !krishiv_common::allows_remote_sql_comment_fallback() {
+                return Err(e);
+            }
             let _ = execute_remote_sql(flight_url, &plan_to_sql(plan)).await?;
             Ok(())
         }

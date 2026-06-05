@@ -1238,6 +1238,18 @@ pub trait SandboxedUdfExecutor: Send + Sync {
 /// Concrete real implementation that enforces limits (using timeout for time).
 pub struct DefaultSandboxedExecutor;
 
+fn allows_full_privilege_udfs() -> bool {
+    std::env::var("KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
     fn execute_with_limits(
         &self,
@@ -1245,6 +1257,16 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
         batch: &RecordBatch,
         limits: &ResourceLimits,
     ) -> Result<ArrayRef, UdfError> {
+        if krishiv_common::is_production_mode()
+            && !allows_full_privilege_udfs()
+        {
+            return Err(UdfError::Execution {
+                message: String::from(
+                    "native UDF execution runs with full process privileges; in production use \
+                     LANGUAGE sql UDFs or set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1",
+                ),
+            });
+        }
         let start = std::time::Instant::now();
 
         // Catch panics in user-supplied UDF bodies so a buggy or hostile UDF

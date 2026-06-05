@@ -211,6 +211,16 @@ impl SessionBuilder {
             builder = builder.with_remote_execution(remote);
         }
 
+        if krishiv_common::profile_requires_fail_closed_metadata(
+            krishiv_common::resolve_durability_profile(),
+        ) && builder.mode == ExecutionMode::Embedded
+        {
+            return Err(KrishivError::unsupported(
+                "embedded session mode is dev-only; set KRISHIV_MODE to single-node, \
+                 distributed, bare-metal, or k8s for durable deployments",
+            ));
+        }
+
         Ok(builder)
     }
 

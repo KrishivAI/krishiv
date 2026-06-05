@@ -207,6 +207,14 @@ impl Coordinator {
                     message: format!("restore rejected for job {job_id}: {e}"),
                 }
             })?;
+        } else if self.durability_profile.spec().requires_fencing
+            || krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile)
+        {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "restore rejected for job {job_id}: no live fencing token available (A8)"
+                ),
+            });
         } else {
             tracing::warn!(
                 job_id = %job_id,

@@ -1,6 +1,7 @@
 //! HTTP client for the cluster control plane APIs.
 
 use krishiv_scheduler::decode_inline_record_batches;
+use krishiv_scheduler::configured_coordinator_bearer_token;
 use std::sync::OnceLock;
 
 use crate::flight_protocol::parquet_file_to_ipc_b64;
@@ -42,6 +43,16 @@ fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
         .map_err(|e| RuntimeError::transport(format!("HTTP client build failed: {e}")))?;
     let _ = COORDINATOR_HTTP_CLIENT.set(client.clone()); // ignore if another thread won the race
     Ok(COORDINATOR_HTTP_CLIENT.get().unwrap_or(&client).clone())
+}
+
+fn apply_coordinator_bearer(
+    builder: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    if let Some(token) = configured_coordinator_bearer_token() {
+        builder.header("Authorization", format!("Bearer {token}"))
+    } else {
+        builder
+    }
 }
 
 fn normalize_http_base(url: &str) -> RuntimeResult<String> {
@@ -117,8 +128,7 @@ async fn poll_batch_sql_job(
                 "batch-sql job {job_id} timed out after 300s"
             )));
         }
-        let poll_resp = client
-            .get(poll_url)
+        let poll_resp = apply_coordinator_bearer(client.get(poll_url))
             .send()
             .await
             .map_err(|e| RuntimeError::transport(format!("batch-sql poll failed: {e}")))?;
@@ -194,9 +204,7 @@ pub async fn execute_coordinator_batch_sql(
 
     let client = coordinator_http_client()?;
     let submit_url = format!("{base}/api/v1/batch-sql/submit");
-    let submit_resp = client
-        .post(&submit_url)
-        .json(&submit_body)
+    let submit_resp = apply_coordinator_bearer(client.post(&submit_url).json(&submit_body))
         .send()
         .await
         .map_err(|e| RuntimeError::transport(format!("batch-sql submit failed: {e}")))?;
@@ -251,9 +259,7 @@ pub async fn execute_coordinator_batch_sql_inline(
 
     let client = coordinator_http_client()?;
     let submit_url = format!("{base}/api/v1/batch-sql/submit");
-    let submit_resp = client
-        .post(&submit_url)
-        .json(&submit_body)
+    let submit_resp = apply_coordinator_bearer(client.post(&submit_url).json(&submit_body))
         .send()
         .await
         .map_err(|e| RuntimeError::transport(format!("batch-sql submit failed: {e}")))?;
@@ -315,7 +321,10 @@ pub async fn execute_coordinator_bounded_window(
 
     let client = coordinator_http_client()?;
     let response =
-        client.post(&url).json(&body).send().await.map_err(|e| {
+        apply_coordinator_bearer(client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
             RuntimeError::transport(format!("bounded-window HTTP request failed: {e}"))
         })?;
 
@@ -417,7 +426,10 @@ pub async fn execute_coordinator_continuous_register(
 
     let client = coordinator_http_client()?;
     let response =
-        client.post(&url).json(&body).send().await.map_err(|e| {
+        apply_coordinator_bearer(client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
             RuntimeError::transport(format!("continuous-register request failed: {e}"))
         })?;
 
@@ -452,9 +464,7 @@ pub async fn execute_coordinator_continuous_push(
     };
 
     let client = coordinator_http_client()?;
-    let response = client
-        .post(&url)
-        .json(&body)
+    let response = apply_coordinator_bearer(client.post(&url).json(&body))
         .send()
         .await
         .map_err(|e| RuntimeError::transport(format!("continuous-push request failed: {e}")))?;
@@ -488,7 +498,10 @@ pub async fn execute_coordinator_continuous_drain(
 
     let client = coordinator_http_client()?;
     let response =
-        client.post(&url).json(&body).send().await.map_err(|e| {
+        apply_coordinator_bearer(client.post(&url).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
             RuntimeError::transport(format!("continuous-drain request failed: {e}"))
         })?;
 
