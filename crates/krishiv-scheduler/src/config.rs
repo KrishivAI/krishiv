@@ -71,19 +71,24 @@ impl CoordinatorConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `requests_per_minute` or `tokens_per_minute` is zero.
+    /// Configures per-minute LLM quota limits. Zero values are clamped to 1
+    /// with a warning — LLM quota enforcement requires positive limits.
     #[must_use]
     pub fn with_llm_quota(mut self, requests_per_minute: u32, tokens_per_minute: u64) -> Self {
-        assert!(
-            requests_per_minute > 0,
-            "llm_quota_requests_per_minute must be > 0"
-        );
-        assert!(
-            tokens_per_minute > 0,
-            "llm_quota_tokens_per_minute must be > 0"
-        );
-        self.llm_quota_requests_per_minute = requests_per_minute;
-        self.llm_quota_tokens_per_minute = tokens_per_minute;
+        let rpm = if requests_per_minute == 0 {
+            tracing::warn!("llm_quota_requests_per_minute is zero, clamping to 1");
+            1
+        } else {
+            requests_per_minute
+        };
+        let tpm = if tokens_per_minute == 0 {
+            tracing::warn!("llm_quota_tokens_per_minute is zero, clamping to 1");
+            1
+        } else {
+            tokens_per_minute
+        };
+        self.llm_quota_requests_per_minute = rpm;
+        self.llm_quota_tokens_per_minute = tpm;
         self
     }
 

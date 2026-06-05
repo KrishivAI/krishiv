@@ -2,6 +2,8 @@
 
 use crate::{ExecutorError, ExecutorResult};
 
+const MAX_SIMULATED_SNAPSHOTS: usize = 1000;
+
 // ── BarrierSimulator (Slice F) ────────────────────────────────────────────────
 
 /// Checkpoint-barrier simulation for R5.1.
@@ -65,6 +67,10 @@ impl BarrierSimulator {
             watermark_ms,
             open_windows,
         });
+        if self.simulated_snapshots.len() > MAX_SIMULATED_SNAPSHOTS {
+            let excess = self.simulated_snapshots.len() - MAX_SIMULATED_SNAPSHOTS;
+            self.simulated_snapshots.drain(0..excess);
+        }
         self.last_committed_epoch = epoch;
         Ok(())
     }

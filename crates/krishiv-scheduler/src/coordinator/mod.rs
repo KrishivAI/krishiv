@@ -312,7 +312,7 @@ impl SharedCoordinator {
 
             for lost in &lost {
                 let ts = krishiv_common::async_util::unix_now_ms() as u64;
-                let stale = jc.record_heartbeat_and_detect_stale(lost, ts).await;
+                let stale = jc.record_heartbeat_and_detect_stale(lost, ts);
                 let affected = jc.handle_executor_loss(lost).await;
                 if affected > 0 || stale {
                     tracing::warn!(

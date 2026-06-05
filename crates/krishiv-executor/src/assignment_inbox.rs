@@ -20,22 +20,45 @@ pub enum AssignmentPushOutcome {
 /// Deduplicates assignments by (JobId, TaskId, AttemptId) — duplicate pushes
 /// return Ok(()) without enqueuing to prevent redundant execution.
 const DEFAULT_CAPACITY: usize = 256;
+/// Maximum entries in the deduplication seen-set before evicting oldest entries.
+const MAX_SEEN_ENTRIES: usize = 10_000;
+
+/// Tracks (job_id, task_id, attempt_id) tuples already received to prevent
+/// duplicate execution from at-least-once delivery retries.
+/// Bounded to MAX_SEEN_ENTRIES; oldest entries evicted when full.
+#[derive(Debug, Clone)]
+struct SeenSet {
+    entries: BTreeSet<(krishiv_proto::JobId, krishiv_proto::TaskId, krishiv_proto::AttemptId)>,
+    max_entries: usize,
+}
+
+impl SeenSet {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: BTreeSet::new(),
+            max_entries,
+        }
+    }
+
+    fn insert(&mut self, key: (krishiv_proto::JobId, krishiv_proto::TaskId, krishiv_proto::AttemptId)) -> bool {
+        if self.entries.len() >= self.max_entries && !self.entries.contains(&key) {
+            if let Some(oldest) = self.entries.iter().next().cloned() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key)
+    }
+
+    fn remove(&mut self, key: &(krishiv_proto::JobId, krishiv_proto::TaskId, krishiv_proto::AttemptId)) -> bool {
+        self.entries.remove(key)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutorAssignmentInbox {
     assignments: Arc<RwLock<VecDeque<ExecutorTaskAssignment>>>,
     cancelled_tasks: Arc<RwLock<BTreeSet<krishiv_proto::TaskId>>>,
-    /// Tracks (job_id, task_id, attempt_id) tuples already received to prevent
-    /// duplicate execution from at-least-once delivery retries.
-    seen: Arc<
-        RwLock<
-            BTreeSet<(
-                krishiv_proto::JobId,
-                krishiv_proto::TaskId,
-                krishiv_proto::AttemptId,
-            )>,
-        >,
-    >,
+    seen: Arc<RwLock<SeenSet>>,
     /// None = unbounded (legacy / test default). Some(n) = hard limit.
     max_capacity: Option<usize>,
 }
@@ -57,7 +80,7 @@ impl ExecutorAssignmentInbox {
         Self {
             assignments: Arc::new(RwLock::new(VecDeque::new())),
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
-            seen: Arc::new(RwLock::new(BTreeSet::new())),
+            seen: Arc::new(RwLock::new(SeenSet::new(MAX_SEEN_ENTRIES))),
             max_capacity: None,
         }
     }
@@ -68,7 +91,7 @@ impl ExecutorAssignmentInbox {
         Self {
             assignments: Arc::new(RwLock::new(VecDeque::new())),
             cancelled_tasks: Arc::new(RwLock::new(BTreeSet::new())),
-            seen: Arc::new(RwLock::new(BTreeSet::new())),
+            seen: Arc::new(RwLock::new(SeenSet::new(MAX_SEEN_ENTRIES))),
             max_capacity: Some(max),
         }
     }

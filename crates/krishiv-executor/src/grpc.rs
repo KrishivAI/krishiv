@@ -10,6 +10,19 @@ use krishiv_proto::{
 
 use crate::{AssignmentPushOutcome, ExecutorAssignmentInbox, ExecutorError};
 
+/// Constant-time byte comparison for bearer token validation.
+/// Prevents timing side-channel attacks on token comparison.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Executor-side task assignment service backed by an in-memory inbox.
 #[derive(Debug, Clone)]
 pub struct ExecutorTaskInboxService {
@@ -64,6 +77,11 @@ impl ExecutorTaskAuthConfig {
         self.bearer_token.is_some()
     }
 
+    /// The configured bearer token, if any.
+    pub fn bearer_token(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
+    }
+
     /// Validate the required-auth startup contract.
     pub fn validate_required(&self) -> crate::ExecutorResult<()> {
         if self.require_auth && self.bearer_token.is_none() {
@@ -107,7 +125,7 @@ fn configured_executor_task_bearer_token() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn bearer_token_from_metadata(metadata: &tonic::metadata::MetadataMap) -> Option<&str> {
+pub fn bearer_token_from_metadata(metadata: &tonic::metadata::MetadataMap) -> Option<&str> {
     metadata
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -250,7 +268,7 @@ impl ExecutorTaskGrpcService {
             return Ok(());
         };
         match bearer_token_from_metadata(metadata) {
-            Some(actual) if actual == expected => Ok(()),
+            Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
             Some(_) => Err(tonic::Status::unauthenticated(
                 "invalid executor task bearer token",
             )),

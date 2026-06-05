@@ -68,20 +68,24 @@ impl<'a> PreDowncastCol<'a> {
         }
     }
 
-    fn int64_value(&self, row: usize) -> i64 {
+    fn int64_value(&self, row: usize) -> ExecResult<i64> {
         match self {
-            Self::Int32(arr) => arr.value(row) as i64,
-            Self::Int64(arr) => arr.value(row),
-            _ => unreachable!("int64_value called on non-integer column"),
+            Self::Int32(arr) => Ok(arr.value(row) as i64),
+            Self::Int64(arr) => Ok(arr.value(row)),
+            _ => Err(ExecError::Arrow(format!(
+                "int64_value called on unsupported column type"
+            ))),
         }
     }
 
-    fn float64_value(&self, row: usize) -> f64 {
+    fn float64_value(&self, row: usize) -> ExecResult<f64> {
         match self {
-            Self::Int32(arr) => arr.value(row) as f64,
-            Self::Int64(arr) => arr.value(row) as f64,
-            Self::Float64(arr) => arr.value(row),
-            _ => unreachable!("float64_value called on non-numeric column"),
+            Self::Int32(arr) => Ok(arr.value(row) as f64),
+            Self::Int64(arr) => Ok(arr.value(row) as f64),
+            Self::Float64(arr) => Ok(arr.value(row)),
+            _ => Err(ExecError::Arrow(format!(
+                "float64_value called on unsupported column type"
+            ))),
         }
     }
 }
@@ -300,7 +304,7 @@ fn update_agg_state_pre(
     agg_exprs: &[AggExpr],
     pre_cols: &[Option<PreDowncastCol>],
     row: usize,
-) {
+) -> ExecResult<()> {
     for (i, expr) in agg_exprs.iter().enumerate() {
         match expr.function {
             AggFunction::Count => {
@@ -310,8 +314,10 @@ fn update_agg_state_pre(
             AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
                 let col = pre_cols[i]
                     .as_ref()
-                    .expect("Sum/Min/Max must have input col");
-                let v = col.int64_value(row);
+                    .ok_or_else(|| ExecError::Arrow(format!(
+                        "Sum/Min/Max aggregate expr {} missing input column", i
+                    )))?;
+                let v = col.int64_value(row)?;
                 match expr.function {
                     AggFunction::Sum => {
                         state.values[i] += v;
@@ -329,18 +335,27 @@ fn update_agg_state_pre(
                         }
                         state.has_value[i] = true;
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(ExecError::Arrow(format!(
+                            "unexpected aggregate function {:?} for numeric column", expr.function
+                        )));
+                    }
                 }
             }
             AggFunction::Avg => {
-                let col = pre_cols[i].as_ref().expect("Avg must have input col");
-                let v = col.float64_value(row);
+                let col = pre_cols[i]
+                    .as_ref()
+                    .ok_or_else(|| ExecError::Arrow(format!(
+                        "Avg aggregate expr {} missing input column", i
+                    )))?;
+                let v = col.float64_value(row)?;
                 state.avg_sums[i] += v;
                 state.avg_counts[i] += 1;
                 state.has_value[i] = true;
             }
         }
     }
+    Ok(())
 }
 
 /// Local pre-aggregation operator.
@@ -409,7 +424,7 @@ impl LocalAggregator {
             let state = groups
                 .entry(key)
                 .or_insert_with(|| AggState::new(&self.agg_exprs));
-            update_agg_state_pre(state, &self.agg_exprs, &pre_agg_cols, row);
+            update_agg_state_pre(state, &self.agg_exprs, &pre_agg_cols, row)?;
         }
 
         let mut sorted_entries: Vec<(SmallVec<[AggKey; 4]>, AggState)> =

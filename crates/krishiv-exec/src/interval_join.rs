@@ -90,14 +90,12 @@ impl IntervalJoinState {
     }
 
     pub fn evict_before(&mut self, watermark_ms: i64) {
-        // C4: Eviction horizon uses max absolute bound so asymmetric intervals
-        // don't prematurely evict the longer side.
         let bound = self
             .spec
             .upper_bound_ms
-            .abs()
-            .max(self.spec.lower_bound_ms.abs());
-        let horizon = watermark_ms - bound;
+            .unsigned_abs()
+            .max(self.spec.lower_bound_ms.unsigned_abs());
+        let horizon = watermark_ms.saturating_sub(bound as i64);
         self.left.retain(|e| e.event_time_ms >= horizon);
         self.right.retain(|e| e.event_time_ms >= horizon);
     }

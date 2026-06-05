@@ -1,6 +1,47 @@
 # Krishiv Implementation Status
 
-## Production Stabilization Slice: Watermarks And Schema Registry (2026-06-05)
+## Critical Bug Fixes + Security Hardening (2026-06-05)
+
+Completed Phase 1 production stabilization: 10 critical bugs, 2 security fixes, 3 memory leaks.
+
+### Bugs Fixed
+| # | File | Fix |
+|---|------|-----|
+| B1 | `coordinator/checkpoint_ops.rs:84` | `Ok(false) => (false, None)` — non-quorum ack no longer treated as quorum. Sync version also fixed. Added regression test. |
+| B2 | `job_coordinator.rs` | `record_executor_heartbeat` now stores real timestamps; `record_heartbeat_and_detect_stale` detects staleness; `has_tasks_eligible_for_launch` checks pending tasks; `should_consider_for_launch` scans all eligible tasks |
+| B3 | `config.rs:77-78` | `with_llm_quota` assert→clamp with warning; zero values default to 1 instead of panicking |
+| B4 | `window/sliding.rs:165` | Watermark monotonicity guard added (`if new >= prev`) matching tumbling window |
+| B5 | `aggregate.rs` | All 5 panic sites (`unreachable!`, `expect`) replaced with `ExecResult` error propagation |
+| B6 | `barrier_align.rs` | `reset()` method added; auto-reset on timeout so aligner unblocks for next epoch |
+| B7 | `interval_join.rs:98` | `abs()` replaced with `unsigned_abs()` to prevent `i64::MIN` panic in debug |
+
+### Security
+| # | File | Fix |
+|---|------|-----|
+| S1 | `executor/grpc.rs:253` | Bearer token comparison now constant-time via `constant_time_eq` (XOR accumulator) |
+| S2 | `executor/barrier_grpc.rs` | Barrier gRPC service now validates bearer tokens via `ExecutorTaskAuthConfig`; `bearer_token_to_metadata` made public |
+
+### Memory Leaks
+| # | File | Fix |
+|---|------|-----|
+| L1 | `executor/barrier.rs` | `simulated_snapshots` capped at 1000 entries (oldest evicted) |
+| L2 | `executor/assignment_inbox.rs` | `seen` BTreeSet replaced with `SeenSet` wrapper capped at 10k entries |
+| L3 | `coordinator/checkpoint_ops.rs` | `checkpoint_notify_sent` capped at 10k entries (oldest evicted on insert) |
+
+Validation:
+```bash
+cargo check -p krishiv-exec -p krishiv-executor -p krishiv-scheduler -p krishiv-runtime  # 0 errors, 0 warnings
+```
+
+Next useful commands:
+```bash
+cargo test -p krishiv-scheduler --lib
+cargo test -p krishiv-exec --lib
+cargo test -p krishiv-executor --lib
+```
+
+---
+
 
 Completed the next production-stabilization slice from the code-grounded feature review:
 

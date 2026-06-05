@@ -8,8 +8,10 @@ use krishiv_proto::wire::v1::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::MetadataMap;
 
 use crate::barrier_transport::{SharedBarrierInjector, SharedKeyGroupRanges};
+use crate::grpc::{ExecutorTaskAuthConfig, bearer_token_from_metadata, constant_time_eq};
 
 /// Serves barrier injection and returns acknowledgments after enqueue.
 #[derive(Clone)]
@@ -19,6 +21,8 @@ pub struct ExecutorBarrierService {
     pub key_group_range_start: u32,
     pub key_group_range_end: u32,
     pub key_group_ranges: SharedKeyGroupRanges,
+    /// Optional auth config — when set, all barrier RPCs require a valid bearer token.
+    pub auth_config: Option<ExecutorTaskAuthConfig>,
 }
 
 impl ExecutorBarrierService {
@@ -29,6 +33,40 @@ impl ExecutorBarrierService {
             key_group_range_start: 0,
             key_group_range_end: 32_767,
             key_group_ranges: SharedKeyGroupRanges::new(),
+            auth_config: None,
+        }
+    }
+
+    /// Require bearer-token auth matching the task gRPC auth config.
+    #[must_use]
+    pub fn with_auth_config(mut self, auth: ExecutorTaskAuthConfig) -> Self {
+        self.auth_config = Some(auth);
+        self
+    }
+
+    fn validate_auth(&self, metadata: &MetadataMap) -> Result<(), tonic::Status> {
+        let Some(auth) = &self.auth_config else {
+            return Ok(());
+        };
+        if auth.require_auth() {
+            match auth.bearer_token() {
+                Some(expected) => {
+                    match bearer_token_from_metadata(metadata) {
+                        Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
+                        Some(_) => Err(tonic::Status::unauthenticated(
+                            "invalid barrier bearer token",
+                        )),
+                        None => Err(tonic::Status::unauthenticated(
+                            "missing barrier bearer token",
+                        )),
+                    }
+                }
+                None => Err(tonic::Status::unauthenticated(
+                    "barrier auth required but no token configured",
+                )),
+            }
+        } else {
+            Ok(())
         }
     }
 
@@ -71,6 +109,7 @@ impl BarrierService for ExecutorBarrierService {
         &self,
         request: tonic::Request<tonic::Streaming<CheckpointBarrier>>,
     ) -> Result<tonic::Response<Self::BarrierStreamStream>, tonic::Status> {
+        self.validate_auth(request.metadata())?;
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(16);
         let injector = self.injector.clone();

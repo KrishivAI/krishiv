@@ -93,9 +93,11 @@ impl BarrierAligner {
         if let Some(deadline) = self.alignment_deadline
             && Instant::now() > deadline
         {
+            let waited = self.barrier_inputs_seen.len();
+            self.reset();
             return Err(BarrierAlignError::CheckpointAlignmentTimeout {
                 epoch,
-                waited_inputs: self.barrier_inputs_seen.len(),
+                waited_inputs: waited,
                 expected_inputs: self.input_count,
             });
         }
@@ -108,6 +110,14 @@ impl BarrierAligner {
             .get_mut(input_index)
             .map(|q| q.drain(..).collect())
             .unwrap_or_default()
+    }
+
+    /// Reset alignment state so a new epoch can begin.
+    /// Call this after a timeout or cancellation to unblock the aligner.
+    pub fn reset(&mut self) {
+        self.current_epoch = None;
+        self.barrier_inputs_seen.clear();
+        self.alignment_deadline = None;
     }
 }
 

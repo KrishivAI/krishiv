@@ -3050,6 +3050,58 @@ mod scheduler_tests {
         assert_eq!(response, CheckpointAckResponse::JobNotFound);
     }
 
+    #[test]
+    fn checkpoint_coordinator_rejects_non_quorum_ack_as_stale_epoch() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage_path = storage.base_dir().to_string_lossy().to_string();
+
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-nq").unwrap());
+        let executor_id = ExecutorId::try_new("exec-nq").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-nq", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-nq").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "non-quorum", JobKind::Streaming)
+            .with_checkpoint(5000, &storage_path)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream:tw"),
+                )
+                .with_task(
+                    TaskSpec::new(TaskId::try_new("task-2").unwrap(), "stream:tw"),
+                ),
+            );
+        coordinator.submit_job(spec).unwrap();
+
+        // Store the notify count before the ack.
+        let notify_count_before = coordinator.checkpoint_notify_sent.len();
+
+        // Initiate an epoch — expected_task_count = 2.
+        {
+            let coord = coordinator.checkpoint_coordinator_mut(&job_id).unwrap();
+            coord.set_expected_task_count(2);
+            coord.initiate().unwrap();
+        }
+
+        // Send one ack — NOT enough for quorum (needs 2).
+        let ack = make_ack(&job_id, "task-1", 1, FencingToken::initial(), None);
+        let response = coordinator.handle_checkpoint_ack(ack);
+        assert_eq!(
+            response,
+            CheckpointAckResponse::StaleEpoch { current_epoch: 1 },
+            "single ack with 2 expected tasks must return StaleEpoch, not Accepted"
+        );
+
+        // Notify entries must NOT have been cleared by a non-quorum ack.
+        assert_eq!(
+            coordinator.checkpoint_notify_sent.len(),
+            notify_count_before,
+            "non-quorum ack must not clear checkpoint_notify_sent"
+        );
+    }
+
     #[tokio::test]
     async fn shared_coordinator_seeds_checkpoint_inner_from_existing_state() {
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();

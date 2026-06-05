@@ -1,5 +1,8 @@
 use super::*;
 
+/// Maximum entries in checkpoint_notify_sent before old entries are evicted.
+const MAX_CHECKPOINT_NOTIFY_ENTRIES: usize = 10_000;
+
 impl Coordinator {
     /// Route a checkpoint ack to the correct per-job coordinator.
     pub fn handle_checkpoint_ack(&mut self, ack: CheckpointAckRequest) -> CheckpointAckResponse {
@@ -30,7 +33,7 @@ impl Coordinator {
                         record_checkpoint_epoch(job_id.as_str(), ack.epoch);
                         CheckpointAckResponse::Accepted
                     }
-                    Ok(false) => CheckpointAckResponse::Accepted,
+                    Ok(false) => CheckpointAckResponse::StaleEpoch { current_epoch },
                     Err(_) => CheckpointAckResponse::StaleEpoch { current_epoch },
                 }
             }
@@ -81,7 +84,7 @@ impl Coordinator {
                 // calling self.* methods.
                 let (is_quorum, pending) = match is_quorum {
                     Ok(true) => (true, coord.take_pending_commit()),
-                    Ok(false) => (true, None),
+                    Ok(false) => (false, None),
                     Err(_) => (false, None),
                 };
                 // coord borrow released — safe to call self.* now.
@@ -334,15 +337,18 @@ impl Coordinator {
                 fencing_token: coord.fencing_token,
             });
             self.checkpoint_notify_sent.insert(key);
+            while self.checkpoint_notify_sent.len() > MAX_CHECKPOINT_NOTIFY_ENTRIES {
+                let Some(oldest) = self.checkpoint_notify_sent.iter().next().cloned() else {
+                    break;
+                };
+                self.checkpoint_notify_sent.remove(&oldest);
+            }
         }
         out
     }
 
     pub(crate) fn clear_checkpoint_notify_for_epoch(&mut self, job_id: &JobId, epoch: u64) {
         self.checkpoint_notify_sent
-            .retain(|(jid, _, e)| jid != job_id || *e != epoch);
-        // Also clean up barrier dispatch tracking for the committed epoch.
-        self.barrier_dispatch_sent
-            .retain(|(jid, e)| jid != job_id || *e != epoch);
+            .retain(|(jid, _, ep)| jid != job_id || ep != &epoch);
     }
 }
