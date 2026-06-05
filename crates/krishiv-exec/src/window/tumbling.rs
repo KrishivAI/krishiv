@@ -7,6 +7,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::aggregate::{AggExpr, AggFunction, AggState};
 use crate::join::extract_agg_key;
+use crate::window::LateEventHandler;
 use crate::{ExecError, ExecResult};
 
 // ── TumblingWindowSpec ────────────────────────────────────────────────────────
@@ -42,13 +43,10 @@ pub struct TumblingWindowSpec {
 ///  …agg output columns (Int64)`.
 pub struct TumblingWindowOperator {
     spec: TumblingWindowSpec,
-    // (serialised_key, window_start_ms) → aggregate accumulator
     accumulators: HashMap<(String, i64), AggState>,
-    // Watermark from before the last processed batch; used for late-event
-    // detection.  Initialised to i64::MIN so the first batch is never late.
     prev_watermark_ms: i64,
-    /// Total late events dropped by this operator since creation.
     pub late_events_dropped: u64,
+    late_event_handler: Option<Box<dyn LateEventHandler>>,
 }
 
 impl TumblingWindowOperator {
@@ -59,7 +57,14 @@ impl TumblingWindowOperator {
             accumulators: HashMap::new(),
             prev_watermark_ms: i64::MIN,
             late_events_dropped: 0,
+            late_event_handler: None,
         }
+    }
+
+    /// Attach a late-event handler that receives each dropped late event.
+    pub fn with_late_event_handler(mut self, handler: Box<dyn LateEventHandler>) -> Self {
+        self.late_event_handler = Some(handler);
+        self
     }
 
     /// Number of open (not yet flushed) window buckets.
@@ -143,9 +148,14 @@ impl TumblingWindowOperator {
 
         for row in 0..batch.num_rows() {
             let event_time_ms = time_arr.value(row);
-            // Drop events that arrived late relative to the previous watermark.
             if event_time_ms < late_threshold {
                 self.late_events_dropped = self.late_events_dropped.saturating_add(1);
+                let key = extract_agg_key(batch, key_idx, row)
+                    .map(|k| k.to_string())
+                    .unwrap_or_default();
+                if let Some(ref handler) = self.late_event_handler {
+                    handler.on_late_event(&key, event_time_ms, row);
+                }
                 continue;
             }
             let key = extract_agg_key(batch, key_idx, row)?.to_string();

@@ -14,6 +14,52 @@ pub use tumbling::{TumblingWindowOperator, TumblingWindowSpec};
 
 use std::collections::HashMap;
 
+/// Handler for late events that arrive after the watermark has passed.
+///
+/// Window operators call this for each event whose event-time is below the
+/// current watermark, instead of silently dropping them. Implementations can
+/// route late events to a side-output, dead-letter queue, or metrics system.
+pub trait LateEventHandler: Send + Sync {
+    /// Called for each late event. `key` is the serialised join/group key,
+    /// `event_time_ms` is the event timestamp, and `batch` is the full
+    /// batch containing the late row at index `row_idx`.
+    fn on_late_event(&self, key: &str, event_time_ms: i64, row_idx: usize);
+}
+
+/// Default no-op handler that only counts late events.
+#[derive(Debug, Default)]
+pub struct CountingLateEventHandler {
+    pub dropped: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for CountingLateEventHandler {
+    fn clone(&self) -> Self {
+        Self {
+            dropped: std::sync::atomic::AtomicU64::new(
+                self.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl CountingLateEventHandler {
+    pub fn new() -> Self {
+        Self {
+            dropped: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl LateEventHandler for CountingLateEventHandler {
+    fn on_late_event(&self, _key: &str, _event_time_ms: i64, _row_idx: usize) {
+        self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // ── WatermarkState ────────────────────────────────────────────────────────────
 
 /// Per-operator monotonic watermark tracker for event-time streaming.
