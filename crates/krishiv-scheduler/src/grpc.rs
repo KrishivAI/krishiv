@@ -306,6 +306,7 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
                 if let Some(coord) = inner.coordinators.get_mut(&job_id) {
                     coord.abort_epoch(&format!("checkpoint storage write failed: {e}"));
                 }
+                krishiv_metrics::global_metrics().inc_checkpoint_failed(job_id.as_str());
                 // Sync inner → outer coordinator after abort.
                 let mut coordinator = self.coordinator.write().await;
                 coordinator
@@ -363,8 +364,24 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         validate_grpc_writer(&auth)?;
         tracing::debug!(subject = %auth.subject(), "restore_job");
         let req = request.into_inner();
+        let leader_token = {
+            let token = self
+                .coordinator
+                .leader_fencing_token
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if token > 0 {
+                Some(token)
+            } else {
+                None
+            }
+        };
         let coordinator = self.coordinator.read().await;
-        match coordinator.restore_job_from_checkpoint(&req.job_id, req.epoch, &req.storage_path) {
+        match coordinator.restore_job_from_checkpoint_with_fencing(
+            &req.job_id,
+            req.epoch,
+            &req.storage_path,
+            leader_token,
+        ) {
             Ok(_meta) => Ok(tonic::Response::new(RestoreJobResponse {
                 accepted: true,
                 message: format!(

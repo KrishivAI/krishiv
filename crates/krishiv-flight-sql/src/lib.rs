@@ -571,6 +571,16 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::ContinuousRegister(body) => {
+                if let Some(http_base) = self.host.coordinator_http_url() {
+                    krishiv_runtime::execute_coordinator_continuous_register(
+                        http_base,
+                        &body.job_id,
+                        &body.spec,
+                    )
+                    .await
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    return Ok(Vec::new());
+                }
                 let cluster = self.host.cluster().ok_or_else(|| {
                     KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
                 })?;
@@ -592,6 +602,16 @@ impl KrishivFlightSqlService {
             A::ContinuousPush(body) => {
                 let batches = krishiv_runtime::decode_batches(&body.batches_b64)
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                if let Some(http_base) = self.host.coordinator_http_url() {
+                    krishiv_runtime::execute_coordinator_continuous_push(
+                        http_base,
+                        &body.job_id,
+                        &batches,
+                    )
+                    .await
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    return Ok(Vec::new());
+                }
                 let cluster = self.host.cluster().ok_or_else(|| {
                     KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
                 })?;
@@ -610,6 +630,15 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::ContinuousDrain(body) => {
+                if let Some(http_base) = self.host.coordinator_http_url() {
+                    let batches = krishiv_runtime::execute_coordinator_continuous_drain(
+                        http_base,
+                        &body.job_id,
+                    )
+                    .await
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    return encode_batches_ipc(&batches);
+                }
                 let cluster = self.host.cluster().ok_or_else(|| {
                     KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
                 })?;

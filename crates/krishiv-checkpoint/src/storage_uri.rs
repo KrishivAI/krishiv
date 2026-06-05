@@ -20,9 +20,14 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
         });
     }
     if trimmed == "memory://" || trimmed.starts_with("memory://") {
-        if krishiv_common::is_production_mode() {
+        if !krishiv_common::allows_memory_checkpoint_uri(
+            krishiv_common::resolve_durability_profile(),
+        ) {
             return Err(CheckpointError::Storage {
-                message: "memory:// checkpoint URIs are disabled in production mode".into(),
+                message: format!(
+                    "memory:// checkpoint URIs are forbidden for durability profile '{}'",
+                    krishiv_common::resolve_durability_profile()
+                ),
             });
         }
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());

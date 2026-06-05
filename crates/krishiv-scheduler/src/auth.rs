@@ -265,7 +265,16 @@ pub fn spawn_grpc_auth_reload_task_from_env() -> Option<tokio::task::JoinHandle<
 
 /// Return `true` when at least one coordinator server bearer token is configured.
 pub fn coordinator_bearer_auth_configured() -> bool {
-    !configured_coordinator_bearer_tokens().is_empty()
+    match try_configured_coordinator_bearer_tokens() {
+        Ok(tokens) => !tokens.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Fail closed when bearer token files are configured but unreadable.
+pub fn validate_coordinator_bearer_token_sources() -> std::io::Result<()> {
+    let _ = try_configured_coordinator_bearer_tokens()?;
+    Ok(())
 }
 
 /// Error installing permissive gRPC auth for development.

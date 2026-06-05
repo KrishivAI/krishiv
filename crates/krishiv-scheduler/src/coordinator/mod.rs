@@ -5,6 +5,7 @@ use krishiv_checkpoint::{
     CheckpointMetadata, CheckpointStorage, open_checkpoint_storage_from_uri, read_epoch_metadata,
     validate_epoch, validate_fencing_token_for_restore,
 };
+use krishiv_common::DurabilityProfile;
 use krishiv_plan::{LogicalPlan, PhysicalPlan};
 use krishiv_proto::{
     AttemptId, CheckpointAckRequest, CheckpointAckResponse, CoordinatorId, CoordinatorState,
@@ -91,6 +92,8 @@ pub struct Coordinator {
     pub(crate) coordinator_id: CoordinatorId,
     pub(crate) state: CoordinatorState,
     pub(crate) config: CoordinatorConfig,
+    /// Active durability profile for fail-closed admission and restore paths.
+    pub(crate) durability_profile: DurabilityProfile,
     pub(crate) executors: ExecutorRegistry,
     pub(crate) store: Option<NonBlockingStoreHandle>,
     /// Per-job checkpoint coordinators for streaming jobs with checkpoint config.
@@ -191,6 +194,10 @@ pub struct SharedCoordinator {
     /// Dedicated lock for checkpoint coordinator state — avoids serialising
     /// checkpoint ack processing behind the full coordinator write lock.
     pub checkpoint_inner: Arc<RwLock<crate::coordinator_sharded::CheckpointInner>>,
+    /// Process-wide durability profile (from daemon config or env).
+    pub durability_profile: DurabilityProfile,
+    /// Live leader-election fencing token mirrored from the CCP leader backend.
+    pub leader_fencing_token: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedCoordinator {
@@ -209,11 +216,27 @@ impl SharedCoordinator {
             coordinator.checkpoint_notify_sent.clone(),
             coordinator.barrier_dispatch_sent.clone(),
         );
+        let durability_profile = coordinator.durability_profile;
         Self {
             inner: Arc::new(RwLock::new(coordinator)),
             executor_inner: Arc::new(RwLock::new(executor_inner)),
             checkpoint_inner: Arc::new(RwLock::new(checkpoint_inner)),
+            durability_profile,
+            leader_fencing_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Attach the daemon durability profile to this shared handle.
+    #[must_use]
+    pub fn with_durability_profile(mut self, profile: DurabilityProfile) -> Self {
+        self.durability_profile = profile;
+        self
+    }
+
+    /// Mirror the live leader-election fencing token for restore validation (A8).
+    pub fn sync_leader_fencing_token(&self, token: u64) {
+        self.leader_fencing_token
+            .store(token, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Borrow the coordinator for read-only status snapshots.
@@ -652,6 +675,7 @@ impl Coordinator {
             coordinator_id,
             state,
             config,
+            durability_profile: DurabilityProfile::DevLocal,
             executors: ExecutorRegistry::new(
                 config.heartbeat_timeout_ticks(),
                 config.memory_threshold_bytes(),
@@ -719,6 +743,13 @@ impl Coordinator {
 
     pub fn active_with_config(coordinator_id: CoordinatorId, config: CoordinatorConfig) -> Self {
         Self::build(coordinator_id, config, CoordinatorState::Active)
+    }
+
+    /// Override the durability profile used for fail-closed admission/restore.
+    #[must_use]
+    pub fn with_durability_profile(mut self, profile: DurabilityProfile) -> Self {
+        self.durability_profile = profile;
+        self
     }
 
     /// Attach a metadata store to this coordinator (builder).

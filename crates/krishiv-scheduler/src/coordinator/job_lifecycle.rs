@@ -24,6 +24,15 @@ impl Coordinator {
         let quota = self.namespace_quota_snapshot(spec.namespace_id());
         let outcome = self.queue_manager.admit(&spec, &quota);
         if let SubmitOutcome::Queued { .. } = &outcome {
+            if krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile) {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "job {} was queued by admission control but durable profiles require \
+                         immediate admission; increase quota or reduce concurrent load",
+                        spec.job_id()
+                    ),
+                });
+            }
             return Ok(outcome);
         }
 

@@ -4225,6 +4225,7 @@ dependencies = [
  "futures",
  "k8s-openapi",
  "krishiv-checkpoint",
+ "krishiv-common",
  "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
@@ -4462,6 +4463,7 @@ name = "krishiv-udf"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "krishiv-common",
  "thiserror 1.0.69",
 ]
 

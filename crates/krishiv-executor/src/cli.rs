@@ -268,12 +268,14 @@ async fn heartbeat_loop(
     }
     let barrier_injector: SharedBarrierInjector = Default::default();
     let key_group_ranges = SharedKeyGroupRanges::new();
+    let task_auth = ExecutorTaskAuthConfig::from_env();
     if let Some(listener) = barrier_listener {
         let barrier_service = ExecutorBarrierService::new(
             barrier_injector.clone(),
             runtime.config().executor_id().as_str(),
         )
-        .with_key_group_ranges(key_group_ranges.clone());
+        .with_key_group_ranges(key_group_ranges.clone())
+        .with_auth_config(task_auth);
         tokio::spawn(async move {
             let _ = Server::builder()
                 .add_service(tonic::service::interceptor::InterceptedService::new(
@@ -291,8 +293,11 @@ async fn heartbeat_loop(
     let checkpoint_storage: Arc<dyn CheckpointStorage> =
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
-    let state_backend =
-        Arc::new(FjallStateBackend::ephemeral().map_err(|e| format!("state backend: {e}"))?);
+    let durability_profile = krishiv_common::resolve_durability_profile();
+    let state_backend = Arc::new(
+        FjallStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
+            .map_err(|e| format!("state backend: {e}"))?,
+    );
 
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
     // operators that exchange partitions between executors (B5).  When no
@@ -330,10 +335,12 @@ async fn heartbeat_loop(
             flight_endpoint: endpoint,
         });
     }
-    let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(
-        InMemoryShuffleStore::new(),
-    )));
-    runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
+    if krishiv_common::allows_unbounded_shuffle_store(durability_profile) {
+        let inmem_shuffle = Arc::new(krishiv_shuffle::ShuffleBackend::InMemory(Arc::new(
+            InMemoryShuffleStore::new(),
+        )));
+        runner_builder = runner_builder.with_inmem_shuffle(inmem_shuffle);
+    }
 
     // Streaming progress buffer (GAP-OB-04): shared between runner tasks
     // (writers) and the heartbeat loop (reader).  Keyed by "job_id:task_id".
@@ -731,6 +738,20 @@ impl ExecutorCliConfig {
         &self,
         auth: &ExecutorTaskAuthConfig,
     ) -> crate::ExecutorResult<()> {
+        let network_control = self.task_grpc_addr.is_some() || self.barrier_grpc_addr.is_some();
+        let durable = matches!(
+            self.durability_profile,
+            DurabilityProfile::SingleNodeDurable | DurabilityProfile::DistributedDurable
+        ) || krishiv_common::is_production_mode();
+        if durable && network_control && auth.bearer_token().is_none() {
+            return Err(crate::ExecutorError::LocalExecution {
+                message: format!(
+                    "durability profile '{}' requires non-empty KRISHIV_EXECUTOR_TASK_BEARER_TOKEN \
+                     when task or barrier gRPC is enabled",
+                    self.durability_profile
+                ),
+            });
+        }
         if self.task_grpc_addr.is_some() {
             auth.validate_required()?;
         }

@@ -284,6 +284,16 @@ impl SqlEngine {
 
     /// Create an engine whose `krishiv` catalog resolves tables registered in `InMemoryCatalog` (P0-10).
     pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self> {
+        if krishiv_common::profile_requires_fail_closed_metadata(
+            krishiv_common::resolve_durability_profile(),
+        ) {
+            return Err(SqlError::DataFusion {
+                message: String::from(
+                    "InMemoryCatalog is dev-only; configure a durable REST or file-backed \
+                     catalog for production deployments",
+                ),
+            });
+        }
         Self::build_local(Some(catalog), WindowFnRegistration::Register)
     }
 

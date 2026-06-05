@@ -633,6 +633,25 @@ async fn execute_source_to_sink_pipeline(
     runner: &ExecutorTaskRunner,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
+    let profile = krishiv_common::resolve_durability_profile();
+    if krishiv_common::forbids_simulation_connectors(profile) {
+        return execute_broker_kafka_to_parquet(runner, assignment, profile).await;
+    }
+    execute_memory_kafka_to_parquet(runner, assignment).await
+}
+
+#[cfg(feature = "kafka")]
+async fn wait_for_throttle(runner: &ExecutorTaskRunner, source_id: &str, rows: u64) {
+    while runner.source_throttle_limits.try_consume(source_id, rows) < rows {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(feature = "kafka")]
+async fn execute_memory_kafka_to_parquet(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_connectors::kafka::{
         InMemoryKafkaOffsetCommitter, InMemoryKafkaSource, KafkaOffset,
     };
@@ -642,8 +661,6 @@ async fn execute_source_to_sink_pipeline(
     let (topic, partition, start_offset, batch) =
         parse_memory_kafka_partition(assignment.input_partitions())?;
     let sink_path = parse_parquet_sink_path(assignment.output_contract())?;
-    // Build the source_id used to look up any coordinator-issued throttle limit.
-    // Format mirrors the assignment partition descriptor: "<topic>/<partition>".
     let source_id = format!("{topic}/{partition}");
     let mut source = InMemoryKafkaSource::new(topic, partition, start_offset, vec![batch]);
     let mut sink =
@@ -666,10 +683,8 @@ async fn execute_source_to_sink_pipeline(
                 message: format!("memory Kafka source read failed: {error}"),
             })?
     {
-        // R7.2: Log any active throttle limit for this source before emitting.
-        // Real token-bucket enforcement is a follow-on task; the log makes the
-        // wiring visible in traces so operators can confirm the limit arrived.
-        runner.source_throttle_limits.check_and_log(&source_id);
+        let rows = batch.num_rows() as u64;
+        wait_for_throttle(runner, &source_id, rows).await;
         row_count += batch.num_rows();
         batch_count += 1;
         column_count = batch.num_columns();
@@ -691,6 +706,102 @@ async fn execute_source_to_sink_pipeline(
     if committer.committed_offsets().is_empty() && row_count > 0 {
         return Err(ExecutorError::LocalExecution {
             message: String::from("Kafka-to-Parquet pipeline wrote rows without committing offset"),
+        });
+    }
+
+    Ok(ExecutorTaskOutput::connector_pipeline(
+        row_count,
+        batch_count,
+        column_count,
+    ))
+}
+
+#[cfg(feature = "kafka")]
+async fn execute_broker_kafka_to_parquet(
+    runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
+    profile: krishiv_common::DurabilityProfile,
+) -> ExecutorResult<ExecutorTaskOutput> {
+    use krishiv_connectors::kafka::{KafkaOffset, RdkafkaKafkaSource};
+    use krishiv_connectors::parquet::ParquetSink;
+    use krishiv_connectors::{Sink, Source};
+
+    let (topic, partition, _, _) = parse_memory_kafka_partition(assignment.input_partitions())?;
+    let sink_path = parse_parquet_sink_path(assignment.output_contract())?;
+    let source_id = format!("{topic}/{partition}");
+    let bootstrap = std::env::var("KAFKA_BOOTSTRAP_SERVERS").map_err(|_| {
+        ExecutorError::LocalExecution {
+            message: String::from(
+                "durable Kafka pipeline requires KAFKA_BOOTSTRAP_SERVERS to be set",
+            ),
+        }
+    })?;
+    let group_id = format!("krishiv-{}", assignment.job_id());
+    let auto_commit = if krishiv_common::requires_manual_kafka_commit(profile) {
+        None
+    } else {
+        Some(5_000)
+    };
+    let mut source = RdkafkaKafkaSource::new(
+        bootstrap,
+        group_id,
+        topic.clone(),
+        auto_commit,
+        None,
+    )
+    .map_err(|error| ExecutorError::LocalExecution {
+        message: format!("rdkafka source for topic '{topic}': {error}"),
+    })?;
+    let mut sink =
+        ParquetSink::create(&sink_path).map_err(|error| ExecutorError::LocalExecution {
+            message: format!(
+                "parquet sink create failed for '{}': {error}",
+                sink_path.display()
+            ),
+        })?;
+
+    let mut row_count = 0usize;
+    let mut batch_count = 0usize;
+    let mut column_count = 0usize;
+    let mut commits = 0usize;
+    loop {
+        let Some(batch) = source
+            .read_batch()
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("broker Kafka source read failed: {error}"),
+            })?
+        else {
+            break;
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let rows = batch.num_rows() as u64;
+        wait_for_throttle(runner, &source_id, rows).await;
+        row_count += batch.num_rows();
+        batch_count += 1;
+        column_count = batch.num_columns();
+        sink.write_batch(batch)
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("Kafka-to-Parquet write failed: {error}"),
+            })?;
+        sink.flush()
+            .await
+            .map_err(|error| ExecutorError::LocalExecution {
+                message: format!("Kafka-to-Parquet flush failed: {error}"),
+            })?;
+        source.commit_offsets();
+        commits += 1;
+        let _ = source
+            .current_offset()
+            .and_then(|offset| offset.downcast::<KafkaOffset>().ok());
+    }
+
+    if row_count > 0 && commits == 0 {
+        return Err(ExecutorError::LocalExecution {
+            message: String::from("broker Kafka pipeline wrote rows without committing offsets"),
         });
     }
 

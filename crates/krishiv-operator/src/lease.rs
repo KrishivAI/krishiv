@@ -435,6 +435,13 @@ impl LeaderElection for K8sLeaseElection {
         if let Some(ref client) = self.client {
             self.k8s_try_acquire(client).await
         } else {
+            if krishiv_common::is_production_mode() {
+                tracing::error!(
+                    "K8s lease election simulation mode is forbidden in production; \
+                     attach a kube client via with_kube_client()"
+                );
+                return false;
+            }
             // Simulation mode: increment fencing token and mark as leader.
             let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             s.fencing_token += 1;
