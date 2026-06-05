@@ -79,17 +79,20 @@ impl crate::Offset for KafkaOffset {
 /// Validated Kafka connector configuration.
 #[derive(Debug, Clone)]
 pub struct KafkaConfig {
-    /// Comma-separated list of `host:port` bootstrap server addresses.
     pub bootstrap_servers: String,
-    /// The Kafka topic to read from or write to.
     pub topic: String,
-    /// The consumer group id used for offset management.
     pub group_id: String,
-    /// `None` = manual commit (default, use `commit_watermark` explicitly).
-    /// `Some(ms)` enables rdkafka auto-commit every `ms` milliseconds —
-    /// gives at-least-once delivery for streaming SQL paths without
-    /// requiring explicit offset management.
     pub auto_commit_interval_ms: Option<u64>,
+    pub security_protocol: Option<String>,
+    pub ssl_ca_location: Option<String>,
+    pub ssl_certificate_location: Option<String>,
+    pub ssl_key_location: Option<String>,
+    pub ssl_key_password: Option<String>,
+    pub sasl_username: Option<String>,
+    pub sasl_password: Option<String>,
+    pub sasl_mechanisms: Option<String>,
+    pub enable_idempotence: Option<bool>,
+    pub transactional_id: Option<String>,
 }
 
 impl KafkaConfig {
@@ -109,6 +112,16 @@ impl KafkaConfig {
             auto_commit_interval_ms: config
                 .get("auto.commit.interval.ms")
                 .and_then(|s| s.parse().ok()),
+            security_protocol: config.get("security.protocol").map(|s| s.to_string()),
+            ssl_ca_location: config.get("ssl.ca.location").map(|s| s.to_string()),
+            ssl_certificate_location: config.get("ssl.certificate.location").map(|s| s.to_string()),
+            ssl_key_location: config.get("ssl.key.location").map(|s| s.to_string()),
+            ssl_key_password: config.get("ssl.key.password").map(|s| s.to_string()),
+            sasl_username: config.get("sasl.username").map(|s| s.to_string()),
+            sasl_password: config.get("sasl.password").map(|s| s.to_string()),
+            sasl_mechanisms: config.get("sasl.mechanisms").map(|s| s.to_string()),
+            enable_idempotence: config.get("enable.idempotence").and_then(|s| s.parse().ok()),
+            transactional_id: config.get("transactional.id").map(|s| s.to_string()),
         })
     }
 
@@ -176,6 +189,7 @@ impl KafkaSource {
             config.group_id.clone(),
             config.topic.clone(),
             config.auto_commit_interval_ms,
+            Some(&config),
         )
         .map_err(|message| ConnectorError::Kafka {
             message,
@@ -283,16 +297,16 @@ pub struct KafkaSink {
 
 #[cfg(feature = "kafka")]
 impl KafkaSink {
-    /// Create a new `KafkaSink` from a validated config.
-    ///
-    /// Returns an error if the rdkafka producer cannot be created
-    /// (e.g. invalid bootstrap servers string).
     pub fn new(config: KafkaConfig) -> ConnectorResult<Self> {
         use rdkafka::ClientConfig;
 
-        let producer: rdkafka::producer::FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", &config.bootstrap_servers)
-            .set("message.timeout.ms", "5000")
+        let mut client = ClientConfig::new();
+        client.set("bootstrap.servers", &config.bootstrap_servers)
+            .set("message.timeout.ms", "5000");
+        apply_kafka_security_config(&mut client, &config);
+        apply_kafka_transactional_config(&mut client, &config);
+
+        let producer: rdkafka::producer::FutureProducer = client
             .create()
             .map_err(|e| ConnectorError::Kafka {
                 message: format!("rdkafka producer creation failed: {e}"),
@@ -545,6 +559,7 @@ impl RdkafkaKafkaSource {
         group_id: impl AsRef<str>,
         topic: impl Into<String>,
         auto_commit_interval_ms: Option<u64>,
+        kafka_cfg: Option<&KafkaConfig>,
     ) -> Result<Self, String> {
         use rdkafka::ClientConfig;
         use rdkafka::consumer::Consumer;
@@ -554,6 +569,10 @@ impl RdkafkaKafkaSource {
         cfg.set("bootstrap.servers", bootstrap_servers.as_ref())
             .set("group.id", group_id.as_ref())
             .set("auto.offset.reset", "earliest");
+
+        if let Some(kc) = kafka_cfg {
+            apply_kafka_security_config(&mut cfg, kc);
+        }
 
         match auto_commit_interval_ms {
             Some(ms) => {
@@ -601,6 +620,7 @@ impl RdkafkaKafkaSource {
             &config.bootstrap_servers,
             &config.group_id,
             &config.topic,
+            None,
             None,
         )
     }
@@ -819,6 +839,49 @@ impl Source for RdkafkaKafkaSource {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+#[cfg(feature = "kafka")]
+fn apply_kafka_security_config(cfg: &mut rdkafka::ClientConfig, config: &KafkaConfig) {
+    if let Some(ref proto) = config.security_protocol {
+        cfg.set("security.protocol", proto);
+    }
+    if let Some(ref ca) = config.ssl_ca_location {
+        cfg.set("ssl.ca.location", ca);
+    }
+    if let Some(ref cert) = config.ssl_certificate_location {
+        cfg.set("ssl.certificate.location", cert);
+    }
+    if let Some(ref key) = config.ssl_key_location {
+        cfg.set("ssl.key.location", key);
+    }
+    if let Some(ref pass) = config.ssl_key_password {
+        cfg.set("ssl.key.password", pass);
+    }
+    if let Some(ref user) = config.sasl_username {
+        cfg.set("sasl.username", user);
+    }
+    if let Some(ref pass) = config.sasl_password {
+        cfg.set("sasl.password", pass);
+    }
+    if let Some(ref mech) = config.sasl_mechanisms {
+        cfg.set("sasl.mechanisms", mech);
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn apply_kafka_transactional_config(cfg: &mut rdkafka::ClientConfig, config: &KafkaConfig) {
+    if config.enable_idempotence.unwrap_or(false) {
+        cfg.set("enable.idempotence", "true");
+    }
+    if let Some(ref tid) = config.transactional_id {
+        cfg.set("enable.idempotence", "true");
+        cfg.set("transactional.id", tid);
+        tracing::info!(
+            transactional_id = %tid,
+            "kafka producer configured for exactly-once transactions"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1057,7 +1120,7 @@ mod tests {
         // Connecting to an unreachable broker should fail with a descriptive
         // error rather than panicking.
         let result =
-            super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic", None);
+            super::RdkafkaKafkaSource::new("localhost:1", "test-group", "test-topic", None, None);
         // rdkafka validates config synchronously; creation may succeed or fail
         // depending on platform.  Both are acceptable — we only assert no panic.
         let _ = result;
