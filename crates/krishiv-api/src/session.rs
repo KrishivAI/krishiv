@@ -1031,8 +1031,9 @@ impl Session {
     /// There is currently no API to push batches into this stream after creation.
     /// Use `Session::memory_stream()` with pre-loaded batches, or
     /// `Session::submit_stream_job()` for continuous streaming jobs.
-    pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Stream {
-        Stream::for_session(
+    pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Result<Stream> {
+        crate::window::ensure_alpha_api("unbounded_memory_stream")?;
+        Ok(Stream::for_session(
             name,
             StreamMode::Unbounded,
             Vec::new(),
@@ -1040,7 +1041,7 @@ impl Session {
             self.coordinator_url.clone(),
             self.state_ttl.map(|c| c.ttl_ms()),
             self.runtime.clone(),
-        )
+        ))
     }
 }
 

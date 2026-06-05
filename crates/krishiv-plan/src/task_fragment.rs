@@ -75,6 +75,30 @@ impl TypedTaskFragment {
     }
 }
 
+/// Validate and return the task body for executor/scheduler routing.
+pub fn task_body_for_profile(
+    fragment: &str,
+    profile: krishiv_common::DurabilityProfile,
+) -> Result<String, PlanError> {
+    Ok(TypedTaskFragment::decode_for_profile(fragment, profile)?
+        .body
+        .trim()
+        .to_owned())
+}
+
+/// Validate every task fragment in a job spec.
+pub fn validate_job_fragments(
+    spec: &krishiv_proto::JobSpec,
+    profile: krishiv_common::DurabilityProfile,
+) -> Result<(), PlanError> {
+    for stage in spec.stages() {
+        for task in stage.tasks() {
+            TypedTaskFragment::decode_for_profile(task.description(), profile)?;
+        }
+    }
+    Ok(())
+}
+
 /// Encode a plan node as a typed task fragment string for the scheduler/executor.
 pub fn encode_typed_task_fragment(node: &PlanNode) -> Result<String, PlanError> {
     let body = crate::encode_task_fragment(node);

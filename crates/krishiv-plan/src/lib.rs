@@ -21,6 +21,7 @@ pub use r17::{
 };
 pub use task_fragment::{
     TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
+    task_body_for_profile, validate_job_fragments,
 };
 
 pub type SendableRecordBatchStream = std::pin::Pin<

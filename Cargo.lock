@@ -4254,6 +4254,7 @@ dependencies = [
  "arrow",
  "futures",
  "krishiv-common",
+ "krishiv-proto",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

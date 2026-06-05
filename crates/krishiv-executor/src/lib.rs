@@ -30,7 +30,6 @@ pub use error::{ExecutorError, ExecutorResult, ExecutorTransportResult};
 pub use execution_model::ExecutionModel;
 
 // Re-exports of barrier, runner, transport, and grpc types.
-pub use barrier::{BarrierSimulator, BarrierSnapshot};
 pub use barrier_grpc::{ExecutorBarrierService, executor_barrier_grpc_server};
 pub use barrier_transport::{
     BarrierInjector, SharedBarrierInjector, SharedKeyGroupRanges, make_checkpoint_barrier,

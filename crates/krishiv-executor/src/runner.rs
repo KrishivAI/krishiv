@@ -1006,8 +1006,10 @@ impl ExecutorTaskRunner {
             ));
         }
 
-        let model =
-            crate::ExecutionModel::from_fragment(assignment.plan_fragment().description().trim());
+        let model = crate::ExecutionModel::from_fragment(
+            assignment.plan_fragment().description().trim(),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
 
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_udf::ResourceLimits {

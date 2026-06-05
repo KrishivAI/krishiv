@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use krishiv_governance::{AuthProvider, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_common::PRODUCTION_ENV;
 
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
 
@@ -267,11 +268,28 @@ pub fn coordinator_bearer_auth_configured() -> bool {
     !configured_coordinator_bearer_tokens().is_empty()
 }
 
+/// Error installing permissive gRPC auth for development.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GrpcAuthSetupError {
+    /// Anonymous gRPC access is forbidden in production mode.
+    #[error("anonymous gRPC access is forbidden when {PRODUCTION_ENV}=1")]
+    AnonymousForbiddenInProduction,
+}
+
 /// Allow anonymous gRPC access when no auth provider is configured.
 ///
 /// Call this once during startup for development / test binaries.
-pub fn set_allow_anonymous() {
+/// Returns an error when [`krishiv_common::is_production_mode`] is active.
+pub fn set_allow_anonymous() -> Result<(), GrpcAuthSetupError> {
+    set_allow_anonymous_when(!krishiv_common::is_production_mode())
+}
+
+fn set_allow_anonymous_when(allowed: bool) -> Result<(), GrpcAuthSetupError> {
+    if !allowed {
+        return Err(GrpcAuthSetupError::AnonymousForbiddenInProduction);
+    }
     ALLOW_ANONYMOUS.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// Validate `auth` against the configured provider.
@@ -599,5 +617,14 @@ mod tests {
 
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert!(status.message().contains("read-only-client"));
+    }
+
+    #[test]
+    fn set_allow_anonymous_rejected_in_production_mode() {
+        let result = set_allow_anonymous_when(false);
+        assert!(matches!(
+            result,
+            Err(GrpcAuthSetupError::AnonymousForbiddenInProduction)
+        ));
     }
 }

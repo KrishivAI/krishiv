@@ -36,6 +36,7 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
         return Ok(());
     }
     config.validate_task_auth_startup(&ExecutorTaskAuthConfig::from_env())?;
+    config.validate_durable_startup()?;
 
     let mode = config.mode;
     let heartbeat_interval_secs = config.heartbeat_interval_secs;
@@ -736,6 +737,21 @@ impl ExecutorCliConfig {
         Ok(())
     }
 
+    fn validate_durable_startup(&self) -> crate::ExecutorResult<()> {
+        if !krishiv_common::allows_memory_checkpoint_uri(self.durability_profile)
+            && self.checkpoint_uri.trim().starts_with("memory://")
+        {
+            return Err(crate::ExecutorError::LocalExecution {
+                message: format!(
+                    "checkpoint URI '{}' is forbidden for durability profile '{}'; \
+                     use a file:// or s3:// URI",
+                    self.checkpoint_uri, self.durability_profile
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn set_mode(&mut self, mode: ExecutorMode) -> crate::ExecutorResult<()> {
         if self.mode != ExecutorMode::DryRun && self.mode != mode {
             return Err(crate::ExecutorError::LocalExecution {
@@ -963,8 +979,11 @@ mod tests {
     #[test]
     fn default_config_from_empty_args() {
         let config = ExecutorCliConfig::parse(std::iter::empty::<String>()).unwrap();
+        let expected_host = std::env::var("POD_IP")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| String::from("localhost"));
         assert_eq!(config.executor_id, "exec-local");
-        assert_eq!(config.host, "localhost");
+        assert_eq!(config.host, expected_host);
         assert_eq!(config.slots, 1);
         assert_eq!(config.coordinator_endpoint, "http://127.0.0.1:8080");
         assert_eq!(config.mode, ExecutorMode::DryRun);
@@ -1024,6 +1043,19 @@ mod tests {
             ExecutorCliConfig::parse([String::from("--task-grpc-addr"), String::from("off")])
                 .unwrap();
         assert!(config.task_grpc_addr.is_none());
+    }
+
+    #[test]
+    fn durable_profile_rejects_memory_checkpoint_uri() {
+        let config = ExecutorCliConfig::parse([
+            String::from("--durability-profile"),
+            String::from("single-node-durable"),
+            String::from("--checkpoint-uri"),
+            String::from("memory://test"),
+        ])
+        .unwrap();
+        let err = config.validate_durable_startup().unwrap_err();
+        assert!(err.to_string().contains("memory://"));
     }
 
     #[test]

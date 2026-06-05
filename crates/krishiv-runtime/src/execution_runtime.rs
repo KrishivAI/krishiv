@@ -369,6 +369,10 @@ fn is_server_unimplemented(e: &RuntimeError) -> bool {
     matches!(e, RuntimeError::ServerUnimplemented { .. })
 }
 
+fn allow_remote_sql_comment_fallback() -> bool {
+    krishiv_common::allows_remote_sql_comment_fallback()
+}
+
 impl ExecutionRuntime for RemoteExecutionRuntime {
     fn mode(&self) -> RuntimeMode {
         self.session_mode
@@ -406,6 +410,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         match result {
             Ok(_) => {}
             Err(ref e) if is_server_unimplemented(e) => {
+                if !allow_remote_sql_comment_fallback() {
+                    return Err(e.clone());
+                }
                 let sql = crate::flight_client::plan_to_sql(plan);
                 let _ = block_on(self.pool.execute_sql(&sql))?;
             }
@@ -474,6 +481,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                         all_batches.extend(decode_ipc_response(&body)?);
                     }
                     Err(ref e) if is_server_unimplemented(e) => {
+                        if !allow_remote_sql_comment_fallback() {
+                            return Err(e.clone());
+                        }
                         let sql = encode_bounded_window(topic, spec, &shard_batches)?;
                         all_batches.extend(block_on(self.pool.execute_sql(&sql))?);
                     }
@@ -501,6 +511,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
                 Ok((batches, watermark))
             }
             Err(ref e) if is_server_unimplemented(e) => {
+                if !allow_remote_sql_comment_fallback() {
+                    return Err(e.clone());
+                }
                 let sql = encode_bounded_window(topic, spec, &input_batches)?;
                 let batches = block_on(self.pool.execute_sql(&sql))?;
                 Ok((batches, None))
@@ -549,6 +562,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         match result {
             Ok(_) => Ok(()),
             Err(ref e) if is_server_unimplemented(e) => {
+                if !allow_remote_sql_comment_fallback() {
+                    return Err(e.clone());
+                }
                 let sql = encode_continuous_register(job_id, spec)?;
                 let _ = block_on(self.pool.execute_sql(&sql))?;
                 Ok(())
@@ -574,6 +590,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         match result {
             Ok(_) => Ok(()),
             Err(ref e) if is_server_unimplemented(e) => {
+                if !allow_remote_sql_comment_fallback() {
+                    return Err(e.clone());
+                }
                 let sql = encode_continuous_push(job_id, &batches)?;
                 let _ = block_on(self.pool.execute_sql(&sql))?;
                 Ok(())
@@ -594,6 +613,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         match result {
             Ok(body) => decode_ipc_response(&body),
             Err(ref e) if is_server_unimplemented(e) => {
+                if !allow_remote_sql_comment_fallback() {
+                    return Err(e.clone());
+                }
                 let sql = encode_continuous_drain(job_id);
                 block_on(self.pool.execute_sql(&sql))
             }

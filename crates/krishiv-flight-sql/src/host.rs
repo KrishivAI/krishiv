@@ -297,10 +297,21 @@ impl FlightExecutionHost {
 ///
 /// Requires a multi-threaded tokio runtime, which is always the case for a
 /// Flight SQL gRPC server.
-fn run_blocking<T>(
-    f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError>,
+fn run_blocking<T: Send>(
+    f: impl FnOnce() -> Result<T, krishiv_runtime::RuntimeError> + Send,
 ) -> Result<T, Status> {
-    tokio::task::block_in_place(f).map_err(|e| Status::internal(e.to_string()))
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f).map_err(|e| Status::internal(e.to_string()))
+        }
+        _ => std::thread::scope(|scope| {
+            scope
+                .spawn(f)
+                .join()
+                .expect("run_blocking thread panicked")
+                .map_err(|e| Status::internal(e.to_string()))
+        }),
+    }
 }
 
 fn explain_batch(text: &str) -> Result<RecordBatch, Status> {

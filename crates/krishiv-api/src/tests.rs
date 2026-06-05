@@ -216,7 +216,7 @@ fn unbounded_memory_stream_rejects_collect() {
     let session = Session::builder()
         .build()
         .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
-    let stream = session.unbounded_memory_stream("events");
+    let stream = session.unbounded_memory_stream("events").unwrap();
 
     assert!(!stream.is_bounded());
     assert!(stream.collect_bounded().is_err());
@@ -361,7 +361,7 @@ fn state_ttl_config_roundtrip() {
 #[test]
 fn sliding_window_api_builder() {
     let session = Session::builder().build().unwrap();
-    let stream = session.unbounded_memory_stream("events");
+    let stream = session.unbounded_memory_stream("events").unwrap();
     let sliding: SlidingWindowedStream = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -377,7 +377,7 @@ fn sliding_window_api_builder() {
 #[test]
 fn session_window_api_builder() {
     let session = Session::builder().build().unwrap();
-    let stream = session.unbounded_memory_stream("events");
+    let stream = session.unbounded_memory_stream("events").unwrap();
     let sess: SessionWindowedStream = stream
         .key_by("device_id")
         .with_event_time("ts")
