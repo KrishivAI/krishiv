@@ -113,6 +113,13 @@ fn resolve_ui_token() -> Option<String> {
                 }
             }
             Err(e) => {
+                if krishiv_common::is_production_mode() {
+                    eprintln!(
+                        "krishiv-ui: KRISHIV_UI_TOKEN_FILE='{path}' could not be read: {e}; \
+                         denying all protected routes (production fail-closed)"
+                    );
+                    return Some(String::new());
+                }
                 eprintln!(
                     "krishiv-ui: KRISHIV_UI_TOKEN_FILE='{path}' could not be read: {e}; \
                      falling back to anonymous router"

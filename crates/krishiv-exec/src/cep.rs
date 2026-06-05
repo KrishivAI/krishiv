@@ -11,6 +11,7 @@ pub struct CepOperator {
     matcher: SequentialPatternMatcher,
     key_column: String,
     states: HashMap<Vec<u8>, CepKeyState>,
+    last_barrier_epoch: u64,
 }
 
 impl CepOperator {
@@ -19,7 +20,12 @@ impl CepOperator {
             matcher: SequentialPatternMatcher::new(pattern),
             key_column: key_column.into(),
             states: HashMap::new(),
+            last_barrier_epoch: 0,
         }
+    }
+
+    pub fn last_barrier_epoch(&self) -> u64 {
+        self.last_barrier_epoch
     }
 
     pub fn key_column(&self) -> &str {
@@ -39,8 +45,10 @@ impl CepOperator {
             .process_event(state, stage_name, batch, event_time_ms)
     }
 
-    /// Barriers pass through without clearing CEP state (matches R16 spec).
-    pub fn on_barrier(&mut self, _epoch: u64) {}
+    /// Checkpoint barrier fence: record the committed epoch for restore alignment.
+    pub fn on_barrier(&mut self, epoch: u64) {
+        self.last_barrier_epoch = epoch;
+    }
 }
 
 #[cfg(test)]

@@ -191,7 +191,7 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if let Some(rest) = fragment.strip_prefix(WINDOW_PREFIX) {
-        return execute_window_fragment(rest, assignment).await;
+        return execute_window_fragment(runner, rest, assignment).await;
     }
 
     Err(ExecutorError::InvalidAssignment {
@@ -205,6 +205,7 @@ pub(crate) async fn execute_batch_fragment(
 /// assignment — they never travel inside the fragment description string.
 /// Results are returned as inline IPC via `OutputContractKind::InlineRecordBatches`.
 async fn execute_window_fragment(
+    runner: &ExecutorTaskRunner,
     rest: &str,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -237,8 +238,17 @@ async fn execute_window_fragment(
     let inline_tables = read_inline_ipc_partitions(assignment.input_partitions())?;
     let input_batches: Vec<_> = inline_tables.into_iter().flat_map(|(_, b)| b).collect();
 
+    let job_state_dir = runner
+        .state_dir
+        .as_ref()
+        .map(|d| d.join(assignment.job_id().as_str()));
+
     let output_batches = tokio::task::spawn_blocking(move || {
-        krishiv_exec::execute_bounded_window(input_batches, &plan_spec, None)
+        krishiv_exec::execute_bounded_window(
+            input_batches,
+            &plan_spec,
+            job_state_dir.as_deref(),
+        )
     })
     .await
     .map_err(|e| ExecutorError::LocalExecution {

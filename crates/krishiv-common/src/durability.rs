@@ -158,9 +158,9 @@ pub enum ShuffleDurability {
 pub enum StateDurability {
     /// In-memory operator state.
     Memory,
-    /// File-backed redb state on one host.
+    /// File-backed embedded state on one host (Fjall LSM; historically named redb).
     LocalRedb,
-    /// Local redb state restored from distributed checkpoints.
+    /// Local embedded state restored from distributed checkpoints.
     LocalRedbWithCheckpointRestore,
 }
 

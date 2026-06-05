@@ -55,6 +55,24 @@ impl TypedTaskFragment {
             )
         })
     }
+
+    /// Decode a fragment, rejecting legacy untyped strings in durable/production profiles.
+    pub fn decode_for_profile(
+        fragment: &str,
+        profile: krishiv_common::DurabilityProfile,
+    ) -> Result<Self, PlanError> {
+        if let Some(decoded) = Self::decode(fragment) {
+            return Ok(decoded);
+        }
+        if krishiv_common::allow_legacy_task_fragments(profile) {
+            return Ok(Self::decode_or_legacy(fragment));
+        }
+        Err(PlanError::Validation(format!(
+            "legacy untyped task fragment rejected for profile '{}': {}",
+            profile,
+            fragment.chars().take(120).collect::<String>()
+        )))
+    }
 }
 
 /// Encode a plan node as a typed task fragment string for the scheduler/executor.
@@ -95,4 +113,16 @@ mod tests {
             ExecutionKind::Streaming
         );
     }
+
+    #[test]
+    fn durable_profile_rejects_legacy_fragment() {
+        use krishiv_common::DurabilityProfile;
+        let err = TypedTaskFragment::decode_for_profile(
+            "stream:tw:key=u",
+            DurabilityProfile::SingleNodeDurable,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("legacy untyped"));
+    }
 }
+

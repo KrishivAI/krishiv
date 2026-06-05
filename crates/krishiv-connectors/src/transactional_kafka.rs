@@ -19,6 +19,10 @@ pub struct KafkaTxnHandle {
 }
 
 /// Transactional sink backed by in-memory topic simulation for certification.
+///
+/// **Not broker-backed.** Do not use in `single-node-durable` or
+/// `distributed-durable` profiles; call [`Self::new_for_profile`] which rejects
+/// durable profiles.
 #[derive(Debug)]
 pub struct TransactionalKafkaSink {
     job_id: String,
@@ -41,6 +45,23 @@ impl TransactionalKafkaSink {
             committed: Vec::new(),
             fenced_epochs: Vec::new(),
         }
+    }
+
+    /// Create a sink only when simulation is permitted for the durability profile.
+    pub fn new_for_profile(
+        profile: krishiv_common::DurabilityProfile,
+        job_id: impl Into<String>,
+        partition_id: u32,
+        epoch: u64,
+    ) -> ConnectorResult<Self> {
+        if krishiv_common::forbids_simulation_connectors(profile) {
+            return Err(ConnectorError::IoStr {
+                message: "TransactionalKafkaSink is an in-memory simulator and cannot be used in \
+                          durable profiles; wire a broker-backed rdkafka transactional producer"
+                    .into(),
+            });
+        }
+        Ok(Self::new(job_id, partition_id, epoch))
     }
 
     pub fn txn_id(&self) -> String {

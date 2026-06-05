@@ -20,6 +20,11 @@ pub fn open_checkpoint_storage_from_uri(uri: &str) -> CheckpointResult<Arc<dyn C
         });
     }
     if trimmed == "memory://" || trimmed.starts_with("memory://") {
+        if krishiv_common::is_production_mode() {
+            return Err(CheckpointError::Storage {
+                message: "memory:// checkpoint URIs are disabled in production mode".into(),
+            });
+        }
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let prefix = trimmed
             .strip_prefix("memory://")

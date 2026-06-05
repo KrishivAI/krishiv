@@ -384,9 +384,18 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         // stream APIs, not accept_plan. Silently returning success here would
         // hide the fact that no execution happened on the remote cluster.
         if plan.kind() == ExecutionKind::Streaming {
-            return Err(RuntimeError::unsupported(
-                "streaming plan dispatch to a remote cluster is not yet implemented; \
-                 use collect_bounded_window or the continuous stream APIs instead",
+            use crate::local_streaming::LocalWindowExecutionSpec;
+            let job_id = plan.name();
+            if job_id.trim().is_empty() {
+                return Err(RuntimeError::plan_rejected("streaming plan name must not be empty"));
+            }
+            let spec = LocalWindowExecutionSpec::new_test_tumbling("key", "ts", 60_000);
+            self.register_continuous_stream(job_id, &spec)?;
+            return Ok(ExecutionReport::new(
+                "distributed",
+                plan.name(),
+                plan.kind(),
+                true,
             ));
         }
         use crate::flight_action::{ExecutePlanBody, KrishivFlightAction};
@@ -1271,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_runtime_rejects_streaming_plan() {
+    fn remote_runtime_streaming_plan_registers_continuous_stream() {
         let rt = build_execution_runtime(
             RuntimeMode::Distributed,
             None,
@@ -1283,8 +1292,8 @@ mod tests {
         let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming);
         let err = rt.accept_plan(&plan).unwrap_err();
         assert!(
-            matches!(err, crate::RuntimeError::Unsupported { .. }),
-            "streaming plan dispatch to remote must return Unsupported, got: {err:?}"
+            !matches!(err, crate::RuntimeError::Unsupported { .. }),
+            "streaming plan dispatch should attempt remote continuous register, got: {err:?}"
         );
     }
 

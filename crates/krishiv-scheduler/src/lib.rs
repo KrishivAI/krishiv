@@ -18,6 +18,7 @@ pub mod etcd_lease;
 #[cfg(feature = "etcd")]
 pub mod etcd_metadata;
 pub mod grpc;
+pub mod http_auth;
 pub mod leadership;
 pub mod metrics;
 
@@ -103,6 +104,7 @@ pub use job::{
     job_spec_from_physical_plan,
 };
 pub use job_coordinator::JobCoordinator;
+pub use krishiv_common::DurabilityProfile;
 pub use leadership::{LeaderElection, SingleNodeElection};
 pub use metrics::{SchedulerMetrics, scheduler_metrics};
 #[cfg(feature = "redb")]
