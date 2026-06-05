@@ -21,8 +21,8 @@ use krishiv_state::StateBackend;
 use krishiv_udf::ResourceLimits;
 
 use crate::{
-    ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierInjector,
-    SharedKeyGroupRanges,
+    ExecutorAssignmentInbox, ExecutorError, ExecutorResult, SharedBarrierAckRegistry,
+    SharedBarrierInjector, SharedKeyGroupRanges,
     fragment::{batch::execute_batch_fragment, streaming::execute_streaming_fragment},
 };
 
@@ -684,6 +684,8 @@ pub struct ExecutorTaskRunner {
     /// enqueued here are drained by the runner loop and trigger checkpoint
     /// initiation.
     pub(crate) barrier_injector: Option<SharedBarrierInjector>,
+    /// Completion registry wired to the barrier gRPC stream for deferred acks.
+    pub(crate) barrier_ack_registry: Option<SharedBarrierAckRegistry>,
     pub(crate) key_group_ranges: Option<SharedKeyGroupRanges>,
 
     /// Most-recently observed coordinator fencing token, cached from real gRPC
@@ -772,6 +774,7 @@ impl ExecutorTaskRunner {
                 krishiv_proto::LeaseGeneration::initial(),
             ),
             barrier_injector: None,
+            barrier_ack_registry: None,
             key_group_ranges: None,
             cached_coordinator_fencing_token: Arc::new(AtomicU64::new(
                 FencingToken::initial().as_u64(),
@@ -826,6 +829,12 @@ impl ExecutorTaskRunner {
     /// consumed by the runner loop and trigger checkpoint initiation.
     pub fn with_barrier_injector(mut self, injector: SharedBarrierInjector) -> Self {
         self.barrier_injector = Some(injector);
+        self
+    }
+
+    /// Attach the barrier ack completion registry shared with the gRPC service.
+    pub fn with_barrier_ack_registry(mut self, registry: SharedBarrierAckRegistry) -> Self {
+        self.barrier_ack_registry = Some(registry);
         self
     }
 
@@ -1408,6 +1417,21 @@ impl ExecutorTaskRunner {
                 .await
             {
                 tracing::warn!(error = %e, "barrier checkpoint failed");
+            } else if let Some(registry) = &self.barrier_ack_registry {
+                use crate::barrier_transport::BarrierAckCompletion;
+                let (kg_start, kg_end) = (0u32, 32_767u32);
+                registry.complete(
+                    &barrier.job_id,
+                    barrier.epoch,
+                    BarrierAckCompletion {
+                        checkpoint_uri: format!(
+                            "checkpoint://{}/{}",
+                            barrier.job_id, barrier.checkpoint_id
+                        ),
+                        key_group_range_start: kg_start,
+                        key_group_range_end: kg_end,
+                    },
+                );
             }
         }
     }

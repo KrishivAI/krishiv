@@ -200,9 +200,11 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         // In embedded mode input is pushed via ContinuousStreamRegistry directly;
         // in distributed mode the coordinator delivers batches as InlineIpc in task
         // assignments. This endpoint satisfies the proto interface but is never called.
-        Ok(tonic::Response::new(TaskStatusResponse::new(
-            TransportDisposition::Accepted,
-        )))
+        Ok(tonic::Response::new(
+            TaskStatusResponse::new(TransportDisposition::Rejected).with_message(
+                "continuous input must be delivered via coordinator task assignments or Flight SQL",
+            ),
+        ))
     }
 
     async fn drain_continuous_output(
@@ -216,7 +218,7 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
         Ok(tonic::Response::new(
             krishiv_proto::task::DrainContinuousOutputResponse {
                 version: TransportVersion::CURRENT,
-                disposition: TransportDisposition::Accepted,
+                disposition: TransportDisposition::Rejected,
                 ipc_bytes: vec![],
             },
         ))

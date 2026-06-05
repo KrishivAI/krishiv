@@ -68,8 +68,11 @@ impl LeaderElection for SingleNodeLeader {
     }
 
     async fn try_acquire(&self) -> bool {
+        let was_leader = self.inner.is_leader();
         let acquired = self.inner.try_acquire().await;
-        if acquired {
+        // Bump the fencing token only on a fresh leadership transition, not on
+        // periodic lease renewals that call try_acquire while already leader.
+        if acquired && !was_leader {
             let _ = self.bump_fencing_token();
         }
         acquired

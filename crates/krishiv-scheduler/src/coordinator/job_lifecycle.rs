@@ -365,12 +365,13 @@ impl Coordinator {
             .map(|jc| jc.read_record())
             && let Some(store) = &self.store
         {
-            if terminal_state.is_terminal() {
-                // Synchronous durable commit for critical task state transitions
+            if terminal_state.is_terminal()
+                || krishiv_common::profile_requires_fail_closed_metadata(self.durability_profile)
+            {
+                // Durable profiles require synchronous metadata commits for all task updates.
                 let mut guard = store.inner();
                 guard.save_job(&record)?;
             } else {
-                // Non-blocking fire-and-forget: enqueue the save to background task.
                 store.save_job(&record);
             }
         }

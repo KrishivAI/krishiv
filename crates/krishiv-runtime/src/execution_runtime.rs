@@ -388,12 +388,11 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         // stream APIs, not accept_plan. Silently returning success here would
         // hide the fact that no execution happened on the remote cluster.
         if plan.kind() == ExecutionKind::Streaming {
-            use crate::local_streaming::LocalWindowExecutionSpec;
             let job_id = plan.name();
             if job_id.trim().is_empty() {
                 return Err(RuntimeError::plan_rejected("streaming plan name must not be empty"));
             }
-            let spec = LocalWindowExecutionSpec::new_test_tumbling("key", "ts", 60_000);
+            let spec = crate::plan::streaming_spec_from_plan(plan)?;
             self.register_continuous_stream(job_id, &spec)?;
             return Ok(ExecutionReport::new(
                 "distributed",

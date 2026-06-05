@@ -58,6 +58,7 @@ impl PartitionStream for KafkaPartitionStream {
     fn execute(&self, _ctx: Arc<datafusion::execution::TaskContext>) -> SendableRecordBatchStream {
         let source = self.source.clone();
         let schema = self.schema.clone();
+        let manual_commit = kafka_auto_commit_interval_ms().is_none();
 
         // Use an async channel so the polling loop can run indefinitely.
         // `Ok(None)` from `read_batch` means "no message on this poll cycle"
@@ -84,6 +85,10 @@ impl PartitionStream for KafkaPartitionStream {
                         let projected = project_batch(&batch, &schema);
                         if tx.send(Ok(projected)).await.is_err() {
                             break; // receiver dropped — query cancelled
+                        }
+                        if manual_commit {
+                            let guard = source.lock().await;
+                            guard.commit_current_offset();
                         }
                     }
                     Ok(None) => {

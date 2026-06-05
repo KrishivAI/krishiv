@@ -9,7 +9,8 @@ use std::time::Duration;
 use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
-    ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector,
+    ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierAckRegistry,
+    SharedBarrierInjector,
     SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
     serve_executor_task_grpc_with_listener,
 };
@@ -267,6 +268,7 @@ async fn heartbeat_loop(
         });
     }
     let barrier_injector: SharedBarrierInjector = Default::default();
+    let barrier_ack_registry = SharedBarrierAckRegistry::new();
     let key_group_ranges = SharedKeyGroupRanges::new();
     let task_auth = ExecutorTaskAuthConfig::from_env();
     if let Some(listener) = barrier_listener {
@@ -275,6 +277,7 @@ async fn heartbeat_loop(
             runtime.config().executor_id().as_str(),
         )
         .with_key_group_ranges(key_group_ranges.clone())
+        .with_ack_registry(barrier_ack_registry.clone())
         .with_auth_config(task_auth);
         tokio::spawn(async move {
             let _ = Server::builder()
@@ -308,6 +311,7 @@ async fn heartbeat_loop(
     let mut runner_builder = ExecutorTaskRunner::new(inbox.clone())
         .with_live_lease(shared_lease.clone())
         .with_barrier_injector(barrier_injector)
+        .with_barrier_ack_registry(barrier_ack_registry)
         .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts)
         .with_udf_limits(krishiv_udf::ResourceLimits::default());

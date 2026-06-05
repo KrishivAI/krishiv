@@ -450,8 +450,14 @@ impl SqlEngine {
             bootstrap_servers: bootstrap_servers.into(),
             topic: topic.into(),
             group_id: group_id.into(),
-            // Enable at-least-once delivery for the streaming SQL path.
-            auto_commit_interval_ms: Some(1_000),
+            auto_commit_interval_ms: {
+                let profile = krishiv_common::resolve_durability_profile();
+                if krishiv_common::requires_manual_kafka_commit(profile) {
+                    None
+                } else {
+                    Some(1_000)
+                }
+            },
             security_protocol: None,
             ssl_ca_location: None,
             ssl_certificate_location: None,

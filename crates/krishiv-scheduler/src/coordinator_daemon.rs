@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
 use crate::InMemoryMetadataStore;
+use crate::auth::configured_coordinator_bearer_token;
 use crate::store::MetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
@@ -1172,7 +1173,11 @@ pub async fn run_job_coordinator_daemon(
             "spec_json": spec_json,
         });
         let url = format!("{base}/federation/v1/jobs");
-        match client.post(&url).json(&body).send().await {
+        let mut submit = client.post(&url).json(&body);
+        if let Some(token) = configured_coordinator_bearer_token() {
+            submit = submit.header("Authorization", format!("Bearer {token}"));
+        }
+        match submit.send().await {
             Ok(resp) if resp.status().is_success() => {
                 println!("Krishiv JCP: submitted job {job_id} to {base}");
             }
@@ -1195,7 +1200,11 @@ pub async fn run_job_coordinator_daemon(
 
     let status_url = format!("{base}/federation/v1/jobs/{job_id}");
     loop {
-        match client.get(&status_url).send().await {
+        let mut status_req = client.get(&status_url);
+        if let Some(token) = configured_coordinator_bearer_token() {
+            status_req = status_req.header("Authorization", format!("Bearer {token}"));
+        }
+        match status_req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<JcpJobStatusResponse>().await {
                     Ok(status) => {

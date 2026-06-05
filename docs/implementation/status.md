@@ -1,5 +1,42 @@
 # Krishiv Implementation Status
 
+## Full Stabilization Wave 0 (2026-06-05)
+
+Implemented Wave 0 P0 fixes on branch `cursor/full-stabilization-dd55`:
+
+### Security & metadata durability
+- JCP federation HTTP submit/poll attach coordinator bearer tokens.
+- Non-terminal task metadata saves are synchronous under durable profiles.
+- `SingleNodeLeader` bumps fencing token only on fresh leadership acquisition.
+- Operator controller opens `RedbMetadataStore` from `KRISHIV_METADATA_PATH` with fail-closed writes.
+- Metadata store `flush()` waits for in-flight background writes.
+
+### Barriers & checkpoints
+- Barrier gRPC auth matches task gRPC (token configured ⇒ required).
+- Barrier stream acks deferred until checkpoint completion via `SharedBarrierAckRegistry`.
+- Continuous executor gRPC stubs return `Rejected` instead of fake `Accepted`.
+
+### Distributed execution
+- `ExecutePlan` routes through coordinator HTTP in proxy mode; streaming uses typed plan nodes.
+- `streaming_spec_from_plan` derives window specs from `PhysicalPlan` nodes (no hardcoded test tumbling).
+- Flight client attaches bearer auth from `KRISHIV_FLIGHT_API_KEY` / `KRISHIV_API_KEY` / `KRISHIV_API_KEYS`.
+- Continuous/bounded Flight fallbacks profile-gated like batch SQL fallback.
+
+### Kafka & state
+- SQL `register_kafka_source` respects manual commit under durable profiles.
+- Kafka table loop calls `commit_current_offset` when auto-commit is disabled.
+- `FjallStateBackend::ephemeral()` forbidden under durable profiles.
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test --workspace --lib --no-fail-fast --exclude krishiv-python
+```
+
+Next useful task: Wave 1–2 shuffle lease persistence and CEP durable partial state.
+
+---
+
 ## Production Stabilization F1–F15 (2026-06-05)
 
 Implemented full F1–F15 stabilization on branch `cursor/f1-f15-stabilization-dd55`:

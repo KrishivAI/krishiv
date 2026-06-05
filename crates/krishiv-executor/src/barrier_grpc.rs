@@ -10,13 +10,16 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
 
-use crate::barrier_transport::{SharedBarrierInjector, SharedKeyGroupRanges};
+use crate::barrier_transport::{
+    SharedBarrierAckRegistry, SharedBarrierInjector, SharedKeyGroupRanges,
+};
 use crate::grpc::{ExecutorTaskAuthConfig, bearer_token_from_metadata, constant_time_eq};
 
-/// Serves barrier injection and returns acknowledgments after enqueue.
+/// Serves barrier injection and returns acknowledgments after checkpoint completion.
 #[derive(Clone)]
 pub struct ExecutorBarrierService {
     pub injector: SharedBarrierInjector,
+    pub ack_registry: SharedBarrierAckRegistry,
     pub task_id: String,
     pub key_group_range_start: u32,
     pub key_group_range_end: u32,
@@ -33,6 +36,7 @@ impl ExecutorBarrierService {
     pub fn new(injector: SharedBarrierInjector, task_id: impl Into<String>) -> Self {
         Self {
             injector,
+            ack_registry: SharedBarrierAckRegistry::new(),
             task_id: task_id.into(),
             key_group_range_start: 0,
             key_group_range_end: 32_767,
@@ -54,25 +58,22 @@ impl ExecutorBarrierService {
         let Some(auth) = &self.auth_config else {
             return Ok(());
         };
-        if auth.require_auth() {
-            match auth.bearer_token() {
-                Some(expected) => match bearer_token_from_metadata(metadata) {
-                    Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => {
-                        Ok(())
-                    }
-                    Some(_) => Err(tonic::Status::unauthenticated(
-                        "invalid barrier bearer token",
-                    )),
-                    None => Err(tonic::Status::unauthenticated(
-                        "missing barrier bearer token",
-                    )),
-                },
-                None => Err(tonic::Status::unauthenticated(
-                    "barrier auth required but no token configured",
-                )),
-            }
-        } else {
-            Ok(())
+        if auth.require_auth() && auth.bearer_token().is_none() {
+            return Err(tonic::Status::unauthenticated(
+                "barrier auth required but no token configured",
+            ));
+        }
+        let Some(expected) = auth.bearer_token() else {
+            return Ok(());
+        };
+        match bearer_token_from_metadata(metadata) {
+            Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
+            Some(_) => Err(tonic::Status::unauthenticated(
+                "invalid barrier bearer token",
+            )),
+            None => Err(tonic::Status::unauthenticated(
+                "missing barrier bearer token",
+            )),
         }
     }
 
@@ -88,6 +89,13 @@ impl ExecutorBarrierService {
     #[must_use]
     pub fn with_key_group_ranges(mut self, ranges: SharedKeyGroupRanges) -> Self {
         self.key_group_ranges = ranges;
+        self
+    }
+
+    /// Share the barrier ack completion registry with the task runner.
+    #[must_use]
+    pub fn with_ack_registry(mut self, registry: SharedBarrierAckRegistry) -> Self {
+        self.ack_registry = registry;
         self
     }
 
@@ -119,39 +127,48 @@ impl BarrierService for ExecutorBarrierService {
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(16);
         let injector = self.injector.clone();
+        let ack_registry = self.ack_registry.clone();
         let task_id = self.task_id.clone();
-        let key_group_range_start = self.key_group_range_start;
-        let key_group_range_end = self.key_group_range_end;
-        let key_group_ranges = self.key_group_ranges.clone();
         let state_backend_kind = self.state_backend_kind.clone();
-        let checkpoint_uri = self.checkpoint_uri.clone();
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 injector.enqueue(barrier.clone());
                 let ack_task_id = task_id_from_checkpoint_id(&barrier.checkpoint_id)
                     .unwrap_or_else(|| task_id.clone());
-                let (key_group_range_start, key_group_range_end) =
-                    if let Some(assigned_range) = key_group_ranges.get(&ack_task_id) {
-                        (assigned_range.start(), assigned_range.end())
-                    } else {
-                        (key_group_range_start, key_group_range_end)
-                    };
-                let ack = BarrierAck {
-                    epoch: barrier.epoch,
-                    job_id: barrier.job_id.clone(),
-                    task_id: ack_task_id,
-                    state_handle: Some(StateHandle {
-                        backend_kind: state_backend_kind.clone(),
-                        checkpoint_uri: checkpoint_uri.clone().unwrap_or_else(|| {
-                            format!("checkpoint://{}/{}", barrier.job_id, barrier.checkpoint_id)
+                let completion_rx =
+                    ack_registry.register_wait(&barrier.job_id, barrier.epoch);
+                let ack = match tokio::time::timeout(Duration::from_secs(120), completion_rx).await
+                {
+                    Ok(Ok(completion)) => Ok(BarrierAck {
+                        epoch: barrier.epoch,
+                        job_id: barrier.job_id.clone(),
+                        task_id: ack_task_id,
+                        state_handle: Some(StateHandle {
+                            backend_kind: state_backend_kind.clone(),
+                            checkpoint_uri: completion.checkpoint_uri,
+                            key_group_range_start: completion.key_group_range_start,
+                            key_group_range_end: completion.key_group_range_end,
+                            schema_version: 1,
                         }),
-                        key_group_range_start,
-                        key_group_range_end,
-                        schema_version: 1,
                     }),
+                    Ok(Err(_)) => Err(tonic::Status::internal(
+                        "barrier checkpoint completion channel closed",
+                    )),
+                    Err(_) => Err(tonic::Status::deadline_exceeded(
+                        "barrier checkpoint completion timeout",
+                    )),
                 };
-                if tx.send(Ok(ack)).await.is_err() {
-                    break;
+                match ack {
+                    Ok(ack) => {
+                        if tx.send(Ok(ack)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(status) => {
+                        if tx.send(Err(status)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });

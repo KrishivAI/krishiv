@@ -682,7 +682,26 @@ impl KrishivFlightSqlService {
                 let plan = body
                     .to_plan()
                     .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                if let Some(http_base) = self.host.coordinator_http_url() {
+                    krishiv_runtime::execute_coordinator_physical_plan(http_base, &plan)
+                        .await
+                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    return Ok(Vec::new());
+                }
                 let sql = krishiv_runtime::flight_client::plan_to_sql(&plan);
+                if plan.kind() == krishiv_plan::ExecutionKind::Streaming {
+                    let spec = krishiv_runtime::streaming_spec_from_plan(&plan)
+                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    let cluster = self.host.cluster().ok_or_else(|| {
+                        KrishivActionError::Other("embedded cluster unavailable".into())
+                    })?;
+                    let job_id = plan.name().to_string();
+                    tokio::task::block_in_place(|| {
+                        cluster.register_continuous_job(&job_id, &spec)
+                    })
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    return Ok(Vec::new());
+                }
                 let _ = self
                     .host
                     .execute_sql(&sql)
