@@ -1708,12 +1708,24 @@ mod tests {
             drop(span);
         }
 
-        // Force flush to drain the processor.
-        let _ = handle.tracer_provider.force_flush();
-
-        let spans = exporter
-            .get_finished_spans()
-            .expect("get_finished_spans must succeed");
+        // Force flush to drain the processor (retry briefly for parallel test runs).
+        let mut spans = Vec::new();
+        for _ in 0..50 {
+            let _ = handle.tracer_provider.force_flush();
+            if let Ok(captured) = exporter.get_finished_spans() {
+                if !captured.is_empty() {
+                    spans = captured;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = handle.tracer_provider.shutdown();
+        if spans.is_empty() {
+            if let Ok(captured) = exporter.get_finished_spans() {
+                spans = captured;
+            }
+        }
         assert!(
             !spans.is_empty(),
             "at least one span must be captured by InMemory exporter after init()"

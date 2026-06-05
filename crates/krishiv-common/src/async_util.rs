@@ -31,14 +31,12 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
 ///    is active on the same thread is undefined behaviour in Tokio.
 pub fn block_on<T, F: Future<Output = T>>(fut: F) -> T {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            let worker_count = handle.metrics().num_workers();
-            if worker_count > 1 {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| handle.block_on(fut))
-            } else {
-                handle.block_on(fut)
             }
-        }
+            _ => fallback_runtime().block_on(fut),
+        },
         Err(_) => fallback_runtime().block_on(fut),
     }
 }

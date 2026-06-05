@@ -79,7 +79,7 @@ fn configure_grpc_auth_for_startup(exposes_coordinator_grpc: bool) -> Result<boo
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        krishiv_scheduler::set_allow_anonymous();
+        krishiv_scheduler::set_allow_anonymous().map_err(|error| error.to_string())?;
         return Ok(false);
     }
     if krishiv_scheduler::configure_grpc_auth_provider_from_env() {

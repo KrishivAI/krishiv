@@ -1302,6 +1302,12 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
             });
         }
     }
+    let profile = krishiv_common::resolve_durability_profile();
+    krishiv_plan::validate_job_fragments(spec, profile).map_err(|error| {
+        SchedulerError::InvalidJob {
+            message: error.to_string(),
+        }
+    })?;
     Ok(())
 }
 

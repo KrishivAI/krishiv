@@ -886,7 +886,10 @@ fn coordinator_bearer_token_configured() -> bool {
 
 fn configure_coordinator_grpc_auth(config: &CoordinatorDaemonConfig) -> bool {
     if config.insecure {
-        crate::auth::set_allow_anonymous();
+        if let Err(error) = crate::auth::set_allow_anonymous() {
+            tracing::error!("{error}");
+            return false;
+        }
         false
     } else {
         crate::auth::configure_grpc_auth_provider_from_env()
@@ -1448,7 +1451,7 @@ mod parse_tests {
         use krishiv_proto::{ExecutorDescriptor, ExecutorId};
         use tower::ServiceExt;
 
-        crate::auth::set_allow_anonymous();
+        let _ = crate::auth::set_allow_anonymous();
 
         let coordinator = SharedCoordinator::new(Coordinator::active(
             CoordinatorId::try_new("coord-cb-reset").unwrap(),

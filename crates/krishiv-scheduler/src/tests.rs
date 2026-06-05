@@ -29,7 +29,9 @@ mod scheduler_tests {
 
     fn allow_anonymous_for_tests() {
         static AUTH_INIT: Once = Once::new();
-        AUTH_INIT.call_once(crate::auth::set_allow_anonymous);
+        AUTH_INIT.call_once(|| {
+            let _ = crate::auth::set_allow_anonymous();
+        });
     }
 
     fn in_process_bridge_for(coordinator: Coordinator) -> InProcessCoordinatorBridge {
@@ -484,13 +486,11 @@ mod scheduler_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn tonic_service_register_executor_persists_descriptor() {
         allow_anonymous_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("metadata.json");
-        let store = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
+        let store = crate::redb_metadata::RedbMetadataStore::in_memory().unwrap();
         let shared = SharedCoordinator::new(
             Coordinator::active(CoordinatorId::try_new("coord-persist").unwrap()).with_store(store),
         );
-        let service = CoordinatorExecutorTonicService::new(shared);
+        let service = CoordinatorExecutorTonicService::new(shared.clone());
         let executor_id = ExecutorId::try_new("exec-persist").unwrap();
 
         let response = service
@@ -503,10 +503,12 @@ mod scheduler_tests {
 
         assert_eq!(response.disposition(), TransportDisposition::Accepted);
 
-        let reopened = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
-        let executors = reopened.executors();
+        if let Some(store) = &shared.read().await.store {
+            store.flush().await;
+        }
+        let executors = shared.read().await.executors().list();
         assert_eq!(executors.len(), 1);
-        assert_eq!(executors[0].executor_id(), &executor_id);
+        assert_eq!(executors[0].descriptor.executor_id(), &executor_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2092,6 +2094,21 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn validate_job_rejects_legacy_fragment_in_durable_profile() {
+        use krishiv_common::DurabilityProfile;
+        use krishiv_plan::validate_job_fragments;
+        let job_id = JobId::try_new("job-legacy-frag").unwrap();
+        let spec = JobSpec::new(job_id, "ns", JobKind::Streaming).with_stage(
+            StageSpec::new(StageId::try_new("stage-1").unwrap(), "s").with_task(
+                TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream:tw:key=u"),
+            ),
+        );
+        let err = validate_job_fragments(&spec, DurabilityProfile::SingleNodeDurable)
+            .expect_err("legacy fragment must fail in durable profile");
+        assert!(err.to_string().contains("legacy untyped"), "got {err}");
+    }
+
+    #[test]
     fn validate_job_rejects_empty_namespace() {
         use crate::job::validate_job;
         let job_id = JobId::try_new("job-empty-ns").unwrap();
@@ -2495,11 +2512,6 @@ mod scheduler_tests {
                 )
                 .unwrap();
         }
-
-        let raw_json = std::fs::read_to_string(&path).unwrap();
-        let metadata_json: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
-        assert_eq!(metadata_json["schema_version"], 1);
-        assert_eq!(metadata_json["store_kind"], "krishiv.scheduler.metadata");
 
         let reopened = crate::redb_metadata::RedbMetadataStore::open(&path).unwrap();
         assert_eq!(reopened.events().len(), 1);

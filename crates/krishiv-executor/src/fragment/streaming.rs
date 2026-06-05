@@ -281,7 +281,7 @@ pub(crate) async fn execute_streaming_fragment(
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();
 
     // Fragment dispatch priority (first match wins):

@@ -1,4 +1,4 @@
-//! Barrier simulation for R5.1: `BarrierSimulator` and `BarrierSnapshot`.
+//! Barrier simulation for R5.1 (test/dev only): `BarrierSimulator` and `BarrierSnapshot`.
 
 use crate::{ExecutorError, ExecutorResult};
 
@@ -6,27 +6,19 @@ const MAX_SIMULATED_SNAPSHOTS: usize = 1000;
 
 // ── BarrierSimulator (Slice F) ────────────────────────────────────────────────
 
-/// Checkpoint-barrier simulation for R5.1.
+/// Checkpoint-barrier simulation for R5.1 (dev/test only).
 ///
-/// This is a metadata-only simulation that validates barrier/watermark ordering
-/// without writing durable state (which arrives in R6).  The protocol:
-///
-/// 1. Coordinator initiates epoch `E` → all sources emit barriers after batch boundaries.
-/// 2. Operator receives barrier on all inputs → finishes current batch → flushes
-///    pending windows → logs simulated snapshot → acknowledges.
-/// 3. Coordinator collects acks → marks epoch committed.
-///
-/// Invariant (keyed-distribution stability): the barrier epoch is monotonically
-/// increasing; a stale barrier (epoch <= last_committed) is rejected.
+/// Production checkpointing uses [`crate::runner::TaskRunner::handle_initiate_checkpoint`]
+/// together with [`crate::BarrierInjector`] and the gRPC barrier service.
 #[derive(Debug, Default)]
-pub struct BarrierSimulator {
+pub(crate) struct BarrierSimulator {
     last_committed_epoch: u64,
     simulated_snapshots: Vec<BarrierSnapshot>,
 }
 
 /// Metadata logged for each simulated checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BarrierSnapshot {
+pub(crate) struct BarrierSnapshot {
     pub epoch: u64,
     /// Watermark at the time the barrier was processed.
     pub watermark_ms: i64,

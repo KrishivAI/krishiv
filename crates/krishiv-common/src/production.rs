@@ -14,6 +14,17 @@ pub const ALLOW_LEGACY_FRAGMENTS_ENV: &str = "KRISHIV_ALLOW_LEGACY_FRAGMENTS";
 /// When set, allows anonymous coordinator HTTP even in durable profiles (dev only).
 pub const ALLOW_ANONYMOUS_HTTP_ENV: &str = "KRISHIV_ALLOW_ANONYMOUS_HTTP";
 
+/// Process-wide durability profile (`KRISHIV_DURABILITY_PROFILE`).
+pub const DURABILITY_PROFILE_ENV: &str = "KRISHIV_DURABILITY_PROFILE";
+
+/// Resolve the active durability profile from the environment.
+pub fn resolve_durability_profile() -> DurabilityProfile {
+    std::env::var(DURABILITY_PROFILE_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DurabilityProfile::DevLocal)
+}
+
 /// Returns whether the process is running in production mode.
 pub fn is_production_mode() -> bool {
     truthy_env(PRODUCTION_ENV)
@@ -83,6 +94,16 @@ pub fn allows_memory_checkpoint_uri(profile: DurabilityProfile) -> bool {
 /// Public in-memory shuffle constructors should be capped or hidden.
 pub fn allows_unbounded_shuffle_store(profile: DurabilityProfile) -> bool {
     profile == DurabilityProfile::DevLocal && !is_production_mode()
+}
+
+/// Whether remote Flight SQL-comment fallbacks are permitted (dev-local only).
+pub fn allows_remote_sql_comment_fallback() -> bool {
+    allow_legacy_task_fragments(resolve_durability_profile())
+}
+
+/// Whether alpha / placeholder public APIs may be invoked.
+pub fn allows_alpha_api() -> bool {
+    resolve_durability_profile() == DurabilityProfile::DevLocal && !is_production_mode()
 }
 
 /// Fjall `ephemeral()` / `in_memory()` constructors are forbidden for durable profiles.

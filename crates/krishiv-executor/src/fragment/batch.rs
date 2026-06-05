@@ -32,7 +32,7 @@ pub(crate) async fn execute_batch_fragment(
     assignment: &ExecutorTaskAssignment,
     udf_limits: ResourceLimits,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     let fragment = fragment_body.as_str();
     if fragment.is_empty() {
         return Err(ExecutorError::InvalidAssignment {
@@ -460,7 +460,7 @@ async fn execute_inmem_shuffle_write(
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_shuffle::{HashPartitioner, PartitionId, ShufflePartition, ShuffleStore as _};
 
-    let fragment_body = task_fragment_body(assignment.plan_fragment().description());
+    let fragment_body = task_fragment_body(assignment.plan_fragment().description())?;
     // Create a new SQL engine with UDF limits for this task execution.
     let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
     let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {

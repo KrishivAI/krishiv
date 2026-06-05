@@ -28,11 +28,11 @@ pub(crate) fn sql_query_from_fragment(fragment: &str) -> Option<&str> {
     (!query.is_empty()).then_some(query)
 }
 
-pub(crate) fn task_fragment_body(fragment: &str) -> String {
-    krishiv_plan::TypedTaskFragment::decode_or_legacy(fragment)
-        .body
-        .trim()
-        .to_owned()
+pub(crate) fn task_fragment_body(fragment: &str) -> ExecutorResult<String> {
+    krishiv_plan::task_body_for_profile(fragment, krishiv_common::resolve_durability_profile())
+        .map_err(|error| ExecutorError::InvalidAssignment {
+            message: error.to_string(),
+        })
 }
 
 pub(crate) fn ensure_status_accepted_or_duplicate(

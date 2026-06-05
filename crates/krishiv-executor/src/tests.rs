@@ -30,7 +30,9 @@ mod executor_tests {
 
     fn allow_anonymous_for_tests() {
         static AUTH_INIT: Once = Once::new();
-        AUTH_INIT.call_once(set_allow_anonymous);
+        AUTH_INIT.call_once(|| {
+            let _ = set_allow_anonymous();
+        });
     }
 
     async fn serve_coordinator_executor_grpc_with_listener(
@@ -1774,7 +1776,7 @@ mod executor_tests {
     #[test]
     fn execution_model_batch_for_sql_fragment() {
         assert_eq!(
-            ExecutionModel::from_fragment("sql: SELECT 1"),
+            ExecutionModel::from_fragment("sql: SELECT 1").unwrap(),
             ExecutionModel::Batch
         );
     }
@@ -1782,7 +1784,7 @@ mod executor_tests {
     #[test]
     fn execution_model_batch_for_shuffle_write() {
         assert_eq!(
-            ExecutionModel::from_fragment("shuffle-write:hash:key:4"),
+            ExecutionModel::from_fragment("shuffle-write:hash:key:4").unwrap(),
             ExecutionModel::Batch
         );
     }
@@ -1790,7 +1792,7 @@ mod executor_tests {
     #[test]
     fn execution_model_batch_for_kafka_pipeline() {
         assert_eq!(
-            ExecutionModel::from_fragment("kafka-to-parquet"),
+            ExecutionModel::from_fragment("kafka-to-parquet").unwrap(),
             ExecutionModel::Batch
         );
     }
@@ -1798,7 +1800,7 @@ mod executor_tests {
     #[test]
     fn execution_model_streaming_for_stream_prefix() {
         assert_eq!(
-            ExecutionModel::from_fragment("stream:tumbling-window:key:60s"),
+            ExecutionModel::from_fragment("stream:tumbling-window:key:60s").unwrap(),
             ExecutionModel::Streaming
         );
     }
@@ -1807,7 +1809,7 @@ mod executor_tests {
     fn execution_model_streaming_exact_prefix() {
         // Any fragment starting with "stream:" is streaming regardless of suffix.
         assert_eq!(
-            ExecutionModel::from_fragment("stream:"),
+            ExecutionModel::from_fragment("stream:").unwrap(),
             ExecutionModel::Streaming
         );
     }

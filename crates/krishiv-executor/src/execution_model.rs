@@ -28,11 +28,15 @@ impl ExecutionModel {
     ///
     /// All `stream:` prefixed fragments use the streaming model.
     /// Everything else is treated as batch (existing behaviour is preserved).
-    pub fn from_fragment(fragment: &str) -> Self {
-        let typed = krishiv_plan::TypedTaskFragment::decode_or_legacy(fragment);
-        match typed.execution_kind {
+    pub fn from_fragment(fragment: &str) -> crate::ExecutorResult<Self> {
+        let profile = krishiv_common::resolve_durability_profile();
+        let typed = krishiv_plan::TypedTaskFragment::decode_for_profile(fragment, profile)
+            .map_err(|error| crate::ExecutorError::InvalidAssignment {
+                message: error.to_string(),
+            })?;
+        Ok(match typed.execution_kind {
             krishiv_plan::ExecutionKind::Streaming => Self::Streaming,
             krishiv_plan::ExecutionKind::Batch => Self::Batch,
-        }
+        })
     }
 }

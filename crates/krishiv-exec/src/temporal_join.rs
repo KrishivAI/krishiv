@@ -44,6 +44,11 @@ impl VersionedTableState {
                     break;
                 }
             }
+        } else {
+            // Zero lookback retains only the latest version snapshot.
+            while self.versions.len() > 1 {
+                self.versions.pop_first();
+            }
         }
     }
 
@@ -123,6 +128,7 @@ impl TemporalJoinOperator {
                 .collect::<Result<Vec<_>, _>>()?;
 
         let mut output_columns: Vec<Vec<ArrayRef>> = Vec::new();
+        let mut table_schema: Option<SchemaRef> = None;
 
         for row in 0..stream_batch.num_rows() {
             let event_ts = timestamps.value(row);
@@ -131,6 +137,9 @@ impl TemporalJoinOperator {
             if let Some(state) = self.keyed_state.get(&join_key)
                 && let Some(table_version) = state.lookup_as_of(event_ts)
             {
+                if table_schema.is_none() {
+                    table_schema = Some(table_version.schema());
+                }
                 // Build joined row: stream columns + table columns.
                 let mut row_cols: Vec<ArrayRef> = Vec::new();
                 for col_idx in 0..stream_batch.num_columns() {
@@ -154,8 +163,16 @@ impl TemporalJoinOperator {
         }
 
         if output_columns.is_empty() {
-            // Return empty batch with joined schema.
-            let schema = build_joined_schema(stream_batch.schema(), None)?;
+            let table_schema = table_schema.or_else(|| {
+                self.keyed_state.values().find_map(|state| {
+                    state
+                        .versions
+                        .values()
+                        .next()
+                        .map(|batch| batch.schema())
+                })
+            });
+            let schema = build_joined_schema(stream_batch.schema(), table_schema)?;
             return Ok(RecordBatch::new_empty(schema));
         }
 
@@ -173,7 +190,7 @@ impl TemporalJoinOperator {
             )?);
         }
 
-        let schema = build_joined_schema(stream_batch.schema(), None)?;
+        let schema = build_joined_schema(stream_batch.schema(), table_schema)?;
 
         RecordBatch::try_new(schema, arrays).map_err(|e| ExecError::Arrow(e.to_string()))
     }
@@ -246,6 +263,7 @@ mod tests {
     }
 
     fn stream_batch(ids: Vec<&str>, timestamps: Vec<i64>) -> RecordBatch {
+        let len = ids.len();
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -255,7 +273,7 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(ids)),
                 Arc::new(Int64Array::from(timestamps)),
-                Arc::new(Int64Array::from((0..).take(100).collect::<Vec<i64>>())),
+                Arc::new(Int64Array::from((0..len as i64).collect::<Vec<i64>>())),
             ],
         )
         .unwrap()

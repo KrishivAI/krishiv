@@ -27,10 +27,29 @@ fn batch(v: i32) -> RecordBatch {
 #[test]
 #[cfg(feature = "kafka")]
 fn kafka_to_kafka_certification() {
-    let mut sink = TransactionalKafkaSink::new("job-k2k", 0, 1);
+    let mut sink = TransactionalKafkaSink::new_for_profile(
+        krishiv_common::DurabilityProfile::DevLocal,
+        "job-k2k",
+        0,
+        1,
+    )
+    .expect("simulation sink permitted in dev-local");
     let h = sink.prepare(1, &batch(1)).unwrap();
     sink.commit(h).unwrap();
     assert!(!sink.committed_batches().is_empty());
+}
+
+#[test]
+#[cfg(feature = "kafka")]
+fn transactional_kafka_rejects_durable_profile() {
+    let err = TransactionalKafkaSink::new_for_profile(
+        krishiv_common::DurabilityProfile::DistributedDurable,
+        "job-k2k",
+        0,
+        1,
+    )
+    .expect_err("simulation sink must be rejected in durable profiles");
+    assert!(err.to_string().contains("simulator"));
 }
 
 #[test]
@@ -60,7 +79,13 @@ fn s3_parquet_to_iceberg_offset_checkpoint_semantics() {
 #[test]
 #[cfg(feature = "kafka")]
 fn s3_parquet_to_kafka_uses_transactional_sink() {
-    let mut sink = TransactionalKafkaSink::new("job-s3k", 1, 2);
+    let mut sink = TransactionalKafkaSink::new_for_profile(
+        krishiv_common::DurabilityProfile::DevLocal,
+        "job-s3k",
+        1,
+        2,
+    )
+    .expect("simulation sink permitted in dev-local");
     let h = sink.prepare(2, &batch(7)).unwrap();
     sink.commit(h).unwrap();
     assert_eq!(sink.committed_batches().len(), 1);

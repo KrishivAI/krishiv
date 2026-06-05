@@ -158,7 +158,23 @@ fn event_time_column_for_keyed(keyed: &KeyedStream) -> Result<String> {
     })
 }
 
-fn apply_multi_source_watermark(keyed: &KeyedStream, spec: &mut LocalWindowExecutionSpec) {
+pub(crate) fn ensure_alpha_api(feature: &str) -> Result<()> {
+    if krishiv_common::allows_alpha_api() {
+        Ok(())
+    } else {
+        Err(KrishivError::unsupported(format!(
+            "{feature} (alpha API disabled in production/durable profiles)"
+        )))
+    }
+}
+
+fn apply_multi_source_watermark(
+    keyed: &KeyedStream,
+    spec: &mut LocalWindowExecutionSpec,
+) -> Result<()> {
+    if keyed.multi_source_watermark().is_some() {
+        ensure_alpha_api("multi_source_watermark")?;
+    }
     if let Some(ms) = keyed.multi_source_watermark() {
         spec.source_watermark_lags = ms
             .source_specs()
@@ -167,6 +183,7 @@ fn apply_multi_source_watermark(keyed: &KeyedStream, spec: &mut LocalWindowExecu
             .collect();
         spec.source_id_column = ms.source_id_column().map(|s| s.to_string());
     }
+    Ok(())
 }
 
 fn build_tumbling_spec(
@@ -190,7 +207,7 @@ fn build_tumbling_spec(
         source_watermark_lags: HashMap::new(),
         source_id_column: None,
     };
-    apply_multi_source_watermark(keyed, &mut spec);
+    apply_multi_source_watermark(keyed, &mut spec)?;
     Ok(spec)
 }
 
@@ -350,6 +367,7 @@ impl SessionWindowedStream {
 
     /// Execute with custom aggregates.
     pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
+        ensure_alpha_api("session_window")?;
         let event_time = event_time_column_for_keyed(&self.keyed)?;
         let lag = self
             .keyed
@@ -369,7 +387,7 @@ impl SessionWindowedStream {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
-        apply_multi_source_watermark(&self.keyed, &mut spec);
+        apply_multi_source_watermark(&self.keyed, &mut spec)?;
         execute_windowed_inner(&self.keyed.inner, spec)
     }
 }
@@ -382,6 +400,7 @@ impl SlidingWindowedStream {
 
     /// Execute with custom aggregates.
     pub fn collect_with_aggs(&self, agg_exprs: Vec<AggExpr>) -> Result<Vec<StreamBatch>> {
+        ensure_alpha_api("sliding_window")?;
         let event_time = event_time_column_for_keyed(&self.keyed)?;
         let lag = self
             .keyed
@@ -401,7 +420,7 @@ impl SlidingWindowedStream {
             source_watermark_lags: HashMap::new(),
             source_id_column: None,
         };
-        apply_multi_source_watermark(&self.keyed, &mut spec);
+        apply_multi_source_watermark(&self.keyed, &mut spec)?;
         execute_windowed_inner(&self.keyed.inner, spec)
     }
 }
