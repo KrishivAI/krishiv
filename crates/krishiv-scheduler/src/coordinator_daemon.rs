@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
 use crate::InMemoryMetadataStore;
+use crate::auth::configured_coordinator_bearer_token;
 use crate::store::MetadataStore;
 use crate::{
     ClusterControlPlane, Coordinator, LeaderElection, SharedCoordinator, SingleNodeLeader,
@@ -394,6 +395,10 @@ pub fn coordinator_http_router(
             "/api/v1/continuous-drain",
             post(crate::continuous_stream_http::api_continuous_drain),
         )
+        .route(
+            "/api/v1/jobs/{job_id}/diagnose",
+            get(api_job_diagnose),
+        )
         .route("/federation/v1/jobs", post(federation_submit_job))
         .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
         .route(
@@ -534,6 +539,42 @@ async fn api_executor_reset(
         axum::http::StatusCode::OK,
         Json(serde_json::json!({"reset": true, "executor_id": executor_id_str})),
     )
+}
+
+/// Structured observability report for production diagnosis (GAP-OB-07).
+async fn api_job_diagnose(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Path(job_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    use krishiv_proto::JobId;
+
+    let job_id = match JobId::try_new(&job_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid job id"})),
+            )
+                .into_response();
+        }
+    };
+
+    let report = {
+        let coord = coordinator.read().await;
+        match crate::coordinator::observability::build_observability_report(&coord, &job_id) {
+            Ok(report) => report,
+            Err(e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    Json(report).into_response()
 }
 
 async fn live_ui(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
@@ -1172,7 +1213,11 @@ pub async fn run_job_coordinator_daemon(
             "spec_json": spec_json,
         });
         let url = format!("{base}/federation/v1/jobs");
-        match client.post(&url).json(&body).send().await {
+        let mut submit = client.post(&url).json(&body);
+        if let Some(token) = configured_coordinator_bearer_token() {
+            submit = submit.header("Authorization", format!("Bearer {token}"));
+        }
+        match submit.send().await {
             Ok(resp) if resp.status().is_success() => {
                 println!("Krishiv JCP: submitted job {job_id} to {base}");
             }
@@ -1195,7 +1240,11 @@ pub async fn run_job_coordinator_daemon(
 
     let status_url = format!("{base}/federation/v1/jobs/{job_id}");
     loop {
-        match client.get(&status_url).send().await {
+        let mut status_req = client.get(&status_url);
+        if let Some(token) = configured_coordinator_bearer_token() {
+            status_req = status_req.header("Authorization", format!("Bearer {token}"));
+        }
+        match status_req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<JcpJobStatusResponse>().await {
                     Ok(status) => {

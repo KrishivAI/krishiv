@@ -106,6 +106,61 @@ impl ObjectStoreShuffleStore {
         ))
     }
 
+    fn lease_object_path(&self, id: &PartitionId) -> ShuffleResult<object_store::path::Path> {
+        let ipc_path = self.object_path(id)?;
+        Ok(object_store::path::Path::from(
+            format!("{ipc_path}.lease").as_str(),
+        ))
+    }
+
+    async fn load_persisted_lease(&self, id: &PartitionId) -> ShuffleResult<Option<u64>> {
+        let path = self.lease_object_path(id)?;
+        match self.store.get(&path).await {
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(crate::error::io_err(e.to_string())),
+            Ok(obj) => {
+                let bytes = obj
+                    .bytes()
+                    .await
+                    .map_err(|e| crate::error::io_err(e.to_string()))?;
+                crate::lease_persistence::decode_lease_token(bytes.as_ref())
+                    .ok_or_else(|| {
+                        ShuffleError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid shuffle lease sidecar",
+                        ))
+                    })
+                    .map(Some)
+            }
+        }
+    }
+
+    async fn persist_lease(&self, id: &PartitionId, token: u64) -> ShuffleResult<()> {
+        self.store
+            .put(
+                &self.lease_object_path(id)?,
+                bytes::Bytes::from(crate::lease_persistence::encode_lease_token(token)).into(),
+            )
+            .await
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn resolve_lease_token(
+        &self,
+        key: &PartitionKey,
+        id: &PartitionId,
+        incoming: u64,
+    ) -> ShuffleResult<u64> {
+        let memory = self.lease_tokens.get(key).map(|entry| *entry);
+        let persisted = self.load_persisted_lease(id).await?;
+        let current = memory.or(persisted);
+        let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
+        self.lease_tokens.insert(key.clone(), next);
+        self.persist_lease(id, next).await?;
+        Ok(next)
+    }
+
     fn job_prefix(&self, job_id: &str) -> ShuffleResult<object_store::path::Path> {
         crate::validate_safe_id(job_id, "job_id")?;
         if self.prefix.as_ref().is_empty() {
@@ -126,24 +181,8 @@ impl ShuffleStore for ObjectStoreShuffleStore {
     ) -> ShuffleResult<()> {
         crate::validate_safe_id(&id.job_id, "job_id")?;
         crate::validate_safe_id(&id.stage_id, "stage_id")?;
-        let key = (id.job_id, id.stage_id, id.partition);
-        // Atomically compare-and-swap via DashMap entry API to close the
-        // TOCTOU gap between read and insert.
-        match self.lease_tokens.entry(key.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(mut o) => {
-                let expected = *o.get();
-                if lease_token < expected {
-                    return Err(ShuffleError::StaleLeaseToken {
-                        expected,
-                        actual: lease_token,
-                    });
-                }
-                o.insert(lease_token);
-            }
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(lease_token);
-            }
-        }
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        let _ = self.resolve_lease_token(&key, &id, lease_token).await?;
         Ok(())
     }
 
@@ -157,23 +196,9 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             partition.id.stage_id.clone(),
             partition.id.partition,
         );
-        match self.lease_tokens.entry(key.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(mut o) => {
-                let expected = *o.get();
-                if lease_token < expected {
-                    return Err(ShuffleError::StaleLeaseToken {
-                        expected,
-                        actual: lease_token,
-                    });
-                }
-                // Advance the stored token so a zombie with the previous token
-                // cannot win a race by writing before the replacement arrives.
-                o.insert(lease_token);
-            }
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(lease_token);
-            }
-        }
+        let _ = self
+            .resolve_lease_token(&key, &partition.id, lease_token)
+            .await?;
 
         use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 

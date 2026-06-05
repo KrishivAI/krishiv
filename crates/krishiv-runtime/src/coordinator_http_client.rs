@@ -518,3 +518,29 @@ pub async fn execute_coordinator_continuous_drain(
 
     decode_inline_record_batches(&payload.inline_record_batch_ipc).map_err(RuntimeError::transport)
 }
+
+/// Execute a physical plan on the coordinator via HTTP (batch SQL or continuous register).
+pub async fn execute_coordinator_physical_plan(
+    coordinator_http: &str,
+    plan: &krishiv_plan::PhysicalPlan,
+) -> RuntimeResult<()> {
+    use krishiv_plan::ExecutionKind;
+
+    match plan.kind() {
+        ExecutionKind::Batch => {
+            let sql = crate::flight_client::plan_to_sql(plan);
+            let _ =
+                execute_coordinator_batch_sql_inline(coordinator_http, &sql, &[], false).await?;
+            Ok(())
+        }
+        ExecutionKind::Streaming => {
+            let spec = crate::plan::streaming_spec_from_plan(plan)?;
+            execute_coordinator_continuous_register(
+                coordinator_http,
+                plan.name(),
+                &spec.to_plan_spec(),
+            )
+            .await
+        }
+    }
+}

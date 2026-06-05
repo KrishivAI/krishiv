@@ -43,6 +43,13 @@ impl FjallStateBackend {
     }
 
     pub fn ephemeral() -> StateResult<Self> {
+        if krishiv_common::requires_file_backed_state(krishiv_common::resolve_durability_profile())
+        {
+            return Err(StateError::BackendUnavailable {
+                message: "ephemeral state backend is forbidden under durable profiles".into(),
+                source: None,
+            });
+        }
         Self::in_memory()
     }
 

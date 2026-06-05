@@ -35,6 +35,10 @@ pub struct KubernetesControllerConfig {
     ///
     /// Defaults to `http://krishiv-coordinator:9090` if not set.
     coordinator_endpoint: String,
+    /// Optional durable metadata store path (Redb).
+    metadata_path: Option<std::path::PathBuf>,
+    /// Durability profile for coordinator metadata writes.
+    durability_profile: krishiv_common::DurabilityProfile,
 }
 
 /// Runtime state owned by the live R2 Kubernetes controller process.
@@ -60,13 +64,37 @@ impl std::fmt::Debug for KubernetesControllerRuntime {
 impl KubernetesControllerRuntime {
     /// Create an active coordinator runtime from controller config.
     pub fn new(config: &KubernetesControllerConfig) -> OperatorResult<Self> {
-        let mut coordinator = Coordinator::active(config.coordinator_id.clone());
+        let mut coordinator = Coordinator::active(config.coordinator_id.clone())
+            .with_durability_profile(config.durability_profile);
         if let Some(executor) = &config.bootstrap_executor {
             register_bootstrap_executor(&mut coordinator, executor)?;
         }
 
+        if let Some(path) = &config.metadata_path {
+            let store = krishiv_scheduler::RedbMetadataStore::open(path).map_err(|error| {
+                OperatorError::InvalidResource {
+                    message: format!(
+                        "failed to open metadata store at {}: {error}",
+                        path.display()
+                    ),
+                }
+            })?;
+            coordinator
+                .recover_from_store(&store)
+                .map_err(OperatorError::from)?;
+            let fail_closed =
+                krishiv_common::profile_requires_fail_closed_metadata(config.durability_profile);
+            coordinator = coordinator.with_store_fail_closed(store, fail_closed);
+        }
+
+        let shared = SharedCoordinator::new(coordinator)
+            .with_durability_profile(config.durability_profile);
+        if krishiv_common::profile_requires_fail_closed_metadata(config.durability_profile) {
+            shared.sync_leader_fencing_token(1);
+        }
+
         Ok(Self {
-            coordinator: SharedCoordinator::new(coordinator),
+            coordinator: shared,
             reconciler: KrishivJobReconciler::new(config.coordinator_id.clone()),
             pod_manager: None,
         })
@@ -105,6 +133,10 @@ impl KubernetesControllerConfig {
             field_selector: None,
             bootstrap_executor: None,
             coordinator_endpoint: "http://krishiv-coordinator:9090".to_owned(),
+            metadata_path: std::env::var("KRISHIV_METADATA_PATH")
+                .ok()
+                .map(std::path::PathBuf::from),
+            durability_profile: krishiv_common::resolve_durability_profile(),
         }
     }
 
@@ -117,6 +149,10 @@ impl KubernetesControllerConfig {
             field_selector: None,
             bootstrap_executor: None,
             coordinator_endpoint: "http://krishiv-coordinator:9090".to_owned(),
+            metadata_path: std::env::var("KRISHIV_METADATA_PATH")
+                .ok()
+                .map(std::path::PathBuf::from),
+            durability_profile: krishiv_common::resolve_durability_profile(),
         }
     }
 

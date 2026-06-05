@@ -31,6 +31,19 @@ pub fn sync_scalar_udfs_with_limits(
     registry: &krishiv_udf::UdfRegistry,
     limits: ResourceLimits,
 ) -> Result<(), DataFusionError> {
+    let profile = krishiv_common::resolve_durability_profile();
+    if krishiv_common::profile_forbids_native_scalar_udfs(profile)
+        && !registry.scalar_names().is_empty()
+    {
+        return Err(DataFusionError::External(
+            format!(
+                "native scalar UDF registration is forbidden under durability profile '{profile}' \
+                 (set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1 to override)"
+            )
+            .into(),
+        ));
+    }
+
     let limits = Arc::new(limits);
     for name in registry.scalar_names() {
         let Some(udf) = registry.get_scalar(name) else {
@@ -74,6 +87,19 @@ pub fn sync_aggregate_udfs(
     ctx: &datafusion::prelude::SessionContext,
     registry: &krishiv_udf::UdfRegistry,
 ) -> Result<(), DataFusionError> {
+    let profile = krishiv_common::resolve_durability_profile();
+    if krishiv_common::profile_forbids_native_scalar_udfs(profile)
+        && !registry.aggregate_names().is_empty()
+    {
+        return Err(DataFusionError::External(
+            format!(
+                "native aggregate UDF registration is forbidden under durability profile '{profile}' \
+                 (set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1 to override)"
+            )
+            .into(),
+        ));
+    }
+
     for name in registry.aggregate_names() {
         let Some(udf) = registry.get_aggregate(name) else {
             continue;

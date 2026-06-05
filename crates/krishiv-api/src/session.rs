@@ -627,6 +627,11 @@ impl Session {
 
     /// Register a vectorized scalar UDF for this session.
     pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) {
+        if krishiv_common::profile_forbids_native_scalar_udfs(
+            krishiv_common::resolve_durability_profile(),
+        ) {
+            return;
+        }
         self.udf_registry
             .write()
             .unwrap_or_else(|e| e.into_inner())

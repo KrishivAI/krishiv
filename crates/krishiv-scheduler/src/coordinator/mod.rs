@@ -940,6 +940,7 @@ impl Coordinator {
 mod checkpoint_ops;
 mod executor_ops;
 mod job_lifecycle;
+pub mod observability;
 mod recovery;
 mod snapshots;
 mod streaming;

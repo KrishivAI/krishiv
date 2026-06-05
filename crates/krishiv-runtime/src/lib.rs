@@ -27,6 +27,7 @@ pub use coordinator_http_client::{
     execute_coordinator_batch_sql, execute_coordinator_batch_sql_inline,
     execute_coordinator_bounded_window, execute_coordinator_continuous_drain,
     execute_coordinator_continuous_push, execute_coordinator_continuous_register,
+    execute_coordinator_physical_plan,
 };
 pub use execution_runtime::{
     BatchTableRegistration, ClusterEndpoints, ExecutionPlacement, ExecutionRuntime,
@@ -42,7 +43,7 @@ pub use in_process_cluster::{InProcessCluster, fragment_from_local_spec, plan_sp
 pub use local_streaming::{
     LocalWindowExecutionSpec, LocalWindowKind, execute_streaming_window, execute_windowed_stream,
 };
-pub use plan::is_streaming_plan;
+pub use plan::{is_streaming_plan, streaming_spec_from_plan};
 
 // tracing is used for debug-level plan delegation logging.
 use tracing::debug;

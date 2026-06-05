@@ -113,7 +113,9 @@ fn resolve_ui_token() -> Option<String> {
                 }
             }
             Err(e) => {
-                if krishiv_common::is_production_mode() {
+                if krishiv_common::profile_requires_authenticated_ui(
+                    krishiv_common::resolve_durability_profile(),
+                ) {
                     eprintln!(
                         "krishiv-ui: KRISHIV_UI_TOKEN_FILE='{path}' could not be read: {e}; \
                          denying all protected routes (production fail-closed)"

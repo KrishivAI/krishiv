@@ -450,8 +450,14 @@ impl SqlEngine {
             bootstrap_servers: bootstrap_servers.into(),
             topic: topic.into(),
             group_id: group_id.into(),
-            // Enable at-least-once delivery for the streaming SQL path.
-            auto_commit_interval_ms: Some(1_000),
+            auto_commit_interval_ms: {
+                let profile = krishiv_common::resolve_durability_profile();
+                if krishiv_common::requires_manual_kafka_commit(profile) {
+                    None
+                } else {
+                    Some(1_000)
+                }
+            },
             security_protocol: None,
             ssl_ca_location: None,
             ssl_certificate_location: None,
@@ -1001,11 +1007,13 @@ impl SqlEngine {
                     std::sync::Arc::new(self.context.clone()),
                 ))
             } else {
-                if krishiv_common::is_production_mode() {
+                if krishiv_common::profile_forbids_udtf_stubs(
+                    krishiv_common::resolve_durability_profile(),
+                ) {
                     return Err(SqlError::DataFusion {
                         message: format!(
-                            "CREATE FUNCTION '{}' with language {:?} is not supported in \
-                             production; only LANGUAGE sql AS '...' table functions are allowed",
+                            "CREATE FUNCTION '{}' with language {:?} is not supported under \
+                             durable profiles; only LANGUAGE sql AS '...' table functions are allowed",
                             ddl.function_name, ddl.language
                         ),
                     });

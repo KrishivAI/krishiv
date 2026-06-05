@@ -16,6 +16,56 @@ use crate::in_process::BatchSqlTable;
 use crate::local_streaming::LocalWindowExecutionSpec;
 use crate::{RuntimeError, RuntimeResult};
 
+/// Bearer token for outbound Flight SQL / Flight action requests.
+fn configured_flight_api_key() -> Option<String> {
+    for env_name in ["KRISHIV_FLIGHT_API_KEY", "KRISHIV_API_KEY"] {
+        if let Ok(key) = std::env::var(env_name) {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    std::env::var("KRISHIV_API_KEYS").ok().and_then(|raw| {
+        raw.split(',')
+            .find_map(|part| part.trim().split_once('='))
+            .map(|(key, _)| key.trim().to_owned())
+            .filter(|key| !key.is_empty())
+    })
+}
+
+fn apply_flight_auth<T>(mut req: tonic::Request<T>) -> tonic::Request<T> {
+    if let Some(key) = configured_flight_api_key() {
+        if let Ok(value) = format!("Bearer {key}").parse() {
+            req.metadata_mut().insert("authorization", value);
+        }
+    }
+    req
+}
+
+struct FlightAuthInterceptor;
+
+impl tonic::service::Interceptor for FlightAuthInterceptor {
+    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(key) = configured_flight_api_key() {
+            if let Ok(value) = format!("Bearer {key}").parse() {
+                request.metadata_mut().insert("authorization", value);
+            }
+        }
+        Ok(request)
+    }
+}
+
+type AuthenticatedFlightChannel =
+    tonic::service::interceptor::InterceptedService<Channel, FlightAuthInterceptor>;
+
+fn flight_sql_client(channel: Channel) -> FlightSqlServiceClient<AuthenticatedFlightChannel> {
+    FlightSqlServiceClient::new(tonic::service::interceptor::InterceptedService::new(
+        channel,
+        FlightAuthInterceptor,
+    ))
+}
+
 /// Retry delays (ms) for transient Flight connection failures.
 const RETRY_DELAYS_MS: &[u64] = &[100, 500, 2_000];
 
@@ -104,7 +154,9 @@ fn normalize_flight_endpoint(url: &str) -> RuntimeResult<String> {
     }
 }
 
-async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlServiceClient<Channel>> {
+async fn connect_flight_client(
+    endpoint: &str,
+) -> RuntimeResult<FlightSqlServiceClient<AuthenticatedFlightChannel>> {
     let channel = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| RuntimeError::transport(format!("invalid coordinator URL: {e}")))?
         .connect_timeout(std::time::Duration::from_secs(FLIGHT_CONNECT_TIMEOUT_SECS))
@@ -112,7 +164,7 @@ async fn connect_flight_client(endpoint: &str) -> RuntimeResult<FlightSqlService
         .connect()
         .await
         .map_err(|e| RuntimeError::transport(format!("flight connect failed: {e}")))?;
-    Ok(FlightSqlServiceClient::new(channel))
+    Ok(flight_sql_client(channel))
 }
 
 async fn connect_flight_channel(endpoint: &str) -> RuntimeResult<Channel> {
@@ -405,7 +457,7 @@ impl FlightClientPool {
                 body: body.clone().into(),
             };
             let mut stream = client
-                .do_action(tonic::Request::new(req))
+                .do_action(apply_flight_auth(tonic::Request::new(req)))
                 .await
                 .map_err(|s| {
                     if s.code() == tonic::Code::Unimplemented {
@@ -435,7 +487,7 @@ impl FlightClientPool {
         let sql = sql.to_string();
         with_retry(|| async {
             let channel = self.get_channel().await?;
-            let mut client = FlightSqlServiceClient::new(channel);
+            let mut client = flight_sql_client(channel);
 
             let flight_info = client
                 .execute(sql.clone(), None)
@@ -496,7 +548,7 @@ impl FlightClientPool {
                 body: body.clone().into(),
             };
             let mut stream = client
-                .do_action(tonic::Request::new(req))
+                .do_action(apply_flight_auth(tonic::Request::new(req)))
                 .await
                 .map_err(|e| RuntimeError::transport(format!("do_action_on_shard: {e}")))?
                 .into_inner();
@@ -533,7 +585,7 @@ impl FlightClientPool {
     ) -> RuntimeResult<impl futures::Stream<Item = RuntimeResult<arrow::record_batch::RecordBatch>>>
     {
         let channel = self.get_channel().await?;
-        let mut client = FlightSqlServiceClient::new(channel);
+        let mut client = flight_sql_client(channel);
         let flight_info = client
             .execute(sql.to_string(), None)
             .await
@@ -683,6 +735,9 @@ pub async fn execute_remote_continuous_register(
     match do_action(flight_url, &action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
+            if !krishiv_common::allows_remote_sql_comment_fallback() {
+                return Err(e);
+            }
             let sql = encode_continuous_register(job_id, spec)?;
             let _ = execute_remote_sql(flight_url, &sql).await?;
             Ok(())
@@ -706,6 +761,9 @@ pub async fn execute_remote_continuous_push(
     match do_action(flight_url, &action).await {
         Ok(_) => Ok(()),
         Err(e) if is_unimplemented(&e) => {
+            if !krishiv_common::allows_remote_sql_comment_fallback() {
+                return Err(e);
+            }
             let sql = encode_continuous_push(job_id, &batches)?;
             let _ = execute_remote_sql(flight_url, &sql).await?;
             Ok(())
@@ -726,6 +784,9 @@ pub async fn execute_remote_continuous_drain(
     match do_action(flight_url, &action).await {
         Ok(body) => decode_ipc_response(&body),
         Err(e) if is_unimplemented(&e) => {
+            if !krishiv_common::allows_remote_sql_comment_fallback() {
+                return Err(e);
+            }
             let sql = encode_continuous_drain(job_id);
             execute_remote_sql(flight_url, &sql).await
         }
@@ -751,6 +812,9 @@ pub async fn execute_remote_bounded_window(
     match do_action(flight_url, &action).await {
         Ok(body) => decode_ipc_response(&body),
         Err(e) if is_unimplemented(&e) => {
+            if !krishiv_common::allows_remote_sql_comment_fallback() {
+                return Err(e);
+            }
             let sql = encode_bounded_window(topic, spec, &input_batches)?;
             execute_remote_sql(flight_url, &sql).await
         }
@@ -797,7 +861,7 @@ pub(crate) async fn do_action(
         body: body.into(),
     };
     let mut stream = client
-        .do_action(tonic::Request::new(req))
+        .do_action(apply_flight_auth(tonic::Request::new(req)))
         .await
         .map_err(|s| {
             if s.code() == tonic::Code::Unimplemented {

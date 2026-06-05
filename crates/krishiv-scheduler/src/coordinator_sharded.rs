@@ -162,6 +162,7 @@ impl CheckpointInner {
         if let Some(coord) = self.coordinators.get_mut(job_id) {
             if let crate::checkpoint::CheckpointCoordinatorState::Committing { .. } = &coord.state {
                 coord.finalize_commit(epoch);
+                krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
             }
         }
         self.notify.notify_waiters();

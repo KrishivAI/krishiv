@@ -6,6 +6,46 @@ use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use krishiv_proto::KeyGroupRange;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
+use tokio::sync::oneshot;
+
+/// Checkpoint metadata returned after a barrier-driven checkpoint completes.
+#[derive(Debug, Clone)]
+pub struct BarrierAckCompletion {
+    pub checkpoint_uri: String,
+    pub key_group_range_start: u32,
+    pub key_group_range_end: u32,
+}
+
+/// Waits for barrier checkpoint completion before gRPC acks are sent.
+#[derive(Clone, Default)]
+pub struct SharedBarrierAckRegistry {
+    waiters: Arc<DashMap<(String, u64), Vec<oneshot::Sender<BarrierAckCompletion>>>>,
+}
+
+impl SharedBarrierAckRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a waiter for `(job_id, epoch)` barrier completion.
+    pub fn register_wait(&self, job_id: &str, epoch: u64) -> oneshot::Receiver<BarrierAckCompletion> {
+        let (tx, rx) = oneshot::channel();
+        self.waiters
+            .entry((job_id.to_owned(), epoch))
+            .or_default()
+            .push(tx);
+        rx
+    }
+
+    /// Signal completion for all waiters on a barrier epoch.
+    pub fn complete(&self, job_id: &str, epoch: u64, completion: BarrierAckCompletion) {
+        if let Some((_, senders)) = self.waiters.remove(&(job_id.to_owned(), epoch)) {
+            for tx in senders {
+                let _ = tx.send(completion.clone());
+            }
+        }
+    }
+}
 
 /// Receives barriers from the coordinator and dispatches to source injectors.
 #[derive(Debug, Default)]

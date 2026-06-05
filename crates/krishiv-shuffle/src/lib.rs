@@ -10,6 +10,7 @@ pub mod compression;
 pub mod disk_store;
 pub mod error;
 pub mod flight;
+pub mod lease_persistence;
 pub mod local_store;
 pub mod memory_store;
 pub mod metadata;
@@ -18,6 +19,7 @@ pub mod orphan;
 pub mod partitioner;
 pub mod path;
 pub mod shuffle_svc;
+pub mod storage_uri;
 pub mod store;
 pub mod tiered_store;
 
@@ -49,6 +51,7 @@ pub use orphan::{cleanup_orphans, scan_orphans};
 pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
 pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
+pub use storage_uri::open_shuffle_backend_from_uri;
 pub use tiered_store::TieredShuffleStore;
 
 // StoreError is deprecated but retained for source compatibility.

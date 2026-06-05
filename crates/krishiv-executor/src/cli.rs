@@ -9,7 +9,8 @@ use std::time::Duration;
 use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
-    ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierInjector,
+    ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierAckRegistry,
+    SharedBarrierInjector,
     SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
     serve_executor_task_grpc_with_listener,
 };
@@ -21,7 +22,7 @@ use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
-use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore};
+use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri};
 use krishiv_state::FjallStateBackend;
 use krishiv_udf;
 use tokio::net::TcpListener;
@@ -47,7 +48,11 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
 
     // Apply profile-driven backend defaults when explicit flags were not given.
     // The profile acts as a policy; explicit flags always win.
-    let shuffle_dir = apply_shuffle_default(config.shuffle_dir.clone(), durability_profile)?;
+    let (shuffle_dir, shuffle_uri) = apply_shuffle_defaults(
+        config.shuffle_dir.clone(),
+        config.shuffle_uri.clone(),
+        durability_profile,
+    )?;
     let state_dir = apply_state_default(config.state_dir.clone(), durability_profile)?;
     let checkpoint_uri = config.checkpoint_uri.clone();
     let slots = config.slots;
@@ -80,9 +85,11 @@ pub async fn run_executor_cli(args: impl IntoIterator<Item = String>) -> crate::
                 task_grpc_addr,
                 barrier_grpc_addr,
                 shuffle_dir,
+                shuffle_uri,
                 state_dir,
                 checkpoint_uri,
                 slots,
+                durability_profile,
             )
             .await
         }
@@ -198,9 +205,11 @@ async fn heartbeat_loop(
     task_grpc_addr: Option<SocketAddr>,
     barrier_grpc_addr: Option<SocketAddr>,
     shuffle_dir: Option<std::path::PathBuf>,
+    shuffle_uri: Option<String>,
     state_dir: Option<std::path::PathBuf>,
     checkpoint_uri: String,
     slots: usize,
+    durability_profile: DurabilityProfile,
 ) -> crate::ExecutorResult<()> {
     // Bind task/barrier listeners FIRST so the *first* register advertises real
     // endpoints — avoids the double-register race that previously bumped the
@@ -267,6 +276,7 @@ async fn heartbeat_loop(
         });
     }
     let barrier_injector: SharedBarrierInjector = Default::default();
+    let barrier_ack_registry = SharedBarrierAckRegistry::new();
     let key_group_ranges = SharedKeyGroupRanges::new();
     let task_auth = ExecutorTaskAuthConfig::from_env();
     if let Some(listener) = barrier_listener {
@@ -275,6 +285,7 @@ async fn heartbeat_loop(
             runtime.config().executor_id().as_str(),
         )
         .with_key_group_ranges(key_group_ranges.clone())
+        .with_ack_registry(barrier_ack_registry.clone())
         .with_auth_config(task_auth);
         tokio::spawn(async move {
             let _ = Server::builder()
@@ -293,21 +304,19 @@ async fn heartbeat_loop(
     let checkpoint_storage: Arc<dyn CheckpointStorage> =
         open_checkpoint_storage_from_uri(&checkpoint_uri)
             .map_err(|e| format!("checkpoint storage at {checkpoint_uri}: {e}"))?;
-    let durability_profile = krishiv_common::resolve_durability_profile();
     let state_backend = Arc::new(
         FjallStateBackend::open_for_profile(durability_profile, state_dir.as_deref())
             .map_err(|e| format!("state backend: {e}"))?,
     );
 
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
-    // operators that exchange partitions between executors (B5).  When no
-    // `--shuffle-dir` is provided we still create an in-memory shuffle store so
-    // R4a typed shuffle write/read tasks succeed for tests.
+    // operators that exchange partitions between executors (B5).
     let running_attempts: Arc<DashMap<String, TaskAttemptRef>> = Arc::new(DashMap::new());
     runtime.set_running_attempts(running_attempts.clone());
     let mut runner_builder = ExecutorTaskRunner::new(inbox.clone())
         .with_live_lease(shared_lease.clone())
         .with_barrier_injector(barrier_injector)
+        .with_barrier_ack_registry(barrier_ack_registry)
         .with_key_group_ranges(key_group_ranges)
         .with_running_attempts(running_attempts)
         .with_udf_limits(krishiv_udf::ResourceLimits::default());
@@ -315,7 +324,49 @@ async fn heartbeat_loop(
     if let Some(ref dir) = state_dir {
         runner_builder = runner_builder.with_state_dir(dir.clone());
     }
-    if let Some(dir) = &shuffle_dir {
+    if let Some(uri) = shuffle_uri {
+        let backend = open_shuffle_backend_from_uri(&uri, durability_profile)
+            .map_err(|e| format!("shuffle URI {uri}: {e}"))?;
+        match backend.as_ref() {
+            ShuffleBackend::Local(disk) => {
+                let bind: SocketAddr = "0.0.0.0:0"
+                    .parse()
+                    .map_err(|e| format!("failed to parse shuffle bind address: {e}"))?;
+                let (local_addr, _server_handle) =
+                    krishiv_shuffle::flight::serve(bind, Arc::clone(disk))
+                        .await
+                        .map_err(|e| format!("shuffle flight server: {e}"))?;
+                let endpoint = local_addr.to_string();
+                println!("Krishiv executor shuffle flight listening on {endpoint}");
+                let local_dir = shuffle_dir.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from(if uri.starts_with("file://") {
+                        uri.strip_prefix("file://").unwrap_or(&uri)
+                    } else {
+                        "/tmp/krishiv-shuffle"
+                    })
+                });
+                runner_builder = runner_builder
+                    .with_shuffle(ShuffleContext {
+                        store: Arc::clone(&backend),
+                        local_dir,
+                        flight_endpoint: endpoint,
+                    })
+                    .with_inmem_shuffle(backend);
+            }
+            ShuffleBackend::Object(_) | ShuffleBackend::Tiered(_) => {
+                runner_builder = runner_builder
+                    .with_shuffle(ShuffleContext {
+                        store: Arc::clone(&backend),
+                        local_dir: shuffle_dir.clone().unwrap_or_default(),
+                        flight_endpoint: String::new(),
+                    })
+                    .with_inmem_shuffle(backend);
+            }
+            ShuffleBackend::InMemory(_) => {
+                runner_builder = runner_builder.with_inmem_shuffle(backend);
+            }
+        }
+    } else if let Some(dir) = &shuffle_dir {
         let disk = Arc::new(
             LocalDiskShuffleStore::new(dir)
                 .map_err(|e| format!("local shuffle store at {}: {e}", dir.display()))?,
@@ -541,6 +592,9 @@ struct ExecutorCliConfig {
     /// Local on-disk shuffle store directory; if set, the shuffle Flight
     /// server is started and the runner is wired for `shuffle-write:` fragments (B5).
     shuffle_dir: Option<std::path::PathBuf>,
+    /// Shuffle storage URI (`file://`, `s3://`, `memory://`). Takes precedence over `--shuffle-dir`.
+    /// Reads `KRISHIV_SHUFFLE_URI`.
+    shuffle_uri: Option<String>,
     /// Root directory for durable window operator state.
     /// When set, continuous window operators use file-backed Fjall state instead
     /// of ephemeral (in-memory) state, surviving executor restarts.
@@ -598,6 +652,7 @@ impl ExecutorCliConfig {
             shuffle_dir: env::var("KRISHIV_SHUFFLE_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
+            shuffle_uri: env::var("KRISHIV_SHUFFLE_URI").ok(),
             state_dir: env::var("KRISHIV_STATE_DIR")
                 .ok()
                 .map(std::path::PathBuf::from),
@@ -677,6 +732,10 @@ impl ExecutorCliConfig {
                     } else {
                         Some(std::path::PathBuf::from(value))
                     };
+                }
+                "--shuffle-uri" => {
+                    let value = next_arg(&mut args, "--shuffle-uri")?;
+                    config.shuffle_uri = if value.is_empty() { None } else { Some(value) };
                 }
                 "--checkpoint-uri" => {
                     config.checkpoint_uri = next_arg(&mut args, "--checkpoint-uri")?;
@@ -800,6 +859,7 @@ impl ExecutorCliConfig {
            --task-grpc-addr <ADDR>      Task gRPC server address (default: KRISHIV_TASK_GRPC_ADDR or 0.0.0.0:50055; use 'off' to disable)\n\
            --barrier-grpc-addr <ADDR>   Barrier gRPC server address (default: KRISHIV_BARRIER_GRPC_ADDR or 0.0.0.0:50056; use 'off' to disable)\n\
            --shuffle-dir <DIR>          On-disk shuffle store directory (also KRISHIV_SHUFFLE_DIR)\n\
+           --shuffle-uri <URI>          Shuffle storage URI: file://path, s3://bucket/prefix (KRISHIV_SHUFFLE_URI)\n\
            --checkpoint-uri <URI>       Checkpoint storage URI: file://path, s3://bucket/prefix, memory:// (default: KRISHIV_CHECKPOINT_STORAGE or file:///tmp/krishiv-checkpoints)\n\
            \n\
          Security:\n\
@@ -814,33 +874,33 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
         .ok_or_else(|| format!("missing value for {flag}"))
 }
 
-/// Apply shuffle-dir defaults driven by the durability profile.
+/// Apply shuffle backend defaults driven by the durability profile.
 ///
-/// | Profile             | Explicit flag | Result                          |
-/// |---------------------|---------------|---------------------------------|
-/// | DevLocal            | any           | use as-is (None = in-memory OK) |
-/// | SingleNodeDurable   | None          | auto: `/tmp/krishiv-shuffle`    |
-/// | DistributedDurable  | None          | **error** — must be explicit    |
-fn apply_shuffle_default(
-    explicit: Option<std::path::PathBuf>,
+/// When `shuffle_uri` is set it takes precedence over directory defaults.
+fn apply_shuffle_defaults(
+    explicit_dir: Option<std::path::PathBuf>,
+    shuffle_uri: Option<String>,
     profile: DurabilityProfile,
-) -> crate::ExecutorResult<Option<std::path::PathBuf>> {
-    match (explicit, profile) {
-        (Some(dir), _) => Ok(Some(dir)),
-        (None, DurabilityProfile::DevLocal) => Ok(None),
+) -> crate::ExecutorResult<(Option<std::path::PathBuf>, Option<String>)> {
+    if let Some(uri) = shuffle_uri.filter(|u| !u.trim().is_empty()) {
+        return Ok((explicit_dir, Some(uri)));
+    }
+    match (explicit_dir, profile) {
+        (Some(dir), _) => Ok((Some(dir), None)),
+        (None, DurabilityProfile::DevLocal) => Ok((None, None)),
         (None, DurabilityProfile::SingleNodeDurable) => {
             let dir = std::path::PathBuf::from("/tmp/krishiv-shuffle");
             tracing::info!(
                 path = %dir.display(),
                 "single-node-durable: auto-selecting shuffle dir (set --shuffle-dir to override)"
             );
-            Ok(Some(dir))
+            Ok((Some(dir), None))
         }
         (None, DurabilityProfile::DistributedDurable) => {
             Err(crate::ExecutorError::LocalExecution {
                 message: String::from(
-                    "durability-profile=distributed-durable requires --shuffle-dir \
-                     (set KRISHIV_SHUFFLE_DIR or pass --shuffle-dir <path>)",
+                    "durability-profile=distributed-durable requires --shuffle-uri or --shuffle-dir \
+                     (set KRISHIV_SHUFFLE_URI, KRISHIV_SHUFFLE_DIR, or pass explicit flags)",
                 ),
             })
         }

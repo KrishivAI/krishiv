@@ -1037,11 +1037,15 @@ impl NonBlockingStoreHandle {
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
+            let in_flight =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
                         StoreCommand::AppendEvent(event) => {
+                            in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let bg = std::sync::Arc::clone(&bg_store);
+                            let in_flight_done = std::sync::Arc::clone(&in_flight);
                             tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Err(e) = guard.append_event(event) {
@@ -1050,12 +1054,15 @@ impl NonBlockingStoreHandle {
                                         "NonBlockingStoreHandle: append_event failed"
                                     );
                                 }
+                                in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             })
                             .await
                             .ok();
                         }
                         StoreCommand::SaveJob(record) => {
+                            in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let bg = std::sync::Arc::clone(&bg_store);
+                            let in_flight_done = std::sync::Arc::clone(&in_flight);
                             tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Err(e) = guard.save_job(&record) {
@@ -1064,11 +1071,15 @@ impl NonBlockingStoreHandle {
                                         "NonBlockingStoreHandle: save_job failed"
                                     );
                                 }
+                                in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             })
                             .await
                             .ok();
                         }
                         StoreCommand::Flush(reply) => {
+                            while in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                                tokio::task::yield_now().await;
+                            }
                             let _ = reply.send(());
                         }
                     }
