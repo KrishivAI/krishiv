@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use krishiv_proto::JobSpec;
 use serde::{Deserialize, Serialize};
@@ -283,5 +285,146 @@ impl ConfigFileQueueManager {
 impl QueueManager for ConfigFileQueueManager {
     fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
         self.inner.admit(spec, quota)
+    }
+}
+
+// ── CrdQueueManager ────────────────────────────────────────────────────────────
+
+/// Queue manager that reloads admission policies from a JSON config file
+/// periodically, suitable for Kubernetes ConfigMap-mounted deployments.
+///
+/// On each call to `admit()`, the manager checks whether the file has been
+/// modified since the last load and reloads if needed. This avoids the need
+/// for a background thread while still picking up operator- or CRD-driven
+/// policy changes within one `reload_interval`.
+#[derive(Debug)]
+pub struct CrdQueueManager {
+    inner: Arc<RwLock<QuotaQueueManager>>,
+    config_path: PathBuf,
+    last_modified: Arc<RwLock<Option<std::time::SystemTime>>>,
+    reload_interval: Duration,
+}
+
+impl CrdQueueManager {
+    /// Create a `CrdQueueManager` that loads policies from `path` and
+    /// checks for updates at most once every `reload_interval`.
+    pub fn new(
+        path: impl Into<PathBuf>,
+        reload_interval: Duration,
+    ) -> std::io::Result<Self> {
+        let path = path.into();
+        let config = Self::load_config(&path)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(config)),
+            config_path: path,
+            last_modified: Arc::new(RwLock::new(None)),
+            reload_interval,
+        })
+    }
+
+    fn load_config(path: &Path) -> std::io::Result<QuotaQueueManager> {
+        let content = std::fs::read_to_string(path)?;
+        let config: QueueConfig = serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(QuotaQueueManager::new(config.default, config.namespaces))
+    }
+
+    fn maybe_reload(&self) {
+        match std::fs::metadata(&self.config_path) {
+            Ok(meta) => {
+                let mtime = meta.modified().ok();
+                let should_reload = {
+                    let last = self.last_modified.read().unwrap_or_else(|p| p.into_inner());
+                    mtime != *last
+                };
+                if should_reload {
+                    // Check reload interval to avoid thundering re-reads.
+                    let can_reload = {
+                        let last = self.last_modified.read().unwrap_or_else(|p| p.into_inner());
+                        last.map_or(true, |t| {
+                            t.elapsed().unwrap_or(Duration::MAX) >= self.reload_interval
+                        })
+                    };
+                    if can_reload {
+                        match Self::load_config(&self.config_path) {
+                            Ok(qm) => {
+                                *self.inner.write().unwrap_or_else(|p| p.into_inner()) = qm;
+                                *self.last_modified.write().unwrap_or_else(|p| p.into_inner()) =
+                                    mtime;
+                                tracing::info!(
+                                    path = %self.config_path.display(),
+                                    "crd queue manager reloaded admission policies"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %self.config_path.display(),
+                                    error = %e,
+                                    "crd queue manager failed to reload policies; using cached"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // File may not exist yet; keep current policies.
+            }
+        }
+    }
+}
+
+impl QueueManager for CrdQueueManager {
+    fn admit(&self, spec: &JobSpec, quota: &NamespaceQuotaSnapshot) -> SubmitOutcome {
+        self.maybe_reload();
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .admit(spec, quota)
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn crd_queue_manager_reload_picks_up_new_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("admission.json");
+
+        // Write initial policy: max 1 concurrent job.
+        let initial = r#"{"default": {"max_concurrent_jobs": 1}}"#;
+        std::fs::write(&config_path, initial).unwrap();
+
+        let mgr = CrdQueueManager::new(&config_path, Duration::from_secs(0)).unwrap();
+
+        let spec = JobSpec::new(
+            krishiv_proto::JobId::try_new("job-1").unwrap(),
+            "test",
+            krishiv_proto::JobKind::Batch,
+        );
+        let quota = NamespaceQuotaSnapshot::default();
+
+        // First job admitted.
+        let outcome = mgr.admit(&spec, &quota);
+        assert!(
+            matches!(outcome, SubmitOutcome::Accepted),
+            "first job must be accepted: {:?}", outcome
+        );
+
+        // Update policy: max 0 concurrent jobs (block all).
+        let updated = r#"{"default": {"max_concurrent_jobs": 0}}"#;
+        // Sleep past mtime resolution (some FS have 1s granularity).
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(&config_path, updated).unwrap();
+
+        // Next admission should block.
+        let outcome = mgr.admit(&spec, &quota);
+        assert!(
+            !matches!(outcome, SubmitOutcome::Accepted),
+            "job should be queued after policy update: {:?}", outcome
+        );
     }
 }

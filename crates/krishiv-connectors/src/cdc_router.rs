@@ -45,15 +45,21 @@ impl CdcRouter {
         let route = self.routes.get(&event.table).ok_or_else(|| {
             ConnectorError::Cdc(format!("no live table route for {}", event.table))
         })?;
-        let guard = route
-            .lock()
-            .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?;
         let batch = event
             .after
             .as_ref()
             .or(event.before.as_ref())
             .ok_or_else(|| ConnectorError::Cdc("cdc event missing payload".into()))?;
-        let normalized = krishiv_exec::SchemaNormalizeOperator::new(guard.target_schema.clone())
+        // Clone the target schema outside the mutex lock so schema normalization
+        // does not extend the critical section unnecessarily.
+        let target_schema = {
+            route
+                .lock()
+                .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?
+                .target_schema
+                .clone()
+        };
+        let normalized = krishiv_exec::SchemaNormalizeOperator::new(target_schema)
             .normalize(batch)
             .map_err(|e| ConnectorError::Cdc(e.to_string()))?;
         let op = match event.op {
@@ -61,7 +67,9 @@ impl CdcRouter {
             CdcOp::Update => DeltaOp::Update,
             CdcOp::Delete => DeltaOp::Delete,
         };
-        guard
+        route
+            .lock()
+            .map_err(|_| ConnectorError::Cdc("cdc router lock poisoned".into()))?
             .store
             .append(normalized, op)
             .map_err(|e| ConnectorError::Cdc(e.to_string()))
@@ -74,11 +82,25 @@ impl CdcRouter {
     ) -> Result<usize, ConnectorError> {
         let raw = source.poll_events(max).map_err(ConnectorError::Cdc)?;
         let mut routed = 0usize;
+        let mut dropped = 0usize;
         for (i, json) in raw.iter().enumerate() {
-            if let Ok(event) = crate::cdc::parse_debezium_envelope(json, 0, i as i64) {
-                self.route_event(&event)?;
-                routed += 1;
+            match crate::cdc::parse_debezium_envelope(json, 0, i as i64) {
+                Ok(event) => {
+                    self.route_event(&event)?;
+                    routed += 1;
+                }
+                Err(e) => {
+                    dropped += 1;
+                    tracing::warn!(
+                        index = i,
+                        error = %e,
+                        "dropping unparseable CDC event; check source format"
+                    );
+                }
             }
+        }
+        if dropped > 0 {
+            tracing::warn!(dropped, routed, "CDC poll partially succeeded");
         }
         Ok(routed)
     }

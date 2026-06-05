@@ -23,6 +23,10 @@ pub struct ExecutorBarrierService {
     pub key_group_ranges: SharedKeyGroupRanges,
     /// Optional auth config — when set, all barrier RPCs require a valid bearer token.
     pub auth_config: Option<ExecutorTaskAuthConfig>,
+    /// Checkpoint URI to use in barrier acknowledgements (e.g. "file:///tmp/krishiv-checkpoints").
+    pub checkpoint_uri: Option<String>,
+    /// State backend kind ("redb", "rocksdb", etc.).
+    pub state_backend_kind: String,
 }
 
 impl ExecutorBarrierService {
@@ -34,6 +38,8 @@ impl ExecutorBarrierService {
             key_group_range_end: 32_767,
             key_group_ranges: SharedKeyGroupRanges::new(),
             auth_config: None,
+            checkpoint_uri: None,
+            state_backend_kind: "redb".into(),
         }
     }
 
@@ -117,6 +123,8 @@ impl BarrierService for ExecutorBarrierService {
         let key_group_range_start = self.key_group_range_start;
         let key_group_range_end = self.key_group_range_end;
         let key_group_ranges = self.key_group_ranges.clone();
+        let state_backend_kind = self.state_backend_kind.clone();
+        let checkpoint_uri = self.checkpoint_uri.clone();
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 injector.enqueue(barrier.clone());
@@ -133,11 +141,10 @@ impl BarrierService for ExecutorBarrierService {
                     job_id: barrier.job_id.clone(),
                     task_id: ack_task_id,
                     state_handle: Some(StateHandle {
-                        backend_kind: "redb".into(),
-                        checkpoint_uri: format!(
-                            "checkpoint://{}/{}",
-                            barrier.job_id, barrier.checkpoint_id
-                        ),
+                        backend_kind: state_backend_kind.clone(),
+                        checkpoint_uri: checkpoint_uri.clone().unwrap_or_else(|| {
+                            format!("checkpoint://{}/{}", barrier.job_id, barrier.checkpoint_id)
+                        }),
                         key_group_range_start,
                         key_group_range_end,
                         schema_version: 1,

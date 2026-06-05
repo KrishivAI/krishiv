@@ -2,33 +2,78 @@
 //!
 //! The coordinator sends `HeartbeatThrottleCommand` entries in the executor
 //! heartbeat response.  This module stores the current `rows_per_second` limit
-//! for each `source_id` and exposes a lightweight check that source operators
-//! can call when deciding how many rows to emit.
+//! for each `source_id` and enforces a token-bucket algorithm.
 //!
 //! A `None` limit means "unlimited" (the throttle has been cleared).
-//!
-//! # Design notes
-//!
-//! The table is wrapped in an `Arc<DashMap>` so it can be shared between the
-//! heartbeat loop (writer) and the task runner clones (readers) without a
-//! coarse lock.  Real token-bucket enforcement is left as a follow-on task;
-//! for now the table records the limit and emits a `tracing::info!` each time
-//! a source is polled while a limit is active.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 
-/// Shared, clone-safe table of `source_id → rows_per_second` throttle limits.
+/// Shared, clone-safe table of `source_id → rows_per_second` throttle limits
+/// with per-source token-bucket enforcement.
 ///
 /// Clone is cheap (`Arc` clone).  All clones share the same underlying map.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SourceThrottleTable {
-    inner: Arc<DashMap<String, Option<u64>>>,
+    inner: Arc<DashMap<String, TokenBucket>>,
+}
+
+impl Default for SourceThrottleTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-source token bucket for rate limiting.
+#[derive(Debug)]
+struct TokenBucket {
+    rate: u64,
+    capacity: u64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate,
+            capacity: rate.max(1),
+            tokens: rate as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn clear() -> Self {
+        Self::new(0)
+    }
+
+    fn is_active(&self) -> bool {
+        self.rate > 0
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed_secs = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed_secs * self.rate as f64)
+            .min(self.capacity as f64);
+        self.last_refill = now;
+    }
+
+    fn try_consume(&mut self, requested: u64) -> u64 {
+        if self.rate == 0 {
+            return requested;
+        }
+        self.refill();
+        let available = self.tokens.floor() as u64;
+        let granted = requested.min(available);
+        self.tokens -= granted as f64;
+        granted
+    }
 }
 
 impl SourceThrottleTable {
-    /// Create an empty throttle table.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
@@ -36,63 +81,62 @@ impl SourceThrottleTable {
     }
 
     /// Apply a throttle limit for `source_id`.
-    ///
-    /// Passing `rows_per_second = None` clears the throttle (unlimited).
     pub fn apply(&self, source_id: impl Into<String>, rows_per_second: Option<u64>) {
         let source_id = source_id.into();
         match rows_per_second {
-            Some(rps) => {
-                tracing::info!(
-                    source_id = %source_id,
-                    rows_per_second = rps,
-                    "source throttle applied"
-                );
-                self.inner.insert(source_id, Some(rps));
+            Some(rps) if rps > 0 => {
+                self.inner.insert(source_id, TokenBucket::new(rps));
             }
-            None => {
-                tracing::info!(source_id = %source_id, "source throttle cleared (unlimited)");
-                self.inner.insert(source_id, None);
+            _ => {
+                self.inner.insert(source_id, TokenBucket::clear());
             }
         }
     }
 
-    /// Return the current limit for `source_id`, or `None` if no limit is set.
-    ///
-    /// A return value of `Some(None)` means the source has been explicitly set
-    /// to unlimited; `None` means no entry exists in the table.
-    pub fn limit_for(&self, source_id: &str) -> Option<Option<u64>> {
-        self.inner.get(source_id).map(|v| *v)
+    /// Return the current rate limit for `source_id`, or `None` if no
+    /// limit has been applied.
+    pub fn limit_for(&self, source_id: &str) -> Option<u64> {
+        let mut bucket = self.inner.get_mut(source_id)?;
+        bucket.refill();
+        Some(bucket.rate)
     }
 
-    /// Check whether `source_id` has an active (non-`None`) throttle limit.
-    ///
-    /// Returns the limit when active, or `None` when there is no limit or the
-    /// entry is set to unlimited.  Source operators should call this before
-    /// emitting a batch and log accordingly.
+    /// Number of rows the source is allowed to emit right now.
+    /// Returns the rate limit if active, or `None` if unlimited/unknown.
     pub fn active_limit(&self, source_id: &str) -> Option<u64> {
-        self.inner.get(source_id).and_then(|v| *v)
+        let mut bucket = self.inner.get_mut(source_id)?;
+        bucket.refill();
+        if bucket.is_active() {
+            Some(bucket.rate)
+        } else {
+            None
+        }
     }
 
-    /// Log a trace-level note when a source is polled under a throttle limit.
-    ///
-    /// Call this at the start of each source-poll cycle to make throttle
-    /// enforcement visible in traces before a full token-bucket is wired in.
+    /// Try to consume `requested` rows from the source's token bucket.
+    /// Returns the number of rows that may be emitted (0..=requested).
+    pub fn try_consume(&self, source_id: &str, requested: u64) -> u64 {
+        let Some(mut bucket) = self.inner.get_mut(source_id) else {
+            return requested; // no throttle → unlimited
+        };
+        bucket.try_consume(requested)
+    }
+
+    /// Log the current throttle state for observability.
     pub fn check_and_log(&self, source_id: &str) {
         if let Some(rps) = self.active_limit(source_id) {
-            tracing::info!(
+            tracing::debug!(
                 source_id = %source_id,
                 rows_per_second = rps,
-                "source poll: throttle limit active (enforcement pending)"
+                "source throttle active"
             );
         }
     }
 
-    /// Number of entries currently tracked.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// `true` if no entries are tracked.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -103,29 +147,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_bucket_new_has_full_capacity() {
+        let mut tb = TokenBucket::new(100);
+        assert!(tb.is_active());
+        // Should be able to consume up to rate immediately (burst = rate).
+        let granted = tb.try_consume(100);
+        assert_eq!(granted, 100);
+        // Next consume should have 0 tokens (unless time has passed).
+        let granted = tb.try_consume(1);
+        assert_eq!(granted, 0);
+    }
+
+    #[test]
+    fn token_bucket_empty_grants_all() {
+        let mut tb = TokenBucket::clear();
+        assert!(!tb.is_active());
+        let granted = tb.try_consume(10_000);
+        assert_eq!(granted, 10_000);
+    }
+
+    #[test]
+    fn token_bucket_partial_consume() {
+        let mut tb = TokenBucket::new(50);
+        let granted = tb.try_consume(200);
+        assert_eq!(granted, 50);
+    }
+
+    #[test]
     fn apply_and_read_limits() {
         let table = SourceThrottleTable::new();
         assert!(table.is_empty());
 
         table.apply("src-a", Some(1000));
-        assert_eq!(table.active_limit("src-a"), Some(1000));
-        assert_eq!(table.limit_for("src-a"), Some(Some(1000)));
+        let limit = table.active_limit("src-a");
+        assert_eq!(limit, Some(1000));
 
-        // Clear the throttle.
+        table.apply("src-a", Some(0));
+        assert_eq!(table.active_limit("src-a"), None);
+
         table.apply("src-a", None);
         assert_eq!(table.active_limit("src-a"), None);
-        assert_eq!(table.limit_for("src-a"), Some(None));
 
-        // Unknown source.
         assert_eq!(table.active_limit("src-z"), None);
-        assert_eq!(table.limit_for("src-z"), None);
+    }
+
+    #[test]
+    fn try_consume_respects_limit() {
+        let table = SourceThrottleTable::new();
+        table.apply("src-x", Some(500));
+        let granted = table.try_consume("src-x", 1000);
+        assert!(granted <= 500);
+        assert!(granted > 0);
+    }
+
+    #[test]
+    fn try_consume_unlimited_when_no_entry() {
+        let table = SourceThrottleTable::new();
+        let granted = table.try_consume("src-y", 10_000);
+        assert_eq!(granted, 10_000);
     }
 
     #[test]
     fn check_and_log_does_not_panic() {
         let table = SourceThrottleTable::new();
         table.apply("src-b", Some(500));
-        // Should emit a tracing event but not panic.
         table.check_and_log("src-b");
         table.check_and_log("src-unknown");
     }
@@ -135,6 +220,7 @@ mod tests {
         let table = SourceThrottleTable::new();
         let clone = table.clone();
         table.apply("src-c", Some(250));
-        assert_eq!(clone.active_limit("src-c"), Some(250));
+        let limit = clone.active_limit("src-c");
+        assert_eq!(limit, Some(250));
     }
 }

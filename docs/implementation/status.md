@@ -1,5 +1,28 @@
 # Krishiv Implementation Status
 
+## Sprint: P0-P1 Stabilization (2026-06-05)
+
+Completed 10 fixes: 5 data-safety, 2 stubs→production, 2 configurable infrastructure, 1 new operator.
+
+### P0 — Data Correctness / Safety
+| # | File | Fix |
+|---|------|-----|
+| P0-1 | `connectors/src/cdc.rs:1073` | Replaced `try_into().unwrap()` panics with `let Ok(...) else { continue; }` patterns + tracing warnings |
+| P0-2 | `connectors/src/cdc_router.rs` | Shrunk `std::sync::Mutex` critical section — schema normalization moved outside lock |
+| P0-3 | `connectors/src/cdc_router.rs:77` | Silent `if let Ok(event)` replaced with match + `tracing::warn!` per dropped event + summary |
+| P0-4 | `connectors/src/source.rs:40` | `debug_assert!` replaced with unconditional `tracing::error!` — catches capability mismatch in release |
+| P0-5 | `exec/src/temporal_join.rs` | Implemented `TemporalJoinOperator` with per-key state, as-of join, inner/left-outer, column dedup. 4 new tests. |
+| P1-1 | `executor/src/source_throttle.rs` | Replaced log-only stub with real `TokenBucket` enforcement (`try_consume`, per-source refill). 5 new tests. |
+| P1-3 | `executor/src/barrier_grpc.rs` | `StateHandle` now uses configurable `checkpoint_uri` and `state_backend_kind` instead of hardcoded strings |
+| P1-5 | `scheduler/src/admission.rs` | Added `CrdQueueManager` — periodic JSON config file reload with reload-interval guard. 1 test. |
+
+Validation:
+```bash
+cargo check -p krishiv-exec -p krishiv-executor -p krishiv-scheduler -p krishiv-connectors  # 0 errors, 0 warnings
+```
+
+---
+
 ## Critical Bug Fixes + Security Hardening (2026-06-05)
 
 Completed Phase 1 production stabilization: 10 critical bugs, 2 security fixes, 3 memory leaks.

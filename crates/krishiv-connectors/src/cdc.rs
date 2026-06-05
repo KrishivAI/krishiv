@@ -1070,12 +1070,18 @@ impl CdcOffsetTracker {
         if let Ok(keys) = backend.list_keys(&ns) {
             for k in keys {
                 if k.len() == 4 {
-                    let partition = u32::from_le_bytes(k.as_slice().try_into().unwrap());
+                    let Ok(key_arr) = k.as_slice().try_into() else {
+                        tracing::warn!(key_len = k.len(), "cdc offset key has unexpected length, skipping");
+                        continue;
+                    };
+                    let partition = u32::from_le_bytes(key_arr);
                     if let Ok(Some(val_bytes)) = backend.get(&ns, &k) {
-                        let len = val_bytes.len();
-                        if len == 8 {
-                            let offset =
-                                i64::from_le_bytes(val_bytes.as_slice().try_into().unwrap());
+                        if val_bytes.len() == 8 {
+                            let Ok(val_arr) = val_bytes.as_slice().try_into() else {
+                                tracing::warn!(partition, "cdc offset value has unexpected length, skipping");
+                                continue;
+                            };
+                            let offset = i64::from_le_bytes(val_arr);
                             offsets.insert(partition, offset);
                         }
                     }

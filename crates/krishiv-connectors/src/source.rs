@@ -34,12 +34,16 @@ pub trait Source {
     ///
     /// The default implementation is a no-op; sources that advertise
     /// [`ConnectorCapabilities::is_rewindable`] **must** override this method.
-    /// A debug-mode assertion fires if a rewindable source does not override,
-    /// catching capability mismatches during development.
+    /// A warning is logged in all build profiles when a rewindable source
+    /// has not overridden reset() — in release this produces an
+    /// observability signal rather than silently producing incorrect results.
     fn reset(&mut self) {
-        debug_assert!(
-            !self.capabilities().is_rewindable(),
-            "source advertises rewindable capability but does not override reset()"
-        );
+        if self.capabilities().is_rewindable() {
+            tracing::error!(
+                "rewindable source with capabilities {:?} does not override reset(); \
+                 reset will be a no-op and may produce incorrect results",
+                self.capabilities()
+            );
+        }
     }
 }
