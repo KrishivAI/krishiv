@@ -44,7 +44,10 @@ impl JobCoordinator {
     }
 
     pub async fn snapshot(&self) -> crate::job::JobSnapshot {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).snapshot()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
     }
 
     pub async fn current_state(&self) -> krishiv_proto::JobState {
@@ -55,15 +58,14 @@ impl JobCoordinator {
         &self,
         update: krishiv_proto::TaskStatusUpdate,
     ) -> crate::SchedulerResult<crate::TaskUpdateOutcome> {
-        self.inner.write().unwrap_or_else(|p| p.into_inner()).apply_task_update(update)
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .apply_task_update(update)
     }
 
     /// Record a heartbeat from an executor and store its timestamp.
-    pub fn record_executor_heartbeat(
-        &self,
-        executor_id: &ExecutorId,
-        ts_ms: u64,
-    ) {
+    pub fn record_executor_heartbeat(&self, executor_id: &ExecutorId, ts_ms: u64) {
         self.heartbeat_timestamps
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -72,11 +74,7 @@ impl JobCoordinator {
 
     /// Record a heartbeat and detect whether the executor is stale
     /// (no heartbeat received within `stale_threshold_ms`).
-    pub fn record_heartbeat_and_detect_stale(
-        &self,
-        executor_id: &ExecutorId,
-        ts_ms: u64,
-    ) -> bool {
+    pub fn record_heartbeat_and_detect_stale(&self, executor_id: &ExecutorId, ts_ms: u64) -> bool {
         let mut timestamps = self
             .heartbeat_timestamps
             .lock()
@@ -90,11 +88,18 @@ impl JobCoordinator {
     }
 
     pub async fn running_task_count(&self) -> usize {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).running_task_count()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .running_task_count()
     }
 
     pub async fn stage_count(&self) -> usize {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).stages().len()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .stages()
+            .len()
     }
 
     pub async fn has_in_flight_tasks(&self) -> bool {
@@ -102,10 +107,7 @@ impl JobCoordinator {
         job.running_task_count() > 0 || job.failed_task_count() > 0
     }
 
-    pub async fn clear_assignments_for_bad_executor(
-        &self,
-        executor_id: &ExecutorId,
-    ) {
+    pub async fn clear_assignments_for_bad_executor(&self, executor_id: &ExecutorId) {
         let mut job = self.inner.write().unwrap_or_else(|p| p.into_inner());
         for stage in job.stages_mut() {
             for task in stage.tasks_mut() {
@@ -175,7 +177,10 @@ impl JobCoordinator {
             stage.tasks().iter().any(|task| {
                 task.assigned_executor.is_some()
                     && !task.launch_in_flight
-                    && !matches!(task.state(), TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled)
+                    && !matches!(
+                        task.state(),
+                        TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled
+                    )
             })
         })
     }
@@ -204,11 +209,17 @@ impl JobCoordinator {
     }
 
     pub async fn udf_execution_time_cap_ms(&self) -> Option<u64> {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).udf_execution_time_cap_ms()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .udf_execution_time_cap_ms()
     }
 
     pub async fn udf_memory_limit_bytes(&self) -> Option<u64> {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).udf_memory_limit_bytes()
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .udf_memory_limit_bytes()
     }
 
     pub async fn udf_resource_limits(&self) -> (Option<u64>, Option<u64>) {
@@ -246,7 +257,10 @@ mod tests {
 
         // Initially no heartbeat, so detect_stale returns true.
         let stale = jc.record_heartbeat_and_detect_stale(&executor_id, 100);
-        assert!(stale, "first heartbeat should report stale (no prior timestamp)");
+        assert!(
+            stale,
+            "first heartbeat should report stale (no prior timestamp)"
+        );
 
         // Second heartbeat immediately — should NOT be stale.
         let stale = jc.record_heartbeat_and_detect_stale(&executor_id, 101);
@@ -255,8 +269,7 @@ mod tests {
 
     #[test]
     fn record_heartbeat_detects_stale_after_timeout() {
-        let jc = make_job_coordinator("stale-test", 2)
-            .with_stale_threshold(100); // 100ms threshold
+        let jc = make_job_coordinator("stale-test", 2).with_stale_threshold(100); // 100ms threshold
 
         let executor_id = ExecutorId::try_new("exec-stale").unwrap();
 
@@ -269,7 +282,10 @@ mod tests {
 
         // Third heartbeat at t=200ms — exceeds 100ms threshold.
         let stale = jc.record_heartbeat_and_detect_stale(&executor_id, 200);
-        assert!(stale, "heartbeat after 200ms with 100ms threshold should be stale");
+        assert!(
+            stale,
+            "heartbeat after 200ms with 100ms threshold should be stale"
+        );
     }
 
     #[test]
@@ -291,21 +307,23 @@ mod tests {
         // Record a heartbeat so there's an entry to clean up.
         jc.record_executor_heartbeat(&executor_id, 100);
 
-        assert!(jc
-            .heartbeat_timestamps
-            .lock()
-            .unwrap()
-            .contains_key(&executor_id));
+        assert!(
+            jc.heartbeat_timestamps
+                .lock()
+                .unwrap()
+                .contains_key(&executor_id)
+        );
 
         rt.block_on(async {
             let affected = jc.handle_executor_loss(&executor_id).await;
             assert_eq!(affected, 0);
         });
-        assert!(!jc
-            .heartbeat_timestamps
-            .lock()
-            .unwrap()
-            .contains_key(&executor_id));
+        assert!(
+            !jc.heartbeat_timestamps
+                .lock()
+                .unwrap()
+                .contains_key(&executor_id)
+        );
     }
 
     #[test]

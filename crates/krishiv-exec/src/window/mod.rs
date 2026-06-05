@@ -56,7 +56,8 @@ impl CountingLateEventHandler {
 
 impl LateEventHandler for CountingLateEventHandler {
     fn on_late_event(&self, _key: &str, _event_time_ms: i64, _row_idx: usize) {
-        self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

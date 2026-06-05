@@ -1551,6 +1551,7 @@ mod tests {
         let mut state = IntervalJoinState::new(IntervalJoinSpec {
             lower_bound_ms: -100,
             upper_bound_ms: 100,
+            key_column: "k".into(),
         });
         // left event at t=1000
         let left = make_interval_batch("lv", vec![1]);
@@ -1570,6 +1571,7 @@ mod tests {
         let mut state = IntervalJoinState::new(IntervalJoinSpec {
             lower_bound_ms: -100,
             upper_bound_ms: 100,
+            key_column: "k".into(),
         });
         // push left with no right events buffered
         let left = make_interval_batch("lv", vec![1]);
@@ -1582,6 +1584,7 @@ mod tests {
         let mut state = IntervalJoinState::new(IntervalJoinSpec {
             lower_bound_ms: -100,
             upper_bound_ms: 100,
+            key_column: "k".into(),
         });
         let right = make_interval_batch("rv", vec![1]);
         let matches = state.push_right(1000, right);
@@ -1595,6 +1598,7 @@ mod tests {
         let mut state = IntervalJoinState::new(IntervalJoinSpec {
             lower_bound_ms: -50,
             upper_bound_ms: 50,
+            key_column: "k".into(),
         });
 
         let left_schema = Arc::new(Schema::new(vec![

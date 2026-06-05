@@ -48,7 +48,8 @@ pub use adaptive::{
     ThrottleDecision,
 };
 pub use admission::{
-    ConfigFileQueueManager, CrdQueueManager, InMemoryQueueManager, QueueManager, QuotaPolicy, QuotaQueueManager,
+    ConfigFileQueueManager, CrdQueueManager, InMemoryQueueManager, QueueManager, QuotaPolicy,
+    QuotaQueueManager,
 };
 pub use auth::{
     AuthContext, COORDINATOR_AUTH_RELOAD_INTERVAL_SECS_ENV, COORDINATOR_BEARER_TOKEN_ENV,

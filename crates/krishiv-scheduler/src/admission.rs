@@ -308,10 +308,7 @@ pub struct CrdQueueManager {
 impl CrdQueueManager {
     /// Create a `CrdQueueManager` that loads policies from `path` and
     /// checks for updates at most once every `reload_interval`.
-    pub fn new(
-        path: impl Into<PathBuf>,
-        reload_interval: Duration,
-    ) -> std::io::Result<Self> {
+    pub fn new(path: impl Into<PathBuf>, reload_interval: Duration) -> std::io::Result<Self> {
         let path = path.into();
         let config = Self::load_config(&path)?;
         Ok(Self {
@@ -349,8 +346,10 @@ impl CrdQueueManager {
                         match Self::load_config(&self.config_path) {
                             Ok(qm) => {
                                 *self.inner.write().unwrap_or_else(|p| p.into_inner()) = qm;
-                                *self.last_modified.write().unwrap_or_else(|p| p.into_inner()) =
-                                    mtime;
+                                *self
+                                    .last_modified
+                                    .write()
+                                    .unwrap_or_else(|p| p.into_inner()) = mtime;
                                 tracing::info!(
                                     path = %self.config_path.display(),
                                     "crd queue manager reloaded admission policies"
@@ -387,7 +386,6 @@ impl QueueManager for CrdQueueManager {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn crd_queue_manager_reload_picks_up_new_policy() {
@@ -411,7 +409,8 @@ mod admission_tests {
         let outcome = mgr.admit(&spec, &quota);
         assert!(
             matches!(outcome, SubmitOutcome::Accepted),
-            "first job must be accepted: {:?}", outcome
+            "first job must be accepted: {:?}",
+            outcome
         );
 
         // Update policy: max 0 concurrent jobs (block all).
@@ -424,7 +423,8 @@ mod admission_tests {
         let outcome = mgr.admit(&spec, &quota);
         assert!(
             !matches!(outcome, SubmitOutcome::Accepted),
-            "job should be queued after policy update: {:?}", outcome
+            "job should be queued after policy update: {:?}",
+            outcome
         );
     }
 }

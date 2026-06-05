@@ -442,6 +442,16 @@ impl SqlEngine {
             group_id: group_id.into(),
             // Enable at-least-once delivery for the streaming SQL path.
             auto_commit_interval_ms: Some(1_000),
+            security_protocol: None,
+            ssl_ca_location: None,
+            ssl_certificate_location: None,
+            ssl_key_location: None,
+            ssl_key_password: None,
+            sasl_username: None,
+            sasl_password: None,
+            sasl_mechanisms: None,
+            enable_idempotence: None,
+            transactional_id: None,
         };
         let table =
             crate::kafka_table::create_kafka_streaming_table(schema, config).map_err(|e| {
@@ -497,6 +507,16 @@ impl SqlEngine {
             topic: topic.into(),
             group_id: "krishiv-sql-writer".into(),
             auto_commit_interval_ms: None,
+            security_protocol: None,
+            ssl_ca_location: None,
+            ssl_certificate_location: None,
+            ssl_key_location: None,
+            ssl_key_password: None,
+            sasl_username: None,
+            sasl_password: None,
+            sasl_mechanisms: None,
+            enable_idempotence: None,
+            transactional_id: None,
         };
         let mut sink = KafkaSink::new(config).map_err(|e| SqlError::DataFusion {
             message: e.to_string(),

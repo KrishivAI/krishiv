@@ -1,5 +1,131 @@
 # Krishiv Implementation Status
 
+## Checkpoint Savepoint Integrity Hardening (2026-06-05)
+
+Completed the checkpoint savepoint production-readiness slice:
+
+- `create_savepoint` now validates source checkpoint metadata identity before copying it into the immutable savepoint prefix.
+- Savepoint creation now rebuilds `manifest.sha256` from the rewritten savepoint metadata and copied state snapshots instead of copying the source checkpoint manifest.
+- Savepoint creation now fails closed when metadata references a missing snapshot or a snapshot not covered by the source checkpoint manifest.
+- Savepoint creation now pre-validates snapshot bytes before writing and best-effort cleans partial savepoint prefixes on write failure, so failed creates do not show up as listed savepoints.
+- `restore_savepoint` now validates the savepoint manifest before trusting metadata or copying files back into the active checkpoint prefix.
+- `restore_savepoint` now uses restore fencing semantics, accepting prior coordinator tokens and rejecting only future/stale metadata.
+- Restored active checkpoints now receive a rebuilt manifest matching the exact metadata and state bytes restored from the savepoint.
+- Added focused regression tests for valid active-manifest rebuild, corrupt savepoint payload rejection, unmanifested snapshot rejection, and greater-current-token restore.
+
+Validation:
+```bash
+cargo check -p krishiv-checkpoint --tests --offline
+cargo test -p krishiv-checkpoint savepoint --offline
+cargo check --workspace --tests --offline
+cargo fmt --all
+git diff --check
+```
+
+Blockers: none.
+
+Next useful commands:
+```bash
+cargo test -p krishiv-checkpoint --offline
+cargo test --workspace --no-fail-fast --offline
+```
+
+---
+
+## Legacy Local Shuffle Integrity Hardening (2026-06-05)
+
+Completed the remaining local IPC shuffle production-readiness slice:
+
+- `LocalShuffleStore` now writes a persisted `.ipc.blake3` sidecar next to every legacy local shuffle IPC file.
+- Local IPC reads now validate file bytes against the persisted sidecar before header parsing and decompression.
+- Reads fail closed with `ShuffleError::ContentHashMismatch` when the sidecar is missing, malformed, or mismatched.
+- Local IPC writes now fsync the data and hash staging files before rename and fsync the parent directory after commit.
+- `delete_job` removes sidecars by deleting the full job directory; tests now assert the sidecar exists before cleanup.
+- Orphan scanning/cleanup now treats `.blake3` sidecars as owned shuffle artifacts so inactive-job cleanup does not leak integrity metadata.
+- Added restart/tamper/missing-hash/malformed-hash tests for `LocalShuffleStore`.
+
+Validation:
+```bash
+cargo check -p krishiv-shuffle --tests --offline
+cargo test -p krishiv-shuffle local_store --offline
+cargo test -p krishiv-shuffle orphan --offline
+cargo check --workspace --tests --offline
+git diff --check
+```
+
+Blockers: none.
+
+Next useful commands:
+```bash
+cargo test -p krishiv-shuffle --offline
+cargo test --workspace --no-fail-fast --offline
+```
+
+---
+
+## Local-Disk Shuffle Integrity Hardening (2026-06-05)
+
+Completed the single-node shuffle production-readiness slice:
+
+- `LocalDiskShuffleStore` now writes a persisted `.parquet.blake3` sidecar next to every local shuffle Parquet file.
+- Local-disk reads now validate Parquet bytes against the persisted sidecar before constructing the Parquet reader, so restarted single-node stores retain corruption detection.
+- Reads fail closed with `ShuffleError::ContentHashMismatch` when a data file exists but its hash sidecar is missing, malformed, mismatched, or diverges from the same-process hash cache.
+- Local shuffle write commit now writes/fsyncs both data and hash temp files, renames both into place, and removes both temps on stale-writer rejection.
+- Existing spill and tiered paths continue to work with local sidecars because they share `LocalDiskShuffleStore`.
+- Added restart/tamper/missing-hash/malformed-hash tests for local-disk shuffle.
+
+Validation:
+```bash
+cargo check -p krishiv-shuffle --tests --offline
+cargo test -p krishiv-shuffle disk_store_ --offline
+cargo test -p krishiv-shuffle content_hash --offline
+cargo test -p krishiv-shuffle corrupt_parquet --offline
+cargo test -p krishiv-shuffle spill --offline
+cargo test -p krishiv-shuffle tiered_store --offline
+cargo check --workspace --tests --offline
+```
+
+Blockers: none.
+
+Next useful commands:
+```bash
+cargo test -p krishiv-shuffle --offline
+cargo test --workspace --no-fail-fast --offline
+```
+
+---
+
+## Object-Store Shuffle Integrity Hardening (2026-06-05)
+
+Completed the next shuffle production-readiness slice:
+
+- `ObjectStoreShuffleStore` now writes a persisted `.ipc.blake3` sidecar next to every remote shuffle IPC object.
+- Object-store reads now validate remote bytes against the persisted sidecar, so restarted readers retain integrity checks instead of relying on process-local hash maps.
+- Reads fail closed with `ShuffleError::ContentHashMismatch` when a data object exists but its hash sidecar is missing, malformed, or mismatched.
+- Same-process hash cache is still checked against the persisted sidecar to catch divergent metadata.
+- `delete_job_partitions` continues to delete every object under the job prefix; tests now assert persisted hash sidecars are removed.
+- Added restart/tamper/missing-hash/malformed-hash coverage for object-store shuffle.
+
+Validation:
+```bash
+cargo check -p krishiv-shuffle --tests --offline
+cargo test -p krishiv-shuffle object_store_shuffle --offline
+cargo test -p krishiv-shuffle object_store --offline
+cargo test -p krishiv-shuffle tiered_store --offline
+cargo check --workspace --tests --offline
+git diff --check
+```
+
+Blockers: none.
+
+Next useful commands:
+```bash
+cargo test -p krishiv-shuffle --offline
+cargo test --workspace --no-fail-fast --offline
+```
+
+---
+
 ## Sprint: P0-P1 Stabilization (2026-06-05)
 
 Completed 10 fixes: 5 data-safety, 2 stubs→production, 2 configurable infrastructure, 1 new operator.
@@ -148,6 +274,48 @@ cargo test --workspace --lib --locked
 
 ---
 
+## Shuffle Durability + Capacity Hardening (2026-06-05)
+
+Completed the shuffle production-readiness slice:
+
+- `TieredShuffleStore::write_partition` now acknowledges only after both local disk and remote object-store writes commit.
+- Remote object-store write failures now propagate to the caller instead of being logged from a background task after success was already returned.
+- Tiered reads still prefer local disk and fall back to the committed remote copy after local loss/restart.
+- `InMemoryShuffleStore` now enforces `max_bytes` without requiring a spill store: writes within the cap succeed, writes over the cap return `ShuffleError::MemoryLimitExceeded`.
+- Spill-enabled memory stores now reject writes that cannot fit even after safe spills, rather than exceeding the configured cap.
+- Spill-enabled memory stores write a single oversized partition directly to spill storage, keeping the memory cap strict while preserving readability.
+- Failed in-memory admission no longer records partition hashes or advances lease tokens; metadata is committed only after capacity admission succeeds.
+- In-memory capacity checks subtract the replaced partition size so same-key overwrites/retries are admitted correctly.
+- Final workspace validation also fixed stale compile fixtures:
+  - `IntervalJoinSpec` test/API fixtures now set `key_column`
+  - `KafkaConfig` SQL/Python/test literals now set the optional security/idempotence fields explicitly
+  - Removed a redundant scheduler test import surfaced by the workspace check
+
+Validation:
+```bash
+cargo check -p krishiv-shuffle --tests --offline
+cargo test -p krishiv-shuffle tiered_store --offline
+cargo test -p krishiv-shuffle in_memory --offline
+cargo test -p krishiv-shuffle spill --offline
+cargo check -p krishiv-exec --tests --offline
+cargo check -p krishiv-connectors --tests --offline
+cargo check -p krishiv-sql --tests --offline
+cargo check -p krishiv-python --tests --offline
+cargo check -p krishiv-api --tests --offline
+cargo check --workspace --tests --offline
+git diff --check
+```
+
+Blockers: none.
+
+Next useful commands:
+```bash
+cargo test -p krishiv-shuffle --offline
+cargo test --workspace --no-fail-fast --offline
+```
+
+---
+
 ## Production Stabilization (2026-06-05)
 
 Completed first batch of P0/P1 production stabilization items from feature maturity review:
@@ -179,7 +347,7 @@ Completed first batch of P0/P1 production stabilization items from feature matur
 - Added default cap of 128 MiB (`DEFAULT_SHUFFLE_MEMORY_BYTES`) to `InMemoryShuffleStore::new()`
 - Added `new_unbounded()` for backward compat (tests, dev-local)
 - Configurable via `KRISHIV_SHUFFLE_MEMORY_BYTES` env var
-- Changed max_bytes-without-spill from hard error to warning (prevents breakage)
+- Memory-only capped stores now admit writes within the cap and reject writes over the cap with `ShuffleError::MemoryLimitExceeded`
 
 ### P1-1: Plan Cache Config
 - `PLAN_CACHE_MAX_ENTRIES` now reads from `KRISHIV_PLAN_CACHE_MAX_ENTRIES` env var

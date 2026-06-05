@@ -28,7 +28,11 @@ const MAX_SEEN_ENTRIES: usize = 10_000;
 /// Bounded to MAX_SEEN_ENTRIES; oldest entries evicted when full.
 #[derive(Debug, Clone)]
 struct SeenSet {
-    entries: BTreeSet<(krishiv_proto::JobId, krishiv_proto::TaskId, krishiv_proto::AttemptId)>,
+    entries: BTreeSet<(
+        krishiv_proto::JobId,
+        krishiv_proto::TaskId,
+        krishiv_proto::AttemptId,
+    )>,
     max_entries: usize,
 }
 
@@ -40,7 +44,14 @@ impl SeenSet {
         }
     }
 
-    fn insert(&mut self, key: (krishiv_proto::JobId, krishiv_proto::TaskId, krishiv_proto::AttemptId)) -> bool {
+    fn insert(
+        &mut self,
+        key: (
+            krishiv_proto::JobId,
+            krishiv_proto::TaskId,
+            krishiv_proto::AttemptId,
+        ),
+    ) -> bool {
         if self.entries.len() >= self.max_entries && !self.entries.contains(&key) {
             if let Some(oldest) = self.entries.iter().next().cloned() {
                 self.entries.remove(&oldest);
@@ -49,7 +60,14 @@ impl SeenSet {
         self.entries.insert(key)
     }
 
-    fn remove(&mut self, key: &(krishiv_proto::JobId, krishiv_proto::TaskId, krishiv_proto::AttemptId)) -> bool {
+    fn remove(
+        &mut self,
+        key: &(
+            krishiv_proto::JobId,
+            krishiv_proto::TaskId,
+            krishiv_proto::AttemptId,
+        ),
+    ) -> bool {
         self.entries.remove(key)
     }
 }

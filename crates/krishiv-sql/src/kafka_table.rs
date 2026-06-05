@@ -184,6 +184,16 @@ impl TableProviderFactory for KafkaTableFactory {
             topic,
             group_id,
             auto_commit_interval_ms: Some(STREAMING_AUTO_COMMIT_MS),
+            security_protocol: None,
+            ssl_ca_location: None,
+            ssl_certificate_location: None,
+            ssl_key_location: None,
+            ssl_key_password: None,
+            sasl_username: None,
+            sasl_password: None,
+            sasl_mechanisms: None,
+            enable_idempotence: None,
+            transactional_id: None,
         };
 
         let source =

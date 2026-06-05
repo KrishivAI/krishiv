@@ -63,7 +63,10 @@ impl IntervalJoinBuffers {
                 }
             }
         }
-        this_buf.push_back(BufferedEvent { event_time_ms, batch });
+        this_buf.push_back(BufferedEvent {
+            event_time_ms,
+            batch,
+        });
         matches
     }
 
@@ -103,8 +106,17 @@ impl PerKeyIntervalJoin {
         event_time_ms: i64,
         batch: RecordBatch,
     ) -> Vec<(RecordBatch, RecordBatch)> {
-        let state = self.states.entry(key.to_owned()).or_insert_with(IntervalJoinBuffers::new);
-        state.push_side(true, event_time_ms, batch, self.spec.lower_bound_ms, self.spec.upper_bound_ms)
+        let state = self
+            .states
+            .entry(key.to_owned())
+            .or_insert_with(IntervalJoinBuffers::new);
+        state.push_side(
+            true,
+            event_time_ms,
+            batch,
+            self.spec.lower_bound_ms,
+            self.spec.upper_bound_ms,
+        )
     }
 
     /// Push an event onto the right side for `key`.
@@ -114,8 +126,17 @@ impl PerKeyIntervalJoin {
         event_time_ms: i64,
         batch: RecordBatch,
     ) -> Vec<(RecordBatch, RecordBatch)> {
-        let state = self.states.entry(key.to_owned()).or_insert_with(IntervalJoinBuffers::new);
-        state.push_side(false, event_time_ms, batch, self.spec.lower_bound_ms, self.spec.upper_bound_ms)
+        let state = self
+            .states
+            .entry(key.to_owned())
+            .or_insert_with(IntervalJoinBuffers::new);
+        state.push_side(
+            false,
+            event_time_ms,
+            batch,
+            self.spec.lower_bound_ms,
+            self.spec.upper_bound_ms,
+        )
     }
 
     /// Evict stale events across all keys.
@@ -160,7 +181,14 @@ impl IntervalJoinState {
         event_time_ms: i64,
         batch: RecordBatch,
     ) -> Vec<(RecordBatch, RecordBatch)> {
-        push_global_side(&mut self.left, &mut self.right, true, event_time_ms, batch, &self.spec)
+        push_global_side(
+            &mut self.left,
+            &mut self.right,
+            true,
+            event_time_ms,
+            batch,
+            &self.spec,
+        )
     }
 
     pub fn push_right(
@@ -168,11 +196,21 @@ impl IntervalJoinState {
         event_time_ms: i64,
         batch: RecordBatch,
     ) -> Vec<(RecordBatch, RecordBatch)> {
-        push_global_side(&mut self.right, &mut self.left, false, event_time_ms, batch, &self.spec)
+        push_global_side(
+            &mut self.right,
+            &mut self.left,
+            false,
+            event_time_ms,
+            batch,
+            &self.spec,
+        )
     }
 
     pub fn evict_before(&mut self, watermark_ms: i64) {
-        let bound = self.spec.upper_bound_ms.unsigned_abs()
+        let bound = self
+            .spec
+            .upper_bound_ms
+            .unsigned_abs()
             .max(self.spec.lower_bound_ms.unsigned_abs());
         let horizon = watermark_ms.saturating_sub(bound as i64);
         self.left.retain(|e| e.event_time_ms >= horizon);
@@ -203,14 +241,17 @@ fn push_global_side(
             }
         }
     }
-    this_buf.push_back(BufferedEvent { event_time_ms, batch });
+    this_buf.push_back(BufferedEvent {
+        event_time_ms,
+        batch,
+    });
     matches
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 

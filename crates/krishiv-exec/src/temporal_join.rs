@@ -74,12 +74,7 @@ impl TemporalJoinOperator {
     }
 
     /// Register or update a table version for a specific join key.
-    pub fn upsert_version(
-        &mut self,
-        join_key: &str,
-        version_ms: i64,
-        batch: RecordBatch,
-    ) {
+    pub fn upsert_version(&mut self, join_key: &str, version_ms: i64, batch: RecordBatch) {
         self.keyed_state
             .entry(join_key.to_owned())
             .or_insert_with(|| VersionedTableState::new(self.lookback_ms))
@@ -98,30 +93,34 @@ impl TemporalJoinOperator {
         let time_col_idx = stream_batch
             .schema()
             .index_of(&self.spec.stream_time_col)
-            .map_err(|_| ExecError::Arrow(format!(
-                "stream time column '{}' not found in stream batch",
-                self.spec.stream_time_col
-            )))?;
+            .map_err(|_| {
+                ExecError::Arrow(format!(
+                    "stream time column '{}' not found in stream batch",
+                    self.spec.stream_time_col
+                ))
+            })?;
 
         let time_col = stream_batch.column(time_col_idx);
         let timestamps = time_col
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| ExecError::Arrow(format!(
-                "stream time column '{}' is not Int64",
-                self.spec.stream_time_col
-            )))?;
+            .ok_or_else(|| {
+                ExecError::Arrow(format!(
+                    "stream time column '{}' is not Int64",
+                    self.spec.stream_time_col
+                ))
+            })?;
 
-        let join_key_indices: Vec<usize> = self
-            .spec
-            .join_keys
-            .iter()
-            .map(|key| {
-                stream_batch.schema().index_of(key).map_err(|_| {
-                    ExecError::Arrow(format!("join key column '{}' not found", key))
+        let join_key_indices: Vec<usize> =
+            self.spec
+                .join_keys
+                .iter()
+                .map(|key| {
+                    stream_batch.schema().index_of(key).map_err(|_| {
+                        ExecError::Arrow(format!("join key column '{}' not found", key))
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()?;
 
         let mut output_columns: Vec<Vec<ArrayRef>> = Vec::new();
 
@@ -156,10 +155,7 @@ impl TemporalJoinOperator {
 
         if output_columns.is_empty() {
             // Return empty batch with joined schema.
-            let schema = build_joined_schema(
-                stream_batch.schema(),
-                None,
-            )?;
+            let schema = build_joined_schema(stream_batch.schema(), None)?;
             return Ok(RecordBatch::new_empty(schema));
         }
 
@@ -168,17 +164,18 @@ impl TemporalJoinOperator {
         let total_cols = output_columns[0].len();
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(total_cols);
         for col_idx in 0..total_cols {
-            let col_arrays: Vec<_> = output_columns.iter().map(|row| row[col_idx].clone()).collect();
-            arrays.push(arrow::compute::concat(&col_arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?);
+            let col_arrays: Vec<_> = output_columns
+                .iter()
+                .map(|row| row[col_idx].clone())
+                .collect();
+            arrays.push(arrow::compute::concat(
+                &col_arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>(),
+            )?);
         }
 
-        let schema = build_joined_schema(
-            stream_batch.schema(),
-            None,
-        )?;
+        let schema = build_joined_schema(stream_batch.schema(), None)?;
 
-        RecordBatch::try_new(schema, arrays)
-            .map_err(|e| ExecError::Arrow(e.to_string()))
+        RecordBatch::try_new(schema, arrays).map_err(|e| ExecError::Arrow(e.to_string()))
     }
 }
 
@@ -211,7 +208,11 @@ fn build_joined_schema(
     stream_schema: SchemaRef,
     table_schema: Option<SchemaRef>,
 ) -> ExecResult<SchemaRef> {
-    let stream_fields: Vec<Field> = stream_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let stream_fields: Vec<Field> = stream_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     let mut fields = stream_fields;
     if let Some(ts) = &table_schema {
         for f_ref in ts.fields() {
@@ -280,11 +281,27 @@ mod tests {
         state.upsert_version(1000, version_batch(1));
         state.upsert_version(2000, version_batch(2));
         assert_eq!(
-            state.lookup_as_of(2500).unwrap().column(0).as_any()
-                .downcast_ref::<Int64Array>().unwrap().value(0), 2);
+            state
+                .lookup_as_of(2500)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
         assert_eq!(
-            state.lookup_as_of(1500).unwrap().column(0).as_any()
-                .downcast_ref::<Int64Array>().unwrap().value(0), 1);
+            state
+                .lookup_as_of(1500)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
         assert!(state.lookup_as_of(500).is_none());
     }
 
@@ -312,8 +329,16 @@ mod tests {
         let mut state = VersionedTableState::new(10_000);
         state.upsert_version(5000, version_batch(42));
         assert_eq!(
-            state.lookup_as_of(5000).unwrap().column(0).as_any()
-                .downcast_ref::<Int64Array>().unwrap().value(0), 42);
+            state
+                .lookup_as_of(5000)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
     }
 
     #[test]
@@ -322,8 +347,16 @@ mod tests {
         state.upsert_version(1000, version_batch(10));
         state.upsert_version(3000, version_batch(30));
         assert_eq!(
-            state.lookup_as_of(2000).unwrap().column(0).as_any()
-                .downcast_ref::<Int64Array>().unwrap().value(0), 10);
+            state
+                .lookup_as_of(2000)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
     }
 
     #[test]
@@ -337,8 +370,14 @@ mod tests {
         let mut state = VersionedTableState::new(10_000);
         state.upsert_version(1000, version_batch(1));
         state.upsert_version(1000, version_batch(99));
-        let val = state.lookup_as_of(1000).unwrap().column(0).as_any()
-            .downcast_ref::<Int64Array>().unwrap().value(0);
+        let val = state
+            .lookup_as_of(1000)
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
         assert_eq!(val, 99);
     }
 
@@ -419,7 +458,11 @@ mod tests {
 
         let stream = stream_batch(vec!["a"], vec![2000]);
         let result = op.join(&stream).unwrap();
-        assert_eq!(result.num_rows(), 0, "inner join with no match must return empty");
+        assert_eq!(
+            result.num_rows(),
+            0,
+            "inner join with no match must return empty"
+        );
     }
 
     #[test]

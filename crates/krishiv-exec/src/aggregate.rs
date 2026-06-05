@@ -312,11 +312,12 @@ fn update_agg_state_pre(
                 state.has_value[i] = true;
             }
             AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
-                let col = pre_cols[i]
-                    .as_ref()
-                    .ok_or_else(|| ExecError::Arrow(format!(
-                        "Sum/Min/Max aggregate expr {} missing input column", i
-                    )))?;
+                let col = pre_cols[i].as_ref().ok_or_else(|| {
+                    ExecError::Arrow(format!(
+                        "Sum/Min/Max aggregate expr {} missing input column",
+                        i
+                    ))
+                })?;
                 let v = col.int64_value(row)?;
                 match expr.function {
                     AggFunction::Sum => {
@@ -337,17 +338,16 @@ fn update_agg_state_pre(
                     }
                     _ => {
                         return Err(ExecError::Arrow(format!(
-                            "unexpected aggregate function {:?} for numeric column", expr.function
+                            "unexpected aggregate function {:?} for numeric column",
+                            expr.function
                         )));
                     }
                 }
             }
             AggFunction::Avg => {
-                let col = pre_cols[i]
-                    .as_ref()
-                    .ok_or_else(|| ExecError::Arrow(format!(
-                        "Avg aggregate expr {} missing input column", i
-                    )))?;
+                let col = pre_cols[i].as_ref().ok_or_else(|| {
+                    ExecError::Arrow(format!("Avg aggregate expr {} missing input column", i))
+                })?;
                 let v = col.float64_value(row)?;
                 state.avg_sums[i] += v;
                 state.avg_counts[i] += 1;

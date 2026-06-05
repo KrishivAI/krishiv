@@ -77,6 +77,16 @@ impl PyKafkaSink {
                 topic: self.topic.clone(),
                 group_id: String::from("krishiv-python"),
                 auto_commit_interval_ms: None,
+                security_protocol: None,
+                ssl_ca_location: None,
+                ssl_certificate_location: None,
+                ssl_key_location: None,
+                ssl_key_password: None,
+                sasl_username: None,
+                sasl_password: None,
+                sasl_mechanisms: None,
+                enable_idempotence: None,
+                transactional_id: None,
             };
             let mut sink = KafkaSink::new(cfg)
                 .map_err(|e| PyRuntimeError::new_err(format!("kafka sink init: {e}")))?;

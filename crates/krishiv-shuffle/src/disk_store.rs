@@ -27,6 +27,43 @@ fn compute_hash_bytes(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+fn encode_hash(hash: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in hash {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_hash(encoded: &[u8]) -> Option<[u8; 32]> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let encoded = match encoded {
+        [body @ .., b'\n'] | [body @ .., b'\r'] => body,
+        body => body,
+    };
+    if encoded.len() != 64 {
+        return None;
+    }
+
+    let mut hash = [0u8; 32];
+    for (idx, chunk) in encoded.chunks_exact(2).enumerate() {
+        let high = nibble(chunk[0])?;
+        let low = nibble(chunk[1])?;
+        hash[idx] = (high << 4) | low;
+    }
+    Some(hash)
+}
+
 impl LocalDiskShuffleStore {
     /// Create a new store rooted at `base_dir`, creating the directory if needed.
     pub fn new(base_dir: impl AsRef<Path>) -> ShuffleResult<Self> {
@@ -86,6 +123,13 @@ impl LocalDiskShuffleStore {
             .join(&id.job_id)
             .join(&id.stage_id)
             .join(format!("{}.parquet", id.partition)))
+    }
+
+    fn partition_hash_path(&self, id: &PartitionId) -> ShuffleResult<PathBuf> {
+        let partition_path = self.partition_path(id)?;
+        let mut path = partition_path.into_os_string();
+        path.push(".blake3");
+        Ok(PathBuf::from(path))
     }
 }
 
@@ -159,6 +203,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
         }
 
         let final_path = self.partition_path(&partition.id)?;
+        let final_hash_path = self.partition_hash_path(&partition.id)?;
         let writer_props = parquet_writer_properties(self.compression);
         let lease_tokens = Arc::clone(&self.lease_tokens);
         let content_hashes = Arc::clone(&self.content_hashes);
@@ -210,6 +255,22 @@ impl ShuffleStore for LocalDiskShuffleStore {
             let parquet_bytes = std::fs::read(&tmp_path)
                 .map_err(|e| io_err(format!("failed to read temp file for hashing: {e}")))?;
             let hash = compute_hash_bytes(&parquet_bytes);
+            let tmp_hash_path = final_hash_path.with_extension(format!("blake3.tmp.{tmp_suffix}"));
+            {
+                let mut hash_file = std::fs::File::create(&tmp_hash_path).map_err(|e| {
+                    io_err(format!(
+                        "failed to create temp partition hash file '{}': {e}",
+                        tmp_hash_path.display()
+                    ))
+                })?;
+                use std::io::Write;
+                hash_file
+                    .write_all(encode_hash(&hash).as_bytes())
+                    .map_err(|e| io_err(format!("failed to write temp partition hash: {e}")))?;
+                hash_file
+                    .sync_all()
+                    .map_err(|e| io_err(format!("failed to fsync temp partition hash: {e}")))?;
+            }
 
             // Phase 2: Re-acquire the lock and commit via rename only if our token
             // is still the current winner.  If a newer writer advanced the token
@@ -229,6 +290,13 @@ impl ShuffleStore for LocalDiskShuffleStore {
                         final_path.display()
                     ))
                 })?;
+                std::fs::rename(&tmp_hash_path, &final_hash_path).map_err(|e| {
+                    io_err(format!(
+                        "failed to rename temp partition hash '{}' → '{}': {e}",
+                        tmp_hash_path.display(),
+                        final_hash_path.display()
+                    ))
+                })?;
                 // S4: Fsync the parent directory so the rename is durable.
                 if let Some(ref parent) = parent_dir
                     && let Ok(dir) = std::fs::File::open(parent)
@@ -241,6 +309,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
             } else {
                 // Newer writer won — silently discard this temp file.
                 let _ = std::fs::remove_file(&tmp_path);
+                let _ = std::fs::remove_file(&tmp_hash_path);
                 return Err(ShuffleError::StaleLeaseToken {
                     expected: lease_token.saturating_add(1),
                     actual: lease_token,
@@ -272,6 +341,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
 
     async fn stream_partition(&self, id: &PartitionId) -> ShuffleResult<Option<ShuffleStream>> {
         let path = self.partition_path(id)?;
+        let hash_path = self.partition_hash_path(id)?;
         let id = id.clone();
         let id_clone = id.clone();
         let content_hashes = Arc::clone(&self.content_hashes);
@@ -291,16 +361,45 @@ impl ShuffleStore for LocalDiskShuffleStore {
             };
 
             let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-            if let Some(stored_ref) = content_hashes.get(&key) {
-                let stored = *stored_ref;
-                let computed = compute_hash_bytes(&raw_bytes);
-                if computed != stored {
-                    return Err(ShuffleError::ContentHashMismatch {
+            let persisted_hash_bytes = std::fs::read(&hash_path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ShuffleError::ContentHashMismatch {
                         partition: format!("{:?}", key),
-                        expected: format!("{:02x?}", stored),
-                        actual: format!("{:02x?}", computed),
-                    });
+                        expected: "persisted blake3 sidecar".to_string(),
+                        actual: "missing".to_string(),
+                    }
+                } else {
+                    io_err(format!(
+                        "failed to read partition hash file '{}': {e}",
+                        hash_path.display()
+                    ))
                 }
+            })?;
+            let persisted_hash = decode_hash(&persisted_hash_bytes).ok_or_else(|| {
+                ShuffleError::ContentHashMismatch {
+                    partition: format!("{:?}", key),
+                    expected: "64 lowercase hex blake3 digest".to_string(),
+                    actual: String::from_utf8_lossy(&persisted_hash_bytes).into_owned(),
+                }
+            })?;
+
+            if let Some(stored_ref) = content_hashes.get(&key)
+                && *stored_ref != persisted_hash
+            {
+                return Err(ShuffleError::ContentHashMismatch {
+                    partition: format!("{:?}", key),
+                    expected: encode_hash(stored_ref.value()),
+                    actual: encode_hash(&persisted_hash),
+                });
+            }
+
+            let computed = compute_hash_bytes(&raw_bytes);
+            if computed != persisted_hash {
+                return Err(ShuffleError::ContentHashMismatch {
+                    partition: format!("{:?}", key),
+                    expected: encode_hash(&persisted_hash),
+                    actual: encode_hash(&computed),
+                });
             }
 
             let parquet_bytes_frozen = bytes::Bytes::from(raw_bytes);

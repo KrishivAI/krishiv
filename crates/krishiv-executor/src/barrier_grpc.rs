@@ -56,17 +56,17 @@ impl ExecutorBarrierService {
         };
         if auth.require_auth() {
             match auth.bearer_token() {
-                Some(expected) => {
-                    match bearer_token_from_metadata(metadata) {
-                        Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => Ok(()),
-                        Some(_) => Err(tonic::Status::unauthenticated(
-                            "invalid barrier bearer token",
-                        )),
-                        None => Err(tonic::Status::unauthenticated(
-                            "missing barrier bearer token",
-                        )),
+                Some(expected) => match bearer_token_from_metadata(metadata) {
+                    Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_bytes()) => {
+                        Ok(())
                     }
-                }
+                    Some(_) => Err(tonic::Status::unauthenticated(
+                        "invalid barrier bearer token",
+                    )),
+                    None => Err(tonic::Status::unauthenticated(
+                        "missing barrier bearer token",
+                    )),
+                },
                 None => Err(tonic::Status::unauthenticated(
                     "barrier auth required but no token configured",
                 )),

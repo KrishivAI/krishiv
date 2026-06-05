@@ -3055,8 +3055,7 @@ mod scheduler_tests {
         let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
         let storage_path = storage.base_dir().to_string_lossy().to_string();
 
-        let mut coordinator =
-            Coordinator::active(CoordinatorId::try_new("coord-nq").unwrap());
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-nq").unwrap());
         let executor_id = ExecutorId::try_new("exec-nq").unwrap();
         coordinator
             .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-nq", 1))
@@ -3066,12 +3065,15 @@ mod scheduler_tests {
         let spec = JobSpec::new(job_id.clone(), "non-quorum", JobKind::Streaming)
             .with_checkpoint(5000, &storage_path)
             .with_stage(
-                StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
-                    TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream:tw"),
-                )
-                .with_task(
-                    TaskSpec::new(TaskId::try_new("task-2").unwrap(), "stream:tw"),
-                ),
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage")
+                    .with_task(TaskSpec::new(
+                        TaskId::try_new("task-1").unwrap(),
+                        "stream:tw",
+                    ))
+                    .with_task(TaskSpec::new(
+                        TaskId::try_new("task-2").unwrap(),
+                        "stream:tw",
+                    )),
             );
         coordinator.submit_job(spec).unwrap();
 

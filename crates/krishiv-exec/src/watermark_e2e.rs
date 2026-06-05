@@ -38,6 +38,7 @@ impl WatermarkE2ePipeline {
             interval: IntervalJoinState::new(IntervalJoinSpec {
                 lower_bound_ms: -100,
                 upper_bound_ms: 100,
+                key_column: "k".into(),
             }),
             cep: CepOperator::new(pattern, "k"),
         }

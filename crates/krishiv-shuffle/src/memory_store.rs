@@ -117,22 +117,29 @@ impl InMemoryShuffleStore {
         &self,
         incoming_key: &PartitionKey,
         incoming_size: usize,
+        old_size: usize,
     ) -> ShuffleResult<()> {
         let Some(max_bytes) = self.max_bytes else {
             return Ok(());
         };
-        let Some(spill) = self.spill_store.as_ref() else {
-            return Ok(());
-        };
 
         loop {
-            let projected = {
+            let current_bytes = {
                 let used = shuffle_read_lock(&self.bytes_used)?;
-                used.saturating_add(incoming_size)
+                used.saturating_sub(old_size)
             };
+            let projected = current_bytes.saturating_add(incoming_size);
             if projected <= max_bytes {
                 return Ok(());
             }
+
+            let Some(spill) = self.spill_store.as_ref() else {
+                return Err(ShuffleError::MemoryLimitExceeded {
+                    max_bytes,
+                    current_bytes,
+                    incoming_bytes: incoming_size,
+                });
+            };
 
             let key_to_spill = {
                 let order = shuffle_read_lock(&self.spill_order)?;
@@ -143,7 +150,11 @@ impl InMemoryShuffleStore {
                     .cloned()
             };
             let Some(key_to_spill) = key_to_spill else {
-                return Ok(());
+                return Err(ShuffleError::MemoryLimitExceeded {
+                    max_bytes,
+                    current_bytes,
+                    incoming_bytes: incoming_size,
+                });
             };
 
             // Read partition data under lock (clone is cheap — Arc bumps).
@@ -232,21 +243,11 @@ impl ShuffleStore for InMemoryShuffleStore {
             partition.id.partition,
         );
 
-        // Content hash verification on write
         let computed_hash = compute_simple_partition_hash(&partition);
-        {
-            let mut hashes = shuffle_write_lock(&self.content_hashes)?;
-            if let Some(&existing) = hashes.get(&key) {
-                if existing != computed_hash {
-                    tracing::warn!("shuffle content hash mismatch for {:?}", key);
-                }
-            } else {
-                hashes.insert(key.clone(), computed_hash);
-            }
-        }
+        let new_size = partition_memory_bytes(&partition);
 
         {
-            let mut leases = shuffle_write_lock(&self.lease_tokens)?;
+            let leases = shuffle_read_lock(&self.lease_tokens)?;
             if let Some(&expected) = leases.get(&key) {
                 if lease_token < expected {
                     return Err(ShuffleError::StaleLeaseToken {
@@ -254,47 +255,87 @@ impl ShuffleStore for InMemoryShuffleStore {
                         actual: lease_token,
                     });
                 }
-                leases.insert(key.clone(), lease_token);
-            } else {
-                leases.insert(key.clone(), lease_token);
             }
         }
 
-        if self.max_bytes.is_some() && self.spill_store.is_none() {
-            tracing::warn!(
-                "in-memory shuffle store configured with max_bytes but no spill_store; \
-                 memory limit will not be enforced"
-            );
-        }
-
-        let new_size = partition_memory_bytes(&partition);
-
-        let _spill_guard = if self.max_bytes.is_some() && self.spill_store.is_some() {
-            Some(self.spill_lock.lock().await)
-        } else {
-            None
+        let _write_guard = self.spill_lock.lock().await;
+        let old_size = {
+            let parts = shuffle_read_lock(&self.partitions)?;
+            parts.get(&key).map(partition_memory_bytes).unwrap_or(0)
         };
+
+        if let (Some(max_bytes), Some(spill)) = (self.max_bytes, self.spill_store.as_ref())
+            && new_size > max_bytes
+        {
+            spill.write_partition(partition, lease_token).await?;
+
+            {
+                let mut leases = shuffle_write_lock(&self.lease_tokens)?;
+                if let Some(&expected) = leases.get(&key)
+                    && lease_token < expected
+                {
+                    return Err(ShuffleError::StaleLeaseToken {
+                        expected,
+                        actual: lease_token,
+                    });
+                }
+                leases.insert(key.clone(), lease_token);
+            }
+
+            {
+                let mut parts = shuffle_write_lock(&self.partitions)?;
+                let removed_size = parts
+                    .remove(&key)
+                    .map(|p| partition_memory_bytes(&p))
+                    .unwrap_or(0);
+                let mut order = shuffle_write_lock(&self.spill_order)?;
+                order.retain(|existing| existing != &key);
+                let mut spilled = shuffle_write_lock(&self.spilled)?;
+                spilled.insert(key.clone());
+                let mut used = shuffle_write_lock(&self.bytes_used)?;
+                *used = used.saturating_sub(removed_size);
+                let mut hashes = shuffle_write_lock(&self.content_hashes)?;
+                hashes.remove(&key);
+            }
+            return Ok(());
+        }
 
         // Ensure capacity BEFORE mutating accounting state. If the spill
         // fails, no state has changed yet and we can safely retry.
-        self.ensure_memory_capacity_locked(&key, new_size).await?;
+        self.ensure_memory_capacity_locked(&key, new_size, old_size)
+            .await?;
 
-        // Mark as not spilled before updating partitions.
-        shuffle_write_lock(&self.spilled)?.remove(&key);
+        {
+            let mut leases = shuffle_write_lock(&self.lease_tokens)?;
+            if let Some(&expected) = leases.get(&key)
+                && lease_token < expected
+            {
+                return Err(ShuffleError::StaleLeaseToken {
+                    expected,
+                    actual: lease_token,
+                });
+            }
+            leases.insert(key.clone(), lease_token);
+        }
 
         // Update partitions and bytes_used atomically in a single lock scope.
         // This avoids the tear where bytes_used undercounts between the old-size
         // subtraction and new-size addition, which would cause ensure_memory_capacity
         // to incorrectly skip needed spills.
         {
+            let committed_key = key.clone();
             let mut parts = shuffle_write_lock(&self.partitions)?;
             let old_size = parts.get(&key).map(partition_memory_bytes).unwrap_or(0);
             parts.insert(key.clone(), partition);
             let mut order = shuffle_write_lock(&self.spill_order)?;
             order.retain(|existing| existing != &key);
-            order.push_back(key);
+            order.push_back(committed_key.clone());
+            let mut spilled = shuffle_write_lock(&self.spilled)?;
+            spilled.remove(&committed_key);
             let mut used = shuffle_write_lock(&self.bytes_used)?;
             *used = used.saturating_sub(old_size).saturating_add(new_size);
+            let mut hashes = shuffle_write_lock(&self.content_hashes)?;
+            hashes.insert(committed_key, computed_hash);
         }
         Ok(())
     }

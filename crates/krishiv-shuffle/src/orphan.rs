@@ -1,6 +1,7 @@
 use crate::ShuffleResult;
 
-/// Scan `base_dir` for `.ipc` files whose job directory is not in `active_job_ids`.
+/// Scan `base_dir` for local shuffle artifacts whose job directory is not in
+/// `active_job_ids`.
 ///
 /// Returns a list of orphan file paths (absolute paths under `base_dir`).
 pub fn scan_orphans(
@@ -26,7 +27,7 @@ pub fn scan_orphans(
         };
 
         if !active_job_ids.contains(&job_id) {
-            // Recursively collect all .ipc files in this job directory.
+            // Recursively collect all local shuffle artifacts in this job directory.
             collect_ipc_files(&path, &mut orphans)?;
         }
     }
@@ -34,7 +35,7 @@ pub fn scan_orphans(
     Ok(orphans)
 }
 
-/// Recursively collect all `.ipc` and `.tmp` files under `dir`.
+/// Recursively collect all local shuffle data, hash sidecar, and staging files under `dir`.
 fn collect_ipc_files(
     dir: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
@@ -47,8 +48,11 @@ fn collect_ipc_files(
         if is_dir {
             collect_ipc_files(&path, out)?;
         } else {
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("ipc") | Some("tmp") => out.push(path),
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let extension = path.extension().and_then(|e| e.to_str());
+            match extension {
+                Some("ipc") | Some("tmp") | Some("blake3") => out.push(path),
+                _ if file_name.contains(".tmp.blake3") => out.push(path),
                 _ => {}
             }
         }

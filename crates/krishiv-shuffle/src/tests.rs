@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod shuffle_tests {
     use std::collections::HashSet;
+    use std::fmt;
     use std::hash::Hasher;
     use std::sync::Arc;
 
@@ -13,8 +14,8 @@ mod shuffle_tests {
     use crate::{
         CompressionCodec, HashPartitioner, InMemoryShuffleStore, LocalDiskShuffleStore,
         LocalShuffleStore, PartitionId, PartitionState, ShuffleCompression, ShuffleError,
-        ShuffleMetadata, ShufflePartition, ShufflePath, ShuffleStore, cleanup_orphans,
-        scan_orphans,
+        ShuffleMetadata, ShufflePartition, ShufflePath, ShuffleStore, TieredShuffleStore,
+        cleanup_orphans, compression::partition_memory_bytes, scan_orphans,
     };
 
     // ── ShufflePath ───────────────────────────────────────────────────────
@@ -145,6 +146,84 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
+    async fn local_store_restart_reads_with_persisted_hash_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = ShufflePath::new("job-local-restart", "s0", 0);
+        let data = b"restart-safe local shuffle bytes";
+
+        let writer = LocalShuffleStore::new(dir.path());
+        writer.write_partition(&path, data).await.unwrap();
+
+        let restarted_reader = LocalShuffleStore::new(dir.path());
+        let read = restarted_reader.read_partition(&path).await.unwrap();
+        assert_eq!(read, data);
+    }
+
+    #[tokio::test]
+    async fn local_store_tampered_data_fails_before_decompression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path()).with_compression(CompressionCodec::Lz4);
+        let path = ShufflePath::new("job-local-tamper", "s0", 0);
+
+        store.write_partition(&path, b"tamper me").await.unwrap();
+        std::fs::write(dir.path().join("job-local-tamper/s0/0.ipc"), b"KSH\x01bad").unwrap();
+
+        let err = LocalShuffleStore::new(dir.path())
+            .read_partition(&path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for tampered local shuffle bytes, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_store_data_without_hash_sidecar_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path());
+        let path = ShufflePath::new("job-local-missing-hash", "s0", 0);
+
+        store
+            .write_partition(&path, b"missing sidecar")
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.path().join("job-local-missing-hash/s0/0.ipc.blake3")).unwrap();
+
+        let err = LocalShuffleStore::new(dir.path())
+            .read_partition(&path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for missing local shuffle hash sidecar, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_store_malformed_hash_sidecar_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalShuffleStore::new(dir.path());
+        let path = ShufflePath::new("job-local-bad-hash", "s0", 0);
+
+        store.write_partition(&path, b"bad sidecar").await.unwrap();
+        std::fs::write(
+            dir.path().join("job-local-bad-hash/s0/0.ipc.blake3"),
+            b"not-a-blake3-digest",
+        )
+        .unwrap();
+
+        let err = LocalShuffleStore::new(dir.path())
+            .read_partition(&path)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for malformed local shuffle hash sidecar, got {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn local_store_read_missing_returns_partition_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalShuffleStore::new(dir.path());
@@ -172,6 +251,7 @@ mod shuffle_tests {
         store.write_partition(&path, b"data").await.unwrap();
         let job_dir = dir.path().join("deljob");
         assert!(job_dir.exists());
+        assert!(dir.path().join("deljob/s0/0.ipc.blake3").exists());
 
         store.delete_job("deljob").await.unwrap();
         assert!(!job_dir.exists());
@@ -381,6 +461,26 @@ mod shuffle_tests {
         // Files should be gone.
         let remaining = scan_orphans(dir.path(), &active).unwrap();
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn cleanup_orphans_removes_hash_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ipc_file(dir.path(), "dead_with_hash", "s0", 0);
+        let sidecar = dir.path().join("dead_with_hash/s0/0.ipc.blake3");
+        std::fs::write(&sidecar, b"abcd").unwrap();
+
+        let active: HashSet<String> = HashSet::new();
+        let mut orphans = scan_orphans(dir.path(), &active).unwrap();
+        orphans.sort();
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.iter().any(|p| p.ends_with("0.ipc")));
+        assert!(orphans.iter().any(|p| p.ends_with("0.ipc.blake3")));
+
+        let count = cleanup_orphans(dir.path(), &active).unwrap();
+        assert_eq!(count, 2);
+        assert!(!dir.path().join("dead_with_hash/s0/0.ipc").exists());
+        assert!(!sidecar.exists());
     }
 
     // ── HashPartitioner ───────────────────────────────────────────────────
@@ -770,6 +870,89 @@ mod shuffle_tests {
     use crate::ObjectStoreShuffleStore;
     use object_store::{ObjectStoreExt as _, memory::InMemory};
 
+    #[derive(Debug)]
+    struct FailingPutObjectStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+    }
+
+    impl FailingPutObjectStore {
+        fn injected_error() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "failing-put-object-store",
+                source: Box::new(std::io::Error::other("injected object-store write failure")),
+            }
+        }
+    }
+
+    impl fmt::Display for FailingPutObjectStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("FailingPutObjectStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailingPutObjectStore {
+        async fn put_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            Err(Self::injected_error())
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &object_store::path::Path,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            Err(Self::injected_error())
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            _from: &object_store::path::Path,
+            _to: &object_store::path::Path,
+            _options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            Err(Self::injected_error())
+        }
+    }
+
     fn make_object_store_partition(
         job_id: &str,
         stage_id: &str,
@@ -833,6 +1016,95 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
+    async fn object_store_shuffle_restart_reads_with_persisted_hash_sidecar() {
+        let inner = Arc::new(InMemory::new());
+        let writer = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-test");
+
+        let partition = make_object_store_partition("job-os-restart", "s0", 0);
+        let id = partition.id.clone();
+        writer.write_partition(partition, 0).await.unwrap();
+
+        let restarted_reader = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+        let read = restarted_reader.read_partition(&id).await.unwrap().unwrap();
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_restart_detects_tampered_ipc_bytes() {
+        let inner = Arc::new(InMemory::new());
+        let writer = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-test");
+
+        let partition = make_object_store_partition("job-os-restart-tamper", "s0", 0);
+        let id = partition.id.clone();
+        writer.write_partition(partition, 0).await.unwrap();
+
+        inner
+            .put(
+                &object_store::path::Path::from("shuffle-test/job-os-restart-tamper/s0/0.ipc"),
+                bytes::Bytes::from_static(b"not-arrow-ipc").into(),
+            )
+            .await
+            .unwrap();
+
+        let restarted_reader = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+        let err = restarted_reader.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch after restart, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_data_without_hash_sidecar_fails_closed() {
+        let inner = Arc::new(InMemory::new());
+        let writer = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-test");
+
+        let partition = make_object_store_partition("job-os-missing-hash", "s0", 0);
+        let id = partition.id.clone();
+        writer.write_partition(partition, 0).await.unwrap();
+
+        inner
+            .delete(&object_store::path::Path::from(
+                "shuffle-test/job-os-missing-hash/s0/0.ipc.blake3",
+            ))
+            .await
+            .unwrap();
+
+        let restarted_reader = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+        let err = restarted_reader.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for data object without persisted hash, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_shuffle_malformed_hash_sidecar_fails_closed() {
+        let inner = Arc::new(InMemory::new());
+        let writer = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-test");
+
+        let partition = make_object_store_partition("job-os-bad-hash", "s0", 0);
+        let id = partition.id.clone();
+        writer.write_partition(partition, 0).await.unwrap();
+
+        inner
+            .put(
+                &object_store::path::Path::from("shuffle-test/job-os-bad-hash/s0/0.ipc.blake3"),
+                bytes::Bytes::from_static(b"not-a-blake3-digest").into(),
+            )
+            .await
+            .unwrap();
+
+        let restarted_reader = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+        let err = restarted_reader.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for malformed hash sidecar, got {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn object_store_shuffle_read_missing_returns_none() {
         let inner = Arc::new(InMemory::new());
         let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
@@ -848,7 +1120,7 @@ mod shuffle_tests {
     #[tokio::test]
     async fn object_store_shuffle_delete_job_removes_all_partitions() {
         let inner = Arc::new(InMemory::new());
-        let store = ObjectStoreShuffleStore::new(inner, "shuffle-test");
+        let store = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-test");
 
         store
             .write_partition(make_object_store_partition("job-del-os", "s0", 0), 0)
@@ -873,6 +1145,15 @@ mod shuffle_tests {
         };
         assert!(store.read_partition(&id0).await.unwrap().is_none());
         assert!(store.read_partition(&id1).await.unwrap().is_none());
+        let sidecar_result = inner
+            .get(&object_store::path::Path::from(
+                "shuffle-test/job-del-os/s0/0.ipc.blake3",
+            ))
+            .await;
+        assert!(
+            matches!(sidecar_result, Err(object_store::Error::NotFound { .. })),
+            "delete_job_partitions must remove persisted hash sidecars"
+        );
     }
 
     #[tokio::test]
@@ -901,6 +1182,62 @@ mod shuffle_tests {
             assert_eq!(read_back.batches.len(), 1, "codec {:?}", codec);
             assert_eq!(read_back.batches[0].num_rows(), 1, "codec {:?}", codec);
         }
+    }
+
+    #[tokio::test]
+    async fn tiered_store_remote_write_failure_is_returned_to_caller() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalDiskShuffleStore::new(local_dir.path()).unwrap());
+        let failing_inner = Arc::new(FailingPutObjectStore {
+            inner: Arc::new(InMemory::new()),
+        });
+        let remote = Arc::new(ObjectStoreShuffleStore::new(failing_inner, "tiered-fail"));
+        let store = TieredShuffleStore::new(Arc::clone(&local), Arc::clone(&remote));
+
+        let partition = make_object_store_partition("job-tiered-fail", "s0", 0);
+        let id = partition.id.clone();
+
+        let err = store.write_partition(partition, 1).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::Io(_)),
+            "expected remote write I/O failure, got {err}"
+        );
+        assert!(
+            local.read_partition(&id).await.unwrap().is_some(),
+            "local write happens before remote commit and remains available for retry cleanup"
+        );
+        assert!(
+            remote.read_partition(&id).await.unwrap().is_none(),
+            "failed remote commit must not create a readable remote partition"
+        );
+    }
+
+    #[tokio::test]
+    async fn tiered_store_reads_remote_copy_after_local_loss() {
+        let first_local_dir = tempfile::tempdir().unwrap();
+        let first_local = Arc::new(LocalDiskShuffleStore::new(first_local_dir.path()).unwrap());
+        let remote = Arc::new(ObjectStoreShuffleStore::new(
+            Arc::new(InMemory::new()),
+            "tiered-remote-copy",
+        ));
+        let first_store = TieredShuffleStore::new(first_local, Arc::clone(&remote));
+
+        let partition = make_object_store_partition("job-tiered-remote", "s0", 0);
+        let id = partition.id.clone();
+        first_store.write_partition(partition, 1).await.unwrap();
+
+        let replacement_local_dir = tempfile::tempdir().unwrap();
+        let replacement_local =
+            Arc::new(LocalDiskShuffleStore::new(replacement_local_dir.path()).unwrap());
+        let replacement_store = TieredShuffleStore::new(replacement_local, remote);
+
+        let read = replacement_store
+            .read_partition(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 1);
     }
 
     #[tokio::test]
@@ -1084,9 +1421,30 @@ mod shuffle_tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create a spill store at path, then use chattr +i to make it
-        // immutable (works regardless of root vs non-root file permissions).
+        // immutable before the second write triggers eviction.
         let spill_path = dir.path().join("spill_fail");
         std::fs::create_dir_all(&spill_path).unwrap();
+        let spill = Arc::new(LocalDiskShuffleStore::new(&spill_path).unwrap());
+
+        let p0 = make_store_partition("job-spill-fail", "s0", 0);
+        let p1 = make_store_partition("job-spill-fail", "s0", 1);
+        let id0 = p0.id.clone();
+        let id1 = p1.id.clone();
+        let max_bytes = partition_memory_bytes(&p0);
+        assert!(max_bytes > 0, "test partition must consume memory");
+        assert_eq!(
+            partition_memory_bytes(&p1),
+            max_bytes,
+            "test expects same-sized partitions so p1 can fit after p0 spills"
+        );
+
+        let store = InMemoryShuffleStore::new()
+            .with_max_bytes(max_bytes)
+            .with_spill_store(spill);
+
+        // First write succeeds and stays in memory.
+        store.write_partition(p0, 1).await.unwrap();
+
         use std::process::Command;
         let made_immutable = Command::new("chattr")
             .args(["+i", &spill_path.to_string_lossy()])
@@ -1099,21 +1457,7 @@ mod shuffle_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&spill_path, Permissions::from_mode(0o000)).unwrap();
         }
-        let spill = Arc::new(LocalDiskShuffleStore::new(&spill_path).unwrap());
 
-        // Use a tiny max_bytes so writes trigger spills immediately.
-        let store = InMemoryShuffleStore::new()
-            .with_max_bytes(64)
-            .with_spill_store(spill);
-
-        // Write partitions at or below max_bytes — first few should stay in memory.
-        let p0 = make_store_partition("job-spill-fail", "s0", 0);
-        let p1 = make_store_partition("job-spill-fail", "s0", 1);
-        let id0 = p0.id.clone();
-        let id1 = p1.id.clone();
-
-        // First write succeeds (below max_bytes, stays in memory).
-        store.write_partition(p0, 1).await.unwrap();
         // Second write triggers a spill of the oldest partition — this spill
         // will FAIL because the spill dir is immutable. Existing data must remain
         // accessible in memory and bytes_used must not be corrupted.
@@ -1438,8 +1782,7 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
-    async fn in_memory_misconfiguration_fails_closed() {
-        let store = InMemoryShuffleStore::new().with_max_bytes(1024);
+    async fn in_memory_without_spill_accepts_write_within_cap() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
@@ -1452,12 +1795,82 @@ mod shuffle_tests {
             schema,
             batches: vec![batch],
         };
-        // This must fail because max_bytes is set but no spill_store is attached.
-        let result = store.write_partition(partition, 1).await;
-        assert!(result.is_err());
-        let err_str = result.err().unwrap().to_string();
-        assert!(err_str.contains("misconfigured"));
-        assert!(err_str.contains("no spill_store"));
+        let id = partition.id.clone();
+        let store = InMemoryShuffleStore::new().with_max_bytes(partition_memory_bytes(&partition));
+
+        store.write_partition(partition, 1).await.unwrap();
+        assert!(store.read_partition(&id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn in_memory_without_spill_rejects_write_over_cap() {
+        let store = InMemoryShuffleStore::new().with_max_bytes(1);
+        let partition = make_store_partition("memory-cap", "s0", 0);
+        let id = partition.id.clone();
+
+        let err = store.write_partition(partition, 1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShuffleError::MemoryLimitExceeded {
+                    max_bytes: 1,
+                    current_bytes: 0,
+                    incoming_bytes: _
+                }
+            ),
+            "expected MemoryLimitExceeded, got {err}"
+        );
+        assert!(
+            store.read_partition(&id).await.unwrap().is_none(),
+            "rejected partition must not be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_capacity_accounts_for_overwrite() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let id = PartitionId {
+            job_id: "memory-overwrite-cap".to_owned(),
+            stage_id: "s0".to_owned(),
+            partition: 0,
+        };
+        let first = ShufflePartition {
+            id: id.clone(),
+            schema: schema.clone(),
+            batches: vec![
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                    .unwrap(),
+            ],
+        };
+        let max_bytes = partition_memory_bytes(&first);
+        let replacement = ShufflePartition {
+            id: id.clone(),
+            schema,
+            batches: vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                    vec![Arc::new(Int32Array::from(vec![9]))],
+                )
+                .unwrap(),
+            ],
+        };
+        assert_eq!(
+            partition_memory_bytes(&replacement),
+            max_bytes,
+            "test requires same-sized replacement partitions"
+        );
+
+        let store = InMemoryShuffleStore::new().with_max_bytes(max_bytes);
+        store.write_partition(first, 1).await.unwrap();
+        store.write_partition(replacement, 2).await.unwrap();
+
+        let read = store.read_partition(&id).await.unwrap().unwrap();
+        let values = read.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 9);
     }
 
     #[tokio::test]
@@ -1916,7 +2329,7 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
-    async fn corrupt_parquet_file_returns_io_error() {
+    async fn corrupt_parquet_file_returns_content_hash_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
 
@@ -1932,20 +2345,30 @@ mod shuffle_tests {
         drop(f);
 
         let err = store.read_partition(&id).await.unwrap_err();
-        // With BLAKE3 hash verification, file corruption is caught as
-        // ContentHashMismatch before the Parquet decoder even runs.
-        // Both Io and ContentHashMismatch indicate detected corruption.
         assert!(
-            matches!(
-                err,
-                ShuffleError::Io(_) | ShuffleError::ContentHashMismatch { .. }
-            ),
-            "expected Io or ContentHashMismatch error for corrupt parquet, got {err}"
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for corrupt parquet, got {err}"
         );
     }
 
     #[tokio::test]
-    async fn content_hash_mismatch_detected_on_tampered_partition() {
+    async fn disk_store_restart_reads_with_persisted_hash_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+
+        let partition = make_store_partition("job-hash-restart", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+        drop(store);
+
+        let restarted = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let read = restarted.read_partition(&id).await.unwrap().unwrap();
+        assert_eq!(read.batches.len(), 1);
+        assert_eq!(read.batches[0].num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn content_hash_mismatch_detected_after_restart_on_tampered_partition() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
 
@@ -1961,13 +2384,53 @@ mod shuffle_tests {
         f.write_all(b"TAMPERED DATA OVERWRITE").unwrap();
         drop(f);
 
-        // Create a new store instance (loads clean hashes — no stored hash means no mismatch error)
         let store2 = LocalDiskShuffleStore::new(dir.path()).unwrap();
         let err = store2.read_partition(&id).await.unwrap_err();
-        // After tampering, the read should fail (Io error from parquet deserialization)
         assert!(
-            matches!(err, ShuffleError::Io(_)),
-            "expected Io error for tampered parquet, got {err}"
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for tampered parquet after restart, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_store_data_without_hash_sidecar_fails_closed_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+
+        let partition = make_store_partition("job-missing-disk-hash", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+        drop(store);
+
+        let hash_path = dir.path().join("job-missing-disk-hash/s0/0.parquet.blake3");
+        std::fs::remove_file(hash_path).unwrap();
+
+        let restarted = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let err = restarted.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for local data without persisted hash, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_store_malformed_hash_sidecar_fails_closed_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDiskShuffleStore::new(dir.path()).unwrap();
+
+        let partition = make_store_partition("job-bad-disk-hash", "s0", 0);
+        let id = partition.id.clone();
+        store.write_partition(partition, 1).await.unwrap();
+        drop(store);
+
+        let hash_path = dir.path().join("job-bad-disk-hash/s0/0.parquet.blake3");
+        std::fs::write(hash_path, b"not-a-blake3-digest").unwrap();
+
+        let restarted = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let err = restarted.read_partition(&id).await.unwrap_err();
+        assert!(
+            matches!(err, ShuffleError::ContentHashMismatch { .. }),
+            "expected ContentHashMismatch for malformed local hash sidecar, got {err}"
         );
     }
 

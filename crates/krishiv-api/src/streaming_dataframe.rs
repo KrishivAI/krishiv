@@ -498,6 +498,7 @@ mod tests {
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
             upper_bound_ms: 100,
+            key_column: "k".into(),
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         assert_eq!(pairs.len(), 1, "events within window should match");
@@ -512,6 +513,7 @@ mod tests {
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
             upper_bound_ms: 100,
+            key_column: "k".into(),
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty(), "events outside window must not match");
@@ -526,6 +528,7 @@ mod tests {
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
             upper_bound_ms: 200,
+            key_column: "k".into(),
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         // 1050-1000=50 ✓, 1080-1000=80 ✓, 2000-1000=1000 ✗
@@ -537,6 +540,7 @@ mod tests {
         let spec = IntervalJoinSpec {
             lower_bound_ms: 0,
             upper_bound_ms: 1000,
+            key_column: "k".into(),
         };
         let pairs = interval_join(&[], &[], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty());

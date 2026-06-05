@@ -585,17 +585,56 @@ pub fn validate_epoch(
     job_id: &str,
     epoch: u64,
 ) -> CheckpointResult<bool> {
-    let manifest_bytes = match storage.read_bytes(&manifest_path(job_id, epoch))? {
-        None => return Ok(false),
-        Some(b) => b,
+    let Some(manifest) = read_optional_manifest(storage, &manifest_path(job_id, epoch), epoch)?
+    else {
+        return Ok(false);
     };
-    let manifest =
-        IntegrityManifest::deserialize(&manifest_bytes).map_err(|e| CheckpointError::Corrupt {
+    validate_manifest_entries(storage, &epoch_dir(job_id, epoch), &manifest)
+}
+
+fn read_optional_manifest(
+    storage: &dyn CheckpointStorage,
+    path: &str,
+    epoch: u64,
+) -> CheckpointResult<Option<IntegrityManifest>> {
+    let Some(manifest_bytes) = storage.read_bytes(path)? else {
+        return Ok(None);
+    };
+    IntegrityManifest::deserialize(&manifest_bytes)
+        .map(Some)
+        .map_err(|e| CheckpointError::Corrupt {
             epoch,
             message: format!("manifest parse: {e}"),
-        })?;
+        })
+}
+
+fn read_required_manifest(
+    storage: &dyn CheckpointStorage,
+    path: &str,
+    epoch: u64,
+) -> CheckpointResult<IntegrityManifest> {
+    read_optional_manifest(storage, path, epoch)?.ok_or(CheckpointError::NoValidEpoch)
+}
+
+fn validate_manifest_at_prefix(
+    storage: &dyn CheckpointStorage,
+    base_prefix: &str,
+    manifest_path: &str,
+    epoch: u64,
+) -> CheckpointResult<bool> {
+    let Some(manifest) = read_optional_manifest(storage, manifest_path, epoch)? else {
+        return Ok(false);
+    };
+    validate_manifest_entries(storage, base_prefix, &manifest)
+}
+
+fn validate_manifest_entries(
+    storage: &dyn CheckpointStorage,
+    base_prefix: &str,
+    manifest: &IntegrityManifest,
+) -> CheckpointResult<bool> {
     for (path, expected_hex) in &manifest.entries {
-        let full = format!("{}/{path}", epoch_dir(job_id, epoch));
+        let full = format!("{base_prefix}/{path}");
         match storage.read_bytes(&full)? {
             None => return Ok(false),
             Some(data) => {
@@ -624,6 +663,52 @@ pub fn validate_epoch(
         }
     }
     Ok(true)
+}
+
+fn validate_metadata_identity(
+    metadata: &CheckpointMetadata,
+    job_id: &str,
+    epoch: u64,
+) -> CheckpointResult<()> {
+    metadata.validate()?;
+    if metadata.job_id != job_id {
+        return Err(CheckpointError::Corrupt {
+            epoch,
+            message: format!(
+                "metadata job_id {} does not match requested job_id {job_id}",
+                metadata.job_id
+            ),
+        });
+    }
+    if metadata.epoch != epoch {
+        return Err(CheckpointError::Corrupt {
+            epoch,
+            message: format!(
+                "metadata epoch {} does not match requested epoch {epoch}",
+                metadata.epoch
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn snapshot_relative_path<'a>(
+    job_id: &str,
+    epoch: u64,
+    snapshot: &'a OperatorSnapshotRef,
+) -> CheckpointResult<&'a str> {
+    let prefix = format!("{}/", epoch_dir(job_id, epoch));
+    snapshot
+        .snapshot_path
+        .strip_prefix(&prefix)
+        .ok_or_else(|| CheckpointError::Corrupt {
+            epoch,
+            message: format!(
+                "snapshot path {} is not under checkpoint epoch {}",
+                snapshot.snapshot_path,
+                epoch_dir(job_id, epoch)
+            ),
+        })
 }
 
 /// Async variant of [`validate_epoch`].
@@ -943,38 +1028,63 @@ pub fn create_savepoint(
     label: Option<&str>,
 ) -> CheckpointResult<(u64, CheckpointMetadata)> {
     let epoch = latest_valid_epoch(storage, job_id)?;
+    let source_manifest = read_required_manifest(storage, &manifest_path(job_id, epoch), epoch)?;
     let mut metadata =
         read_epoch_metadata(storage, job_id, epoch)?.ok_or(CheckpointError::NoValidEpoch)?;
+    validate_metadata_identity(&metadata, job_id, epoch)?;
     metadata.is_savepoint = true;
     metadata.savepoint_label = label.map(str::to_string);
 
     let savepoint_dir = savepoint_epoch_dir(job_id, epoch);
-    let epoch_dir = epoch_dir(job_id, epoch);
+    let mut savepoint_manifest = IntegrityManifest::new();
 
-    // Copy metadata to savepoint prefix.
     let metadata_json =
         serde_json::to_vec_pretty(&metadata).map_err(|e| CheckpointError::Storage {
             message: format!("savepoint metadata serialize: {e}"),
         })?;
-    storage.write_bytes(&format!("{savepoint_dir}/metadata.json"), &metadata_json)?;
+    savepoint_manifest.insert_bytes("metadata.json", &metadata_json);
 
-    // Copy operator state snapshots.
+    let mut snapshot_files = Vec::with_capacity(metadata.operator_snapshots.len());
     for snap in &metadata.operator_snapshots {
-        let src_path = &snap.snapshot_path;
-        if let Some(data) = storage.read_bytes(src_path)? {
-            let rel = snap
-                .snapshot_path
-                .strip_prefix(&format!("{epoch_dir}/"))
-                .unwrap_or(&snap.snapshot_path);
-            storage.write_bytes(&format!("{savepoint_dir}/{rel}"), &data)?;
+        let rel = snapshot_relative_path(job_id, epoch, snap)?;
+        let data =
+            storage
+                .read_bytes(&snap.snapshot_path)?
+                .ok_or_else(|| CheckpointError::Corrupt {
+                    epoch,
+                    message: format!(
+                        "snapshot {} referenced by metadata is missing",
+                        snap.snapshot_path
+                    ),
+                })?;
+        if !source_manifest.verify(rel, &data) {
+            return Err(CheckpointError::Corrupt {
+                epoch,
+                message: format!(
+                    "snapshot {} is not covered by the source checkpoint manifest",
+                    snap.snapshot_path
+                ),
+            });
         }
+        savepoint_manifest.insert_bytes(rel, &data);
+        snapshot_files.push((rel.to_owned(), data));
     }
 
-    // Copy manifest.
-    let manifest_bytes = storage
-        .read_bytes(&manifest_path(job_id, epoch))?
-        .ok_or(CheckpointError::NoValidEpoch)?;
-    storage.write_bytes(&format!("{savepoint_dir}/manifest.sha256"), &manifest_bytes)?;
+    let write_result = (|| -> CheckpointResult<()> {
+        storage.write_bytes(&format!("{savepoint_dir}/metadata.json"), &metadata_json)?;
+        for (rel, data) in &snapshot_files {
+            storage.write_bytes(&format!("{savepoint_dir}/{rel}"), data)?;
+        }
+        storage.write_bytes(
+            &format!("{savepoint_dir}/manifest.sha256"),
+            &savepoint_manifest.serialize(),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        cleanup_partial_prefix(storage, &savepoint_dir);
+        return Err(error);
+    }
 
     Ok((epoch, metadata))
 }
@@ -992,46 +1102,60 @@ pub fn restore_savepoint(
     current_fencing_token: u64,
 ) -> CheckpointResult<CheckpointMetadata> {
     let savepoint_dir = savepoint_epoch_dir(job_id, savepoint_epoch);
+    if !validate_manifest_at_prefix(
+        storage,
+        &savepoint_dir,
+        &format!("{savepoint_dir}/manifest.sha256"),
+        savepoint_epoch,
+    )? {
+        return Err(CheckpointError::Corrupt {
+            epoch: savepoint_epoch,
+            message: "savepoint manifest validation failed".to_owned(),
+        });
+    }
 
     let meta_path = format!("{savepoint_dir}/metadata.json");
-    let metadata = storage
+    let metadata_bytes = storage
         .read_bytes(&meta_path)?
-        .ok_or(CheckpointError::NoValidEpoch)
-        .and_then(|bytes| {
-            serde_json::from_slice::<CheckpointMetadata>(&bytes).map_err(|e| {
-                CheckpointError::Corrupt {
-                    epoch: savepoint_epoch,
-                    message: format!("savepoint metadata JSON parse: {e}"),
-                }
-            })
-        })?;
+        .ok_or(CheckpointError::NoValidEpoch)?;
+    let metadata = serde_json::from_slice::<CheckpointMetadata>(&metadata_bytes).map_err(|e| {
+        CheckpointError::Corrupt {
+            epoch: savepoint_epoch,
+            message: format!("savepoint metadata JSON parse: {e}"),
+        }
+    })?;
 
-    validate_fencing_token(&metadata, current_fencing_token)?;
+    validate_metadata_identity(&metadata, job_id, savepoint_epoch)?;
+    validate_fencing_token_for_restore(&metadata, current_fencing_token)?;
 
     // Copy savepoint files back into the active checkpoints directory for restore.
     let epoch_dir = epoch_dir(job_id, savepoint_epoch);
-    storage.write_bytes(
-        &format!("{epoch_dir}/metadata.json"),
-        &serde_json::to_vec_pretty(&metadata).map_err(|e| CheckpointError::Storage {
-            message: format!("metadata serialize: {e}"),
-        })?,
-    )?;
+    let mut restored_manifest = IntegrityManifest::new();
+    restored_manifest.insert_bytes("metadata.json", &metadata_bytes);
 
+    let mut snapshot_files = Vec::with_capacity(metadata.operator_snapshots.len());
     for snap in &metadata.operator_snapshots {
-        let savepoint_snap = format!(
-            "{savepoint_dir}/{}/{}/state.bin",
-            snap.operator_id, snap.task_id
-        );
-        if let Some(data) = storage.read_bytes(&savepoint_snap)? {
-            let target = snapshot_path(job_id, savepoint_epoch, &snap.operator_id, &snap.task_id);
-            storage.write_bytes(&target, &data)?;
-        }
+        let rel = snapshot_relative_path(job_id, savepoint_epoch, snap)?;
+        let savepoint_snap = format!("{savepoint_dir}/{rel}");
+        let data =
+            storage
+                .read_bytes(&savepoint_snap)?
+                .ok_or_else(|| CheckpointError::Corrupt {
+                    epoch: savepoint_epoch,
+                    message: format!("savepoint snapshot {savepoint_snap} is missing"),
+                })?;
+        restored_manifest.insert_bytes(rel, &data);
+        snapshot_files.push((rel.to_owned(), data));
     }
 
-    let saved_manifest_path = format!("{savepoint_dir}/manifest.sha256");
-    if let Some(manifest_data) = storage.read_bytes(&saved_manifest_path)? {
-        storage.write_bytes(&manifest_path(job_id, savepoint_epoch), &manifest_data)?;
+    storage.write_bytes(&format!("{epoch_dir}/metadata.json"), &metadata_bytes)?;
+    for (rel, data) in &snapshot_files {
+        storage.write_bytes(&format!("{epoch_dir}/{rel}"), data)?;
     }
+    storage.write_bytes(
+        &manifest_path(job_id, savepoint_epoch),
+        &restored_manifest.serialize(),
+    )?;
 
     Ok(metadata)
 }
@@ -1059,6 +1183,16 @@ pub fn delete_savepoint(
 ) -> CheckpointResult<()> {
     let dir = savepoint_epoch_dir(job_id, savepoint_epoch);
     storage.delete_prefix(&dir)
+}
+
+fn cleanup_partial_prefix(storage: &dyn CheckpointStorage, prefix: &str) {
+    if let Err(error) = storage.delete_prefix(prefix) {
+        tracing::warn!(
+            prefix,
+            error = %error,
+            "failed to clean up partial checkpoint storage prefix"
+        );
+    }
 }
 
 // ── LocalFsCheckpointStorage ──────────────────────────────────────────────────
@@ -1327,10 +1461,14 @@ mod tests {
     }
 
     fn sample_metadata(epoch: u64) -> CheckpointMetadata {
+        sample_metadata_for_job("job-test", epoch)
+    }
+
+    fn sample_metadata_for_job(job_id: &str, epoch: u64) -> CheckpointMetadata {
         CheckpointMetadata {
             version: CheckpointMetadata::VERSION,
             epoch,
-            job_id: "job-test".to_owned(),
+            job_id: job_id.to_owned(),
             fencing_token: 1,
             coordinator_id: None,
             timestamp_ms: 1_716_000_000_000,
@@ -1341,7 +1479,7 @@ mod tests {
             operator_snapshots: vec![OperatorSnapshotRef {
                 operator_id: "op-0".to_owned(),
                 task_id: "task-0".to_owned(),
-                snapshot_path: snapshot_path("job-test", epoch, "op-0", "task-0"),
+                snapshot_path: snapshot_path(job_id, epoch, "op-0", "task-0"),
             }],
             is_savepoint: false,
             savepoint_label: None,
@@ -3012,9 +3150,9 @@ mod tests {
         let state3 = b"state-epoch-3";
 
         // Establish epochs 1, 2, 3
-        let meta1 = sample_metadata(1);
-        let meta2 = sample_metadata(2);
-        let meta3 = sample_metadata(3);
+        let meta1 = sample_metadata_for_job("j-sp", 1);
+        let meta2 = sample_metadata_for_job("j-sp", 2);
+        let meta3 = sample_metadata_for_job("j-sp", 3);
         for epoch in &[1u64, 2, 3] {
             let meta = if *epoch == 1 {
                 &meta1
@@ -3070,7 +3208,7 @@ mod tests {
         assert_eq!(latest_valid_epoch(&s, "j-sp").unwrap(), 5);
 
         // Savepoint still readable
-        let restored = restore_savepoint(&s, "j-sp", 3, 1).unwrap();
+        let restored = restore_savepoint(&s, "j-sp", 3, 2).unwrap();
         assert!(restored.is_savepoint);
         assert_eq!(restored.savepoint_label.as_deref(), Some("test-savepoint"));
 
@@ -3080,10 +3218,110 @@ mod tests {
     }
 
     #[test]
+    fn restore_savepoint_rebuilds_valid_active_manifest() {
+        let s = make_storage();
+        let state = b"state-before-savepoint";
+        let meta = sample_metadata_for_job("j-sp-restore", 1);
+        write_operator_snapshot(&s, "j-sp-restore", 1, "op-0", "task-0", state).unwrap();
+        write_epoch_metadata(&s, "j-sp-restore", 1, &meta).unwrap();
+        let mut manifest = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        manifest.insert_bytes("metadata.json", &meta_json);
+        manifest.insert_bytes("op-0/task-0/state.bin", state);
+        write_manifest(&s, "j-sp-restore", 1, &manifest).unwrap();
+
+        create_savepoint(&s, "j-sp-restore", Some("pre-upgrade")).unwrap();
+        assert!(
+            validate_manifest_at_prefix(
+                &s,
+                &savepoint_epoch_dir("j-sp-restore", 1),
+                &format!("{}/manifest.sha256", savepoint_epoch_dir("j-sp-restore", 1)),
+                1,
+            )
+            .unwrap(),
+            "savepoint manifest must match rewritten savepoint metadata"
+        );
+
+        let restored = restore_savepoint(&s, "j-sp-restore", 1, 5).unwrap();
+        assert!(restored.is_savepoint);
+        assert_eq!(restored.savepoint_label.as_deref(), Some("pre-upgrade"));
+        assert!(
+            validate_epoch(&s, "j-sp-restore", 1).unwrap(),
+            "restored active checkpoint must validate with the rebuilt manifest"
+        );
+    }
+
+    #[test]
+    fn restore_savepoint_rejects_corrupt_savepoint_payload() {
+        let s = make_storage();
+        let state = b"state-before-corruption";
+        let meta = sample_metadata_for_job("j-sp-corrupt", 1);
+        write_operator_snapshot(&s, "j-sp-corrupt", 1, "op-0", "task-0", state).unwrap();
+        write_epoch_metadata(&s, "j-sp-corrupt", 1, &meta).unwrap();
+        let mut manifest = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        manifest.insert_bytes("metadata.json", &meta_json);
+        manifest.insert_bytes("op-0/task-0/state.bin", state);
+        write_manifest(&s, "j-sp-corrupt", 1, &manifest).unwrap();
+        create_savepoint(&s, "j-sp-corrupt", Some("before-corruption")).unwrap();
+
+        s.write_bytes(
+            &format!(
+                "{}/op-0/task-0/state.bin",
+                savepoint_epoch_dir("j-sp-corrupt", 1)
+            ),
+            b"tampered",
+        )
+        .unwrap();
+
+        let result = restore_savepoint(&s, "j-sp-corrupt", 1, 1);
+        assert!(matches!(
+            result,
+            Err(CheckpointError::Corrupt {
+                epoch: 1,
+                message: _
+            })
+        ));
+    }
+
+    #[test]
+    fn create_savepoint_rejects_unmanifested_snapshot() {
+        let s = make_storage();
+        let meta = sample_metadata_for_job("j-sp-unmanifested", 1);
+        write_operator_snapshot(
+            &s,
+            "j-sp-unmanifested",
+            1,
+            "op-0",
+            "task-0",
+            b"state-not-in-manifest",
+        )
+        .unwrap();
+        write_epoch_metadata(&s, "j-sp-unmanifested", 1, &meta).unwrap();
+        let mut manifest = IntegrityManifest::new();
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        manifest.insert_bytes("metadata.json", &meta_json);
+        write_manifest(&s, "j-sp-unmanifested", 1, &manifest).unwrap();
+
+        let result = create_savepoint(&s, "j-sp-unmanifested", Some("bad-source"));
+        assert!(matches!(
+            result,
+            Err(CheckpointError::Corrupt {
+                epoch: 1,
+                message: _
+            })
+        ));
+        assert!(
+            list_savepoints(&s, "j-sp-unmanifested").unwrap().is_empty(),
+            "failed savepoint creation must not leave a listed partial savepoint"
+        );
+    }
+
+    #[test]
     fn delete_savepoint_does_not_affect_checkpoint_epochs() {
         let s = make_storage();
         let state1 = b"state-epoch-1";
-        let meta1 = sample_metadata(1);
+        let meta1 = sample_metadata_for_job("j-del", 1);
         write_operator_snapshot(&s, "j-del", 1, "op-0", "task-0", state1).unwrap();
         write_epoch_metadata(&s, "j-del", 1, &meta1).unwrap();
         let mut m = IntegrityManifest::new();
@@ -3095,7 +3333,7 @@ mod tests {
         create_savepoint(&s, "j-del", Some("to-delete")).unwrap();
 
         // Write a newer checkpoint with manifest
-        let meta2 = sample_metadata(2);
+        let meta2 = sample_metadata_for_job("j-del", 2);
         write_operator_snapshot(&s, "j-del", 2, "op-0", "task-0", b"state-epoch-2").unwrap();
         write_epoch_metadata(&s, "j-del", 2, &meta2).unwrap();
         let mut m2 = IntegrityManifest::new();

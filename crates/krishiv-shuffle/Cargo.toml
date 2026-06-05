@@ -29,10 +29,10 @@ twox-hash = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [[bin]]
 name = "krishiv-shuffle-svc"
 path = "src/bin/krishiv_shuffle_svc.rs"
-

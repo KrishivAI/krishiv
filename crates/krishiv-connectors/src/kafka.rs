@@ -114,13 +114,17 @@ impl KafkaConfig {
                 .and_then(|s| s.parse().ok()),
             security_protocol: config.get("security.protocol").map(|s| s.to_string()),
             ssl_ca_location: config.get("ssl.ca.location").map(|s| s.to_string()),
-            ssl_certificate_location: config.get("ssl.certificate.location").map(|s| s.to_string()),
+            ssl_certificate_location: config
+                .get("ssl.certificate.location")
+                .map(|s| s.to_string()),
             ssl_key_location: config.get("ssl.key.location").map(|s| s.to_string()),
             ssl_key_password: config.get("ssl.key.password").map(|s| s.to_string()),
             sasl_username: config.get("sasl.username").map(|s| s.to_string()),
             sasl_password: config.get("sasl.password").map(|s| s.to_string()),
             sasl_mechanisms: config.get("sasl.mechanisms").map(|s| s.to_string()),
-            enable_idempotence: config.get("enable.idempotence").and_then(|s| s.parse().ok()),
+            enable_idempotence: config
+                .get("enable.idempotence")
+                .and_then(|s| s.parse().ok()),
             transactional_id: config.get("transactional.id").map(|s| s.to_string()),
         })
     }
@@ -301,14 +305,14 @@ impl KafkaSink {
         use rdkafka::ClientConfig;
 
         let mut client = ClientConfig::new();
-        client.set("bootstrap.servers", &config.bootstrap_servers)
+        client
+            .set("bootstrap.servers", &config.bootstrap_servers)
             .set("message.timeout.ms", "5000");
         apply_kafka_security_config(&mut client, &config);
         apply_kafka_transactional_config(&mut client, &config);
 
-        let producer: rdkafka::producer::FutureProducer = client
-            .create()
-            .map_err(|e| ConnectorError::Kafka {
+        let producer: rdkafka::producer::FutureProducer =
+            client.create().map_err(|e| ConnectorError::Kafka {
                 message: format!("rdkafka producer creation failed: {e}"),
                 retriable: false,
             })?;
@@ -888,6 +892,25 @@ mod tests {
     use super::*;
     use crate::{ConnectorConfig, Offset};
 
+    fn test_kafka_config() -> KafkaConfig {
+        KafkaConfig {
+            bootstrap_servers: "localhost:9092".into(),
+            topic: "events".into(),
+            group_id: "test-group".into(),
+            auto_commit_interval_ms: None,
+            security_protocol: None,
+            ssl_ca_location: None,
+            ssl_certificate_location: None,
+            ssl_key_location: None,
+            ssl_key_password: None,
+            sasl_username: None,
+            sasl_password: None,
+            sasl_mechanisms: None,
+            enable_idempotence: None,
+            transactional_id: None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // KafkaOffset
     // -----------------------------------------------------------------------
@@ -942,12 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn kafka_source_reports_unbounded_and_rewindable() {
-        let config = KafkaConfig {
-            bootstrap_servers: "localhost:9092".into(),
-            topic: "events".into(),
-            group_id: "test-group".into(),
-            auto_commit_interval_ms: None,
-        };
+        let config = test_kafka_config();
         #[cfg(not(feature = "kafka"))]
         let source = KafkaSource::new(config);
         #[cfg(feature = "kafka")]
@@ -970,12 +988,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "kafka"))]
     fn kafka_sink_stub_reports_no_runtime_capabilities() {
-        let config = KafkaConfig {
-            bootstrap_servers: "localhost:9092".into(),
-            topic: "events".into(),
-            group_id: "test-group".into(),
-            auto_commit_interval_ms: None,
-        };
+        let config = test_kafka_config();
         let sink = KafkaSink::new(config);
         let caps = sink.capabilities();
         assert!(!caps.is_unbounded());
@@ -992,12 +1005,7 @@ mod tests {
     #[tokio::test]
     #[cfg(not(feature = "kafka"))]
     async fn kafka_source_read_batch_returns_unsupported() {
-        let config = KafkaConfig {
-            bootstrap_servers: "localhost:9092".into(),
-            topic: "events".into(),
-            group_id: "test-group".into(),
-            auto_commit_interval_ms: None,
-        };
+        let config = test_kafka_config();
         let mut source = KafkaSource::new(config);
         let err = source.read_batch().await.unwrap_err();
         match err {
@@ -1029,12 +1037,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        let config = KafkaConfig {
-            bootstrap_servers: "localhost:9092".into(),
-            topic: "events".into(),
-            group_id: "test-group".into(),
-            auto_commit_interval_ms: None,
-        };
+        let config = test_kafka_config();
         let mut sink = KafkaSink::new(config);
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -1141,12 +1144,7 @@ mod tests {
         #[cfg(not(feature = "kafka"))]
         {
             use crate::Sink;
-            let config = KafkaConfig {
-                bootstrap_servers: "localhost:9092".to_string(),
-                topic: "events".to_string(),
-                group_id: "krishiv-default".to_string(),
-                auto_commit_interval_ms: None,
-            };
+            let config = test_kafka_config();
             let mut sink = KafkaSink::new(config);
             let result = sink.flush().await;
             assert!(

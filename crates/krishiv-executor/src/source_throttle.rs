@@ -56,8 +56,7 @@ impl TokenBucket {
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed_secs = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed_secs * self.rate as f64)
-            .min(self.capacity as f64);
+        self.tokens = (self.tokens + elapsed_secs * self.rate as f64).min(self.capacity as f64);
         self.last_refill = now;
     }
 

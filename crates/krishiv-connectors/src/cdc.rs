@@ -1071,14 +1071,20 @@ impl CdcOffsetTracker {
             for k in keys {
                 if k.len() == 4 {
                     let Ok(key_arr) = k.as_slice().try_into() else {
-                        tracing::warn!(key_len = k.len(), "cdc offset key has unexpected length, skipping");
+                        tracing::warn!(
+                            key_len = k.len(),
+                            "cdc offset key has unexpected length, skipping"
+                        );
                         continue;
                     };
                     let partition = u32::from_le_bytes(key_arr);
                     if let Ok(Some(val_bytes)) = backend.get(&ns, &k) {
                         if val_bytes.len() == 8 {
                             let Ok(val_arr) = val_bytes.as_slice().try_into() else {
-                                tracing::warn!(partition, "cdc offset value has unexpected length, skipping");
+                                tracing::warn!(
+                                    partition,
+                                    "cdc offset value has unexpected length, skipping"
+                                );
                                 continue;
                             };
                             let offset = i64::from_le_bytes(val_arr);

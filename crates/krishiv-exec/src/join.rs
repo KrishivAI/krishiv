@@ -126,10 +126,13 @@ fn join_output_schema_multi(
     right: &RecordBatch,
     right_keys: &[String],
 ) -> Arc<Schema> {
-    let right_key_set: std::collections::HashSet<String> =
-        right_keys.iter().cloned().collect();
-    let mut fields: Vec<Field> = left.schema().fields().iter()
-        .map(|f| f.as_ref().clone()).collect();
+    let right_key_set: std::collections::HashSet<String> = right_keys.iter().cloned().collect();
+    let mut fields: Vec<Field> = left
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     for f in right.schema().fields() {
         let fname = f.name().to_string();
         if right_key_set.contains(&fname) {
@@ -140,7 +143,11 @@ fn join_output_schema_multi(
         } else {
             f.name().clone()
         };
-        fields.push(Field::new(name, f.as_ref().data_type().clone(), f.as_ref().is_nullable()));
+        fields.push(Field::new(
+            name,
+            f.as_ref().data_type().clone(),
+            f.as_ref().is_nullable(),
+        ));
     }
     Arc::new(Schema::new(fields))
 }
@@ -230,10 +237,7 @@ impl HashJoin {
     }
 
     /// Multi-key join: `left_keys[i] = right_keys[i]`.
-    pub fn with_multi_keys(
-        left_keys: Vec<String>,
-        right_keys: Vec<String>,
-    ) -> Self {
+    pub fn with_multi_keys(left_keys: Vec<String>, right_keys: Vec<String>) -> Self {
         Self {
             left_keys,
             right_keys,
@@ -251,12 +255,19 @@ impl HashJoin {
     fn key_indices(batch: &RecordBatch, keys: &[String]) -> ExecResult<Vec<usize>> {
         keys.iter()
             .map(|k| {
-                batch.schema().index_of(k).map_err(|_| ExecError::ColumnNotFound(k.clone()))
+                batch
+                    .schema()
+                    .index_of(k)
+                    .map_err(|_| ExecError::ColumnNotFound(k.clone()))
             })
             .collect()
     }
 
-    fn build_composite_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> ExecResult<CompositeKey> {
+    fn build_composite_key(
+        batch: &RecordBatch,
+        key_indices: &[usize],
+        row: usize,
+    ) -> ExecResult<CompositeKey> {
         let keys: Result<Vec<AggKey>, _> = key_indices
             .iter()
             .map(|&idx| extract_agg_key(batch, idx, row))
@@ -271,7 +282,8 @@ impl HashJoin {
         let right_key_indices = Self::key_indices(right, &self.right_keys)?;
 
         // Build phase.
-        let mut build_map: HashMap<CompositeKey, Vec<u32>> = HashMap::with_capacity(right.num_rows());
+        let mut build_map: HashMap<CompositeKey, Vec<u32>> =
+            HashMap::with_capacity(right.num_rows());
         for row in 0..right.num_rows() {
             let key = Self::build_composite_key(right, &right_key_indices, row)?;
             build_map.entry(key).or_default().push(row as u32);
@@ -591,16 +603,17 @@ fn build_outer_join_batch(
 
     let mut columns: Vec<ArrayRef> = Vec::new();
     for i in 0..left.num_columns() {
-        columns.push(take(left.column(i), &left_idx_arr, None)
-            .map_err(|e| ExecError::Arrow(e.to_string()))?);
+        columns.push(
+            take(left.column(i), &left_idx_arr, None)
+                .map_err(|e| ExecError::Arrow(e.to_string()))?,
+        );
     }
     for (i, f) in right.schema().fields().iter().enumerate() {
         if right_keys.iter().any(|k| k == f.name()) {
             continue;
         }
         let col = right.column(i);
-        let taken = take(col, &right_idx_arr, None)
-            .map_err(|e| ExecError::Arrow(e.to_string()))?;
+        let taken = take(col, &right_idx_arr, None).map_err(|e| ExecError::Arrow(e.to_string()))?;
         // For unmatched left rows, the right column should be null.
         // take returns null for null indices, so we need the right column
         // for matched rows and null for unmatched. We use the mixed indices.

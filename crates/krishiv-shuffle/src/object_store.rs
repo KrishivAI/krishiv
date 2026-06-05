@@ -43,6 +43,43 @@ impl ObjectStoreShuffleStore {
         *blake3::hash(data).as_bytes()
     }
 
+    fn encode_content_hash(hash: &[u8; 32]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in hash {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    fn decode_content_hash(encoded: &[u8]) -> Option<[u8; 32]> {
+        fn nibble(byte: u8) -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        let encoded = match encoded {
+            [body @ .., b'\n'] | [body @ .., b'\r'] => body,
+            body => body,
+        };
+        if encoded.len() != 64 {
+            return None;
+        }
+
+        let mut hash = [0u8; 32];
+        for (idx, chunk) in encoded.chunks_exact(2).enumerate() {
+            let high = nibble(chunk[0])?;
+            let low = nibble(chunk[1])?;
+            hash[idx] = (high << 4) | low;
+        }
+        Some(hash)
+    }
+
     /// Set the IPC compression codec for written partitions.
     pub fn with_compression(mut self, compression: ShuffleCompression) -> Self {
         self.compression = compression;
@@ -60,6 +97,13 @@ impl ObjectStoreShuffleStore {
                 format!("{}/{key}", self.prefix).as_str(),
             ))
         }
+    }
+
+    fn hash_object_path(&self, id: &PartitionId) -> ShuffleResult<object_store::path::Path> {
+        let ipc_path = self.object_path(id)?;
+        Ok(object_store::path::Path::from(
+            format!("{ipc_path}.blake3").as_str(),
+        ))
     }
 
     fn job_prefix(&self, job_id: &str) -> ShuffleResult<object_store::path::Path> {
@@ -164,8 +208,16 @@ impl ShuffleStore for ObjectStoreShuffleStore {
             )
             .await
             .map_err(|e| crate::error::io_err(e.to_string()))?;
+        self.store
+            .put(
+                &self.hash_object_path(&partition.id)?,
+                bytes::Bytes::from(Self::encode_content_hash(&hash)).into(),
+            )
+            .await
+            .map_err(|e| crate::error::io_err(e.to_string()))?;
 
-        // Store byte-level content hash for strict verification on subsequent reads.
+        // Keep an in-process cache, but persisted sidecars are the source of
+        // truth after a reader restart.
         self.content_hashes.insert(key, hash);
         Ok(())
     }
@@ -184,16 +236,48 @@ impl ShuffleStore for ObjectStoreShuffleStore {
                     .await
                     .map_err(|e| crate::error::io_err(e.to_string()))?;
                 let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-                if let Some(stored_ref) = self.content_hashes.get(&key) {
-                    let stored = *stored_ref;
-                    let computed = Self::compute_content_hash(data.as_ref());
-                    if computed != stored {
+                let persisted_hash_path = self.hash_object_path(id)?;
+                let persisted_hash = match self.store.get(&persisted_hash_path).await {
+                    Err(object_store::Error::NotFound { .. }) => {
                         return Err(ShuffleError::ContentHashMismatch {
                             partition: format!("{:?}", key),
-                            expected: format!("{:02x?}", stored),
-                            actual: format!("{:02x?}", computed),
+                            expected: "persisted blake3 sidecar".to_string(),
+                            actual: "missing".to_string(),
                         });
                     }
+                    Err(e) => return Err(crate::error::io_err(e.to_string())),
+                    Ok(hash_obj) => {
+                        let hash_bytes = hash_obj
+                            .bytes()
+                            .await
+                            .map_err(|e| crate::error::io_err(e.to_string()))?;
+                        Self::decode_content_hash(hash_bytes.as_ref()).ok_or_else(|| {
+                            ShuffleError::ContentHashMismatch {
+                                partition: format!("{:?}", key),
+                                expected: "64 lowercase hex blake3 digest".to_string(),
+                                actual: String::from_utf8_lossy(hash_bytes.as_ref()).into_owned(),
+                            }
+                        })?
+                    }
+                };
+
+                if let Some(stored_ref) = self.content_hashes.get(&key)
+                    && *stored_ref != persisted_hash
+                {
+                    return Err(ShuffleError::ContentHashMismatch {
+                        partition: format!("{:?}", key),
+                        expected: Self::encode_content_hash(stored_ref.value()),
+                        actual: Self::encode_content_hash(&persisted_hash),
+                    });
+                }
+
+                let computed = Self::compute_content_hash(data.as_ref());
+                if computed != persisted_hash {
+                    return Err(ShuffleError::ContentHashMismatch {
+                        partition: format!("{:?}", key),
+                        expected: Self::encode_content_hash(&persisted_hash),
+                        actual: Self::encode_content_hash(&computed),
+                    });
                 }
 
                 let cursor = std::io::Cursor::new(data.as_ref());

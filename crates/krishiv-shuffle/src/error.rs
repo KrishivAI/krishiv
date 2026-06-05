@@ -25,6 +25,16 @@ pub enum ShuffleError {
     #[error("shuffle partition limit exceeded: max {limit} partitions")]
     TooManyPartitions { limit: usize },
 
+    /// The in-memory shuffle byte cap was exceeded and no safe spill/admission path exists.
+    #[error(
+        "shuffle memory limit exceeded: max {max_bytes} bytes, current {current_bytes} bytes, incoming {incoming_bytes} bytes"
+    )]
+    MemoryLimitExceeded {
+        max_bytes: usize,
+        current_bytes: usize,
+        incoming_bytes: usize,
+    },
+
     /// An internal `RwLock` was poisoned.
     #[error("shuffle lock poisoned")]
     LockPoisoned,
