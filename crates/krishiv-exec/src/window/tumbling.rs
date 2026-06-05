@@ -88,6 +88,11 @@ impl TumblingWindowOperator {
             namespace,
             &self.accumulators,
             b"tw:",
+        )?;
+        super::state_persistence::persist_operator_watermark_ms(
+            backend,
+            namespace,
+            self.prev_watermark_ms,
         )
     }
 
@@ -99,6 +104,11 @@ impl TumblingWindowOperator {
     ) -> krishiv_state::StateResult<()> {
         self.accumulators =
             super::state_persistence::restore_window_accumulators(backend, namespace, b"tw:")?;
+        if let Some(wm) =
+            super::state_persistence::restore_operator_watermark_ms(backend, namespace)?
+        {
+            self.prev_watermark_ms = wm;
+        }
         Ok(())
     }
 

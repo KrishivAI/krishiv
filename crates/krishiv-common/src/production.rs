@@ -63,6 +63,11 @@ pub fn profile_requires_durable_window_state(profile: DurabilityProfile) -> bool
     )
 }
 
+/// State backends must be file-backed (not ephemeral/in-memory) when this returns true.
+pub fn requires_file_backed_state(profile: DurabilityProfile) -> bool {
+    profile_requires_durable_window_state(profile) || is_production_mode()
+}
+
 /// In-memory simulation connectors (transactional Kafka, etc.) are forbidden.
 pub fn forbids_simulation_connectors(profile: DurabilityProfile) -> bool {
     matches!(
@@ -106,9 +111,34 @@ pub fn allows_alpha_api() -> bool {
     resolve_durability_profile() == DurabilityProfile::DevLocal && !is_production_mode()
 }
 
-/// Fjall `ephemeral()` / `in_memory()` constructors are forbidden for durable profiles.
-pub fn requires_file_backed_state(profile: DurabilityProfile) -> bool {
-    profile_requires_durable_window_state(profile)
+/// Opt-in escape hatch for native scalar UDF execution under durable profiles.
+pub const ALLOW_FULL_PRIVILEGE_UDFS_ENV: &str = "KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS";
+
+fn allows_full_privilege_udfs() -> bool {
+    truthy_env(ALLOW_FULL_PRIVILEGE_UDFS_ENV)
+}
+
+/// Native scalar UDF execution is forbidden under durable profiles unless opted in.
+pub fn profile_forbids_native_scalar_udfs(profile: DurabilityProfile) -> bool {
+    if allows_full_privilege_udfs() {
+        return false;
+    }
+    profile_requires_durable_window_state(profile) || is_production_mode()
+}
+
+/// CREATE FUNCTION stubs (non-SQL languages) are forbidden under durable profiles.
+pub fn profile_forbids_udtf_stubs(profile: DurabilityProfile) -> bool {
+    profile_forbids_native_scalar_udfs(profile)
+}
+
+/// Flight SQL and UI surfaces require API keys under durable profiles.
+pub fn profile_requires_authenticated_flight(profile: DurabilityProfile) -> bool {
+    requires_http_auth(profile)
+}
+
+/// Whether anonymous UI/status HTTP is forbidden.
+pub fn profile_requires_authenticated_ui(profile: DurabilityProfile) -> bool {
+    requires_http_auth(profile)
 }
 
 #[cfg(test)]

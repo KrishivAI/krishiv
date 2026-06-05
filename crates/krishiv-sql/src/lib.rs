@@ -1007,11 +1007,13 @@ impl SqlEngine {
                     std::sync::Arc::new(self.context.clone()),
                 ))
             } else {
-                if krishiv_common::is_production_mode() {
+                if krishiv_common::profile_forbids_udtf_stubs(
+                    krishiv_common::resolve_durability_profile(),
+                ) {
                     return Err(SqlError::DataFusion {
                         message: format!(
-                            "CREATE FUNCTION '{}' with language {:?} is not supported in \
-                             production; only LANGUAGE sql AS '...' table functions are allowed",
+                            "CREATE FUNCTION '{}' with language {:?} is not supported under \
+                             durable profiles; only LANGUAGE sql AS '...' table functions are allowed",
                             ddl.function_name, ddl.language
                         ),
                     });

@@ -435,9 +435,12 @@ impl LeaderElection for K8sLeaseElection {
         if let Some(ref client) = self.client {
             self.k8s_try_acquire(client).await
         } else {
-            if krishiv_common::is_production_mode() {
+            let profile = krishiv_common::resolve_durability_profile();
+            if krishiv_common::profile_requires_durable_window_state(profile)
+                || krishiv_common::is_production_mode()
+            {
                 tracing::error!(
-                    "K8s lease election simulation mode is forbidden in production; \
+                    "K8s lease election simulation mode is forbidden under durable profiles; \
                      attach a kube client via with_kube_client()"
                 );
                 return false;

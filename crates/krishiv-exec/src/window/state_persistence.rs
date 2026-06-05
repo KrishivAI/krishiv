@@ -95,6 +95,9 @@ pub fn restore_window_accumulators(
     let mut restored = HashMap::new();
 
     for key_bytes in backend.list_keys(namespace)? {
+        if key_bytes.len() < 3 || &key_bytes[..3] != key_prefix {
+            continue;
+        }
         let Some(payload) = backend.get(namespace, &key_bytes)? else {
             continue;
         };
@@ -135,6 +138,33 @@ pub fn restore_window_accumulators(
     }
 
     Ok(restored)
+}
+
+/// Persist the operator watermark (monotonic event-time progress) for checkpoint restore.
+pub fn persist_operator_watermark_ms(
+    backend: &mut dyn StateBackend,
+    namespace: &Namespace,
+    watermark_ms: i64,
+) -> StateResult<()> {
+    backend.put(namespace, b"wm:".to_vec(), watermark_ms.to_le_bytes().to_vec())
+}
+
+/// Restore a previously persisted operator watermark, if present.
+pub fn restore_operator_watermark_ms(
+    backend: &dyn StateBackend,
+    namespace: &Namespace,
+) -> StateResult<Option<i64>> {
+    let Some(bytes) = backend.get(namespace, b"wm:")? else {
+        return Ok(None);
+    };
+    if bytes.len() < 8 {
+        return Err(StateError::CorruptEntry {
+            message: format!("watermark entry too short ({} bytes)", bytes.len()),
+        });
+    }
+    Ok(Some(i64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])))
 }
 
 /// Parse a length-prefixed window state key.

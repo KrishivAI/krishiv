@@ -1,5 +1,32 @@
 # Krishiv Implementation Status
 
+## Full Stabilization Waves 1–4 (2026-06-05)
+
+Implemented Waves 1–4 on branch `cursor/full-stabilization-dd55` (continues PR #59):
+
+### Wave 1 — Shuffle leases & wiring
+- Durable shuffle lease sidecars (`.lease` / object-store sidecars) with monotonic validation and restart tests.
+- `open_shuffle_backend_from_uri` for `file://`, `s3://`, `memory://`.
+- Executor `--shuffle-uri` / `KRISHIV_SHUFFLE_URI` wired for distributed-durable object-store shuffle.
+- Profile-aware UDF guards in `krishiv-udf`, `krishiv-sql` (`sync_scalar_udfs` / `sync_aggregate_udfs`), `krishiv-api` session registration, and CREATE FUNCTION stubs.
+
+### Wave 2 — CEP partial state
+- `CepOperator::persist_to_state` / `restore_from_state` plus JSON snapshot helpers for checkpoint metadata.
+
+### Wave 3–4 — Observability & profile guards
+- `GET /api/v1/jobs/{job_id}/diagnose` returns structured `ObservabilityReport`.
+- `inc_checkpoint_committed` metrics on checkpoint quorum (sync) and finalize (async).
+- Window operator watermark persistence across tumbling/sliding/session restore paths.
+- Flight SQL, UI, and K8s lease simulation guards use durability-profile helpers (not production-only).
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test --workspace --lib --no-fail-fast --exclude krishiv-python
+```
+
+---
+
 ## Full Stabilization Wave 0 (2026-06-05)
 
 Implemented Wave 0 P0 fixes on branch `cursor/full-stabilization-dd55`:

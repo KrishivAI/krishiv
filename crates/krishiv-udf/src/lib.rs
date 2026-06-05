@@ -1257,13 +1257,13 @@ impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
         batch: &RecordBatch,
         limits: &ResourceLimits,
     ) -> Result<ArrayRef, UdfError> {
-        if krishiv_common::is_production_mode()
-            && !allows_full_privilege_udfs()
-        {
+        if krishiv_common::profile_forbids_native_scalar_udfs(
+            krishiv_common::resolve_durability_profile(),
+        ) {
             return Err(UdfError::Execution {
                 message: String::from(
-                    "native UDF execution runs with full process privileges; in production use \
-                     LANGUAGE sql UDFs or set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1",
+                    "native UDF execution runs with full process privileges; under durable \
+                     profiles use LANGUAGE sql UDFs or set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1",
                 ),
             });
         }

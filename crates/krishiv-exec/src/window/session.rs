@@ -110,7 +110,11 @@ impl SessionWindowOperator {
             .map(|(k, v)| (op_id, name, k.as_slice(), v.as_slice()))
             .collect();
         backend.put_batch(&batch_entries)?;
-        Ok(())
+        super::state_persistence::persist_operator_watermark_ms(
+            backend,
+            namespace,
+            self.prev_watermark_ms,
+        )
     }
 
     /// Restore open sessions from `StateBackend`.
@@ -121,6 +125,9 @@ impl SessionWindowOperator {
     ) -> StateResult<()> {
         let mut restored = HashMap::new();
         for key_bytes in backend.list_keys(namespace)? {
+            if key_bytes.len() < 4 || &key_bytes[..4] != b"ses:" {
+                continue;
+            }
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
                 continue;
             };
@@ -163,6 +170,11 @@ impl SessionWindowOperator {
             }
         }
         self.sessions = restored;
+        if let Some(wm) =
+            super::state_persistence::restore_operator_watermark_ms(backend, namespace)?
+        {
+            self.prev_watermark_ms = wm;
+        }
         Ok(())
     }
 

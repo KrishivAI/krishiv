@@ -130,9 +130,11 @@ impl KrishivFlightSqlService {
     #[allow(clippy::result_large_err)]
     fn authenticate_request<B>(&self, req: &Request<B>) -> Result<Option<Principal>, Status> {
         let Some(auth) = &self.auth else {
-            if krishiv_common::is_production_mode() {
+            if krishiv_common::profile_requires_authenticated_flight(
+                krishiv_common::resolve_durability_profile(),
+            ) {
                 return Err(Status::unauthenticated(
-                    "Flight SQL auth is required in production mode; configure KRISHIV_API_KEYS",
+                    "Flight SQL auth is required under durable profiles; configure KRISHIV_API_KEYS",
                 ));
             }
             return Ok(None);
@@ -251,9 +253,11 @@ impl FlightSqlService for KrishivFlightSqlService {
     > {
         if self.auth.is_some() {
             self.authenticate_request(&request)?;
-        } else if krishiv_common::is_production_mode() {
+        } else if krishiv_common::profile_requires_authenticated_flight(
+            krishiv_common::resolve_durability_profile(),
+        ) {
             return Err(Status::unauthenticated(
-                "Flight SQL auth is required in production mode; configure KRISHIV_API_KEYS",
+                "Flight SQL auth is required under durable profiles; configure KRISHIV_API_KEYS",
             ));
         }
         let resp = HandshakeResponse {
@@ -755,7 +759,9 @@ fn configure_flight_auth_from_env(
         Ok(Some(auth)) => service.with_auth(auth),
         Ok(None) => service,
         Err(message) => {
-            if krishiv_common::is_production_mode() {
+            if krishiv_common::profile_requires_authenticated_flight(
+                krishiv_common::resolve_durability_profile(),
+            ) {
                 panic!("{message}");
             }
             eprintln!("krishiv-flight-sql: {message}; serving anonymously (dev only)");
@@ -767,9 +773,11 @@ fn configure_flight_auth_from_env(
 fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
     let raw = match std::env::var("KRISHIV_API_KEYS") {
         Ok(v) if !v.trim().is_empty() => v,
-        _ if krishiv_common::is_production_mode() => {
+        _ if krishiv_common::profile_requires_authenticated_flight(
+            krishiv_common::resolve_durability_profile(),
+        ) => {
             return Err(String::from(
-                "KRISHIV_API_KEYS is required in production mode (format: key1=user:reader,...)",
+                "KRISHIV_API_KEYS is required under durable profiles (format: key1=user:reader,...)",
             ));
         }
         _ => return Ok(None),

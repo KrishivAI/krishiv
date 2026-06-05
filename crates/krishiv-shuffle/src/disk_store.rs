@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 /// A local-disk shuffle store that serialises partitions to Parquet files.
 ///
 /// Each partition is written to `{base_dir}/{job_id}/{stage_id}/{partition}.parquet`.
-/// Lease tokens are tracked in memory; they survive the process only as long as
-/// the store object is alive.
+/// Lease tokens are persisted to `{partition}.lease` sidecars so zombie writers
+/// are rejected after executor restart.
 pub struct LocalDiskShuffleStore {
     base_dir: PathBuf,
     lease_tokens: LeaseMap,
@@ -131,6 +131,70 @@ impl LocalDiskShuffleStore {
         path.push(".blake3");
         Ok(PathBuf::from(path))
     }
+
+    fn partition_lease_path(&self, id: &PartitionId) -> ShuffleResult<PathBuf> {
+        crate::validate_safe_id(&id.job_id, "job_id")?;
+        crate::validate_safe_id(&id.stage_id, "stage_id")?;
+        Ok(self
+            .base_dir
+            .join(&id.job_id)
+            .join(&id.stage_id)
+            .join(format!("{}.lease", id.partition)))
+    }
+
+    fn load_persisted_lease(&self, id: &PartitionId) -> ShuffleResult<Option<u64>> {
+        let path = self.partition_lease_path(id)?;
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err(format!(
+                "failed to read shuffle lease file '{}': {e}",
+                path.display()
+            ))),
+            Ok(bytes) => crate::lease_persistence::decode_lease_token(&bytes)
+                .ok_or_else(|| {
+                    io_err(format!(
+                        "invalid shuffle lease file '{}'",
+                        path.display()
+                    ))
+                })
+                .map(Some),
+        }
+    }
+
+    fn persist_lease(&self, id: &PartitionId, token: u64) -> ShuffleResult<()> {
+        let path = self.partition_lease_path(id)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                io_err(format!(
+                    "failed to create shuffle lease dir '{}': {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        std::fs::write(&path, crate::lease_persistence::encode_lease_token(token)).map_err(|e| {
+            io_err(format!(
+                "failed to write shuffle lease file '{}': {e}",
+                path.display()
+            ))
+        })
+    }
+
+    fn resolve_lease_token(
+        &self,
+        id: &PartitionId,
+        incoming: u64,
+    ) -> ShuffleResult<u64> {
+        let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
+        let memory = shuffle_write_lock(&self.lease_tokens)?
+            .get(&key)
+            .copied();
+        let persisted = self.load_persisted_lease(id)?;
+        let current = memory.or(persisted);
+        let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;
+        shuffle_write_lock(&self.lease_tokens)?.insert(key, next);
+        self.persist_lease(id, next)?;
+        Ok(next)
+    }
 }
 
 impl ShuffleStore for LocalDiskShuffleStore {
@@ -141,17 +205,7 @@ impl ShuffleStore for LocalDiskShuffleStore {
     ) -> ShuffleResult<()> {
         crate::validate_safe_id(&id.job_id, "job_id")?;
         crate::validate_safe_id(&id.stage_id, "stage_id")?;
-        let key = (id.job_id, id.stage_id, id.partition);
-        let mut leases = shuffle_write_lock(&self.lease_tokens)?;
-        if let Some(&expected) = leases.get(&key)
-            && lease_token < expected
-        {
-            return Err(ShuffleError::StaleLeaseToken {
-                expected,
-                actual: lease_token,
-            });
-        }
-        leases.insert(key, lease_token);
+        let _ = self.resolve_lease_token(&id, lease_token)?;
         Ok(())
     }
 
@@ -180,26 +234,9 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // path only if the token in the map still matches (phase 2).  If a newer
         // writer has meanwhile advanced the token past ours, we discard the temp.
         //
-        // Phase 1: validate initial token and advance it.
+        // Phase 1: validate initial token and advance it (persisted + in-memory).
         {
-            let mut tokens = shuffle_write_lock(&self.lease_tokens)?;
-            if let Some(&expected) = tokens.get(&key) {
-                // P1.25: use `<` (monotonic-token semantics) — reject stale writes,
-                // accept equal or newer tokens.
-                if lease_token < expected {
-                    return Err(ShuffleError::StaleLeaseToken {
-                        expected,
-                        actual: lease_token,
-                    });
-                }
-                // Advance the stored token so a zombie with the previous token
-                // cannot win a race by writing before the replacement arrives.
-                tokens.insert(key.clone(), lease_token);
-            } else {
-                // Compatibility path for direct single-attempt writes: the first
-                // writer establishes the expected token for this partition.
-                tokens.insert(key.clone(), lease_token);
-            }
+            let _ = self.resolve_lease_token(&partition.id, lease_token)?;
         }
 
         let final_path = self.partition_path(&partition.id)?;

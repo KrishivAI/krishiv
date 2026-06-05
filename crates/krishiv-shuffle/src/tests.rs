@@ -1521,6 +1521,82 @@ mod shuffle_tests {
     }
 
     #[tokio::test]
+    async fn object_store_shuffle_restart_rejects_stale_lease() {
+        let inner = Arc::new(InMemory::new());
+        let writer = ObjectStoreShuffleStore::new(inner.clone(), "shuffle-lease-restart");
+        let partition = make_object_store_partition("job-lease-restart", "s0", 0);
+        let id = partition.id.clone();
+
+        writer.register_partition_lease(id.clone(), 9).await.unwrap();
+        writer.write_partition(partition, 9).await.unwrap();
+
+        let restarted = ObjectStoreShuffleStore::new(inner, "shuffle-lease-restart");
+        let err = restarted
+            .write_partition(make_object_store_partition("job-lease-restart", "s0", 0), 8)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShuffleError::StaleLeaseToken {
+                    expected: 9,
+                    actual: 8
+                }
+            ),
+            "expected stale lease after restart, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_store_restart_rejects_stale_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let partition = ShufflePartition {
+            id: PartitionId {
+                job_id: "job-disk-lease".to_owned(),
+                stage_id: "s0".to_owned(),
+                partition: 0,
+            },
+            schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            batches: vec![RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap()],
+        };
+        let id = partition.id.clone();
+        writer.register_partition_lease(id.clone(), 9).await.unwrap();
+        writer.write_partition(partition, 9).await.unwrap();
+
+        let restarted = LocalDiskShuffleStore::new(dir.path()).unwrap();
+        let err = restarted
+            .write_partition(
+                ShufflePartition {
+                    id: id.clone(),
+                    schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                    batches: vec![RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                        vec![Arc::new(Int32Array::from(vec![2]))],
+                    )
+                    .unwrap()],
+                },
+                8,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShuffleError::StaleLeaseToken {
+                    expected: 9,
+                    actual: 8
+                }
+            ),
+            "expected stale lease after disk restart, got {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn disk_store_cleanup_temp_files_on_startup() {
         let dir = tempfile::tempdir().unwrap();
         let job_dir = dir.path().join("job1").join("s0");
