@@ -1,4 +1,4 @@
-//! Apply coordinator LLM throttle commands to the process-level rate limiter (R17 S4.4).
+//! Apply coordinator LLM throttle commands to the process-level rate limiter.
 
 use krishiv_ai::{LlmRateLimiter, RateLimitConfig};
 
@@ -11,8 +11,27 @@ pub fn apply_llm_throttle(model: &str, max_requests_per_minute: u32, max_tokens_
             tokens_per_minute: max_tokens_per_minute,
         },
     );
-    if let Ok(mut guard) = limiter.try_lock() {
-        guard.apply_throttle(max_requests_per_minute, max_tokens_per_minute);
+    let mut attempts = 0u8;
+    loop {
+        match limiter.try_lock() {
+            Ok(mut guard) => {
+                guard.apply_throttle(max_requests_per_minute, max_tokens_per_minute);
+                return;
+            }
+            Err(_) if attempts < 5 => {
+                attempts += 1;
+                std::thread::yield_now();
+            }
+            Err(_) => {
+                tracing::warn!(
+                    model,
+                    max_requests_per_minute,
+                    max_tokens_per_minute,
+                    "llm throttle command dropped: rate limiter locked after retries"
+                );
+                return;
+            }
+        }
     }
 }
 

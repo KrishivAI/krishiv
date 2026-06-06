@@ -285,7 +285,7 @@ impl ExecutorTaskOutput {
         }
     }
 
-    /// Output from a R5.1 streaming window aggregation task.
+    /// Output from a streaming window aggregation task (tumbling, sliding, or session).
     pub(crate) fn streaming_window(
         row_count: usize,
         batch_count: usize,
@@ -397,7 +397,7 @@ pub enum ExecutorTaskOutputKind {
     Cancelled,
     /// Shuffle write: hash-partitioned batches written to the local shuffle store.
     ShuffleWrite,
-    /// R5.1 streaming tumbling-window aggregation output.
+    /// Streaming window aggregation output (tumbling, sliding, or session).
     StreamingWindow,
 }
 
@@ -581,7 +581,7 @@ impl TaskRunner {
     }
 }
 
-/// Drains output from a long-running continuous streaming job (R5.2).
+/// Drains output from a long-running continuous streaming job.
 pub trait ContinuousJobDrainer: Send + Sync {
     /// Process pending input for `job_id` and return newly emitted batches.
     fn drain_job(&self, job_id: &str) -> Result<Vec<RecordBatch>, String>;

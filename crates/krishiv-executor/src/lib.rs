@@ -32,8 +32,8 @@ pub use execution_model::ExecutionModel;
 // Re-exports of barrier, runner, transport, and grpc types.
 pub use barrier_grpc::{ExecutorBarrierService, executor_barrier_grpc_server};
 pub use barrier_transport::{
-    BarrierInjector, SharedBarrierAckRegistry, SharedBarrierInjector, SharedKeyGroupRanges,
-    make_checkpoint_barrier,
+    BarrierInjector, BarrierSource, SharedBarrierAckRegistry, SharedBarrierInjector,
+    SharedKeyGroupRanges, make_checkpoint_barrier,
 };
 pub use grpc::{
     ExecutorTaskAuthConfig, ExecutorTaskGrpcService, ExecutorTaskInboxService,

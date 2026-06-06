@@ -1,4 +1,4 @@
-//! Pooled gRPC client for coordinator RPCs (GAP-C3, B7).
+//! Pooled gRPC client for coordinator RPCs.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +12,7 @@ pub const COORDINATOR_BEARER_TOKEN_ENV: &str = "KRISHIV_COORDINATOR_BEARER_TOKEN
 /// Shared, atomically-updated lease generation handle.  The executor binary
 /// owns one of these for the entire process; every component that sends a
 /// coordinator RPC reads the live generation from it before transmitting so
-/// retries after a lease bump cannot ship a stale lease (B7/B8/F1).
+/// retries after a lease bump cannot ship a stale lease.
 #[derive(Debug, Clone)]
 pub struct SharedLeaseGeneration {
     inner: Arc<AtomicU64>,
@@ -129,14 +129,11 @@ impl CoordinatorGrpcPool {
     }
 
     pub async fn client(&self) -> Result<InterceptedCoordinatorClient, tonic::transport::Error> {
-        // Double-check pattern: lock, check, unlock, connect, re-lock, store.
-        {
-            let guard = self.client.lock().await;
-            if let Some(client) = guard.as_ref() {
-                return Ok(client.clone());
-            }
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
         }
-        // Lock released — connect without holding the mutex.
+        // Connect while holding the lock — prevents concurrent duplicate connects.
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())?
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
@@ -151,11 +148,6 @@ impl CoordinatorGrpcPool {
                 inject_coordinator_request_context
                     as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
             );
-        // Re-lock and store if still empty (another task may have connected first).
-        let mut guard = self.client.lock().await;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(existing.clone());
-        }
         *guard = Some(client.clone());
         Ok(client)
     }

@@ -74,10 +74,7 @@ pub struct ExecutorConfig {
     lease_generation: LeaseGeneration,
     task_endpoint: Option<String>,
     barrier_endpoint: Option<String>,
-    /// Optional shared progress buffer for streaming tasks (GAP-OB-04).
-    /// The heartbeat loop sets this; Runner tasks write streaming progress
-    /// snapshots into it, and heartbeat_request() drains and reports them.
-    pub(crate) progress_buffer:
+    progress_buffer:
         Option<Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>>,
 }
 
@@ -133,7 +130,7 @@ impl ExecutorConfig {
         self
     }
 
-    /// Attach a shared streaming progress buffer (GAP-OB-04).
+    /// Attach a shared streaming progress buffer (builder form).
     #[must_use]
     pub fn with_progress_buffer(
         mut self,
@@ -141,6 +138,14 @@ impl ExecutorConfig {
     ) -> Self {
         self.progress_buffer = Some(buffer);
         self
+    }
+
+    /// Attach a shared streaming progress buffer (setter form, for post-construction wiring).
+    pub fn set_progress_buffer(
+        &mut self,
+        buffer: Arc<dashmap::DashMap<String, krishiv_proto::StreamingProgressReport>>,
+    ) {
+        self.progress_buffer = Some(buffer);
     }
 
     /// Executor id.

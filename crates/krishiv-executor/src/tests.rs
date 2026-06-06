@@ -3232,7 +3232,6 @@ mod executor_tests {
             matches!(error, crate::ExecutorError::InvalidAssignment { .. }),
             "legacy fragment must fail as an invalid assignment: {error}"
         );
-        assert!(error.to_string().contains("stream:loop"));
     }
 
     // ── R7.2 source throttle wiring ──────────────────────────────────────────

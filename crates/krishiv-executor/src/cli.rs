@@ -214,7 +214,7 @@ async fn heartbeat_loop(
 ) -> crate::ExecutorResult<()> {
     // Bind task/barrier listeners FIRST so the *first* register advertises real
     // endpoints — avoids the double-register race that previously bumped the
-    // lease before the loop could observe it (B8).
+    // lease before the loop could observe it.
     let inbox = ExecutorAssignmentInbox::new();
     let task_listener = if let Some(addr) = task_grpc_addr {
         Some(
@@ -285,6 +285,7 @@ async fn heartbeat_loop(
             barrier_injector.clone(),
             runtime.config().executor_id().as_str(),
         )
+        .with_state_backend_kind("fjall")
         .with_key_group_ranges(key_group_ranges.clone())
         .with_ack_registry(barrier_ack_registry.clone())
         .with_auth_config(task_auth);
@@ -311,7 +312,7 @@ async fn heartbeat_loop(
     );
 
     // Shuffle store: required for `shuffle-write:` fragments and for streaming
-    // operators that exchange partitions between executors (B5).
+    // operators that exchange partitions between executors.
     let running_attempts: Arc<DashMap<String, TaskAttemptRef>> = Arc::new(DashMap::new());
     runtime.set_running_attempts(running_attempts.clone());
     let mut runner_builder = ExecutorTaskRunner::new(inbox.clone())
@@ -406,12 +407,14 @@ async fn heartbeat_loop(
 
     // Wire the progress buffer into the executor transport config so
     // heartbeat_request() drains and reports snapshots to the coordinator.
-    runtime.config_mut().progress_buffer = Some(Arc::clone(&progress_buffer));
+    runtime
+        .config_mut()
+        .set_progress_buffer(Arc::clone(&progress_buffer));
 
     let runner = Arc::new(runner_builder);
 
-    // Spawn `slots` concurrent runner tasks all reading from the same inbox
-    // (B6): without this the executor processes one task at a time regardless
+    // Spawn `slots` concurrent runner tasks all reading from the same inbox;
+    // without this the executor processes one task at a time regardless
     // of the advertised slot count.
     let shutdown = Arc::new(AtomicBool::new(false));
     let effective_slots = slots.max(1);
@@ -477,7 +480,7 @@ async fn heartbeat_loop(
                             heartbeat.disposition(),
                             heartbeat.message().unwrap_or("")
                         );
-                        // F1: if the coordinator reports our lease is stale (or we are
+                        // If the coordinator reports our lease is stale (or we are
                         // unknown to it), re-register.  This is the steady-state
                         // recovery path that allows an executor to survive a
                         // coordinator restart or a transient lease bump.
@@ -586,12 +589,12 @@ struct ExecutorCliConfig {
     mode: ExecutorMode,
     heartbeat_interval_secs: u64,
     http_addr: Option<SocketAddr>,
-    /// GAP-CP-09: Address for the executor task gRPC server.
+    /// Address for the executor task gRPC server.
     task_grpc_addr: Option<SocketAddr>,
-    /// BarrierService gRPC listen address (WS-4).
+    /// BarrierService gRPC listen address.
     barrier_grpc_addr: Option<SocketAddr>,
     /// Local on-disk shuffle store directory; if set, the shuffle Flight
-    /// server is started and the runner is wired for `shuffle-write:` fragments (B5).
+    /// server is started and the runner is wired for `shuffle-write:` fragments.
     shuffle_dir: Option<std::path::PathBuf>,
     /// Shuffle storage URI (`file://`, `s3://`, `memory://`). Takes precedence over `--shuffle-dir`.
     /// Reads `KRISHIV_SHUFFLE_URI`.
@@ -777,7 +780,7 @@ impl ExecutorCliConfig {
         // Pre-populate task and barrier endpoints so that the FIRST register
         // call advertises real endpoints; the binary will rewrite them after
         // binding listeners (which use kernel-chosen ports if 0).  This avoids
-        // the lease-bumping double-register race documented in B8.
+        // the lease-bumping double-register race.
         let mut cfg = ExecutorConfig::new(
             self.executor_id,
             self.host,
@@ -1303,8 +1306,6 @@ mod tests {
         assert!(err.to_string().contains("unknown option"));
     }
 }
-
-// ── Progress buffer callback (GAP-OB-04) ────────────────────────────────────
 
 /// Bridges streaming progress snapshots from runner tasks to the heartbeat loop
 /// via a shared DashMap. Runner tasks write progress; the heartbeat loop drains
