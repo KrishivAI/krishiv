@@ -39,11 +39,9 @@ pub enum ExecutorError {
     #[error("local stage fragment execution failed: {message}")]
     LocalExecution { message: String },
 
-    /// A streaming task fragment was submitted but the streaming runner is not
-    /// yet implemented.
-    #[error(
-        "streaming task runner not yet implemented; available in R5 (fragment must not use the 'stream:' prefix until R5.1)"
-    )]
+    /// A streaming task fragment was submitted but streaming execution is not
+    /// available on this executor configuration.
+    #[error("streaming execution not available on this executor configuration")]
     StreamingNotImplemented,
 }
 
@@ -106,8 +104,8 @@ mod tests {
     #[test]
     fn error_display_streaming_not_implemented() {
         let err = ExecutorError::StreamingNotImplemented;
-        assert!(err.to_string().contains("streaming task runner"));
-        assert!(err.to_string().contains("R5"));
+        assert!(err.to_string().contains("streaming execution"));
+        assert!(!err.to_string().contains("R5"));
     }
 
     #[test]

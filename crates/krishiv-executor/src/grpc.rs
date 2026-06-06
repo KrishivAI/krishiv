@@ -94,17 +94,6 @@ impl ExecutorTaskAuthConfig {
         Ok(())
     }
 
-    fn required_bearer_token(&self) -> Option<String> {
-        self.bearer_token.clone()
-    }
-
-    fn misconfiguration_message(&self) -> Option<String> {
-        (self.require_auth && self.bearer_token.is_none()).then(|| {
-            format!(
-                "{REQUIRE_EXECUTOR_TASK_AUTH_ENV}=true requires non-empty {EXECUTOR_TASK_BEARER_TOKEN_ENV}"
-            )
-        })
-    }
 }
 
 fn parse_bool_env(name: &str) -> bool {
@@ -193,34 +182,28 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
 
     async fn push_continuous_input(
         &self,
-        request: tonic::Request<krishiv_proto::task::PushContinuousInputRequest>,
+        _request: tonic::Request<krishiv_proto::task::PushContinuousInputRequest>,
     ) -> Result<tonic::Response<TaskStatusResponse>, tonic::Status> {
-        let _request = request.into_inner();
-        // Continuous input is not routed through the executor gRPC endpoint.
-        // In embedded mode input is pushed via ContinuousStreamRegistry directly;
-        // in distributed mode the coordinator delivers batches as InlineIpc in task
-        // assignments. This endpoint satisfies the proto interface but is never called.
-        Ok(tonic::Response::new(
-            TaskStatusResponse::new(TransportDisposition::Rejected).with_message(
-                "continuous input must be delivered via coordinator task assignments or Flight SQL",
-            ),
+        tracing::warn!(
+            "push_continuous_input is not routed through executor gRPC; \
+             use coordinator task assignments"
+        );
+        Err(tonic::Status::unimplemented(
+            "continuous input must be delivered via coordinator task assignments or Flight SQL",
         ))
     }
 
     async fn drain_continuous_output(
         &self,
-        request: tonic::Request<krishiv_proto::task::DrainContinuousOutputRequest>,
+        _request: tonic::Request<krishiv_proto::task::DrainContinuousOutputRequest>,
     ) -> Result<tonic::Response<krishiv_proto::task::DrainContinuousOutputResponse>, tonic::Status>
     {
-        let _request = request.into_inner();
-        // Output is returned via the coordinator's task-result path, not polled from
-        // the executor directly. Satisfies the proto interface; never called in practice.
-        Ok(tonic::Response::new(
-            krishiv_proto::task::DrainContinuousOutputResponse {
-                version: TransportVersion::CURRENT,
-                disposition: TransportDisposition::Rejected,
-                ipc_bytes: vec![],
-            },
+        tracing::warn!(
+            "drain_continuous_output is not routed through executor gRPC; \
+             output is returned via coordinator task-result path"
+        );
+        Err(tonic::Status::unimplemented(
+            "output is returned via the coordinator task-result path, not polled from the executor",
         ))
     }
 }
@@ -241,10 +224,16 @@ impl ExecutorTaskGrpcService {
 
     /// Create a networked executor task service with explicit auth config.
     pub fn with_auth_config(inbox: ExecutorAssignmentInbox, auth: ExecutorTaskAuthConfig) -> Self {
+        let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
+            format!(
+                "{REQUIRE_EXECUTOR_TASK_AUTH_ENV}=true requires non-empty \
+                 {EXECUTOR_TASK_BEARER_TOKEN_ENV}"
+            )
+        });
         Self {
             inner: ExecutorTaskInboxService::new(inbox),
-            required_bearer_token: auth.required_bearer_token(),
-            auth_misconfiguration: auth.misconfiguration_message(),
+            required_bearer_token: auth.bearer_token().map(ToOwned::to_owned),
+            auth_misconfiguration,
         }
     }
 

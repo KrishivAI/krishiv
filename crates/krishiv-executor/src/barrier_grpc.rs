@@ -1,4 +1,4 @@
-//! Executor-side `BarrierService` gRPC server (R16 S1.2–S1.4).
+//! Executor-side `BarrierService` gRPC server.
 
 use std::time::Duration;
 
@@ -28,8 +28,10 @@ pub struct ExecutorBarrierService {
     pub auth_config: Option<ExecutorTaskAuthConfig>,
     /// Checkpoint URI to use in barrier acknowledgements (e.g. "file:///tmp/krishiv-checkpoints").
     pub checkpoint_uri: Option<String>,
-    /// State backend kind ("redb", "rocksdb", etc.).
+    /// State backend kind ("fjall", "rocksdb", etc.).
     pub state_backend_kind: String,
+    /// How long to wait for a checkpoint to complete before returning deadline_exceeded.
+    pub checkpoint_timeout_secs: u64,
 }
 
 impl ExecutorBarrierService {
@@ -43,8 +45,23 @@ impl ExecutorBarrierService {
             key_group_ranges: SharedKeyGroupRanges::new(),
             auth_config: None,
             checkpoint_uri: None,
-            state_backend_kind: "redb".into(),
+            state_backend_kind: String::new(),
+            checkpoint_timeout_secs: 120,
         }
+    }
+
+    /// Set the state backend kind reported in barrier acks (e.g. `"fjall"`, `"rocksdb"`).
+    #[must_use]
+    pub fn with_state_backend_kind(mut self, kind: impl Into<String>) -> Self {
+        self.state_backend_kind = kind.into();
+        self
+    }
+
+    /// Override the checkpoint completion timeout (default: 120 s).
+    #[must_use]
+    pub fn with_checkpoint_timeout_secs(mut self, secs: u64) -> Self {
+        self.checkpoint_timeout_secs = secs;
+        self
     }
 
     /// Require bearer-token auth matching the task gRPC auth config.
@@ -130,13 +147,18 @@ impl BarrierService for ExecutorBarrierService {
         let ack_registry = self.ack_registry.clone();
         let task_id = self.task_id.clone();
         let state_backend_kind = self.state_backend_kind.clone();
+        let checkpoint_timeout_secs = self.checkpoint_timeout_secs;
         tokio::spawn(async move {
             while let Ok(Some(barrier)) = inbound.message().await {
                 injector.enqueue(barrier.clone());
                 let ack_task_id = task_id_from_checkpoint_id(&barrier.checkpoint_id)
                     .unwrap_or_else(|| task_id.clone());
                 let completion_rx = ack_registry.register_wait(&barrier.job_id, barrier.epoch);
-                let ack = match tokio::time::timeout(Duration::from_secs(120), completion_rx).await
+                let ack = match tokio::time::timeout(
+                    Duration::from_secs(checkpoint_timeout_secs),
+                    completion_rx,
+                )
+                .await
                 {
                     Ok(Ok(completion)) => Ok(BarrierAck {
                         epoch: barrier.epoch,

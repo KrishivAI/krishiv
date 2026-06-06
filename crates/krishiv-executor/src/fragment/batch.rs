@@ -7,7 +7,6 @@ use std::sync::Arc;
 use krishiv_proto::{ExecutorTaskAssignment, TaskRuntimeStats};
 #[cfg(feature = "kafka")]
 use krishiv_proto::{InputPartitionDescriptor, OutputContract, OutputContractDescriptor};
-use krishiv_sql::SqlEngine;
 use krishiv_udf::ResourceLimits;
 
 use super::common::{
@@ -18,6 +17,52 @@ use super::common::{
 use crate::runner::{
     ExecutorTaskOutput, ExecutorTaskRunner, OBJECT_PARQUET_SINK_PREFIX, SHUFFLE_WRITE_PREFIX,
 };
+
+/// Register all input partitions from an assignment onto a SQL engine.
+async fn load_input_tables(
+    engine: &Arc<krishiv_sql::SqlEngine>,
+    assignment: &krishiv_proto::ExecutorTaskAssignment,
+) -> crate::ExecutorResult<()> {
+    for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
+        engine
+            .register_parquet(partition.table_name(), partition.path())
+            .await
+            .map_err(|e| crate::ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    for (table_name, batches) in
+        read_connector_parquet_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| crate::ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    for (table_name, batches) in
+        read_object_parquet_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| crate::ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    for (table_name, batches) in
+        read_shuffle_flight_partitions(assignment.input_partitions()).await?
+    {
+        engine
+            .register_record_batches(&table_name, batches)
+            .await
+            .map_err(|e| crate::ExecutorError::LocalExecution {
+                message: e.to_string(),
+            })?;
+    }
+    Ok(())
+}
 #[cfg(feature = "kafka")]
 use crate::runner::{
     KAFKA_TO_PARQUET_FRAGMENT, MEMORY_KAFKA_PARTITION_PREFIX, PARQUET_SINK_PREFIX,
@@ -66,7 +111,6 @@ pub(crate) async fn execute_batch_fragment(
     if let Some(shuffle_spec) = fragment.strip_prefix(SHUFFLE_WRITE_PREFIX) {
         if let Some(ctx) = &runner.shuffle {
             return execute_shuffle_write_fragment(
-                Arc::clone(&runner.sql_engine),
                 assignment,
                 shuffle_spec,
                 ctx,
@@ -86,7 +130,6 @@ pub(crate) async fn execute_batch_fragment(
     if let Some(write_cfg) = assignment.shuffle_write() {
         if let Some(store) = &runner.inmem_shuffle {
             return execute_inmem_shuffle_write(
-                Arc::clone(&runner.sql_engine),
                 assignment,
                 write_cfg,
                 store,
@@ -285,7 +328,6 @@ async fn execute_window_fragment(
 
 /// Execute a `shuffle-write:hash:<key_column>:<num_partitions>` fragment.
 async fn execute_shuffle_write_fragment(
-    _engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     spec: &str,
     ctx: &crate::runner::ShuffleContext,
@@ -333,45 +375,7 @@ async fn execute_shuffle_write_fragment(
 
     // Create a new SQL engine with UDF limits for this task execution.
     let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
-
-    for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
-        limited_engine
-            .register_parquet(partition.table_name(), partition.path())
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: e.to_string(),
-            })?;
-    }
-    for (table_name, batches) in
-        read_connector_parquet_partitions(assignment.input_partitions()).await?
-    {
-        limited_engine
-            .register_record_batches(&table_name, batches)
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: e.to_string(),
-            })?;
-    }
-    for (table_name, batches) in
-        read_object_parquet_partitions(assignment.input_partitions()).await?
-    {
-        limited_engine
-            .register_record_batches(&table_name, batches)
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: e.to_string(),
-            })?;
-    }
-    for (table_name, batches) in
-        read_shuffle_flight_partitions(assignment.input_partitions()).await?
-    {
-        limited_engine
-            .register_record_batches(&table_name, batches)
-            .await
-            .map_err(|e| ExecutorError::LocalExecution {
-                message: e.to_string(),
-            })?;
-    }
+    load_input_tables(&limited_engine, assignment).await?;
 
     let dataframe = limited_engine
         .sql(query)
@@ -469,7 +473,6 @@ async fn execute_shuffle_write_fragment(
 
 /// Execute a typed R4a shuffle-write task backed by `InMemoryShuffleStore`.
 async fn execute_inmem_shuffle_write(
-    _engine: Arc<SqlEngine>,
     assignment: &ExecutorTaskAssignment,
     write_cfg: &krishiv_proto::ShuffleWriteConfig,
     store: &std::sync::Arc<krishiv_shuffle::ShuffleBackend>,
@@ -481,44 +484,7 @@ async fn execute_inmem_shuffle_write(
     // Create a new SQL engine with UDF limits for this task execution.
     let limited_engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
     let batches = if let Some(query) = sql_query_from_fragment(&fragment_body) {
-        for partition in parse_local_parquet_partitions(assignment.input_partitions())? {
-            limited_engine
-                .register_parquet(partition.table_name(), partition.path())
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: e.to_string(),
-                })?;
-        }
-        for (table_name, tbl_batches) in
-            read_connector_parquet_partitions(assignment.input_partitions()).await?
-        {
-            limited_engine
-                .register_record_batches(&table_name, tbl_batches)
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: e.to_string(),
-                })?;
-        }
-        for (table_name, tbl_batches) in
-            read_object_parquet_partitions(assignment.input_partitions()).await?
-        {
-            limited_engine
-                .register_record_batches(&table_name, tbl_batches)
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: e.to_string(),
-                })?;
-        }
-        for (table_name, tbl_batches) in
-            read_shuffle_flight_partitions(assignment.input_partitions()).await?
-        {
-            limited_engine
-                .register_record_batches(&table_name, tbl_batches)
-                .await
-                .map_err(|e| ExecutorError::LocalExecution {
-                    message: e.to_string(),
-                })?;
-        }
+        load_input_tables(&limited_engine, assignment).await?;
         let dataframe =
             limited_engine
                 .sql(query)
@@ -562,7 +528,7 @@ async fn execute_inmem_shuffle_write(
                 partitioner
                     .partition(batch)
                     .map_err(|e| ExecutorError::LocalExecution {
-                        message: format!("R4a hash partition failed: {e}"),
+                        message: format!("hash partition failed: {e}"),
                     })?;
             for (bucket_idx, bucket_batch) in buckets.into_iter().enumerate() {
                 if bucket_batch.num_rows() > 0 {
@@ -601,7 +567,7 @@ async fn execute_inmem_shuffle_write(
             .write_partition(partition, lease_token)
             .await
             .map_err(|e| ExecutorError::LocalExecution {
-                message: format!("R4a in-memory shuffle write failed for partition {p}: {e}"),
+                message: format!("in-memory shuffle write failed for partition {p}: {e}"),
             })?;
         outputs.push(krishiv_proto::ShufflePartitionOutput::inline(p, size_bytes));
     }
@@ -638,11 +604,8 @@ async fn execute_inmem_shuffle_read(
     let batch_count = batches.len();
     let column_count = batches.first().map_or(0, |b| b.num_columns());
 
-    Ok(ExecutorTaskOutput::sql(
-        row_count,
-        batch_count,
-        column_count,
-    ))
+    Ok(ExecutorTaskOutput::sql(row_count, batch_count, column_count)
+        .with_record_batches(batches))
 }
 
 #[cfg(feature = "kafka")]

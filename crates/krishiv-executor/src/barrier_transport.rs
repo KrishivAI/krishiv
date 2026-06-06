@@ -78,10 +78,12 @@ impl BarrierInjector {
         Some(next)
     }
 
-    /// Convert a proto barrier to operator epoch for `OperatorMessage::Barrier`.
-    pub fn operator_epoch(barrier: &CheckpointBarrier) -> u64 {
-        barrier.epoch
-    }
+}
+
+/// Abstraction over any barrier source so downstream operators can consume barriers
+/// without being coupled to `SharedBarrierInjector` directly.
+pub trait BarrierSource: Send + Sync {
+    fn next_barrier(&self) -> Option<CheckpointBarrier>;
 }
 
 /// Thread-safe barrier inbox shared between gRPC task and source operators.
@@ -107,6 +109,12 @@ impl SharedBarrierInjector {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .next_barrier()
+    }
+}
+
+impl BarrierSource for SharedBarrierInjector {
+    fn next_barrier(&self) -> Option<CheckpointBarrier> {
+        SharedBarrierInjector::next_barrier(self)
     }
 }
 
@@ -206,12 +214,6 @@ mod tests {
         assert_eq!(barrier.checkpoint_id, "cp-42");
         assert_eq!(barrier.barrier_kind, BarrierKind::Checkpoint as i32);
         assert!(barrier.timestamp_ms > 0);
-    }
-
-    #[test]
-    fn operator_epoch_returns_barrier_epoch() {
-        let barrier = make_checkpoint_barrier("job", 7, "cp-7");
-        assert_eq!(BarrierInjector::operator_epoch(&barrier), 7);
     }
 
     #[test]

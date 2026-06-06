@@ -327,10 +327,6 @@ pub(crate) async fn read_shuffle_flight_partitions(
     Ok(table_batches.into_iter().collect())
 }
 
-/// Decode `InlineIpc` partitions into (table_name, batches) pairs.
-///
-/// The IPC bytes are Arrow IPC stream format, delivered in-band with the task
-/// assignment to avoid any external data dependency.
 /// Extract the upstream watermark hint from task input partitions if present.
 /// Returns the highest watermark_ms value found (in case multiple hints exist).
 pub(crate) fn read_watermark_hint(partitions: &[krishiv_proto::InputPartition]) -> Option<i64> {

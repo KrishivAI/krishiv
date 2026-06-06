@@ -13,7 +13,6 @@ use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, decode_window_exe
 use krishiv_proto::ExecutorTaskAssignment;
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
-const LEGACY_STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
 
 /// Fragment prefix for continuous window loop execution (GAP-6).
 ///
@@ -118,7 +117,9 @@ fn parse_stream_kafka_partitions(
             timestamps.push(ts.ok_or_else(|| ExecutorError::InvalidAssignment {
                 message: String::from("stream-kafka record missing 'ts' field"),
             })?);
-            values.push(val.unwrap_or(0));
+            values.push(val.ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: String::from("stream-kafka record missing 'val' field"),
+            })?);
         }
 
         if keys.is_empty() {
@@ -328,15 +329,6 @@ pub(crate) async fn execute_streaming_fragment(
         return execute_loop_fragment(runner, assignment, fragment);
     }
 
-    if fragment.starts_with(LEGACY_STREAM_CONTINUOUS_PREFIX) {
-        return Err(ExecutorError::InvalidAssignment {
-            message: String::from(
-                "legacy stream:continuous fragments are unsupported; \
-                 continuous assignments must use stream:loop with an encoded window specification",
-            ),
-        });
-    }
-
     let mut plan_spec =
         decode_window_execution_spec(fragment).map_err(|e| ExecutorError::InvalidAssignment {
             message: e.to_string(),
@@ -352,11 +344,6 @@ pub(crate) async fn execute_streaming_fragment(
     if let Some(upstream_wm) =
         crate::fragment::common::read_watermark_hint(assignment.input_partitions())
     {
-        // Propagate as the initial watermark_lag baseline so the first batch of
-        // this stage uses the correct late-event threshold.
-        if plan_spec.watermark_lag_ms == 0 {
-            plan_spec.watermark_lag_ms = upstream_wm.unsigned_abs();
-        }
         tracing::debug!(
             upstream_watermark_ms = upstream_wm,
             "applied upstream watermark hint to downstream stage window spec"

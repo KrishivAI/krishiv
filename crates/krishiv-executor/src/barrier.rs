@@ -1,19 +1,23 @@
-//! Barrier simulation for R5.1 (test/dev only): `BarrierSimulator` and `BarrierSnapshot`.
+//! Checkpoint barrier simulation (dev/test only): `BarrierSimulator` and `BarrierSnapshot`.
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+use krishiv_proto::wire::v1::CheckpointBarrier;
+
+use crate::barrier_transport::BarrierSource;
 use crate::{ExecutorError, ExecutorResult};
 
 const MAX_SIMULATED_SNAPSHOTS: usize = 1000;
 
-// ── BarrierSimulator (Slice F) ────────────────────────────────────────────────
-
-/// Checkpoint-barrier simulation for R5.1 (dev/test only).
+/// Checkpoint-barrier simulation for dev/test use.
 ///
 /// Production checkpointing uses [`crate::runner::TaskRunner::handle_initiate_checkpoint`]
 /// together with [`crate::BarrierInjector`] and the gRPC barrier service.
-#[derive(Debug, Default)]
 pub(crate) struct BarrierSimulator {
     last_committed_epoch: u64,
     simulated_snapshots: Vec<BarrierSnapshot>,
+    pending: Mutex<VecDeque<CheckpointBarrier>>,
 }
 
 /// Metadata logged for each simulated checkpoint.
@@ -26,10 +30,37 @@ pub(crate) struct BarrierSnapshot {
     pub open_windows: usize,
 }
 
+impl Default for BarrierSimulator {
+    fn default() -> Self {
+        Self {
+            last_committed_epoch: 0,
+            simulated_snapshots: Vec::new(),
+            pending: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+impl BarrierSource for BarrierSimulator {
+    fn next_barrier(&self) -> Option<CheckpointBarrier> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+}
+
 impl BarrierSimulator {
     /// Create a new barrier simulator.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Queue a barrier to be returned by [`BarrierSource::next_barrier`].
+    pub fn queue_barrier(&self, barrier: CheckpointBarrier) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(barrier);
     }
 
     /// Process a checkpoint barrier for `epoch`.
@@ -52,8 +83,6 @@ impl BarrierSimulator {
                 ),
             });
         }
-        // Simulate: finish current batch → flush windows → snapshot → ack.
-        // (No durable write in R5.1; durable snapshots arrive in R6.)
         self.simulated_snapshots.push(BarrierSnapshot {
             epoch,
             watermark_ms,
