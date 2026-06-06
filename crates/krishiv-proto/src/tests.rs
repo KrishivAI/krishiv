@@ -163,7 +163,7 @@ mod proto_tests {
         .with_input_partitions(vec![InputPartition::new("part-1", "first file split")])
         .with_key_group_range(KeyGroupRange::new(1024, 2047));
 
-        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone());
+        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone()).unwrap();
         let round_trip = crate::wire::executor_task_assignment_from_wire(wire).unwrap();
 
         assert_eq!(round_trip, assignment);
@@ -186,7 +186,7 @@ mod proto_tests {
         )
         .with_key_group_range(KeyGroupRange::new(0, 0));
 
-        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone());
+        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone()).unwrap();
         let round_trip = crate::wire::executor_task_assignment_from_wire(wire.clone()).unwrap();
         assert_eq!(round_trip.key_group_range(), KeyGroupRange::new(0, 0));
 
@@ -227,7 +227,7 @@ mod proto_tests {
             },
         )]);
 
-        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone());
+        let wire = crate::wire::executor_task_assignment_to_wire(assignment.clone()).unwrap();
         let round_trip = crate::wire::executor_task_assignment_from_wire(wire).unwrap();
 
         assert_eq!(round_trip, assignment);

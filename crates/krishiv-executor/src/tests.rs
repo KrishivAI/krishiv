@@ -478,7 +478,7 @@ mod executor_tests {
         let response = client
             .assign_task(wire::executor_task_assignment_to_wire(demo_assignment(
                 "task-network-1",
-            )))
+            )).unwrap())
             .await
             .unwrap()
             .into_inner();
@@ -505,7 +505,7 @@ mod executor_tests {
             &service,
             tonic::Request::new(wire::executor_task_assignment_to_wire(demo_assignment(
                 "task-auth-missing",
-            ))),
+            )).unwrap()),
         )
         .await
         .unwrap_err();
@@ -514,7 +514,7 @@ mod executor_tests {
 
         let mut request = tonic::Request::new(wire::executor_task_assignment_to_wire(
             demo_assignment("task-auth-ok"),
-        ));
+        ).unwrap());
         request.metadata_mut().insert(
             "authorization",
             tonic::metadata::MetadataValue::from_static("Bearer task-secret"),
@@ -541,7 +541,7 @@ mod executor_tests {
             &service,
             tonic::Request::new(wire::executor_task_assignment_to_wire(demo_assignment(
                 "task-auth-misconfigured",
-            ))),
+            )).unwrap()),
         )
         .await
         .unwrap_err();
@@ -827,7 +827,7 @@ mod executor_tests {
         .await
         .unwrap();
         let assign_response = executor_client
-            .assign_task(wire::executor_task_assignment_to_wire(assignment))
+            .assign_task(wire::executor_task_assignment_to_wire(assignment).unwrap())
             .await
             .unwrap()
             .into_inner();
@@ -950,7 +950,7 @@ mod executor_tests {
         .await
         .unwrap();
         let assign_response = executor_client
-            .assign_task(wire::executor_task_assignment_to_wire(assignment))
+            .assign_task(wire::executor_task_assignment_to_wire(assignment).unwrap())
             .await
             .unwrap()
             .into_inner();

@@ -677,7 +677,7 @@ async fn render_metrics_body(coordinator: &SharedCoordinator) -> String {
         .map(|a| a.age_ticks())
         .max()
         .unwrap_or(0);
-    let body = format!(
+    let mut body = format!(
         "\
 # HELP krishiv_running_tasks Currently running task count
 # TYPE krishiv_running_tasks gauge
@@ -697,7 +697,6 @@ krishiv_max_executor_heartbeat_age_ticks {hb_age}
         failed = m.failed_assignments(),
         hb_age = max_hb_age,
     );
-    let mut body = body;
     body.push('\n');
     let scheduler = scheduler_metrics();
     let scheduler_body = format!(

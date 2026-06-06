@@ -133,14 +133,8 @@ impl Coordinator {
             let streaming = record.spec.kind() == JobKind::Streaming;
             self.job_coordinators.insert(
                 job_id.clone(),
-                Arc::new(JobCoordinator::new(job_id.clone(), record.clone())),
+                Arc::new(JobCoordinator::new(job_id.clone(), record)),
             );
-            // Track B (two-tier): keep the JCP surface consistent when a dedicated
-            // per-job coordinator syncs a single job record from shared metadata.
-            if !self.job_coordinators.contains_key(job_id) {
-                let jcp = crate::job_coordinator::JobCoordinator::new(job_id.clone(), record);
-                self.job_coordinators.insert(job_id.clone(), Arc::new(jcp));
-            }
             if streaming {
                 self.index_streaming_tasks(job_id);
             }

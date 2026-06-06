@@ -278,8 +278,8 @@ fn run_blocking<T: Send>(
             scope
                 .spawn(f)
                 .join()
-                .expect("run_blocking thread panicked")
-                .map_err(|e| Status::internal(e.to_string()))
+                .map_err(|_| Status::internal("run_blocking thread panicked"))
+                .and_then(|r| r.map_err(|e| Status::internal(e.to_string())))
         }),
     }
 }

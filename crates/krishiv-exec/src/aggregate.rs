@@ -195,7 +195,9 @@ impl AggState {
         for (i, expr) in agg_exprs.iter().enumerate() {
             match expr.function {
                 AggFunction::Count => {
-                    self.values[i] += 1;
+                    self.values[i] = self.values[i].checked_add(1).ok_or_else(|| {
+                        ExecError::InvalidInput("count overflow: i64::MAX reached".into())
+                    })?;
                     self.has_value[i] = true;
                 }
                 AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
@@ -231,7 +233,12 @@ impl AggState {
                     };
                     match expr.function {
                         AggFunction::Sum => {
-                            self.values[i] += v;
+                            self.values[i] = self.values[i].checked_add(v).ok_or_else(|| {
+                                ExecError::InvalidInput(format!(
+                                    "sum overflow on column '{}': i64::MAX reached",
+                                    expr.input_column
+                                ))
+                            })?;
                             self.has_value[i] = true;
                         }
                         AggFunction::Min => {
@@ -246,7 +253,11 @@ impl AggState {
                             }
                             self.has_value[i] = true;
                         }
-                        AggFunction::Count | AggFunction::Avg => unreachable!(),
+                        AggFunction::Count | AggFunction::Avg => {
+                            return Err(ExecError::InvalidInput(
+                                "unexpected Count/Avg in Sum/Min/Max branch".into(),
+                            ));
+                        }
                     }
                 }
                 AggFunction::Avg => {

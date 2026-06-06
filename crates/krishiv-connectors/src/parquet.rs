@@ -194,7 +194,9 @@ impl Sink for ParquetSink {
 
         self.writer
             .as_mut()
-            .expect("writer is set above")
+            .ok_or_else(|| ConnectorError::IoStr {
+                message: "Parquet writer not initialized; call write_batch with a schema-bearing batch first".into(),
+            })?
             .write(&batch)
             .map_err(|e| ConnectorError::IoStr {
                 message: format!("failed to write Parquet batch: {e}"),

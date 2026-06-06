@@ -613,7 +613,6 @@ fn build_outer_join_batch(
     let mut all_left: Vec<u32> = left_indices.to_vec();
     all_left.extend_from_slice(unmatched_left);
 
-    let _num_right_cols = right.schema().fields().len() - right_keys.len();
     let mut null_right_indices: Vec<u32> = vec![0; unmatched_left.len()];
     let mut all_right: Vec<u32> = right_indices.to_vec();
     all_right.append(&mut null_right_indices);

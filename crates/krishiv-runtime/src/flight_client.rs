@@ -209,7 +209,13 @@ impl FlightClientPool {
         let url = flight_url.into();
         // Normalize eagerly so a bad URL fails at construction rather than
         // surfacing as an opaque tonic error on the first request.
-        let endpoint = normalize_flight_endpoint(&url).unwrap_or_else(|_| url.trim().to_string());
+        let endpoint = normalize_flight_endpoint(&url)
+            .unwrap_or_else(|_| {
+                let trimmed = url.trim().to_string();
+                tracing::warn!(url = %url, "Flight URL normalization failed; using trimmed input");
+                trimmed
+            });
+        assert!(!endpoint.is_empty(), "Flight URL is empty after normalization");
         let health = EndpointHealth {
             endpoint: endpoint.clone(),
             consecutive_failures: 0,
@@ -515,10 +521,13 @@ impl FlightClientPool {
                 .map_err(|e| RuntimeError::transport(format!("flight do_get failed: {e}")))?;
 
             let mut batches = Vec::new();
-            while let Some(batch) = stream
-                .try_next()
-                .await
-                .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
+            while let Some(batch) = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                stream.try_next(),
+            )
+            .await
+            .map_err(|_| RuntimeError::transport("flight streaming batch timed out after 60s"))?
+            .map_err(|e| RuntimeError::transport(format!("flight decode failed: {e}")))?
             {
                 batches.push(batch);
             }
@@ -829,6 +838,13 @@ pub(crate) async fn do_action(
     while let Some(item) = stream.next().await {
         let part = item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
         buf.extend_from_slice(&part.body);
+        const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+        if buf.len() > MAX_RESPONSE_BYTES {
+            return Err(RuntimeError::transport(format!(
+                "do_action response exceeded {} MiB limit",
+                MAX_RESPONSE_BYTES / (1024 * 1024)
+            )));
+        }
     }
     Ok(buf)
 }

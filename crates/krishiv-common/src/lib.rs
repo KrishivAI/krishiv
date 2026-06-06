@@ -8,7 +8,6 @@
 
 pub mod arrow;
 pub mod async_util;
-pub mod blocking;
 #[cfg(feature = "chaos")]
 pub mod chaos;
 pub mod durability;

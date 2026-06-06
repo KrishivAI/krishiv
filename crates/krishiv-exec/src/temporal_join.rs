@@ -155,10 +155,23 @@ impl TemporalJoinOperator {
                 for col_idx in 0..stream_batch.num_columns() {
                     row_cols.push(slice_column(stream_batch.column(col_idx), row, 1));
                 }
-                // Null table columns — we need to know the table schema.
-                // Since no match, emit nulls for each table column.
-                // We don't know the table schema at this point, so skip.
-                // For correctness, callers must ensure table schema is known.
+                // Resolve table schema from a previous match or from keyed state.
+                let resolved_schema = table_schema.clone().or_else(|| {
+                    self.keyed_state.values().find_map(|state| {
+                        state.versions.values().next().map(|batch| batch.schema())
+                    })
+                });
+                if let Some(ref ts) = resolved_schema {
+                    if table_schema.is_none() {
+                        table_schema = Some(ts.clone());
+                    }
+                    for f_ref in ts.fields() {
+                        let dt = f_ref.data_type();
+                        row_cols.push(arrow::array::new_null_array(dt, 1));
+                    }
+                    output_columns.push(row_cols);
+                }
+                // If no schema available, skip this row (no table data seen yet).
             }
         }
 
@@ -210,7 +223,7 @@ fn format_column_value(array: &dyn Array, row: usize) -> String {
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
         return arr.value(row).to_owned();
     }
-    format!("<unsupported_type>")
+    "<unsupported_type>".to_owned()
 }
 
 fn slice_column(array: &ArrayRef, offset: usize, length: usize) -> ArrayRef {

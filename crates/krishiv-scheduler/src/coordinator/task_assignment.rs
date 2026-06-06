@@ -507,9 +507,13 @@ impl Coordinator {
                 inject_executor_task_request_context
                     as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
             );
+            let wire_assignment = wire::executor_task_assignment_to_wire(assignment.clone())
+                .map_err(|e| SchedulerError::Transport {
+                    message: format!("wire encode for {endpoint}: {e}"),
+                })?;
             let response = tokio::time::timeout(
                 ASSIGNMENT_DELIVERY_TIMEOUT,
-                client.assign_task(wire::executor_task_assignment_to_wire(assignment.clone())),
+                client.assign_task(wire_assignment),
             )
             .await;
 
@@ -761,14 +765,6 @@ impl Coordinator {
     ///
     /// On a cache hit, clones the existing `Channel` (pointer-only cost).
     /// On a miss, establishes a new TCP+TLS connection and stores it for reuse.
-    #[allow(dead_code)]
-    async fn get_or_connect_channel(
-        &self,
-        endpoint: &str,
-    ) -> SchedulerResult<tonic::transport::Channel> {
-        Self::get_or_connect_channel_on_map(&self.executor_channels, endpoint).await
-    }
-
     pub(crate) async fn get_or_connect_channel_on_map(
         channels: &Arc<DashMap<String, tonic::transport::Channel>>,
         endpoint: &str,

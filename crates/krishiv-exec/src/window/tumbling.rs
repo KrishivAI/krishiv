@@ -317,10 +317,34 @@ fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
 
 fn key_value_to_typed_array(key_type: &str, key_value: &str) -> Arc<dyn arrow::array::Array> {
     match key_type {
-        "int32" => Arc::new(Int32Array::from(vec![key_value.parse::<i32>().unwrap_or(0)])),
-        "int64" => Arc::new(Int64Array::from(vec![key_value.parse::<i64>().unwrap_or(0)])),
-        "float64" => Arc::new(Float64Array::from(vec![key_value.parse::<f64>().unwrap_or(0.0)])),
-        "bool" => Arc::new(BooleanArray::from(vec![key_value.parse::<bool>().unwrap_or(false)])),
+        "int32" => {
+            let v = key_value.parse::<i32>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as int32, using 0");
+                0
+            });
+            Arc::new(Int32Array::from(vec![v]))
+        }
+        "int64" => {
+            let v = key_value.parse::<i64>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as int64, using 0");
+                0
+            });
+            Arc::new(Int64Array::from(vec![v]))
+        }
+        "float64" => {
+            let v = key_value.parse::<f64>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as float64, using 0.0");
+                0.0
+            });
+            Arc::new(Float64Array::from(vec![v]))
+        }
+        "bool" => {
+            let v = key_value.parse::<bool>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as bool, using false");
+                false
+            });
+            Arc::new(BooleanArray::from(vec![v]))
+        }
         _ => Arc::new(StringArray::from(vec![key_value])),
     }
 }

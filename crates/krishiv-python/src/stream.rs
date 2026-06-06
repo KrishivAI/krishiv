@@ -210,7 +210,7 @@ pub struct PyWindowedStream {
 
 impl PyWindowedStream {
     fn ensure_collected(&self) -> PyResult<()> {
-        let mut cached = self.cached.lock().unwrap();
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if cached.is_none() {
             let batches = execute_pipeline(&self.pipeline)?;
             *cached = Some(batches);
@@ -244,11 +244,11 @@ impl PyWindowedStream {
         // Python threads and async tasks can run without stalling.
         // pyo3 0.28 uses `detach` instead of the older `allow_threads`.
         py.detach(|| self.ensure_collected())?;
-        Ok(self.cached.lock().unwrap().clone().unwrap_or_default())
+        Ok(self.cached.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default())
     }
 
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        let mut rx_guard = slf.stream_rx.lock().unwrap();
+        let mut rx_guard = slf.stream_rx.lock().unwrap_or_else(|e| e.into_inner());
         if rx_guard.is_none() {
             if let Ok(rx) = crate::stream_exec::spawn_pipeline_stream(slf.pipeline.clone()) {
                 *rx_guard = Some(rx);
@@ -259,7 +259,7 @@ impl PyWindowedStream {
     }
 
     pub fn __anext__(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
-        let mut rx_guard = self.stream_rx.lock().unwrap();
+        let mut rx_guard = self.stream_rx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rx) = rx_guard.as_mut() {
             // Use block_in_place when running inside a tokio context so the
             // worker thread is properly yielded during the recv rather than
@@ -284,7 +284,7 @@ impl PyWindowedStream {
     /// Non-blocking poll — returns `None` immediately if no batch is ready.
     /// Useful for polling patterns in async Python without blocking the event loop.
     pub fn try_next(&self, py: Python<'_>) -> PyResult<Option<Py<PyBatch>>> {
-        let mut rx_guard = self.stream_rx.lock().unwrap();
+        let mut rx_guard = self.stream_rx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rx) = rx_guard.as_mut() {
             match rx.try_recv() {
                 Ok(Ok(batch)) => Ok(Some(Py::new(py, batch)?)),

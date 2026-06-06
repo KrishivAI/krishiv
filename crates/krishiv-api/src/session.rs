@@ -110,15 +110,26 @@ pub(crate) fn shared_embedded_runtime() -> Arc<dyn ExecutionRuntime> {
     // OnceLock itself is unused for hand-out; left here for backward-compat
     // marker placement only.
     let _ = std::sync::OnceLock::<()>::new();
-    let cluster = Arc::new(InProcessCluster::new().expect("orphan embedded in-process cluster"));
-    build_execution_runtime(
+    let cluster = match InProcessCluster::new() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create in-process cluster");
+            panic!("orphan embedded in-process cluster: {e}");
+        }
+    };
+    match build_execution_runtime(
         RuntimeMode::Embedded,
         Some(cluster),
         None,
         None,
         ExecutionPlacement::LocalInProcess,
-    )
-    .expect("embedded in-process runtime placement is valid")
+    ) {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build embedded runtime");
+            panic!("embedded in-process runtime placement is valid: {e}");
+        }
+    }
 }
 
 fn execution_mode_to_runtime_mode(mode: ExecutionMode) -> RuntimeMode {

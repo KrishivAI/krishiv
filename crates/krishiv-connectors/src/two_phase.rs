@@ -224,7 +224,11 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
 
         let (staging_path, final_path, file) = loop {
             let handle_id = self.next_handle;
-            self.next_handle += 1;
+            self.next_handle = self.next_handle.checked_add(1).ok_or_else(|| {
+                ConnectorError::IoStr {
+                    message: "parquet 2pc prepare: handle ID overflow".into(),
+                }
+            })?;
             let staging_name = format!("{epoch}-{handle_id}.parquet.tmp");
             let final_name = format!("{epoch}-{handle_id}.parquet");
             let staging_path = self.output_dir.join(&staging_name);

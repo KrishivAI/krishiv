@@ -661,7 +661,7 @@ async fn healthz() -> &'static str {
 /// Prometheus-format metrics endpoint backed by live `StabilityMetrics`.
 async fn metrics(State(state): State<UiState>) -> impl IntoResponse {
     let coordinator = state.coordinator.read().await;
-    let mut cache = state.metrics_cache.lock().unwrap();
+    let mut cache = state.metrics_cache.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
     let body = if now.duration_since(cache.1).as_secs() >= 1 || cache.0.is_empty() {
         let mut body = format_stability_metrics(&coordinator.stability_metrics());

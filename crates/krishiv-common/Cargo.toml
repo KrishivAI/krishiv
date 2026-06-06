@@ -10,6 +10,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
 thiserror = { workspace = true, optional = true }
 
 [features]

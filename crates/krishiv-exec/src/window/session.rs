@@ -138,8 +138,16 @@ impl SessionWindowOperator {
                 serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
                     message: e.to_string(),
                 })?;
-            let session_start_ms = parsed["session_start_ms"].as_i64().unwrap_or(0);
-            let last_event_time_ms = parsed["last_event_time_ms"].as_i64().unwrap_or(0);
+            let session_start_ms = parsed["session_start_ms"].as_i64().ok_or_else(|| {
+                StateError::CorruptEntry {
+                    message: "missing or invalid session_start_ms".into(),
+                }
+            })?;
+            let last_event_time_ms = parsed["last_event_time_ms"].as_i64().ok_or_else(|| {
+                StateError::CorruptEntry {
+                    message: "missing or invalid last_event_time_ms".into(),
+                }
+            })?;
             let values: Vec<i64> = parsed["values"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
@@ -243,7 +251,9 @@ impl SessionWindowOperator {
             session.agg.update(&self.spec.agg_exprs, batch, row)?;
         }
 
-        self.prev_watermark_ms = new_watermark_ms;
+        if new_watermark_ms >= self.prev_watermark_ms {
+            self.prev_watermark_ms = new_watermark_ms;
+        }
         output.extend(self.flush_closed_sessions(new_watermark_ms)?);
         Ok(output)
     }
@@ -346,10 +356,34 @@ fn key_type_to_data_type(key_type: &str) -> DataType {
 
 fn key_value_to_typed_column(key_type: &str, key_value: &str) -> Arc<dyn arrow::array::Array> {
     match key_type {
-        "int32" => Arc::new(Int32Array::from(vec![key_value.parse::<i32>().unwrap_or(0)])),
-        "int64" => Arc::new(Int64Array::from(vec![key_value.parse::<i64>().unwrap_or(0)])),
-        "float64" => Arc::new(Float64Array::from(vec![key_value.parse::<f64>().unwrap_or(0.0)])),
-        "bool" => Arc::new(BooleanArray::from(vec![key_value.parse::<bool>().unwrap_or(false)])),
+        "int32" => {
+            let v = key_value.parse::<i32>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as int32, using 0");
+                0
+            });
+            Arc::new(Int32Array::from(vec![v]))
+        }
+        "int64" => {
+            let v = key_value.parse::<i64>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as int64, using 0");
+                0
+            });
+            Arc::new(Int64Array::from(vec![v]))
+        }
+        "float64" => {
+            let v = key_value.parse::<f64>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as float64, using 0.0");
+                0.0
+            });
+            Arc::new(Float64Array::from(vec![v]))
+        }
+        "bool" => {
+            let v = key_value.parse::<bool>().unwrap_or_else(|_| {
+                tracing::warn!(key = key_value, "failed to parse key as bool, using false");
+                false
+            });
+            Arc::new(BooleanArray::from(vec![v]))
+        }
         _ => Arc::new(StringArray::from(vec![key_value])),
     }
 }

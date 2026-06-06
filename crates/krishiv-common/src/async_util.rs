@@ -12,7 +12,10 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("failed to create fallback Tokio runtime")
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to create fallback Tokio runtime; panicking");
+                panic!("failed to create fallback Tokio runtime: {e}");
+            })
     })
 }
 
@@ -48,7 +51,10 @@ pub fn unix_now_ms_checked() -> Result<i64, SystemTimeError> {
 }
 
 pub fn unix_now_ms() -> i64 {
-    unix_now_ms_checked().unwrap_or(0)
+    unix_now_ms_checked().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "system clock before UNIX epoch; returning 0");
+        0
+    })
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ license.workspace = true
 async-trait = { workspace = true }
 arrow = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-governance = { path = "../krishiv-governance" }
 krishiv-plan = { path = "../krishiv-plan" }

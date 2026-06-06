@@ -248,7 +248,6 @@ impl ClusterControlPlane {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorId, JobId, JobKind, JobSpec, StageId, StageSpec,

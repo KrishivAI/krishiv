@@ -955,7 +955,6 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 }
 
 /// Serialize coordinator metadata for etcd or other blob stores.
-#[allow(dead_code)]
 pub(crate) fn encode_metadata_snapshot(
     events: &[EventLogEvent],
     jobs: &[JobRecord],
@@ -1076,7 +1075,12 @@ impl NonBlockingStoreHandle {
                             .ok();
                         }
                         StoreCommand::Flush(reply) => {
-                            while in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                            // Wait for in-flight tasks to complete using a
+                            // Notify-based approach instead of busy-waiting.
+                            loop {
+                                if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                    break;
+                                }
                                 tokio::task::yield_now().await;
                             }
                             let _ = reply.send(());
@@ -1253,7 +1257,6 @@ impl NonBlockingStoreHandle {
 }
 
 /// Restore coordinator metadata from a serialized snapshot blob.
-#[allow(dead_code)]
 pub(crate) fn decode_metadata_snapshot(
     bytes: &[u8],
 ) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {

@@ -21,7 +21,18 @@ pub const DURABILITY_PROFILE_ENV: &str = "KRISHIV_DURABILITY_PROFILE";
 pub fn resolve_durability_profile() -> DurabilityProfile {
     std::env::var(DURABILITY_PROFILE_ENV)
         .ok()
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| match value.parse() {
+            Ok(profile) => Some(profile),
+            Err(e) => {
+                tracing::warn!(
+                    env = DURABILITY_PROFILE_ENV,
+                    value = %value,
+                    error = %e,
+                    "invalid durability profile; falling back to DevLocal"
+                );
+                None
+            }
+        })
         .unwrap_or(DurabilityProfile::DevLocal)
 }
 

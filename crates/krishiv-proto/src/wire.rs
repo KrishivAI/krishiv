@@ -502,8 +502,8 @@ fn heartbeat_throttle_command_from_wire(
 /// Convert a domain executor task assignment to protobuf.
 pub fn executor_task_assignment_to_wire(
     value: ExecutorTaskAssignment,
-) -> v1::ExecutorTaskAssignment {
-    v1::ExecutorTaskAssignment {
+) -> WireResult<v1::ExecutorTaskAssignment> {
+    Ok(v1::ExecutorTaskAssignment {
         version: Some(transport_version_to_wire(value.version())),
         job_id: value.job_id().as_str().to_owned(),
         stage_id: value.stage_id().as_str().to_owned(),
@@ -515,7 +515,7 @@ pub fn executor_task_assignment_to_wire(
             .input_partitions()
             .iter()
             .map(input_partition_to_wire)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
         plan_fragment: Some(plan_fragment_to_wire(value.plan_fragment())),
         output_contract: Some(output_contract_to_wire(value.output_contract())),
         task_timeout_secs: value.task_timeout_secs().unwrap_or(0),
@@ -526,7 +526,7 @@ pub fn executor_task_assignment_to_wire(
         memory_limit_bytes: value.memory_limit_bytes().unwrap_or(0),
         shuffle_write: value.shuffle_write().map(shuffle_write_config_to_wire),
         shuffle_read: value.shuffle_read().map(shuffle_read_config_to_wire),
-    }
+    })
 }
 
 /// Convert a protobuf executor task assignment to the domain contract.
@@ -888,12 +888,12 @@ fn task_attempt_ref_from_wire(value: v1::TaskAttemptRef) -> WireResult<TaskAttem
     ))
 }
 
-fn input_partition_to_wire(value: &InputPartition) -> v1::InputPartition {
-    v1::InputPartition {
+fn input_partition_to_wire(value: &InputPartition) -> WireResult<v1::InputPartition> {
+    Ok(v1::InputPartition {
         partition_id: value.partition_id().to_owned(),
         description: value.description().to_owned(),
-        descriptor: value.descriptor().map(input_partition_descriptor_to_wire),
-    }
+        descriptor: value.descriptor().map(input_partition_descriptor_to_wire).transpose()?,
+    })
 }
 
 fn input_partition_from_wire(value: v1::InputPartition) -> WireResult<InputPartition> {
@@ -911,41 +911,41 @@ fn input_partition_from_wire(value: v1::InputPartition) -> WireResult<InputParti
 
 fn input_partition_descriptor_to_wire(
     value: &InputPartitionDescriptor,
-) -> v1::InputPartitionDescriptor {
+) -> WireResult<v1::InputPartitionDescriptor> {
     match value {
         InputPartitionDescriptor::LocalParquet { table_name, path } => {
-            v1::InputPartitionDescriptor {
+            Ok(v1::InputPartitionDescriptor {
                 kind: v1::InputPartitionDescriptorKind::LocalParquet as i32,
                 table_name: table_name.clone(),
                 path: path.clone(),
                 ..Default::default()
-            }
+            })
         }
         InputPartitionDescriptor::ConnectorParquet { table_name, path } => {
-            v1::InputPartitionDescriptor {
+            Ok(v1::InputPartitionDescriptor {
                 kind: v1::InputPartitionDescriptorKind::ConnectorParquet as i32,
                 table_name: table_name.clone().unwrap_or_default(),
                 path: path.clone(),
                 ..Default::default()
-            }
+            })
         }
         InputPartitionDescriptor::ObjectParquet {
             table_name,
             base_dir,
             object_path,
-        } => v1::InputPartitionDescriptor {
+        } => Ok(v1::InputPartitionDescriptor {
             kind: v1::InputPartitionDescriptorKind::ObjectParquet as i32,
             table_name: table_name.clone(),
             object_base_dir: base_dir.clone(),
             object_path: object_path.clone(),
             ..Default::default()
-        },
+        }),
         InputPartitionDescriptor::MemoryKafka {
             topic,
             partition,
             start_offset,
             records,
-        } => v1::InputPartitionDescriptor {
+        } => Ok(v1::InputPartitionDescriptor {
             kind: v1::InputPartitionDescriptorKind::MemoryKafka as i32,
             kafka_topic: topic.clone(),
             kafka_partition: *partition,
@@ -958,14 +958,14 @@ fn input_partition_descriptor_to_wire(
                 })
                 .collect(),
             ..Default::default()
-        },
+        }),
         InputPartitionDescriptor::ShuffleFlight {
             table_name,
             flight_endpoint,
             job_id,
             upstream_stage_id,
             partition_id,
-        } => v1::InputPartitionDescriptor {
+        } => Ok(v1::InputPartitionDescriptor {
             kind: v1::InputPartitionDescriptorKind::ShuffleFlight as i32,
             table_name: table_name.clone(),
             shuffle_flight_endpoint: flight_endpoint.clone(),
@@ -973,29 +973,29 @@ fn input_partition_descriptor_to_wire(
             shuffle_upstream_stage_id: upstream_stage_id.as_str().to_owned(),
             shuffle_partition_id: *partition_id,
             ..Default::default()
-        },
+        }),
         InputPartitionDescriptor::InlineIpc {
             table_name,
             ipc_bytes,
-        } => v1::InputPartitionDescriptor {
+        } => Ok(v1::InputPartitionDescriptor {
             kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
             table_name: table_name.clone(),
             ipc_bytes: ipc_bytes.clone(),
             ..Default::default()
-        },
+        }),
         // InMemory is in-process only and must never reach the wire.
         InputPartitionDescriptor::InMemory { table_name, .. } => {
-            panic!(
+            return Err(WireError::new(format!(
                 "InputPartitionDescriptor::InMemory (table_name={table_name:?}) \
                  is in-process only and cannot be serialised to the wire; \
                  use InlineIpc for remote task assignments"
-            );
+            )));
         }
-        InputPartitionDescriptor::WatermarkHint { watermark_ms } => v1::InputPartitionDescriptor {
+        InputPartitionDescriptor::WatermarkHint { watermark_ms } => Ok(v1::InputPartitionDescriptor {
             kind: v1::InputPartitionDescriptorKind::WatermarkHint as i32,
             watermark_ms: *watermark_ms,
             ..Default::default()
-        },
+        }),
     }
 }
 

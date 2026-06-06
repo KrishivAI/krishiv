@@ -779,26 +779,6 @@ fn trace_and_auth_interceptor(
     crate::auth::auth_interceptor(req)
 }
 
-/// Serve the coordinator/executor gRPC API on a socket address.
-#[allow(dead_code)]
-pub async fn serve_coordinator_executor_grpc(
-    addr: SocketAddr,
-    coordinator: SharedCoordinator,
-) -> Result<(), tonic::transport::Error> {
-    let coordinator_for_management = coordinator.clone();
-    tonic::transport::Server::builder()
-        .add_service(tonic::service::interceptor::InterceptedService::new(
-            coordinator_executor_grpc_server(coordinator),
-            trace_and_auth_interceptor,
-        ))
-        .add_service(tonic::service::interceptor::InterceptedService::new(
-            coordinator_management_grpc_server(coordinator_for_management),
-            trace_and_auth_interceptor,
-        ))
-        .serve(addr)
-        .await
-}
-
 /// Serve the coordinator/executor gRPC API on an already-bound listener.
 pub async fn serve_coordinator_executor_grpc_with_listener(
     listener: tokio::net::TcpListener,
