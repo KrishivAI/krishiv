@@ -67,6 +67,7 @@ fn events_batch(user_ids: &[&str], timestamps: &[i64]) -> RecordBatch {
 fn tumbling_spec() -> LocalWindowExecutionSpec {
     LocalWindowExecutionSpec {
         key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
         event_time_column: "ts".into(),
         watermark_lag_ms: 0,
         window_kind: LocalWindowKind::Tumbling,
@@ -505,6 +506,7 @@ async fn flight_sql_continuous_stream_register_push_drain() {
 
     let spec = LocalWindowExecutionSpec {
         key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
         event_time_column: "ts".into(),
         watermark_lag_ms: 0,
         window_kind: LocalWindowKind::Tumbling,

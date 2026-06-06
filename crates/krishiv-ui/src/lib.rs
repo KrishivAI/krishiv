@@ -222,6 +222,46 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .with_state(state)
 }
 
+/// Build the UI-specific routes (jobs, executors, SQL editor, health dashboard)
+/// for embedding inside the coordinator HTTP server.
+///
+/// Skips `/healthz`, `/readyz`, `/metrics`, and `/assets/*` — the coordinator
+/// already serves those. Only includes `/`, `/ui*`, and `/api/v1/*` routes.
+pub fn embedded_router(state: UiState) -> Router {
+    let protected = Router::new()
+        .route("/", get(|| async { Redirect::temporary("/ui") }))
+        .route("/api/v1/jobs", get(api_jobs))
+        .route("/api/v1/jobs/{job_id}", get(api_job_detail))
+        .route(
+            "/api/v1/jobs/{job_id}/checkpoints",
+            get(api_job_checkpoints),
+        )
+        .route("/api/v1/executors", get(api_executors))
+        .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
+        .route("/api/v1/queues", get(api_queues))
+        .route("/api/v1/sql", post(api_sql_execute))
+        .route("/ui", get(ui_jobs))
+        .route("/ui/jobs/{job_id}", get(ui_job_detail))
+        .route("/ui/jobs/{job_id}/checkpoints", get(ui_job_checkpoints_page))
+        .route("/ui/executors/{executor_id}", get(ui_executor_detail))
+        .route("/ui/submit", get(ui_submit))
+        .route("/ui/health", get(ui_health));
+
+    let protected = if let Some(expected) = resolve_ui_token().as_deref() {
+        let expected = expected.to_string();
+        protected.layer(middleware::from_fn(move |req, next| {
+            let expected = expected.clone();
+            async move { require_bearer(req, next, &expected).await }
+        }))
+    } else {
+        protected
+    };
+
+    Router::new()
+        .merge(protected)
+        .with_state(state)
+}
+
 async fn require_bearer(request: axum::extract::Request, next: Next, expected: &str) -> Response {
     if expected.is_empty() {
         return (

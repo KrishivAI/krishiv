@@ -95,6 +95,7 @@ pub fn execute_bounded_window(
         WindowKind::Tumbling => {
             let tw_spec = TumblingWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
@@ -121,6 +122,7 @@ pub fn execute_bounded_window(
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
             let sw_spec = SlidingWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -148,6 +150,7 @@ pub fn execute_bounded_window(
             let gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
             let sess_spec = SessionWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 session_gap_ms: gap_ms,
                 agg_exprs,
@@ -192,6 +195,7 @@ pub fn execute_streaming_window(
         WindowKind::Tumbling => {
             let tw_spec = TumblingWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
@@ -256,6 +260,7 @@ pub fn execute_streaming_window(
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
             let sw_spec = SlidingWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -321,6 +326,7 @@ pub fn execute_streaming_window(
             let session_gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
             let sess_spec = SessionWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 session_gap_ms,
                 agg_exprs,
@@ -401,6 +407,7 @@ pub fn local_spec_to_window_execution(
     };
     WindowExecutionSpec {
         key_column,
+        key_column_type: String::from("utf8"),
         event_time_column,
         watermark_lag_ms,
         window_kind: kind,
@@ -453,6 +460,7 @@ mod tests {
 
         let spec = WindowExecutionSpec {
             key_column: "user_id".into(),
+            key_column_type: String::from("utf8"),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: WindowKind::Tumbling,

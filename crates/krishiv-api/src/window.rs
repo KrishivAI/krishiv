@@ -197,7 +197,8 @@ fn build_tumbling_spec(
         .map(WatermarkSpec::lag_ms)
         .unwrap_or(0);
     let mut spec = LocalWindowExecutionSpec {
-        key_column: keyed.key_column.clone(),
+            key_column: keyed.key_column.clone(),
+            key_column_type: String::from("utf8"),
         event_time_column: event_time,
         watermark_lag_ms: lag,
         window_kind: LocalWindowKind::Tumbling,
@@ -375,7 +376,8 @@ impl SessionWindowedStream {
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
         let mut spec = LocalWindowExecutionSpec {
-            key_column: self.keyed.key_column.clone(),
+                key_column: self.keyed.key_column.clone(),
+                key_column_type: String::from("utf8"),
             event_time_column: event_time,
             watermark_lag_ms: lag,
             window_kind: LocalWindowKind::Session {
@@ -408,7 +410,8 @@ impl SlidingWindowedStream {
             .map(WatermarkSpec::lag_ms)
             .unwrap_or(0);
         let mut spec = LocalWindowExecutionSpec {
-            key_column: self.keyed.key_column.clone(),
+                key_column: self.keyed.key_column.clone(),
+                key_column_type: String::from("utf8"),
             event_time_column: event_time,
             watermark_lag_ms: lag,
             window_kind: LocalWindowKind::Sliding {

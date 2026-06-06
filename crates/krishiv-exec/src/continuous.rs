@@ -109,6 +109,7 @@ fn build_operator(
         WindowKind::Tumbling => {
             let tw_spec = TumblingWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.to_vec(),
@@ -127,6 +128,7 @@ fn build_operator(
             let slide_ms = spec.slide_ms.unwrap_or(spec.window_size_ms);
             let sw_spec = SlidingWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 window_size_ms: spec.window_size_ms,
                 slide_ms,
@@ -146,6 +148,7 @@ fn build_operator(
             let gap_ms = spec.session_gap_ms.unwrap_or(spec.window_size_ms);
             let sess_spec = SessionWindowSpec {
                 key_column: spec.key_column.clone(),
+                key_column_type: spec.key_column_type.clone(),
                 event_time_column: spec.event_time_column.clone(),
                 session_gap_ms: gap_ms,
                 agg_exprs: agg_exprs.to_vec(),

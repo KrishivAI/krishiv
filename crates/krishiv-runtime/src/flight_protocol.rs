@@ -525,6 +525,7 @@ mod tests {
     #[test]
     fn continuous_register_round_trip() {
         let local = LocalWindowExecutionSpec {
+                key_column_type: String::from("utf8"),
             key_column: "user_id".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
@@ -595,6 +596,7 @@ mod tests {
     #[test]
     fn bounded_window_with_input_batches() {
         let local = LocalWindowExecutionSpec {
+                key_column_type: String::from("utf8"),
             key_column: "user_id".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
@@ -952,6 +954,7 @@ mod tests {
     #[test]
     fn bounded_window_empty_ipc() {
         let local = LocalWindowExecutionSpec {
+                key_column_type: String::from("utf8"),
             key_column: "k".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,

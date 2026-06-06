@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use krishiv_state::{Namespace, StateBackend, StateError, StateResult};
@@ -19,6 +19,9 @@ use crate::{ExecError, ExecResult};
 pub struct SessionWindowSpec {
     /// Column used to key the stream.
     pub key_column: String,
+    /// Arrow type of the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
+    /// Defaults to `"utf8"`.
+    pub key_column_type: String,
     /// Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Inactivity gap that closes the session in milliseconds.
@@ -281,8 +284,9 @@ impl SessionWindowOperator {
         session_end_ms: i64,
         state: &AggState,
     ) -> ExecResult<RecordBatch> {
+        let key_dtype = key_type_to_data_type(&self.spec.key_column_type);
         let mut fields = vec![
-            Field::new(&self.spec.key_column, DataType::Utf8, false),
+            Field::new(&self.spec.key_column, key_dtype, false),
             Field::new("session_start_ms", DataType::Int64, false),
             Field::new("session_end_ms", DataType::Int64, false),
         ];
@@ -295,7 +299,7 @@ impl SessionWindowOperator {
         }
         let schema = Arc::new(Schema::new(fields));
         let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![
-            Arc::new(StringArray::from(vec![key_value])),
+            key_value_to_typed_column(&self.spec.key_column_type, key_value),
             Arc::new(Int64Array::from(vec![session_start_ms])),
             Arc::new(Int64Array::from(vec![session_end_ms])),
         ];
@@ -330,6 +334,26 @@ fn parse_session_state_key(bytes: &[u8]) -> Option<String> {
     Some(key)
 }
 
+fn key_type_to_data_type(key_type: &str) -> DataType {
+    match key_type {
+        "int32" => DataType::Int32,
+        "int64" => DataType::Int64,
+        "float64" => DataType::Float64,
+        "bool" => DataType::Boolean,
+        _ => DataType::Utf8,
+    }
+}
+
+fn key_value_to_typed_column(key_type: &str, key_value: &str) -> Arc<dyn arrow::array::Array> {
+    match key_type {
+        "int32" => Arc::new(Int32Array::from(vec![key_value.parse::<i32>().unwrap_or(0)])),
+        "int64" => Arc::new(Int64Array::from(vec![key_value.parse::<i64>().unwrap_or(0)])),
+        "float64" => Arc::new(Float64Array::from(vec![key_value.parse::<f64>().unwrap_or(0.0)])),
+        "bool" => Arc::new(BooleanArray::from(vec![key_value.parse::<bool>().unwrap_or(false)])),
+        _ => Arc::new(StringArray::from(vec![key_value])),
+    }
+}
+
 #[cfg(test)]
 mod session_state_tests {
     use super::*;
@@ -341,6 +365,7 @@ mod session_state_tests {
     fn session_state_persist_and_restore_roundtrip() {
         let spec = SessionWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -373,6 +398,7 @@ mod session_state_tests {
 
         let mut restored = SessionWindowOperator::new(SessionWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {

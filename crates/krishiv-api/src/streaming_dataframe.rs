@@ -244,7 +244,8 @@ impl StreamingDataFrame {
         };
 
         Ok(Some(LocalWindowExecutionSpec {
-            key_column,
+                key_column,
+                key_column_type: String::from("utf8"),
             event_time_column,
             watermark_lag_ms: self.watermark_lag_ms,
             window_kind,

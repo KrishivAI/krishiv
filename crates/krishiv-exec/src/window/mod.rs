@@ -418,6 +418,7 @@ mod watermark_tests {
         ]));
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {
@@ -467,6 +468,7 @@ mod watermark_tests {
         ]));
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 10_000,
             agg_exprs: vec![AggExpr {

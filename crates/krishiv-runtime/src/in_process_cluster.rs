@@ -118,6 +118,7 @@ pub(crate) fn local_spec_to_plan_spec(spec: &LocalWindowExecutionSpec) -> Window
 
     WindowExecutionSpec {
         key_column: spec.key_column.clone(),
+        key_column_type: spec.key_column_type.clone(),
         event_time_column: spec.event_time_column.clone(),
         watermark_lag_ms: spec.watermark_lag_ms,
         window_kind,
@@ -164,6 +165,7 @@ pub fn plan_spec_to_local(spec: &WindowExecutionSpec) -> LocalWindowExecutionSpe
 
     LocalWindowExecutionSpec {
         key_column: spec.key_column.clone(),
+        key_column_type: spec.key_column_type.clone(),
         event_time_column: spec.event_time_column.clone(),
         watermark_lag_ms: spec.watermark_lag_ms,
         window_kind,
@@ -228,6 +230,7 @@ mod tests {
     fn tumbling_spec() -> LocalWindowExecutionSpec {
         LocalWindowExecutionSpec {
             key_column: "user_id".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: crate::local_streaming::LocalWindowKind::Tumbling,
@@ -334,6 +337,7 @@ mod tests {
         let batch = events_batch(&["a", "b"], &[1_000, 5_000]);
         let spec = LocalWindowExecutionSpec {
             key_column: "user_id".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: crate::local_streaming::LocalWindowKind::Sliding { slide_ms: 5_000 },
@@ -385,6 +389,7 @@ mod tests {
     fn local_spec_to_plan_spec_preserves_fields() {
         let local = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 500,
             window_kind: crate::local_streaming::LocalWindowKind::Sliding { slide_ms: 2_000 },
@@ -407,6 +412,7 @@ mod tests {
     fn plan_spec_to_local_preserves_fields() {
         let plan = krishiv_plan::window::WindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 500,
             window_kind: krishiv_plan::window::WindowKind::Session,
@@ -438,6 +444,7 @@ mod tests {
     fn local_spec_to_plan_spec_tumbling_roundtrip() {
         let local = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: crate::local_streaming::LocalWindowKind::Tumbling,
@@ -458,6 +465,7 @@ mod tests {
     fn local_spec_to_plan_spec_session_roundtrip() {
         let local = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: crate::local_streaming::LocalWindowKind::Session { gap_ms: 3_000 },
@@ -476,6 +484,7 @@ mod tests {
     fn plan_spec_to_local_tumbling_roundtrip() {
         let plan = krishiv_plan::window::WindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: krishiv_plan::window::WindowKind::Tumbling,
@@ -499,6 +508,7 @@ mod tests {
     fn plan_spec_to_local_sliding_roundtrip() {
         let plan = krishiv_plan::window::WindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: krishiv_plan::window::WindowKind::Sliding,
@@ -521,6 +531,7 @@ mod tests {
     fn plan_spec_to_local_sliding_uses_default_slide() {
         let plan = krishiv_plan::window::WindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: krishiv_plan::window::WindowKind::Sliding,
@@ -543,6 +554,7 @@ mod tests {
     fn plan_spec_to_local_session_uses_default_gap() {
         let plan = krishiv_plan::window::WindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: krishiv_plan::window::WindowKind::Session,
@@ -565,6 +577,7 @@ mod tests {
     fn fragment_from_local_spec_sliding() {
         let spec = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: crate::local_streaming::LocalWindowKind::Sliding { slide_ms: 5_000 },
@@ -582,6 +595,7 @@ mod tests {
     fn fragment_from_local_spec_session() {
         let spec = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: crate::local_streaming::LocalWindowKind::Session { gap_ms: 3_000 },

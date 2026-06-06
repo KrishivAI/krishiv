@@ -44,6 +44,10 @@ impl WindowAgg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowExecutionSpec {
     pub key_column: String,
+    /// Arrow type of the key column as a simple string tag: `"int32"`,
+    /// `"int64"`, `"float64"`, `"utf8"`, or `"bool"`.  Defaults to `"utf8"`.
+    #[serde(default = "default_key_type")]
+    pub key_column_type: String,
     pub event_time_column: String,
     pub watermark_lag_ms: u64,
     pub window_kind: WindowKind,
@@ -63,6 +67,10 @@ pub struct WindowExecutionSpec {
     pub source_id_column: Option<String>,
 }
 
+fn default_key_type() -> String {
+    String::from("utf8")
+}
+
 impl WindowExecutionSpec {
     pub fn default_count_agg() -> Vec<WindowAgg> {
         vec![WindowAgg::count("count")]
@@ -75,6 +83,7 @@ impl WindowExecutionSpec {
     ) -> Self {
         Self {
             key_column: key_column.into(),
+            key_column_type: default_key_type(),
             event_time_column: event_time_column.into(),
             watermark_lag_ms: 0,
             window_kind: WindowKind::Tumbling,
@@ -125,6 +134,7 @@ pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec
     };
     let spec = WindowExecutionSpec {
         key_column: parsed.key_col,
+        key_column_type: String::from("utf8"),
         event_time_column: parsed.time_col,
         watermark_lag_ms: parsed.lag_ms,
         window_kind: parsed.window_kind,
@@ -581,6 +591,7 @@ mod tests {
     fn roundtrip_tumbling_fragment() {
         let spec = WindowExecutionSpec {
             key_column: "user_id".into(),
+            key_column_type: default_key_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 1000,
             window_kind: WindowKind::Tumbling,
@@ -607,6 +618,7 @@ mod tests {
         source_watermark_lags.insert(String::from("payments"), 2_000);
         let spec = WindowExecutionSpec {
             key_column: String::from("customer_id"),
+            key_column_type: default_key_type(),
             event_time_column: String::from("event_ts"),
             watermark_lag_ms: 250,
             window_kind: WindowKind::Sliding,
@@ -676,6 +688,7 @@ mod tests {
         source_watermark_lags.insert("payments".to_string(), 2_500);
         let spec = WindowExecutionSpec {
             key_column: "customer_id".into(),
+            key_column_type: default_key_type(),
             event_time_column: "event_ts".into(),
             watermark_lag_ms: 100,
             window_kind: WindowKind::Tumbling,
@@ -724,6 +737,7 @@ mod tests {
     fn roundtrip_fragment_with_colon_in_column_name() {
         let spec = WindowExecutionSpec {
             key_column: "ns:user_id".into(),
+            key_column_type: default_key_type(),
             event_time_column: "ts:ms".into(),
             watermark_lag_ms: 100,
             window_kind: WindowKind::Tumbling,
@@ -745,6 +759,7 @@ mod tests {
     fn roundtrip_fragment_with_backslash_in_column_name() {
         let spec = WindowExecutionSpec {
             key_column: "path\\to".into(),
+            key_column_type: default_key_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: WindowKind::Tumbling,
@@ -767,6 +782,7 @@ mod tests {
         source_watermark_lags.insert("ns:orders".to_string(), 1_000);
         let spec = WindowExecutionSpec {
             key_column: "customer_id".into(),
+            key_column_type: default_key_type(),
             event_time_column: "event_ts".into(),
             watermark_lag_ms: 100,
             window_kind: WindowKind::Tumbling,

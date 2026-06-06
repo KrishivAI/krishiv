@@ -17,6 +17,9 @@ use crate::{ExecError, ExecResult};
 pub struct SlidingWindowSpec {
     /// Column used to key the stream.
     pub key_column: String,
+    /// Arrow type of the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
+    /// Defaults to `"utf8"`.
+    pub key_column_type: String,
     /// Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Total window duration in milliseconds.
@@ -209,6 +212,7 @@ impl SlidingWindowOperator {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
         build_window_record_batch(
             &self.spec.key_column,
+            &self.spec.key_column_type,
             key_value,
             window_start_ms,
             window_end_ms,
@@ -251,6 +255,7 @@ mod sliding_state_tests {
     fn sliding_state_persist_and_restore_roundtrip() {
         let spec = SlidingWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,
@@ -284,6 +289,7 @@ mod sliding_state_tests {
 
         let mut restored = SlidingWindowOperator::new(SlidingWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 2000,
             slide_ms: 1000,

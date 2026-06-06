@@ -142,6 +142,7 @@ pub(crate) fn spec_from_pipeline(pipeline: &StreamPipeline) -> PyResult<LocalWin
             .or_else(|| Some("source_id".to_string()))
     };
     Ok(LocalWindowExecutionSpec {
+                key_column_type: String::from("utf8"),
         key_column,
         event_time_column: event_time,
         watermark_lag_ms: pipeline.max_lateness_ms,

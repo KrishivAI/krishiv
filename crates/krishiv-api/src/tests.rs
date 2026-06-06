@@ -802,6 +802,7 @@ async fn continuous_stream_job_poll_drains_via_coordinator() {
     let session = Session::builder().build().unwrap();
     let spec = LocalWindowExecutionSpec {
         key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
         event_time_column: "ts".into(),
         watermark_lag_ms: 0,
         window_kind: LocalWindowKind::Tumbling,
@@ -844,6 +845,7 @@ async fn continuous_job_id_takes_precedence_over_unbounded_table_name() {
         .expect("register SQL stream");
     let spec = LocalWindowExecutionSpec {
         key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
         event_time_column: "ts".into(),
         watermark_lag_ms: 0,
         window_kind: LocalWindowKind::Tumbling,
@@ -885,6 +887,7 @@ fn duplicate_continuous_job_registration_is_rejected() {
     let session = Session::builder().build().unwrap();
     let spec = LocalWindowExecutionSpec {
         key_column: "user_id".into(),
+        key_column_type: String::from("utf8"),
         event_time_column: "ts".into(),
         watermark_lag_ms: 0,
         window_kind: LocalWindowKind::Tumbling,

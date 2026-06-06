@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{BooleanArray, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -15,8 +15,11 @@ use crate::{ExecError, ExecResult};
 /// Configuration for a tumbling event-time window operator.
 #[derive(Debug, Clone)]
 pub struct TumblingWindowSpec {
-    /// Name of the column to key by (Utf8 or Int64; serialised to String).
+    /// Name of the column to key by.
     pub key_column: String,
+    /// Arrow type of the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
+    /// Defaults to `"utf8"`.
+    pub key_column_type: String,
     /// Name of the Int64 column carrying event time in milliseconds.
     pub event_time_column: String,
     /// Window duration in milliseconds.
@@ -224,6 +227,7 @@ impl TumblingWindowOperator {
         let window_end_ms = window_start_ms + self.spec.window_size_ms as i64;
         build_window_record_batch(
             &self.spec.key_column,
+            &self.spec.key_column_type,
             key_value,
             window_start_ms,
             window_end_ms,
@@ -239,8 +243,11 @@ impl TumblingWindowOperator {
 ///
 /// Used by both `TumblingWindowOperator` and `SlidingWindowOperator` so that
 /// the output schema and column layout stay in sync automatically.
+/// `key_type` is the Arrow type tag for the key column (`"int32"`, `"int64"`,
+/// `"float64"`, `"utf8"`, `"bool"`).
 pub(crate) fn build_window_record_batch(
     key_column: &str,
+    key_type: &str,
     key_value: &str,
     window_start_ms: i64,
     window_end_ms: i64,
@@ -248,8 +255,9 @@ pub(crate) fn build_window_record_batch(
     state: &AggState,
 ) -> ExecResult<RecordBatch> {
     use std::sync::Arc as StdArc;
+    let key_dtype = key_type_to_arrow_data_type(key_type);
     let mut fields = vec![
-        Field::new(key_column, DataType::Utf8, false),
+        Field::new(key_column, key_dtype, false),
         Field::new("window_start_ms", DataType::Int64, false),
         Field::new("window_end_ms", DataType::Int64, false),
     ];
@@ -262,7 +270,7 @@ pub(crate) fn build_window_record_batch(
     }
     let schema = StdArc::new(Schema::new(fields));
     let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = vec![
-        Arc::new(StringArray::from(vec![key_value])),
+        key_value_to_typed_array(key_type, key_value),
         Arc::new(Int64Array::from(vec![window_start_ms])),
         Arc::new(Int64Array::from(vec![window_end_ms])),
     ];
@@ -281,6 +289,26 @@ pub(crate) fn build_window_record_batch(
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
+fn key_type_to_arrow_data_type(key_type: &str) -> DataType {
+    match key_type {
+        "int32" => DataType::Int32,
+        "int64" => DataType::Int64,
+        "float64" => DataType::Float64,
+        "bool" => DataType::Boolean,
+        _ => DataType::Utf8,
+    }
+}
+
+fn key_value_to_typed_array(key_type: &str, key_value: &str) -> Arc<dyn arrow::array::Array> {
+    match key_type {
+        "int32" => Arc::new(Int32Array::from(vec![key_value.parse::<i32>().unwrap_or(0)])),
+        "int64" => Arc::new(Int64Array::from(vec![key_value.parse::<i64>().unwrap_or(0)])),
+        "float64" => Arc::new(Float64Array::from(vec![key_value.parse::<f64>().unwrap_or(0.0)])),
+        "bool" => Arc::new(BooleanArray::from(vec![key_value.parse::<bool>().unwrap_or(false)])),
+        _ => Arc::new(StringArray::from(vec![key_value])),
+    }
+}
+
 #[cfg(test)]
 mod state_tests {
     use super::*;
@@ -291,6 +319,7 @@ mod state_tests {
     fn tumbling_state_persist_and_restore_roundtrip() {
         let spec = TumblingWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -323,6 +352,7 @@ mod state_tests {
 
         let mut restored = TumblingWindowOperator::new(TumblingWindowSpec {
             key_column: "k".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {

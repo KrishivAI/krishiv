@@ -19,6 +19,9 @@ pub enum LocalWindowKind {
 #[derive(Debug, Clone)]
 pub struct LocalWindowExecutionSpec {
     pub key_column: String,
+    /// Arrow type tag for the key column: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
+    /// Defaults to `"utf8"`.
+    pub key_column_type: String,
     pub event_time_column: String,
     pub watermark_lag_ms: u64,
     pub window_kind: LocalWindowKind,
@@ -44,6 +47,7 @@ impl LocalWindowExecutionSpec {
     pub fn new_test_tumbling(key_col: &str, ts_col: &str, window_size_ms: u64) -> Self {
         Self {
             key_column: key_col.to_owned(),
+            key_column_type: "utf8".into(),
             event_time_column: ts_col.to_owned(),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,
@@ -91,6 +95,10 @@ pub fn execute_streaming_window(
         .map_err(|e| RuntimeError::transport(e.to_string()))
 }
 
+fn default_key_column_type() -> String {
+    String::from("utf8")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -119,6 +127,7 @@ mod tests {
     fn tumbling_window_produces_closed_buckets() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
+            key_column_type: default_key_column_type(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,
@@ -137,6 +146,7 @@ mod tests {
     fn session_window_produces_output() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
+            key_column_type: default_key_column_type(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Session { gap_ms: 5_000 },
@@ -154,6 +164,7 @@ mod tests {
     fn empty_input_returns_empty() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
+            key_column_type: default_key_column_type(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,
@@ -171,6 +182,7 @@ mod tests {
     fn sliding_window_produces_output() {
         let spec = LocalWindowExecutionSpec {
             key_column: String::from("user_id"),
+            key_column_type: default_key_column_type(),
             event_time_column: String::from("ts"),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Sliding { slide_ms: 5_000 },
@@ -196,6 +208,7 @@ mod tests {
     fn to_plan_spec_roundtrip() {
         let spec = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: default_key_column_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 100,
             window_kind: LocalWindowKind::Sliding { slide_ms: 3_000 },
@@ -245,6 +258,7 @@ mod tests {
         .unwrap();
         let spec = LocalWindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: default_key_column_type(),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: LocalWindowKind::Tumbling,

@@ -523,6 +523,7 @@ mod tests {
     fn round_trip_continuous_register_sliding_window() {
         let spec = WindowExecutionSpec {
             key_column: "k".into(),
+            key_column_type: String::from("utf8"),
             event_time_column: "ts".into(),
             watermark_lag_ms: 500,
             window_kind: krishiv_plan::window::WindowKind::Sliding,
@@ -557,6 +558,7 @@ mod tests {
     fn round_trip_bounded_window_with_session_spec() {
         let spec = WindowExecutionSpec {
             key_column: "user_id".into(),
+            key_column_type: String::from("utf8"),
             event_time_column: "ts".into(),
             watermark_lag_ms: 0,
             window_kind: krishiv_plan::window::WindowKind::Session,

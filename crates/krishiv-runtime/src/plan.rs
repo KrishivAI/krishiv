@@ -124,6 +124,7 @@ pub fn streaming_spec_from_plan(
 
     Ok(LocalWindowExecutionSpec {
         key_column,
+        key_column_type: String::from("utf8"),
         event_time_column,
         watermark_lag_ms,
         window_kind,

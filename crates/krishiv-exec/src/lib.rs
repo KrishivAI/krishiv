@@ -565,6 +565,7 @@ mod tests {
     fn count_window_spec() -> TumblingWindowSpec {
         TumblingWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000, // 1-second windows
             agg_exprs: vec![AggExpr {
@@ -659,6 +660,7 @@ mod tests {
     fn window_sum_aggregation() {
         let spec = TumblingWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -684,6 +686,7 @@ mod tests {
     fn window_avg_aggregation() {
         let spec = TumblingWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             agg_exprs: vec![AggExpr {
@@ -826,6 +829,7 @@ mod tests {
     fn sliding_spec() -> SlidingWindowSpec {
         SlidingWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             slide_ms: 500,
@@ -911,6 +915,7 @@ mod tests {
     fn sliding_window_avg_aggregation() {
         let spec = SlidingWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             slide_ms: 500,
@@ -938,6 +943,7 @@ mod tests {
     fn session_spec() -> SessionWindowSpec {
         SessionWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -989,6 +995,7 @@ mod tests {
     fn session_window_avg_aggregation() {
         let spec = SessionWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             session_gap_ms: 500,
             agg_exprs: vec![AggExpr {
@@ -1203,6 +1210,7 @@ mod tests {
     fn sliding_window_zero_slide_returns_error() {
         let bad_spec = SlidingWindowSpec {
             key_column: "key".into(),
+            key_column_type: "utf8".into(),
             event_time_column: "ts".into(),
             window_size_ms: 1000,
             slide_ms: 0, // invalid — would cause infinite loop

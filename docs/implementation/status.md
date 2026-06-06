@@ -1,5 +1,57 @@
 # Krishiv Implementation Status
 
+## Production Stabilization Wave 0.10 — Window Key Column Type Fix (2026-06-06)
+
+### Problem
+Window operators (`TumblingWindowOperator`, `SlidingWindowOperator`, `SessionWindowOperator`) hardcoded the key column output type to `DataType::Utf8` regardless of the actual key type. Even though `extract_agg_key` produces typed `AggKey` values, the operators called `.to_string()` and built `StringArray` output, silently converting all keys to strings.
+
+### Fix
+- **Plan layer** (`krishiv-plan/src/window.rs`): Added `key_column_type: String` field (default `"utf8"`) to `WindowExecutionSpec` with serde default. Supported values: `"int32"`, `"int64"`, `"float64"`, `"utf8"`, `"bool"`.
+- **Runtime layer** (`krishiv-runtime/src/local_streaming.rs`): Added `key_column_type: String` to `LocalWindowExecutionSpec`. Propagated through `local_spec_to_plan_spec` and `plan_spec_to_local` conversions. `streaming_spec_from_plan` defaults to `"utf8"`.
+- **Exec layer** (`krishiv-exec/src/window/{tumbling,sliding,session}.rs`, `operator_runtime.rs`, `continuous.rs`): Added `key_column_type` to `TumblingWindowSpec`, `SlidingWindowSpec`, `SessionWindowSpec`. Updated `build_window_record_batch` and session `build_output_batch` to produce correctly-typed key arrays instead of hardcoded `StringArray`.
+- Added helper functions: `key_type_to_arrow_data_type`, `key_value_to_typed_array` (tumbling.rs), and `key_type_to_data_type`, `key_value_to_typed_column` (session.rs).
+
+### Status
+- Default key type is `"utf8"` for backward compatibility. Callers can opt into type-aware keys by setting `key_column_type` on the spec.
+- 199 `krishiv-exec`, 304 `krishiv-runtime`, 60 `krishiv-api`, 46 `krishiv-plan` tests pass.
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test -p krishiv-plan --lib --no-fail-fast
+cargo +nightly test -p krishiv-exec --lib --no-fail-fast  
+cargo +nightly test -p krishiv-runtime --lib --no-fail-fast
+cargo +nightly test -p krishiv-api --lib --no-fail-fast
+cargo +nightly test -p krishiv-ui --lib --no-fail-fast
+cargo +nightly test -p krishiv-operator --lib --no-fail-fast
+```
+
+Next useful commands:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test --workspace --lib --no-fail-fast --exclude krishiv-python
+```
+
+---
+
+## Production Stabilization Wave 0.9 — Plan Validator (completed, no-op)
+
+The plan validator (`krishiv-plan/src/graph.rs`) already returns `Result<(), PlanError>` for all validation paths. No raw `assert!`, `panic!`, or `unwrap()` calls exist in non-test validation code.
+
+---
+
+## Production Stabilization Wave 0.8 — Iceberg REST (completed, prior sprint)
+
+`RestCatalogConfig` already has URL validation, request timeouts, response size limits, pagination deduplication, and endpoint capability enforcement. No new changes required.
+
+---
+
+## Production Stabilization Wave 0.7 — UDTF/DDL Stubs (completed, prior sprint)
+
+Non-SQL UDTF DDL (`LANGUAGE RUST`, `LANGUAGE PYTHON`, missing language) already rejected in `krishiv-sql/src/create_function_ddl.rs` and `krishiv-sql/src/lib.rs`. No new changes required.
+
+---
+
 ## Production Stabilization Wave 0.6 — Library Panic Cleanup (2026-06-06)
 
 ### Runtime

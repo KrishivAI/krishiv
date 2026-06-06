@@ -82,6 +82,7 @@ impl StreamingChain {
         let state_ttl_ms = self.session.state_ttl().map(|c| c.ttl_ms());
 
         Ok(LocalWindowExecutionSpec {
+                key_column_type: String::from("utf8"),
             key_column,
             event_time_column,
             watermark_lag_ms: self.watermark_lag_ms,
