@@ -35,6 +35,8 @@ use crate::error::{OperatorError, OperatorResult};
 pub const JOB_LABEL: &str = "krishiv.io/job";
 /// Label propagated to executors so the scheduler can identify them.
 const EXECUTOR_IDX_LABEL: &str = "krishiv.io/executor-idx";
+/// Heartbeat interval (seconds) injected into every executor pod.
+const EXECUTOR_HEARTBEAT_INTERVAL_SECS: &str = "1";
 /// Environment variable passed to the executor process with the coordinator gRPC endpoint.
 const ENV_COORDINATOR_ENDPOINT: &str = "KRISHIV_COORDINATOR_ENDPOINT";
 /// Environment variable passed to the executor process with its unique executor id.
@@ -107,48 +109,15 @@ impl PodLifecycleManager {
     ) -> OperatorResult<Vec<String>> {
         let namespace = resource.metadata.namespace_or_default();
         let job_name = &resource.metadata.name;
-
-        let max_parallelism = resource.spec.effective_parallelism();
-        let mut target_parallelism = max_parallelism;
-
-        // Plumb HPA (Horizontal Pod Autoscaling) metrics directly into the operator runtime.
-        if resource.spec.mode == crate::crd::job::KrishivJobMode::Streaming {
-            let job_id = resource.metadata.scheduler_job_id();
-            let mut max_lag: i64 = 0;
-
-            // Collect maximum backlog across all partitions for this streaming job
-            krishiv_metrics::global_metrics()
-                .source_offset_lag
-                .iter()
-                .for_each(|entry| {
-                    if entry.key().starts_with(&job_id) {
-                        let lag = entry.value().load(std::sync::atomic::Ordering::Relaxed);
-                        if lag > max_lag {
-                            max_lag = lag;
-                        }
-                    }
-                });
-
-            // Scale out based on data backlogs
-            if max_lag > 50_000 {
-                target_parallelism = max_parallelism;
-            } else if max_lag > 10_000 {
-                target_parallelism = std::cmp::max(1, max_parallelism / 2);
-            } else if max_lag > 1_000 {
-                target_parallelism = std::cmp::max(1, max_parallelism / 4);
-            } else {
-                target_parallelism = 1; // Minimum 1 executor when mostly idle
-            }
-        }
+        let parallelism = resource.spec.effective_parallelism();
+        let job_id = resource.metadata.scheduler_job_id();
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let mut executor_ids = Vec::with_capacity(target_parallelism);
+        let mut executor_ids = Vec::with_capacity(parallelism);
 
-        // Scale UP / Maintain
-        for idx in 0..target_parallelism {
+        for idx in 0..parallelism {
             let executor_id = format!("{job_name}-exec-{idx}");
             let pod_name = format!("{job_name}-exec-{idx}");
-            let job_id = resource.metadata.scheduler_job_id();
 
             let pod = self.build_pod(resource, &pod_name, &executor_id, idx, &job_id);
 
@@ -158,7 +127,7 @@ impl PodLifecycleManager {
                         job = job_name,
                         pod = pod_name,
                         executor_id,
-                        "created executor pod (scaled up)"
+                        "created executor pod"
                     );
                     executor_ids.push(executor_id);
                 }
@@ -176,26 +145,6 @@ impl PodLifecycleManager {
                             "failed to create executor pod {pod_name} for job {job_name}: {err}"
                         ),
                     });
-                }
-            }
-        }
-
-        // Scale DOWN / Cleanup excess pods based on HPA target
-        for idx in target_parallelism..max_parallelism {
-            let pod_name = format!("{job_name}-exec-{idx}");
-            match pods.delete(&pod_name, &DeleteParams::default()).await {
-                Ok(_) => {
-                    info!(
-                        job = job_name,
-                        pod = pod_name,
-                        "deleted executor pod (scaled down)"
-                    );
-                }
-                Err(kube::Error::Api(err)) if err.code == 404 => {
-                    // Already gone
-                }
-                Err(err) => {
-                    warn!(job = job_name, pod = pod_name, error = %err, "failed to delete excess executor pod");
                 }
             }
         }
@@ -274,7 +223,6 @@ pub(crate) fn build_executor_pod(
         .metadata
         .uid
         .as_deref()
-        .filter(|_| resource.metadata.generation >= 0)
         .map(|uid| {
             vec![OwnerReference {
                 api_version: format!("{API_GROUP}/{API_VERSION}"),
@@ -370,13 +318,20 @@ pub(crate) fn build_executor_pod(
 /// Build a `PodTemplateSpec` from a `KrishivJobResource` without a live kube client.
 ///
 /// Used by the admission webhook and dry-run tooling where a full
-/// `PodLifecycleManager` is not available.
+/// `PodLifecycleManager` is not available.  The template uses index 0 for the
+/// executor-id label since a concrete index is not known at template-build time;
+/// callers that create multiple pods should use `build_executor_pod` directly.
 pub fn build_executor_pod_template(
     resource: &KrishivJobResource,
     coordinator_endpoint: &str,
 ) -> PodTemplateSpec {
+    let job_name = &resource.metadata.name;
+    let executor_id = format!("{job_name}-exec-0");
+    let job_id = resource.metadata.scheduler_job_id();
+
     let mut labels: BTreeMap<String, String> = resource.spec.labels.clone();
-    labels.insert(JOB_LABEL.to_owned(), resource.metadata.name.clone());
+    labels.insert(JOB_LABEL.to_owned(), job_name.clone());
+    labels.insert(EXECUTOR_ID_LABEL.to_owned(), executor_id.clone());
 
     let container = Container {
         name: "executor".to_owned(),
@@ -395,8 +350,13 @@ pub fn build_executor_pod_template(
                 ..Default::default()
             },
             EnvVar {
+                name: ENV_EXECUTOR_ID.to_owned(),
+                value: Some(executor_id),
+                ..Default::default()
+            },
+            EnvVar {
                 name: ENV_JOB_ID.to_owned(),
-                value: Some(resource.metadata.scheduler_job_id()),
+                value: Some(job_id),
                 ..Default::default()
             },
             EnvVar {
@@ -434,7 +394,7 @@ fn executor_args(coordinator_endpoint: &str) -> Vec<String> {
         coordinator_endpoint.to_owned(),
         "--connect".to_owned(),
         "--heartbeat-interval-secs".to_owned(),
-        "1".to_owned(),
+        EXECUTOR_HEARTBEAT_INTERVAL_SECS.to_owned(),
     ]
 }
 

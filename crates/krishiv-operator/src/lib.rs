@@ -42,9 +42,10 @@ pub use queue_manager::{
     CrdQueueManager, KrishivQueue, KrishivQueueSpec, KrishivQueueStatus, QUEUE_KIND,
 };
 pub use reconciler::{
-    BootstrapExecutor, KrishivJobReconciler, ReconcileAction, ReconcileOutcome, demo_coordinator,
-    job_spec_from_resource,
+    BootstrapExecutor, KrishivJobReconciler, ReconcileAction, ReconcileOutcome, job_spec_from_resource,
 };
+#[cfg(test)]
+pub use reconciler::demo_coordinator;
 pub use status::{
     ConditionStatus, JobCondition, KrishivJobPhase, KrishivJobStatus, TaskStatusCounters,
 };

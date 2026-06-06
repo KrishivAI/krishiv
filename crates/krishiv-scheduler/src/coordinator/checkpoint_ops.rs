@@ -93,6 +93,7 @@ impl Coordinator {
                     self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
                     CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                     record_checkpoint_epoch(job_id.as_str(), ack.epoch);
+                    krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
                     (CheckpointAckResponse::Accepted, pending)
                 } else {
                     (CheckpointAckResponse::StaleEpoch { current_epoch }, None)

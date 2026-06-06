@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use krishiv_proto::wire::v1::{BarrierKind, CheckpointBarrier};
-use krishiv_proto::{CheckpointAckRequest, ExecutorId, FencingToken, JobId, TaskId};
+use krishiv_proto::{CheckpointAckRequest, CheckpointAckResponse, ExecutorId, FencingToken, JobId, TaskId};
 
 use crate::barrier_client::inject_barrier;
 use crate::barrier_tracker::CheckpointBarrierTracker;
@@ -131,7 +131,18 @@ impl Coordinator {
                 source_offsets: Vec::new(),
                 snapshot_path,
             };
-            let _ = self.handle_checkpoint_ack(request);
+            match self.handle_checkpoint_ack(request) {
+                CheckpointAckResponse::Accepted => {}
+                response => {
+                    tracing::warn!(
+                        job_id = job_id.as_str(),
+                        task_id = task_id.as_str(),
+                        epoch,
+                        ?response,
+                        "barrier ack rejected during fanout"
+                    );
+                }
+            }
         }
     }
 }

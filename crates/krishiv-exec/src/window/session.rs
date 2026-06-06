@@ -225,7 +225,7 @@ impl SessionWindowOperator {
                 output.push(self.build_output_batch(
                     &key,
                     s.session_start_ms,
-                    s.last_event_time_ms + gap,
+                    s.last_event_time_ms.saturating_add(gap),
                     &s.agg,
                 )?);
             }
@@ -269,7 +269,7 @@ impl SessionWindowOperator {
                 output.push(self.build_output_batch(
                     &key,
                     s.session_start_ms,
-                    s.last_event_time_ms + gap,
+                    s.last_event_time_ms.saturating_add(gap),
                     &s.agg,
                 )?);
             }

@@ -646,14 +646,20 @@ async fn readyz(
     State(coordinator): State<SharedCoordinator>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let c = coordinator.read().await;
-    if c.state() == CoordinatorState::Active {
-        Ok("ready\n")
-    } else {
-        Err((
+    if c.state() != CoordinatorState::Active {
+        return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "coordinator is not active\n".to_owned(),
-        ))
+        ));
     }
+    let healthy_executors = c.executors().executors.values().filter(|e| e.state.can_accept_work()).count();
+    if healthy_executors == 0 {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no healthy executors registered\n".to_owned(),
+        ));
+    }
+    Ok("ready\n")
 }
 
 async fn metrics(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {

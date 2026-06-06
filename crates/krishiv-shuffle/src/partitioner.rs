@@ -6,24 +6,45 @@ use arrow::compute::take;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Splits an Arrow `RecordBatch` into N buckets by hashing one key column.
 ///
 /// Supported key column types: `Int32`, `Int64`, `Utf8`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HashPartitioner {
     key_column: String,
     buckets: u32,
+    null_key_count: AtomicU64,
+}
+
+impl Clone for HashPartitioner {
+    fn clone(&self) -> Self {
+        Self {
+            key_column: self.key_column.clone(),
+            buckets: self.buckets,
+            null_key_count: AtomicU64::new(0),
+        }
+    }
 }
 
 impl HashPartitioner {
-    /// Create a partitioner that splits on `key_column` into `buckets` buckets.
     pub fn new(key_column: impl Into<String>, buckets: u32) -> Self {
         Self {
             key_column: key_column.into(),
             buckets,
+            null_key_count: AtomicU64::new(0),
         }
+    }
+
+    pub fn null_key_count(&self) -> u64 {
+        self.null_key_count.load(Ordering::Relaxed)
+    }
+
+    fn inc_null(&self) -> u32 {
+        self.null_key_count.fetch_add(1, Ordering::Relaxed);
+        0
     }
 
     /// Partition `batch` into `self.buckets` sub-batches.
@@ -60,7 +81,7 @@ impl HashPartitioner {
                     })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
                     if arr.is_null(row) {
-                        0
+                        self.inc_null()
                     } else {
                         hash_i64(arr.value(row) as i64, self.buckets)
                     }
@@ -75,7 +96,7 @@ impl HashPartitioner {
                     })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
                     if arr.is_null(row) {
-                        0
+                        self.inc_null()
                     } else {
                         hash_i64(arr.value(row), self.buckets)
                     }
@@ -90,7 +111,7 @@ impl HashPartitioner {
                     })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
                     if arr.is_null(row) {
-                        0
+                        self.inc_null()
                     } else {
                         hash_str(arr.value(row), self.buckets)
                     }
@@ -105,7 +126,7 @@ impl HashPartitioner {
                     })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
                     if arr.is_null(row) {
-                        0
+                        self.inc_null()
                     } else {
                         hash_str(arr.value(row), self.buckets)
                     }
@@ -120,7 +141,7 @@ impl HashPartitioner {
                     })?;
                 fill_buckets(num_rows, self.buckets, &mut bucket_indices, |row| {
                     if arr.is_null(row) {
-                        0
+                        self.inc_null()
                     } else {
                         hash_str(arr.value(row), self.buckets)
                     }

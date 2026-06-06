@@ -4229,7 +4229,6 @@ dependencies = [
  "k8s-openapi",
  "krishiv-checkpoint",
  "krishiv-common",
- "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
  "krishiv-ui",

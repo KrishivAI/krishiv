@@ -27,6 +27,7 @@ pub struct KrishivQueueSpec {
     #[serde(default)]
     pub max_concurrent_jobs: Option<usize>,
     /// Scheduling priority band (0 = lowest, 255 = highest; default 128).
+    /// Reserved for future priority-based queue ordering; not yet read by `admit()`.
     #[serde(default = "default_priority")]
     pub priority: u8,
 }

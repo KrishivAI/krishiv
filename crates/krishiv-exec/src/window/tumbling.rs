@@ -64,6 +64,31 @@ impl TumblingWindowOperator {
         }
     }
 
+    /// Validate the spec before accepting it.
+    pub fn validate_spec(spec: &TumblingWindowSpec) -> ExecResult<()> {
+        if spec.window_size_ms == 0 {
+            return Err(ExecError::InvalidWindowConfig(
+                "tumbling window_size_ms must be non-zero".into(),
+            ));
+        }
+        if spec.window_size_ms > i64::MAX as u64 {
+            return Err(ExecError::InvalidWindowConfig(
+                format!(
+                    "tumbling window_size_ms ({}) exceeds i64::MAX",
+                    spec.window_size_ms,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn window_start(event_time_ms: i64, window_size_ms: u64) -> i64 {
+        let size = window_size_ms as i64;
+        let q = event_time_ms / size;
+        let r = event_time_ms % size;
+        if r < 0 { (q - 1) * size } else { q * size }
+    }
+
     /// Attach a late-event handler that receives each dropped late event.
     pub fn with_late_event_handler(mut self, handler: Box<dyn LateEventHandler>) -> Self {
         self.late_event_handler = Some(handler);
@@ -113,15 +138,6 @@ impl TumblingWindowOperator {
             self.prev_watermark_ms = wm;
         }
         Ok(())
-    }
-
-    /// Compute the window start for an event time using floor division.
-    fn window_start(event_time_ms: i64, window_size_ms: u64) -> i64 {
-        let size = window_size_ms as i64;
-        // Integer floor division that works for negative timestamps too.
-        let q = event_time_ms / size;
-        let r = event_time_ms % size;
-        if r < 0 { (q - 1) * size } else { q * size }
     }
 
     /// Process one `RecordBatch`.

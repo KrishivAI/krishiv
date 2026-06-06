@@ -232,6 +232,25 @@ mod operator_tests {
     }
 
     #[test]
+    fn executor_pod_template_includes_executor_id_label_and_env() {
+        let resource = sample_resource();
+        let template = build_executor_pod_template(&resource, "http://krishiv-coordinator:9090");
+        let meta = template.metadata.expect("pod template metadata");
+        let labels = meta.labels.expect("pod template labels");
+        assert!(
+            labels.contains_key(EXECUTOR_ID_LABEL),
+            "template must carry executor-id label for pod-failure detection"
+        );
+        let spec = template.spec.expect("pod template spec");
+        let container = spec.containers.first().expect("executor container");
+        let env = container.env.as_ref().expect("executor env");
+        assert!(
+            env.iter().any(|e| e.name == "KRISHIV_EXECUTOR_ID"),
+            "template must inject KRISHIV_EXECUTOR_ID env var"
+        );
+    }
+
+    #[test]
     fn build_pod_omits_hostpath_volume() {
         let resource = sample_resource();
         let pod = build_executor_pod(&resource, "sample-batch-exec-0", "exec-0", 0, "job-0", "http://krishiv-coordinator:9090");
@@ -439,6 +458,7 @@ mod operator_tests {
         let outcome = reconciler.reconcile(&mut coordinator, &resource).unwrap();
 
         assert_eq!(outcome.action(), ReconcileAction::FinalizerRemoved);
+        assert_eq!(outcome.status().phase, KrishivJobPhase::Cancelled);
     }
 
     #[test]
@@ -884,16 +904,12 @@ mod operator_tests {
         assert_eq!(patch["status"]["observedGeneration"], 3);
     }
 
-    /// Simulate a concurrent-update scenario: two coordinators produce status
-    /// patches in parallel.  With `Patch::Apply` + `fieldManager`, the API
-    /// server tracks field ownership, so the last writer wins for its own fields
-    /// rather than silently overwriting unrelated fields the way `Patch::Merge`
-    /// does.  This test documents the expected apply params.
+    /// Verify the params used by `patch_krishivjob_status`: field manager is set
+    /// and force=true so concurrent SSA updates for owned fields always win.
     #[test]
     fn patch_apply_params_are_correct() {
         use kube::api::PatchParams;
 
-        // PatchParams::apply sets field_manager and is suitable for Patch::Apply.
         let params = PatchParams::apply(FIELD_MANAGER).force();
         assert_eq!(
             params.field_manager.as_deref(),

@@ -5,7 +5,7 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use serde_json::{Value, json};
 
-use crate::constants::{API_GROUP, API_VERSION, FINALIZER, KIND};
+use crate::constants::{API_GROUP, API_VERSION, FIELD_MANAGER, FINALIZER, KIND};
 use crate::crd::job::{KrishivJobResource, KrishivJobStatus};
 use crate::error::OperatorResult;
 
@@ -61,9 +61,16 @@ pub async fn patch_krishivjob_status(
     resource: &KrishivJobResource,
     status: &KrishivJobStatus,
 ) -> OperatorResult<()> {
-    let params = PatchParams::default();
-    let patch = status_patch(status);
-    jobs.patch_status(&resource.metadata.name, &params, &Patch::Merge(&patch))
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    // SSA requires apiVersion/kind/metadata so the server can track field
+    // ownership; the status subresource ignores spec fields in the document.
+    let doc = json!({
+        "apiVersion": format!("{API_GROUP}/{API_VERSION}"),
+        "kind": KIND,
+        "metadata": { "name": &resource.metadata.name },
+        "status": status,
+    });
+    jobs.patch_status(&resource.metadata.name, &params, &Patch::Apply(doc))
         .await?;
     Ok(())
 }

@@ -470,10 +470,17 @@ impl FlightClientPool {
                 })?
                 .into_inner();
             let mut buf = Vec::new();
+            let max_response_bytes: usize = 64 * 1024 * 1024; // 64 MiB cap
             while let Some(item) = stream.next().await {
                 let part =
                     item.map_err(|e| RuntimeError::transport(format!("do_action stream: {e}")))?;
                 buf.extend_from_slice(&part.body);
+                if buf.len() > max_response_bytes {
+                    return Err(RuntimeError::transport(format!(
+                        "do_action response exceeded {} MiB limit",
+                        max_response_bytes / (1024 * 1024),
+                    )));
+                }
             }
             Ok(buf)
         })

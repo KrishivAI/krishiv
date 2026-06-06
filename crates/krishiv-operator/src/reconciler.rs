@@ -3,11 +3,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use krishiv_proto::{
-    CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
-    JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec,
-};
-use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError, SharedCoordinator};
+use krishiv_proto::{CoordinatorId, JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+#[cfg(test)]
+use krishiv_proto::{ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState};
+use krishiv_scheduler::{Coordinator, JobSnapshot, SchedulerError};
 
 use crate::constants::{API_GROUP, API_VERSION, KIND};
 use crate::crd::job::{
@@ -90,38 +89,19 @@ impl KrishivJobReconciler {
         }
     }
 
-    /// Start a per-job orchestration loop when `dedicatedCoordinator` is
-    /// enabled in the `KrishivJob` spec.
+    /// Record that a dedicated per-job orchestration loop has been requested
+    /// for `job_id` (when `dedicatedCoordinator: true` in the `KrishivJob` spec).
     ///
-    /// The operator runs the loop **inside its own process** sharing the
-    /// operator's `SharedCoordinator` — this avoids the original A3/E1 bug
-    /// where standalone JCP daemons could never see executor heartbeats
-    /// because executors register with the CCP, not the JCP.
-    ///
-    /// Standalone "JCP pod" deployments (when the operator launches a pod
-    /// per job) use the new RPC-client mode in `krishiv-job-coordinator`
-    /// which only watches its job over the federation HTTP endpoint.
-    pub fn ensure_dedicated_job_loop(
-        &self,
-        cluster: &SharedCoordinator,
-        job_id: &JobId,
-        enabled: bool,
-    ) {
+    /// Per-job JCP loops are integrated into the main coordinator tick
+    /// (Track B two-tier model); this call is deduplication bookkeeping only.
+    pub fn ensure_dedicated_job_loop(&self, job_id: &JobId, enabled: bool) {
         if !enabled {
             return;
         }
         let Ok(mut guard) = self.dedicated_loops.lock() else {
             return;
         };
-        if !guard.insert(job_id.clone()) {
-            return;
-        }
-        drop(guard);
-        // Per-job JCP loops are now integrated into the main coordinator tick
-        // via advance_heartbeat_tick and drive_pending_task_launches (Track B
-        // two-tier model). The operator's SharedCoordinator handle is already
-        // wired to the same Coordinators; no dedicated spawn needed here.
-        let _ = cluster;
+        guard.insert(job_id.clone());
     }
 
     /// Active coordinator id used in status patches.
@@ -147,25 +127,39 @@ impl KrishivJobReconciler {
     ) -> OperatorResult<ReconcileOutcome> {
         // Finalizer lifecycle: add on first observe; remove on deletion after cleanup.
         if resource.metadata.is_being_deleted() {
-            // Resource is being deleted — cancel the scheduler job if it exists and
-            // signal that the finalizer should be stripped so Kubernetes can proceed.
-            let job_id = scheduler_job_id(resource)?;
-            if let Err(error) = coordinator.cancel_job(&job_id) {
-                // UnknownJob is expected when the coordinator restarted without
-                // durable state; surface anything else so the operator does
-                // not get stuck in Terminating.
-                if !matches!(error, SchedulerError::UnknownJob { .. }) {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %error,
-                        "coordinator.cancel_job failed during finalizer cleanup; \
-                         CRD may stay in Terminating until next reconcile"
-                    );
+            // Resource is being deleted — attempt to cancel the scheduler job.
+            // If scheduler_job_id fails (e.g. empty name via admission bypass) we
+            // still strip the finalizer so the resource is never permanently stuck
+            // in Terminating.
+            if let Ok(job_id) = scheduler_job_id(resource) {
+                if let Err(error) = coordinator.cancel_job(&job_id) {
+                    // UnknownJob is expected when the coordinator restarted without
+                    // durable state; surface anything else so the operator does
+                    // not get stuck in Terminating.
+                    if !matches!(error, SchedulerError::UnknownJob { .. }) {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %error,
+                            "coordinator.cancel_job failed during finalizer cleanup; \
+                             CRD may stay in Terminating until next reconcile"
+                        );
+                    }
                 }
             }
-            let status = match coordinator.job_snapshot(&job_id) {
-                Ok(snapshot) => status_from_snapshot(resource, &self.coordinator_id, &snapshot),
-                Err(_) => accepted_waiting_for_executors(resource, &self.coordinator_id),
+            // Always report Cancelled so the final status patch reflects the
+            // deletion intent, regardless of coordinator state.
+            let status = KrishivJobStatus {
+                phase: KrishivJobPhase::Cancelled,
+                coordinator: Some(self.coordinator_id.to_string()),
+                observed_generation: resource.metadata.generation,
+                stages: 0,
+                tasks: TaskStatusCounters::default(),
+                conditions: vec![JobCondition::new(
+                    "Scheduled",
+                    ConditionStatus::False,
+                    "JobDeleted",
+                    "KrishivJob is being deleted",
+                )],
             };
             return Ok(ReconcileOutcome {
                 action: ReconcileAction::FinalizerRemoved,
@@ -260,6 +254,7 @@ pub fn job_spec_from_resource(resource: &KrishivJobResource) -> OperatorResult<J
 }
 
 /// Build a deterministic local coordinator with one healthy executor for tests.
+#[cfg(test)]
 pub fn demo_coordinator(
     coordinator_id: CoordinatorId,
     slots: usize,

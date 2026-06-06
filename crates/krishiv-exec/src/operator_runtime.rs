@@ -38,6 +38,7 @@ fn open_state_backend(
 
 use crate::watermark_util::advance_effective_watermark;
 use crate::window::MultiSourceWatermarkState;
+use crate::window::tumbling::TumblingWindowOperator;
 use crate::{
     AggExpr, AggFunction, ExecError, ExecResult, SessionWindowSpec, SlidingWindowSpec,
     StateBackedSessionWindowOperator, StateBackedSlidingWindowOperator,
@@ -100,6 +101,8 @@ pub fn execute_bounded_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
+            TumblingWindowOperator::validate_spec(&tw_spec)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")
@@ -200,6 +203,8 @@ pub fn execute_streaming_window(
                 window_size_ms: spec.window_size_ms,
                 agg_exprs: agg_exprs.clone(),
             };
+            TumblingWindowOperator::validate_spec(&tw_spec)
+                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?;
             let state = open_state_backend(state_dir, "tumbling", spec.state_ttl_ms)?;
             let mut op =
                 StateBackedTumblingWindowOperator::new(tw_spec, state, "window-exec", "tumbling")

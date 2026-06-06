@@ -20,9 +20,6 @@ pub enum OperatorError {
     /// Serialization or deserialization failed.
     #[error("serialization failed: {message}")]
     Serialization { message: String },
-    /// Shared coordinator lock was poisoned.
-    #[error("shared coordinator lock was poisoned")]
-    CoordinatorLockPoisoned,
 }
 
 #[cfg(feature = "k8s")]

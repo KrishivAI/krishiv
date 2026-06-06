@@ -292,6 +292,7 @@ pub struct KrishivMetrics {
     tasks_running: AtomicU64,
     tasks_succeeded: AtomicU64,
     tasks_failed: AtomicU64,
+    executor_lost: AtomicU64,
     shuffle_bytes_written: AtomicU64,
     job_queue_depth: AtomicU64,
     /// Current committed checkpoint epoch per job_id (gauge, keyed by job_id).
@@ -372,6 +373,11 @@ impl KrishivMetrics {
     /// Record a failed task.
     pub fn inc_tasks_failed(&self) {
         self.tasks_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an executor heartbeat timeout (executor marked lost).
+    pub fn inc_executor_lost(&self) {
+        self.executor_lost.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Add shuffle bytes written.
@@ -622,6 +628,11 @@ impl KrishivMetrics {
         out.push_str("# HELP krishiv_tasks_running Currently running tasks\n");
         out.push_str("# TYPE krishiv_tasks_running gauge\n");
         out.push_str(&format!("krishiv_tasks_running {running}\n"));
+
+        let executor_lost = self.executor_lost.load(Ordering::Relaxed);
+        out.push_str("# HELP krishiv_executor_lost_total Executors marked lost (heartbeat timeout)\n");
+        out.push_str("# TYPE krishiv_executor_lost_total counter\n");
+        out.push_str(&format!("krishiv_executor_lost_total {executor_lost}\n"));
 
         let shuffle_bytes = self.shuffle_bytes_written.load(Ordering::Relaxed);
         out.push_str("# HELP krishiv_shuffle_bytes_written_total Shuffle bytes written\n");

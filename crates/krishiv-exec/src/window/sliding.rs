@@ -55,6 +55,19 @@ impl SlidingWindowOperator {
                 "slide_ms must be greater than zero".into(),
             ));
         }
+        if spec.window_size_ms == 0 {
+            return Err(ExecError::InvalidWindowConfig(
+                "window_size_ms must be non-zero".into(),
+            ));
+        }
+        if spec.window_size_ms > i64::MAX as u64 || spec.slide_ms > i64::MAX as u64 {
+            return Err(ExecError::InvalidWindowConfig(
+                format!(
+                    "sliding window size ({}) or slide ({}) exceeds i64::MAX",
+                    spec.window_size_ms, spec.slide_ms,
+                ),
+            ));
+        }
         Ok(Self {
             spec,
             accumulators: HashMap::new(),
@@ -110,20 +123,21 @@ impl SlidingWindowOperator {
     fn window_starts(event_time_ms: i64, size_ms: u64, slide_ms: u64) -> Vec<i64> {
         let slide = slide_ms as i64;
         let size = size_ms as i64;
-        // The largest multiple of slide that is ≤ event_time_ms.
+
         let q = event_time_ms / slide;
         let r = event_time_ms % slide;
         let first = if r < 0 { (q - 1) * slide } else { q * slide };
-        // Number of overlapping windows = ceil(size / slide).
-        let count = ((size + slide - 1) / slide) as usize;
-        let mut starts = Vec::with_capacity(count);
+
+        let count = match (size as u64).checked_add(slide_ms).and_then(|n| n.checked_sub(1)) {
+            Some(n) => (n / slide_ms) as usize,
+            None => usize::MAX,
+        };
+        let mut starts = Vec::with_capacity(count.min(1024));
         let mut s = first;
-        while s + size > event_time_ms {
+        while let Some(sum) = s.checked_add(size) {
+            if sum <= event_time_ms { break; }
             starts.push(s);
-            // Safety: break if decrement would go past any valid window.
-            if s.checked_sub(slide).is_none() {
-                break;
-            }
+            if s.checked_sub(slide).is_none() { break; }
             s -= slide;
         }
         starts

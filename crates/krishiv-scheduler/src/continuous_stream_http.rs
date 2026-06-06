@@ -246,6 +246,7 @@ mod tests {
     fn tumbling_spec() -> WindowExecutionSpec {
         WindowExecutionSpec {
             key_column: "user_id".to_string(),
+            key_column_type: String::from("utf8"),
             event_time_column: "ts".to_string(),
             watermark_lag_ms: 0,
             window_kind: WindowKind::Tumbling,

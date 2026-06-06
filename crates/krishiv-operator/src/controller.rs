@@ -16,6 +16,7 @@ use crate::dynamic::{
     patch_krishivjob_finalizer, patch_krishivjob_status, remove_krishivjob_finalizer,
 };
 use crate::error::{OperatorError, OperatorResult};
+use krishiv_scheduler::SchedulerError;
 use crate::pod_manager::PodLifecycleManager;
 use crate::reconciler::*;
 use crate::status::KrishivJobStatus;
@@ -226,16 +227,23 @@ pub async fn run_kubernetes_controller_with_client(
 ) -> OperatorResult<()> {
     let pod_manager = PodLifecycleManager::new(client.clone(), config.coordinator_endpoint());
     let runtime = KubernetesControllerRuntime::new(&config)?.with_pod_manager(pod_manager);
+    // Non-HA path: no external leader-election loop manages orchestration, so
+    // we own the handles here and shut them down when the watcher exits.
+    let _orchestration = runtime.coordinator.spawn_orchestration_loops();
     run_kubernetes_controller_runtime_with_client(client, config, runtime).await
 }
 
 /// Run the live Kubernetes controller with an explicit shared runtime.
+///
+/// Orchestration loops are **not** started here; the caller is responsible for
+/// managing them.  In the non-HA path, `run_kubernetes_controller_with_client`
+/// owns the handles.  In the HA path, `spawn_coordinator_leader_election` in
+/// `main.rs` starts and stops loops tied to lease ownership.
 pub async fn run_kubernetes_controller_runtime_with_client(
     client: Client,
     config: KubernetesControllerConfig,
     runtime: KubernetesControllerRuntime,
 ) -> OperatorResult<()> {
-    let orchestration = runtime.coordinator.spawn_orchestration_loops();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let jobs = krishivjob_api(client, config.namespace())?;
     let watcher_config = watcher_config(&config);
@@ -244,7 +252,7 @@ pub async fn run_kubernetes_controller_runtime_with_client(
     let status_runtime = runtime.clone();
     let mut status_shutdown_rx = shutdown_rx.clone();
     let status_handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -277,7 +285,10 @@ pub async fn run_kubernetes_controller_runtime_with_client(
             WatchEvent::Apply(object) | WatchEvent::InitApply(object) => {
                 if let Err(e) = reconcile_dynamic_object_with_runtime(&jobs, &runtime, object).await
                 {
-                    if e.to_string().contains("InactiveCoordinator") {
+                    if matches!(
+                        e,
+                        OperatorError::Scheduler(SchedulerError::InactiveCoordinator { .. })
+                    ) {
                         tracing::debug!(
                             "skipping reconcile because coordinator is inactive (standby mode)"
                         );
@@ -292,7 +303,6 @@ pub async fn run_kubernetes_controller_runtime_with_client(
 
     let _ = shutdown_tx.send(true);
     status_handle.abort();
-    orchestration.shutdown();
 
     Ok(())
 }
@@ -347,7 +357,6 @@ pub async fn reconcile_dynamic_object_with_runtime(
                     }
                 }
                 runtime.reconciler.ensure_dedicated_job_loop(
-                    &runtime.coordinator,
                     job_id,
                     resource.spec.dedicated_coordinator,
                 );

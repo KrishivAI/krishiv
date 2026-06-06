@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             runtime,
             config.status_addr,
             config.executor_grpc_addr,
+            config.http_sidecar_addr,
         )
         .await?;
     } else {
@@ -115,6 +116,7 @@ async fn run_controller_with_servers(
     runtime: KubernetesControllerRuntime,
     status_addr: Option<SocketAddr>,
     executor_grpc_addr: Option<SocketAddr>,
+    http_sidecar_addr: SocketAddr,
 ) -> Result<(), Box<dyn Error>> {
     #[cfg(not(feature = "ui"))]
     if status_addr.is_some() {
@@ -148,7 +150,7 @@ async fn run_controller_with_servers(
         None => None,
     };
 
-    let http_listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    let http_listener = tokio::net::TcpListener::bind(http_sidecar_addr).await?;
     let http_coordinator = runtime.coordinator().clone();
     let http_config = krishiv_scheduler::CoordinatorDaemonConfig::http_sidecar(
         krishiv_checkpoint::DurabilityProfile::DistributedDurable,
@@ -218,8 +220,15 @@ fn spawn_coordinator_leader_election(
     coordinator_id: String,
 ) {
     let ns = namespace.unwrap_or_else(|| "krishiv-system".to_string());
+    // Holder identity must be unique per pod so that two operator replicas do
+    // not share the same identity and inadvertently both believe they hold the
+    // lease.  POD_NAME is the canonical source (set via the downward API);
+    // HOSTNAME is the fallback for bare-metal / local runs.
+    let holder_identity = std::env::var("POD_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| coordinator_id.clone());
     let election: std::sync::Arc<dyn LeaderElection + Send + Sync> = std::sync::Arc::new(
-        K8sLeaseElection::new(&coordinator_id, &ns, &coordinator_id).with_kube_client(client),
+        K8sLeaseElection::new(&coordinator_id, &ns, &holder_identity).with_kube_client(client),
     );
 
     // E3: orchestration loops are tied to leadership.  We hold the handles
@@ -281,6 +290,8 @@ struct OperatorCliConfig {
     bootstrap_executor_slots: Option<usize>,
     status_addr: Option<SocketAddr>,
     executor_grpc_addr: Option<SocketAddr>,
+    /// Coordinator HTTP sidecar address (health-check / state API); defaults to 0.0.0.0:8080.
+    http_sidecar_addr: SocketAddr,
     help: bool,
 }
 
@@ -301,6 +312,9 @@ impl OperatorCliConfig {
             bootstrap_executor_slots: None,
             status_addr: None,
             executor_grpc_addr: None,
+            http_sidecar_addr: "0.0.0.0:8080"
+                .parse()
+                .expect("default sidecar addr is valid"),
             help: false,
         };
         let mut args = args.into_iter();
@@ -359,6 +373,12 @@ impl OperatorCliConfig {
                             .parse()
                             .map_err(|_| format!("invalid socket address: {value}"))?,
                     );
+                }
+                "--http-sidecar-addr" => {
+                    let value = next_arg(&mut args, "--http-sidecar-addr")?;
+                    config.http_sidecar_addr = value
+                        .parse()
+                        .map_err(|_| format!("invalid socket address: {value}"))?;
                 }
                 "--help" | "-h" => config.help = true,
                 unknown => return Err(format!("unknown option: {unknown}\n\n{}", Self::help())),
@@ -433,6 +453,7 @@ impl OperatorCliConfig {
            --bootstrap-executor-slots <N>   Register a bootstrap executor with N slots\n\
            --status-addr <HOST:PORT>        Serve scheduler-backed status API/UI on this address\n\
            --executor-grpc-addr <HOST:PORT> Serve coordinator/executor gRPC on this address\n\
+           --http-sidecar-addr <HOST:PORT>  Coordinator HTTP sidecar address (default: 0.0.0.0:8080)\n\
            -h, --help                       Show help\n"
     }
 }

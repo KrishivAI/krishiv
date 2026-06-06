@@ -198,6 +198,7 @@ impl Coordinator {
         self.prune_executor_channel(executor_id);
         self.executors.mark_lost(executor_id)?;
         self.reset_running_tasks_for_lost_executor(executor_id);
+        krishiv_metrics::global_metrics().inc_executor_lost();
         Ok(())
     }
 

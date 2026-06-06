@@ -1,5 +1,48 @@
 # Krishiv Implementation Status
 
+## Production Stabilization Waves 1–4 — Data Correctness, Scheduler, Runtime, Observability (2026-06-06)
+
+### Wave 1 — Data Correctness
+- **`krishiv-exec/src/window/tumbling.rs`**: Added `validate_spec()` with zero-check and `window_size_ms > i64::MAX` guard. Called from `execute_bounded_window` and `execute_streaming_window`.
+- **`krishiv-exec/src/window/sliding.rs`**: Added `window_size_ms == 0` and u64→i64 overflow validation to `SlidingWindowOperator::new()`. Replaced `s + size > event_time_ms` overflow-prone arithmetic with `checked_add`. Replaced `(size + slide - 1) / slide` overflow-prone count with `checked_add`/`checked_sub`.
+- **`krishiv-exec/src/window/session.rs`**: Fixed `s.last_event_time_ms + gap` → `s.saturating_add(gap)` for consistent overflow handling with `flush_closed_sessions`.
+- **`krishiv-shuffle/src/partitioner.rs`**: Added `null_key_count: AtomicU64` to `HashPartitioner` for tracking null-key routing (all nulls → bucket 0). Exposed via `null_key_count()` accessor. Manual `Clone` impl resets counter on clone.
+
+### Wave 2 — Scheduler Hardening
+- **`krishiv-scheduler/src/barrier_dispatch.rs`**: Replaced `let _ = self.handle_checkpoint_ack(request)` with explicit `match` that logs `CheckpointAckResponse::Accepted` vs rejected variants.
+
+### Wave 3 — Runtime/Flight/Continuous Stream
+- **`krishiv-runtime/src/flight_client.rs`**: Added 64 MiB response size cap on `do_action` stream reads; returns `RuntimeError::transport` if exceeded.
+- **`krishiv-runtime/src/continuous_stream.rs`**: Capped `drain_job()` to `Self::DEFAULT_MAX_DRAIN_BATCHES` (256) instead of `usize::MAX`, preventing unbounded memory use.
+
+### Wave 4 — Observability & Shutdown
+- **`krishiv-metrics/src/lib.rs`**: Added `executor_lost` atomic counter and `inc_executor_lost()` method. Added Prometheus renderer line for `krishiv_executor_lost_total`.
+- **`krishiv-scheduler/src/coordinator/executor_ops.rs`**: Added `inc_executor_lost()` metric call in `mark_executor_lost`.
+- **`krishiv-scheduler/src/coordinator/job_lifecycle.rs`**: Added `inc_tasks_succeeded()` and `inc_tasks_failed()` metric calls in `apply_task_update`.
+- **`krishiv-scheduler/src/coordinator/checkpoint_ops.rs`**: Added missing `inc_checkpoint_committed()` to async checkpoint ack path (was only in sync path).
+- **`krishiv-scheduler/src/coordinator_daemon.rs`**: `readyz` now checks for healthy executors in addition to `Active` state; returns 503 when no executors can accept work.
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test -p krishiv-exec --lib --no-fail-fast      # 199 ✓
+cargo +nightly test -p krishiv-scheduler --lib --no-fail-fast  # 282 ✓
+cargo +nightly test -p krishiv-metrics --lib --no-fail-fast    # 70 ✓
+cargo +nightly test -p krishiv-runtime --lib --no-fail-fast    # 304 ✓
+cargo +nightly test -p krishiv-api --lib --no-fail-fast        # 60 ✓
+cargo +nightly test -p krishiv-ui --lib --no-fail-fast         # 18 ✓
+cargo +nightly test -p krishiv-executor --lib --no-fail-fast   # 183 ✓
+cargo +nightly test -p krishiv-flight-sql --lib --no-fail-fast # 1 ✓
+```
+
+Next useful commands:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test --workspace --lib --no-fail-fast --exclude krishiv-python
+```
+
+---
+
 ## Production Stabilization Wave 0.10 — Window Key Column Type Fix (2026-06-06)
 
 ### Problem

@@ -329,13 +329,11 @@ impl ContinuousStreamRegistry {
         Ok(output)
     }
 
-    /// Drain ALL pending input batches through the window operator.
+    /// Drain up to [`DEFAULT_MAX_DRAIN_BATCHES`] batches through the operator.
     ///
-    /// Equivalent to calling [`drain_job_up_to`] with `usize::MAX`. For large
-    /// input queues, prefer `drain_job_up_to(job_id, DEFAULT_MAX_DRAIN_BATCHES)`
-    /// in a loop to avoid memory spikes.
+    /// For draining all pending batches, loop until this returns empty results.
     pub fn drain_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        self.drain_job_up_to(job_id, usize::MAX)
+        self.drain_job_up_to(job_id, Self::DEFAULT_MAX_DRAIN_BATCHES)
     }
 
     /// Borrow the window spec for coordinator fragment encoding.

@@ -247,6 +247,7 @@ impl Coordinator {
         // Record failure and, if the executor is now bad, clear the assignment
         // so the task can be re-assigned to a healthy executor on the next launch cycle.
         if terminal_state == TaskState::Failed {
+            krishiv_metrics::global_metrics().inc_tasks_failed();
             krishiv_governance::audit_log(
                 "scheduler",
                 &krishiv_governance::AuditAction::TaskFailed {
@@ -296,6 +297,7 @@ impl Coordinator {
                 self.notify.notify_waiters();
             }
         } else if terminal_state == TaskState::Succeeded {
+            krishiv_metrics::global_metrics().inc_tasks_succeeded();
             self.executors.reset_task_failures(&executor_id_for_circuit);
         }
 

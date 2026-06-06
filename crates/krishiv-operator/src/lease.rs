@@ -348,10 +348,9 @@ impl K8sLeaseElection {
             .await
         {
             Ok(_) => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .last_renewed_at = Some(std::time::Instant::now());
+                let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                s.is_leader = true;
+                s.last_renewed_at = Some(std::time::Instant::now());
                 true
             }
             Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
@@ -383,6 +382,7 @@ impl K8sLeaseElection {
     /// Release the lease via live K8s API calls.
     async fn k8s_release(&self, client: &kube::Client) {
         let api = self.lease_api(client);
+        // Use null (not "") so the API server treats the lease as unowned.
         let patch_value = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
@@ -391,7 +391,7 @@ impl K8sLeaseElection {
                 "namespace": self.namespace,
             },
             "spec": {
-                "holderIdentity": "",
+                "holderIdentity": serde_json::Value::Null,
             }
         });
         let patch = Patch::Merge(patch_value);
