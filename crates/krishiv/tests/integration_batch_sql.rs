@@ -518,7 +518,8 @@ async fn sql_with_udf_registration() {
 
     // Register a "double" UDF that multiplies a column by 2
     let udf = Arc::new(MultiplyScalarUdf::new("double", "v", 2));
-    s.register_scalar_udf(udf);
+    s.register_scalar_udf(udf)
+        .expect("scalar UDF registration should succeed");
     assert_eq!(s.scalar_udf_names(), vec!["double".to_string()]);
 
     // Verify UDF is in the registry
@@ -531,13 +532,23 @@ async fn sql_with_udf_registration() {
         assert_eq!(loaded.name(), "double");
     }
 
-    // Standard SQL still works after UDF registration
+    // Registration synchronizes the UDF into DataFusion before query planning.
     s.register_parquet("measurements", &path).unwrap();
     let df = s
-        .sql("SELECT id, value FROM measurements ORDER BY id")
+        .sql("SELECT id, double(value) AS doubled FROM measurements ORDER BY id")
         .unwrap();
     let result = df.collect_async().await.unwrap();
     assert_eq!(result.row_count(), 3);
+    let mut doubled = Vec::new();
+    for batch in result.batches() {
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("double output should be Int64");
+        doubled.extend((0..values.len()).map(|row| values.value(row)));
+    }
+    assert_eq!(doubled, vec![20, 40, 60]);
 }
 
 // ── Bonus: multi-batch Parquet scan preserves row ordering ──────────────────

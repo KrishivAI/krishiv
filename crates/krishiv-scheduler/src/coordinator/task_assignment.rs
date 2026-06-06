@@ -149,6 +149,206 @@ impl Coordinator {
         self.job_input_partitions.insert(job_id, partitions);
     }
 
+    /// Atomically submit a job with an exact task-to-input mapping.
+    pub(crate) fn submit_job_with_task_input_partitions(
+        &mut self,
+        job_spec: JobSpec,
+        partitions: std::collections::HashMap<TaskId, Vec<krishiv_proto::InputPartition>>,
+    ) -> SchedulerResult<()> {
+        let job_id = job_spec.job_id().clone();
+        if partitions.is_empty() {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("job {job_id} has no task-scoped input partitions"),
+            });
+        }
+
+        let expected_task_ids: std::collections::HashSet<TaskId> = job_spec
+            .stages()
+            .iter()
+            .flat_map(|stage| stage.tasks())
+            .map(|task| task.task_id().clone())
+            .collect();
+        let actual_task_ids: std::collections::HashSet<TaskId> =
+            partitions.keys().cloned().collect();
+        if actual_task_ids != expected_task_ids {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "job {job_id} task-scoped input mapping does not exactly match its tasks"
+                ),
+            });
+        }
+        if let Some(task_id) = partitions
+            .iter()
+            .find_map(|(task_id, inputs)| inputs.is_empty().then_some(task_id))
+        {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("task {task_id} has no input partitions"),
+            });
+        }
+
+        self.submit_job(job_spec)?;
+        self.job_task_input_partitions.insert(job_id, partitions);
+        Ok(())
+    }
+
+    /// Fence and prepare one input cycle for a registered continuous job.
+    ///
+    /// Continuous cycles reuse the task's assigned executor and retained
+    /// `stream:loop` operator state. Only one cycle may be assigned or running
+    /// for a job at a time.
+    pub(crate) fn prepare_continuous_input_cycle(
+        &mut self,
+        job_id: &JobId,
+        partitions: Vec<krishiv_proto::InputPartition>,
+    ) -> SchedulerResult<()> {
+        self.ensure_active()?;
+        if self.continuous_input_cycles.contains(job_id) {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("continuous job {job_id} already has an input cycle in flight"),
+            });
+        }
+        if self
+            .job_inline_results
+            .get(job_id)
+            .is_some_and(|results| !results.is_empty())
+        {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "continuous job {job_id} has undrained output; drain it before pushing more input"
+                ),
+            });
+        }
+
+        let profile = self.durability_profile;
+        {
+            let mut job = self.find_job_mut(job_id)?;
+            if job.spec.kind() != JobKind::Streaming {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!("job {job_id} is not a streaming job"),
+                });
+            }
+
+            let mut continuous_task_count = 0usize;
+            for stage in &mut job.stages {
+                for task in stage.tasks_mut() {
+                    let body =
+                        krishiv_plan::task_body_for_profile(task.spec.description(), profile)
+                            .map_err(|error| SchedulerError::InvalidJob {
+                                message: error.to_string(),
+                            })?;
+                    if !body.starts_with("stream:loop:") {
+                        continue;
+                    }
+                    continuous_task_count = continuous_task_count.saturating_add(1);
+                    if task.assigned_executor.is_none() || task.launch_in_flight {
+                        return Err(SchedulerError::InvalidJob {
+                            message: format!(
+                                "continuous job {job_id} is not idle and ready for input"
+                            ),
+                        });
+                    }
+                    match task.state {
+                        TaskState::Running | TaskState::Succeeded => {
+                            task.state = TaskState::Assigned;
+                        }
+                        TaskState::Assigned => {}
+                        _ => {
+                            return Err(SchedulerError::InvalidJob {
+                                message: format!(
+                                    "continuous job {job_id} is not idle and ready for input"
+                                ),
+                            });
+                        }
+                    }
+                    task.output_metadata = None;
+                    task.assigned_at_ms = None;
+                }
+                stage.refresh_state();
+            }
+            if continuous_task_count != 1 {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "continuous job {job_id} must contain exactly one stream:loop task; \
+                         found {continuous_task_count}"
+                    ),
+                });
+            }
+            job.refresh_state();
+        }
+
+        self.job_input_partitions.insert(job_id.clone(), partitions);
+        self.continuous_input_cycles.insert(job_id.clone());
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Roll back a cycle that could not be delivered to its executor.
+    pub(crate) fn abort_continuous_input_cycle(&mut self, job_id: &JobId) {
+        self.continuous_input_cycles.remove(job_id);
+        self.job_input_partitions.remove(job_id);
+        let Some(mut job) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.write_record())
+        else {
+            return;
+        };
+        for stage in &mut job.stages {
+            for task in stage.tasks_mut() {
+                if task.state == TaskState::Assigned {
+                    task.state = TaskState::Succeeded;
+                    task.launch_in_flight = false;
+                    task.assigned_at_ms = None;
+                }
+            }
+            stage.refresh_state();
+        }
+        job.state = JobState::Running;
+    }
+
+    /// Complete a cycle while keeping the logical job active and the task
+    /// terminal for idempotent status retries.
+    pub(crate) fn complete_continuous_input_cycle(&mut self, job_id: &JobId, task_id: &TaskId) {
+        self.continuous_input_cycles.remove(job_id);
+        self.job_input_partitions.remove(job_id);
+        let Some(mut job) = self
+            .job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.write_record())
+        else {
+            return;
+        };
+        let completed = job
+            .stages
+            .iter()
+            .flat_map(|stage| stage.tasks())
+            .any(|task| task.task_id() == task_id && task.state == TaskState::Succeeded);
+        if completed {
+            // Keep the task terminal for idempotent terminal-status retries,
+            // but keep the logical continuous job active and ready for the
+            // next coordinator-fenced input cycle.
+            job.state = JobState::Running;
+        }
+    }
+
+    pub(crate) fn is_continuous_cycle_task(&self, job_id: &JobId, task_id: &TaskId) -> bool {
+        let profile = self.durability_profile;
+        self.job_coordinators
+            .get(job_id)
+            .map(|coordinator| coordinator.read_record())
+            .and_then(|job| {
+                job.stages
+                    .iter()
+                    .flat_map(|stage| stage.tasks())
+                    .find(|task| task.task_id() == task_id)
+                    .map(|task| {
+                        krishiv_plan::task_body_for_profile(task.spec.description(), profile)
+                            .is_ok_and(|body| body.starts_with("stream:loop:"))
+                    })
+            })
+            .unwrap_or(false)
+    }
+
     /// Launch all assigned tasks for a job and return executor transport assignments.
     pub fn launch_assigned_task_assignments(
         &mut self,
@@ -182,13 +382,20 @@ impl Coordinator {
 
         let batch_tables = self.batch_sql_job_tables.get(job_id).cloned();
         let window_parts = self.job_input_partitions.get(job_id).cloned();
-        let assignments = self
-            .find_job_mut(job_id)?
-            .launch_assigned_task_assignments(
+        let task_window_parts = self.job_task_input_partitions.remove(job_id);
+        let assignment_result = match self.find_job_mut(job_id) {
+            Ok(mut job) => job.launch_assigned_task_assignments(
                 &executor_leases,
                 batch_tables.as_deref(),
                 window_parts.as_deref(),
-            )?;
+                task_window_parts.as_ref(),
+            ),
+            Err(error) => Err(error),
+        };
+        if let Some(parts) = task_window_parts {
+            self.job_task_input_partitions.insert(job_id.clone(), parts);
+        }
+        let assignments = assignment_result?;
         // GAP-OB-01: Increment tasks_assigned counter.
         TASKS_ASSIGNED_TOTAL.fetch_add(assignments.len() as u64, AtomicOrdering::Relaxed);
         Ok(assignments)

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
@@ -13,7 +14,7 @@ use krishiv_runtime::LocalWindowKind;
 
 use crate::error::KrishivError;
 use crate::session::{Session, SessionBuilder};
-use crate::types::{ExecutionMode, StreamBatch};
+use crate::types::{ExecutionMode, StreamBatch, StreamMode};
 use crate::window::{
     KeyedStream, MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream,
     StateTtlConfig, WatermarkSpec, WindowedStream,
@@ -212,14 +213,185 @@ fn memory_stream_supports_bounded_map_filter_collect() {
 }
 
 #[test]
+fn direct_stream_constructor_rejects_unbounded_without_schema() {
+    let error = crate::Stream::new(
+        "events",
+        StreamMode::Unbounded,
+        Vec::new(),
+        ExecutionMode::Embedded,
+    )
+    .expect_err("unbounded direct construction must fail");
+
+    assert!(matches!(
+        error,
+        KrishivError::InvalidConfig { message }
+            if message.contains("unbounded_memory_stream")
+    ));
+}
+
+#[test]
 fn unbounded_memory_stream_rejects_collect() {
     let session = Session::builder()
         .build()
         .unwrap_or_else(|error| panic!("unexpected API error: {error}"));
-    let stream = session.unbounded_memory_stream("events").unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let stream = session.unbounded_memory_stream("events", schema).unwrap();
 
     assert!(!stream.is_bounded());
     assert!(stream.collect_bounded().is_err());
+}
+
+#[tokio::test]
+async fn unbounded_memory_stream_round_trips_through_streaming_sql() {
+    let session = Session::builder().build().expect("session should build");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let stream = session
+        .unbounded_memory_stream("live_values", Arc::clone(&schema))
+        .expect("unbounded stream should register");
+    assert_eq!(stream.input_schema(), Some(&schema));
+    assert!(!stream.is_input_closed().expect("input state should load"));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))])
+        .expect("valid input batch");
+
+    stream
+        .try_push_batch(batch)
+        .expect("input batch should be accepted");
+    assert!(stream.close_input().expect("input should close"));
+    assert!(!stream.close_input().expect("close should be idempotent"));
+    assert!(stream.is_input_closed().expect("input state should load"));
+    let closed_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![4]))],
+    )
+    .expect("valid closed-input batch");
+    assert!(
+        stream
+            .try_push_batch(closed_batch)
+            .expect_err("closed input must reject new batches")
+            .to_string()
+            .contains("input is closed")
+    );
+
+    let dataframe = session
+        .sql_async("SELECT value FROM live_values")
+        .await
+        .expect("streaming query should plan");
+    let mut output = dataframe
+        .execute_stream_async()
+        .await
+        .expect("streaming query should execute");
+    let mut values = Vec::new();
+    while let Some(batch) = output.next().await {
+        let batch = batch.expect("stream output should succeed");
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value should remain Int64");
+        values.extend((0..column.len()).map(|row| column.value(row)));
+    }
+
+    assert_eq!(values, vec![1, 2, 3]);
+
+    let mut second_execution = dataframe
+        .execute_stream_async()
+        .await
+        .expect("second execution should return an error stream");
+    let second_error = second_execution
+        .next()
+        .await
+        .expect("error stream should emit one item")
+        .expect_err("continuous table is single-consumer");
+    assert!(second_error.contains("already been consumed"));
+}
+
+#[test]
+fn unbounded_memory_stream_enforces_schema_and_backpressure() {
+    let session = Session::builder().build().expect("session should build");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let stream = session
+        .unbounded_memory_stream_with_capacity("bounded_input", Arc::clone(&schema), 1)
+        .expect("unbounded stream should register");
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .expect("valid input batch");
+    stream
+        .try_push_batch(first)
+        .expect("first batch should fill the queue");
+
+    let second = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![2]))])
+        .expect("valid input batch");
+    let full_error = stream
+        .try_push_batch(second)
+        .expect_err("full queue must backpressure");
+    assert!(full_error.to_string().contains("queue is full"));
+
+    let wrong_schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Utf8,
+        false,
+    )]));
+    let wrong_batch = RecordBatch::try_new(
+        wrong_schema,
+        vec![Arc::new(StringArray::from(vec!["wrong"]))],
+    )
+    .expect("valid wrong-schema batch");
+    let schema_error = stream
+        .try_push_batch(wrong_batch)
+        .expect_err("schema mismatch must fail");
+    assert!(schema_error.to_string().contains("schema mismatch"));
+}
+
+#[test]
+fn unbounded_memory_stream_rejects_duplicate_name() {
+    let session = Session::builder().build().expect("session should build");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    session
+        .unbounded_memory_stream("duplicate_input", Arc::clone(&schema))
+        .expect("first registration should succeed");
+
+    let error = session
+        .unbounded_memory_stream("duplicate_input", schema)
+        .expect_err("duplicate table registration must fail");
+
+    assert!(error.to_string().contains("already registered"));
+}
+
+#[test]
+fn unbounded_memory_stream_rejects_empty_schema() {
+    let session = Session::builder().build().expect("session should build");
+
+    let error = session
+        .unbounded_memory_stream("empty_input", Arc::new(Schema::empty()))
+        .expect_err("empty stream schema must fail");
+
+    assert!(matches!(
+        error,
+        KrishivError::InvalidConfig { message }
+            if message.contains("at least one field")
+    ));
 }
 
 // ── Streaming API tests ───────────────────────────────────────────────────
@@ -361,7 +533,11 @@ fn state_ttl_config_roundtrip() {
 #[test]
 fn sliding_window_api_builder() {
     let session = Session::builder().build().unwrap();
-    let stream = session.unbounded_memory_stream("events").unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let stream = session.unbounded_memory_stream("events", schema).unwrap();
     let sliding: SlidingWindowedStream = stream
         .key_by("user_id")
         .with_event_time("ts")
@@ -377,7 +553,11 @@ fn sliding_window_api_builder() {
 #[test]
 fn session_window_api_builder() {
     let session = Session::builder().build().unwrap();
-    let stream = session.unbounded_memory_stream("events").unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("device_id", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let stream = session.unbounded_memory_stream("events", schema).unwrap();
     let sess: SessionWindowedStream = stream
         .key_by("device_id")
         .with_event_time("ts")
@@ -533,7 +713,9 @@ fn session_register_scalar_udf() {
     assert!(session.scalar_udf_names().is_empty());
 
     let udf = Arc::new(MultiplyScalarUdf::new("double", "x", 2));
-    session.register_scalar_udf(udf);
+    session
+        .register_scalar_udf(udf)
+        .expect("scalar UDF registration should succeed");
     let names = session.scalar_udf_names();
     assert_eq!(names, vec!["double".to_string()]);
 
@@ -646,6 +828,79 @@ async fn continuous_stream_job_poll_drains_via_coordinator() {
         .push_stream_job_input("events", vec![batch])
         .expect("push");
     let _ = session.poll_stream_job("events").await.expect("poll");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuous_job_id_takes_precedence_over_unbounded_table_name() {
+    use krishiv_runtime::LocalWindowExecutionSpec;
+
+    let session = Session::builder().build().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    session
+        .register_unbounded("shared-name", schema.clone())
+        .expect("register SQL stream");
+    let spec = LocalWindowExecutionSpec {
+        key_column: "user_id".into(),
+        event_time_column: "ts".into(),
+        watermark_lag_ms: 0,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms: 10_000,
+        agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+        state_ttl_ms: None,
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+    };
+    session
+        .submit_stream_job("shared-name", spec)
+        .expect("submit continuous job");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "a"])) as _,
+            Arc::new(Int64Array::from(vec![1_000, 12_000])) as _,
+        ],
+    )
+    .unwrap();
+
+    session
+        .push_stream_job_input("shared-name", vec![batch])
+        .expect("push must target the registered job");
+    let output = session
+        .poll_stream_job("shared-name")
+        .await
+        .expect("poll continuous job");
+    assert!(
+        !output.is_empty(),
+        "job input must not be diverted to the same-name SQL table"
+    );
+}
+
+#[test]
+fn duplicate_continuous_job_registration_is_rejected() {
+    use krishiv_runtime::LocalWindowExecutionSpec;
+
+    let session = Session::builder().build().unwrap();
+    let spec = LocalWindowExecutionSpec {
+        key_column: "user_id".into(),
+        event_time_column: "ts".into(),
+        watermark_lag_ms: 0,
+        window_kind: LocalWindowKind::Tumbling,
+        window_size_ms: 10_000,
+        agg_exprs: LocalWindowExecutionSpec::default_count_agg(),
+        state_ttl_ms: None,
+        source_watermark_lags: HashMap::new(),
+        source_id_column: None,
+    };
+    session
+        .submit_stream_job("duplicate-job", spec.clone())
+        .expect("first registration");
+    let error = session
+        .submit_stream_job("duplicate-job", spec)
+        .expect_err("duplicate registration must not reset live state");
+    assert!(error.to_string().contains("already registered"));
 }
 
 #[test]

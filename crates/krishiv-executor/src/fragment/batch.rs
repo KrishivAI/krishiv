@@ -191,7 +191,7 @@ pub(crate) async fn execute_batch_fragment(
     }
 
     if let Some(rest) = fragment.strip_prefix(WINDOW_PREFIX) {
-        return execute_window_fragment(runner, rest, assignment).await;
+        return execute_window_fragment(rest, assignment).await;
     }
 
     Err(ExecutorError::InvalidAssignment {
@@ -205,7 +205,6 @@ pub(crate) async fn execute_batch_fragment(
 /// assignment — they never travel inside the fragment description string.
 /// Results are returned as inline IPC via `OutputContractKind::InlineRecordBatches`.
 async fn execute_window_fragment(
-    runner: &ExecutorTaskRunner,
     rest: &str,
     assignment: &ExecutorTaskAssignment,
 ) -> ExecutorResult<ExecutorTaskOutput> {
@@ -213,11 +212,16 @@ async fn execute_window_fragment(
 
     // Format: <topic>:<spec_b64>
     let mut parts = rest.splitn(2, ':');
-    let _topic = parts
+    let topic = parts
         .next()
         .ok_or_else(|| ExecutorError::InvalidAssignment {
             message: format!("window fragment missing topic: {rest}"),
         })?;
+    if !krishiv_common::validate::is_safe_identifier(topic) {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!("window fragment contains invalid topic '{topic}'"),
+        });
+    }
     let spec_b64 = parts
         .next()
         .ok_or_else(|| ExecutorError::InvalidAssignment {
@@ -235,20 +239,33 @@ async fn execute_window_fragment(
         })?;
 
     // Read input batches from InlineIpc partitions (not from the fragment string).
-    let inline_tables = read_inline_ipc_partitions(assignment.input_partitions())?;
-    let input_batches: Vec<_> = inline_tables.into_iter().flat_map(|(_, b)| b).collect();
-
-    let job_state_dir = runner
-        .state_dir
-        .as_ref()
-        .map(|d| d.join(assignment.job_id().as_str()));
+    let mut inline_tables = read_inline_ipc_partitions(assignment.input_partitions())?;
+    if inline_tables.len() != 1 {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "bounded window task requires exactly one inline input table; found {}",
+                inline_tables.len()
+            ),
+        });
+    }
+    let (input_topic, input_batches) =
+        inline_tables
+            .pop()
+            .ok_or_else(|| ExecutorError::InvalidAssignment {
+                message: "bounded window task is missing its inline input table".into(),
+            })?;
+    if input_topic != topic {
+        return Err(ExecutorError::InvalidAssignment {
+            message: format!(
+                "bounded window input table '{input_topic}' does not match fragment topic '{topic}'"
+            ),
+        });
+    }
 
     let output_batches = tokio::task::spawn_blocking(move || {
-        krishiv_exec::execute_bounded_window(
-            input_batches,
-            &plan_spec,
-            job_state_dir.as_deref(),
-        )
+        // Bounded tasks replay their complete InlineIpc input after failure.
+        // Reopening partial persistent state would double-apply rows on retry.
+        krishiv_exec::execute_bounded_window(input_batches, &plan_spec, None)
     })
     .await
     .map_err(|e| ExecutorError::LocalExecution {
@@ -729,29 +746,22 @@ async fn execute_broker_kafka_to_parquet(
     let (topic, partition, _, _) = parse_memory_kafka_partition(assignment.input_partitions())?;
     let sink_path = parse_parquet_sink_path(assignment.output_contract())?;
     let source_id = format!("{topic}/{partition}");
-    let bootstrap = std::env::var("KAFKA_BOOTSTRAP_SERVERS").map_err(|_| {
-        ExecutorError::LocalExecution {
+    let bootstrap =
+        std::env::var("KAFKA_BOOTSTRAP_SERVERS").map_err(|_| ExecutorError::LocalExecution {
             message: String::from(
                 "durable Kafka pipeline requires KAFKA_BOOTSTRAP_SERVERS to be set",
             ),
-        }
-    })?;
+        })?;
     let group_id = format!("krishiv-{}", assignment.job_id());
     let auto_commit = if krishiv_common::requires_manual_kafka_commit(profile) {
         None
     } else {
         Some(5_000)
     };
-    let mut source = RdkafkaKafkaSource::new(
-        bootstrap,
-        group_id,
-        topic.clone(),
-        auto_commit,
-        None,
-    )
-    .map_err(|error| ExecutorError::LocalExecution {
-        message: format!("rdkafka source for topic '{topic}': {error}"),
-    })?;
+    let mut source = RdkafkaKafkaSource::new(bootstrap, group_id, topic.clone(), auto_commit, None)
+        .map_err(|error| ExecutorError::LocalExecution {
+            message: format!("rdkafka source for topic '{topic}': {error}"),
+        })?;
     let mut sink =
         ParquetSink::create(&sink_path).map_err(|error| ExecutorError::LocalExecution {
             message: format!(
@@ -765,12 +775,13 @@ async fn execute_broker_kafka_to_parquet(
     let mut column_count = 0usize;
     let mut commits = 0usize;
     loop {
-        let Some(batch) = source
-            .read_batch()
-            .await
-            .map_err(|error| ExecutorError::LocalExecution {
-                message: format!("broker Kafka source read failed: {error}"),
-            })?
+        let Some(batch) =
+            source
+                .read_batch()
+                .await
+                .map_err(|error| ExecutorError::LocalExecution {
+                    message: format!("broker Kafka source read failed: {error}"),
+                })?
         else {
             break;
         };

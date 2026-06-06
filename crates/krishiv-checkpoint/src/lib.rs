@@ -18,9 +18,11 @@
 //! {base_dir}/{job_id}/checkpoints/{epoch:020}/manifest.sha256
 //! ```
 //!
-//! An epoch is considered complete only when `manifest.sha256` is present and
-//! every file it lists passes SHA-256 validation.  Epochs missing the manifest
-//! (partial writes) are treated as corrupt during restore.
+//! An epoch is considered complete only when `manifest.sha256` is present,
+//! covers `metadata.json`, the metadata belongs to the requested job/epoch, and
+//! every manifest-listed file passes SHA-256 validation.  Epochs missing the
+//! manifest or required metadata coverage are treated as incomplete during
+//! restore.
 
 pub mod object_store;
 pub mod rescaling;
@@ -374,6 +376,7 @@ pub fn write_epoch_metadata(
     epoch: u64,
     metadata: &CheckpointMetadata,
 ) -> CheckpointResult<()> {
+    validate_metadata_identity(metadata, job_id, epoch)?;
     // Propagate real storage errors; only `NoValidEpoch` (first checkpoint)
     // is benign and should be treated as "no prior epoch, proceed".
     // Using `if let Ok(...)` would silently swallow non-`NoValidEpoch` errors
@@ -404,6 +407,7 @@ pub async fn write_epoch_metadata_async(
     epoch: u64,
     metadata: &CheckpointMetadata,
 ) -> CheckpointResult<()> {
+    validate_metadata_identity(metadata, job_id, epoch)?;
     match latest_valid_epoch_async(storage, job_id).await {
         Ok(latest) if epoch <= latest => {
             return Err(CheckpointError::StaleEpoch {
@@ -577,9 +581,11 @@ pub async fn write_manifest_async(
 
 /// Validate the integrity manifest for `epoch`.
 ///
-/// Returns `true` if the manifest exists and every listed file's SHA-256
-/// matches the manifest entry.  Returns `false` if the manifest is absent
-/// or any hash fails.
+/// Returns `true` if the manifest exists, covers `metadata.json`, the metadata
+/// identity matches `job_id`/`epoch`, every metadata-declared snapshot is
+/// covered by the manifest, and every listed file's SHA-256 matches the
+/// manifest entry.  Returns `false` if the manifest is absent, omits required
+/// files, or any hash fails.
 pub fn validate_epoch(
     storage: &dyn CheckpointStorage,
     job_id: &str,
@@ -589,7 +595,7 @@ pub fn validate_epoch(
     else {
         return Ok(false);
     };
-    validate_manifest_entries(storage, &epoch_dir(job_id, epoch), &manifest)
+    validate_checkpoint_manifest(storage, job_id, epoch, &manifest)
 }
 
 fn read_optional_manifest(
@@ -625,15 +631,79 @@ fn validate_manifest_at_prefix(
     let Some(manifest) = read_optional_manifest(storage, manifest_path, epoch)? else {
         return Ok(false);
     };
-    validate_manifest_entries(storage, base_prefix, &manifest)
+    validate_manifest_entries(storage, base_prefix, epoch, &manifest)
+}
+
+fn validate_checkpoint_manifest(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    manifest: &IntegrityManifest,
+) -> CheckpointResult<bool> {
+    if !validate_manifest_entries(storage, &epoch_dir(job_id, epoch), epoch, manifest)? {
+        return Ok(false);
+    }
+
+    let Some(metadata_bytes) = storage.read_bytes(&metadata_path(job_id, epoch))? else {
+        return Ok(false);
+    };
+    validate_checkpoint_metadata_contract(&metadata_bytes, job_id, epoch, manifest)
+}
+
+async fn validate_checkpoint_manifest_async(
+    storage: &dyn CheckpointStorage,
+    job_id: &str,
+    epoch: u64,
+    manifest: &IntegrityManifest,
+) -> CheckpointResult<bool> {
+    if !validate_manifest_entries_async(storage, &epoch_dir(job_id, epoch), epoch, manifest).await?
+    {
+        return Ok(false);
+    }
+
+    let Some(metadata_bytes) = storage
+        .read_bytes_async(&metadata_path(job_id, epoch))
+        .await?
+    else {
+        return Ok(false);
+    };
+    validate_checkpoint_metadata_contract(&metadata_bytes, job_id, epoch, manifest)
+}
+
+fn validate_checkpoint_metadata_contract(
+    metadata_bytes: &[u8],
+    job_id: &str,
+    epoch: u64,
+    manifest: &IntegrityManifest,
+) -> CheckpointResult<bool> {
+    let metadata = serde_json::from_slice::<CheckpointMetadata>(metadata_bytes).map_err(|e| {
+        CheckpointError::Corrupt {
+            epoch,
+            message: format!("metadata JSON parse: {e}"),
+        }
+    })?;
+    validate_metadata_identity(&metadata, job_id, epoch)?;
+    for snapshot in &metadata.operator_snapshots {
+        let relative_path = snapshot_relative_path(job_id, epoch, snapshot)?;
+        validate_manifest_relative_path(relative_path, epoch)?;
+        if !manifest.entries.contains_key(relative_path) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_manifest_entries(
     storage: &dyn CheckpointStorage,
     base_prefix: &str,
+    epoch: u64,
     manifest: &IntegrityManifest,
 ) -> CheckpointResult<bool> {
+    if !manifest.entries.contains_key("metadata.json") {
+        return Ok(false);
+    }
     for (path, expected_hex) in &manifest.entries {
+        validate_manifest_relative_path(path, epoch)?;
         let full = format!("{base_prefix}/{path}");
         match storage.read_bytes(&full)? {
             None => return Ok(false),
@@ -663,6 +733,70 @@ fn validate_manifest_entries(
         }
     }
     Ok(true)
+}
+
+async fn validate_manifest_entries_async(
+    storage: &dyn CheckpointStorage,
+    base_prefix: &str,
+    epoch: u64,
+    manifest: &IntegrityManifest,
+) -> CheckpointResult<bool> {
+    if !manifest.entries.contains_key("metadata.json") {
+        return Ok(false);
+    }
+    for (path, expected_hex) in &manifest.entries {
+        validate_manifest_relative_path(path, epoch)?;
+        let full = format!("{base_prefix}/{path}");
+        match storage.read_bytes_async(&full).await? {
+            None => return Ok(false),
+            Some(data) => {
+                use std::io::Read as _;
+                let mut reader = std::io::BufReader::new(data.as_slice());
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = reader
+                        .read(&mut buf)
+                        .map_err(|e| CheckpointError::Storage {
+                            message: format!("reading {full} for hash: {e}"),
+                        })?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let hash = format!("{:x}", hasher.finalize());
+                if hash != *expected_hex {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn validate_manifest_relative_path(path: &str, epoch: u64) -> CheckpointResult<()> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        return Err(CheckpointError::Corrupt {
+            epoch,
+            message: format!("manifest path {path:?} is not a relative checkpoint path"),
+        });
+    }
+    if path == "manifest.sha256" {
+        return Err(CheckpointError::Corrupt {
+            epoch,
+            message: "manifest must not include itself".to_owned(),
+        });
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(CheckpointError::Corrupt {
+                epoch,
+                message: format!("manifest path {path:?} contains an invalid component"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_metadata_identity(
@@ -729,34 +863,7 @@ pub async fn validate_epoch_async(
             epoch,
             message: format!("manifest parse: {e}"),
         })?;
-    for (path, expected_hex) in &manifest.entries {
-        let full = format!("{}/{path}", epoch_dir(job_id, epoch));
-        match storage.read_bytes_async(&full).await? {
-            None => return Ok(false),
-            Some(data) => {
-                use std::io::Read as _;
-                let mut reader = std::io::BufReader::new(data.as_slice());
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = reader
-                        .read(&mut buf)
-                        .map_err(|e| CheckpointError::Storage {
-                            message: format!("reading {full} for hash: {e}"),
-                        })?;
-                    if n == 0 {
-                        break;
-                    }
-                    hasher.update(&buf[..n]);
-                }
-                let hash = format!("{:x}", hasher.finalize());
-                if hash != *expected_hex {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    Ok(true)
+    validate_checkpoint_manifest_async(storage, job_id, epoch, &manifest).await
 }
 
 /// Return all epoch numbers that have a valid integrity manifest, in ascending order.
@@ -1488,6 +1595,12 @@ mod tests {
         }
     }
 
+    fn metadata_without_snapshots_for_job(job_id: &str, epoch: u64) -> CheckpointMetadata {
+        let mut metadata = sample_metadata_for_job(job_id, epoch);
+        metadata.operator_snapshots.clear();
+        metadata
+    }
+
     // ── LocalFsCheckpointStorage ──────────────────────────────────────────
 
     #[test]
@@ -1738,7 +1851,7 @@ mod tests {
         let s = make_storage();
 
         // Epoch 4: valid
-        let meta4 = sample_metadata(4);
+        let meta4 = sample_metadata_for_job("job-fb", 4);
         let state4 = b"good state";
         write_operator_snapshot(&s, "job-fb", 4, "op-0", "task-0", state4).unwrap();
         let meta4_json = serde_json::to_vec_pretty(&meta4).unwrap();
@@ -1749,7 +1862,7 @@ mod tests {
         write_manifest(&s, "job-fb", 4, &m4).unwrap();
 
         // Epoch 5: written but then state tampered → corrupt
-        let meta5 = sample_metadata(5);
+        let meta5 = sample_metadata_for_job("job-fb", 5);
         let state5 = b"state for 5";
         write_operator_snapshot(&s, "job-fb", 5, "op-0", "task-0", state5).unwrap();
         let meta5_json = serde_json::to_vec_pretty(&meta5).unwrap();
@@ -2043,7 +2156,7 @@ mod tests {
     #[test]
     fn write_epoch_metadata_stale_epoch_rejected() {
         let s = make_storage();
-        let meta = sample_metadata(3);
+        let meta = metadata_without_snapshots_for_job("j", 3);
         write_epoch_metadata(&s, "j", 3, &meta).unwrap();
         // Write a manifest so epoch 3 is valid
         let mut manifest = IntegrityManifest::new();
@@ -2051,7 +2164,7 @@ mod tests {
         write_manifest(&s, "j", 3, &manifest).unwrap();
 
         // Epoch 2 is older than latest valid (3) → StaleEpoch
-        let meta2 = sample_metadata(2);
+        let meta2 = metadata_without_snapshots_for_job("j", 2);
         let result = write_epoch_metadata(&s, "j", 2, &meta2);
         assert!(matches!(
             result,
@@ -2065,14 +2178,14 @@ mod tests {
     #[test]
     fn write_epoch_metadata_equal_epoch_rejected() {
         let s = make_storage();
-        let meta = sample_metadata(5);
+        let meta = metadata_without_snapshots_for_job("j", 5);
         write_epoch_metadata(&s, "j", 5, &meta).unwrap();
         let mut manifest = IntegrityManifest::new();
         manifest.insert_bytes("metadata.json", &serde_json::to_vec_pretty(&meta).unwrap());
         write_manifest(&s, "j", 5, &manifest).unwrap();
 
         // Same epoch number again → StaleEpoch
-        let meta_dup = sample_metadata(5);
+        let meta_dup = metadata_without_snapshots_for_job("j", 5);
         let result = write_epoch_metadata(&s, "j", 5, &meta_dup);
         assert!(matches!(
             result,
@@ -2087,9 +2200,41 @@ mod tests {
     fn write_epoch_metadata_first_epoch_accepted() {
         let s = make_storage();
         // No prior epochs → NoValidEpoch is treated as "proceed"
-        let meta = sample_metadata(1);
+        let meta = metadata_without_snapshots_for_job("j-first", 1);
         let result = write_epoch_metadata(&s, "j-first", 1, &meta);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn write_epoch_metadata_rejects_identity_mismatch() {
+        let s = make_storage();
+        let meta = metadata_without_snapshots_for_job("other-job", 1);
+
+        let result = write_epoch_metadata(&s, "j", 1, &meta);
+
+        assert!(matches!(
+            result,
+            Err(CheckpointError::Corrupt {
+                epoch: 1,
+                message: _
+            })
+        ));
+        assert_eq!(read_epoch_metadata(&s, "j", 1).unwrap(), None);
+    }
+
+    #[test]
+    fn write_epoch_metadata_rejects_incompatible_version() {
+        let s = make_storage();
+        let mut meta = metadata_without_snapshots_for_job("j", 1);
+        meta.version = CheckpointMetadata::VERSION + 1;
+
+        let result = write_epoch_metadata(&s, "j", 1, &meta);
+
+        assert!(matches!(
+            result,
+            Err(CheckpointError::IncompatibleVersion { version }) if version == CheckpointMetadata::VERSION + 1
+        ));
+        assert_eq!(read_epoch_metadata(&s, "j", 1).unwrap(), None);
     }
 
     #[test]
@@ -2113,7 +2258,7 @@ mod tests {
         // (which is older) — validate_epoch returns Ok(false) because it's
         // checking the manifest hash, not the epoch number. The stale epoch
         // guard lives in write_epoch_metadata.
-        let meta = sample_metadata(5);
+        let meta = metadata_without_snapshots_for_job("j", 5);
         write_epoch_metadata(&s, "j", 5, &meta).unwrap();
         let mut manifest = IntegrityManifest::new();
         manifest.insert_bytes("metadata.json", &serde_json::to_vec_pretty(&meta).unwrap());
@@ -2124,7 +2269,7 @@ mod tests {
     #[test]
     fn validate_epoch_missing_manifest_returns_false() {
         let s = make_storage();
-        let meta = sample_metadata(20);
+        let meta = metadata_without_snapshots_for_job("j", 20);
         write_epoch_metadata(&s, "j", 20, &meta).unwrap();
         // No manifest → false
         assert!(!validate_epoch(&s, "j", 20).unwrap());
@@ -2178,7 +2323,7 @@ mod tests {
         let s = make_storage();
 
         // Epoch 1: valid
-        let meta1 = sample_metadata(1);
+        let meta1 = sample_metadata_for_job("job-fb2", 1);
         let state1 = b"state-1";
         write_operator_snapshot(&s, "job-fb2", 1, "op-0", "task-0", state1).unwrap();
         let meta1_json = serde_json::to_vec_pretty(&meta1).unwrap();
@@ -2189,7 +2334,7 @@ mod tests {
         write_manifest(&s, "job-fb2", 1, &m1).unwrap();
 
         // Epoch 2: complete but then state file corrupted
-        let meta2 = sample_metadata(2);
+        let meta2 = sample_metadata_for_job("job-fb2", 2);
         let state2 = b"state-2";
         write_operator_snapshot(&s, "job-fb2", 2, "op-0", "task-0", state2).unwrap();
         let meta2_json = serde_json::to_vec_pretty(&meta2).unwrap();
@@ -2206,7 +2351,7 @@ mod tests {
         .unwrap();
 
         // Epoch 3: valid
-        let meta3 = sample_metadata(3);
+        let meta3 = sample_metadata_for_job("job-fb2", 3);
         let state3 = b"state-3";
         write_operator_snapshot(&s, "job-fb2", 3, "op-0", "task-0", state3).unwrap();
         let meta3_json = serde_json::to_vec_pretty(&meta3).unwrap();
@@ -2225,7 +2370,7 @@ mod tests {
         let s = make_storage();
 
         // Epoch 1: valid
-        let meta1 = sample_metadata(1);
+        let meta1 = sample_metadata_for_job("job-hint", 1);
         let state1 = b"s1";
         write_operator_snapshot(&s, "job-hint", 1, "op-0", "task-0", state1).unwrap();
         let meta1_json = serde_json::to_vec_pretty(&meta1).unwrap();
@@ -2236,7 +2381,7 @@ mod tests {
         write_manifest(&s, "job-hint", 1, &m1).unwrap();
 
         // Epoch 2: valid, then hint set to 2
-        let meta2 = sample_metadata(2);
+        let meta2 = sample_metadata_for_job("job-hint", 2);
         let state2 = b"s2";
         write_operator_snapshot(&s, "job-hint", 2, "op-0", "task-0", state2).unwrap();
         let meta2_json = serde_json::to_vec_pretty(&meta2).unwrap();
@@ -2269,11 +2414,11 @@ mod tests {
         let s = make_storage();
 
         // Epoch 1: metadata only, no manifest
-        let meta1 = sample_metadata(1);
+        let meta1 = sample_metadata_for_job("j-corrupt", 1);
         write_epoch_metadata(&s, "j-corrupt", 1, &meta1).unwrap();
 
         // Epoch 2: manifest present but file tampered
-        let meta2 = sample_metadata(2);
+        let meta2 = sample_metadata_for_job("j-corrupt", 2);
         let state2 = b"state";
         write_operator_snapshot(&s, "j-corrupt", 2, "op-0", "task-0", state2).unwrap();
         let meta2_json = serde_json::to_vec_pretty(&meta2).unwrap();
@@ -2315,7 +2460,11 @@ mod tests {
     #[test]
     fn zero_byte_file_in_manifest_validates() {
         let s = make_storage();
+        let meta = metadata_without_snapshots_for_job("j", 1);
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        write_epoch_metadata(&s, "j", 1, &meta).unwrap();
         let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &meta_json);
         manifest.insert_bytes("empty.bin", b"");
         write_manifest(&s, "j", 1, &manifest).unwrap();
         s.write_bytes(&format!("{}/empty.bin", epoch_dir("j", 1)), b"")
@@ -2324,11 +2473,80 @@ mod tests {
     }
 
     #[test]
-    fn empty_manifest_validates_as_empty_epoch() {
+    fn empty_manifest_is_not_a_valid_epoch() {
         let s = make_storage();
         let manifest = IntegrityManifest::new();
         write_manifest(&s, "j", 1, &manifest).unwrap();
-        assert!(validate_epoch(&s, "j", 1).unwrap());
+        assert!(!validate_epoch(&s, "j", 1).unwrap());
+    }
+
+    #[test]
+    fn manifest_without_metadata_is_not_a_valid_epoch() {
+        let s = make_storage();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("state.bin", b"state");
+        write_manifest(&s, "j", 1, &manifest).unwrap();
+        s.write_bytes(&format!("{}/state.bin", epoch_dir("j", 1)), b"state")
+            .unwrap();
+
+        assert!(!validate_epoch(&s, "j", 1).unwrap());
+    }
+
+    #[test]
+    fn validate_epoch_rejects_metadata_identity_mismatch() {
+        let s = make_storage();
+        let meta = metadata_without_snapshots_for_job("other-job", 1);
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        s.write_bytes(&metadata_path("j", 1), &meta_json).unwrap();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &meta_json);
+        write_manifest(&s, "j", 1, &manifest).unwrap();
+
+        let result = validate_epoch(&s, "j", 1);
+        assert!(matches!(
+            result,
+            Err(CheckpointError::Corrupt {
+                epoch: 1,
+                message: _
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_epoch_rejects_unmanifested_metadata_snapshot() {
+        let s = make_storage();
+        let meta = sample_metadata_for_job("j", 1);
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        write_operator_snapshot(&s, "j", 1, "op-0", "task-0", b"state").unwrap();
+        write_epoch_metadata(&s, "j", 1, &meta).unwrap();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &meta_json);
+        write_manifest(&s, "j", 1, &manifest).unwrap();
+
+        assert!(!validate_epoch(&s, "j", 1).unwrap());
+    }
+
+    #[test]
+    fn validate_epoch_rejects_unsafe_manifest_path() {
+        let s = make_storage();
+        let meta = metadata_without_snapshots_for_job("j", 1);
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        write_epoch_metadata(&s, "j", 1, &meta).unwrap();
+        s.write_bytes(&format!("{}/evil.bin", epoch_dir("j", 1)), b"evil")
+            .unwrap();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &meta_json);
+        manifest.insert_bytes("../evil.bin", b"evil");
+        write_manifest(&s, "j", 1, &manifest).unwrap();
+
+        let result = validate_epoch(&s, "j", 1);
+        assert!(matches!(
+            result,
+            Err(CheckpointError::Corrupt {
+                epoch: 1,
+                message: _
+            })
+        ));
     }
 
     // ── Concurrent writes ───────────────────────────────────────────────
@@ -2617,7 +2835,7 @@ mod tests {
     #[test]
     fn generate_replay_bundle_savepoint_fields() {
         let s = make_storage();
-        let mut meta = sample_metadata(10);
+        let mut meta = metadata_without_snapshots_for_job("j", 10);
         meta.is_savepoint = true;
         meta.savepoint_label = Some("manual-save".into());
         write_epoch_metadata(&s, "j", 10, &meta).unwrap();
@@ -2631,7 +2849,7 @@ mod tests {
     #[test]
     fn full_epoch_multiple_operators_validates() {
         let s = make_storage();
-        let meta = sample_metadata(15);
+        let meta = sample_metadata_for_job("j", 15);
         let state1 = b"state-op0";
         let state2 = b"state-op1";
 
@@ -2699,8 +2917,8 @@ mod tests {
     #[test]
     fn delete_epoch_only_removes_target() {
         let s = make_storage();
-        write_epoch_metadata(&s, "j", 1, &sample_metadata(1)).unwrap();
-        write_epoch_metadata(&s, "j", 2, &sample_metadata(2)).unwrap();
+        write_epoch_metadata(&s, "j", 1, &metadata_without_snapshots_for_job("j", 1)).unwrap();
+        write_epoch_metadata(&s, "j", 2, &metadata_without_snapshots_for_job("j", 2)).unwrap();
         delete_epoch(&s, "j", 1).unwrap();
         assert_eq!(read_epoch_metadata(&s, "j", 1).unwrap(), None);
         assert!(read_epoch_metadata(&s, "j", 2).unwrap().is_some());
@@ -2813,7 +3031,11 @@ mod tests {
     #[test]
     fn validate_epoch_all_empty_files() {
         let s = make_storage();
+        let meta = metadata_without_snapshots_for_job("j", 1);
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        write_epoch_metadata(&s, "j", 1, &meta).unwrap();
         let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &meta_json);
         manifest.insert_bytes("a.bin", b"");
         manifest.insert_bytes("b.bin", b"");
         write_manifest(&s, "j", 1, &manifest).unwrap();
@@ -2865,16 +3087,14 @@ mod tests {
     fn write_epoch_metadata_propagates_non_no_valid_epoch_errors() {
         let s = make_storage();
         // Create a valid epoch so later checks don't see NoValidEpoch
-        write_epoch_metadata(&s, "j", 1, &sample_metadata(1)).unwrap();
+        let meta1 = metadata_without_snapshots_for_job("j", 1);
+        write_epoch_metadata(&s, "j", 1, &meta1).unwrap();
         let mut m = IntegrityManifest::new();
-        m.insert_bytes(
-            "metadata.json",
-            &serde_json::to_vec_pretty(&sample_metadata(1)).unwrap(),
-        );
+        m.insert_bytes("metadata.json", &serde_json::to_vec_pretty(&meta1).unwrap());
         write_manifest(&s, "j", 1, &m).unwrap();
 
         // Now try to write epoch 2 - it should succeed since epoch 1 is valid
-        let result = write_epoch_metadata(&s, "j", 2, &sample_metadata(2));
+        let result = write_epoch_metadata(&s, "j", 2, &metadata_without_snapshots_for_job("j", 2));
         assert!(result.is_ok());
     }
 
@@ -2892,7 +3112,12 @@ mod tests {
     fn validate_epoch_manifest_does_not_cover_all_files() {
         let s = make_storage();
         // Manifest only covers file1.bin, but file2.bin also exists on disk
+        // and is not referenced by metadata.
+        let meta = metadata_without_snapshots_for_job("j", 1);
+        let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
+        write_epoch_metadata(&s, "j", 1, &meta).unwrap();
         let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &meta_json);
         manifest.insert_bytes("file1.bin", b"good");
         write_manifest(&s, "j", 1, &manifest).unwrap();
         s.write_bytes(&format!("{}/file1.bin", epoch_dir("j", 1)), b"good")
@@ -3113,7 +3338,7 @@ mod tests {
     fn latest_valid_epoch_uses_hint_when_valid() {
         let s = make_storage();
         // Write epoch 3 as valid
-        let meta3 = sample_metadata(3);
+        let meta3 = sample_metadata_for_job("j-hp", 3);
         let state3 = b"state-3";
         write_operator_snapshot(&s, "j-hp", 3, "op-0", "task-0", state3).unwrap();
         let meta3_json = serde_json::to_vec_pretty(&meta3).unwrap();
@@ -3304,13 +3529,7 @@ mod tests {
         write_manifest(&s, "j-sp-unmanifested", 1, &manifest).unwrap();
 
         let result = create_savepoint(&s, "j-sp-unmanifested", Some("bad-source"));
-        assert!(matches!(
-            result,
-            Err(CheckpointError::Corrupt {
-                epoch: 1,
-                message: _
-            })
-        ));
+        assert!(matches!(result, Err(CheckpointError::NoValidEpoch)));
         assert!(
             list_savepoints(&s, "j-sp-unmanifested").unwrap().is_empty(),
             "failed savepoint creation must not leave a listed partial savepoint"
@@ -3368,7 +3587,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let storage = LocalFsCheckpointStorage::new(dir.path()).unwrap();
-            let meta = sample_metadata(1);
+            let meta = metadata_without_snapshots_for_job("restart-job", 1);
             write_epoch_metadata(&storage, "restart-job", 1, &meta).unwrap();
             let mut manifest = IntegrityManifest::new();
             let meta_json = serde_json::to_vec_pretty(&meta).unwrap();
@@ -3394,9 +3613,15 @@ mod tests {
         // Epoch 2: write metadata + manifest — complete.
         // list_valid_epochs must return only epoch 2.
         let s = make_storage();
-        write_epoch_metadata(&s, "partial-job", 1, &sample_metadata(1)).unwrap();
+        write_epoch_metadata(
+            &s,
+            "partial-job",
+            1,
+            &metadata_without_snapshots_for_job("partial-job", 1),
+        )
+        .unwrap();
         // Write epoch 2 fully.
-        let meta2 = sample_metadata(2);
+        let meta2 = metadata_without_snapshots_for_job("partial-job", 2);
         write_epoch_metadata(&s, "partial-job", 2, &meta2).unwrap();
         let mut m2 = IntegrityManifest::new();
         let meta2_json = serde_json::to_vec_pretty(&meta2).unwrap();

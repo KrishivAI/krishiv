@@ -69,6 +69,9 @@ pub enum SchedulerError {
     /// Distributed DAG conversion failed.
     #[error("invalid plan: {message}")]
     InvalidPlan { message: String },
+    /// Adaptive query optimization failed.
+    #[error(transparent)]
+    Optimizer(#[from] krishiv_optimizer::OptimizerError),
     /// Coordinator/executor transport failed.
     #[error("transport error: {message}")]
     Transport { message: String },

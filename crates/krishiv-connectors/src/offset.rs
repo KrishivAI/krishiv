@@ -64,14 +64,22 @@ impl Offset for ParquetOffset {
     }
 
     fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
-        if bytes.len() < 8 {
-            return Err(ConnectorError::IoStr {
-                message: "ParquetOffset decode: expected 8 bytes".into(),
+        if bytes.len() != 8 {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "ParquetOffset decode: expected exactly 8 bytes, got {}",
+                    bytes.len()
+                ),
             });
         }
-        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        Ok(Self {
-            batch_index: n as usize,
-        })
+        let batch_index = usize::try_from(u64::from_le_bytes(bytes.try_into().map_err(|_| {
+            ConnectorError::Offset {
+                message: "ParquetOffset decode: invalid byte width".into(),
+            }
+        })?))
+        .map_err(|_| ConnectorError::Offset {
+            message: "ParquetOffset decode: batch index exceeds this platform's usize".into(),
+        })?;
+        Ok(Self { batch_index })
     }
 }

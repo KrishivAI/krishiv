@@ -7,7 +7,6 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use krishiv_runtime::continuous_stream::ContinuousStreamRegistry;
 use krishiv_runtime::flight_protocol::{
     FlightDirective, apply_register_directives, has_control_directive, parse_sql,
 };
@@ -41,19 +40,16 @@ fn collect_ipc_tables(
 /// Server-side catalog and cluster state shared across Flight SQL requests.
 ///
 /// **Proxy mode** (`coordinator_http` is `Some`): batch SQL, bounded windows,
-/// and continuous streams are all forwarded to the external coordinator. No
-/// `InProcessCluster` or `ContinuousStreamRegistry` is created — those
-/// allocations are unnecessary overhead in proxy deployments.
+/// and continuous streams are forwarded to the external coordinator. The
+/// local cluster remains available for non-proxied compatibility paths but is
+/// not a second owner of proxied continuous state.
 ///
 /// **Embedded mode** (`coordinator_http` is `None`): all operations run on the
 /// local `InProcessCluster`.
 #[derive(Clone)]
 pub struct FlightExecutionHost {
-    /// Present only in embedded mode. `None` in proxy mode — all execution is
-    /// forwarded to the coordinator, so no local cluster is needed.
+    /// Local cluster used by embedded execution and compatibility paths.
     cluster: Option<Arc<InProcessCluster>>,
-    /// Present only in embedded mode for the legacy continuous-stream local path.
-    continuous: Option<Arc<ContinuousStreamRegistry>>,
     /// Path-based catalog shared across requests (persisted registrations).
     catalog: Arc<DashMap<String, PathBuf>>,
     /// When set, routes all execution through the coordinator HTTP API.
@@ -79,22 +75,15 @@ impl FlightExecutionHost {
 
     /// Create a host with an optional coordinator HTTP base URL.
     ///
-    /// - `Some(url)` → proxy mode: batch SQL is forwarded to the coordinator;
-    ///   an `InProcessCluster` is still created for continuous streaming jobs
-    ///   because window state is session-local and does not need coordinator routing.
+    /// - `Some(url)` → proxy mode: execution is forwarded to the coordinator;
+    ///   a local cluster remains allocated only for compatibility paths.
     /// - `None` → embedded mode: all operations run on the local cluster.
     pub fn with_coordinator_http(coordinator_http: Option<String>) -> Result<Self, Status> {
-        // Always create the in-process cluster and continuous registry.
-        // Batch SQL is proxied to the coordinator when coordinator_http is set;
-        // continuous job operations always run locally in the flight-server process.
+        // Keep one cluster-owned continuous registry in embedded mode. Proxy
+        // mode forwards continuous operations to the coordinator.
         let c = InProcessCluster::new().map_err(|e| Status::internal(e.to_string()))?;
-        let (cluster, continuous) = (
-            Some(Arc::new(c)),
-            Some(Arc::new(ContinuousStreamRegistry::new())),
-        );
         Ok(Self {
-            cluster,
-            continuous,
+            cluster: Some(Arc::new(c)),
             catalog: Arc::new(DashMap::new()),
             coordinator_http,
         })
@@ -103,10 +92,6 @@ impl FlightExecutionHost {
     /// Embedded cluster — `None` in proxy mode.
     pub fn cluster(&self) -> Option<Arc<InProcessCluster>> {
         self.cluster.clone()
-    }
-
-    pub fn continuous_registry(&self) -> Option<Arc<ContinuousStreamRegistry>> {
-        self.continuous.clone()
     }
 
     pub fn coordinator_http_url(&self) -> Option<&str> {
@@ -202,17 +187,9 @@ impl FlightExecutionHost {
                     let cluster = self
                         .cluster()
                         .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
-                    let continuous = self
-                        .continuous
-                        .clone()
-                        .ok_or_else(|| Status::internal("continuous registry unavailable"))?;
                     let local = plan_spec_to_local(&spec);
                     let job_id = job_id.clone();
-                    let spec = spec.clone();
-                    run_blocking(move || {
-                        cluster.register_continuous_job(&job_id, &local)?;
-                        continuous.register_job(job_id, spec)
-                    })?;
+                    run_blocking(move || cluster.register_continuous_job(&job_id, &local))?;
                 }
                 FlightDirective::ContinuousPush { job_id, batches } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {
@@ -226,15 +203,8 @@ impl FlightExecutionHost {
                     let cluster = self
                         .cluster()
                         .ok_or_else(|| Status::internal("embedded cluster unavailable"))?;
-                    let continuous = self
-                        .continuous
-                        .clone()
-                        .ok_or_else(|| Status::internal("continuous registry unavailable"))?;
                     let job_id = job_id.clone();
-                    run_blocking(move || {
-                        cluster.push_continuous_input(&job_id, batches.clone())?;
-                        continuous.push_input(&job_id, batches.to_vec())
-                    })?;
+                    run_blocking(move || cluster.push_continuous_input(&job_id, batches))?;
                 }
                 FlightDirective::ContinuousDrain { job_id } => {
                     if let Some(http_base) = self.coordinator_http.as_deref() {

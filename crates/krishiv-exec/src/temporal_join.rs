@@ -164,13 +164,9 @@ impl TemporalJoinOperator {
 
         if output_columns.is_empty() {
             let table_schema = table_schema.or_else(|| {
-                self.keyed_state.values().find_map(|state| {
-                    state
-                        .versions
-                        .values()
-                        .next()
-                        .map(|batch| batch.schema())
-                })
+                self.keyed_state
+                    .values()
+                    .find_map(|state| state.versions.values().next().map(|batch| batch.schema()))
             });
             let schema = build_joined_schema(stream_batch.schema(), table_schema)?;
             return Ok(RecordBatch::new_empty(schema));

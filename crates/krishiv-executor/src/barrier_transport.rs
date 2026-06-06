@@ -28,7 +28,11 @@ impl SharedBarrierAckRegistry {
     }
 
     /// Register a waiter for `(job_id, epoch)` barrier completion.
-    pub fn register_wait(&self, job_id: &str, epoch: u64) -> oneshot::Receiver<BarrierAckCompletion> {
+    pub fn register_wait(
+        &self,
+        job_id: &str,
+        epoch: u64,
+    ) -> oneshot::Receiver<BarrierAckCompletion> {
         let (tx, rx) = oneshot::channel();
         self.waiters
             .entry((job_id.to_owned(), epoch))

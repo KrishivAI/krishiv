@@ -152,6 +152,11 @@ impl UdfRegistry {
         self.scalars.insert(udf.name().to_owned(), udf);
     }
 
+    /// Remove and return a scalar UDF registration by name.
+    pub fn remove_scalar(&mut self, name: &str) -> Option<Arc<dyn ScalarUdf>> {
+        self.scalars.remove(name)
+    }
+
     /// Register an aggregate UDAF; replaces any existing registration with the
     /// same name.
     pub fn register_aggregate(&mut self, udf: Arc<dyn AggregateUdf>) {
@@ -947,6 +952,19 @@ mod tests {
     }
 
     #[test]
+    fn udf_registry_remove_scalar_returns_registration() {
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("double", "x", 2)));
+
+        let removed = registry
+            .remove_scalar("double")
+            .expect("registered scalar should be returned");
+
+        assert_eq!(removed.name(), "double");
+        assert!(registry.get_scalar("double").is_none());
+    }
+
+    #[test]
     fn udf_registry_multiple_aggregates_sorted() {
         let mut registry = UdfRegistry::new();
         registry.register_aggregate(Arc::new(SumAggUdf::new()));
@@ -1237,18 +1255,6 @@ pub trait SandboxedUdfExecutor: Send + Sync {
 
 /// Concrete real implementation that enforces limits (using timeout for time).
 pub struct DefaultSandboxedExecutor;
-
-fn allows_full_privilege_udfs() -> bool {
-    std::env::var("KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
 
 impl SandboxedUdfExecutor for DefaultSandboxedExecutor {
     fn execute_with_limits(

@@ -46,7 +46,10 @@ fn apply_flight_auth<T>(mut req: tonic::Request<T>) -> tonic::Request<T> {
 struct FlightAuthInterceptor;
 
 impl tonic::service::Interceptor for FlightAuthInterceptor {
-    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
         if let Some(key) = configured_flight_api_key() {
             if let Ok(value) = format!("Bearer {key}").parse() {
                 request.metadata_mut().insert("authorization", value);
@@ -518,62 +521,6 @@ impl FlightClientPool {
             Ok(batches)
         })
         .await
-    }
-
-    /// Number of executor endpoints configured — the shard count for key-based
-    /// routing (R7).
-    pub fn shard_count(&self) -> usize {
-        self.endpoints.len()
-    }
-
-    /// Execute a Flight action on a specific shard endpoint (R7).
-    ///
-    /// Routes to `endpoints[shard_idx % len]`, enabling key-hashed batches to
-    /// be sent to different executor Flight endpoints for distributed aggregation.
-    pub async fn do_action_on_shard(
-        &self,
-        shard_idx: usize,
-        action: &crate::flight_action::KrishivFlightAction,
-    ) -> RuntimeResult<Vec<u8>> {
-        use futures::StreamExt;
-        let ep_idx = shard_idx % self.endpoints.len();
-        let _endpoint = self.endpoints[ep_idx].clone();
-        let body = action.to_action_body()?;
-        let action_type = action.action_type();
-        with_retry(|| async {
-            let channel = self.get_shard_channel(ep_idx).await?;
-            let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel);
-            let req = arrow_flight::Action {
-                r#type: action_type.clone(),
-                body: body.clone().into(),
-            };
-            let mut stream = client
-                .do_action(apply_flight_auth(tonic::Request::new(req)))
-                .await
-                .map_err(|e| RuntimeError::transport(format!("do_action_on_shard: {e}")))?
-                .into_inner();
-            let mut buf = Vec::new();
-            while let Some(item) = stream.next().await {
-                let part = item.map_err(|e| {
-                    RuntimeError::transport(format!("do_action_on_shard stream: {e}"))
-                })?;
-                buf.extend_from_slice(&part.body);
-            }
-            Ok(buf)
-        })
-        .await
-    }
-
-    /// Get a channel for a specific shard endpoint with health tracking.
-    async fn get_shard_channel(&self, shard_idx: usize) -> RuntimeResult<Channel> {
-        let endpoint = self.endpoints[shard_idx].clone();
-        match connect_flight_channel(&endpoint).await {
-            Ok(ch) => Ok(ch),
-            Err(e) => {
-                self.mark_endpoint_unhealthy(&endpoint).await;
-                Err(e)
-            }
-        }
     }
 
     /// Stream SQL results lazily — returns batches one at a time without

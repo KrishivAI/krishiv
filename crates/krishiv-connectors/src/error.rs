@@ -36,6 +36,9 @@ pub enum ConnectorError {
     /// Schema mismatch or incompatible field types.
     #[error("connector schema error: {message}")]
     Schema { message: String },
+    /// Invalid, incompatible, or unrestorable source offset.
+    #[error("connector offset error: {message}")]
+    Offset { message: String },
     /// Operation is not supported by this connector.
     #[error("connector unsupported: {message}")]
     Unsupported { message: String },

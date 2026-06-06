@@ -45,3 +45,20 @@ impl From<krishiv_sql::SqlError> for KrishivError {
         }
     }
 }
+
+impl From<krishiv_sql::ContinuousInputError> for KrishivError {
+    fn from(value: krishiv_sql::ContinuousInputError) -> Self {
+        match value {
+            error @ krishiv_sql::ContinuousInputError::SchemaMismatch { .. } => {
+                Self::InvalidConfig {
+                    message: error.to_string(),
+                }
+            }
+            error @ (krishiv_sql::ContinuousInputError::QueueFull
+            | krishiv_sql::ContinuousInputError::Closed
+            | krishiv_sql::ContinuousInputError::LockPoisoned(_)) => Self::Runtime {
+                message: error.to_string(),
+            },
+        }
+    }
+}

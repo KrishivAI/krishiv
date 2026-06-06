@@ -203,8 +203,7 @@ impl ClusterControlPlane {
         let mut orchestration_handles: Option<crate::OrchestratorHandles> = None;
 
         if self.leader.try_acquire().await {
-            self.shared
-                .sync_leader_fencing_token(self.fencing_token());
+            self.shared.sync_leader_fencing_token(self.fencing_token());
             if let Err(e) = self.promote_to_active().await {
                 tracing::error!(error = %e, "failed to promote to active");
             }
@@ -218,8 +217,7 @@ impl ClusterControlPlane {
         loop {
             interval.tick().await;
             if self.leader.try_acquire().await {
-                self.shared
-                    .sync_leader_fencing_token(self.fencing_token());
+                self.shared.sync_leader_fencing_token(self.fencing_token());
                 if let Err(e) = self.promote_to_active().await {
                     tracing::error!(error = %e, "failed to promote to active");
                 }
@@ -228,8 +226,7 @@ impl ClusterControlPlane {
                 }
             } else if self.leader.is_leader() {
                 if self.leader.renew().await {
-                    self.shared
-                        .sync_leader_fencing_token(self.fencing_token());
+                    self.shared.sync_leader_fencing_token(self.fencing_token());
                 } else {
                     if let Err(e) = self.demote_to_standby().await {
                         tracing::error!(error = %e, "failed to demote to standby");

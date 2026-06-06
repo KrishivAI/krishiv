@@ -9,11 +9,11 @@ use crate::fragment::common::task_fragment_body;
 use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_exec::execute_bounded_window;
-use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, WindowKind, parse_stream_fragment};
+use krishiv_plan::window::{WindowAggKind, WindowExecutionSpec, decode_window_execution_spec};
 use krishiv_proto::ExecutorTaskAssignment;
 
 const STREAM_KAFKA_PARTITION_PREFIX: &str = "stream-kafka:";
-const STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
+const LEGACY_STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
 
 /// Fragment prefix for continuous window loop execution (GAP-6).
 ///
@@ -26,32 +26,11 @@ const STREAM_CONTINUOUS_PREFIX: &str = "stream:continuous:";
 ///  1. Looks up (or creates) a per-job `ContinuousWindowExecutor` stored in
 ///     `runner.loop_executors`.  State is retained across calls so partial
 ///     windows accumulate correctly.
-///  2. Calls `runner.continuous_drainer.drain_job(job_id)` to fetch newly
-///     arrived input batches.
+///  2. Reads newly arrived input from the local continuous drainer or from
+///     coordinator-delivered inline IPC partitions.
 ///  3. Passes the batches through `ContinuousWindowExecutor::drain()`.
 ///  4. Returns any newly emitted (closed) window batches.
 const STREAM_LOOP_PREFIX: &str = "stream:loop:";
-
-fn parsed_to_plan_spec(parsed: krishiv_plan::window::ParsedStreamFragment) -> WindowExecutionSpec {
-    let (slide_ms, session_gap_ms) = match parsed.window_kind {
-        WindowKind::Tumbling => (None, None),
-        WindowKind::Sliding => (parsed.slide_ms, None),
-        WindowKind::Session => (None, parsed.session_gap_ms),
-    };
-    WindowExecutionSpec {
-        key_column: parsed.key_col,
-        event_time_column: parsed.time_col,
-        watermark_lag_ms: parsed.lag_ms,
-        window_kind: parsed.window_kind,
-        window_size_ms: parsed.window_ms,
-        slide_ms,
-        session_gap_ms,
-        agg_exprs: vec![parsed.agg],
-        state_ttl_ms: parsed.ttl_ms,
-        source_watermark_lags: parsed.source_watermark_lags,
-        source_id_column: parsed.source_id_column,
-    }
-}
 
 /// Parse `stream-kafka:` partitions into batches with schema `(key, ts, val)`.
 fn parse_stream_kafka_partitions(
@@ -177,6 +156,7 @@ fn parse_stream_kafka_partitions(
 /// passes them through the window operator, and returns emitted window batches.
 fn execute_loop_fragment(
     runner: &ExecutorTaskRunner,
+    assignment: &ExecutorTaskAssignment,
     fragment: &str,
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let payload = fragment.strip_prefix(STREAM_LOOP_PREFIX).ok_or_else(|| {
@@ -212,15 +192,11 @@ fn execute_loop_fragment(
         .loop_executors
         .entry(job_id.to_owned())
         .or_try_insert_with(|| {
-            let parsed = parse_stream_fragment(window_spec_str).map_err(|e| {
+            let plan_spec = decode_window_execution_spec(window_spec_str).map_err(|e| {
                 ExecutorError::InvalidAssignment {
                     message: format!("stream:loop invalid window spec '{window_spec_str}': {e}"),
                 }
             })?;
-            let mut plan_spec = parsed_to_plan_spec(parsed);
-            // Normalise column names for Kafka-style data (same as bounded path).
-            plan_spec.key_column = String::from("key");
-            plan_spec.event_time_column = String::from("ts");
             // Use durable state dir when the runner is configured for
             // single-node-durable or distributed-durable profiles.
             let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
@@ -234,19 +210,19 @@ fn execute_loop_fragment(
     let executor_arc = executor_entry.value().clone();
     drop(executor_entry); // release dashmap lock
 
-    // Get new input batches from the drainer.
-    let drainer =
-        runner
-            .continuous_drainer
-            .as_ref()
-            .ok_or_else(|| ExecutorError::InvalidAssignment {
-                message: String::from(
-                    "stream:loop fragment requires a continuous_drainer on the executor runner",
-                ),
-            })?;
-    let input_batches = drainer
-        .drain_job(job_id)
-        .map_err(|message| ExecutorError::LocalExecution { message })?;
+    // Embedded execution drains the shared session registry. Distributed
+    // execution receives the cycle's batches as coordinator-owned InlineIpc
+    // partitions on the assignment.
+    let input_batches = if let Some(drainer) = runner.continuous_drainer.as_ref() {
+        drainer
+            .drain_job(job_id)
+            .map_err(|message| ExecutorError::LocalExecution { message })?
+    } else {
+        crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
+            .into_iter()
+            .flat_map(|(_, batches)| batches)
+            .collect()
+    };
 
     // Process through the stateful window executor.
     let output_batches = {
@@ -285,10 +261,9 @@ pub(crate) async fn execute_streaming_fragment(
     let fragment = fragment_body.as_str();
 
     // Fragment dispatch priority (first match wins):
-    //   1. SQL query          — detected via sql_query_from_fragment()
-    //   2. stream:loop:       — stateful ContinuousWindowExecutor (long-lived)
-    //   3. stream:continuous: — ContinuousStreamRegistry drain (session-scoped)
-    //   4. <default>          — bounded window (tumbling / sliding / session)
+    //   1. SQL query    — detected via sql_query_from_fragment()
+    //   2. stream:loop: — stateful ContinuousWindowExecutor (long-lived)
+    //   3. <default>    — bounded window (tumbling / sliding / session)
     if let Some(query) = crate::fragment::common::sql_query_from_fragment(fragment) {
         // Create a new SQL engine with UDF limits for this task execution.
         let engine = Arc::new(krishiv_sql::SqlEngine::new().with_udf_limits(udf_limits));
@@ -350,48 +325,22 @@ pub(crate) async fn execute_streaming_fragment(
     // GAP-6: stream:loop: fragments use a stateful ContinuousWindowExecutor
     // shared across drain cycles via runner.loop_executors.
     if fragment.starts_with(STREAM_LOOP_PREFIX) {
-        return execute_loop_fragment(runner, fragment);
+        return execute_loop_fragment(runner, assignment, fragment);
     }
 
-    if let Some(job_id) = fragment.strip_prefix(STREAM_CONTINUOUS_PREFIX) {
-        let job_id = job_id.trim();
-        if job_id.is_empty() {
-            return Err(ExecutorError::InvalidAssignment {
-                message: String::from("stream:continuous fragment requires a job id"),
-            });
-        }
-        // In-process mode: drain from the shared ContinuousStreamRegistry.
-        // Distributed mode: read InlineIpc partitions delivered in the task
-        // assignment — pushed there by api_continuous_push via the coordinator.
-        let collected_batches = if let Some(drainer) = runner.continuous_drainer.as_ref() {
-            drainer
-                .drain_job(job_id)
-                .map_err(|message| ExecutorError::LocalExecution { message })?
-        } else {
-            // Flatten all InlineIpc partitions into a single batch list.
-            crate::fragment::common::read_inline_ipc_partitions(assignment.input_partitions())?
-                .into_iter()
-                .flat_map(|(_, batches)| batches)
-                .collect()
-        };
-        let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
-        let total_batches = collected_batches.len();
-        let column_count = collected_batches
-            .first()
-            .map(|b| b.num_columns())
-            .unwrap_or(0);
-        return Ok(ExecutorTaskOutput::streaming_window(
-            total_rows,
-            total_batches,
-            column_count,
-            collected_batches,
-        ));
+    if fragment.starts_with(LEGACY_STREAM_CONTINUOUS_PREFIX) {
+        return Err(ExecutorError::InvalidAssignment {
+            message: String::from(
+                "legacy stream:continuous fragments are unsupported; \
+                 continuous assignments must use stream:loop with an encoded window specification",
+            ),
+        });
     }
 
-    let parsed = parse_stream_fragment(fragment).map_err(|e| ExecutorError::InvalidAssignment {
-        message: e.to_string(),
-    })?;
-    let mut plan_spec = parsed_to_plan_spec(parsed);
+    let mut plan_spec =
+        decode_window_execution_spec(fragment).map_err(|e| ExecutorError::InvalidAssignment {
+            message: e.to_string(),
+        })?;
 
     // GAP-WATERMARK: Apply the upstream stage's output watermark as the initial
     // prev_watermark_ms for this stage's window operators. Without this, stage 2
@@ -448,11 +397,9 @@ pub(crate) async fn execute_streaming_fragment(
 
     let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
 
-    let collected_batches =
-        execute_bounded_window(batches, &plan_spec, job_state_dir.as_deref()).map_err(|e| {
-        ExecutorError::LocalExecution {
-            message: e.to_string(),
-        }
+    let collected_batches = execute_bounded_window(batches, &plan_spec, job_state_dir.as_deref())
+        .map_err(|e| ExecutorError::LocalExecution {
+        message: e.to_string(),
     })?;
 
     let total_rows: usize = collected_batches.iter().map(|b| b.num_rows()).sum();
@@ -504,11 +451,12 @@ async fn execute_streaming_with_batches(
 ) -> ExecutorResult<ExecutorTaskOutput> {
     let observed_watermark_ms = compute_input_watermark(&batches, &spec);
     let job_state_dir = runner.state_dir.as_ref().map(|d| d.join(job_id));
-    let collected = execute_bounded_window(batches, &spec, job_state_dir.as_deref()).map_err(|e| {
-        ExecutorError::LocalExecution {
-            message: e.to_string(),
-        }
-    })?;
+    let collected =
+        execute_bounded_window(batches, &spec, job_state_dir.as_deref()).map_err(|e| {
+            ExecutorError::LocalExecution {
+                message: e.to_string(),
+            }
+        })?;
     let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
     let total_batches = collected.len();
     let column_count = collected.first().map(|b| b.num_columns()).unwrap_or(0);

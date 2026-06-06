@@ -292,79 +292,7 @@ impl RemoteExecutionRuntime {
     }
 }
 
-/// Returns `true` only when `e` is a tonic `Status::Unimplemented` response
-/// from the server — meaning the server explicitly does not support the
-/// requested action and the client should fall back to the SQL protocol.
-///
-/// This is intentionally strict to avoid triggering the fallback on real errors
-/// that happen to contain the word "Unimplemented" (schema errors, auth errors,
-/// user-facing messages, etc.). Tonic formats unimplemented status as:
-/// `"status: Unimplemented, message: ..."`.
-/// Split `batches` into `num_shards` groups based on the hash of each row's
-/// `key_column` value (R7 — partition-key routing).
-///
-/// Rows where the key column is missing or non-string are placed in shard 0.
-/// The split is deterministic: the same key always routes to the same shard,
-/// ensuring that a given aggregation key is processed by exactly one executor.
-fn shard_batches_by_key(
-    batches: &[RecordBatch],
-    key_column: &str,
-    num_shards: usize,
-) -> RuntimeResult<Vec<Vec<RecordBatch>>> {
-    use arrow::array::{Array, BooleanBuilder, StringArray};
-    use arrow::compute::filter_record_batch;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut shards: Vec<Vec<RecordBatch>> = (0..num_shards).map(|_| Vec::new()).collect();
-
-    for batch in batches {
-        // Clone the Arc<dyn Array> so that `keys` doesn't borrow `batch`,
-        // allowing `filter_record_batch(batch, …)` later in the same scope.
-        let key_col_opt = batch
-            .schema()
-            .index_of(key_column)
-            .ok()
-            .filter(|&idx| batch.column(idx).as_any().is::<StringArray>())
-            .map(|idx| Arc::clone(batch.column(idx)));
-
-        if let Some(key_col) = key_col_opt {
-            let keys = key_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("type already verified above");
-            // Build one boolean mask per shard.
-            let mut masks: Vec<BooleanBuilder> = (0..num_shards)
-                .map(|_| BooleanBuilder::with_capacity(batch.num_rows()))
-                .collect();
-            for i in 0..batch.num_rows() {
-                let shard = if keys.is_null(i) {
-                    0
-                } else {
-                    let mut h = DefaultHasher::new();
-                    keys.value(i).hash(&mut h);
-                    (h.finish() as usize) % num_shards
-                };
-                for (s, mask) in masks.iter_mut().enumerate() {
-                    mask.append_value(s == shard);
-                }
-            }
-            for (shard_idx, mut mask_builder) in masks.into_iter().enumerate() {
-                let mask = mask_builder.finish();
-                if mask.true_count() > 0 {
-                    let filtered = filter_record_batch(batch, &mask)
-                        .map_err(|e| RuntimeError::transport(format!("shard filter: {e}")))?;
-                    shards[shard_idx].push(filtered);
-                }
-            }
-        } else {
-            // Key column not found or not string — route entire batch to shard 0.
-            shards[0].push(batch.clone());
-        }
-    }
-    Ok(shards)
-}
-
+/// Return true only for the dedicated tonic `Unimplemented` transport status.
 fn is_server_unimplemented(e: &RuntimeError) -> bool {
     matches!(e, RuntimeError::ServerUnimplemented { .. })
 }
@@ -390,7 +318,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         if plan.kind() == ExecutionKind::Streaming {
             let job_id = plan.name();
             if job_id.trim().is_empty() {
-                return Err(RuntimeError::plan_rejected("streaming plan name must not be empty"));
+                return Err(RuntimeError::plan_rejected(
+                    "streaming plan name must not be empty",
+                ));
             }
             let spec = crate::plan::streaming_spec_from_plan(plan)?;
             self.register_continuous_stream(job_id, &spec)?;
@@ -446,53 +376,8 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
         use crate::flight_protocol::encode_bounded_window;
         use krishiv_common::async_util::block_on;
 
-        let num_shards = self.pool.shard_count();
-
-        // R7: If multiple executor endpoints are configured, split batches by
-        // key-column hash and route each shard to its designated endpoint.
-        // Each executor handles its own key partition independently, so keyed
-        // aggregations (GROUP BY) are distributed across the executor pool.
-        if num_shards > 1 && !input_batches.is_empty() {
-            let sharded = shard_batches_by_key(&input_batches, &spec.key_column, num_shards)?;
-            let mut all_batches: Vec<RecordBatch> = Vec::new();
-            let mut global_watermark: Option<i64> = None;
-
-            for (shard_idx, shard_batches) in sharded.into_iter().enumerate() {
-                if shard_batches.is_empty() {
-                    continue;
-                }
-                let batches_b64 = encode_batches(&shard_batches)?;
-                let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
-                    topic: topic.to_string(),
-                    spec: spec.to_plan_spec(),
-                    batches_b64,
-                    response_watermark_ms: None,
-                });
-                match block_on(self.pool.do_action_on_shard(shard_idx, &action)) {
-                    Ok(body) => {
-                        let wm = serde_json::from_slice::<BoundedWindowBody>(&body)
-                            .ok()
-                            .and_then(|r| r.response_watermark_ms);
-                        if let Some(wm) = wm {
-                            global_watermark =
-                                Some(global_watermark.map_or(wm, |prev: i64| prev.min(wm)));
-                        }
-                        all_batches.extend(decode_ipc_response(&body)?);
-                    }
-                    Err(ref e) if is_server_unimplemented(e) => {
-                        if !allow_remote_sql_comment_fallback() {
-                            return Err(e.clone());
-                        }
-                        let sql = encode_bounded_window(topic, spec, &shard_batches)?;
-                        all_batches.extend(block_on(self.pool.execute_sql(&sql))?);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            return Ok((all_batches, global_watermark));
-        }
-
-        // Single endpoint: send all batches to the one executor (original path).
+        // The active coordinator owns partitioning and executor placement.
+        // Flight pool alternates are failover coordinators, not data shards.
         let batches_b64 = encode_batches(&input_batches)?;
         let action = KrishivFlightAction::BoundedWindow(BoundedWindowBody {
             topic: topic.to_string(),

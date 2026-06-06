@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use arrow::record_batch::RecordBatch;
 
-use crate::{ConnectorError, ConnectorResult, TwoPhaseCommitSink};
+use crate::{ConnectorCapabilities, ConnectorError, ConnectorResult, TwoPhaseCommitSink};
 
 fn io_err(context: &str, e: std::io::Error) -> ConnectorError {
     ConnectorError::IoStr {
@@ -12,11 +12,27 @@ fn io_err(context: &str, e: std::io::Error) -> ConnectorError {
     }
 }
 
+fn publish_staged_file(staging_path: &Path, final_path: &Path) -> ConnectorResult<()> {
+    match std::fs::hard_link(staging_path, final_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && final_path.exists() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && final_path.exists() => {}
+        Err(error) => return Err(io_err("publish staged parquet without replacement", error)),
+    }
+
+    match std::fs::remove_file(staging_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_err("remove published staging file", error)),
+    }
+}
+
 /// Handle identifying a staged Parquet object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetStagingHandle {
     id: u64,
-    path: PathBuf,
+    staging_path: PathBuf,
+    final_path: PathBuf,
 }
 
 /// Stages Parquet under `{base}/_staging/{epoch}/` then commits to `{base}/data/`.
@@ -61,11 +77,29 @@ impl TwoPhaseParquetSink {
                 .map_err(|e| io_err("create data dir", e))?;
             for entry in std::fs::read_dir(&staging).map_err(|e| io_err("read staging dir", e))? {
                 let entry = entry.map_err(|e| io_err("read staging entry", e))?;
-                let dest = base_dir.join("data").join(entry.file_name());
-                // On POSIX rename() atomically replaces the destination; deleting
-                // first creates a window where the file is missing and can lose
-                // data if a reader accesses the path during the gap.
-                std::fs::rename(entry.path(), dest).map_err(|e| io_err("commit staged file", e))?;
+                if !entry
+                    .file_type()
+                    .map_err(|e| io_err("read staging entry type", e))?
+                    .is_file()
+                {
+                    return Err(ConnectorError::IoStr {
+                        message: format!(
+                            "orphan staging contains non-file entry: {:?}",
+                            entry.path()
+                        ),
+                    });
+                }
+                let staging_name =
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|name| ConnectorError::IoStr {
+                            message: format!("non-UTF-8 staging file name: {name:?}"),
+                        })?;
+                let final_path = base_dir
+                    .join("data")
+                    .join(format!("epoch-{epoch}-{staging_name}"));
+                publish_staged_file(&entry.path(), &final_path)?;
             }
         }
         std::fs::remove_dir_all(&staging).map_err(|e| io_err("remove staging dir", e))?;
@@ -76,51 +110,102 @@ impl TwoPhaseParquetSink {
 impl TwoPhaseCommitSink for TwoPhaseParquetSink {
     type Handle = ParquetStagingHandle;
 
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_two_phase_commit()
+    }
+
     fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         if epoch != self.epoch {
             return Err(ConnectorError::IoStr {
                 message: "prepare epoch mismatch".into(),
             });
         }
-        std::fs::create_dir_all(self.staging_dir()).map_err(|e| io_err("create staging dir", e))?;
-        let id = self.next_id;
-        self.next_id += 1;
-        let path = self.staging_dir().join(format!("part-{id}.parquet"));
-        let file = std::fs::File::create(&path).map_err(|e| io_err("create staged parquet", e))?;
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None).map_err(|e| {
-                ConnectorError::IoStr {
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir).map_err(|e| io_err("create staging dir", e))?;
+
+        let (id, staging_path, final_path, file) = loop {
+            let id = self.next_id;
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .ok_or_else(|| ConnectorError::IoStr {
+                    message: "Parquet two-phase commit handle space exhausted".into(),
+                })?;
+            let staging_name = format!("part-{id}.parquet");
+            let staging_path = staging_dir.join(&staging_name);
+            let final_path = self
+                .final_dir()
+                .join(format!("epoch-{}-{staging_name}", self.epoch));
+            if final_path.exists() {
+                continue;
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging_path)
+            {
+                Ok(file) => break (id, staging_path, final_path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(io_err("create staged parquet", error)),
+            }
+        };
+
+        let write_result = (|| {
+            let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
+                .map_err(|e| ConnectorError::IoStr {
                     message: format!("parquet writer: {e}"),
-                }
+                })?;
+            writer.write(batch).map_err(|e| ConnectorError::IoStr {
+                message: format!("parquet write: {e}"),
             })?;
-        writer.write(batch).map_err(|e| ConnectorError::IoStr {
-            message: format!("parquet write: {e}"),
-        })?;
-        writer.close().map_err(|e| ConnectorError::IoStr {
-            message: format!("parquet close: {e}"),
-        })?;
-        self.staged_paths.insert(id, path.clone());
-        Ok(ParquetStagingHandle { id, path })
+            writer.close().map_err(|e| ConnectorError::IoStr {
+                message: format!("parquet close: {e}"),
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if let Err(cleanup_error) = std::fs::remove_file(&staging_path)
+                && cleanup_error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    path = %staging_path.display(),
+                    error = %cleanup_error,
+                    "failed to clean up incomplete staged Parquet file"
+                );
+            }
+            return Err(error);
+        }
+
+        self.staged_paths.insert(id, staging_path.clone());
+        Ok(ParquetStagingHandle {
+            id,
+            staging_path,
+            final_path,
+        })
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
         std::fs::create_dir_all(self.final_dir()).map_err(|e| io_err("create final dir", e))?;
-        let name = handle
-            .path
-            .file_name()
-            .ok_or_else(|| ConnectorError::IoStr {
-                message: "invalid staged path".into(),
-            })?;
-        let dest = self.final_dir().join(name);
-        // rename is atomic on POSIX — single metadata operation.
-        std::fs::rename(&handle.path, &dest).map_err(|e| io_err("commit staged parquet", e))?;
+        publish_staged_file(&handle.staging_path, &handle.final_path)?;
         self.staged_paths.remove(&handle.id);
         Ok(())
     }
 
     fn abort(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
-        std::fs::remove_file(&handle.path)
-            .map_err(|e| io_err("remove staging file on abort", e))?;
+        match std::fs::remove_file(&handle.staging_path) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !handle.final_path.exists() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ConnectorError::IoStr {
+                    message: format!(
+                        "cannot abort committed Parquet handle at {:?}",
+                        handle.final_path
+                    ),
+                });
+            }
+            Err(error) => return Err(io_err("remove staging file on abort", error)),
+        }
         self.staged_paths.remove(&handle.id);
         Ok(())
     }
@@ -160,6 +245,46 @@ mod tests {
         let mut sink = TwoPhaseParquetSink::new(dir.path(), 1);
         let h = sink.prepare(1, &batch()).unwrap();
         sink.commit(h).unwrap();
-        assert!(dir.path().join("data").join("part-0.parquet").exists());
+        assert!(
+            dir.path()
+                .join("data")
+                .join("epoch-1-part-0.parquet")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn parquet_2pc_preserves_commits_across_epochs() {
+        let dir = tempdir().unwrap();
+        for epoch in [1, 2] {
+            let mut sink = TwoPhaseParquetSink::new(dir.path(), epoch);
+            let handle = sink.prepare(epoch, &batch()).unwrap();
+            sink.commit(handle).unwrap();
+        }
+
+        assert!(
+            dir.path()
+                .join("data")
+                .join("epoch-1-part-0.parquet")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("data")
+                .join("epoch-2-part-0.parquet")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("data")).unwrap().count(),
+            2
+        );
+    }
+
+    #[test]
+    fn parquet_2pc_lifecycle_is_retry_safe() {
+        let dir = tempdir().unwrap();
+        let mut sink = TwoPhaseParquetSink::new(dir.path(), 7);
+        crate::CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 7, &batch())
+            .expect("Parquet 2PC sink must tolerate coordinator decision retries");
     }
 }

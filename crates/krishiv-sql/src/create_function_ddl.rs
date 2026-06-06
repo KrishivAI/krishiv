@@ -7,15 +7,17 @@
 //!
 //! * A SQL body (`LANGUAGE sql AS '…'`) — executed via the session context.
 //! * A runtime-provided Rust closure — registered via `SqlEngine::register_table_udf_fn`.
-//! * A stub that returns a clear "not yet implemented" error for other languages.
+//!
+//! Unsupported DDL languages are rejected before any registry mutation.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use regex::Regex;
 
-use krishiv_udf::{ScalarValue, TableUdf, UdfError, UdfRegistry};
+use krishiv_udf::{ScalarValue, TableUdf, UdfError};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Parsed CREATE FUNCTION descriptor
@@ -28,11 +30,20 @@ pub struct ColumnDef {
     pub data_type: DataType,
 }
 
+/// A typed function argument extracted from the function signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionArgDef {
+    pub name: String,
+    pub data_type: DataType,
+}
+
 /// Parsed descriptor produced by [`parse_create_function`].
 #[derive(Debug, Clone)]
 pub struct CreateFunctionDdl {
     /// Function name as written in the SQL statement.
     pub function_name: String,
+    /// Typed arguments declared in the function signature.
+    pub arguments: Vec<FunctionArgDef>,
     /// Output columns declared in `RETURNS TABLE (…)`.
     pub return_columns: Vec<ColumnDef>,
     /// Language string (e.g. `RUST`, `PYTHON`), lower-cased.
@@ -64,12 +75,12 @@ pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String> {
     // LANGUAGE clause, and optional AS body.
     //
     // Pattern (case-insensitive):
-    //   CREATE [OR REPLACE] FUNCTION  <name> (<args>)
+    //   CREATE [OR REPLACE] FUNCTION  <name> ( <args> )
     //   RETURNS TABLE ( <col_defs> )
     //   [LANGUAGE <lang>]
     //   [AS '<body>']
     let re = Regex::new(
-        r"(?is)CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\([^)]*\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?",
+        r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\(([^)]*)\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?\s*;?\s*$",
     )
     .map_err(|e| format!("internal regex error: {e}"))?;
 
@@ -82,39 +93,61 @@ pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String> {
         .map(|m| m.as_str().to_string())
         .ok_or("could not extract function name")?;
 
-    let col_list = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+    let arg_list = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+    let arguments = parse_argument_list(arg_list)?;
+
+    let col_list = caps.get(3).map(|m| m.as_str()).unwrap_or("");
     let return_columns = parse_column_list(col_list)?;
 
-    let language = caps.get(3).map(|m| m.as_str().to_ascii_lowercase());
-    let body = caps.get(4).map(|m| m.as_str().replace("''", "'"));
+    let language = caps.get(4).map(|m| m.as_str().to_ascii_lowercase());
+    let body = caps.get(5).map(|m| m.as_str().replace("''", "'"));
 
     Ok(CreateFunctionDdl {
         function_name,
+        arguments,
         return_columns,
         language,
         body,
     })
 }
 
+fn parse_argument_list(list: &str) -> Result<Vec<FunctionArgDef>, String> {
+    parse_named_type_list(list, "argument")?
+        .into_iter()
+        .map(|(name, data_type)| Ok(FunctionArgDef { name, data_type }))
+        .collect()
+}
+
 /// Parse a comma-separated `name TYPE` column list as it appears inside
 /// `RETURNS TABLE (…)`.
 fn parse_column_list(list: &str) -> Result<Vec<ColumnDef>, String> {
+    parse_named_type_list(list, "column")?
+        .into_iter()
+        .map(|(name, data_type)| Ok(ColumnDef { name, data_type }))
+        .collect()
+}
+
+fn parse_named_type_list(list: &str, item_kind: &str) -> Result<Vec<(String, DataType)>, String> {
     let list = list.trim();
     if list.is_empty() {
         return Ok(Vec::new());
     }
-    list.split(',')
-        .map(|col| {
-            let parts: Vec<&str> = col.split_whitespace().collect();
-            if parts.len() < 2 {
-                return Err(format!("invalid column definition: '{col}'"));
-            }
-            let name = parts[0].to_string();
-            let type_str = parts[1..].join(" ");
-            let data_type = sql_type_to_arrow(&type_str)?;
-            Ok(ColumnDef { name, data_type })
-        })
-        .collect()
+    let mut parsed = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for item in list.split(',') {
+        let parts: Vec<&str> = item.split_whitespace().collect();
+        if parts.len() < 2 {
+            return Err(format!("invalid {item_kind} definition: '{item}'"));
+        }
+        let name = parts[0].to_string();
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!("duplicate {item_kind} name '{name}'"));
+        }
+        let type_str = parts[1..].join(" ");
+        let data_type = sql_type_to_arrow(&type_str)?;
+        parsed.push((name, data_type));
+    }
+    Ok(parsed)
 }
 
 /// Map a SQL type keyword (as used in DDL) to an Arrow [`DataType`].
@@ -150,48 +183,41 @@ fn sql_type_to_arrow(type_str: &str) -> Result<DataType, String> {
 /// Body-function type alias for runtime-registered UDTFs.
 pub type UdtfBodyFn = Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>;
 
-/// A [`TableUdf`] backed by either a runtime closure or the "not yet
-/// implemented" error for unsupported language bodies.
+/// A [`TableUdf`] backed by a runtime-provided Rust closure.
 #[derive(Clone)]
-pub struct StubTableUdf {
+pub struct ClosureTableUdf {
     pub(crate) name: String,
     pub(crate) schema: Schema,
-    /// Optional runtime-provided body.  `None` → return a clear error.
-    body_fn: Option<UdtfBodyFn>,
+    body_fn: UdtfBodyFn,
 }
 
-impl std::fmt::Debug for StubTableUdf {
+impl std::fmt::Debug for ClosureTableUdf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StubTableUdf")
+        f.debug_struct("ClosureTableUdf")
             .field("name", &self.name)
-            .field("has_body", &self.body_fn.is_some())
+            .field("schema", &self.schema)
             .finish()
     }
 }
 
-impl StubTableUdf {
-    /// Build a stub (no body) from a parsed [`CreateFunctionDdl`].
-    pub fn from_ddl(ddl: &CreateFunctionDdl) -> Self {
-        let fields: Vec<Field> = ddl
-            .return_columns
-            .iter()
-            .map(|col| Field::new(&col.name, col.data_type.clone(), true))
-            .collect();
-        Self {
-            name: ddl.function_name.clone(),
-            schema: Schema::new(fields),
-            body_fn: None,
-        }
-    }
-
-    /// Attach a runtime body function.
-    pub fn with_body_fn(mut self, f: UdtfBodyFn) -> Self {
-        self.body_fn = Some(f);
-        self
+impl ClosureTableUdf {
+    /// Create a closure-backed UDTF with an explicit output schema.
+    pub fn try_new(
+        name: impl Into<String>,
+        schema: Schema,
+        body_fn: UdtfBodyFn,
+    ) -> Result<Self, UdfError> {
+        let name = name.into();
+        validate_udtf_definition(&name, &schema)?;
+        Ok(Self {
+            name,
+            schema,
+            body_fn,
+        })
     }
 }
 
-impl TableUdf for StubTableUdf {
+impl TableUdf for ClosureTableUdf {
     fn name(&self) -> &str {
         &self.name
     }
@@ -201,18 +227,68 @@ impl TableUdf for StubTableUdf {
     }
 
     fn call(&self, args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
-        match &self.body_fn {
-            Some(f) => f(args),
-            None => Err(UdfError::Execution {
+        let batch =
+            catch_unwind(AssertUnwindSafe(|| (self.body_fn)(args))).map_err(|payload| {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic");
+                UdfError::Panic(format!("UDTF '{}': {message}", self.name))
+            })??;
+        if !schema_contract_matches(batch.schema().as_ref(), &self.schema) {
+            return Err(UdfError::Execution {
                 message: format!(
-                    "UDTF '{}': body execution is not yet implemented; \
-                     register a body via SqlEngine::register_table_udf_fn() \
-                     or use LANGUAGE sql AS '…'",
-                    self.name
+                    "UDTF '{}' returned schema {:?}, expected {:?}",
+                    self.name,
+                    batch.schema(),
+                    self.schema
                 ),
-            }),
+            });
+        }
+        Ok(batch)
+    }
+}
+
+fn validate_udtf_definition(name: &str, schema: &Schema) -> Result<(), UdfError> {
+    if name.trim().is_empty() {
+        return Err(UdfError::InvalidArgument {
+            message: String::from("UDTF name must not be empty"),
+        });
+    }
+    if schema.fields().is_empty() {
+        return Err(UdfError::InvalidArgument {
+            message: format!("UDTF '{name}' must declare at least one output column"),
+        });
+    }
+    let mut names = std::collections::HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if field.name().trim().is_empty() {
+            return Err(UdfError::InvalidArgument {
+                message: format!("UDTF '{name}' contains an empty output column name"),
+            });
+        }
+        if !names.insert(field.name()) {
+            return Err(UdfError::InvalidArgument {
+                message: format!(
+                    "UDTF '{name}' contains duplicate output column '{}'",
+                    field.name()
+                ),
+            });
         }
     }
+    Ok(())
+}
+
+fn schema_contract_matches(actual: &Schema, expected: &Schema) -> bool {
+    actual.fields().len() == expected.fields().len()
+        && actual
+            .fields()
+            .iter()
+            .zip(expected.fields())
+            .all(|(actual, expected)| {
+                actual.name() == expected.name() && actual.data_type() == expected.data_type()
+            })
 }
 
 /// A [`TableUdf`] whose body is a SQL query executed via a DataFusion session.
@@ -225,6 +301,7 @@ pub struct SqlBodyTableUdf {
     pub(crate) name: String,
     pub(crate) schema: Schema,
     body_sql: String,
+    argument_count: usize,
     ctx: Arc<datafusion::prelude::SessionContext>,
 }
 
@@ -238,18 +315,30 @@ impl std::fmt::Debug for SqlBodyTableUdf {
 }
 
 impl SqlBodyTableUdf {
-    pub fn new(
+    pub fn try_new(
         name: impl Into<String>,
         schema: Schema,
         body_sql: impl Into<String>,
+        argument_count: usize,
         ctx: Arc<datafusion::prelude::SessionContext>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            schema,
-            body_sql: body_sql.into(),
-            ctx,
+    ) -> Result<Self, UdfError> {
+        let name = name.into();
+        validate_udtf_definition(&name, &schema)?;
+        let body_sql = body_sql.into();
+        if body_sql.trim().is_empty() {
+            return Err(UdfError::InvalidArgument {
+                message: format!("SQL UDTF '{name}' body must not be empty"),
+            });
         }
+        let placeholder_args = vec![ScalarValue::Null; argument_count];
+        bind_sql_body_args(&body_sql, &placeholder_args)?;
+        Ok(Self {
+            name,
+            schema,
+            body_sql,
+            argument_count,
+            ctx,
+        })
     }
 }
 
@@ -262,48 +351,259 @@ impl TableUdf for SqlBodyTableUdf {
         &self.schema
     }
 
-    fn call(&self, _args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
+    fn call(&self, args: &[ScalarValue]) -> Result<RecordBatch, UdfError> {
+        if args.len() != self.argument_count {
+            return Err(UdfError::InvalidArgument {
+                message: format!(
+                    "UDTF '{}' expects {} arguments, got {}",
+                    self.name,
+                    self.argument_count,
+                    args.len()
+                ),
+            });
+        }
+
         // Execute the SQL body synchronously using block_in_place so this
         // sync call-site can safely await without deadlocking the executor.
-        // TODO: substitute $1, $2, … arg placeholders for parameterized UDTFs.
         let ctx = Arc::clone(&self.ctx);
-        let sql = self.body_sql.clone();
+        let sql = bind_sql_body_args(&self.body_sql, args)?;
         let schema = Arc::new(self.schema.clone());
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(async {
-                let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
-                    message: e.to_string(),
-                })?;
-                let batches = df.collect().await.map_err(|e| UdfError::Execution {
-                    message: e.to_string(),
-                })?;
-                if batches.is_empty() {
-                    return Ok(RecordBatch::new_empty(schema));
-                }
-                arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                    .map_err(|e| UdfError::Arrow(e.to_string()))
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|error| UdfError::Execution {
+                message: format!(
+                    "SQL UDTF '{}' requires an active Tokio runtime: {error}",
+                    self.name
+                ),
+            })?;
+        if !matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return Err(UdfError::Execution {
+                message: format!(
+                    "SQL UDTF '{}' requires a multi-thread Tokio runtime",
+                    self.name
+                ),
+            });
+        }
+        catch_unwind(AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let df = ctx.sql(&sql).await.map_err(|e| UdfError::Execution {
+                        message: e.to_string(),
+                    })?;
+                    let batches = df.collect().await.map_err(|e| UdfError::Execution {
+                        message: e.to_string(),
+                    })?;
+                    if batches.is_empty() {
+                        return Ok(RecordBatch::new_empty(schema));
+                    }
+                    let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                        .map_err(|e| UdfError::Arrow(e.to_string()))?;
+                    if !schema_contract_matches(batch.schema().as_ref(), schema.as_ref()) {
+                        return Err(UdfError::Execution {
+                            message: format!(
+                                "SQL UDTF '{}' returned schema {:?}, expected {:?}",
+                                self.name,
+                                batch.schema(),
+                                schema
+                            ),
+                        });
+                    }
+                    Ok(batch)
+                })
             })
-        })
+        }))
+        .map_err(|payload| {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            UdfError::Panic(format!("SQL UDTF '{}': {message}", self.name))
+        })?
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Registration helper
-// ────────────────────────────────────────────────────────────────────────────
+fn bind_sql_body_args(sql: &str, args: &[ScalarValue]) -> Result<String, UdfError> {
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut index = 0;
 
-/// Parse `sql` as a `CREATE FUNCTION … RETURNS TABLE` statement and register
-/// a [`StubTableUdf`] in `registry`.
-///
-/// Returns the parsed [`CreateFunctionDdl`] on success.
-pub fn register_udtf_from_sql(
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                index = copy_quoted_segment(sql, index, bytes[index], &mut output)?;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                let end = sql[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |offset| index + offset + 1);
+                output.push_str(&sql[index..end]);
+                index = end;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index = copy_block_comment(sql, index, &mut output)?;
+            }
+            b'$' => {
+                if let Some((delimiter, end)) = dollar_quote_delimiter(sql, index) {
+                    let body_start = end;
+                    let close_offset = sql[body_start..].find(delimiter).ok_or_else(|| {
+                        UdfError::InvalidArgument {
+                            message: "unterminated dollar-quoted SQL body".to_owned(),
+                        }
+                    })?;
+                    let segment_end = body_start + close_offset + delimiter.len();
+                    output.push_str(&sql[index..segment_end]);
+                    index = segment_end;
+                    continue;
+                }
+
+                let digit_start = index + 1;
+                let mut end = digit_start;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+                if end == digit_start {
+                    output.push('$');
+                    index += 1;
+                    continue;
+                }
+
+                let placeholder = sql[digit_start..end].parse::<usize>().map_err(|error| {
+                    UdfError::InvalidArgument {
+                        message: format!(
+                            "invalid SQL UDTF placeholder '{}': {error}",
+                            &sql[index..end]
+                        ),
+                    }
+                })?;
+                if placeholder == 0 {
+                    return Err(UdfError::InvalidArgument {
+                        message: "SQL UDTF placeholders are 1-based; $0 is invalid".to_owned(),
+                    });
+                }
+                let value = args.get(placeholder - 1).ok_or_else(|| UdfError::InvalidArgument {
+                    message: format!(
+                        "SQL UDTF placeholder ${placeholder} has no matching argument; got {} arguments",
+                        args.len()
+                    ),
+                })?;
+                output.push_str(&scalar_to_sql_literal(value)?);
+                index = end;
+            }
+            _ => {
+                let ch = sql[index..]
+                    .chars()
+                    .next()
+                    .expect("index is within the SQL string");
+                output.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+fn copy_quoted_segment(
     sql: &str,
-    registry: &mut UdfRegistry,
-) -> Result<CreateFunctionDdl, String> {
-    let ddl = parse_create_function(sql)?;
-    let stub = StubTableUdf::from_ddl(&ddl);
-    registry.register_table(Arc::new(stub));
-    Ok(ddl)
+    start: usize,
+    quote: u8,
+    output: &mut String,
+) -> Result<usize, UdfError> {
+    let bytes = sql.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == quote {
+            index += 1;
+            if bytes.get(index) == Some(&quote) {
+                index += 1;
+                continue;
+            }
+            output.push_str(&sql[start..index]);
+            return Ok(index);
+        }
+        let ch = sql[index..]
+            .chars()
+            .next()
+            .expect("index is within the SQL string");
+        index += ch.len_utf8();
+    }
+    Err(UdfError::InvalidArgument {
+        message: "unterminated quoted SQL segment".to_owned(),
+    })
+}
+
+fn copy_block_comment(sql: &str, start: usize, output: &mut String) -> Result<usize, UdfError> {
+    let bytes = sql.as_bytes();
+    let mut index = start + 2;
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            depth += 1;
+            index += 2;
+        } else if bytes.get(index) == Some(&b'*') && bytes.get(index + 1) == Some(&b'/') {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                output.push_str(&sql[start..index]);
+                return Ok(index);
+            }
+        } else {
+            let ch = sql[index..]
+                .chars()
+                .next()
+                .expect("index is within the SQL string");
+            index += ch.len_utf8();
+        }
+    }
+    Err(UdfError::InvalidArgument {
+        message: "unterminated SQL block comment".to_owned(),
+    })
+}
+
+fn dollar_quote_delimiter(sql: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = sql.as_bytes();
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut index = start + 1;
+    if bytes.get(index) == Some(&b'$') {
+        return Some((&sql[start..=index], index + 1));
+    }
+    let first = *bytes.get(index)?;
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return None;
+    }
+    index += 1;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'$') {
+        Some((&sql[start..=index], index + 1))
+    } else {
+        None
+    }
+}
+
+fn scalar_to_sql_literal(value: &ScalarValue) -> Result<String, UdfError> {
+    match value {
+        ScalarValue::Null => Ok("NULL".to_owned()),
+        ScalarValue::Int64(value) => Ok(value.to_string()),
+        ScalarValue::Float64(value) if value.is_finite() => Ok(value.to_string()),
+        ScalarValue::Float64(value) => Err(UdfError::InvalidArgument {
+            message: format!("non-finite floating-point UDTF argument {value} is not supported"),
+        }),
+        ScalarValue::Utf8(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+        ScalarValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_owned()),
+        ScalarValue::Bytes(_) => Err(UdfError::InvalidArgument {
+            message: "binary UDTF arguments are not supported in SQL bodies".to_owned(),
+        }),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -313,7 +613,8 @@ pub fn register_udtf_from_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field};
 
     const BASIC_DDL: &str = "
         CREATE FUNCTION my_udtf(arg1 INT)
@@ -341,6 +642,32 @@ mod tests {
     fn parses_function_name() {
         let ddl = parse_create_function(BASIC_DDL).expect("should parse");
         assert_eq!(ddl.function_name, "my_udtf");
+    }
+
+    #[test]
+    fn parses_typed_arguments() {
+        let ddl = parse_create_function(
+            "CREATE FUNCTION typed_args(count BIGINT, label TEXT, enabled BOOLEAN) \
+             RETURNS TABLE (value TEXT) LANGUAGE SQL AS 'SELECT $2 AS value'",
+        )
+        .expect("should parse");
+        assert_eq!(
+            ddl.arguments,
+            vec![
+                FunctionArgDef {
+                    name: "count".to_owned(),
+                    data_type: DataType::Int64,
+                },
+                FunctionArgDef {
+                    name: "label".to_owned(),
+                    data_type: DataType::Utf8,
+                },
+                FunctionArgDef {
+                    name: "enabled".to_owned(),
+                    data_type: DataType::Boolean,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -379,34 +706,140 @@ mod tests {
     }
 
     #[test]
-    fn stub_table_udf_call_returns_not_implemented_error() {
-        // StubTableUdf is schema-only; calling it returns a clear "not implemented"
-        // error so users get an actionable message rather than silent empty results.
-        let ddl = parse_create_function(BASIC_DDL).expect("should parse");
-        let stub = StubTableUdf::from_ddl(&ddl);
-        let err = stub.call(&[]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("my_udtf"),
-            "error should include function name"
-        );
-        assert!(
-            msg.contains("not yet implemented") || msg.contains("not implemented"),
-            "error should indicate unimplemented: {msg}"
-        );
-        // Schema is still accessible for planning.
-        assert_eq!(stub.output_schema().field(0).name(), "col1");
-        assert_eq!(stub.output_schema().field(1).name(), "col2");
+    fn parser_rejects_trailing_unparsed_sql() {
+        let error = parse_create_function(&format!("{BASIC_DDL} SELECT 1"))
+            .expect_err("trailing SQL must not be ignored");
+        assert!(error.contains("does not match"));
     }
 
     #[test]
-    fn register_udtf_from_sql_adds_to_registry() {
-        let mut registry = UdfRegistry::new();
-        let ddl = register_udtf_from_sql(BASIC_DDL, &mut registry).expect("registration ok");
-        assert_eq!(ddl.function_name, "my_udtf");
-        let found = registry.get_table("my_udtf").expect("must be registered");
-        assert_eq!(found.name(), "my_udtf");
-        assert_eq!(found.output_schema().fields().len(), 2);
+    fn parser_rejects_duplicate_argument_and_output_names() {
+        let duplicate_arg = parse_create_function(
+            "CREATE FUNCTION f(value INT, VALUE BIGINT) \
+             RETURNS TABLE (result BIGINT) LANGUAGE SQL AS 'SELECT 1 AS result'",
+        )
+        .expect_err("argument names are case-insensitively unique");
+        assert!(duplicate_arg.contains("duplicate argument"));
+
+        let duplicate_output = parse_create_function(
+            "CREATE FUNCTION f() RETURNS TABLE (value INT, VALUE BIGINT) \
+             LANGUAGE SQL AS 'SELECT 1 AS value, 2 AS VALUE'",
+        )
+        .expect_err("output names are case-insensitively unique");
+        assert!(duplicate_output.contains("duplicate column"));
+    }
+
+    #[test]
+    fn closure_table_udf_executes_and_validates_output_schema() {
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        let udf = ClosureTableUdf::try_new(
+            "values",
+            schema.clone(),
+            Arc::new({
+                let schema = Arc::new(schema);
+                move |_| {
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(vec![1_i64, 2])) as ArrayRef],
+                    )
+                    .map_err(UdfError::from)
+                }
+            }),
+        )
+        .unwrap();
+
+        let batch = udf.call(&[]).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let wrong_schema = ClosureTableUdf::try_new(
+            "wrong",
+            Schema::new(vec![Field::new("expected", DataType::Int64, false)]),
+            Arc::new(|_| {
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "actual",
+                        DataType::Int64,
+                        false,
+                    )])),
+                    vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+                )
+                .map_err(UdfError::from)
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            wrong_schema.call(&[]),
+            Err(UdfError::Execution { .. })
+        ));
+    }
+
+    #[test]
+    fn closure_table_udf_contains_panics() {
+        let udf = ClosureTableUdf::try_new(
+            "panic_udtf",
+            Schema::new(vec![Field::new("value", DataType::Int64, false)]),
+            Arc::new(|_| -> Result<RecordBatch, UdfError> { panic!("boom") }),
+        )
+        .unwrap();
+
+        assert!(matches!(udf.call(&[]), Err(UdfError::Panic(_))));
+    }
+
+    #[test]
+    fn sql_body_udtf_without_runtime_returns_typed_error() {
+        let udf = SqlBodyTableUdf::try_new(
+            "runtime_required",
+            Schema::new(vec![Field::new("value", DataType::Int64, false)]),
+            "SELECT 1 AS value",
+            0,
+            Arc::new(datafusion::prelude::SessionContext::new()),
+        )
+        .unwrap();
+
+        let error = udf
+            .call(&[])
+            .expect_err("missing Tokio runtime must not panic");
+        assert!(matches!(error, UdfError::Execution { .. }));
+    }
+
+    #[test]
+    fn sql_body_binding_replaces_only_unquoted_placeholders() {
+        let sql = "SELECT $1 AS n, '$1' AS literal, \"$2\" AS quoted, /* $2 */ $2 AS text";
+        let bound = bind_sql_body_args(
+            sql,
+            &[
+                ScalarValue::Int64(42),
+                ScalarValue::Utf8("O'Reilly".to_owned()),
+            ],
+        )
+        .expect("binding should succeed");
+        assert_eq!(
+            bound,
+            "SELECT 42 AS n, '$1' AS literal, \"$2\" AS quoted, /* $2 */ 'O''Reilly' AS text"
+        );
+    }
+
+    #[test]
+    fn sql_body_binding_preserves_comments_and_dollar_quoted_segments() {
+        let sql = "SELECT $$body $1$$ AS body, -- $1\n$1 AS value";
+        let bound =
+            bind_sql_body_args(sql, &[ScalarValue::Boolean(true)]).expect("binding should succeed");
+        assert_eq!(bound, "SELECT $$body $1$$ AS body, -- $1\nTRUE AS value");
+    }
+
+    #[test]
+    fn sql_body_binding_rejects_invalid_placeholders_and_values() {
+        let zero = bind_sql_body_args("SELECT $0", &[ScalarValue::Int64(1)])
+            .expect_err("$0 must be rejected");
+        assert!(zero.to_string().contains("1-based"));
+
+        let missing = bind_sql_body_args("SELECT $2", &[ScalarValue::Int64(1)])
+            .expect_err("missing arguments must be rejected");
+        assert!(missing.to_string().contains("no matching argument"));
+
+        let binary = bind_sql_body_args("SELECT $1", &[ScalarValue::Bytes(vec![1, 2])])
+            .expect_err("binary SQL literals must be rejected");
+        assert!(binary.to_string().contains("binary"));
     }
 
     #[test]

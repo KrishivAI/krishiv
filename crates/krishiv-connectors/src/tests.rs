@@ -44,8 +44,10 @@ mod connector_tests {
     fn connector_capabilities_two_phase_commit_flag() {
         let caps = ConnectorCapabilities::new().with_two_phase_commit();
         assert!(caps.is_two_phase_commit_capable());
-        assert!(!caps.is_checkpoint_capable());
+        assert!(caps.is_checkpoint_capable());
+        assert!(caps.is_transactional());
         assert!(caps.has_any());
+        caps.validate().unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -103,6 +105,131 @@ mod connector_tests {
             ConnectorError::Unsupported { .. } => {}
             other => panic!("expected Unsupported, got: {other}"),
         }
+    }
+
+    struct ModeLessSource;
+
+    impl Source for ModeLessSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new().with_rewindable()
+        }
+
+        async fn read_batch(
+            &mut self,
+        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
+            Ok(None)
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+            Some(Box::new(0usize))
+        }
+    }
+
+    #[test]
+    fn certification_suite_rejects_source_without_boundedness_mode() {
+        let source = ModeLessSource;
+        let error = CertificationSuite::run_source_capabilities_test(&source)
+            .expect_err("source must declare bounded or unbounded");
+        assert!(
+            matches!(error, ConnectorError::CertificationFailed { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
+    struct BrokenRewindSource {
+        cursor: usize,
+    }
+
+    impl Source for BrokenRewindSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_rewindable()
+        }
+
+        async fn read_batch(
+            &mut self,
+        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
+            if self.cursor > 0 {
+                return Ok(None);
+            }
+            self.cursor += 1;
+            Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(
+                Schema::empty(),
+            ))))
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+            Some(Box::new(self.cursor))
+        }
+    }
+
+    #[tokio::test]
+    async fn certification_rewind_test_detects_default_noop_reset() {
+        let mut source = BrokenRewindSource { cursor: 0 };
+        let error = CertificationSuite::run_rewind_test::<usize>(&mut source)
+            .await
+            .expect_err("default no-op reset must fail certification");
+        assert!(
+            error.to_string().contains("did not restore initial offset"),
+            "unexpected error: {error}"
+        );
+    }
+
+    struct BrokenCheckpointSource {
+        cursor: usize,
+    }
+
+    impl Source for BrokenCheckpointSource {
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new()
+                .with_bounded()
+                .with_checkpoint()
+        }
+
+        async fn read_batch(
+            &mut self,
+        ) -> ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
+            if self.cursor > 0 {
+                return Ok(None);
+            }
+            self.cursor += 1;
+            Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(
+                Schema::empty(),
+            ))))
+        }
+
+        fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
+            Some(Box::new(ParquetOffset {
+                batch_index: self.cursor,
+            }))
+        }
+    }
+
+    impl CheckpointSource for BrokenCheckpointSource {
+        type Offset = ParquetOffset;
+
+        fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+            Ok(ParquetOffset {
+                batch_index: self.cursor,
+            })
+        }
+
+        fn restore_offset(&mut self, _offset: &Self::Offset) -> ConnectorResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_certification_detects_noop_restore() {
+        let mut source = BrokenCheckpointSource { cursor: 0 };
+        let error = CertificationSuite::run_checkpoint_restore_test(&mut source)
+            .await
+            .expect_err("checkpoint restore must change the source position");
+        assert!(
+            error.to_string().contains("did not recover initial offset"),
+            "unexpected error: {error}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -171,6 +298,15 @@ mod connector_tests {
         let encoded = original.encode();
         let decoded = ParquetOffset::decode(&encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn parquet_offset_decode_rejects_noncanonical_length() {
+        let mut encoded = ParquetOffset { batch_index: 42 }.encode();
+        encoded.push(0);
+        let error =
+            ParquetOffset::decode(&encoded).expect_err("trailing offset bytes must be rejected");
+        assert!(matches!(error, ConnectorError::Offset { .. }));
     }
 
     #[test]
@@ -340,6 +476,43 @@ mod connector_tests {
     // TwoPhaseCommitSink
     // -----------------------------------------------------------------------
 
+    struct DishonestTwoPhaseSink;
+
+    impl TwoPhaseCommitSink for DishonestTwoPhaseSink {
+        type Handle = ();
+
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::new().with_checkpoint()
+        }
+
+        fn prepare(
+            &mut self,
+            _epoch: u64,
+            _batch: &arrow::record_batch::RecordBatch,
+        ) -> ConnectorResult<Self::Handle> {
+            Ok(())
+        }
+
+        fn commit(&mut self, _handle: Self::Handle) -> ConnectorResult<()> {
+            Ok(())
+        }
+
+        fn abort(&mut self, _handle: Self::Handle) -> ConnectorResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn certification_rejects_two_phase_sink_without_transactional_capability() {
+        let sink = DishonestTwoPhaseSink;
+        let error = CertificationSuite::run_two_phase_commit_capabilities_test(&sink)
+            .expect_err("2PC certification must inspect the actual sink capabilities");
+        assert!(
+            matches!(error, ConnectorError::CertificationFailed { .. }),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn two_phase_commit_sink_prepare_commit_roundtrip() {
         use arrow::array::Int64Array;
@@ -360,6 +533,22 @@ mod connector_tests {
         assert_eq!(sink.staged_count(), 0);
         assert_eq!(sink.committed().len(), 1);
         assert_eq!(sink.committed()[0].0, 1); // epoch
+    }
+
+    #[test]
+    fn in_memory_two_phase_commit_lifecycle_is_retry_safe() {
+        let batch = make_int32_batch(vec![1, 2, 3]);
+        let mut sink = InMemoryTwoPhaseCommitSink::new();
+
+        CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 9, &batch)
+            .expect("in-memory 2PC sink must tolerate coordinator decision retries");
+
+        assert_eq!(sink.staged_count(), 0);
+        assert_eq!(
+            sink.committed().len(),
+            1,
+            "repeated commit must not duplicate output"
+        );
     }
 
     #[test]

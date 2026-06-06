@@ -108,7 +108,8 @@ impl WatermarkState {
         if self.max_event_time_ms == i64::MIN {
             i64::MIN
         } else {
-            self.max_event_time_ms.saturating_sub(self.lag_ms as i64)
+            let watermark = i128::from(self.max_event_time_ms) - i128::from(self.lag_ms);
+            watermark.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         }
     }
 
@@ -289,6 +290,14 @@ mod watermark_tests {
         let mut w = WatermarkState::new(1_000);
         w.advance(5_000);
         assert_eq!(w.current_watermark_ms(), 4_000);
+    }
+
+    #[test]
+    fn watermark_state_saturates_for_lag_larger_than_i64() {
+        let mut w = WatermarkState::new(u64::MAX);
+        w.advance(i64::MAX);
+
+        assert_eq!(w.current_watermark_ms(), i64::MIN);
     }
 
     #[test]

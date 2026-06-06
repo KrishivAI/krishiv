@@ -31,8 +31,7 @@ impl Coordinator {
                         self.clear_checkpoint_notify_for_epoch(&job_id, ack.epoch);
                         CHECKPOINT_EPOCHS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                         record_checkpoint_epoch(job_id.as_str(), ack.epoch);
-                        krishiv_metrics::global_metrics()
-                            .inc_checkpoint_committed(job_id.as_str());
+                        krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
                         CheckpointAckResponse::Accepted
                     }
                     Ok(false) => CheckpointAckResponse::StaleEpoch { current_epoch },
@@ -189,20 +188,41 @@ impl Coordinator {
             message: format!("checkpoint epoch {epoch} not found for job {job_id}"),
         })?;
 
-        validate_epoch(storage.as_ref(), job_id.as_str(), epoch).map_err(|e| {
-            SchedulerError::InvalidJob {
-                message: format!("checkpoint epoch {epoch} failed integrity check: {e}"),
-            }
+        meta.validate().map_err(|e| SchedulerError::InvalidJob {
+            message: format!("checkpoint epoch {epoch} metadata is incompatible: {e}"),
         })?;
+        if meta.job_id != job_id.as_str() || meta.epoch != epoch {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "checkpoint epoch {epoch} metadata mismatch for requested job {job_id}: \
+                     metadata has job {} epoch {}",
+                    meta.job_id, meta.epoch
+                ),
+            });
+        }
+
+        let epoch_is_valid =
+            validate_epoch(storage.as_ref(), job_id.as_str(), epoch).map_err(|e| {
+                SchedulerError::InvalidJob {
+                    message: format!("checkpoint epoch {epoch} failed integrity check: {e}"),
+                }
+            })?;
+        if !epoch_is_valid {
+            return Err(SchedulerError::InvalidJob {
+                message: format!("checkpoint epoch {epoch} failed integrity check"),
+            });
+        }
 
         // GAP-CK-01 / A8: prefer the in-memory checkpoint coordinator's token
-        // (most recent), then fall back to the leader-election token.  At
-        // least one MUST be present for distributed deployments.
-        let token = self
-            .checkpoint_coordinators
-            .get(job_id)
-            .map(|coord| coord.fencing_token().as_u64())
-            .or(leader_fencing_token);
+        // when no live leader token was supplied.  A live leader-election
+        // token is authoritative for gRPC/admin restore after failover; using
+        // an older in-memory token would reject valid older checkpoints or
+        // activate future work under the wrong owner generation.
+        let token = leader_fencing_token.or_else(|| {
+            self.checkpoint_coordinators
+                .get(job_id)
+                .map(|coord| coord.fencing_token().as_u64())
+        });
         if let Some(current_token) = token {
             validate_fencing_token_for_restore(&meta, current_token).map_err(|e| {
                 SchedulerError::InvalidJob {
@@ -239,6 +259,90 @@ impl Coordinator {
                 });
             }
         }
+        Ok(meta)
+    }
+
+    /// Validate and activate a checkpoint restore for an already tracked job.
+    ///
+    /// This is the mutating counterpart to
+    /// [`Self::restore_job_from_checkpoint_with_fencing`].  It updates the
+    /// active checkpoint pointer and the in-memory checkpoint coordinator, and
+    /// prunes later active checkpoint epochs so a subsequent restart cannot
+    /// resurrect abandoned post-restore state by scanning storage.
+    pub fn activate_job_restore_from_checkpoint_with_fencing(
+        &mut self,
+        job_id: &JobId,
+        epoch: u64,
+        storage_path: &str,
+        leader_fencing_token: Option<u64>,
+    ) -> SchedulerResult<CheckpointMetadata> {
+        self.ensure_active()?;
+        let metadata = self.restore_job_from_checkpoint_with_fencing(
+            job_id,
+            epoch,
+            storage_path,
+            leader_fencing_token,
+        )?;
+
+        let coord = self.checkpoint_coordinators.get(job_id).ok_or_else(|| {
+            SchedulerError::InvalidJob {
+                message: format!(
+                    "cannot activate restore for job {job_id}: no checkpoint coordinator is registered"
+                ),
+            }
+        })?;
+        if matches!(
+            coord.coordinator_state(),
+            CheckpointCoordinatorState::AwaitingAcks { .. }
+                | CheckpointCoordinatorState::Committing { .. }
+        ) {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "cannot activate restore for job {job_id}: checkpoint epoch is in flight"
+                ),
+            });
+        }
+
+        let storage = Self::open_checkpoint_storage(storage_path)?;
+        let valid_epochs = krishiv_checkpoint::list_valid_epochs(storage.as_ref(), job_id.as_str())
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: format!("cannot list checkpoint epochs for job {job_id}: {e}"),
+            })?;
+        for future_epoch in valid_epochs
+            .into_iter()
+            .filter(|candidate| *candidate > epoch)
+        {
+            krishiv_checkpoint::delete_epoch(storage.as_ref(), job_id.as_str(), future_epoch)
+                .map_err(|e| SchedulerError::InvalidJob {
+                    message: format!(
+                        "cannot prune checkpoint epoch {future_epoch} after restoring job {job_id} \
+                         to epoch {epoch}: {e}"
+                    ),
+                })?;
+        }
+        krishiv_checkpoint::write_epoch_hint(storage.as_ref(), job_id.as_str(), epoch).map_err(
+            |e| SchedulerError::InvalidJob {
+                message: format!("cannot activate checkpoint epoch {epoch} for job {job_id}: {e}"),
+            },
+        )?;
+
+        let coord = self.checkpoint_coordinators.get_mut(job_id).ok_or_else(|| {
+            SchedulerError::InvalidJob {
+                message: format!(
+                    "cannot activate restore for job {job_id}: no checkpoint coordinator is registered"
+                ),
+            }
+        })?;
+        coord
+            .activate_restored_epoch(&metadata, leader_fencing_token)
+            .map_err(|e| SchedulerError::InvalidJob {
+                message: format!("cannot activate checkpoint epoch {epoch} for job {job_id}: {e}"),
+            })?;
+        self.checkpoint_notify_sent
+            .retain(|(jid, _, _)| jid != job_id);
+        self.barrier_dispatch_sent.retain(|(jid, _)| jid != job_id);
+        self.notify.notify_waiters();
+
         krishiv_governance::audit_log(
             "scheduler",
             &krishiv_governance::AuditAction::SavepointRestored {
@@ -248,7 +352,7 @@ impl Coordinator {
             krishiv_governance::AuditOutcome::Allowed,
         );
 
-        Ok(meta)
+        Ok(metadata)
     }
 
     // ── R6a: Out-of-band barrier trigger ──────────────────────────────────────

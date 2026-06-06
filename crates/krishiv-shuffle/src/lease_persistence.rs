@@ -16,10 +16,7 @@ pub fn decode_lease_token(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Validate monotonic lease advancement.
-pub fn enforce_monotonic_lease(
-    current: Option<u64>,
-    incoming: u64,
-) -> ShuffleResult<u64> {
+pub fn enforce_monotonic_lease(current: Option<u64>, incoming: u64) -> ShuffleResult<u64> {
     if let Some(expected) = current
         && incoming < expected
     {

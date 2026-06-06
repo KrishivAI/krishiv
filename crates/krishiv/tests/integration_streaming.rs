@@ -408,7 +408,9 @@ async fn stream_with_udf_applied_in_query() {
 
     // Register a scalar UDF that multiplies values by 3.
     let udf = Arc::new(MultiplyScalarUdf::new("triple", "val", 3));
-    session.register_scalar_udf(udf.clone());
+    session
+        .register_scalar_udf(udf.clone())
+        .expect("scalar UDF registration should succeed");
 
     // Verify the UDF is registered on the session.
     let names = session.scalar_udf_names();

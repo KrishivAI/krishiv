@@ -43,7 +43,7 @@ pub use quality::{
     DataQualityConfig, DataQualityRule, DeadLetterSink, QualityAction, RejectedRow,
 };
 pub use sink::{AtLeastOnceSinkContract, DynSink, PostWriteOffsetCommitProtocol, Sink};
-pub use source::Source;
+pub use source::{CheckpointSource, Source};
 pub use two_phase::{
     InMemoryCommitHandle, InMemoryTwoPhaseCommitSink, LocalParquetTwoPhaseCommitSink,
     ParquetCommitHandle, TwoPhaseCommitSink,

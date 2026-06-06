@@ -1,9 +1,11 @@
 //! Coordinated bounded window execution through the cluster control plane.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
-use krishiv_plan::window::WindowExecutionSpec;
+use krishiv_plan::window::{WindowExecutionSpec, validate_window_execution_spec};
 use krishiv_proto::{
     InputPartition, InputPartitionDescriptor, JobId, JobKind, JobSpec, JobState, StageId,
     StageSpec, TaskId, TaskSpec,
@@ -12,6 +14,12 @@ use krishiv_proto::{
 use crate::{SchedulerError, SchedulerResult, SharedCoordinator};
 
 const WINDOW_JOB_PREFIX: &str = "bounded-window-";
+static NEXT_WINDOW_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct PreparedBoundedWindowJob {
+    job_spec: JobSpec,
+    task_inputs: HashMap<TaskId, Vec<InputPartition>>,
+}
 
 /// Outcome of a coordinated bounded window job.
 #[derive(Debug, Clone)]
@@ -31,51 +39,68 @@ pub async fn execute_bounded_window_coordinated(
     spec: &WindowExecutionSpec,
     input_batches: &[arrow::record_batch::RecordBatch],
 ) -> SchedulerResult<BoundedWindowOutcome> {
+    validate_bounded_window_request(topic, spec)?;
+
+    let input_row_count = input_batches
+        .iter()
+        .map(arrow::record_batch::RecordBatch::num_rows)
+        .try_fold(0usize, |total, rows| total.checked_add(rows))
+        .ok_or_else(|| SchedulerError::InvalidJob {
+            message: "bounded window input row count overflowed usize".into(),
+        })?;
+    let (shard_limit, coordinator_id) = {
+        let coord = coordinator.read().await;
+        coord.ensure_active()?;
+        let executor_count = coord.executors().schedulable_executors().len();
+        if executor_count == 0 {
+            return Err(SchedulerError::NoExecutors);
+        }
+        (
+            executor_count.min(input_row_count.max(1)),
+            coord.coordinator_id().to_string(),
+        )
+    };
+
+    let mut shards = if input_row_count == 0 {
+        vec![Vec::new()]
+    } else {
+        krishiv_common::partition::partition_record_batches_by_key(
+            input_batches,
+            &spec.key_column,
+            shard_limit,
+        )
+        .map_err(|error| SchedulerError::InvalidJob {
+            message: error.to_string(),
+        })?
+        .into_iter()
+        .filter(|batches| !batches.is_empty())
+        .collect::<Vec<_>>()
+    };
+    if shards.is_empty() {
+        shards.push(Vec::new());
+    }
+
+    let sequence = NEXT_WINDOW_JOB_SEQUENCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| SchedulerError::InvalidJob {
+            message: "bounded window job-id sequence exhausted".into(),
+        })?;
     let job_id = JobId::try_new(format!(
-        "{WINDOW_JOB_PREFIX}{}",
-        krishiv_common::async_util::unix_now_ms()
+        "{WINDOW_JOB_PREFIX}{coordinator_id}-{}-{sequence}",
+        krishiv_common::async_util::unix_now_ms(),
     ))
     .map_err(|e| SchedulerError::InvalidJob {
         message: e.to_string(),
     })?;
 
-    let stage_id = StageId::try_new("stage-window").map_err(|e| SchedulerError::InvalidJob {
-        message: e.to_string(),
-    })?;
-    let task_id = TaskId::try_new("task-window").map_err(|e| SchedulerError::InvalidJob {
-        message: e.to_string(),
-    })?;
-
-    let spec_json = serde_json::to_string(spec).map_err(|e| SchedulerError::InvalidJob {
-        message: format!("window spec json: {e}"),
-    })?;
-    let spec_b64 = base64::engine::general_purpose::STANDARD.encode(spec_json.as_bytes());
-
-    // Fragment carries only the topic and spec — no inline data.
-    let fragment = format!("window:{topic}:{spec_b64}");
-
-    // Encode input batches as a single InlineIpc partition.
-    let ipc_bytes = encode_batches_ipc(input_batches).map_err(|e| SchedulerError::InvalidJob {
-        message: format!("window input ipc encode: {e}"),
-    })?;
-    let input_partition = InputPartition::typed(
-        "window-input",
-        InputPartitionDescriptor::InlineIpc {
-            table_name: topic.to_string(),
-            ipc_bytes,
-        },
-    );
-
-    let stage =
-        StageSpec::new(stage_id, "bounded-window").with_task(TaskSpec::new(task_id, fragment));
-    let job_spec = JobSpec::new(job_id.clone(), "bounded-window", JobKind::Batch).with_stage(stage);
+    let prepared = prepare_bounded_window_job(job_id.clone(), topic, spec, shards)?;
 
     {
         let mut coord = coordinator.write().await;
         coord.ensure_active()?;
-        coord.submit_job(job_spec)?;
-        // Register inline partitions separately — same pattern as batch_sql_job_tables.
-        coord.register_job_input_partitions(job_id.clone(), vec![input_partition]);
+        coord.submit_job_with_task_input_partitions(prepared.job_spec, prepared.task_inputs)?;
     }
 
     let notify = {
@@ -134,6 +159,69 @@ pub async fn execute_bounded_window_coordinated(
     }
 }
 
+fn prepare_bounded_window_job(
+    job_id: JobId,
+    topic: &str,
+    spec: &WindowExecutionSpec,
+    shards: Vec<Vec<arrow::record_batch::RecordBatch>>,
+) -> SchedulerResult<PreparedBoundedWindowJob> {
+    validate_bounded_window_request(topic, spec)?;
+    if shards.is_empty() {
+        return Err(SchedulerError::InvalidJob {
+            message: "bounded window job requires at least one shard".into(),
+        });
+    }
+
+    let stage_id =
+        StageId::try_new("stage-window").map_err(|error| SchedulerError::InvalidJob {
+            message: error.to_string(),
+        })?;
+    let spec_json = serde_json::to_string(spec).map_err(|error| SchedulerError::InvalidJob {
+        message: format!("window spec json: {error}"),
+    })?;
+    let spec_b64 = base64::engine::general_purpose::STANDARD.encode(spec_json.as_bytes());
+    let fragment = format!("window:{topic}:{spec_b64}");
+
+    let mut stage = StageSpec::new(stage_id, "bounded-window");
+    let mut task_inputs = HashMap::with_capacity(shards.len());
+    for (shard_idx, batches) in shards.into_iter().enumerate() {
+        let task_id = TaskId::try_new(format!("task-window-{shard_idx}")).map_err(|error| {
+            SchedulerError::InvalidJob {
+                message: error.to_string(),
+            }
+        })?;
+        let ipc_bytes =
+            encode_batches_ipc(&batches).map_err(|error| SchedulerError::InvalidJob {
+                message: format!("window shard {shard_idx} ipc encode: {error}"),
+            })?;
+        let input_partition = InputPartition::typed(
+            format!("window-input-{shard_idx}"),
+            InputPartitionDescriptor::InlineIpc {
+                table_name: topic.to_string(),
+                ipc_bytes,
+            },
+        );
+        stage = stage.with_task(TaskSpec::new(task_id.clone(), fragment.clone()));
+        task_inputs.insert(task_id, vec![input_partition]);
+    }
+
+    Ok(PreparedBoundedWindowJob {
+        job_spec: JobSpec::new(job_id, "bounded-window", JobKind::Batch).with_stage(stage),
+        task_inputs,
+    })
+}
+
+fn validate_bounded_window_request(topic: &str, spec: &WindowExecutionSpec) -> SchedulerResult<()> {
+    if !krishiv_common::validate::is_safe_identifier(topic) {
+        return Err(SchedulerError::InvalidJob {
+            message: format!("bounded window topic '{topic}' must match [A-Za-z0-9_.-]+"),
+        });
+    }
+    validate_window_execution_spec(spec).map_err(|error| SchedulerError::InvalidJob {
+        message: error.to_string(),
+    })
+}
+
 fn encode_batches_ipc(batches: &[arrow::record_batch::RecordBatch]) -> Result<Vec<u8>, String> {
     use arrow::ipc::writer::StreamWriter;
 
@@ -149,4 +237,116 @@ fn encode_batches_ipc(batches: &[arrow::record_batch::RecordBatch]) -> Result<Ve
     }
     writer.finish().map_err(|e| format!("ipc finish: {e}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::reader::StreamReader;
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    fn input_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "a", "c"])),
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prepared_job_binds_each_shard_to_exactly_one_task() {
+        let batches = vec![input_batch()];
+        let shards = krishiv_common::partition::partition_record_batches_by_key(&batches, "key", 3)
+            .unwrap()
+            .into_iter()
+            .filter(|shard| !shard.is_empty())
+            .collect::<Vec<_>>();
+        let expected_task_count = shards.len();
+        let job_id = JobId::try_new("bounded-window-test").unwrap();
+        let spec = WindowExecutionSpec::tumbling("key", "ts", 1_000);
+
+        let prepared = prepare_bounded_window_job(job_id, "events", &spec, shards).unwrap();
+        assert_eq!(prepared.job_spec.task_count(), expected_task_count);
+        assert_eq!(prepared.task_inputs.len(), expected_task_count);
+
+        let task_ids = prepared
+            .job_spec
+            .stages()
+            .iter()
+            .flat_map(StageSpec::tasks)
+            .map(|task| task.task_id().clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(task_ids, prepared.task_inputs.keys().cloned().collect());
+
+        let mut total_rows = 0;
+        let mut key_owners: HashMap<String, TaskId> = HashMap::new();
+        for (task_id, inputs) in &prepared.task_inputs {
+            assert_eq!(inputs.len(), 1);
+            let descriptor = inputs[0].descriptor().unwrap();
+            let InputPartitionDescriptor::InlineIpc {
+                table_name,
+                ipc_bytes,
+            } = descriptor
+            else {
+                panic!("bounded window input must use InlineIpc");
+            };
+            assert_eq!(table_name, "events");
+            let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None).unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                total_rows += batch.num_rows();
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..keys.len() {
+                    let key = keys.value(row).to_owned();
+                    if let Some(owner) = key_owners.insert(key.clone(), task_id.clone()) {
+                        assert_eq!(&owner, task_id, "key {key} crossed task boundaries");
+                    }
+                }
+            }
+        }
+        assert_eq!(total_rows, 4);
+    }
+
+    #[test]
+    fn prepared_job_rejects_zero_shards() {
+        let error = prepare_bounded_window_job(
+            JobId::try_new("bounded-window-empty").unwrap(),
+            "events",
+            &WindowExecutionSpec::tumbling("key", "ts", 1_000),
+            Vec::new(),
+        )
+        .err()
+        .expect("zero shards must fail");
+        assert!(matches!(error, SchedulerError::InvalidJob { .. }));
+    }
+
+    #[test]
+    fn prepared_job_rejects_unsafe_topic() {
+        let error = prepare_bounded_window_job(
+            JobId::try_new("bounded-window-invalid-topic").unwrap(),
+            "events:raw",
+            &WindowExecutionSpec::tumbling("key", "ts", 1_000),
+            vec![vec![input_batch()]],
+        )
+        .err()
+        .expect("fragment-delimiter topic must fail");
+        assert!(matches!(error, SchedulerError::InvalidJob { .. }));
+    }
 }

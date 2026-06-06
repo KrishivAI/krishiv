@@ -320,12 +320,16 @@ impl CoordinatorExecutorService for CoordinatorExecutorTonicService {
             // Phase 3: finalize commit under checkpoint inner lock.
             {
                 let mut inner = self.coordinator.checkpoint_inner.write().await;
-                inner.finalize_ack(&job_id, ack_epoch);
-                // Sync inner → outer coordinator.
+                let finalize_result = inner.finalize_ack(&job_id, ack_epoch);
+                // Sync inner → outer coordinator even if finalization failed so
+                // callers observe the authoritative checkpoint-inner state.
                 let mut coordinator = self.coordinator.write().await;
                 coordinator
                     .checkpoint_coordinators
                     .clone_from(&inner.coordinators);
+                finalize_result.map_err(|error| {
+                    tonic::Status::internal(format!("checkpoint finalize failed: {error}"))
+                })?;
             }
         }
 
@@ -369,26 +373,31 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
                 .coordinator
                 .leader_fencing_token
                 .load(std::sync::atomic::Ordering::SeqCst);
-            if token > 0 {
-                Some(token)
-            } else {
-                None
-            }
+            if token > 0 { Some(token) } else { None }
         };
-        let coordinator = self.coordinator.read().await;
-        match coordinator.restore_job_from_checkpoint_with_fencing(
+        let mut checkpoint_inner = self.coordinator.checkpoint_inner.write().await;
+        let mut coordinator = self.coordinator.write().await;
+        match coordinator.activate_job_restore_from_checkpoint_with_fencing(
             &req.job_id,
             req.epoch,
             &req.storage_path,
             leader_token,
         ) {
-            Ok(_meta) => Ok(tonic::Response::new(RestoreJobResponse {
-                accepted: true,
-                message: format!(
-                    "restore plan loaded for job {} epoch {}",
-                    req.job_id, req.epoch
-                ),
-            })),
+            Ok(_meta) => {
+                crate::coordinator_sharded::sync_checkpoint_to_inner(
+                    &coordinator.checkpoint_coordinators,
+                    &coordinator.checkpoint_notify_sent,
+                    &coordinator.barrier_dispatch_sent,
+                    &mut checkpoint_inner,
+                );
+                Ok(tonic::Response::new(RestoreJobResponse {
+                    accepted: true,
+                    message: format!(
+                        "restore activated for job {} epoch {}",
+                        req.job_id, req.epoch
+                    ),
+                }))
+            }
             Err(e) => Ok(tonic::Response::new(RestoreJobResponse {
                 accepted: false,
                 message: e.to_string(),

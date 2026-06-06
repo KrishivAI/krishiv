@@ -14,7 +14,10 @@ use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, path::Path};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::{ConnectorCapabilities, ConnectorError, ConnectorResult, Sink, Source};
+use crate::{
+    CheckpointSource, ConnectorCapabilities, ConnectorError, ConnectorResult, ParquetOffset, Sink,
+    Source,
+};
 
 // ---------------------------------------------------------------------------
 // S3Source
@@ -95,6 +98,7 @@ impl Source for S3Source {
         ConnectorCapabilities::new()
             .with_bounded()
             .with_rewindable()
+            .with_checkpoint()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -107,12 +111,39 @@ impl Source for S3Source {
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
-        Some(Box::new(self.cursor))
+        Some(Box::new(ParquetOffset {
+            batch_index: self.cursor,
+        }))
     }
 
     /// Reset the cursor to the beginning so the source can be read again.
     fn reset(&mut self) {
         self.cursor = 0;
+    }
+}
+
+impl CheckpointSource for S3Source {
+    type Offset = ParquetOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        Ok(ParquetOffset {
+            batch_index: self.cursor,
+        })
+    }
+
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+        if offset.batch_index > self.batches.len() {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "object-store Parquet offset {} is past the final batch {} for '{}'",
+                    offset.batch_index,
+                    self.batches.len(),
+                    self.path
+                ),
+            });
+        }
+        self.cursor = offset.batch_index;
+        Ok(())
     }
 }
 
@@ -282,9 +313,28 @@ mod tests {
         let caps = source.capabilities();
         assert!(caps.is_bounded());
         assert!(caps.is_rewindable());
+        assert!(caps.is_checkpoint_capable());
         assert!(!caps.is_unbounded());
         assert!(!caps.is_transactional());
         assert!(!caps.is_idempotent());
+    }
+
+    #[tokio::test]
+    async fn s3_source_restores_typed_checkpoint_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let path = Path::from("checkpoint.parquet");
+        let mut sink = S3Sink::new(Arc::clone(&store), path.clone());
+        sink.write_batch(make_batch(&[1, 2], &["a", "b"]))
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+
+        let mut source = S3Source::open(store, path).await.unwrap();
+        crate::CertificationSuite::run_checkpoint_restore_test(&mut source)
+            .await
+            .expect("S3Source must restore typed Parquet offsets");
     }
 
     #[tokio::test]

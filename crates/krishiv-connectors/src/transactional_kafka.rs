@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 
-use crate::{ConnectorError, ConnectorResult, TwoPhaseCommitSink};
+use crate::{ConnectorCapabilities, ConnectorError, ConnectorResult, TwoPhaseCommitSink};
 
 /// Deterministic Kafka transaction id: `{job_id}/{partition_id}/{epoch}`.
 pub fn transaction_id(job_id: &str, partition_id: u32, epoch: u64) -> String {
@@ -85,6 +85,10 @@ impl TransactionalKafkaSink {
 
 impl TwoPhaseCommitSink for TransactionalKafkaSink {
     type Handle = KafkaTxnHandle;
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_two_phase_commit()
+    }
 
     fn prepare(&mut self, epoch: u64, batch: &RecordBatch) -> ConnectorResult<Self::Handle> {
         if epoch != self.epoch {

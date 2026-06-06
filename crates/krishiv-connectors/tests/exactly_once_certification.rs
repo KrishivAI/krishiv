@@ -5,11 +5,12 @@ use arrow::array::{Int32Array, RecordBatch};
 #[cfg(any(feature = "kafka", feature = "state"))]
 use arrow::datatypes::{DataType, Field, Schema};
 #[cfg(any(feature = "kafka", feature = "state"))]
-use krishiv_connectors::TwoPhaseCommitSink;
-#[cfg(any(feature = "kafka", feature = "state"))]
 use krishiv_connectors::two_phase_parquet_s3::TwoPhaseParquetSink;
 #[cfg(feature = "kafka")]
-use krishiv_connectors::{Offset, transactional_kafka::TransactionalKafkaSink};
+use krishiv_connectors::{
+    CertificationSuite, Offset, kafka::InMemoryKafkaSource,
+    transactional_kafka::TransactionalKafkaSink,
+};
 #[cfg(any(feature = "kafka", feature = "state"))]
 use std::sync::Arc;
 #[cfg(any(feature = "kafka", feature = "state"))]
@@ -24,9 +25,11 @@ fn batch(v: i32) -> RecordBatch {
     .unwrap()
 }
 
-#[test]
+#[tokio::test]
 #[cfg(feature = "kafka")]
-fn kafka_to_kafka_certification() {
+async fn kafka_to_kafka_certification() {
+    let input = batch(1);
+    let mut source = InMemoryKafkaSource::new("input", 0, 0, vec![input.clone()]);
     let mut sink = TransactionalKafkaSink::new_for_profile(
         krishiv_common::DurabilityProfile::DevLocal,
         "job-k2k",
@@ -34,9 +37,13 @@ fn kafka_to_kafka_certification() {
         1,
     )
     .expect("simulation sink permitted in dev-local");
-    let h = sink.prepare(1, &batch(1)).unwrap();
-    sink.commit(h).unwrap();
-    assert!(!sink.committed_batches().is_empty());
+
+    CertificationSuite::run_exactly_once_capabilities_test(&source, &sink).unwrap();
+    CertificationSuite::run_checkpoint_restore_test(&mut source)
+        .await
+        .unwrap();
+    CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 1, &input).unwrap();
+    assert_eq!(sink.committed_batches().len(), 1);
 }
 
 #[test]
@@ -57,8 +64,12 @@ fn transactional_kafka_rejects_durable_profile() {
 fn kafka_to_parquet_s3_certification() {
     let dir = tempdir().unwrap();
     let mut sink = TwoPhaseParquetSink::new(dir.path(), 1);
-    let h = sink.prepare(1, &batch(42)).unwrap();
-    sink.commit(h).unwrap();
+    krishiv_connectors::CertificationSuite::run_two_phase_commit_lifecycle_test(
+        &mut sink,
+        1,
+        &batch(42),
+    )
+    .unwrap();
     assert!(dir.path().join("data").exists());
 }
 
@@ -86,8 +97,7 @@ fn s3_parquet_to_kafka_uses_transactional_sink() {
         2,
     )
     .expect("simulation sink permitted in dev-local");
-    let h = sink.prepare(2, &batch(7)).unwrap();
-    sink.commit(h).unwrap();
+    CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 2, &batch(7)).unwrap();
     assert_eq!(sink.committed_batches().len(), 1);
 }
 

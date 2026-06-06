@@ -50,8 +50,8 @@ pub use object_store::ObjectStoreShuffleStore;
 pub use orphan::{cleanup_orphans, scan_orphans};
 pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
-pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
 pub use storage_uri::open_shuffle_backend_from_uri;
+pub use store::{PartitionId, ShuffleBackend, ShufflePartition, ShuffleStore, ShuffleStream};
 pub use tiered_store::TieredShuffleStore;
 
 // StoreError is deprecated but retained for source compatibility.

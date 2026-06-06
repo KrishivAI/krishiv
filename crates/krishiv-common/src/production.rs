@@ -114,6 +114,38 @@ pub fn allows_alpha_api() -> bool {
 /// Opt-in escape hatch for native scalar UDF execution under durable profiles.
 pub const ALLOW_FULL_PRIVILEGE_UDFS_ENV: &str = "KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS";
 
+/// Immutable native scalar UDF policy used across one registration operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeScalarUdfPolicy {
+    profile: DurabilityProfile,
+    forbidden: bool,
+}
+
+impl NativeScalarUdfPolicy {
+    /// Snapshot the current process policy for `profile`.
+    pub fn resolve(profile: DurabilityProfile) -> Self {
+        Self {
+            profile,
+            forbidden: profile_forbids_native_scalar_udfs(profile),
+        }
+    }
+
+    /// Construct a policy from an already-resolved decision.
+    pub const fn from_decision(profile: DurabilityProfile, forbidden: bool) -> Self {
+        Self { profile, forbidden }
+    }
+
+    /// Durability profile associated with this decision.
+    pub const fn profile(self) -> DurabilityProfile {
+        self.profile
+    }
+
+    /// Whether native scalar UDF registration and execution are forbidden.
+    pub const fn is_forbidden(self) -> bool {
+        self.forbidden
+    }
+}
+
 fn allows_full_privilege_udfs() -> bool {
     truthy_env(ALLOW_FULL_PRIVILEGE_UDFS_ENV)
 }
@@ -124,11 +156,6 @@ pub fn profile_forbids_native_scalar_udfs(profile: DurabilityProfile) -> bool {
         return false;
     }
     profile_requires_durable_window_state(profile) || is_production_mode()
-}
-
-/// CREATE FUNCTION stubs (non-SQL languages) are forbidden under durable profiles.
-pub fn profile_forbids_udtf_stubs(profile: DurabilityProfile) -> bool {
-    profile_forbids_native_scalar_udfs(profile)
 }
 
 /// Flight SQL and UI surfaces require API keys under durable profiles.

@@ -32,12 +32,7 @@ fn sample_metadata(job_id: &str, epoch: u64) -> CheckpointMetadata {
         operator_snapshots: vec![OperatorSnapshotRef {
             operator_id: "op-0".to_owned(),
             task_id: "task-0".to_owned(),
-            snapshot_path: krishiv_checkpoint::snapshot_path(
-                "job-integration",
-                epoch,
-                "op-0",
-                "task-0",
-            ),
+            snapshot_path: krishiv_checkpoint::snapshot_path(job_id, epoch, "op-0", "task-0"),
         }],
         is_savepoint: false,
         savepoint_label: None,

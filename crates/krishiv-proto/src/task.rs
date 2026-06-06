@@ -1058,10 +1058,9 @@ pub struct ExecutorTaskAssignment {
     shuffle_read: Option<ShuffleReadConfig>,
     key_group_range: KeyGroupRange,
 
-    /// PRR Parallel (SHORT-2 + MED-1): Explicit signal whether this streaming
-    /// task should report Succeeded (one-shot) or stay Running (continuous).
-    /// This is the typed replacement for the old string heuristics
-    /// ("stream:loop:", "stream:continuous:", etc.).
+    /// Explicit signal whether this streaming task should report Succeeded
+    /// (one-shot) or stay Running and reattach after recovery (continuous).
+    /// Assignment producers derive this from their typed job/task contract.
     requires_reattach: bool,
 
     /// CPU time limit for this task in nanoseconds (from job spec).

@@ -53,11 +53,20 @@ impl ConnectorCapabilities {
 
     /// Validate capability invariants.
     ///
-    /// Returns an error if both `bounded` and `unbounded` are set simultaneously.
+    /// Returns an error when mutually exclusive stream modes are combined or
+    /// when two-phase commit is advertised without its required transactional
+    /// and checkpoint capabilities.
     pub fn validate(&self) -> ConnectorResult<()> {
         if self.bounded && self.unbounded {
             return Err(ConnectorError::Config {
                 message: "connector capabilities: bounded and unbounded cannot both be true".into(),
+            });
+        }
+        if self.supports_two_phase_commit && (!self.transactional || !self.supports_checkpoint) {
+            return Err(ConnectorError::Config {
+                message: "connector capabilities: two-phase commit requires transactional and \
+                          checkpoint capabilities"
+                    .into(),
             });
         }
         Ok(())
@@ -92,9 +101,15 @@ impl ConnectorCapabilities {
     }
 
     /// Mark the connector as implementing two-phase commit for exactly-once delivery.
+    ///
+    /// Two-phase commit necessarily participates in checkpoint coordination and
+    /// commits transactionally, so those prerequisite flags are enabled as part
+    /// of this builder operation.
     #[must_use]
     pub fn with_two_phase_commit(mut self) -> Self {
         self.supports_two_phase_commit = true;
+        self.transactional = true;
+        self.supports_checkpoint = true;
         self
     }
 

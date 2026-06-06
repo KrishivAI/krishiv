@@ -146,7 +146,11 @@ pub fn persist_operator_watermark_ms(
     namespace: &Namespace,
     watermark_ms: i64,
 ) -> StateResult<()> {
-    backend.put(namespace, b"wm:".to_vec(), watermark_ms.to_le_bytes().to_vec())
+    backend.put(
+        namespace,
+        b"wm:".to_vec(),
+        watermark_ms.to_le_bytes().to_vec(),
+    )
 }
 
 /// Restore a previously persisted operator watermark, if present.

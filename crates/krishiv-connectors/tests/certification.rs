@@ -3,18 +3,27 @@
 //! A connector passes certification when all tests in this module pass.
 //! Certification status follows connector capability declarations in code.
 
-use krishiv_connectors::{ConnectorCapabilities, ConnectorResult};
+use arrow::array::Int32Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use krishiv_connectors::{CertificationSuite, ConnectorResult, LocalParquetTwoPhaseCommitSink};
+use std::sync::Arc;
 
-/// Every certified connector must declare at least one bounded or unbounded mode.
+/// The local Parquet 2PC sink declares and exercises the complete protocol.
 #[test]
 fn local_parquet_sink_declares_capabilities() {
-    let caps = ConnectorCapabilities::new()
-        .with_bounded()
-        .with_transactional()
-        .with_two_phase_commit();
-    assert!(caps.is_bounded());
-    assert!(caps.is_transactional());
-    assert!(caps.is_two_phase_commit_capable());
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let mut sink = LocalParquetTwoPhaseCommitSink::new(dir.path());
+
+    CertificationSuite::run_two_phase_commit_lifecycle_test(&mut sink, 1, &batch)
+        .expect("local Parquet sink must satisfy the 2PC lifecycle");
 }
 
 /// Dead-letter sink correctly splits a batch with null violations.

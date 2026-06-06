@@ -1,7 +1,7 @@
 //! Build streaming [`PhysicalPlan`] values from window configuration.
 
 use crate::window::WindowExecutionSpec;
-use crate::{ExecutionKind, LogicalPlan, PhysicalPlan, PlanNode};
+use crate::{ExecutionKind, LogicalPlan, PhysicalPlan, PlanError, PlanNode, lower_to_physical};
 
 /// Build a logical streaming plan for a bounded windowed collect.
 pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSpec) -> LogicalPlan {
@@ -67,28 +67,9 @@ pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSp
 pub fn physical_plan_for_window(
     name: impl Into<String>,
     spec: &WindowExecutionSpec,
-) -> PhysicalPlan {
+) -> Result<PhysicalPlan, PlanError> {
     let logical = logical_plan_for_window(name, spec);
-    let mut physical = PhysicalPlan::new(logical.name(), logical.kind());
-    for node in logical.nodes() {
-        let physical_id = format!("physical:{}", node.id());
-        let mut physical_node = PlanNode::new(
-            physical_id,
-            format!("physical {}", node.label()),
-            node.kind(),
-        )
-        .with_inputs(
-            node.inputs()
-                .iter()
-                .map(|id| format!("physical:{id}"))
-                .collect::<Vec<_>>(),
-        );
-        if let Some(op) = node.op() {
-            physical_node = physical_node.with_op(op.clone());
-        }
-        physical.add_node(physical_node);
-    }
-    physical
+    lower_to_physical(&logical)
 }
 
 #[cfg(test)]
@@ -99,8 +80,9 @@ mod tests {
     #[test]
     fn physical_plan_carries_window_nodes() {
         let spec = WindowExecutionSpec::tumbling("k", "ts", 1000);
-        let physical = physical_plan_for_window("events", &spec);
+        let physical = physical_plan_for_window("events", &spec).expect("physical plan");
         assert_eq!(physical.kind(), ExecutionKind::Streaming);
         assert!(physical.nodes().len() >= 3);
+        physical.validate().expect("valid physical graph");
     }
 }

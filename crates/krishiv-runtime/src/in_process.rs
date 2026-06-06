@@ -318,21 +318,15 @@ impl InProcessStreamingRuntime {
         self.run_terminal_task(&fragment, kind, tables, Vec::new())
     }
 
-    /// Drain a continuous streaming job and return newly emitted batches.
+    /// Drain a locally registered continuous streaming job and return newly
+    /// emitted batches.
     ///
-    /// Fast path: when the job is registered in the local registry, drains
-    /// directly through the registry's split-mutex executor without touching
-    /// the coordinator (eliminates submit_job → task-assignment → run_next_with
-    /// → coordinator_tick → evict = 6 mutex acquisitions per call).
-    ///
-    /// Falls through to the coordinator path only when the job is absent from
-    /// the local registry (distributed mode where batches arrive via InlineIpc).
+    /// In-process runtimes always own and wire the same registry into their
+    /// executor runner. Draining it directly preserves typed not-found errors
+    /// and prevents an unknown job from entering the coordinator through an
+    /// underspecified legacy fragment.
     pub fn drain_continuous_job(&self, job_id: &str) -> RuntimeResult<Vec<RecordBatch>> {
-        if self.continuous_registry.has_job(job_id) {
-            return self.continuous_registry.drain_job(job_id);
-        }
-        let fragment = format!("stream:continuous:{job_id}");
-        self.run_terminal_task(&fragment, JobKind::Streaming, &[], Vec::new())
+        self.continuous_registry.drain_job(job_id)
     }
 
     fn run_terminal_task(
@@ -666,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_job_drains_via_coordinator() {
+    fn continuous_job_drains_via_registry() {
         let runtime = InProcessStreamingRuntime::new().expect("runtime");
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
         runtime

@@ -1,7 +1,9 @@
 //! Unified bounded window execution for batch and streaming (all deployment modes).
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::window::{WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind};
+use krishiv_plan::window::{
+    WindowAgg, WindowAggKind, WindowExecutionSpec, WindowKind, validate_window_execution_spec,
+};
 use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 /// Open or create a state backend for a bounded-window operator.
@@ -77,13 +79,10 @@ pub fn execute_bounded_window(
     spec: &WindowExecutionSpec,
     state_dir: Option<&std::path::Path>,
 ) -> ExecResult<Vec<RecordBatch>> {
+    validate_window_execution_spec(spec)
+        .map_err(|error| ExecError::InvalidWindowConfig(error.to_string()))?;
     if input_batches.is_empty() {
         return Ok(Vec::new());
-    }
-    if spec.agg_exprs.is_empty() {
-        return Err(ExecError::InvalidWindowConfig(
-            "window execution requires at least one aggregate".into(),
-        ));
     }
 
     let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();

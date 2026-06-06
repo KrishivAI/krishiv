@@ -153,8 +153,7 @@ async fn run_controller_with_servers(
     let http_config = krishiv_scheduler::CoordinatorDaemonConfig::http_sidecar(
         krishiv_checkpoint::DurabilityProfile::DistributedDurable,
     );
-    let http_router =
-        krishiv_scheduler::coordinator_http_router(http_coordinator, &http_config);
+    let http_router = krishiv_scheduler::coordinator_http_router(http_coordinator, &http_config);
     let coordinator = runtime.coordinator().clone();
 
     tokio::select! {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_common::async_util::block_on;
@@ -11,8 +12,8 @@ use krishiv_runtime::{
     BatchTableRegistration, ExecutionPlacement, ExecutionRuntime, InProcessCluster, JobStatus,
     LocalJobRegistry, LocalWindowExecutionSpec, RuntimeMode, build_execution_runtime,
 };
-use krishiv_sql::SqlEngine;
 use krishiv_sql::policy::PolicyEnforcingSqlEngine;
+use krishiv_sql::{ContinuousTableInput, SqlEngine};
 use krishiv_udf::{ScalarUdf, UdfRegistry};
 
 use crate::dataframe::DataFrame;
@@ -446,7 +447,7 @@ pub struct Session {
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, PathBuf>>,
     stream_jobs: Arc<DashMap<String, LocalWindowExecutionSpec>>,
-    unbounded_streams: Arc<DashMap<String, tokio::sync::mpsc::Sender<RecordBatch>>>,
+    unbounded_streams: Arc<DashMap<String, Arc<ContinuousTableInput>>>,
 }
 
 impl fmt::Debug for Session {
@@ -556,27 +557,15 @@ impl Session {
     }
 
     pub fn push_stream_job_input(&self, job_id: &str, batches: Vec<RecordBatch>) -> Result<()> {
-        if let Some(tx) = self.unbounded_streams.get(job_id) {
+        if self.stream_jobs.contains_key(job_id) {
+            return self
+                .runtime
+                .push_continuous_stream_input(job_id, batches)
+                .map_err(KrishivError::from);
+        }
+        if let Some(input) = self.unbounded_streams.get(job_id) {
             for batch in batches {
-                // Bounded channel (capacity = `CONTINUOUS_TABLE_CHANNEL_CAPACITY`).
-                // Use `try_send` to avoid blocking the API caller when the
-                // DataFusion consumer is slow. A full channel means the
-                // consumer cannot keep up; surface a typed error so the
-                // caller can decide to slow down rather than silently
-                // buffering unbounded memory.
-                tx.try_send(batch).map_err(|e| match e {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => KrishivError::Runtime {
-                        message: format!(
-                            "Stream consumer for job {} is too slow: channel full. \
-                             Slow down the producer or increase capacity via \
-                             register_streaming_table_with_capacity.",
-                            job_id
-                        ),
-                    },
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => KrishivError::Runtime {
-                        message: format!("Stream consumer for job {} has been dropped", job_id),
-                    },
-                })?;
+                input.try_send(batch).map_err(KrishivError::from)?;
             }
             return Ok(());
         }
@@ -626,23 +615,79 @@ impl Session {
     }
 
     /// Register a vectorized scalar UDF for this session.
-    pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) {
-        if krishiv_common::profile_forbids_native_scalar_udfs(
-            krishiv_common::resolve_durability_profile(),
-        ) {
-            return;
+    ///
+    /// Registration fails closed when native UDFs are forbidden by the active
+    /// durability profile or when the DataFusion bridge cannot be synchronized.
+    pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) -> Result<()> {
+        let profile = krishiv_common::resolve_durability_profile();
+        self.register_scalar_udf_for_policy(
+            udf,
+            krishiv_common::NativeScalarUdfPolicy::resolve(profile),
+        )
+    }
+
+    fn register_scalar_udf_for_policy(
+        &self,
+        udf: Arc<dyn ScalarUdf>,
+        policy: krishiv_common::NativeScalarUdfPolicy,
+    ) -> Result<()> {
+        let name = udf.name().to_owned();
+        if name.trim().is_empty() {
+            return Err(KrishivError::InvalidConfig {
+                message: "scalar UDF name must not be empty".into(),
+            });
         }
-        self.udf_registry
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .register_scalar(udf);
-        // Track E: use the limits-aware path so job-aware callers can supply
-        // concrete ResourceLimits derived from the JobSpec (via scheduler/JCP
-        // raw accessors). Default is unlimited for backward compatibility.
-        let _ = block_on(
-            self.sql_engine
-                .sync_scalar_udfs_with_limits(krishiv_udf::ResourceLimits::default()),
-        );
+
+        if policy.is_forbidden() {
+            return Err(KrishivError::InvalidConfig {
+                message: format!(
+                    "native scalar UDF registration is forbidden under durability profile \
+                     '{}' (set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1 to override)",
+                    policy.profile()
+                ),
+            });
+        }
+
+        let previous = {
+            let mut registry =
+                self.udf_registry
+                    .write()
+                    .map_err(|error| KrishivError::Runtime {
+                        message: format!("scalar UDF registry lock poisoned: {error}"),
+                    })?;
+            let previous = registry.get_scalar(&name).cloned();
+            registry.register_scalar(Arc::clone(&udf));
+            previous
+        };
+
+        let sync_result = block_on(self.sql_engine.sync_scalar_udfs_with_limits_for_policy(
+            krishiv_udf::ResourceLimits::default(),
+            policy,
+        ));
+        if let Err(error) = sync_result {
+            let mut registry =
+                self.udf_registry
+                    .write()
+                    .map_err(|rollback_error| KrishivError::Runtime {
+                        message: format!(
+                            "scalar UDF synchronization failed ({error}); registry rollback \
+                             failed because the lock is poisoned: {rollback_error}"
+                        ),
+                    })?;
+            let still_current = registry
+                .get_scalar(&name)
+                .is_some_and(|current| Arc::ptr_eq(current, &udf));
+            if still_current {
+                if let Some(previous) = previous {
+                    registry.register_scalar(previous);
+                } else {
+                    registry.remove_scalar(&name);
+                }
+            }
+            return Err(KrishivError::from(error));
+        }
+
+        Ok(())
     }
 
     /// Names of scalar UDFs registered on this session.
@@ -694,20 +739,58 @@ impl Session {
     /// Mark a table name as an unbounded streaming source in the SQL engine.
     ///
     /// After this call, [`Session::is_streaming_query`] returns `true` for
-    /// any SQL that references `name`.  The registration is visible to all
-    /// clones of this session because the underlying set is shared via
-    /// `Arc<RwLock<>>`.
-    pub fn register_unbounded(
+    /// any SQL that references `name`. Submit batches with
+    /// [`Session::push_stream_job_input`] and terminate the source with
+    /// [`Session::close_unbounded_input`]. A continuous table has one consuming
+    /// query; a second execution receives an explicit stream error.
+    pub fn register_unbounded(&self, name: &str, schema: SchemaRef) -> Result<()> {
+        self.register_unbounded_input(name, schema, None)?;
+        Ok(())
+    }
+
+    /// Register an unbounded streaming table with a specific queue capacity.
+    pub fn register_unbounded_with_capacity(
         &self,
         name: &str,
-        schema: arrow::datatypes::SchemaRef,
+        schema: SchemaRef,
+        capacity: usize,
     ) -> Result<()> {
-        let tx = self
-            .sql_engine
-            .register_streaming_table(name, schema)
-            .map_err(KrishivError::from)?;
-        self.unbounded_streams.insert(name.to_string(), tx);
+        self.register_unbounded_input(name, schema, Some(capacity))?;
         Ok(())
+    }
+
+    fn register_unbounded_input(
+        &self,
+        name: &str,
+        schema: SchemaRef,
+        capacity: Option<usize>,
+    ) -> Result<Arc<ContinuousTableInput>> {
+        if schema.fields().is_empty() {
+            return Err(KrishivError::InvalidConfig {
+                message: "unbounded stream schema must contain at least one field".into(),
+            });
+        }
+        let input = match capacity {
+            Some(capacity) => self
+                .sql_engine
+                .register_streaming_table_with_capacity(name, schema, capacity),
+            None => self.sql_engine.register_streaming_table(name, schema),
+        }
+        .map_err(KrishivError::from)?;
+        self.unbounded_streams
+            .insert(name.to_string(), Arc::clone(&input));
+        Ok(input)
+    }
+
+    /// Close a registered unbounded input by name.
+    pub fn close_unbounded_input(&self, name: &str) -> Result<bool> {
+        let input =
+            self.unbounded_streams
+                .get(name)
+                .ok_or_else(|| KrishivError::InvalidConfig {
+                    message: format!("unbounded stream '{name}' is not registered"),
+                })?;
+        input.close().map_err(KrishivError::from)
     }
 
     /// Returns `true` if `sql` references any registered streaming source.
@@ -1040,18 +1123,41 @@ impl Session {
         ))
     }
 
-    /// Create an unbounded local memory stream placeholder.
+    /// Create a schema-bound unbounded local memory stream.
     ///
-    /// **Alpha placeholder**: Returns a `Stream` struct with no data attached.
-    /// There is currently no API to push batches into this stream after creation.
-    /// Use `Session::memory_stream()` with pre-loaded batches, or
-    /// `Session::submit_stream_job()` for continuous streaming jobs.
-    pub fn unbounded_memory_stream(&self, name: impl Into<String>) -> Result<Stream> {
+    /// Use [`Stream::try_push_batch`] or [`Stream::push_batch_async`] to ingest
+    /// batches, then [`Stream::close_input`] to terminate the SQL stream.
+    pub fn unbounded_memory_stream(
+        &self,
+        name: impl Into<String>,
+        schema: SchemaRef,
+    ) -> Result<Stream> {
         crate::window::ensure_alpha_api("unbounded_memory_stream")?;
-        Ok(Stream::for_session(
+        let name = name.into();
+        let input = self.register_unbounded_input(&name, schema, None)?;
+        Ok(Stream::for_unbounded_session(
             name,
-            StreamMode::Unbounded,
-            Vec::new(),
+            input,
+            self.mode,
+            self.coordinator_url.clone(),
+            self.state_ttl.map(|c| c.ttl_ms()),
+            self.runtime.clone(),
+        ))
+    }
+
+    /// Create an unbounded local memory stream with a specific queue capacity.
+    pub fn unbounded_memory_stream_with_capacity(
+        &self,
+        name: impl Into<String>,
+        schema: SchemaRef,
+        capacity: usize,
+    ) -> Result<Stream> {
+        crate::window::ensure_alpha_api("unbounded_memory_stream_with_capacity")?;
+        let name = name.into();
+        let input = self.register_unbounded_input(&name, schema, Some(capacity))?;
+        Ok(Stream::for_unbounded_session(
+            name,
+            input,
             self.mode,
             self.coordinator_url.clone(),
             self.state_ttl.map(|c| c.ttl_ms()),
@@ -1083,4 +1189,74 @@ pub(crate) async fn runtime_collect_batch_sql(
             message: format!("runtime collect task failed: {e}"),
         })?
         .map_err(KrishivError::from)
+}
+
+#[cfg(test)]
+mod udf_registration_tests {
+    use super::*;
+    use krishiv_udf::MultiplyScalarUdf;
+
+    #[test]
+    fn durable_profile_rejects_registration_without_mutating_registry() {
+        let session = SessionBuilder::new().build().expect("session should build");
+        let udf = Arc::new(MultiplyScalarUdf::new("double", "x", 2));
+
+        let error = session
+            .register_scalar_udf_for_policy(
+                udf,
+                krishiv_common::NativeScalarUdfPolicy::from_decision(
+                    krishiv_common::DurabilityProfile::SingleNodeDurable,
+                    true,
+                ),
+            )
+            .expect_err("durable profile must reject native scalar UDFs");
+
+        assert!(matches!(
+            error,
+            KrishivError::InvalidConfig { message }
+                if message.contains("single-node-durable")
+        ));
+        assert!(session.scalar_udf_names().is_empty());
+    }
+
+    #[test]
+    fn dev_profile_registers_and_synchronizes_scalar_udf() {
+        let session = SessionBuilder::new().build().expect("session should build");
+        let udf = Arc::new(MultiplyScalarUdf::new("double", "x", 2));
+
+        session
+            .register_scalar_udf_for_policy(
+                udf,
+                krishiv_common::NativeScalarUdfPolicy::from_decision(
+                    krishiv_common::DurabilityProfile::DevLocal,
+                    false,
+                ),
+            )
+            .expect("dev-local scalar UDF registration should succeed");
+
+        assert_eq!(session.scalar_udf_names(), vec!["double".to_string()]);
+    }
+
+    #[test]
+    fn empty_scalar_udf_name_is_rejected_without_mutation() {
+        let session = SessionBuilder::new().build().expect("session should build");
+        let udf = Arc::new(MultiplyScalarUdf::new("   ", "x", 2));
+
+        let error = session
+            .register_scalar_udf_for_policy(
+                udf,
+                krishiv_common::NativeScalarUdfPolicy::from_decision(
+                    krishiv_common::DurabilityProfile::DevLocal,
+                    false,
+                ),
+            )
+            .expect_err("empty scalar UDF name must be rejected");
+
+        assert!(matches!(
+            error,
+            KrishivError::InvalidConfig { message }
+                if message.contains("must not be empty")
+        ));
+        assert!(session.scalar_udf_names().is_empty());
+    }
 }

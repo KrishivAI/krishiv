@@ -256,20 +256,6 @@ impl ExecutorTaskOutput {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn placeholder() -> Self {
-        Self {
-            kind: ExecutorTaskOutputKind::Placeholder,
-            row_count: 0,
-            batch_count: 0,
-            column_count: 0,
-            shuffle_partitions: Vec::new(),
-            runtime_stats: None,
-            record_batches: Vec::new(),
-            watermark_ms: None,
-        }
-    }
-
     pub(crate) fn cancelled() -> Self {
         Self {
             kind: ExecutorTaskOutputKind::Cancelled,
@@ -407,8 +393,6 @@ pub enum ExecutorTaskOutputKind {
     Sql,
     /// Connector-to-connector pipeline executed by the task runner.
     ConnectorPipeline,
-    /// Placeholder path for non-SQL fragments while R3.1 is still bootstrapping.
-    Placeholder,
     /// Task was cancelled before execution started.
     Cancelled,
     /// Shuffle write: hash-partitioned batches written to the local shuffle store.
@@ -422,7 +406,6 @@ impl ExecutorTaskOutputKind {
         match self {
             Self::Sql => "sql",
             Self::ConnectorPipeline => "connector_pipeline",
-            Self::Placeholder => "placeholder",
             Self::Cancelled => "cancelled",
             Self::ShuffleWrite => "shuffle_write",
             Self::StreamingWindow => "streaming_window",
@@ -854,7 +837,7 @@ impl ExecutorTaskRunner {
         self
     }
 
-    /// Wire continuous streaming drain for `stream:continuous:` fragments.
+    /// Wire local input draining for stateful `stream:loop:` fragments.
     pub fn with_continuous_drainer(mut self, drainer: Arc<dyn ContinuousJobDrainer>) -> Self {
         self.continuous_drainer = Some(drainer);
         self
@@ -1015,10 +998,14 @@ impl ExecutorTaskRunner {
             ));
         }
 
-        let model = crate::ExecutionModel::from_fragment(
+        let model =
+            crate::ExecutionModel::from_fragment(assignment.plan_fragment().description().trim())
+                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let fragment_body = crate::fragment::common::task_fragment_body(
             assignment.plan_fragment().description().trim(),
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let is_continuous_cycle = fragment_body.starts_with("stream:loop:");
 
         // Build resource limits from assignment (propagated from job spec).
         let udf_limits = krishiv_udf::ResourceLimits {
@@ -1091,14 +1078,21 @@ impl ExecutorTaskRunner {
 
         let typed_requires_reattach = assignment.requires_reattach();
 
-        // Terminal state: requires_reattach=true → Running (continuous), false → Succeeded (one-shot)
-        let terminal_state = if model == crate::ExecutionModel::Streaming && typed_requires_reattach
-        {
+        // A stream:loop assignment is one bounded input cycle over retained
+        // operator state. Report Succeeded so the coordinator can durably
+        // collect this cycle's output while keeping the logical job active for
+        // the next push. Other reattachable streaming operators remain Running
+        // continuously.
+        let terminal_state = if is_continuous_cycle {
+            TaskState::Succeeded
+        } else if model == crate::ExecutionModel::Streaming && typed_requires_reattach {
             TaskState::Running
         } else {
             TaskState::Succeeded
         };
-        let terminal_message = if terminal_state == TaskState::Running {
+        let terminal_message = if is_continuous_cycle {
+            "continuous input cycle completed"
+        } else if terminal_state == TaskState::Running {
             "streaming operator active"
         } else {
             "executor completed stage-local fragment"
@@ -1503,7 +1497,6 @@ mod runner_tests {
             ExecutorTaskOutputKind::ConnectorPipeline.as_str(),
             "connector_pipeline"
         );
-        assert_eq!(ExecutorTaskOutputKind::Placeholder.as_str(), "placeholder");
         assert_eq!(ExecutorTaskOutputKind::Cancelled.as_str(), "cancelled");
         assert_eq!(
             ExecutorTaskOutputKind::ShuffleWrite.as_str(),
@@ -1542,15 +1535,6 @@ mod runner_tests {
         assert!(output.runtime_stats.is_none());
         assert!(output.record_batches().is_empty());
         assert!(output.watermark_ms().is_none());
-    }
-
-    #[test]
-    fn task_output_placeholder_constructor() {
-        let output = ExecutorTaskOutput::placeholder();
-        assert_eq!(output.kind(), ExecutorTaskOutputKind::Placeholder);
-        assert_eq!(output.row_count(), 0);
-        assert_eq!(output.batch_count(), 0);
-        assert_eq!(output.column_count(), 0);
     }
 
     #[test]

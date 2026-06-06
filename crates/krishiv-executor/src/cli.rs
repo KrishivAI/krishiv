@@ -10,8 +10,7 @@ use crate::grpc_client::SharedLeaseGeneration;
 use crate::{
     ExecutorAssignmentInbox, ExecutorBarrierService, ExecutorConfig, ExecutorRuntime,
     ExecutorTaskAuthConfig, ExecutorTaskRunner, GrpcCoordinatorService, SharedBarrierAckRegistry,
-    SharedBarrierInjector,
-    SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
+    SharedBarrierInjector, SharedKeyGroupRanges, ShuffleContext, executor_barrier_grpc_server,
     serve_executor_task_grpc_with_listener,
 };
 use axum::Router;
@@ -22,7 +21,9 @@ use dashmap::DashMap;
 use krishiv_checkpoint::{CheckpointStorage, open_checkpoint_storage_from_uri};
 use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{InitiateCheckpointRequest, JobId, TaskAttemptRef};
-use krishiv_shuffle::{InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri};
+use krishiv_shuffle::{
+    InMemoryShuffleStore, LocalDiskShuffleStore, ShuffleBackend, open_shuffle_backend_from_uri,
+};
 use krishiv_state::FjallStateBackend;
 use krishiv_udf;
 use tokio::net::TcpListener;

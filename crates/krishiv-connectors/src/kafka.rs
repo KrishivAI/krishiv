@@ -10,8 +10,8 @@ use std::any::Any;
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    ConnectorCapabilities, ConnectorConfig, ConnectorError, ConnectorResult, OffsetCommitter, Sink,
-    Source,
+    CheckpointSource, ConnectorCapabilities, ConnectorConfig, ConnectorError, ConnectorResult,
+    OffsetCommitter, Sink, Source,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,20 +44,31 @@ impl crate::Offset for KafkaOffset {
 
     fn decode(bytes: &[u8]) -> ConnectorResult<Self> {
         if bytes.len() < 4 {
-            return Err(ConnectorError::IoStr {
+            return Err(ConnectorError::Offset {
                 message: "KafkaOffset decode: buffer too short for topic_len".into(),
             });
         }
         let topic_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let topic_end = 4 + topic_len;
-        if bytes.len() < topic_end + 4 + 8 {
-            return Err(ConnectorError::IoStr {
-                message: "KafkaOffset decode: buffer too short for topic + partition + offset"
-                    .into(),
+        let topic_end = 4usize
+            .checked_add(topic_len)
+            .ok_or_else(|| ConnectorError::Offset {
+                message: "KafkaOffset decode: topic length overflow".into(),
+            })?;
+        let expected_len = topic_end
+            .checked_add(12)
+            .ok_or_else(|| ConnectorError::Offset {
+                message: "KafkaOffset decode: encoded length overflow".into(),
+            })?;
+        if bytes.len() != expected_len {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "KafkaOffset decode: expected {expected_len} bytes from topic length, got {}",
+                    bytes.len()
+                ),
             });
         }
         let topic = std::str::from_utf8(&bytes[4..topic_end])
-            .map_err(|e| ConnectorError::IoStr {
+            .map_err(|e| ConnectorError::Offset {
                 message: format!("KafkaOffset decode: invalid UTF-8 in topic: {e}"),
             })?
             .to_string();
@@ -436,6 +447,7 @@ impl Sink for KafkaSink {
 pub struct InMemoryKafkaSource {
     topic: String,
     partition: i32,
+    start_offset: i64,
     next_offset: i64,
     batches: Vec<RecordBatch>,
     cursor: usize,
@@ -452,6 +464,7 @@ impl InMemoryKafkaSource {
         Self {
             topic: topic.into(),
             partition,
+            start_offset,
             next_offset: start_offset,
             batches,
             cursor: 0,
@@ -473,6 +486,7 @@ impl Source for InMemoryKafkaSource {
         ConnectorCapabilities::new()
             .with_bounded()
             .with_rewindable()
+            .with_checkpoint()
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -480,13 +494,92 @@ impl Source for InMemoryKafkaSource {
             return Ok(None);
         }
         let batch = self.batches[self.cursor].clone();
+        let row_count = i64::try_from(batch.num_rows()).map_err(|_| ConnectorError::Offset {
+            message: "in-memory Kafka batch row count exceeds i64".into(),
+        })?;
+        let next_offset =
+            self.next_offset
+                .checked_add(row_count)
+                .ok_or_else(|| ConnectorError::Offset {
+                    message: "in-memory Kafka offset overflow".into(),
+                })?;
         self.cursor += 1;
-        self.next_offset += batch.num_rows() as i64;
+        self.next_offset = next_offset;
         Ok(Some(batch))
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         Some(Box::new(self.next_offset()))
+    }
+
+    fn reset(&mut self) {
+        self.cursor = 0;
+        self.next_offset = self.start_offset;
+    }
+}
+
+impl CheckpointSource for InMemoryKafkaSource {
+    type Offset = KafkaOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        Ok(self.next_offset())
+    }
+
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()> {
+        if offset.topic != self.topic || offset.partition != self.partition {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "Kafka offset belongs to {}/{}, expected {}/{}",
+                    offset.topic, offset.partition, self.topic, self.partition
+                ),
+            });
+        }
+        if offset.offset < self.start_offset {
+            return Err(ConnectorError::Offset {
+                message: format!(
+                    "Kafka offset {} is before configured start offset {}",
+                    offset.offset, self.start_offset
+                ),
+            });
+        }
+
+        let mut candidate = self.start_offset;
+        if offset.offset == candidate {
+            self.cursor = 0;
+            self.next_offset = candidate;
+            return Ok(());
+        }
+        for (index, batch) in self.batches.iter().enumerate() {
+            let row_count =
+                i64::try_from(batch.num_rows()).map_err(|_| ConnectorError::Offset {
+                    message: "in-memory Kafka batch row count exceeds i64".into(),
+                })?;
+            candidate = candidate
+                .checked_add(row_count)
+                .ok_or_else(|| ConnectorError::Offset {
+                    message: "in-memory Kafka offset overflow while restoring".into(),
+                })?;
+            if offset.offset == candidate {
+                self.cursor = index + 1;
+                self.next_offset = candidate;
+                return Ok(());
+            }
+            if offset.offset < candidate {
+                return Err(ConnectorError::Offset {
+                    message: format!(
+                        "Kafka offset {} is not a batch boundary for {}/{}",
+                        offset.offset, self.topic, self.partition
+                    ),
+                });
+            }
+        }
+
+        Err(ConnectorError::Offset {
+            message: format!(
+                "Kafka offset {} is past final available offset {} for {}/{}",
+                offset.offset, candidate, self.topic, self.partition
+            ),
+        })
     }
 }
 
@@ -584,14 +677,15 @@ impl RdkafkaKafkaSource {
                 // independent of the distributed checkpoint cycle. If the
                 // executor crashes after auto-commit but before the state
                 // snapshot, messages committed here will be skipped on restart.
-                // For exactly-once semantics, use None and call commit_offsets()
-                // only after state_backend.snapshot() succeeds (C7).
+                // Manual commit is required for checkpoint-aligned recovery, but
+                // it is not sufficient for exactly-once until broker partition
+                // seek/restore is wired through CheckpointSource.
                 tracing::warn!(
                     topic = %topic,
                     interval_ms = ms,
                     "Kafka auto-commit enabled: at-least-once delivery only. \
-                     For exactly-once, set auto_commit_interval_ms=None and call \
-                     commit_offsets() after each durable state checkpoint."
+                     For checkpoint-aligned recovery, set auto_commit_interval_ms=None \
+                     and commit only after each durable state checkpoint."
                 );
                 cfg.set("enable.auto.commit", "true")
                     .set("auto.commit.interval.ms", ms.to_string());
@@ -642,6 +736,10 @@ impl RdkafkaKafkaSource {
     /// persisted** (e.g. after `state_backend.snapshot()` succeeds). Calling
     /// before the snapshot creates a window where the committed offset advances
     /// past unsnapshotted state — messages would be skipped on restart (C7).
+    ///
+    /// Manual commit alone is not an exactly-once certification. This broker
+    /// source intentionally does not advertise checkpoint capability until
+    /// partition assignment and seek-based restore implement [`CheckpointSource`].
     pub fn commit_offsets(&self) {
         use rdkafka::consumer::Consumer;
         if let Err(e) = self
@@ -927,6 +1025,20 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    #[test]
+    fn kafka_offset_decode_rejects_noncanonical_length() {
+        let mut encoded = KafkaOffset {
+            topic: "events".to_string(),
+            partition: 3,
+            offset: 42,
+        }
+        .encode();
+        encoded.push(0);
+        let error =
+            KafkaOffset::decode(&encoded).expect_err("trailing offset bytes must be rejected");
+        assert!(matches!(error, ConnectorError::Offset { .. }));
+    }
+
     // -----------------------------------------------------------------------
     // KafkaConfig validation
     // -----------------------------------------------------------------------
@@ -979,6 +1091,10 @@ mod tests {
         assert!(!caps.is_bounded());
         assert!(!caps.is_transactional());
         assert!(!caps.is_idempotent());
+        assert!(
+            !caps.is_checkpoint_capable(),
+            "broker Kafka must not claim checkpoint restore before seek is implemented"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1060,7 +1176,8 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
-        let mut source = InMemoryKafkaSource::new("events", 2, 10, vec![batch]);
+        let mut source = InMemoryKafkaSource::new("events", 2, 10, vec![batch.clone()]);
+        assert!(source.capabilities().is_checkpoint_capable());
 
         let read = source.read_batch().await.unwrap().unwrap();
         assert_eq!(read.num_rows(), 3);
@@ -1078,6 +1195,51 @@ mod tests {
             }
         );
         assert!(source.read_batch().await.unwrap().is_none());
+
+        let mut rewind_source = InMemoryKafkaSource::new("events", 2, 10, vec![batch]);
+        crate::CertificationSuite::run_rewind_test::<KafkaOffset>(&mut rewind_source)
+            .await
+            .expect("in-memory Kafka source must restore cursor and starting offset");
+    }
+
+    #[tokio::test]
+    async fn in_memory_kafka_source_restores_typed_checkpoint_offsets() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let first =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let second =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3, 4, 5]))]).unwrap();
+        let mut source = InMemoryKafkaSource::new("events", 2, 10, vec![first, second]);
+
+        crate::CertificationSuite::run_checkpoint_restore_test(&mut source)
+            .await
+            .expect("in-memory Kafka source must restore exact batch boundaries");
+    }
+
+    #[test]
+    fn in_memory_kafka_source_rejects_non_boundary_checkpoint_offset() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let mut source = InMemoryKafkaSource::new("events", 2, 10, vec![batch]);
+
+        let error = source
+            .restore_offset(&KafkaOffset {
+                topic: "events".into(),
+                partition: 2,
+                offset: 11,
+            })
+            .expect_err("offset inside a batch must not be accepted");
+        assert!(matches!(error, ConnectorError::Offset { .. }));
     }
 
     #[tokio::test]

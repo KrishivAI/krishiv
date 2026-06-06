@@ -1,83 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Physical execution stubs for Krishiv.
-//!
-//! This crate will own Arrow physical operators. R1 bootstrap only defines the
-//! lowering seam from Krishiv logical plans into Krishiv physical plans.
+//! Arrow-native physical execution operators for Krishiv.
 
-use krishiv_plan::{LogicalPlan, PhysicalPlan, PlanNode};
-
-/// Bootstrap physical operator categories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperatorKind {
-    /// Source operator.
-    Source,
-    /// Projection operator.
-    Projection,
-    /// Filter operator.
-    Filter,
-    /// Aggregate operator.
-    Aggregate,
-    /// Sink operator.
-    Sink,
-    /// Placeholder for operators not classified in the bootstrap slice.
-    Unknown,
-}
-
-/// Minimal physical operator descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhysicalOperator {
-    name: String,
-    kind: OperatorKind,
-}
-
-impl PhysicalOperator {
-    /// Create an operator descriptor.
-    pub fn new(name: impl Into<String>, kind: OperatorKind) -> Self {
-        Self {
-            name: name.into(),
-            kind,
-        }
-    }
-
-    /// Operator name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Operator kind.
-    pub fn kind(&self) -> OperatorKind {
-        self.kind
-    }
-}
-
-/// Lower a logical plan into a physical plan placeholder.
-///
-/// This is intentionally not a real optimizer or execution engine. It gives R1
-/// callers a stable seam to test while DataFusion-backed execution is added.
-pub fn lower_to_physical(logical: &LogicalPlan) -> PhysicalPlan {
-    let mut physical = PhysicalPlan::new(logical.name(), logical.kind());
-
-    for node in logical.nodes() {
-        let mut physical_node = PlanNode::new(
-            format!("physical:{}", node.id()),
-            format!("physical {}", node.label()),
-            node.kind(),
-        )
-        .with_inputs(node.inputs().iter().cloned());
-        if let Some(op) = node.op() {
-            physical_node = physical_node.with_op(op.clone());
-        }
-        physical.add_node(physical_node);
-    }
-
-    physical
-}
+pub use krishiv_plan::lower_to_physical;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during physical execution.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecError {
     /// An Arrow error occurred.
     #[error("arrow error: {0}")]
@@ -88,6 +18,12 @@ pub enum ExecError {
     /// A data type is not supported for this operation.
     #[error("unsupported type: {0}")]
     UnsupportedType(String),
+    /// An input batch contains values that violate an operator contract.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    /// An upstream stream failed before the operator could process its input.
+    #[error("upstream stream error: {0}")]
+    Upstream(String),
     /// A window operator was constructed with an invalid configuration.
     #[error("invalid window config: {0}")]
     InvalidWindowConfig(String),
@@ -173,7 +109,7 @@ mod tests {
             ExecutionKind::Batch,
         ));
 
-        let physical = lower_to_physical(&logical);
+        let physical = lower_to_physical(&logical).expect("lower");
 
         assert_eq!(physical.name(), "demo");
         assert_eq!(physical.nodes().len(), 1);

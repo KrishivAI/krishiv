@@ -3,10 +3,9 @@
 use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 use krishiv_sql::create_function_ddl::{
-    ColumnDef, StubTableUdf, is_create_function_returns_table, parse_create_function,
+    ColumnDef, is_create_function_returns_table, parse_create_function,
 };
 use krishiv_sql::referenced_table_names;
-use krishiv_udf::TableUdf;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CreateFunctionDdl — parse tests
@@ -122,7 +121,7 @@ fn reject_empty_returns_clause() {
 #[test]
 fn ddl_debug_output_is_human_readable() {
     let sql =
-        "CREATE FUNCTION demo(x INT) RETURNS TABLE (a TEXT, b BIGINT) LANGUAGE RUST AS 'stub'";
+        "CREATE FUNCTION demo(x INT) RETURNS TABLE (a TEXT, b BIGINT) LANGUAGE RUST AS 'body'";
     let ddl = parse_create_function(sql).expect("should parse");
     let debug = format!("{ddl:?}");
     assert!(debug.contains("demo"), "debug should include function name");
@@ -159,20 +158,6 @@ fn column_def_equality() {
     };
     assert_eq!(a, b);
     assert_ne!(a, c);
-}
-
-#[test]
-fn stub_table_udf_name_matches_ddl() {
-    let sql = "CREATE FUNCTION my_stub(p INT) RETURNS TABLE (out_val DOUBLE)";
-    let ddl = parse_create_function(sql).expect("should parse");
-    let stub = StubTableUdf::from_ddl(&ddl);
-    assert_eq!(stub.name(), "my_stub");
-    assert_eq!(stub.output_schema().fields().len(), 1);
-    assert_eq!(stub.output_schema().field(0).name(), "out_val");
-    assert_eq!(
-        stub.output_schema().field(0).data_type(),
-        &DataType::Float64
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

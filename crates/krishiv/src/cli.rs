@@ -1,7 +1,9 @@
 //! CLI dispatch for the `krishiv` binary.
 
 use krishiv_api::Session;
-use krishiv_checkpoint::{LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata};
+use krishiv_checkpoint::{
+    LocalFsCheckpointStorage, list_valid_epochs, read_epoch_metadata, validate_epoch,
+};
 use krishiv_common::async_util::block_on;
 use krishiv_proto::{
     CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState, JobId,
@@ -889,6 +891,41 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
         }
         Err(e) => return CliResponse::err(format!("checkpoint read error: {e}\n"), 1),
     };
+    if let Err(error) = meta.validate() {
+        return CliResponse::err(
+            format!("checkpoint metadata invalid for job {job_id} epoch {epoch_num}: {error}\n"),
+            1,
+        );
+    }
+    if meta.job_id != job_id || meta.epoch != epoch_num {
+        return CliResponse::err(
+            format!(
+                "checkpoint metadata mismatch for requested job {job_id} epoch {epoch_num}: \
+                 metadata has job {} epoch {}\n",
+                meta.job_id, meta.epoch
+            ),
+            1,
+        );
+    }
+    match validate_epoch(&storage, job_id, epoch_num) {
+        Ok(true) => {}
+        Ok(false) => {
+            return CliResponse::err(
+                format!(
+                    "checkpoint epoch {epoch_num} failed integrity validation for job {job_id}\n"
+                ),
+                1,
+            );
+        }
+        Err(error) => {
+            return CliResponse::err(
+                format!(
+                    "checkpoint epoch {epoch_num} integrity check failed for job {job_id}: {error}\n"
+                ),
+                1,
+            );
+        }
+    }
     let snapshot_count = meta.operator_snapshots.len();
     let source_count = meta.source_offsets.len();
     let kind = if meta.is_savepoint {
@@ -1028,6 +1065,52 @@ fn run_checkpoints_list(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
 #[cfg(test)]
 mod tests {
     use super::{CoordinatorMode, dispatch};
+    use krishiv_checkpoint::{
+        CheckpointMetadata, CheckpointStorage, IntegrityManifest, LocalFsCheckpointStorage,
+        metadata_path, write_epoch_metadata, write_manifest,
+    };
+
+    fn write_cli_restore_epoch(
+        storage: &dyn CheckpointStorage,
+        job_id: &str,
+        epoch: u64,
+    ) -> CheckpointMetadata {
+        let metadata = CheckpointMetadata {
+            version: CheckpointMetadata::VERSION,
+            epoch,
+            job_id: job_id.to_owned(),
+            fencing_token: 1,
+            coordinator_id: Some("coord-cli-test".to_owned()),
+            timestamp_ms: 1_716_000_000_000 + epoch,
+            source_offsets: Vec::new(),
+            operator_snapshots: Vec::new(),
+            is_savepoint: false,
+            savepoint_label: None,
+            iceberg_snapshot_id: None,
+            kafka_offsets: None,
+        };
+        write_epoch_metadata(storage, job_id, epoch, &metadata).unwrap();
+        let metadata_bytes = storage
+            .read_bytes(&metadata_path(job_id, epoch))
+            .unwrap()
+            .unwrap();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", &metadata_bytes);
+        write_manifest(storage, job_id, epoch, &manifest).unwrap();
+        metadata
+    }
+
+    fn restore_args<'a>(job_id: &'a str, epoch: &'a str, storage_path: &'a str) -> [&'a str; 7] {
+        [
+            "restore",
+            "--job",
+            job_id,
+            "--epoch",
+            epoch,
+            "--storage-path",
+            storage_path,
+        ]
+    }
 
     #[test]
     fn top_level_help_lists_commands() {
@@ -1201,6 +1284,50 @@ mod tests {
         let response = dispatch(&["restore", "--job", "job-1", "--epoch", "latest"]);
         assert_eq!(response.exit_code, 2);
         assert!(response.stderr.contains("non-negative integer"));
+    }
+
+    #[test]
+    fn restore_local_dry_run_validates_manifest_before_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalFsCheckpointStorage::new(dir.path()).unwrap();
+        write_cli_restore_epoch(&storage, "job-local-restore", 1);
+        let storage_path = dir.path().to_string_lossy().to_string();
+
+        let args = restore_args("job-local-restore", "1", storage_path.as_str());
+        let response = dispatch(&args);
+
+        assert_eq!(response.exit_code, 0, "{:?}", response);
+        assert!(response.stdout.contains("Restore plan"));
+        assert!(response.stdout.contains("job-local-restore"));
+    }
+
+    #[test]
+    fn restore_local_dry_run_rejects_manifest_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = LocalFsCheckpointStorage::new(dir.path()).unwrap();
+        let mut metadata = write_cli_restore_epoch(&storage, "job-local-corrupt", 1);
+        metadata.timestamp_ms = metadata.timestamp_ms.saturating_add(1);
+        storage
+            .write_bytes(
+                &metadata_path("job-local-corrupt", 1),
+                &serde_json::to_vec_pretty(&metadata).unwrap(),
+            )
+            .unwrap();
+        let storage_path = dir.path().to_string_lossy().to_string();
+
+        let args = restore_args("job-local-corrupt", "1", storage_path.as_str());
+        let response = dispatch(&args);
+
+        assert_eq!(response.exit_code, 1, "{:?}", response);
+        assert!(
+            response.stderr.contains("integrity"),
+            "expected integrity failure, got: {:?}",
+            response.stderr
+        );
+        assert!(
+            !response.stdout.contains("Restore plan"),
+            "corrupt checkpoint must not produce a restore plan"
+        );
     }
 
     #[test]

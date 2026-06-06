@@ -348,11 +348,11 @@ pub fn coordinator_http_router(
     coordinator: SharedCoordinator,
     config: &CoordinatorDaemonConfig,
 ) -> Router {
-    use axum::middleware;
     use crate::federation_http::{
         federation_cancel_job, federation_job_status, federation_submit_job,
     };
     use crate::http_auth::{require_coordinator_bearer, resolve_http_bearer_tokens};
+    use axum::middleware;
 
     let public = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
@@ -395,10 +395,7 @@ pub fn coordinator_http_router(
             "/api/v1/continuous-drain",
             post(crate::continuous_stream_http::api_continuous_drain),
         )
-        .route(
-            "/api/v1/jobs/{job_id}/diagnose",
-            get(api_job_diagnose),
-        )
+        .route("/api/v1/jobs/{job_id}/diagnose", get(api_job_diagnose))
         .route("/federation/v1/jobs", post(federation_submit_job))
         .route("/federation/v1/jobs/{job_id}", get(federation_job_status))
         .route(
@@ -895,10 +892,9 @@ fn validate_runtime_security_config(
             .into());
         }
         if let Err(error) = crate::auth::validate_coordinator_bearer_token_sources() {
-            return Err(format!(
-                "failed to read coordinator bearer token configuration: {error}"
-            )
-            .into());
+            return Err(
+                format!("failed to read coordinator bearer token configuration: {error}").into(),
+            );
         }
         if !coordinator_bearer_token_configured {
             return Err(format!(
@@ -1539,8 +1535,8 @@ mod parse_tests {
 
     #[tokio::test]
     async fn circuit_breaker_reset_endpoint_returns_ok() {
-        use crate::coordinator_http_router;
         use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use krishiv_proto::{ExecutorDescriptor, ExecutorId};

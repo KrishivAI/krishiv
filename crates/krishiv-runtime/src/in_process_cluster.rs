@@ -296,7 +296,10 @@ mod tests {
         let err = cluster
             .push_continuous_input("no-such-job", vec![])
             .unwrap_err();
-        assert!(matches!(err, RuntimeError::InvalidState { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::ContinuousStream(crate::ContinuousStreamError::JobNotFound { .. })
+        ));
     }
 
     #[test]

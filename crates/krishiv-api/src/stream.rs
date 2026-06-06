@@ -1,7 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use krishiv_runtime::ExecutionRuntime;
+use krishiv_sql::ContinuousTableInput;
 
 use crate::error::{KrishivError, Result};
 use crate::types::{ExecutionMode, StreamBatch, StreamMode};
@@ -17,6 +20,7 @@ pub struct Stream {
     pub(crate) state_ttl_ms: Option<u64>,
     pub(crate) batches: Vec<StreamBatch>,
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
+    pub(crate) input: Option<Arc<ContinuousTableInput>>,
 }
 
 impl fmt::Debug for Stream {
@@ -26,21 +30,30 @@ impl fmt::Debug for Stream {
             .field("mode", &self.mode)
             .field("execution_mode", &self.execution_mode)
             .field("batch_count", &self.batches.len())
+            .field("has_input", &self.input.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl Stream {
-    /// Create a stream with an explicit execution mode.
+    /// Create a bounded stream with an explicit execution mode.
     ///
     /// Prefer [`Session::memory_stream`] so the stream inherits the session mode.
+    /// Unbounded streams require a registered schema and must be created with
+    /// [`Session::unbounded_memory_stream`].
     pub fn new(
         name: impl Into<String>,
         mode: StreamMode,
         batches: Vec<StreamBatch>,
         execution_mode: ExecutionMode,
-    ) -> Self {
-        Self::for_session(
+    ) -> Result<Self> {
+        if mode == StreamMode::Unbounded {
+            return Err(KrishivError::InvalidConfig {
+                message: "unbounded streams require Session::unbounded_memory_stream(name, schema)"
+                    .into(),
+            });
+        }
+        Ok(Self::for_session(
             name,
             mode,
             batches,
@@ -48,7 +61,7 @@ impl Stream {
             None,
             None,
             crate::session::shared_embedded_runtime(),
-        )
+        ))
     }
 
     pub(crate) fn for_session(
@@ -68,6 +81,27 @@ impl Stream {
             state_ttl_ms,
             batches,
             runtime,
+            input: None,
+        }
+    }
+
+    pub(crate) fn for_unbounded_session(
+        name: impl Into<String>,
+        schema_input: Arc<ContinuousTableInput>,
+        execution_mode: ExecutionMode,
+        coordinator_url: Option<String>,
+        state_ttl_ms: Option<u64>,
+        runtime: Arc<dyn ExecutionRuntime>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            mode: StreamMode::Unbounded,
+            execution_mode,
+            coordinator_url,
+            state_ttl_ms,
+            batches: Vec::new(),
+            runtime,
+            input: Some(schema_input),
         }
     }
 
@@ -95,6 +129,38 @@ impl Stream {
     /// Borrow local batches.
     pub fn batches(&self) -> &[StreamBatch] {
         &self.batches
+    }
+
+    /// Expected Arrow schema for an unbounded input stream.
+    pub fn input_schema(&self) -> Option<&SchemaRef> {
+        self.input.as_ref().map(|input| input.schema())
+    }
+
+    /// Submit an unbounded input batch without waiting for queue capacity.
+    pub fn try_push_batch(&self, batch: RecordBatch) -> Result<()> {
+        let input = self.unbounded_input()?;
+        input.try_send(batch).map_err(KrishivError::from)
+    }
+
+    /// Submit an unbounded input batch, waiting asynchronously for capacity.
+    pub async fn push_batch_async(&self, batch: RecordBatch) -> Result<()> {
+        let input = self.unbounded_input()?;
+        input.send(batch).await.map_err(KrishivError::from)
+    }
+
+    /// Close an unbounded input after all intended batches are submitted.
+    ///
+    /// The SQL consumer receives end-of-stream after draining queued batches.
+    /// Returns `true` when this call closed the input.
+    pub fn close_input(&self) -> Result<bool> {
+        self.unbounded_input()?.close().map_err(KrishivError::from)
+    }
+
+    /// Whether an unbounded input has been closed.
+    pub fn is_input_closed(&self) -> Result<bool> {
+        self.unbounded_input()?
+            .is_closed()
+            .map_err(KrishivError::from)
     }
 
     /// Collect bounded in-memory stream batches.
@@ -179,5 +245,13 @@ impl Stream {
             multi_source_watermark: None,
             inner: self,
         }
+    }
+
+    fn unbounded_input(&self) -> Result<&Arc<ContinuousTableInput>> {
+        self.input.as_ref().ok_or_else(|| {
+            KrishivError::unsupported(
+                "batch ingestion is only available on unbounded input streams",
+            )
+        })
     }
 }

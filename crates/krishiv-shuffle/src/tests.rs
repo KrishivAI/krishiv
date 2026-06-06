@@ -1527,7 +1527,10 @@ mod shuffle_tests {
         let partition = make_object_store_partition("job-lease-restart", "s0", 0);
         let id = partition.id.clone();
 
-        writer.register_partition_lease(id.clone(), 9).await.unwrap();
+        writer
+            .register_partition_lease(id.clone(), 9)
+            .await
+            .unwrap();
         writer.write_partition(partition, 9).await.unwrap();
 
         let restarted = ObjectStoreShuffleStore::new(inner, "shuffle-lease-restart");
@@ -1558,14 +1561,19 @@ mod shuffle_tests {
                 partition: 0,
             },
             schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-            batches: vec![RecordBatch::try_new(
-                Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-                vec![Arc::new(Int32Array::from(vec![1]))],
-            )
-            .unwrap()],
+            batches: vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                    vec![Arc::new(Int32Array::from(vec![1]))],
+                )
+                .unwrap(),
+            ],
         };
         let id = partition.id.clone();
-        writer.register_partition_lease(id.clone(), 9).await.unwrap();
+        writer
+            .register_partition_lease(id.clone(), 9)
+            .await
+            .unwrap();
         writer.write_partition(partition, 9).await.unwrap();
 
         let restarted = LocalDiskShuffleStore::new(dir.path()).unwrap();
@@ -1574,11 +1582,13 @@ mod shuffle_tests {
                 ShufflePartition {
                     id: id.clone(),
                     schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-                    batches: vec![RecordBatch::try_new(
-                        Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
-                        vec![Arc::new(Int32Array::from(vec![2]))],
-                    )
-                    .unwrap()],
+                    batches: vec![
+                        RecordBatch::try_new(
+                            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                            vec![Arc::new(Int32Array::from(vec![2]))],
+                        )
+                        .unwrap(),
+                    ],
                 },
                 8,
             )

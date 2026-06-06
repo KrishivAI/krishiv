@@ -19,7 +19,11 @@ pub fn is_streaming_plan(plan: &PhysicalPlan) -> bool {
 }
 
 /// Derive a local window execution spec from typed streaming plan nodes.
-pub fn streaming_spec_from_plan(plan: &PhysicalPlan) -> Result<LocalWindowExecutionSpec, RuntimeError> {
+pub fn streaming_spec_from_plan(
+    plan: &PhysicalPlan,
+) -> Result<LocalWindowExecutionSpec, RuntimeError> {
+    plan.validate()
+        .map_err(|error| RuntimeError::plan_rejected(error.to_string()))?;
     if plan.kind() != ExecutionKind::Streaming {
         return Err(RuntimeError::plan_rejected(
             "streaming_spec_from_plan requires ExecutionKind::Streaming",

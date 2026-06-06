@@ -158,14 +158,22 @@ impl CheckpointInner {
 
     /// Phase 3: finalize a commit after storage I/O completes.
     /// Must be called under the same lock as `handle_ack`.
-    pub fn finalize_ack(&mut self, job_id: &JobId, epoch: u64) {
-        if let Some(coord) = self.coordinators.get_mut(job_id) {
-            if let crate::checkpoint::CheckpointCoordinatorState::Committing { .. } = &coord.state {
-                coord.finalize_commit(epoch);
-                krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
+    pub fn finalize_ack(
+        &mut self,
+        job_id: &JobId,
+        epoch: u64,
+    ) -> krishiv_checkpoint::CheckpointResult<()> {
+        let coord = self.coordinators.get_mut(job_id).ok_or_else(|| {
+            krishiv_checkpoint::CheckpointError::Storage {
+                message: format!(
+                    "cannot finalize checkpoint epoch {epoch}: job {job_id} is not registered"
+                ),
             }
-        }
+        })?;
+        coord.finalize_commit(epoch)?;
+        krishiv_metrics::global_metrics().inc_checkpoint_committed(job_id.as_str());
         self.notify.notify_waiters();
+        Ok(())
     }
 
     fn clear_notify_for_epoch(&mut self, job_id: &krishiv_proto::JobId, epoch: u64) {

@@ -87,6 +87,7 @@ impl Coordinator {
 
     /// Returns true if the executor owns at least one Running task in a streaming job.
     pub(crate) fn executor_has_streaming_running_tasks(&self, executor_id: &ExecutorId) -> bool {
+        let profile = self.durability_profile;
         self.job_coordinators
             .values()
             .map(|jc| jc.read_record())
@@ -94,8 +95,18 @@ impl Coordinator {
                 job.spec.kind() == JobKind::Streaming
                     && job.stages.iter().any(|stage| {
                         stage.tasks().iter().any(|task| {
-                            task.state() == TaskState::Running
-                                && task.assigned_executor() == Some(executor_id)
+                            if task.assigned_executor() != Some(executor_id) {
+                                return false;
+                            }
+                            if task.state() == TaskState::Running {
+                                return true;
+                            }
+                            task.state() == TaskState::Succeeded
+                                && krishiv_plan::task_body_for_profile(
+                                    task.spec.description(),
+                                    profile,
+                                )
+                                .is_ok_and(|body| body.starts_with("stream:loop:"))
                         })
                     })
             })

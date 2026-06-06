@@ -1,7 +1,7 @@
 //! HTTP client for the cluster control plane APIs.
 
-use krishiv_scheduler::decode_inline_record_batches;
 use krishiv_scheduler::configured_coordinator_bearer_token;
+use krishiv_scheduler::decode_inline_record_batches;
 use std::sync::OnceLock;
 
 use crate::flight_protocol::parquet_file_to_ipc_b64;
@@ -45,9 +45,7 @@ fn coordinator_http_client() -> RuntimeResult<reqwest::Client> {
     Ok(COORDINATOR_HTTP_CLIENT.get().unwrap_or(&client).clone())
 }
 
-fn apply_coordinator_bearer(
-    builder: reqwest::RequestBuilder,
-) -> reqwest::RequestBuilder {
+fn apply_coordinator_bearer(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if let Some(token) = configured_coordinator_bearer_token() {
         builder.header("Authorization", format!("Bearer {token}"))
     } else {
@@ -320,13 +318,10 @@ pub async fn execute_coordinator_bounded_window(
     };
 
     let client = coordinator_http_client()?;
-    let response =
-        apply_coordinator_bearer(client.post(&url).json(&body))
-            .send()
-            .await
-            .map_err(|e| {
-            RuntimeError::transport(format!("bounded-window HTTP request failed: {e}"))
-        })?;
+    let response = apply_coordinator_bearer(client.post(&url).json(&body))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("bounded-window HTTP request failed: {e}")))?;
 
     if !response.status().is_success() {
         return Err(RuntimeError::transport(format!(
@@ -425,13 +420,10 @@ pub async fn execute_coordinator_continuous_register(
     let body = ContinuousRegisterRequest { job_id, spec };
 
     let client = coordinator_http_client()?;
-    let response =
-        apply_coordinator_bearer(client.post(&url).json(&body))
-            .send()
-            .await
-            .map_err(|e| {
-            RuntimeError::transport(format!("continuous-register request failed: {e}"))
-        })?;
+    let response = apply_coordinator_bearer(client.post(&url).json(&body))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-register request failed: {e}")))?;
 
     if !response.status().is_success() {
         return Err(RuntimeError::transport(format!(
@@ -497,13 +489,10 @@ pub async fn execute_coordinator_continuous_drain(
     let body = ContinuousDrainRequest { job_id };
 
     let client = coordinator_http_client()?;
-    let response =
-        apply_coordinator_bearer(client.post(&url).json(&body))
-            .send()
-            .await
-            .map_err(|e| {
-            RuntimeError::transport(format!("continuous-drain request failed: {e}"))
-        })?;
+    let response = apply_coordinator_bearer(client.post(&url).json(&body))
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("continuous-drain request failed: {e}")))?;
 
     if !response.status().is_success() {
         return Err(RuntimeError::transport(format!(
@@ -526,6 +515,8 @@ pub async fn execute_coordinator_physical_plan(
 ) -> RuntimeResult<()> {
     use krishiv_plan::ExecutionKind;
 
+    plan.validate()
+        .map_err(|error| RuntimeError::plan_rejected(error.to_string()))?;
     match plan.kind() {
         ExecutionKind::Batch => {
             let sql = crate::flight_client::plan_to_sql(plan);

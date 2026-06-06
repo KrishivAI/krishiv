@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
-use krishiv_plan::window::{WindowExecutionSpec, WindowKind};
+use krishiv_plan::window::{WindowExecutionSpec, WindowKind, validate_window_execution_spec};
 use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
 use crate::operator_runtime::window_agg_to_expr;
@@ -22,6 +22,7 @@ enum WindowOperatorState {
 }
 
 /// Tracks single- or multi-source watermark state for continuous execution.
+#[derive(Clone)]
 struct WatermarkTracker {
     single: WatermarkState,
     multi: MultiSourceWatermarkState,
@@ -271,11 +272,8 @@ impl ContinuousWindowExecutor {
         spec: WindowExecutionSpec,
         state_dir: Option<&std::path::Path>,
     ) -> ExecResult<Self> {
-        if spec.agg_exprs.is_empty() {
-            return Err(ExecError::InvalidWindowConfig(
-                "window execution requires at least one aggregate".into(),
-            ));
-        }
+        validate_window_execution_spec(&spec)
+            .map_err(|error| ExecError::InvalidWindowConfig(error.to_string()))?;
         let agg_exprs: Vec<AggExpr> = spec.agg_exprs.iter().map(window_agg_to_expr).collect();
         Ok(Self {
             watermark: WatermarkTracker::new(&spec),
@@ -368,6 +366,48 @@ impl ContinuousWindowExecutor {
         Ok(output)
     }
 
+    /// Process one drain cycle atomically with respect to retained operator state.
+    ///
+    /// The current state and watermark trackers are snapshotted before
+    /// processing. If any input batch fails, both are restored so callers may
+    /// retain and retry the same queued input without duplicating partial
+    /// aggregation state.
+    pub fn drain_transactional(
+        &mut self,
+        input_batches: Vec<RecordBatch>,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        if self.quality_hook.is_some() {
+            return Err(ExecError::InvalidWindowConfig(
+                "transactional continuous drain does not support a side-effecting quality hook"
+                    .into(),
+            ));
+        }
+        if input_batches.is_empty() {
+            return self.drain(input_batches);
+        }
+
+        let state_snapshot = self.snapshot()?;
+        let watermark_snapshot = self.watermark.clone();
+        let last_watermark_snapshot = self.last_watermark_ms;
+
+        match self.drain(input_batches) {
+            Ok(output) => Ok(output),
+            Err(process_error) => {
+                self.operator
+                    .load_snapshot_bytes(&state_snapshot)
+                    .map_err(|restore_error| {
+                        ExecError::InvalidWindowConfig(format!(
+                            "continuous drain failed ({process_error}); rollback failed: \
+                             {restore_error}"
+                        ))
+                    })?;
+                self.watermark = watermark_snapshot;
+                self.last_watermark_ms = last_watermark_snapshot;
+                Err(process_error)
+            }
+        }
+    }
+
     /// Borrow the underlying window spec fields (for diagnostics).
     pub fn uses_multi_source_watermark(&self) -> bool {
         !self.watermark.source_lags.is_empty()
@@ -455,6 +495,15 @@ mod tests {
         .unwrap()
     }
 
+    fn invalid_events_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Utf8,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a"])) as _]).unwrap()
+    }
+
     #[test]
     fn continuous_executor_emits_window_after_watermark_passes_boundary() {
         let spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
@@ -477,5 +526,23 @@ mod tests {
             HashMap::from([("src-a".into(), 1_000), ("src-b".into(), 2_000)]);
         let exec = ContinuousWindowExecutor::new(spec).expect("create");
         assert!(exec.uses_multi_source_watermark());
+    }
+
+    #[test]
+    fn transactional_drain_rolls_back_partial_window_and_watermark_state() {
+        let mut spec = WindowExecutionSpec::tumbling("user_id", "ts", 10_000);
+        spec.watermark_lag_ms = 0;
+        let mut exec = ContinuousWindowExecutor::new(spec).expect("create");
+
+        exec.drain_transactional(vec![events_batch(1_000), invalid_events_batch()])
+            .expect_err("invalid second batch must fail the whole drain cycle");
+
+        let output = exec
+            .drain_transactional(vec![events_batch(12_000)])
+            .expect("executor must remain usable after rollback");
+        assert!(
+            output.is_empty(),
+            "the failed cycle's first batch must not remain in window state"
+        );
     }
 }

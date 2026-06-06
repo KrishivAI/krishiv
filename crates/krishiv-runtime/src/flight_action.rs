@@ -117,6 +117,8 @@ pub struct ExecutePlanBody {
 
 impl ExecutePlanBody {
     pub fn from_plan(plan: &krishiv_plan::PhysicalPlan) -> RuntimeResult<Self> {
+        plan.validate()
+            .map_err(|error| RuntimeError::plan_rejected(error.to_string()))?;
         let plan_json = serde_json::to_string(plan)
             .map_err(|e| RuntimeError::transport(format!("plan serialize: {e}")))?;
         Ok(Self {
@@ -127,8 +129,25 @@ impl ExecutePlanBody {
     }
 
     pub fn to_plan(&self) -> RuntimeResult<krishiv_plan::PhysicalPlan> {
-        serde_json::from_str(&self.plan_json)
-            .map_err(|e| RuntimeError::transport(format!("plan deserialize: {e}")))
+        let plan: krishiv_plan::PhysicalPlan = serde_json::from_str(&self.plan_json)
+            .map_err(|e| RuntimeError::transport(format!("plan deserialize: {e}")))?;
+        plan.validate()
+            .map_err(|error| RuntimeError::plan_rejected(error.to_string()))?;
+        if self.name != plan.name() {
+            return Err(RuntimeError::plan_rejected(format!(
+                "execute-plan envelope name '{}' does not match physical plan name '{}'",
+                self.name,
+                plan.name()
+            )));
+        }
+        let actual_execution_kind = plan.kind().to_string();
+        if self.execution_kind != actual_execution_kind {
+            return Err(RuntimeError::plan_rejected(format!(
+                "execute-plan envelope kind '{}' does not match physical plan kind '{actual_execution_kind}'",
+                self.execution_kind
+            )));
+        }
+        Ok(plan)
     }
 }
 
@@ -219,6 +238,7 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use krishiv_plan::window::WindowExecutionSpec;
+    use krishiv_plan::{ExecutionKind, PhysicalPlan, PlanNode};
 
     fn test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -318,8 +338,7 @@ mod tests {
 
     #[test]
     fn round_trip_execute_plan() {
-        use krishiv_plan::ExecutionKind;
-        let plan = krishiv_plan::PhysicalPlan::new("my-batch-job", ExecutionKind::Batch);
+        let plan = PhysicalPlan::new("my-batch-job", ExecutionKind::Batch);
         let action = KrishivFlightAction::ExecutePlan(ExecutePlanBody::from_plan(&plan).unwrap());
         let bytes = action.to_action_body().unwrap();
         let decoded = KrishivFlightAction::from_action_body(&bytes).unwrap();
@@ -333,6 +352,55 @@ mod tests {
             }
             other => panic!("expected ExecutePlan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execute_plan_body_rejects_invalid_graph() {
+        let plan = PhysicalPlan::new("invalid", ExecutionKind::Batch).with_node(
+            PlanNode::new("sink", "sink", ExecutionKind::Batch).with_inputs(["missing"]),
+        );
+        let body = ExecutePlanBody {
+            name: plan.name().to_string(),
+            execution_kind: plan.kind().to_string(),
+            plan_json: serde_json::to_string(&plan).expect("serialize"),
+        };
+
+        let error = body.to_plan().expect_err("invalid graph");
+
+        assert!(matches!(error, RuntimeError::PlanRejected { .. }));
+        assert!(error.to_string().contains("missing input 'missing'"));
+    }
+
+    #[test]
+    fn execute_plan_body_rejects_tampered_envelope_metadata() {
+        let plan = PhysicalPlan::new("actual", ExecutionKind::Batch);
+        let plan_json = serde_json::to_string(&plan).expect("serialize");
+
+        let wrong_name = ExecutePlanBody {
+            name: "other".to_string(),
+            execution_kind: "batch".to_string(),
+            plan_json: plan_json.clone(),
+        };
+        assert!(
+            wrong_name
+                .to_plan()
+                .expect_err("name mismatch")
+                .to_string()
+                .contains("envelope name")
+        );
+
+        let wrong_kind = ExecutePlanBody {
+            name: "actual".to_string(),
+            execution_kind: "streaming".to_string(),
+            plan_json,
+        };
+        assert!(
+            wrong_kind
+                .to_plan()
+                .expect_err("kind mismatch")
+                .to_string()
+                .contains("envelope kind")
+        );
     }
 
     #[test]

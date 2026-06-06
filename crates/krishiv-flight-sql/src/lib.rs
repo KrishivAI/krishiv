@@ -25,7 +25,9 @@ use prost::Message as _; // brings encode_to_vec() into scope
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-use krishiv_governance::{AuthProvider, MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider};
+use krishiv_governance::{
+    AuthProvider, MaskingRule, PolicyHook, Principal, Role, StaticApiKeyAuthProvider,
+};
 use krishiv_sql::SqlEngine;
 use krishiv_sql::policy::PolicyEnforcingSqlEngine;
 
@@ -588,19 +590,10 @@ impl KrishivFlightSqlService {
                 let cluster = self.host.cluster().ok_or_else(|| {
                     KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
                 })?;
-                let registry = self.host.continuous_registry().ok_or_else(|| {
-                    KrishivActionError::Other(
-                        "continuous registry unavailable in proxy mode".into(),
-                    )
-                })?;
                 let local = krishiv_runtime::in_process_cluster::plan_spec_to_local(&body.spec);
                 let job_id = body.job_id.clone();
-                let spec_copy = body.spec.clone();
-                tokio::task::block_in_place(|| {
-                    cluster.register_continuous_job(&job_id, &local)?;
-                    registry.register_job(job_id, spec_copy)
-                })
-                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                tokio::task::block_in_place(|| cluster.register_continuous_job(&job_id, &local))
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 Ok(Vec::new())
             }
             A::ContinuousPush(body) => {
@@ -619,18 +612,9 @@ impl KrishivFlightSqlService {
                 let cluster = self.host.cluster().ok_or_else(|| {
                     KrishivActionError::Other("embedded cluster unavailable in proxy mode".into())
                 })?;
-                let registry = self.host.continuous_registry().ok_or_else(|| {
-                    KrishivActionError::Other(
-                        "continuous registry unavailable in proxy mode".into(),
-                    )
-                })?;
                 let job_id = body.job_id.clone();
-                let batches_for_cluster = batches.clone();
-                tokio::task::block_in_place(|| {
-                    cluster.push_continuous_input(&job_id, batches_for_cluster)?;
-                    registry.push_input(&job_id, batches)
-                })
-                .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                tokio::task::block_in_place(|| cluster.push_continuous_input(&job_id, batches))
+                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                 Ok(Vec::new())
             }
             A::ContinuousDrain(body) => {
@@ -700,10 +684,8 @@ impl KrishivFlightSqlService {
                         KrishivActionError::Other("embedded cluster unavailable".into())
                     })?;
                     let job_id = plan.name().to_string();
-                    tokio::task::block_in_place(|| {
-                        cluster.register_continuous_job(&job_id, &spec)
-                    })
-                    .map_err(|e| KrishivActionError::Other(e.to_string()))?;
+                    tokio::task::block_in_place(|| cluster.register_continuous_job(&job_id, &spec))
+                        .map_err(|e| KrishivActionError::Other(e.to_string()))?;
                     return Ok(Vec::new());
                 }
                 let _ = self
@@ -743,18 +725,15 @@ fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionE
 /// **Beta API**: may change between minor releases.
 pub fn make_flight_sql_server()
 -> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService> {
-    let service = KrishivFlightSqlService::with_host(
-        FlightExecutionHost::from_env().expect("flight host"),
-    );
-    arrow_flight::flight_service_server::FlightServiceServer::new(
-        configure_flight_auth_from_env(service),
-    )
+    let service =
+        KrishivFlightSqlService::with_host(FlightExecutionHost::from_env().expect("flight host"));
+    arrow_flight::flight_service_server::FlightServiceServer::new(configure_flight_auth_from_env(
+        service,
+    ))
 }
 
 /// Attach auth from `KRISHIV_API_KEYS` when configured; fail in production when absent.
-fn configure_flight_auth_from_env(
-    mut service: KrishivFlightSqlService,
-) -> KrishivFlightSqlService {
+fn configure_flight_auth_from_env(mut service: KrishivFlightSqlService) -> KrishivFlightSqlService {
     match auth_provider_from_env() {
         Ok(Some(auth)) => service.with_auth(auth),
         Ok(None) => service,
@@ -775,7 +754,8 @@ fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
         Ok(v) if !v.trim().is_empty() => v,
         _ if krishiv_common::profile_requires_authenticated_flight(
             krishiv_common::resolve_durability_profile(),
-        ) => {
+        ) =>
+        {
             return Err(String::from(
                 "KRISHIV_API_KEYS is required under durable profiles (format: key1=user:reader,...)",
             ));
@@ -791,9 +771,9 @@ fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
         let (key, rest) = part
             .split_once('=')
             .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry: {part}"))?;
-        let (subject, role_str) = rest
-            .split_once(':')
-            .ok_or_else(|| format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}"))?;
+        let (subject, role_str) = rest.split_once(':').ok_or_else(|| {
+            format!("invalid KRISHIV_API_KEYS entry (need key=user:role): {part}")
+        })?;
         let role = match role_str.trim().to_ascii_lowercase().as_str() {
             "reader" => Role::Reader,
             "writer" | "admin" => Role::Admin,

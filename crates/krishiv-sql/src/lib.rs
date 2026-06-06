@@ -38,6 +38,7 @@ pub use cep_sql::{
 };
 pub use lakehouse::{AsOfTableRef, MergeResult, MergeTargetUnsupportedError, preprocess_as_of_sql};
 pub use policy::PolicyEnforcingSqlEngine;
+pub use streaming::{ContinuousInputError, ContinuousTableInput};
 
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
@@ -114,9 +115,15 @@ pub enum SqlError {
     /// The requested SQL feature is not available in R1.
     #[error("unsupported SQL feature: {feature}")]
     Unsupported { feature: String },
+    /// A table-function declaration or runtime registration was invalid.
+    #[error("invalid table function: {message}")]
+    InvalidTableFunction { message: String },
     /// DataFusion returned an error.
     #[error("DataFusion error: {message}")]
     DataFusion { message: String },
+    /// Krishiv logical-plan optimization failed.
+    #[error(transparent)]
+    Optimizer(#[from] krishiv_optimizer::OptimizerError),
     /// Access denied by auth or policy check.
     #[error("access denied: {reason}")]
     AccessDenied { reason: String },
@@ -214,6 +221,8 @@ pub struct SqlEngine {
     /// Table names registered as unbounded streaming sources.
     /// Wrapped in `Arc<RwLock<>>` so that Session clones share the same set.
     streaming_sources: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Serializes streaming table name validation and catalog registration.
+    streaming_registration: Arc<Mutex<()>>,
     /// `true` once any streaming source has been registered.  Checked with a
     /// relaxed atomic load before acquiring `streaming_sources` so that the
     /// common case (no streaming sources, pure batch workload) avoids both the
@@ -351,6 +360,7 @@ impl SqlEngine {
             view_registry: None,
             udf_registry: None,
             streaming_sources,
+            streaming_registration: Arc::new(Mutex::new(())),
             has_streaming_sources: Arc::new(AtomicBool::new(false)),
             udf_limits: None,
             udf_registry_version: Arc::new(AtomicU64::new(0)),
@@ -359,13 +369,13 @@ impl SqlEngine {
         })
     }
 
-    /// Mark a table name as a bounded streaming source, returning a sender to push batches into it.
+    /// Register an unbounded continuous table, returning its typed input.
     ///
-    /// The returned sender is a `tokio::sync::mpsc::Sender` with capacity
+    /// The returned input uses a bounded channel with capacity
     /// [`crate::streaming::CONTINUOUS_TABLE_CHANNEL_CAPACITY`]. When the
     /// consumer (the DataFusion query plan) is slower than the producer,
-    /// `Sender::send(...).await` will backpressure (block) the producer,
-    /// and `Sender::try_send(...)` will return `TrySendError::Full`
+    /// `ContinuousTableInput::send(...).await` backpressures the producer,
+    /// and `ContinuousTableInput::try_send(...)` returns a resource error
     /// rather than growing memory without limit. Use
     /// [`register_streaming_table_with_capacity`] for a non-default
     /// capacity.
@@ -373,24 +383,22 @@ impl SqlEngine {
         &self,
         name: &str,
         schema: arrow::datatypes::SchemaRef,
-    ) -> SqlResult<tokio::sync::mpsc::Sender<RecordBatch>> {
-        let (table, tx) = crate::streaming::create_continuous_table(schema).map_err(|e| {
+    ) -> SqlResult<Arc<ContinuousTableInput>> {
+        let _registration = self.lock_streaming_registration()?;
+        self.validate_new_streaming_table(name, &schema)?;
+        let (table, input) = crate::streaming::create_continuous_table(schema).map_err(|e| {
             SqlError::DataFusion {
                 message: e.to_string(),
             }
         })?;
-        self.context
-            .register_table(name, table)
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?;
+        self.register_new_streaming_provider(name, table)?;
         self.streaming_sources
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string());
         self.has_streaming_sources.store(true, Ordering::Release);
         self.invalidate_plan_cache();
-        Ok(tx)
+        Ok(input)
     }
 
     /// Same as [`Self::register_streaming_table`] but with a caller-supplied
@@ -402,23 +410,85 @@ impl SqlEngine {
         name: &str,
         schema: arrow::datatypes::SchemaRef,
         capacity: usize,
-    ) -> SqlResult<tokio::sync::mpsc::Sender<RecordBatch>> {
-        let (table, tx) = crate::streaming::create_continuous_table_with_capacity(schema, capacity)
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?;
-        self.context
-            .register_table(name, table)
-            .map_err(|e| SqlError::DataFusion {
-                message: e.to_string(),
-            })?;
+    ) -> SqlResult<Arc<ContinuousTableInput>> {
+        let _registration = self.lock_streaming_registration()?;
+        self.validate_new_streaming_table(name, &schema)?;
+        let (table, input) = crate::streaming::create_continuous_table_with_capacity(
+            schema, capacity,
+        )
+        .map_err(|e| SqlError::DataFusion {
+            message: e.to_string(),
+        })?;
+        self.register_new_streaming_provider(name, table)?;
         self.streaming_sources
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string());
         self.has_streaming_sources.store(true, Ordering::Release);
         self.invalidate_plan_cache();
-        Ok(tx)
+        Ok(input)
+    }
+
+    fn lock_streaming_registration(&self) -> SqlResult<std::sync::MutexGuard<'_, ()>> {
+        self.streaming_registration
+            .lock()
+            .map_err(|error| SqlError::DataFusion {
+                message: format!("streaming table registration lock poisoned: {error}"),
+            })
+    }
+
+    fn validate_new_streaming_table(
+        &self,
+        name: &str,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> SqlResult<()> {
+        if name.trim().is_empty() {
+            return Err(SqlError::EmptyTableName);
+        }
+        if schema.fields().is_empty() {
+            return Err(SqlError::DataFusion {
+                message: "streaming table schema must contain at least one field".into(),
+            });
+        }
+        if self
+            .context
+            .table_exist(name)
+            .map_err(|error| SqlError::DataFusion {
+                message: error.to_string(),
+            })?
+        {
+            return Err(SqlError::DataFusion {
+                message: format!("table '{name}' is already registered"),
+            });
+        }
+        Ok(())
+    }
+
+    fn register_new_streaming_provider(
+        &self,
+        name: &str,
+        table: Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> SqlResult<()> {
+        let previous =
+            self.context
+                .register_table(name, table)
+                .map_err(|error| SqlError::DataFusion {
+                    message: error.to_string(),
+                })?;
+        if let Some(previous) = previous {
+            self.context
+                .register_table(name, previous)
+                .map_err(|error| SqlError::DataFusion {
+                    message: format!(
+                        "table '{name}' was concurrently registered and could not be restored: \
+                         {error}"
+                    ),
+                })?;
+            return Err(SqlError::DataFusion {
+                message: format!("table '{name}' was concurrently registered"),
+            });
+        }
+        Ok(())
     }
 
     /// Register a live Kafka/Redpanda topic as an unbounded streaming table.
@@ -629,9 +699,11 @@ impl SqlEngine {
 
     /// Register a table UDF backed by a Rust closure.
     ///
-    /// The closure receives the arguments passed by the SQL caller (as
-    /// `ScalarValue` literals; non-literal args are `ScalarValue::Null`) and
-    /// returns an Arrow `RecordBatch`.  `schema` describes the output columns.
+    /// The closure receives literal arguments passed by the SQL caller as
+    /// `ScalarValue` values and returns an Arrow `RecordBatch`. Non-literal
+    /// arguments are rejected because they cannot be evaluated safely at the
+    /// synchronous DataFusion table-function boundary. `schema` describes the
+    /// output columns.
     ///
     /// # Example
     /// ```ignore
@@ -640,7 +712,7 @@ impl SqlEngine {
     ///     Schema::new(vec![Field::new("n", DataType::Int64, false)]),
     ///     |args| {
     ///         let count = match args.first() {
-    ///             Some(ScalarValue::Int32(n)) => *n as i64,
+    ///             Some(ScalarValue::Int64(n)) => *n,
     ///             _ => 10,
     ///         };
     ///         let arr = Int64Array::from((0..count).collect::<Vec<_>>());
@@ -659,28 +731,18 @@ impl SqlEngine {
         + Sync
         + 'static,
     ) -> SqlResult<()> {
-        let stub =
-            create_function_ddl::StubTableUdf::from_ddl(&create_function_ddl::CreateFunctionDdl {
-                function_name: name.into(),
-                return_columns: schema
-                    .fields()
-                    .iter()
-                    .map(|f| create_function_ddl::ColumnDef {
-                        name: f.name().clone(),
-                        data_type: f.data_type().clone(),
-                    })
-                    .collect(),
-                language: None,
-                body: None,
-            })
-            .with_body_fn(std::sync::Arc::new(f));
+        let udf =
+            create_function_ddl::ClosureTableUdf::try_new(name, schema, std::sync::Arc::new(f))
+                .map_err(|error| SqlError::InvalidTableFunction {
+                    message: error.to_string(),
+                })?;
         if let Some(registry) = &self.udf_registry {
             let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
-            guard.register_table(std::sync::Arc::new(stub.clone()));
+            guard.register_table(std::sync::Arc::new(udf.clone()));
         }
-        udf::register_single_table_udf(&self.context, std::sync::Arc::new(stub))
+        udf::register_single_table_udf(&self.context, std::sync::Arc::new(udf))
             .map_err(SqlError::from)
     }
 
@@ -787,17 +849,43 @@ impl SqlEngine {
         &self,
         limits: krishiv_udf::ResourceLimits,
     ) -> SqlResult<()> {
+        self.sync_scalar_udfs_with_limits_for_profile(
+            limits,
+            krishiv_common::resolve_durability_profile(),
+        )
+        .await
+    }
+
+    /// Register scalar UDFs using a caller-resolved durability profile.
+    pub async fn sync_scalar_udfs_with_limits_for_profile(
+        &self,
+        limits: krishiv_udf::ResourceLimits,
+        profile: krishiv_common::DurabilityProfile,
+    ) -> SqlResult<()> {
+        self.sync_scalar_udfs_with_limits_for_policy(
+            limits,
+            krishiv_common::NativeScalarUdfPolicy::resolve(profile),
+        )
+        .await
+    }
+
+    /// Register scalar UDFs using a caller-snapshotted policy decision.
+    pub async fn sync_scalar_udfs_with_limits_for_policy(
+        &self,
+        limits: krishiv_udf::ResourceLimits,
+        policy: krishiv_common::NativeScalarUdfPolicy,
+    ) -> SqlResult<()> {
         let Some(registry) = &self.udf_registry else {
             return Ok(());
         };
         let guard = registry.read().map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
         })?;
-        udf::sync_scalar_udfs_with_limits(&self.context, &guard, limits).map_err(|e| {
-            SqlError::DataFusion {
+        udf::sync_scalar_udfs_with_limits_for_policy(&self.context, &guard, limits, policy).map_err(
+            |e| SqlError::DataFusion {
                 message: e.to_string(),
-            }
-        })
+            },
+        )
     }
 
     /// Register aggregate UDFs from the attached registry (P1-21).
@@ -984,44 +1072,51 @@ impl SqlEngine {
         }
 
         // ── Intercept CREATE FUNCTION … RETURNS TABLE ────────────────────────
-        // DataFusion does not understand this extended DDL syntax.  Parse it
-        // here, register a stub UDTF, and return a trivial empty DataFrame so
-        // callers see a successful DDL result rather than a parse error.
+        // DataFusion does not understand this extended DDL syntax. Parse and
+        // register only executable LANGUAGE SQL definitions; unsupported
+        // languages fail before any registry mutation.
         if create_function_ddl::is_create_function_returns_table(query) {
             let ddl = create_function_ddl::parse_create_function(query)
-                .map_err(|e| SqlError::DataFusion { message: e })?;
-            let is_sql_body = ddl.language.as_deref() == Some("sql") && ddl.body.is_some();
-            let udf: std::sync::Arc<dyn krishiv_udf::TableUdf> = if is_sql_body {
-                // LANGUAGE sql AS '…': register an executable UDF backed by the body.
-                let body = ddl.body.as_deref().unwrap_or_default();
-                let fields: Vec<_> = ddl
-                    .return_columns
-                    .iter()
-                    .map(|c| arrow::datatypes::Field::new(&c.name, c.data_type.clone(), true))
-                    .collect();
-                let schema = arrow::datatypes::Schema::new(fields);
-                std::sync::Arc::new(create_function_ddl::SqlBodyTableUdf::new(
+                .map_err(|message| SqlError::InvalidTableFunction { message })?;
+            if ddl.language.as_deref() != Some("sql") {
+                return Err(SqlError::Unsupported {
+                    feature: format!(
+                        "CREATE FUNCTION '{}' uses language {:?}; only LANGUAGE SQL AS '...' \
+                         table functions are executable",
+                        ddl.function_name, ddl.language
+                    ),
+                });
+            }
+            let body = ddl
+                .body
+                .as_deref()
+                .filter(|body| !body.trim().is_empty())
+                .ok_or_else(|| SqlError::InvalidTableFunction {
+                    message: format!(
+                        "SQL table function '{}' requires a non-empty AS body",
+                        ddl.function_name
+                    ),
+                })?;
+            let fields: Vec<_> = ddl
+                .return_columns
+                .iter()
+                .map(|column| {
+                    arrow::datatypes::Field::new(&column.name, column.data_type.clone(), true)
+                })
+                .collect();
+            let schema = arrow::datatypes::Schema::new(fields);
+            let udf: std::sync::Arc<dyn krishiv_udf::TableUdf> = std::sync::Arc::new(
+                create_function_ddl::SqlBodyTableUdf::try_new(
                     &ddl.function_name,
                     schema,
                     body,
+                    ddl.arguments.len(),
                     std::sync::Arc::new(self.context.clone()),
-                ))
-            } else {
-                if krishiv_common::profile_forbids_udtf_stubs(
-                    krishiv_common::resolve_durability_profile(),
-                ) {
-                    return Err(SqlError::DataFusion {
-                        message: format!(
-                            "CREATE FUNCTION '{}' with language {:?} is not supported under \
-                             durable profiles; only LANGUAGE sql AS '...' table functions are allowed",
-                            ddl.function_name, ddl.language
-                        ),
-                    });
-                }
-                // Other languages: register a stub so the schema resolves at plan time,
-                // but calling the function will produce a clear error.
-                std::sync::Arc::new(create_function_ddl::StubTableUdf::from_ddl(&ddl))
-            };
+                )
+                .map_err(|error| SqlError::InvalidTableFunction {
+                    message: error.to_string(),
+                })?,
+            );
             if let Some(registry) = &self.udf_registry {
                 let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
@@ -1030,9 +1125,6 @@ impl SqlEngine {
             }
             udf::register_single_table_udf(&self.context, std::sync::Arc::clone(&udf))
                 .map_err(SqlError::from)?;
-            // DDL always succeeds — the stub is registered for planning.
-            // LANGUAGE sql: the body executes at call time.
-            // Other languages: calling the function returns a clear "not implemented" error.
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(SqlDataFrame::new("create-function", empty).with_query(query));
         }
@@ -1353,7 +1445,7 @@ pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan> {
 
     if let Some(stmt) = cep_sql::parse_match_recognize(&query)? {
         let logical_plan = cep_sql::plan_match_recognize(stmt, &query);
-        let optimized = Optimizer::default().optimize(logical_plan);
+        let optimized = Optimizer::default().optimize(logical_plan)?;
         return Ok(SqlPlan {
             query,
             logical_plan: optimized.plan,
@@ -1367,7 +1459,7 @@ pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan> {
             ExecutionKind::Batch,
         ));
 
-    let optimized = Optimizer::default().optimize(logical_plan);
+    let optimized = Optimizer::default().optimize(logical_plan)?;
     Ok(SqlPlan {
         query,
         logical_plan: optimized.plan,
@@ -1386,7 +1478,7 @@ pub fn explain_sql(query: impl Into<String>) -> SqlResult<String> {
 /// summary to the plan description.
 pub fn explain_sql_optimized(query: impl Into<String>, optimizer: &Optimizer) -> SqlResult<String> {
     let plan = plan_sql(query)?;
-    let result = optimizer.optimize(plan.logical_plan().clone());
+    let result = optimizer.optimize(plan.logical_plan().clone())?;
     let mut output = result.plan.describe();
     let optimizer_line = result.describe();
     output.push('\n');
@@ -1910,30 +2002,41 @@ mod udf_sql_tests {
 
 #[cfg(test)]
 mod udtf_ddl_tests {
-    use super::SqlEngine;
+    use std::sync::Arc;
 
-    /// All `CREATE FUNCTION … RETURNS TABLE` DDL succeeds — the stub is registered
-    /// for plan-time schema resolution regardless of language. Execution errors for
-    /// non-SQL languages are deferred to call time.
+    use super::{SqlEngine, SqlError};
+    use arrow::array::{BooleanArray, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
     #[tokio::test]
-    async fn create_function_returns_table_ddl_always_succeeds() {
-        let engine = SqlEngine::new();
+    async fn create_function_returns_table_rejects_unsupported_languages() {
+        let registry = Arc::new(std::sync::RwLock::new(krishiv_udf::UdfRegistry::new()));
+        let engine = SqlEngine::new().with_udf_registry(Arc::clone(&registry));
 
-        // Non-SQL language: DDL registers stub, returns empty DataFrame.
         let rust_result = engine
             .sql(
                 "CREATE FUNCTION my_udtf(arg1 INT) \
                  RETURNS TABLE (col1 TEXT, col2 BIGINT) \
                  LANGUAGE RUST \
-                 AS 'fn stub() {}'",
+                 AS 'fn body() {}'",
             )
-            .await;
+            .await
+            .expect_err("unsupported language must fail before registration");
         assert!(
-            rust_result.is_ok(),
-            "LANGUAGE RUST DDL should succeed, got {rust_result:?}"
+            matches!(rust_result, SqlError::Unsupported { .. }),
+            "unexpected error: {rust_result}"
         );
+        assert!(
+            engine.sql("SELECT * FROM my_udtf(1)").await.is_err(),
+            "failed DDL must not leave a schema-only function registered"
+        );
+        assert!(registry.read().unwrap().table_names().is_empty());
+    }
 
-        // SQL language: inline body registered, also returns empty DataFrame on DDL.
+    #[tokio::test]
+    async fn create_function_returns_table_registers_sql_body() {
+        let engine = SqlEngine::new();
+
         let sql_result = engine
             .sql(
                 "CREATE FUNCTION greet(name TEXT) \
@@ -1946,6 +2049,174 @@ mod udtf_ddl_tests {
             sql_result.is_ok(),
             "LANGUAGE SQL DDL should succeed, got {sql_result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_function_returns_table_rejects_incomplete_sql_definition() {
+        let engine = SqlEngine::new();
+
+        let missing_language = engine
+            .sql(
+                "CREATE FUNCTION no_language() \
+                 RETURNS TABLE (value BIGINT) \
+                 AS 'SELECT 1 AS value'",
+            )
+            .await
+            .expect_err("language must be explicit");
+        assert!(matches!(missing_language, SqlError::Unsupported { .. }));
+
+        let missing_body = engine
+            .sql(
+                "CREATE FUNCTION no_body() \
+                 RETURNS TABLE (value BIGINT) \
+                 LANGUAGE SQL",
+            )
+            .await
+            .expect_err("SQL UDTF body must be required");
+        assert!(matches!(
+            missing_body,
+            SqlError::InvalidTableFunction { .. }
+        ));
+
+        let empty_output = engine
+            .sql(
+                "CREATE FUNCTION no_columns() \
+                 RETURNS TABLE () \
+                 LANGUAGE SQL AS 'SELECT 1'",
+            )
+            .await
+            .expect_err("UDTF output schema must not be empty");
+        assert!(matches!(
+            empty_output,
+            SqlError::InvalidTableFunction { .. }
+        ));
+    }
+
+    #[test]
+    fn closure_table_udf_registration_validates_definition() {
+        let engine = SqlEngine::new();
+        let error = engine
+            .register_table_udf_fn("", Schema::empty(), |_| {
+                unreachable!("invalid definition must fail before body registration")
+            })
+            .expect_err("invalid closure UDTF must fail");
+        assert!(matches!(error, SqlError::InvalidTableFunction { .. }));
+
+        let duplicate_columns = engine
+            .register_table_udf_fn(
+                "duplicates",
+                Schema::new(vec![
+                    Field::new("value", DataType::Int64, false),
+                    Field::new("value", DataType::Int64, false),
+                ]),
+                |_| unreachable!("invalid definition must fail before body registration"),
+            )
+            .expect_err("duplicate output names must fail");
+        assert!(matches!(
+            duplicate_columns,
+            SqlError::InvalidTableFunction { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_body_udtf_rejects_declared_schema_mismatch() {
+        let engine = SqlEngine::new();
+        engine
+            .sql(
+                "CREATE FUNCTION wrong_schema() \
+                 RETURNS TABLE (value BIGINT) \
+                 LANGUAGE SQL AS 'SELECT ''text'' AS value'",
+            )
+            .await
+            .expect("definition itself is syntactically valid");
+
+        let error = engine
+            .sql("SELECT * FROM wrong_schema()")
+            .await
+            .expect_err("runtime schema mismatch must fail");
+        assert!(error.to_string().contains("returned schema"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_body_udtf_binds_literal_arguments() {
+        let engine = SqlEngine::new();
+        engine
+            .sql(
+                "CREATE FUNCTION echo_args(n BIGINT, text TEXT, enabled BOOLEAN) \
+                 RETURNS TABLE (next_n BIGINT, echoed TEXT, flag BOOLEAN) \
+                 LANGUAGE SQL \
+                 AS 'SELECT $1 + 1 AS next_n, $2 AS echoed, $3 AS flag'",
+            )
+            .await
+            .expect("function registration should succeed");
+
+        let batches = engine
+            .sql("SELECT * FROM echo_args(41, 'O''Reilly', TRUE)")
+            .await
+            .expect("table function planning should succeed")
+            .collect()
+            .await
+            .expect("table function execution should succeed");
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let next_n = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("next_n should be Int64");
+        let echoed = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("echoed should be Utf8");
+        let flag = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("flag should be Boolean");
+        assert_eq!(next_n.value(0), 42);
+        assert_eq!(echoed.value(0), "O'Reilly");
+        assert!(flag.value(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sql_body_udtf_rejects_wrong_arity_and_non_literal_arguments() {
+        let engine = SqlEngine::new();
+        let invalid_placeholder = engine
+            .sql(
+                "CREATE FUNCTION invalid_placeholder(n BIGINT) \
+                 RETURNS TABLE (value BIGINT) \
+                 LANGUAGE SQL AS 'SELECT $2 AS value'",
+            )
+            .await
+            .expect_err("out-of-range placeholders must fail during registration");
+        assert!(
+            invalid_placeholder
+                .to_string()
+                .contains("no matching argument")
+        );
+
+        engine
+            .sql(
+                "CREATE FUNCTION one_arg(n BIGINT) \
+                 RETURNS TABLE (value BIGINT) \
+                 LANGUAGE SQL AS 'SELECT $1 AS value'",
+            )
+            .await
+            .expect("function registration should succeed");
+
+        let wrong_arity = engine
+            .sql("SELECT * FROM one_arg()")
+            .await
+            .expect_err("wrong arity must fail");
+        assert!(wrong_arity.to_string().contains("expects 1 arguments"));
+
+        let non_literal = engine
+            .sql("SELECT * FROM one_arg(20 + 22)")
+            .await
+            .expect_err("computed arguments must fail closed");
+        assert!(non_literal.to_string().contains("must be scalar literals"));
     }
 
     // ── Streaming source registration (broker-free path) ─────────────────────

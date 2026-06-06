@@ -219,6 +219,7 @@ impl CheckpointCoordinator {
                 self.job_id, ack.epoch
             ));
         }
+        self.validate_ack_contract(&ack, current_epoch)?;
         // Fencing token check: must exactly match the current leader's token.
         // Reject both older and newer tokens (prevents split-brain from stale or
         // future-generation coordinators after failover / network partition).
@@ -267,6 +268,7 @@ impl CheckpointCoordinator {
                 self.job_id, ack.epoch
             ));
         }
+        self.validate_ack_contract(&ack, current_epoch)?;
         if ack.fencing_token != self.fencing_token {
             return Err(format!(
                 "stale fencing token in ack for job {}: expected {}, got {}",
@@ -285,6 +287,33 @@ impl CheckpointCoordinator {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn validate_ack_contract(
+        &self,
+        ack: &CheckpointAckRequest,
+        current_epoch: u64,
+    ) -> Result<(), String> {
+        if ack.job_id != self.job_id {
+            return Err(format!(
+                "checkpoint ack job_id {} does not match coordinator job_id {}",
+                ack.job_id, self.job_id
+            ));
+        }
+        if let Some(snapshot_path) = &ack.snapshot_path {
+            let expected = krishiv_checkpoint::snapshot_path(
+                self.job_id.as_str(),
+                current_epoch,
+                &ack.operator_id,
+                ack.task_id.as_str(),
+            );
+            if snapshot_path != &expected {
+                return Err(format!(
+                    "checkpoint ack snapshot path {snapshot_path} does not match expected path {expected}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Extract commit data from in-memory state (no I/O).  Called under the
@@ -371,8 +400,6 @@ impl CheckpointCoordinator {
         let job_id = &commit.job_id;
         let metadata = &commit.metadata;
 
-        write_epoch_metadata_async(commit.storage.as_ref(), job_id, epoch, metadata).await?;
-
         // Build manifest: hash metadata.json + each snapshot file.
         let mut manifest = IntegrityManifest::new();
         let meta_json = serde_json::to_vec_pretty(metadata).map_err(|e| {
@@ -393,8 +420,18 @@ impl CheckpointCoordinator {
             {
                 let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
                 manifest.insert_bytes(&rel_path, &bytes);
+            } else {
+                return Err(krishiv_checkpoint::CheckpointError::Corrupt {
+                    epoch,
+                    message: format!(
+                        "snapshot {} referenced by checkpoint ack is missing",
+                        snap_ref.snapshot_path
+                    ),
+                });
             }
         }
+
+        write_epoch_metadata_async(commit.storage.as_ref(), job_id, epoch, metadata).await?;
         write_manifest_async(commit.storage.as_ref(), job_id, epoch, &manifest).await?;
 
         write_epoch_hint_async(commit.storage.as_ref(), job_id, epoch).await?;
@@ -426,12 +463,79 @@ impl CheckpointCoordinator {
     ///
     /// Call this under the coordinator write lock **after**
     /// [`Self::commit_storage`] completes.
-    pub fn finalize_commit(&mut self, epoch: u64) {
+    pub fn finalize_commit(&mut self, epoch: u64) -> CheckpointResult<()> {
+        match &self.state {
+            CheckpointCoordinatorState::Committing {
+                epoch: committing_epoch,
+            } if *committing_epoch == epoch => {}
+            CheckpointCoordinatorState::Committing {
+                epoch: committing_epoch,
+            } => {
+                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                    message: format!(
+                        "cannot finalize checkpoint epoch {epoch} for job {}: \
+                         coordinator is committing epoch {committing_epoch}",
+                        self.job_id
+                    ),
+                });
+            }
+            state => {
+                return Err(krishiv_checkpoint::CheckpointError::Storage {
+                    message: format!(
+                        "cannot finalize checkpoint epoch {epoch} for job {}: \
+                         coordinator state is {state:?}",
+                        self.job_id
+                    ),
+                });
+            }
+        }
         self.state = CheckpointCoordinatorState::Committed { epoch };
         self.pending_is_savepoint = false;
         self.pending_savepoint_label = None;
         self.awaiting_elapsed_ms = 0;
         self.pending_commit = None;
+        Ok(())
+    }
+
+    /// Activate a validated checkpoint restore as this job's committed epoch.
+    ///
+    /// `active_fencing_token` should be the live leader-election token when
+    /// available.  Restore accepts metadata from prior coordinator instances,
+    /// but future barrier acks must use the current owner token rather than the
+    /// older token stored in checkpoint metadata.
+    pub fn activate_restored_epoch(
+        &mut self,
+        metadata: &CheckpointMetadata,
+        active_fencing_token: Option<u64>,
+    ) -> CheckpointResult<()> {
+        metadata.validate()?;
+        if metadata.job_id != self.job_id.as_str() {
+            return Err(krishiv_checkpoint::CheckpointError::Corrupt {
+                epoch: metadata.epoch,
+                message: format!(
+                    "checkpoint metadata job_id {} does not match coordinator job_id {}",
+                    metadata.job_id, self.job_id
+                ),
+            });
+        }
+
+        let token = active_fencing_token.unwrap_or(metadata.fencing_token);
+        self.fencing_token = FencingToken::try_new(token).map_err(|error| {
+            krishiv_checkpoint::CheckpointError::Storage {
+                message: format!("invalid active fencing token {token}: {error}"),
+            }
+        })?;
+        self.current_epoch = metadata.epoch;
+        self.pending_acks.clear();
+        self.pending_is_savepoint = false;
+        self.pending_savepoint_label = None;
+        self.pending_commit = None;
+        self.elapsed_ms = 0;
+        self.awaiting_elapsed_ms = 0;
+        self.state = CheckpointCoordinatorState::Committed {
+            epoch: metadata.epoch,
+        };
+        Ok(())
     }
 
     /// Commit the current epoch: write metadata + manifest to storage.
@@ -503,13 +607,6 @@ impl CheckpointCoordinator {
                 message: format!("fencing token mismatch for job {}: {e}", self.job_id),
             })?;
 
-        write_epoch_metadata(
-            self.storage.as_ref(),
-            self.job_id.as_str(),
-            epoch,
-            &metadata,
-        )?;
-
         // Build manifest: hash metadata.json + each snapshot file.
         let mut manifest = IntegrityManifest::new();
         let meta_json = serde_json::to_vec_pretty(&metadata).map_err(|e| {
@@ -529,8 +626,23 @@ impl CheckpointCoordinator {
                 // The manifest key is the path relative to the epoch dir.
                 let rel_path = format!("{}/{}/state.bin", snap_ref.operator_id, snap_ref.task_id);
                 manifest.insert_bytes(&rel_path, &bytes);
+            } else {
+                return Err(krishiv_checkpoint::CheckpointError::Corrupt {
+                    epoch,
+                    message: format!(
+                        "snapshot {} referenced by checkpoint ack is missing",
+                        snap_ref.snapshot_path
+                    ),
+                });
             }
         }
+
+        write_epoch_metadata(
+            self.storage.as_ref(),
+            self.job_id.as_str(),
+            epoch,
+            &metadata,
+        )?;
         write_manifest(
             self.storage.as_ref(),
             self.job_id.as_str(),
@@ -586,10 +698,7 @@ impl CheckpointCoordinator {
 
         Self::commit_storage(commit).await?;
 
-        self.state = CheckpointCoordinatorState::Committed { epoch };
-        self.pending_is_savepoint = false;
-        self.pending_savepoint_label = None;
-        self.awaiting_elapsed_ms = 0;
+        self.finalize_commit(epoch)?;
         Ok(epoch)
     }
 
@@ -815,7 +924,7 @@ mod tests {
         // Storage I/O and finalisation happen in separate steps.
         let commit = coord.take_pending_commit().expect("pending commit");
         CheckpointCoordinator::commit_storage(commit).await.unwrap();
-        coord.finalize_commit(1);
+        coord.finalize_commit(1).unwrap();
 
         let meta =
             krishiv_checkpoint::read_epoch_metadata_async(storage.as_ref(), "job-async-ck", 1)
@@ -826,6 +935,72 @@ mod tests {
         assert_eq!(
             coord.coordinator_state(),
             &CheckpointCoordinatorState::Committed { epoch: 1 }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_commit_rejects_mismatched_epoch_without_state_change() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-finalize-guard").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord.initiate().unwrap();
+
+        let ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
+        assert!(coord.receive_ack_async(ack).await.unwrap());
+        assert_eq!(
+            coord.coordinator_state(),
+            &CheckpointCoordinatorState::Committing { epoch: 1 }
+        );
+
+        let error = coord
+            .finalize_commit(2)
+            .expect_err("mismatched finalize epoch must be rejected");
+        assert!(
+            error.to_string().contains("committing epoch 1"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            coord.coordinator_state(),
+            &CheckpointCoordinatorState::Committing { epoch: 1 },
+            "failed finalize must leave committing epoch unchanged"
+        );
+        assert!(
+            coord.pending_commit.is_some(),
+            "failed finalize must not discard the pending commit"
+        );
+
+        coord.finalize_commit(1).unwrap();
+        assert_eq!(
+            coord.coordinator_state(),
+            &CheckpointCoordinatorState::Committed { epoch: 1 }
+        );
+    }
+
+    #[test]
+    fn checkpoint_inner_finalize_ack_rejects_mismatched_epoch() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-inner-finalize-guard").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord.state = CheckpointCoordinatorState::Committing { epoch: 1 };
+
+        let mut inner = crate::coordinator_sharded::CheckpointInner::new();
+        inner.coordinators.insert(job_id.clone(), coord);
+
+        let error = inner
+            .finalize_ack(&job_id, 2)
+            .expect_err("checkpoint inner must reject mismatched finalize epoch");
+        assert!(
+            error.to_string().contains("committing epoch 1"),
+            "unexpected error: {error}"
+        );
+        let coord = inner.coordinators.get(&job_id).unwrap();
+        assert_eq!(
+            coord.coordinator_state(),
+            &CheckpointCoordinatorState::Committing { epoch: 1 }
         );
     }
 
@@ -859,6 +1034,141 @@ mod tests {
             result.is_err(),
             "ack with stale fencing token must be rejected"
         );
+    }
+
+    #[test]
+    fn receive_ack_rejects_mismatched_job_id() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ack-contract").unwrap();
+        let other_job_id = JobId::try_new("job-other").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord.initiate().unwrap();
+
+        let ack = make_ack(&other_job_id, "task-1", 1, coord.fencing_token());
+        let error = coord
+            .receive_ack(ack)
+            .expect_err("ack for another job must be rejected");
+
+        assert!(
+            error.contains("does not match coordinator job_id"),
+            "unexpected error: {error}"
+        );
+        assert!(matches!(
+            coord.coordinator_state(),
+            CheckpointCoordinatorState::AwaitingAcks { epoch: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn receive_ack_rejects_noncanonical_snapshot_path() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-ack-path").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord.initiate().unwrap();
+
+        let mut ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
+        ack.snapshot_path = Some("/tmp/not-a-checkpoint-snapshot".to_owned());
+        let error = coord
+            .receive_ack(ack)
+            .expect_err("noncanonical snapshot path must be rejected");
+
+        assert!(error.contains("snapshot path"), "unexpected error: {error}");
+        assert!(
+            krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-ack-path", 1)
+                .unwrap()
+                .is_none(),
+            "invalid ack must not write checkpoint metadata"
+        );
+    }
+
+    #[test]
+    fn receive_ack_rejects_missing_snapshot_without_sealing_epoch() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-missing-snapshot").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord.initiate().unwrap();
+
+        let mut ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
+        ack.snapshot_path = Some(krishiv_checkpoint::snapshot_path(
+            "job-missing-snapshot",
+            1,
+            "op-task-1",
+            "task-1",
+        ));
+        let error = coord
+            .receive_ack(ack)
+            .expect_err("missing snapshot file must reject commit");
+
+        assert!(error.contains("missing"), "unexpected error: {error}");
+        assert!(
+            krishiv_checkpoint::read_epoch_metadata(storage.as_ref(), "job-missing-snapshot", 1)
+                .unwrap()
+                .is_none(),
+            "missing snapshot must fail before metadata is written"
+        );
+        assert!(
+            !krishiv_checkpoint::validate_epoch(storage.as_ref(), "job-missing-snapshot", 1)
+                .unwrap()
+        );
+        assert!(matches!(
+            krishiv_checkpoint::latest_valid_epoch(storage.as_ref(), "job-missing-snapshot"),
+            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_commit_storage_rejects_missing_snapshot_without_sealing_epoch() {
+        let storage: Arc<dyn krishiv_checkpoint::CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let job_id = JobId::try_new("job-async-missing-snapshot").unwrap();
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id.clone(), storage.clone(), 1000, 1);
+        coord.initiate().unwrap();
+
+        let mut ack = make_ack(&job_id, "task-1", 1, coord.fencing_token());
+        ack.snapshot_path = Some(krishiv_checkpoint::snapshot_path(
+            "job-async-missing-snapshot",
+            1,
+            "op-task-1",
+            "task-1",
+        ));
+        let done = coord.receive_ack_async(ack).await.unwrap();
+        assert!(done, "quorum should produce a pending commit");
+        let commit = coord.take_pending_commit().expect("pending commit");
+
+        let error = CheckpointCoordinator::commit_storage(commit)
+            .await
+            .expect_err("missing snapshot file must reject async storage commit");
+
+        assert!(
+            error.to_string().contains("missing"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            krishiv_checkpoint::read_epoch_metadata_async(
+                storage.as_ref(),
+                "job-async-missing-snapshot",
+                1
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "missing async snapshot must fail before metadata is written"
+        );
+        assert!(matches!(
+            krishiv_checkpoint::latest_valid_epoch_async(
+                storage.as_ref(),
+                "job-async-missing-snapshot"
+            )
+            .await,
+            Err(krishiv_checkpoint::CheckpointError::NoValidEpoch)
+        ));
     }
 
     #[test]

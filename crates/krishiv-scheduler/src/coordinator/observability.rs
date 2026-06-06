@@ -35,9 +35,7 @@ pub fn build_observability_report(
             task_details.push(ReportTask {
                 task_id: task.task_id().as_str().to_owned(),
                 state,
-                executor_id: task
-                    .assigned_executor()
-                    .map(|e| e.as_str().to_owned()),
+                executor_id: task.assigned_executor().map(|e| e.as_str().to_owned()),
                 attempt_id: task.attempt(),
                 failure_count: task.failure_count(),
                 last_failure_reason: task.last_failure_reason().map(str::to_owned),
@@ -59,8 +57,10 @@ pub fn build_observability_report(
         });
     }
 
-    let checkpoint = coordinator.checkpoint_coordinators.get(job_id).map(|coord| {
-        ReportCheckpoint {
+    let checkpoint = coordinator
+        .checkpoint_coordinators
+        .get(job_id)
+        .map(|coord| ReportCheckpoint {
             latest_epoch: coord.current_epoch(),
             fencing_token: coord.fencing_token().as_u64(),
             committed_at_ms: 0,
@@ -70,8 +70,7 @@ pub fn build_observability_report(
             savepoint_label: None,
             iceberg_snapshot_id: None,
             kafka_offsets: None,
-        }
-    });
+        });
 
     let executors = coordinator
         .executor_snapshots()
@@ -86,12 +85,8 @@ pub fn build_observability_report(
                 .ticks_since_restart
                 .saturating_sub(record.last_heartbeat_tick()),
             task_endpoint: record.descriptor().task_endpoint().map(str::to_owned),
-            memory_used_bytes: record
-                .health_snapshot()
-                .and_then(|h| h.memory_used_bytes),
-            memory_limit_bytes: record
-                .health_snapshot()
-                .and_then(|h| h.memory_limit_bytes),
+            memory_used_bytes: record.health_snapshot().and_then(|h| h.memory_used_bytes),
+            memory_limit_bytes: record.health_snapshot().and_then(|h| h.memory_limit_bytes),
         })
         .collect();
 

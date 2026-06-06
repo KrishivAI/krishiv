@@ -8,12 +8,14 @@
 
 use std::fmt;
 
+mod graph;
 pub mod lowering;
 pub mod r17;
 pub mod streaming;
 pub mod streaming_plan;
 pub mod task_fragment;
 pub mod window;
+pub use graph::lower_to_physical;
 pub use lowering::{decode_task_fragment, encode_task_fragment};
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
@@ -31,7 +33,7 @@ pub type SendableRecordBatchStream = std::pin::Pin<
 >;
 
 /// Errors returned by plan encoding, decoding, and validation operations.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
     /// Failed to parse a plan fragment or expression.
     #[error("plan parse error: {0}")]
@@ -299,6 +301,13 @@ impl PlanNode {
         self
     }
 
+    /// Replace the human-readable node label.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
     /// Set the output partitioning strategy for this node.
     #[must_use]
     pub fn with_partitioning(mut self, partitioning: Partitioning) -> Self {
@@ -404,12 +413,6 @@ impl PlanCore {
     }
 
     fn add_node(&mut self, node: PlanNode) {
-        assert!(
-            self.nodes.len() < MAX_PLAN_NODES,
-            "plan '{}' exceeds MAX_PLAN_NODES ({MAX_PLAN_NODES}); \
-             check for plan-builder loops or reduce query complexity",
-            self.name
-        );
         self.nodes.push(node);
     }
 
@@ -470,6 +473,11 @@ impl LogicalPlan {
     /// Plan nodes.
     pub fn nodes(&self) -> &[PlanNode] {
         self.core.nodes()
+    }
+
+    /// Validate node identifiers, input references, and graph acyclicity.
+    pub fn validate(&self) -> Result<(), PlanError> {
+        graph::validate_plan("logical", self.name(), self.nodes())
     }
 
     /// Compact textual description for early `EXPLAIN` output.
@@ -537,6 +545,11 @@ impl PhysicalPlan {
     /// Plan nodes.
     pub fn nodes(&self) -> &[PlanNode] {
         self.core.nodes()
+    }
+
+    /// Validate node identifiers, input references, and graph acyclicity.
+    pub fn validate(&self) -> Result<(), PlanError> {
+        graph::validate_plan("physical", self.name(), self.nodes())
     }
 
     /// Compact textual description for early `EXPLAIN` output.

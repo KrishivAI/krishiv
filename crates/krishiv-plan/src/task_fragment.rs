@@ -149,4 +149,3 @@ mod tests {
         assert!(err.to_string().contains("legacy untyped"));
     }
 }
-

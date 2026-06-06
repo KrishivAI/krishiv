@@ -7,7 +7,42 @@
 //! Query Execution) extension traits that operate on runtime statistics
 //! collected during stage execution.
 
-use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
+use std::any::Any;
+use std::collections::HashSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PhysicalPlan, PlanError, PlanNode};
+
+/// Result type for logical and adaptive optimizer pipelines.
+pub type OptimizerResult<T> = Result<T, OptimizerError>;
+
+/// Errors produced while validating or executing optimizer rules.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OptimizerError {
+    /// The optimizer received a malformed input plan.
+    #[error("invalid {optimizer} optimizer input: {source}")]
+    InvalidInput {
+        optimizer: &'static str,
+        #[source]
+        source: PlanError,
+    },
+    /// A rule returned a malformed output plan.
+    #[error("{optimizer} optimizer rule '{rule}' produced an invalid plan: {source}")]
+    InvalidRuleOutput {
+        optimizer: &'static str,
+        rule: String,
+        #[source]
+        source: PlanError,
+    },
+    /// A rule panicked while processing a plan.
+    #[error("{optimizer} optimizer rule '{rule}' panicked: {message}")]
+    RulePanicked {
+        optimizer: &'static str,
+        rule: String,
+        message: String,
+    },
+}
 
 // ── Cost model ────────────────────────────────────────────────────────────────
 
@@ -81,18 +116,6 @@ pub trait AqeRule: Send + Sync {
     fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan>;
 }
 
-/// A rule that applies streaming-specific rewrites to a [`LogicalPlan`].
-// P3.19: StreamRule has no implementations in this workspace; kept for forward
-// compatibility but suppressed from dead-code warnings.
-#[allow(dead_code)]
-pub trait StreamRule: Send + Sync {
-    /// Short, stable rule name used in explain and diagnostics output.
-    fn name(&self) -> &str;
-
-    /// Apply the streaming rewrite to `plan`.
-    fn apply(&self, plan: LogicalPlan) -> LogicalPlan;
-}
-
 /// A rule that detects skewed (hot) partitions from [`RuntimeStats`].
 ///
 /// Returns the indices of partitions whose row count or resource usage
@@ -155,27 +178,60 @@ impl Optimizer {
     ///
     /// P2.4: rules signal no-change by returning `None`, avoiding an O(rules ×
     /// plan_size) clone-per-rule cycle.
-    pub fn optimize(&self, plan: LogicalPlan) -> OptimizeResult {
+    pub fn optimize(&self, plan: LogicalPlan) -> OptimizerResult<OptimizeResult> {
+        plan.validate()
+            .map_err(|source| OptimizerError::InvalidInput {
+                optimizer: "logical",
+                source,
+            })?;
         let mut current = plan;
         let mut applied_rules = Vec::new();
 
         for rule in &self.rules {
-            if let Some(new_plan) = rule.apply(&current) {
-                applied_rules.push(rule.name().to_string());
-                current = new_plan;
+            let rule_name = rule.name().to_string();
+            let outcome =
+                catch_unwind(AssertUnwindSafe(|| rule.apply(&current))).map_err(|payload| {
+                    OptimizerError::RulePanicked {
+                        optimizer: "logical",
+                        rule: rule_name.clone(),
+                        message: panic_payload_message(payload),
+                    }
+                })?;
+            if let Some(new_plan) = outcome {
+                new_plan
+                    .validate()
+                    .map_err(|source| OptimizerError::InvalidRuleOutput {
+                        optimizer: "logical",
+                        rule: rule_name.clone(),
+                        source,
+                    })?;
+                if new_plan != current {
+                    applied_rules.push(rule_name);
+                    current = new_plan;
+                }
             }
         }
 
-        OptimizeResult {
+        Ok(OptimizeResult {
             plan: current,
             applied_rules,
-        }
+        })
     }
 }
 
 impl Default for Optimizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -318,12 +374,16 @@ impl CoalesceRule {
     ///
     /// Returns `ceil(total_bytes / target_partition_bytes)`, with a minimum of 1.
     fn target_partitions_from_stats(&self, stats: &[RuntimeStats]) -> usize {
-        let total_bytes: u64 = stats.iter().map(|s| s.memory_bytes).sum();
+        let total_bytes = stats
+            .iter()
+            .fold(0u128, |total, stat| total + u128::from(stat.memory_bytes));
         if total_bytes == 0 || self.target_partition_bytes == 0 {
             return 1;
         }
-        // ceiling division
-        total_bytes.div_ceil(self.target_partition_bytes).max(1) as usize
+        let target = total_bytes
+            .div_ceil(u128::from(self.target_partition_bytes))
+            .max(1);
+        usize::try_from(target).unwrap_or(usize::MAX)
     }
 }
 
@@ -338,7 +398,7 @@ impl AqeRule for CoalesceRule {
     /// stamps `coalesced_partition_count` on the plan and appends a
     /// [`NodeOp::CoalescePartitions`] node carrying the computed target count.
     fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
-        if stats.is_empty() {
+        if stats.is_empty() || StreamingAqeGuard::plan_is_streaming(&plan) {
             return None;
         }
         let advice = self.advise(stats);
@@ -348,7 +408,13 @@ impl AqeRule for CoalesceRule {
             return None;
         }
 
-        let target_partitions = self.target_partitions_from_stats(stats);
+        let target_partitions = self
+            .target_partitions_from_stats(stats)
+            .min(advice.groups.len())
+            .max(1);
+        if target_partitions >= original_count {
+            return None;
+        }
 
         tracing::debug!(
             rule = self.name(),
@@ -361,17 +427,84 @@ impl AqeRule for CoalesceRule {
             advice.groups.len(),
         );
 
-        let coalesce_node = PlanNode::new(
-            "coalesce",
-            format!("CoalescePartitions({original_count} → {target_partitions})"),
-            ExecutionKind::Batch,
-        )
-        .with_op(NodeOp::CoalescePartitions { target_partitions });
+        let referenced_ids = plan
+            .nodes()
+            .iter()
+            .flat_map(|node| node.inputs().iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        let terminal_indexes = plan
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| (!referenced_ids.contains(node.id())).then_some(index))
+            .collect::<Vec<_>>();
+        if terminal_indexes.len() > 1 {
+            return None;
+        }
 
-        Some(
-            plan.with_node(coalesce_node)
-                .with_coalesced_partition_count(advice.groups.len()),
-        )
+        let label = format!("CoalescePartitions({original_count} → {target_partitions})");
+        if let Some(&terminal_index) = terminal_indexes.first()
+            && matches!(
+                plan.nodes()[terminal_index].op(),
+                Some(NodeOp::CoalescePartitions { .. })
+            )
+        {
+            let mut updated = PhysicalPlan::new(plan.name(), plan.kind());
+            for (index, node) in plan.nodes().iter().enumerate() {
+                let node = if index == terminal_index {
+                    node.clone()
+                        .with_label(label.clone())
+                        .with_op(NodeOp::CoalescePartitions { target_partitions })
+                } else {
+                    node.clone()
+                };
+                updated.add_node(node);
+            }
+            return Some(updated.with_coalesced_partition_count(target_partitions));
+        }
+
+        let existing_ids = plan
+            .nodes()
+            .iter()
+            .map(PlanNode::id)
+            .collect::<HashSet<_>>();
+        let mut suffix = 1usize;
+        let coalesce_id = loop {
+            let candidate = if suffix == 1 {
+                "aqe:coalesce".to_string()
+            } else {
+                format!("aqe:coalesce:{suffix}")
+            };
+            if !existing_ids.contains(candidate.as_str()) {
+                break candidate;
+            }
+            suffix = suffix.checked_add(1)?;
+        };
+
+        let mut rewritten = PhysicalPlan::new(plan.name(), plan.kind());
+        let mut coalesce_inputs = Vec::new();
+        for (index, node) in plan.nodes().iter().enumerate() {
+            if terminal_indexes.first() == Some(&index)
+                && matches!(node.op(), Some(NodeOp::Sink { .. }))
+                && node.inputs().len() == 1
+            {
+                coalesce_inputs.extend(node.inputs().iter().cloned());
+                rewritten.add_node(node.clone().with_inputs([coalesce_id.clone()]));
+            } else {
+                rewritten.add_node(node.clone());
+            }
+        }
+        if coalesce_inputs.is_empty()
+            && let Some(&terminal_index) = terminal_indexes.first()
+        {
+            coalesce_inputs.push(plan.nodes()[terminal_index].id().to_string());
+        }
+        rewritten.add_node(
+            PlanNode::new(coalesce_id, label, plan.kind())
+                .with_inputs(coalesce_inputs)
+                .with_op(NodeOp::CoalescePartitions { target_partitions }),
+        );
+        Some(rewritten.with_coalesced_partition_count(target_partitions))
     }
 }
 
@@ -522,28 +655,69 @@ impl AqeOptimizer {
     /// Apply all applicable rules given per-stage runtime statistics.
     ///
     /// Returns the (possibly rewritten) plan and the names of rules that fired.
-    pub fn apply(&self, plan: PhysicalPlan, stats: &[RuntimeStats]) -> (PhysicalPlan, Vec<String>) {
+    pub fn apply(
+        &self,
+        plan: PhysicalPlan,
+        stats: &[RuntimeStats],
+    ) -> OptimizerResult<(PhysicalPlan, Vec<String>)> {
+        plan.validate()
+            .map_err(|source| OptimizerError::InvalidInput {
+                optimizer: "AQE",
+                source,
+            })?;
         let is_streaming = StreamingAqeGuard::plan_is_streaming(&plan);
         let mut current = plan;
         let mut applied = Vec::new();
 
         for rule in &self.always_rules {
-            if let Some(new_plan) = rule.apply(current.clone(), stats) {
-                applied.push(rule.name().to_string());
-                current = new_plan;
-            }
-        }
-
-        if !is_streaming {
-            for rule in &self.guarded_rules {
-                if let Some(new_plan) = rule.apply(current.clone(), stats) {
-                    applied.push(rule.name().to_string());
+            let rule_name = rule.name().to_string();
+            let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(current.clone(), stats)))
+                .map_err(|payload| OptimizerError::RulePanicked {
+                    optimizer: "AQE",
+                    rule: rule_name.clone(),
+                    message: panic_payload_message(payload),
+                })?;
+            if let Some(new_plan) = outcome {
+                new_plan
+                    .validate()
+                    .map_err(|source| OptimizerError::InvalidRuleOutput {
+                        optimizer: "AQE",
+                        rule: rule_name.clone(),
+                        source,
+                    })?;
+                if new_plan != current {
+                    applied.push(rule_name);
                     current = new_plan;
                 }
             }
         }
 
-        (current, applied)
+        if !is_streaming {
+            for rule in &self.guarded_rules {
+                let rule_name = rule.name().to_string();
+                let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(current.clone(), stats)))
+                    .map_err(|payload| OptimizerError::RulePanicked {
+                        optimizer: "AQE",
+                        rule: rule_name.clone(),
+                        message: panic_payload_message(payload),
+                    })?;
+                if let Some(new_plan) = outcome {
+                    new_plan
+                        .validate()
+                        .map_err(|source| OptimizerError::InvalidRuleOutput {
+                            optimizer: "AQE",
+                            rule: rule_name.clone(),
+                            source,
+                        })?;
+                    if new_plan != current {
+                        applied.push(rule_name);
+                        current = new_plan;
+                    }
+                }
+            }
+        }
+
+        Ok((current, applied))
     }
 }
 

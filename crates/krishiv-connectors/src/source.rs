@@ -5,6 +5,7 @@ use std::future::Future;
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::ConnectorResult;
+use crate::offset::Offset;
 
 // ---------------------------------------------------------------------------
 // Source
@@ -45,5 +46,37 @@ pub trait Source {
                 self.capabilities()
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointSource
+// ---------------------------------------------------------------------------
+
+/// A source that can persist and restore an exact typed read position.
+///
+/// Implementations must reject offsets belonging to another source or offsets
+/// that do not identify a valid read boundary. Restoring an accepted offset
+/// must make the next [`Source::read_batch`] return the same result it returned
+/// from that position originally.
+pub trait CheckpointSource: Source {
+    /// Connector-specific durable offset type.
+    type Offset: Offset + Clone + PartialEq + std::fmt::Debug + Send + 'static;
+
+    /// Return the exact offset of the next record or batch to read.
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset>;
+
+    /// Restore the source to an exact previously captured offset.
+    fn restore_offset(&mut self, offset: &Self::Offset) -> ConnectorResult<()>;
+
+    /// Encode the current checkpoint offset for durable metadata.
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Vec<u8>> {
+        Ok(self.checkpoint_offset()?.encode())
+    }
+
+    /// Decode and restore a checkpoint offset from durable metadata.
+    fn restore_encoded_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        let offset = Self::Offset::decode(encoded)?;
+        self.restore_offset(&offset)
     }
 }

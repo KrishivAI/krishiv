@@ -1,6 +1,6 @@
 //! Streaming window plan configuration and fragment encoding (unified execution).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,143 @@ impl WindowExecutionSpec {
             source_id_column: None,
         }
     }
+}
+
+/// Versioned prefix for lossless JSON-encoded [`WindowExecutionSpec`] values.
+pub const WINDOW_EXECUTION_SPEC_PREFIX: &str = "stream:spec:v1:";
+
+/// Validate and losslessly encode a window execution specification.
+///
+/// An empty aggregate list retains the historical default-count behavior and
+/// is normalized to one `count` aggregate in the encoded representation.
+pub fn encode_window_execution_spec(spec: &WindowExecutionSpec) -> Result<String, PlanError> {
+    let mut normalized = spec.clone();
+    if normalized.agg_exprs.is_empty() {
+        normalized.agg_exprs = WindowExecutionSpec::default_count_agg();
+    }
+    validate_window_execution_spec(&normalized)?;
+    let json =
+        serde_json::to_string(&normalized).map_err(|error| PlanError::Encode(error.to_string()))?;
+    Ok(format!("{WINDOW_EXECUTION_SPEC_PREFIX}{json}"))
+}
+
+/// Decode a lossless window specification, accepting legacy compact fragments
+/// for backward compatibility.
+pub fn decode_window_execution_spec(encoded: &str) -> Result<WindowExecutionSpec, PlanError> {
+    if let Some(json) = encoded.strip_prefix(WINDOW_EXECUTION_SPEC_PREFIX) {
+        let spec: WindowExecutionSpec =
+            serde_json::from_str(json).map_err(|error| PlanError::Parse(error.to_string()))?;
+        validate_window_execution_spec(&spec)?;
+        return Ok(spec);
+    }
+
+    let parsed = parse_stream_fragment(encoded)?;
+    let (slide_ms, session_gap_ms) = match parsed.window_kind {
+        WindowKind::Tumbling => (None, None),
+        WindowKind::Sliding => (parsed.slide_ms, None),
+        WindowKind::Session => (None, parsed.session_gap_ms),
+    };
+    let spec = WindowExecutionSpec {
+        key_column: parsed.key_col,
+        event_time_column: parsed.time_col,
+        watermark_lag_ms: parsed.lag_ms,
+        window_kind: parsed.window_kind,
+        window_size_ms: parsed.window_ms,
+        slide_ms,
+        session_gap_ms,
+        agg_exprs: vec![parsed.agg],
+        state_ttl_ms: parsed.ttl_ms,
+        source_watermark_lags: parsed.source_watermark_lags,
+        source_id_column: parsed.source_id_column,
+    };
+    validate_window_execution_spec(&spec)?;
+    Ok(spec)
+}
+
+/// Validate invariants required by all continuous window executors.
+pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), PlanError> {
+    if spec.key_column.trim().is_empty() {
+        return Err(PlanError::Validation(String::from(
+            "window key_column must not be empty",
+        )));
+    }
+    if spec.event_time_column.trim().is_empty() {
+        return Err(PlanError::Validation(String::from(
+            "window event_time_column must not be empty",
+        )));
+    }
+    if spec.window_size_ms == 0 {
+        return Err(PlanError::Validation(String::from(
+            "window_size_ms must be greater than zero",
+        )));
+    }
+    if spec.window_kind == WindowKind::Sliding && spec.slide_ms.unwrap_or(spec.window_size_ms) == 0
+    {
+        return Err(PlanError::Validation(String::from(
+            "sliding window slide_ms must be greater than zero",
+        )));
+    }
+    if spec.window_kind == WindowKind::Session
+        && spec.session_gap_ms.unwrap_or(spec.window_size_ms) == 0
+    {
+        return Err(PlanError::Validation(String::from(
+            "session window session_gap_ms must be greater than zero",
+        )));
+    }
+    if spec.state_ttl_ms == Some(0) {
+        return Err(PlanError::Validation(String::from(
+            "window state_ttl_ms must be greater than zero",
+        )));
+    }
+    if spec.agg_exprs.is_empty() {
+        return Err(PlanError::Validation(String::from(
+            "window execution requires at least one aggregate",
+        )));
+    }
+
+    let mut output_columns = HashSet::with_capacity(spec.agg_exprs.len());
+    for aggregate in &spec.agg_exprs {
+        if aggregate.output_column.trim().is_empty() {
+            return Err(PlanError::Validation(String::from(
+                "window aggregate output_column must not be empty",
+            )));
+        }
+        if aggregate.kind != WindowAggKind::Count && aggregate.input_column.trim().is_empty() {
+            return Err(PlanError::Validation(format!(
+                "{:?} window aggregate requires a non-empty input_column",
+                aggregate.kind
+            )));
+        }
+        if !output_columns.insert(aggregate.output_column.as_str()) {
+            return Err(PlanError::Validation(format!(
+                "duplicate window aggregate output_column '{}'",
+                aggregate.output_column
+            )));
+        }
+    }
+
+    if let Some(source_id_column) = &spec.source_id_column
+        && source_id_column.trim().is_empty()
+    {
+        return Err(PlanError::Validation(String::from(
+            "source_id_column must not be empty when configured",
+        )));
+    }
+    if !spec.source_watermark_lags.is_empty() && spec.source_id_column.is_none() {
+        return Err(PlanError::Validation(String::from(
+            "source_id_column is required when source_watermark_lags are configured",
+        )));
+    }
+    if spec
+        .source_watermark_lags
+        .keys()
+        .any(|source_id| source_id.trim().is_empty())
+    {
+        return Err(PlanError::Validation(String::from(
+            "source_watermark_lags contains an empty source id",
+        )));
+    }
+    Ok(())
 }
 
 /// Encode a window spec as an executor plan fragment description.
@@ -395,6 +532,67 @@ mod tests {
         assert_eq!(parsed.window_ms, 60_000);
         assert_eq!(parsed.lag_ms, 1000);
         assert_eq!(parsed.ttl_ms, Some(30_000));
+    }
+
+    #[test]
+    fn lossless_window_spec_roundtrip_preserves_all_aggregates() {
+        let mut source_watermark_lags = HashMap::new();
+        source_watermark_lags.insert(String::from("orders"), 1_000);
+        source_watermark_lags.insert(String::from("payments"), 2_000);
+        let spec = WindowExecutionSpec {
+            key_column: String::from("customer_id"),
+            event_time_column: String::from("event_ts"),
+            watermark_lag_ms: 250,
+            window_kind: WindowKind::Sliding,
+            window_size_ms: 60_000,
+            slide_ms: Some(5_000),
+            session_gap_ms: None,
+            agg_exprs: vec![
+                WindowAgg::count("event_count"),
+                WindowAgg {
+                    kind: WindowAggKind::Sum,
+                    input_column: String::from("amount"),
+                    output_column: String::from("gross_amount"),
+                },
+            ],
+            state_ttl_ms: Some(600_000),
+            source_watermark_lags,
+            source_id_column: Some(String::from("source")),
+        };
+
+        let encoded = encode_window_execution_spec(&spec).unwrap();
+        assert!(encoded.starts_with(WINDOW_EXECUTION_SPEC_PREFIX));
+        assert_eq!(decode_window_execution_spec(&encoded).unwrap(), spec);
+    }
+
+    #[test]
+    fn lossless_window_spec_normalizes_empty_aggregate_to_count() {
+        let mut spec = WindowExecutionSpec::tumbling("key", "ts", 1_000);
+        spec.agg_exprs.clear();
+
+        let decoded =
+            decode_window_execution_spec(&encode_window_execution_spec(&spec).unwrap()).unwrap();
+
+        assert_eq!(decoded.agg_exprs, WindowExecutionSpec::default_count_agg());
+    }
+
+    #[test]
+    fn window_spec_validation_rejects_invalid_execution_contracts() {
+        let mut spec = WindowExecutionSpec::tumbling("", "ts", 1_000);
+        assert!(validate_window_execution_spec(&spec).is_err());
+
+        spec.key_column = String::from("key");
+        spec.window_size_ms = 0;
+        assert!(validate_window_execution_spec(&spec).is_err());
+
+        spec.window_size_ms = 1_000;
+        spec.source_watermark_lags
+            .insert(String::from("orders"), 100);
+        assert!(validate_window_execution_spec(&spec).is_err());
+
+        spec.source_id_column = Some(String::from("source"));
+        spec.agg_exprs.push(WindowAgg::count("count"));
+        assert!(validate_window_execution_spec(&spec).is_err());
     }
 
     #[test]

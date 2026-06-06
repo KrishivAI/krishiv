@@ -176,7 +176,10 @@ impl Coordinator {
             self.gc_ready_jobs.push(job_id.clone());
         }
         self.checkpoint_coordinators.remove(job_id);
+        self.job_inline_results.remove(job_id);
         self.job_input_partitions.remove(job_id);
+        self.job_task_input_partitions.remove(job_id);
+        self.continuous_input_cycles.remove(job_id);
         self.batch_sql_job_tables.remove(job_id);
 
         // Emit OpenLineage FAIL event for job cancellation (Phase 3 M5 / GAP-OB-06)
@@ -218,6 +221,7 @@ impl Coordinator {
         let stage_id = update.stage_id().clone();
         let task_id = update.task_id().clone();
         let attempt = update.attempt();
+        let is_continuous_cycle = self.is_continuous_cycle_task(&job_id, &task_id);
         let inline_ipc = update
             .output_metadata()
             .map(|meta| meta.inline_record_batch_ipc().to_vec())
@@ -301,6 +305,12 @@ impl Coordinator {
                 .or_default()
                 .extend(inline_ipc);
         }
+        if is_continuous_cycle && terminal_state == TaskState::Succeeded {
+            self.complete_continuous_input_cycle(&job_id, &task_id);
+        } else if is_continuous_cycle && terminal_state == TaskState::Failed {
+            self.continuous_input_cycles.remove(&job_id);
+            self.job_input_partitions.remove(&job_id);
+        }
 
         // Snapshot the job's current state and resource usage after the update.
         let (is_terminal, usage, state, job_name, namespace) = self
@@ -338,7 +348,12 @@ impl Coordinator {
             // bounded-window jobs) — executors have already consumed this by the
             // time the job reaches a terminal state.
             self.job_input_partitions.remove(&job_id);
+            self.job_task_input_partitions.remove(&job_id);
+            self.continuous_input_cycles.remove(&job_id);
             self.batch_sql_job_tables.remove(&job_id);
+            if state != JobState::Succeeded {
+                self.job_inline_results.remove(&job_id);
+            }
             self.queue_manager.on_job_complete(&job_id, &usage);
 
             // Emit OpenLineage COMPLETE/FAIL events (Phase 3 M5 / GAP-OB-06)
@@ -417,7 +432,10 @@ impl Coordinator {
             return;
         }
         self.job_coordinators.remove(job_id);
+        self.job_inline_results.remove(job_id);
         self.job_input_partitions.remove(job_id);
+        self.job_task_input_partitions.remove(job_id);
+        self.continuous_input_cycles.remove(job_id);
         self.batch_sql_job_tables.remove(job_id);
         self.checkpoint_coordinators.remove(job_id);
         self.gc_ready_jobs.retain(|id| id != job_id);
@@ -451,7 +469,7 @@ impl Coordinator {
         plan: &PhysicalPlan,
     ) -> SchedulerResult<SubmitOutcome> {
         let aqe = krishiv_optimizer::default_aqe_optimizer();
-        let (optimized, _applied) = aqe.apply(plan.clone(), &[]);
+        let (optimized, _applied) = aqe.apply(plan.clone(), &[])?;
         self.submit_job(job_spec_from_physical_plan(job_id, &optimized)?)
     }
 }

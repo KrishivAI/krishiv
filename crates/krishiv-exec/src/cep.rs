@@ -103,9 +103,9 @@ impl CepOperator {
             if !key_bytes.starts_with(b"cep:") || key_bytes.len() < 8 {
                 continue;
             }
-            let key_len = u32::from_le_bytes([
-                key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
-            ]) as usize;
+            let key_len =
+                u32::from_le_bytes([key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7]])
+                    as usize;
             if key_bytes.len() < 8 + key_len {
                 continue;
             }
@@ -113,11 +113,10 @@ impl CepOperator {
             let Some(payload) = backend.get(namespace, &key_bytes)? else {
                 continue;
             };
-            let state: CepKeyState = serde_json::from_slice(&payload).map_err(|e| {
-                StateError::CorruptEntry {
+            let state: CepKeyState =
+                serde_json::from_slice(&payload).map_err(|e| StateError::CorruptEntry {
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             restored.insert(key, state);
         }
         self.states = restored;
@@ -145,9 +144,9 @@ impl CepOperator {
             .iter()
             .map(|(k, v)| (encode_key_hex(k), v.clone()))
             .collect();
-        serde_json::to_vec(&map).map_err(|e| crate::ExecError::InvalidWindowConfig(format!(
-            "CEP snapshot encode failed: {e}"
-        )))
+        serde_json::to_vec(&map).map_err(|e| {
+            crate::ExecError::InvalidWindowConfig(format!("CEP snapshot encode failed: {e}"))
+        })
     }
 
     /// Restore per-key metadata from a JSON snapshot.
@@ -219,15 +218,11 @@ mod tests {
             .unwrap();
         let mut op = CepOperator::new(pattern, "k");
         op.on_barrier(7);
-        op.states
-            .entry(b"k1".to_vec())
-            .or_default()
-            .last_event_ms = 42;
+        op.states.entry(b"k1".to_vec()).or_default().last_event_ms = 42;
 
         let mut backend = FjallStateBackend::ephemeral().expect("ephemeral backend");
         let ns = Namespace::new("job-1", "op-cep");
-        op.persist_to_state(&mut backend, &ns)
-            .expect("persist");
+        op.persist_to_state(&mut backend, &ns).expect("persist");
 
         let mut restored = CepOperator::new(
             Pattern::begin("a")
@@ -237,12 +232,13 @@ mod tests {
                 .unwrap(),
             "k",
         );
-        restored
-            .restore_from_state(&backend, &ns)
-            .expect("restore");
+        restored.restore_from_state(&backend, &ns).expect("restore");
         assert_eq!(restored.last_barrier_epoch(), 7);
         assert_eq!(
-            restored.states.get(&b"k1".to_vec()).map(|s| s.last_event_ms),
+            restored
+                .states
+                .get(&b"k1".to_vec())
+                .map(|s| s.last_event_ms),
             Some(42)
         );
     }

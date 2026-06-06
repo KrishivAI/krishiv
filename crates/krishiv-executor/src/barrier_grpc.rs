@@ -135,8 +135,7 @@ impl BarrierService for ExecutorBarrierService {
                 injector.enqueue(barrier.clone());
                 let ack_task_id = task_id_from_checkpoint_id(&barrier.checkpoint_id)
                     .unwrap_or_else(|| task_id.clone());
-                let completion_rx =
-                    ack_registry.register_wait(&barrier.job_id, barrier.epoch);
+                let completion_rx = ack_registry.register_wait(&barrier.job_id, barrier.epoch);
                 let ack = match tokio::time::timeout(Duration::from_secs(120), completion_rx).await
                 {
                     Ok(Ok(completion)) => Ok(BarrierAck {

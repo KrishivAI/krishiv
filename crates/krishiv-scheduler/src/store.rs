@@ -1037,8 +1037,7 @@ impl NonBlockingStoreHandle {
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StoreCommand>(STORE_CHANNEL_CAPACITY);
             let bg_store = std::sync::Arc::clone(&inner);
-            let in_flight =
-                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             tokio::spawn(async move {
                 while let Some(cmd) = rx.recv().await {
                     match cmd {
@@ -1132,9 +1131,9 @@ impl NonBlockingStoreHandle {
         match &self.tx {
             Some(tx) => match tx.try_send(StoreCommand::AppendEvent(event)) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(
-                    StoreCommand::AppendEvent(event),
-                )) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(StoreCommand::AppendEvent(
+                    event,
+                ))) => {
                     if self.fail_closed_writes {
                         tracing::warn!(
                             "NonBlockingStoreHandle: channel full; performing synchronous append_event"
@@ -1164,9 +1163,9 @@ impl NonBlockingStoreHandle {
         match &self.tx {
             Some(tx) => match tx.try_send(StoreCommand::SaveJob(Box::new(record.clone()))) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(
-                    StoreCommand::SaveJob(record),
-                )) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(StoreCommand::SaveJob(
+                    record,
+                ))) => {
                     if self.fail_closed_writes {
                         tracing::warn!(
                             "NonBlockingStoreHandle: channel full; performing synchronous save_job"

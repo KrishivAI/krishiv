@@ -1114,6 +1114,79 @@ mod executor_tests {
         );
     }
 
+    fn bounded_window_assignment(
+        job_id: &str,
+        fragment_topic: &str,
+        input_topics: &[&str],
+    ) -> ExecutorTaskAssignment {
+        use base64::Engine as _;
+
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("key", "ts", 1_000);
+        let spec_json = serde_json::to_vec(&spec).unwrap();
+        let spec_b64 = base64::engine::general_purpose::STANDARD.encode(spec_json);
+        ExecutorTaskAssignment::new(
+            TaskAttemptRef::new(
+                JobId::try_new(job_id).unwrap(),
+                StageId::try_new("stage-window").unwrap(),
+                TaskId::try_new("task-window").unwrap(),
+                AttemptId::initial(),
+            ),
+            ExecutorId::try_new("exec-window").unwrap(),
+            LeaseGeneration::initial(),
+            PlanFragment::new(format!("window:{fragment_topic}:{spec_b64}")),
+            OutputContract::new(OutputContractKind::InlineRecordBatches, "window output"),
+        )
+        .with_input_partitions(
+            input_topics
+                .iter()
+                .enumerate()
+                .map(|(index, topic)| {
+                    InputPartition::typed(
+                        format!("window-input-{index}"),
+                        InputPartitionDescriptor::InlineIpc {
+                            table_name: (*topic).to_owned(),
+                            ipc_bytes: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn bounded_window_rejects_mismatched_input_topic() {
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let error = runner
+            .run_assignment_with(
+                bounded_window_assignment("job-window-topic", "events", &["other"]),
+                &AcceptingCoordinatorService,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("does not match fragment topic"));
+    }
+
+    #[tokio::test]
+    async fn bounded_window_rejects_multiple_input_tables() {
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let error = runner
+            .run_assignment_with(
+                bounded_window_assignment(
+                    "job-window-input-count",
+                    "events",
+                    &["events", "events"],
+                ),
+                &AcceptingCoordinatorService,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("exactly one inline input table"));
+    }
+
     #[tokio::test]
     async fn executor_runs_parquet_task_via_connector_source() {
         allow_anonymous_for_tests();
@@ -1860,6 +1933,30 @@ mod executor_tests {
                 "loop output",
             ),
         )
+    }
+
+    fn make_loop_assignment_with_batches(
+        fragment: &str,
+        batches: &[RecordBatch],
+    ) -> ExecutorTaskAssignment {
+        use arrow::ipc::writer::StreamWriter;
+
+        let mut ipc_bytes = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut ipc_bytes, &batches[0].schema()).expect("ipc writer");
+            for batch in batches {
+                writer.write(batch).expect("ipc batch");
+            }
+            writer.finish().expect("ipc finish");
+        }
+        make_loop_assignment(fragment).with_input_partitions(vec![InputPartition::typed(
+            "continuous-input",
+            InputPartitionDescriptor::InlineIpc {
+                table_name: "input".into(),
+                ipc_bytes,
+            },
+        )])
     }
 
     fn make_streaming_assignment(fragment: &str, partitions: Vec<&str>) -> ExecutorTaskAssignment {
@@ -3094,18 +3191,48 @@ mod executor_tests {
         );
     }
 
-    /// Verify that a missing drainer returns a clear InvalidAssignment error.
+    /// Distributed stream:loop cycles consume coordinator-delivered InlineIpc
+    /// partitions when no local drainer is attached.
     #[tokio::test]
-    async fn stream_loop_without_drainer_returns_error() {
-        let window_spec = "stream:tw:key=key:time=ts:win=10000:lag=0:agg=count";
+    async fn stream_loop_without_drainer_processes_inline_input() {
+        let window_spec = krishiv_plan::window::encode_window_execution_spec(
+            &krishiv_plan::window::WindowExecutionSpec::tumbling("key", "ts", 10_000),
+        )
+        .unwrap();
         let fragment = format!("stream:loop:no-drainer-job|{window_spec}");
         let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-        let assignment = make_loop_assignment(&fragment);
-        let result = runner.execute_streaming_fragment(&assignment).await;
-        assert!(
-            result.is_err(),
-            "stream:loop without drainer must return an error"
+        let batch = krishiv_common::arrow::make_test_key_ts_batch(
+            vec!["a", "a"],
+            vec![100_i64, 12_000_i64],
         );
+        let assignment = make_loop_assignment_with_batches(&fragment, &[batch]);
+        let output = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .expect("inline continuous cycle must execute");
+        assert!(
+            output.row_count() > 0,
+            "inline cycle must execute the registered window instead of echoing input"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_continuous_fragment_is_rejected() {
+        let fragment = "stream:continuous:legacy-job";
+        let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+        let batch = krishiv_common::arrow::make_test_key_ts_batch(vec!["a"], vec![100_i64]);
+        let assignment = make_loop_assignment_with_batches(fragment, &[batch]);
+
+        let error = runner
+            .execute_streaming_fragment(&assignment)
+            .await
+            .expect_err("legacy fragment must not echo unprocessed input");
+
+        assert!(
+            matches!(error, crate::ExecutorError::InvalidAssignment { .. }),
+            "legacy fragment must fail as an invalid assignment: {error}"
+        );
+        assert!(error.to_string().contains("stream:loop"));
     }
 
     // ── R7.2 source throttle wiring ──────────────────────────────────────────

@@ -22,7 +22,7 @@ pub mod local_streaming;
 mod plan;
 pub mod stream_kafka;
 
-pub use continuous_stream::ContinuousStreamRegistry;
+pub use continuous_stream::{ContinuousStreamError, ContinuousStreamRegistry};
 pub use coordinator_http_client::{
     execute_coordinator_batch_sql, execute_coordinator_batch_sql_inline,
     execute_coordinator_bounded_window, execute_coordinator_continuous_drain,
@@ -61,6 +61,9 @@ pub enum RuntimeError {
     /// Runtime state was invalid for the requested operation.
     #[error("invalid runtime state: {message}")]
     InvalidState { message: String },
+    /// Continuous job lifecycle, input, or execution failure.
+    #[error(transparent)]
+    ContinuousStream(#[from] ContinuousStreamError),
     /// A transport-level failure (connection refused, timeout, etc.).
     #[error("transport error: {message}")]
     Transport { message: String },
@@ -206,60 +209,6 @@ impl LocalJobRegistry {
     }
 }
 
-/// A tiny task spec used by executor stubs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskSpec {
-    id: String,
-    description: String,
-}
-
-impl TaskSpec {
-    /// Create a task spec.
-    pub fn new(id: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            description: description.into(),
-        }
-    }
-
-    /// Task id.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Human-readable task description.
-    pub fn description(&self) -> &str {
-        &self.description
-    }
-}
-
-/// A tiny task report used by executor stubs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskReport {
-    task_id: String,
-    state: JobState,
-}
-
-impl TaskReport {
-    /// Create a task report.
-    pub fn new(task_id: impl Into<String>, state: JobState) -> Self {
-        Self {
-            task_id: task_id.into(),
-            state,
-        }
-    }
-
-    /// Task id.
-    pub fn task_id(&self) -> &str {
-        &self.task_id
-    }
-
-    /// Task state.
-    pub fn state(&self) -> JobState {
-        self.state
-    }
-}
-
 /// Minimal execution report for bootstrap backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionReport {
@@ -321,16 +270,9 @@ pub trait ExecutionBackend: Send + Sync {
     fn execute(&self, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport>;
 }
 
-/// Minimal task executor contract for future scheduler integration.
-pub trait TaskExecutor {
-    /// Execute one task.
-    fn execute_task(&mut self, task: TaskSpec) -> RuntimeResult<TaskReport>;
-}
-
 fn accept_local_plan(backend: &str, plan: &PhysicalPlan) -> RuntimeResult<ExecutionReport> {
-    if plan.name().trim().is_empty() {
-        return Err(RuntimeError::plan_rejected("plan name must not be empty"));
-    }
+    plan.validate()
+        .map_err(|error| RuntimeError::plan_rejected(error.to_string()))?;
     Ok(ExecutionReport::new(
         backend,
         plan.name(),
@@ -482,12 +424,11 @@ mod distributed_flight_tests {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_plan::{ExecutionKind, PhysicalPlan};
+    use krishiv_plan::{ExecutionKind, PhysicalPlan, PlanNode};
 
     use super::{
         DistributedBackend, EmbeddedBackend, ExecutionBackend, ExecutionReport, JobId, JobState,
-        JobStatus, LocalJobRegistry, RuntimeError, SingleNodeBackend, TaskReport, TaskSpec,
-        accept_local_plan,
+        JobStatus, LocalJobRegistry, RuntimeError, SingleNodeBackend, accept_local_plan,
     };
 
     #[test]
@@ -670,34 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn task_spec_accessors() {
-        let t = TaskSpec::new("t-1", "do stuff");
-        assert_eq!(t.id(), "t-1");
-        assert_eq!(t.description(), "do stuff");
-    }
-
-    #[test]
-    fn task_spec_clone_and_eq() {
-        let t1 = TaskSpec::new("t", "desc");
-        let t2 = t1.clone();
-        assert_eq!(t1, t2);
-    }
-
-    #[test]
-    fn task_report_accessors() {
-        let r = TaskReport::new("t-1", JobState::Succeeded);
-        assert_eq!(r.task_id(), "t-1");
-        assert_eq!(r.state(), JobState::Succeeded);
-    }
-
-    #[test]
-    fn task_report_clone_and_eq() {
-        let r1 = TaskReport::new("t", JobState::Failed);
-        let r2 = r1.clone();
-        assert_eq!(r1, r2);
-    }
-
-    #[test]
     fn execution_report_accessors() {
         let r = ExecutionReport::new("single-node", "plan-1", ExecutionKind::Batch, true);
         assert_eq!(r.backend(), "single-node");
@@ -732,6 +645,18 @@ mod tests {
         let report = accept_local_plan("backend", &plan).unwrap();
         assert!(report.accepted());
         assert_eq!(report.backend(), "backend");
+    }
+
+    #[test]
+    fn accept_local_plan_rejects_invalid_graph() {
+        let plan = PhysicalPlan::new("invalid", ExecutionKind::Batch).with_node(
+            PlanNode::new("sink", "sink", ExecutionKind::Batch).with_inputs(["missing"]),
+        );
+
+        let error = accept_local_plan("backend", &plan).expect_err("invalid graph");
+
+        assert!(matches!(error, RuntimeError::PlanRejected { .. }));
+        assert!(error.to_string().contains("missing input 'missing'"));
     }
 
     #[test]

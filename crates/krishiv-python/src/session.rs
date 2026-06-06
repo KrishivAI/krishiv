@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyType};
 
 use crate::batch::PyBatch;
 use crate::dataframe::PyDataFrame;
-use crate::errors::map_krishiv_error;
+use crate::errors::{UdfError as PyUdfError, map_krishiv_error};
 use crate::job_status::PyJobStatus;
 use crate::live_table::PyLiveTable;
 use crate::pipeline::StreamPipeline;
@@ -312,7 +312,9 @@ impl PySession {
             &output_type,
             output_name,
         )?;
-        self.inner.register_scalar_udf(registered);
+        self.inner
+            .register_scalar_udf(registered)
+            .map_err(|error| PyUdfError::new_err(error.to_string()))?;
         Ok(())
     }
 

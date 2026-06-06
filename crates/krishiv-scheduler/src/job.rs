@@ -264,6 +264,9 @@ impl JobRecord {
         executor_leases: &[(ExecutorId, LeaseGeneration)],
         batch_sql_tables: Option<&[crate::batch_sql::BatchSqlTable]>,
         inline_partitions: Option<&[krishiv_proto::InputPartition]>,
+        task_inline_partitions: Option<
+            &std::collections::HashMap<TaskId, Vec<krishiv_proto::InputPartition>>,
+        >,
     ) -> SchedulerResult<Vec<ExecutorTaskAssignment>> {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
@@ -294,6 +297,18 @@ impl JobRecord {
 
             for (task_index, task) in stage.tasks.iter_mut().enumerate() {
                 if task.state == TaskState::Assigned && !task.launch_in_flight {
+                    let task_body =
+                        krishiv_plan::TypedTaskFragment::decode_or_legacy(task.spec.description())
+                            .body;
+                    if task_body.starts_with("stream:loop:")
+                        && inline_partitions.is_none()
+                        && task_inline_partitions.is_none()
+                    {
+                        // A continuous loop task is input-driven. Keep its
+                        // executor ownership assigned but do not launch an
+                        // empty cycle during registration or scheduler ticks.
+                        continue;
+                    }
                     let executor_id = task.assigned_executor.clone().ok_or_else(|| {
                         SchedulerError::InvalidJob {
                             message: format!(
@@ -339,6 +354,15 @@ impl JobRecord {
                                     })
                             })
                             .collect()
+                    } else if let Some(parts_by_task) = task_inline_partitions {
+                        parts_by_task.get(task.task_id()).cloned().ok_or_else(|| {
+                            SchedulerError::InvalidJob {
+                                message: format!(
+                                    "task {} has no registered task-scoped input partition",
+                                    task.task_id()
+                                ),
+                            }
+                        })?
                     } else if let Some(parts) = inline_partitions {
                         parts.to_vec()
                     } else {
@@ -364,9 +388,7 @@ impl JobRecord {
                     )
                     .with_input_partitions(input_partitions)
                     .with_key_group_range(key_group_range_for_task(task_index, stage_parallelism));
-                    if task_description.starts_with("stream:continuous:")
-                        || task_description.starts_with("stream:loop:")
-                    {
+                    if task_body.starts_with("stream:loop:") {
                         assignment = assignment.with_requires_reattach(true);
                     }
                     if let Some(secs) = task_timeout_secs {
@@ -1200,6 +1222,10 @@ impl StabilityMetrics {
 
 /// Convert a Krishiv logical plan into an R2 distributed job spec.
 pub fn job_spec_from_logical_plan(job_id: JobId, plan: &LogicalPlan) -> SchedulerResult<JobSpec> {
+    plan.validate()
+        .map_err(|error| SchedulerError::InvalidPlan {
+            message: error.to_string(),
+        })?;
     job_spec_from_plan_parts(job_id, plan.name(), plan.kind(), plan.nodes(), None)
 }
 
@@ -1209,6 +1235,10 @@ pub fn job_spec_from_logical_plan(job_id: JobId, plan: &LogicalPlan) -> Schedule
 /// AQE `CoalesceRule`), that count overrides the default one-task-per-node
 /// layout so the scheduler generates the correct number of downstream tasks.
 pub fn job_spec_from_physical_plan(job_id: JobId, plan: &PhysicalPlan) -> SchedulerResult<JobSpec> {
+    plan.validate()
+        .map_err(|error| SchedulerError::InvalidPlan {
+            message: error.to_string(),
+        })?;
     job_spec_from_plan_parts(
         job_id,
         plan.name(),
@@ -1368,15 +1398,17 @@ fn job_spec_from_plan_parts(
                     message: error.to_string(),
                 }
             })?;
-            stage = stage.with_task(TaskSpec::new(task_id, plan_node_description(node)));
+            stage = stage.with_task(TaskSpec::new(task_id, plan_node_description(node)?));
         }
     }
 
     Ok(JobSpec::new(job_id, job_name, job_kind).with_stage(stage))
 }
 
-fn plan_node_description(node: &PlanNode) -> String {
-    krishiv_plan::encode_typed_task_fragment(node).unwrap_or_else(|e| format!("encode error: {e}"))
+fn plan_node_description(node: &PlanNode) -> SchedulerResult<String> {
+    krishiv_plan::encode_typed_task_fragment(node).map_err(|error| SchedulerError::InvalidPlan {
+        message: format!("failed to encode plan node '{}': {error}", node.id()),
+    })
 }
 
 fn plan_has_exchange_stages(nodes: &[PlanNode]) -> bool {
@@ -1392,7 +1424,7 @@ fn job_spec_from_exchange_stages(
     job_kind: JobKind,
     nodes: &[PlanNode],
 ) -> SchedulerResult<JobSpec> {
-    let ordered = topo_sort_plan_nodes(nodes);
+    let ordered = topo_sort_plan_nodes(nodes)?;
     let mut stage_slices: Vec<Vec<&PlanNode>> = Vec::new();
     let mut current: Vec<&PlanNode> = Vec::new();
     for node in &ordered {
@@ -1427,7 +1459,7 @@ fn job_spec_from_exchange_stages(
                 .map_err(|error| SchedulerError::InvalidPlan {
                     message: error.to_string(),
                 })?;
-            stage = stage.with_task(TaskSpec::new(task_id, plan_node_description(node)));
+            stage = stage.with_task(TaskSpec::new(task_id, plan_node_description(node)?));
         }
         spec = spec.with_stage(stage);
         prev_stage_id = Some(stage_id);
@@ -1436,7 +1468,7 @@ fn job_spec_from_exchange_stages(
 }
 
 /// Topological order of plan nodes using declared `inputs()` edges.
-fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> Vec<&PlanNode> {
+fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> SchedulerResult<Vec<&PlanNode>> {
     use std::collections::{HashMap, VecDeque};
 
     let by_id: HashMap<&str, &PlanNode> = nodes.iter().map(|n| (n.id(), n)).collect();
@@ -1457,7 +1489,15 @@ fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> Vec<&PlanNode> {
         ordered.push(node);
         for other in nodes {
             if other.inputs().iter().any(|inp| inp == node.id()) {
-                let deg = in_degree.get_mut(other.id()).expect("in_degree");
+                let deg =
+                    in_degree
+                        .get_mut(other.id())
+                        .ok_or_else(|| SchedulerError::InvalidPlan {
+                            message: format!(
+                                "topological sort lost in-degree state for node '{}'",
+                                other.id()
+                            ),
+                        })?;
                 *deg = deg.saturating_sub(1);
                 if *deg == 0 {
                     queue.push_back(other);
@@ -1466,16 +1506,18 @@ fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> Vec<&PlanNode> {
         }
     }
     if ordered.len() != nodes.len() {
-        return nodes.iter().collect();
+        return Err(SchedulerError::InvalidPlan {
+            message: String::from("plan graph is cyclic and cannot be staged"),
+        });
     }
-    ordered
+    Ok(ordered)
 }
 
 #[cfg(test)]
 mod exchange_stage_tests {
     use super::*;
-    use krishiv_plan::{ExecutionKind, Partitioning, PlanNode};
-    use krishiv_proto::JobId;
+    use krishiv_plan::{ExecutionKind, Partitioning, PlanNode, TypedTaskFragment};
+    use krishiv_proto::{InputPartition, JobId};
 
     #[test]
     fn physical_plan_with_exchange_produces_multi_stage_job() {
@@ -1519,5 +1561,95 @@ mod exchange_stage_tests {
         assert_eq!((first.start(), first.end()), (0, 8191));
         assert_eq!((second.start(), second.end()), (8192, 16383));
         assert_eq!((last.start(), last.end()), (24576, 32767));
+    }
+
+    #[test]
+    fn typed_continuous_loop_assignment_requires_reattach() {
+        let job_id = JobId::try_new("continuous-assignment-job").unwrap();
+        let stage_id = StageId::try_new("continuous-stage").unwrap();
+        let task_id = TaskId::try_new("continuous-task").unwrap();
+        let executor_id = ExecutorId::try_new("continuous-executor").unwrap();
+        let fragment = TypedTaskFragment::new(
+            ExecutionKind::Streaming,
+            "stream:loop:continuous-assignment-job|\
+             stream:tw:key=key:time=ts:win=10000:lag=0:agg=count",
+        )
+        .encode()
+        .unwrap();
+        let spec = JobSpec::new(job_id, "continuous", JobKind::Streaming).with_stage(
+            StageSpec::new(stage_id, "continuous-stage")
+                .with_task(TaskSpec::new(task_id.clone(), fragment)),
+        );
+        let mut job = JobRecord::from_spec(spec, 1);
+        job.apply_assignments(vec![TaskAssignment::new(task_id, executor_id.clone())]);
+        let input = vec![InputPartition::new("cycle-input", "inline")];
+
+        let assignments = job
+            .launch_assigned_task_assignments(
+                &[(executor_id, LeaseGeneration::initial())],
+                None,
+                Some(&input),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].requires_reattach());
+    }
+
+    #[test]
+    fn task_scoped_inputs_are_bound_to_the_matching_task() {
+        let job_id = JobId::try_new("task-scoped-input-job").unwrap();
+        let stage_id = StageId::try_new("task-scoped-stage").unwrap();
+        let task_a = TaskId::try_new("task-a").unwrap();
+        let task_b = TaskId::try_new("task-b").unwrap();
+        let executor_a = ExecutorId::try_new("executor-a").unwrap();
+        let executor_b = ExecutorId::try_new("executor-b").unwrap();
+        let spec = JobSpec::new(job_id, "task-scoped", JobKind::Batch).with_stage(
+            StageSpec::new(stage_id, "stage")
+                .with_task(TaskSpec::new(task_a.clone(), "window:a"))
+                .with_task(TaskSpec::new(task_b.clone(), "window:b")),
+        );
+        let mut job = JobRecord::from_spec(spec, 1);
+        job.apply_assignments(vec![
+            TaskAssignment::new(task_a.clone(), executor_a.clone()),
+            TaskAssignment::new(task_b.clone(), executor_b.clone()),
+        ]);
+        let task_inputs = std::collections::HashMap::from([
+            (
+                task_a.clone(),
+                vec![InputPartition::new("input-a", "partition-a")],
+            ),
+            (
+                task_b.clone(),
+                vec![InputPartition::new("input-b", "partition-b")],
+            ),
+        ]);
+
+        let assignments = job
+            .launch_assigned_task_assignments(
+                &[
+                    (executor_a, LeaseGeneration::initial()),
+                    (executor_b, LeaseGeneration::initial()),
+                ],
+                None,
+                None,
+                Some(&task_inputs),
+            )
+            .unwrap();
+        assert_eq!(assignments.len(), 2);
+        for assignment in assignments {
+            let expected_partition = if assignment.task_id() == &task_a {
+                "input-a"
+            } else {
+                assert_eq!(assignment.task_id(), &task_b);
+                "input-b"
+            };
+            assert_eq!(assignment.input_partitions().len(), 1);
+            assert_eq!(
+                assignment.input_partitions()[0].partition_id(),
+                expected_partition
+            );
+        }
     }
 }

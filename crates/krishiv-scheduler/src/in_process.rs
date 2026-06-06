@@ -272,9 +272,11 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
         // Phase 3: finalize and sync inner → outer coordinator.
         {
             let mut inner = self.checkpoint_inner.write().await;
-            if require_finalize {
-                inner.finalize_ack(&job_id, ack_epoch);
-            }
+            let finalize_result = if require_finalize {
+                inner.finalize_ack(&job_id, ack_epoch)
+            } else {
+                Ok(())
+            };
             // Sync inner → outer coordinator to avoid dual-state drift (G3).
             let mut coord = lock_coord(&self.coordinator)?;
             coord
@@ -282,6 +284,11 @@ impl CoordinatorExecutorService for InProcessCoordinatorBridge {
                 .clone_from(&inner.coordinators);
             coord.checkpoint_notify_sent.clone_from(&inner.notify_sent);
             coord.barrier_dispatch_sent.clone_from(&inner.barrier_sent);
+            if require_finalize {
+                finalize_result.map_err(|e| {
+                    tonic::Status::internal(format!("checkpoint finalize failed: {e}"))
+                })?;
+            }
         }
         Ok(tonic::Response::new(response))
     }

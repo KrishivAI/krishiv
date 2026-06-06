@@ -1,5 +1,6 @@
 //! Two-phase commit.
 
+use crate::capabilities::ConnectorCapabilities;
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::quality::{CompiledDataQualityConfig, DataQualityConfig, check_batch_compiled};
 
@@ -18,15 +19,19 @@ use crate::quality::{CompiledDataQualityConfig, DataQualityConfig, check_batch_c
 /// 3. If the checkpoint is aborted, call `abort(handle)` — the sink discards
 ///    the staged output without making it visible.
 ///
-/// `commit` and `abort` are mutually exclusive for a given handle.
-/// Calling `commit` after `abort`, or vice versa, is a logic error and
-/// implementations may panic.
+/// Coordinator delivery can be retried after an uncertain response. Therefore
+/// repeated `commit` and repeated `abort` calls for the same cloned handle must
+/// be idempotent and must return typed errors rather than panic. A conflicting
+/// decision after the opposite outcome must never reverse visible data.
 ///
 /// The certified R6 sink is `S3/Parquet` (object-level atomic rename).
 /// `InMemoryTwoPhaseCommitSink` is provided for deterministic testing.
 pub trait TwoPhaseCommitSink: Send {
     /// Opaque handle returned by `prepare`.
-    type Handle: Send;
+    type Handle: Clone + Send;
+
+    /// Return the capabilities implemented by this sink.
+    fn capabilities(&self) -> ConnectorCapabilities;
 
     /// Buffer `batch` under a staging area keyed to `epoch`.
     ///
@@ -87,6 +92,10 @@ pub struct InMemoryCommitHandle {
 
 impl TwoPhaseCommitSink for InMemoryTwoPhaseCommitSink {
     type Handle = InMemoryCommitHandle;
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_two_phase_commit()
+    }
 
     fn prepare(
         &mut self,
@@ -176,6 +185,10 @@ impl LocalParquetTwoPhaseCommitSink {
 
 impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     type Handle = ParquetCommitHandle;
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::new().with_two_phase_commit()
+    }
 
     fn prepare(
         &mut self,

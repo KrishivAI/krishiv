@@ -87,8 +87,8 @@ impl KubernetesControllerRuntime {
             coordinator = coordinator.with_store_fail_closed(store, fail_closed);
         }
 
-        let shared = SharedCoordinator::new(coordinator)
-            .with_durability_profile(config.durability_profile);
+        let shared =
+            SharedCoordinator::new(coordinator).with_durability_profile(config.durability_profile);
         if krishiv_common::profile_requires_fail_closed_metadata(config.durability_profile) {
             shared.sync_leader_fencing_token(1);
         }

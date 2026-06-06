@@ -62,7 +62,27 @@ impl AggKey {
 /// Supported types: `Int32`, `Int64`, `Float64`, `Utf8`, `Bool`.
 /// Avoids heap allocation for integer and boolean keys.
 pub fn extract_agg_key(batch: &RecordBatch, col_idx: usize, row: usize) -> ExecResult<AggKey> {
+    if col_idx >= batch.num_columns() {
+        return Err(ExecError::InvalidInput(format!(
+            "group key column index {col_idx} is out of bounds for {} columns",
+            batch.num_columns()
+        )));
+    }
+    if row >= batch.num_rows() {
+        return Err(ExecError::InvalidInput(format!(
+            "group key row index {row} is out of bounds for {} rows",
+            batch.num_rows()
+        )));
+    }
+
     let col = batch.column(col_idx);
+    if col.is_null(row) {
+        return Err(ExecError::InvalidInput(format!(
+            "group key column '{}' contains null at row {row}",
+            batch.schema().field(col_idx).name()
+        )));
+    }
+
     match col.data_type() {
         DataType::Int32 => {
             let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
@@ -632,4 +652,38 @@ fn build_composite_key_static(
         .map(|&idx| extract_agg_key(batch, idx, row))
         .collect();
     Ok(CompositeKey::new(keys?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_agg_key_rejects_null_values() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+        )
+        .unwrap();
+
+        let err = extract_agg_key(&batch, 0, 1).unwrap_err();
+        assert!(matches!(err, ExecError::InvalidInput(_)));
+        assert!(err.to_string().contains("contains null at row 1"));
+    }
+
+    #[test]
+    fn extract_agg_key_rejects_out_of_bounds_indices() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7]))]).unwrap();
+
+        let column_err = extract_agg_key(&batch, 1, 0).unwrap_err();
+        assert!(matches!(column_err, ExecError::InvalidInput(_)));
+        assert!(column_err.to_string().contains("column index 1"));
+
+        let row_err = extract_agg_key(&batch, 0, 1).unwrap_err();
+        assert!(matches!(row_err, ExecError::InvalidInput(_)));
+        assert!(row_err.to_string().contains("row index 1"));
+    }
 }

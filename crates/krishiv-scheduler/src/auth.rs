@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use krishiv_governance::{AuthProvider, Principal, Role, StaticApiKeyAuthProvider};
 use krishiv_common::PRODUCTION_ENV;
+use krishiv_governance::{AuthProvider, Principal, Role, StaticApiKeyAuthProvider};
 
 // ── gRPC auth enforcement (P3-20) ─────────────────────────────────────────────
 

@@ -31,21 +31,57 @@ pub fn sync_scalar_udfs_with_limits(
     registry: &krishiv_udf::UdfRegistry,
     limits: ResourceLimits,
 ) -> Result<(), DataFusionError> {
-    let profile = krishiv_common::resolve_durability_profile();
-    if krishiv_common::profile_forbids_native_scalar_udfs(profile)
-        && !registry.scalar_names().is_empty()
-    {
+    sync_scalar_udfs_with_limits_for_profile(
+        ctx,
+        registry,
+        limits,
+        krishiv_common::resolve_durability_profile(),
+    )
+}
+
+/// Register scalar UDFs using one caller-resolved durability profile.
+///
+/// Passing the profile explicitly keeps policy validation stable for the
+/// duration of a higher-level registration operation.
+pub fn sync_scalar_udfs_with_limits_for_profile(
+    ctx: &datafusion::prelude::SessionContext,
+    registry: &krishiv_udf::UdfRegistry,
+    limits: ResourceLimits,
+    profile: krishiv_common::DurabilityProfile,
+) -> Result<(), DataFusionError> {
+    sync_scalar_udfs_with_limits_for_policy(
+        ctx,
+        registry,
+        limits,
+        krishiv_common::NativeScalarUdfPolicy::resolve(profile),
+    )
+}
+
+pub(crate) fn sync_scalar_udfs_with_limits_for_policy(
+    ctx: &datafusion::prelude::SessionContext,
+    registry: &krishiv_udf::UdfRegistry,
+    limits: ResourceLimits,
+    policy: krishiv_common::NativeScalarUdfPolicy,
+) -> Result<(), DataFusionError> {
+    let scalar_names = registry.scalar_names();
+    if scalar_names.iter().any(|name| name.trim().is_empty()) {
+        return Err(DataFusionError::External(
+            "scalar UDF name must not be empty".into(),
+        ));
+    }
+    if policy.is_forbidden() && !scalar_names.is_empty() {
         return Err(DataFusionError::External(
             format!(
-                "native scalar UDF registration is forbidden under durability profile '{profile}' \
-                 (set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1 to override)"
+                "native scalar UDF registration is forbidden under durability profile '{}' \
+                 (set KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS=1 to override)",
+                policy.profile()
             )
             .into(),
         ));
     }
 
     let limits = Arc::new(limits);
-    for name in registry.scalar_names() {
+    for name in scalar_names {
         let Some(udf) = registry.get_scalar(name) else {
             continue;
         };
@@ -324,10 +360,13 @@ impl TableFunctionImpl for KrishivTableFunctionImpl {
         args: &[datafusion::logical_expr::Expr],
     ) -> datafusion::error::Result<Arc<dyn TableProvider>> {
         // Extract literal scalar values from the DataFusion Expr arguments and
-        // pass them to the UDTF body.  Non-literal (computed) args are passed
-        // as Null — full expression evaluation requires async and would require
-        // a deeper DataFusion integration.
-        let scalar_args: Vec<krishiv_udf::ScalarValue> = args.iter().map(expr_to_scalar).collect();
+        // pass them to the UDTF body. Computed expressions cannot be evaluated
+        // correctly at this synchronous table-function boundary, so fail
+        // closed instead of silently replacing them with NULL.
+        let scalar_args: Vec<krishiv_udf::ScalarValue> =
+            args.iter()
+                .map(expr_to_scalar)
+                .collect::<datafusion::error::Result<_>>()?;
         let batch = self
             .inner
             .call(&scalar_args)
@@ -338,25 +377,61 @@ impl TableFunctionImpl for KrishivTableFunctionImpl {
 }
 
 /// Extract a [`krishiv_udf::ScalarValue`] from a DataFusion literal expression.
-/// Non-literal expressions are mapped to `ScalarValue::Null`.
-fn expr_to_scalar(expr: &datafusion::logical_expr::Expr) -> krishiv_udf::ScalarValue {
+fn expr_to_scalar(
+    expr: &datafusion::logical_expr::Expr,
+) -> datafusion::error::Result<krishiv_udf::ScalarValue> {
     use datafusion::logical_expr::Expr;
     use datafusion::scalar::ScalarValue as DfScalar;
     match expr {
-        Expr::Literal(DfScalar::Int8(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v as i64),
-        Expr::Literal(DfScalar::Int16(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v as i64),
-        Expr::Literal(DfScalar::Int32(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v as i64),
-        Expr::Literal(DfScalar::Int64(Some(v)), _) => krishiv_udf::ScalarValue::Int64(*v),
+        Expr::Literal(value, _) if value.is_null() => Ok(krishiv_udf::ScalarValue::Null),
+        Expr::Literal(DfScalar::Int8(Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+        }
+        Expr::Literal(DfScalar::Int16(Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+        }
+        Expr::Literal(DfScalar::Int32(Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+        }
+        Expr::Literal(DfScalar::Int64(Some(v)), _) => Ok(krishiv_udf::ScalarValue::Int64(*v)),
+        Expr::Literal(DfScalar::UInt8(Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+        }
+        Expr::Literal(DfScalar::UInt16(Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+        }
+        Expr::Literal(DfScalar::UInt32(Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Int64(i64::from(*v)))
+        }
+        Expr::Literal(DfScalar::UInt64(Some(v)), _) => i64::try_from(*v)
+            .map(krishiv_udf::ScalarValue::Int64)
+            .map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "UDTF unsigned integer argument {v} exceeds the supported i64 range"
+                ))
+            }),
         Expr::Literal(DfScalar::Float32(Some(v)), _) => {
-            krishiv_udf::ScalarValue::Float64(*v as f64)
+            Ok(krishiv_udf::ScalarValue::Float64(f64::from(*v)))
         }
-        Expr::Literal(DfScalar::Float64(Some(v)), _) => krishiv_udf::ScalarValue::Float64(*v),
+        Expr::Literal(DfScalar::Float64(Some(v)), _) => Ok(krishiv_udf::ScalarValue::Float64(*v)),
         Expr::Literal(DfScalar::Utf8(Some(v)), _)
+        | Expr::Literal(DfScalar::Utf8View(Some(v)), _)
         | Expr::Literal(DfScalar::LargeUtf8(Some(v)), _) => {
-            krishiv_udf::ScalarValue::Utf8(v.clone())
+            Ok(krishiv_udf::ScalarValue::Utf8(v.clone()))
         }
-        Expr::Literal(DfScalar::Boolean(Some(v)), _) => krishiv_udf::ScalarValue::Boolean(*v),
-        _ => krishiv_udf::ScalarValue::Null,
+        Expr::Literal(DfScalar::Boolean(Some(v)), _) => Ok(krishiv_udf::ScalarValue::Boolean(*v)),
+        Expr::Literal(DfScalar::Binary(Some(v)), _)
+        | Expr::Literal(DfScalar::BinaryView(Some(v)), _)
+        | Expr::Literal(DfScalar::LargeBinary(Some(v)), _)
+        | Expr::Literal(DfScalar::FixedSizeBinary(_, Some(v)), _) => {
+            Ok(krishiv_udf::ScalarValue::Bytes(v.clone()))
+        }
+        Expr::Literal(value, _) => Err(DataFusionError::Execution(format!(
+            "unsupported UDTF literal argument {value:?}"
+        ))),
+        other => Err(DataFusionError::Execution(format!(
+            "UDTF arguments must be scalar literals; got {other:?}"
+        ))),
     }
 }
 
@@ -418,7 +493,7 @@ fn columnar_values_to_record_batch(
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
-    use krishiv_udf::{ResourceLimits, UdfRegistry};
+    use krishiv_udf::{MultiplyScalarUdf, ResourceLimits, UdfRegistry};
 
     #[test]
     fn sync_scalar_udfs_with_limits_accepts_non_default_budget() {
@@ -438,5 +513,45 @@ mod tests {
         // captured in the closure. Real enforcement is proven in krishiv-udf tests.
         let res = sync_scalar_udfs_with_limits(&ctx, &registry, limits);
         assert!(res.is_ok(), "limits-aware UDF sync must succeed");
+    }
+
+    #[test]
+    fn explicit_durable_profile_rejects_native_scalar_udfs() {
+        let ctx = SessionContext::new();
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new("double", "x", 2)));
+
+        let error = sync_scalar_udfs_with_limits_for_policy(
+            &ctx,
+            &registry,
+            ResourceLimits::default(),
+            krishiv_common::NativeScalarUdfPolicy::from_decision(
+                krishiv_common::DurabilityProfile::SingleNodeDurable,
+                true,
+            ),
+        )
+        .expect_err("durable profile must reject native scalar UDFs");
+
+        assert!(error.to_string().contains("single-node-durable"));
+    }
+
+    #[test]
+    fn scalar_udf_sync_rejects_empty_names() {
+        let ctx = SessionContext::new();
+        let mut registry = UdfRegistry::new();
+        registry.register_scalar(Arc::new(MultiplyScalarUdf::new(" ", "x", 2)));
+
+        let error = sync_scalar_udfs_with_limits_for_policy(
+            &ctx,
+            &registry,
+            ResourceLimits::default(),
+            krishiv_common::NativeScalarUdfPolicy::from_decision(
+                krishiv_common::DurabilityProfile::DevLocal,
+                false,
+            ),
+        )
+        .expect_err("empty scalar UDF names must be rejected");
+
+        assert!(error.to_string().contains("must not be empty"));
     }
 }

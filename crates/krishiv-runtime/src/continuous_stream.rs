@@ -3,12 +3,56 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
 use krishiv_exec::ContinuousWindowExecutor;
 use krishiv_plan::window::WindowExecutionSpec;
 
-use crate::{RuntimeError, RuntimeResult};
+use crate::RuntimeResult;
+
+/// Typed failures for continuous job registration, input, and execution.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ContinuousStreamError {
+    #[error("continuous job id must not be empty")]
+    InvalidJobId,
+    #[error("continuous job '{job_id}' is already registered")]
+    JobAlreadyExists { job_id: String },
+    #[error("continuous job '{job_id}' was not found")]
+    JobNotFound { job_id: String },
+    #[error(
+        "continuous job '{job_id}' input queue is full: current={current}, \
+         attempted={attempted}, limit={limit}"
+    )]
+    QueueFull {
+        job_id: String,
+        current: usize,
+        attempted: usize,
+        limit: usize,
+    },
+    #[error(
+        "continuous job '{job_id}' input schema mismatch: expected {expected}, actual {actual}"
+    )]
+    SchemaMismatch {
+        job_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("continuous job '{job_id}' {component} lock poisoned during {operation}")]
+    LockPoisoned {
+        job_id: String,
+        component: &'static str,
+        operation: &'static str,
+    },
+    #[error("continuous job '{job_id}' execution failed: {message}")]
+    Execution { job_id: String, message: String },
+}
+
+#[derive(Debug, Default)]
+struct ContinuousInputState {
+    batches: VecDeque<RecordBatch>,
+    schema: Option<SchemaRef>,
+}
 
 /// One continuous streaming job registered on the session cluster.
 ///
@@ -20,7 +64,7 @@ struct ContinuousJobEntry {
     /// Immutable after registration; no lock required.
     spec: WindowExecutionSpec,
     /// Guarded separately so producers can push without waiting for drain.
-    input: Mutex<VecDeque<RecordBatch>>,
+    input: Mutex<ContinuousInputState>,
     /// Locked only during `drain_job` for the window computation itself.
     executor: Mutex<ContinuousWindowExecutor>,
 }
@@ -31,7 +75,11 @@ impl std::fmt::Debug for ContinuousJobEntry {
             .field("spec", &self.spec)
             .field(
                 "input_queue_len",
-                &self.input.lock().map(|q| q.len()).unwrap_or(0),
+                &self
+                    .input
+                    .lock()
+                    .map(|state| state.batches.len())
+                    .unwrap_or(0),
             )
             .finish_non_exhaustive()
     }
@@ -45,7 +93,7 @@ const DEFAULT_MAX_PENDING_BATCHES: usize = 1024;
 pub struct ContinuousStreamRegistry {
     jobs: DashMap<String, Arc<ContinuousJobEntry>>,
     /// Maximum number of pending (not yet drained) input batches per job.
-    /// `push_input` returns [`RuntimeError::InvalidState`] when this limit is
+    /// `push_input` returns [`ContinuousStreamError::QueueFull`] when this limit is
     /// reached so callers can apply backpressure instead of silently filling
     /// memory. Set to `usize::MAX` for unbounded behaviour (tests only).
     max_pending_batches: usize,
@@ -84,17 +132,29 @@ impl ContinuousStreamRegistry {
         job_id: impl Into<String>,
         spec: WindowExecutionSpec,
     ) -> RuntimeResult<()> {
-        let executor = ContinuousWindowExecutor::new(spec.clone())
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
-        self.jobs.insert(
-            job_id.into(),
-            Arc::new(ContinuousJobEntry {
-                spec,
-                input: Mutex::new(VecDeque::new()),
-                executor: Mutex::new(executor),
-            }),
-        );
-        Ok(())
+        let job_id = job_id.into();
+        if job_id.trim().is_empty() {
+            return Err(ContinuousStreamError::InvalidJobId.into());
+        }
+        let executor = ContinuousWindowExecutor::new(spec.clone()).map_err(|error| {
+            ContinuousStreamError::Execution {
+                job_id: job_id.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        match self.jobs.entry(job_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(ContinuousStreamError::JobAlreadyExists { job_id }.into())
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(ContinuousJobEntry {
+                    spec,
+                    input: Mutex::new(ContinuousInputState::default()),
+                    executor: Mutex::new(executor),
+                }));
+                Ok(())
+            }
+        }
     }
 
     /// Maximum input batches consumed by a single [`drain_job_up_to`] call.
@@ -106,7 +166,7 @@ impl ContinuousStreamRegistry {
 
     /// Enqueue input batches for a continuous job.
     ///
-    /// Returns [`RuntimeError::InvalidState`] when the job's input queue has
+    /// Returns [`ContinuousStreamError::QueueFull`] when the job's input queue has
     /// reached `max_pending_batches`. Callers should drain the job before
     /// pushing more data. This prevents unbounded memory accumulation when
     /// producers outrun consumers.
@@ -114,25 +174,66 @@ impl ContinuousStreamRegistry {
         let entry = self
             .jobs
             .get(job_id)
-            .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("continuous job '{job_id}': not found"),
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
             })?;
-        let mut queue = entry.input.lock().map_err(|_| {
-            RuntimeError::transport(format!(
-                "continuous job '{job_id}' input lock poisoned during push_input"
-            ))
-        })?;
-        let current_depth = queue.len();
-        if current_depth >= self.max_pending_batches {
-            return Err(RuntimeError::InvalidState {
-                message: format!(
-                    "continuous job '{job_id}': input queue is full ({current_depth} batches \
-                     pending, limit {limit}); call drain_job before pushing more data",
-                    limit = self.max_pending_batches,
-                ),
-            });
+        if batches.is_empty() {
+            return Ok(());
         }
-        queue.extend(batches);
+        let incoming_schema = batches[0].schema();
+        for batch in &batches[1..] {
+            if batch.schema() != incoming_schema {
+                return Err(ContinuousStreamError::SchemaMismatch {
+                    job_id: job_id.to_owned(),
+                    expected: format!("{incoming_schema:?}"),
+                    actual: format!("{:?}", batch.schema()),
+                }
+                .into());
+            }
+        }
+
+        let mut input = entry
+            .input
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "input",
+                operation: "push_input",
+            })?;
+        if let Some(expected_schema) = &input.schema
+            && expected_schema != &incoming_schema
+        {
+            return Err(ContinuousStreamError::SchemaMismatch {
+                job_id: job_id.to_owned(),
+                expected: format!("{expected_schema:?}"),
+                actual: format!("{incoming_schema:?}"),
+            }
+            .into());
+        }
+        let current = input.batches.len();
+        let attempted = batches.len();
+        let requested =
+            current
+                .checked_add(attempted)
+                .ok_or_else(|| ContinuousStreamError::QueueFull {
+                    job_id: job_id.to_owned(),
+                    current,
+                    attempted,
+                    limit: self.max_pending_batches,
+                })?;
+        if requested > self.max_pending_batches {
+            return Err(ContinuousStreamError::QueueFull {
+                job_id: job_id.to_owned(),
+                current,
+                attempted,
+                limit: self.max_pending_batches,
+            }
+            .into());
+        }
+        if input.schema.is_none() {
+            input.schema = Some(incoming_schema);
+        }
+        input.batches.extend(batches);
         Ok(())
     }
 
@@ -142,15 +243,18 @@ impl ContinuousStreamRegistry {
         let entry = self
             .jobs
             .get(job_id)
-            .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("continuous job '{job_id}': not found"),
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
             })?;
-        let queue = entry.input.lock().map_err(|_| {
-            RuntimeError::transport(format!(
-                "continuous job '{job_id}' input lock poisoned during pending_batch_depth"
-            ))
-        })?;
-        Ok(queue.len())
+        let input = entry
+            .input
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "input",
+                operation: "pending_batch_depth",
+            })?;
+        Ok(input.batches.len())
     }
 
     /// Drain up to `max_input_batches` pending input batches through the window
@@ -167,32 +271,62 @@ impl ContinuousStreamRegistry {
         let entry = self
             .jobs
             .get(job_id)
-            .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("continuous job '{job_id}': not found"),
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
             })?;
-        // Steal at most `max_input_batches` entries with a short critical section,
-        // then release the input lock before acquiring the executor lock.
+
+        // Serialize drains before selecting input so concurrent callers cannot
+        // process later batches ahead of earlier batches.
+        let mut exec = entry
+            .executor
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "executor",
+                operation: "drain_job",
+            })?;
+
+        // Clone Arrow batch handles while holding the short input lock. Keep
+        // the originals queued until the state transaction commits.
         let input: Vec<RecordBatch> = {
-            let mut queue = entry.input.lock().map_err(|_| {
-                RuntimeError::transport(format!(
-                    "continuous job '{job_id}' input lock poisoned during drain_job"
-                ))
-            })?;
-            let take = queue.len().min(max_input_batches);
-            queue.drain(..take).collect()
+            let input = entry
+                .input
+                .lock()
+                .map_err(|_| ContinuousStreamError::LockPoisoned {
+                    job_id: job_id.to_owned(),
+                    component: "input",
+                    operation: "drain_job",
+                })?;
+            input
+                .batches
+                .iter()
+                .take(max_input_batches)
+                .cloned()
+                .collect()
         };
         if input.is_empty() {
             return Ok(Vec::new());
         }
-        // Window computation runs under the executor lock only — producers are
-        // not blocked during this (potentially slow) aggregation step.
-        let mut exec = entry.executor.lock().map_err(|_| {
-            RuntimeError::transport(format!(
-                "continuous job '{job_id}' executor lock poisoned during drain_job"
-            ))
-        })?;
-        exec.drain(input)
-            .map_err(|e| RuntimeError::transport(e.to_string()))
+        let consumed = input.len();
+        let output =
+            exec.drain_transactional(input)
+                .map_err(|error| ContinuousStreamError::Execution {
+                    job_id: job_id.to_owned(),
+                    message: error.to_string(),
+                })?;
+
+        let mut queued = entry
+            .input
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "input",
+                operation: "commit drain_job",
+            })?;
+        for _ in 0..consumed {
+            let _ = queued.batches.pop_front();
+        }
+        Ok(output)
     }
 
     /// Drain ALL pending input batches through the window operator.
@@ -209,8 +343,8 @@ impl ContinuousStreamRegistry {
         let entry = self
             .jobs
             .get(job_id)
-            .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("continuous job '{job_id}': not found"),
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
             })?;
         Ok(entry.spec.clone())
     }
@@ -230,16 +364,24 @@ impl ContinuousStreamRegistry {
         let entry = self
             .jobs
             .get(job_id)
-            .ok_or_else(|| RuntimeError::InvalidState {
-                message: format!("continuous job '{job_id}': not found"),
+            .ok_or_else(|| ContinuousStreamError::JobNotFound {
+                job_id: job_id.to_owned(),
             })?;
-        let mut exec = entry.executor.lock().map_err(|_| {
-            RuntimeError::transport(format!(
-                "continuous job '{job_id}' executor lock poisoned during snapshot"
-            ))
-        })?;
-        exec.snapshot()
-            .map_err(|e| RuntimeError::transport(format!("snapshot failed: {e}")))
+        let mut exec = entry
+            .executor
+            .lock()
+            .map_err(|_| ContinuousStreamError::LockPoisoned {
+                job_id: job_id.to_owned(),
+                component: "executor",
+                operation: "snapshot",
+            })?;
+        exec.snapshot().map_err(|error| {
+            ContinuousStreamError::Execution {
+                job_id: job_id.to_owned(),
+                message: format!("snapshot failed: {error}"),
+            }
+            .into()
+        })
     }
 
     /// C9: Register a job and immediately restore its window state from a prior
@@ -256,29 +398,37 @@ impl ContinuousStreamRegistry {
     ) -> RuntimeResult<()> {
         use krishiv_exec::ContinuousWindowExecutor;
         let job_id = job_id.into();
-        let mut executor = ContinuousWindowExecutor::new(spec.clone())
-            .map_err(|e| RuntimeError::transport(e.to_string()))?;
+        if job_id.trim().is_empty() {
+            return Err(ContinuousStreamError::InvalidJobId.into());
+        }
+        let mut executor = ContinuousWindowExecutor::new(spec.clone()).map_err(|error| {
+            ContinuousStreamError::Execution {
+                job_id: job_id.clone(),
+                message: error.to_string(),
+            }
+        })?;
         // Restore window state from the snapshot before accepting new input.
-        let wm = executor.last_watermark_ms();
         if !snapshot_bytes.is_empty() {
             executor
                 .restore_from_snapshot(snapshot_bytes)
-                .map_err(|e| {
-                    RuntimeError::transport(format!(
-                        "continuous job '{job_id}' snapshot restore failed: {e}"
-                    ))
+                .map_err(|error| ContinuousStreamError::Execution {
+                    job_id: job_id.clone(),
+                    message: format!("snapshot restore failed: {error}"),
                 })?;
         }
-        let _ = wm; // watermark is embedded in restored state
-        self.jobs.insert(
-            job_id,
-            std::sync::Arc::new(ContinuousJobEntry {
-                spec,
-                input: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                executor: std::sync::Mutex::new(executor),
-            }),
-        );
-        Ok(())
+        match self.jobs.entry(job_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(ContinuousStreamError::JobAlreadyExists { job_id }.into())
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(ContinuousJobEntry {
+                    spec,
+                    input: Mutex::new(ContinuousInputState::default()),
+                    executor: Mutex::new(executor),
+                }));
+                Ok(())
+            }
+        }
     }
 
     /// List all registered job ids.
@@ -299,6 +449,7 @@ mod tests {
     use krishiv_plan::window::WindowExecutionSpec;
 
     use super::*;
+    use crate::RuntimeError;
 
     fn batch(ts: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -313,6 +464,15 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn invalid_batch_without_event_time() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Utf8,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a"])) as _]).unwrap()
     }
 
     #[test]
@@ -352,14 +512,20 @@ mod tests {
     fn push_input_unknown_job_fails() {
         let registry = ContinuousStreamRegistry::new();
         let err = registry.push_input("no-such-job", vec![]).unwrap_err();
-        assert!(matches!(err, RuntimeError::InvalidState { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::ContinuousStream(ContinuousStreamError::JobNotFound { .. })
+        ));
     }
 
     #[test]
     fn drain_unknown_job_fails() {
         let registry = ContinuousStreamRegistry::new();
         let err = registry.drain_job("no-such-job").unwrap_err();
-        assert!(matches!(err, RuntimeError::InvalidState { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::ContinuousStream(ContinuousStreamError::JobNotFound { .. })
+        ));
     }
 
     #[test]
@@ -385,7 +551,10 @@ mod tests {
     fn job_spec_unknown_job_fails() {
         let registry = ContinuousStreamRegistry::new();
         let err = registry.job_spec("no-such-job").unwrap_err();
-        assert!(matches!(err, RuntimeError::InvalidState { .. }));
+        assert!(matches!(
+            err,
+            RuntimeError::ContinuousStream(ContinuousStreamError::JobNotFound { .. })
+        ));
     }
 
     #[test]
@@ -404,16 +573,20 @@ mod tests {
     }
 
     #[test]
-    fn register_replaces_existing_job() {
+    fn register_rejects_existing_job_without_resetting_state() {
         let registry = ContinuousStreamRegistry::new();
         registry
             .register_job("j1", WindowExecutionSpec::tumbling("k", "ts", 5_000))
             .unwrap();
-        registry
+        let error = registry
             .register_job("j1", WindowExecutionSpec::tumbling("k", "ts", 20_000))
-            .unwrap();
+            .expect_err("duplicate registration must fail");
+        assert!(matches!(
+            error,
+            RuntimeError::ContinuousStream(ContinuousStreamError::JobAlreadyExists { .. })
+        ));
         let spec = registry.job_spec("j1").unwrap();
-        assert_eq!(spec.window_size_ms, 20_000);
+        assert_eq!(spec.window_size_ms, 5_000);
     }
 
     #[test]
@@ -490,8 +663,11 @@ mod tests {
         // Third push must fail: queue is at capacity.
         let err = registry.push_input("j-bp", vec![batch(3_000)]).unwrap_err();
         assert!(
-            matches!(err, RuntimeError::InvalidState { .. }),
-            "expected InvalidState backpressure error, got: {err:?}"
+            matches!(
+                err,
+                RuntimeError::ContinuousStream(ContinuousStreamError::QueueFull { .. })
+            ),
+            "expected typed backpressure error, got: {err:?}"
         );
         let msg = err.to_string();
         assert!(
@@ -616,5 +792,99 @@ mod tests {
             "drain_job_up_to(usize::MAX) must drain all batches"
         );
         assert!(!out.is_empty(), "closed window must produce output batches");
+    }
+
+    #[test]
+    fn multi_batch_push_is_admitted_atomically() {
+        let registry = ContinuousStreamRegistry::with_max_pending_batches(2);
+        registry
+            .register_job(
+                "j-atomic-capacity",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
+            .unwrap();
+
+        let error = registry
+            .push_input(
+                "j-atomic-capacity",
+                vec![batch(1_000), batch(2_000), batch(3_000)],
+            )
+            .expect_err("oversized push must fail as one unit");
+        assert!(matches!(
+            error,
+            RuntimeError::ContinuousStream(ContinuousStreamError::QueueFull {
+                current: 0,
+                attempted: 3,
+                limit: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            registry.pending_batch_depth("j-atomic-capacity").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn input_schema_is_bound_by_first_successful_push() {
+        let registry = ContinuousStreamRegistry::new();
+        registry
+            .register_job(
+                "j-schema",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
+            .unwrap();
+        registry.push_input("j-schema", vec![batch(1_000)]).unwrap();
+
+        let error = registry
+            .push_input("j-schema", vec![invalid_batch_without_event_time()])
+            .expect_err("schema changes must fail before enqueue");
+        assert!(matches!(
+            error,
+            RuntimeError::ContinuousStream(ContinuousStreamError::SchemaMismatch { .. })
+        ));
+        assert_eq!(registry.pending_batch_depth("j-schema").unwrap(), 1);
+    }
+
+    #[test]
+    fn failed_drain_keeps_input_queued() {
+        let registry = ContinuousStreamRegistry::new();
+        registry
+            .register_job(
+                "j-failed-drain",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
+            .unwrap();
+        registry
+            .push_input("j-failed-drain", vec![invalid_batch_without_event_time()])
+            .unwrap();
+
+        let error = registry
+            .drain_job("j-failed-drain")
+            .expect_err("invalid input must fail execution");
+        assert!(matches!(
+            error,
+            RuntimeError::ContinuousStream(ContinuousStreamError::Execution { .. })
+        ));
+        assert_eq!(
+            registry.pending_batch_depth("j-failed-drain").unwrap(),
+            1,
+            "failed cycle must not acknowledge or remove queued input"
+        );
+    }
+
+    #[test]
+    fn empty_job_id_is_rejected() {
+        let registry = ContinuousStreamRegistry::new();
+        let error = registry
+            .register_job(
+                "   ",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
+            .expect_err("blank job id must fail");
+        assert!(matches!(
+            error,
+            RuntimeError::ContinuousStream(ContinuousStreamError::InvalidJobId)
+        ));
     }
 }

@@ -151,12 +151,7 @@ impl LocalDiskShuffleStore {
                 path.display()
             ))),
             Ok(bytes) => crate::lease_persistence::decode_lease_token(&bytes)
-                .ok_or_else(|| {
-                    io_err(format!(
-                        "invalid shuffle lease file '{}'",
-                        path.display()
-                    ))
-                })
+                .ok_or_else(|| io_err(format!("invalid shuffle lease file '{}'", path.display())))
                 .map(Some),
         }
     }
@@ -179,15 +174,9 @@ impl LocalDiskShuffleStore {
         })
     }
 
-    fn resolve_lease_token(
-        &self,
-        id: &PartitionId,
-        incoming: u64,
-    ) -> ShuffleResult<u64> {
+    fn resolve_lease_token(&self, id: &PartitionId, incoming: u64) -> ShuffleResult<u64> {
         let key = (id.job_id.clone(), id.stage_id.clone(), id.partition);
-        let memory = shuffle_write_lock(&self.lease_tokens)?
-            .get(&key)
-            .copied();
+        let memory = shuffle_write_lock(&self.lease_tokens)?.get(&key).copied();
         let persisted = self.load_persisted_lease(id)?;
         let current = memory.or(persisted);
         let next = crate::lease_persistence::enforce_monotonic_lease(current, incoming)?;

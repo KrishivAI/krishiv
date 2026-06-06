@@ -139,6 +139,12 @@ pub struct Coordinator {
     pub(crate) batch_sql_job_tables: HashMap<JobId, Vec<crate::batch_sql::BatchSqlTable>>,
     /// Inline input partitions registered for coordinated batch-sql and bounded-window jobs.
     pub(crate) job_input_partitions: HashMap<JobId, Vec<krishiv_proto::InputPartition>>,
+    /// Task-scoped inline inputs for coordinator-partitioned jobs.
+    pub(crate) job_task_input_partitions:
+        HashMap<JobId, HashMap<TaskId, Vec<krishiv_proto::InputPartition>>>,
+    /// Continuous jobs with one coordinator-dispatched input cycle currently
+    /// assigned or executing. This fences concurrent pushes for the same job.
+    pub(crate) continuous_input_cycles: HashSet<JobId>,
 
     /// S1: Skew-aware repartitioning overrides. When a hot-key report exceeds
     /// the threshold, the affected job's stage is added here with a RoundRobin
@@ -170,6 +176,10 @@ impl fmt::Debug for Coordinator {
             .field("store", &self.store.as_ref().map(|_| "<store>"))
             .field("streaming_task_index_len", &self.streaming_task_index.len())
             .field("job_inline_results_len", &self.job_inline_results.len())
+            .field(
+                "job_task_input_partitions_len",
+                &self.job_task_input_partitions.len(),
+            )
             .finish()
     }
 }
@@ -705,6 +715,8 @@ impl Coordinator {
             job_inline_results: HashMap::new(),
             batch_sql_job_tables: HashMap::new(),
             job_input_partitions: HashMap::new(),
+            job_task_input_partitions: HashMap::new(),
+            continuous_input_cycles: HashSet::new(),
             skew_repartition_overrides: HashMap::new(),
             notify: Arc::new(Notify::new()),
             job_coordinators: HashMap::new(),
@@ -766,9 +778,8 @@ impl Coordinator {
         store: impl MetadataStore + 'static,
         fail_closed_writes: bool,
     ) -> Self {
-        self.store = Some(
-            NonBlockingStoreHandle::new(store).with_fail_closed_writes(fail_closed_writes),
-        );
+        self.store =
+            Some(NonBlockingStoreHandle::new(store).with_fail_closed_writes(fail_closed_writes));
         self
     }
 
