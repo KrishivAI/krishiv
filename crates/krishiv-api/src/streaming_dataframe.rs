@@ -19,7 +19,8 @@ use crate::error::{KrishivError, Result};
 type ExecStream =
     Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, krishiv_exec::ExecError>> + Send>>;
 
-pub type KrishivStream = krishiv_plan::SendableRecordBatchStream;
+pub type KrishivStream =
+    Pin<Box<dyn futures::stream::Stream<Item = std::result::Result<RecordBatch, String>> + Send>>;
 
 const SIDE_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 

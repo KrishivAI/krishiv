@@ -1,5 +1,40 @@
 # Krishiv Implementation Status
 
+## krishiv-plan Full Audit Resolution (2026-06-06)
+
+Implemented the complete `krishiv-plan` audit resolution plan. No deprecated code, no backward compatibility shims.
+
+### Phase 1 — P0 critical fixes
+- **`NodeOp` consolidation** (`lib.rs`): Replaced `TumblingWindow`, `SlidingWindow`, `SessionWindow` with a single `Window { spec: Box<WindowExecutionSpec> }` variant. All data from `WindowExecutionSpec` is now preserved (key_column_type, watermark_lag_ms, multi-agg). Updated all consumers: `lowering.rs`, `task_fragment.rs`, `streaming_plan.rs`, `krishiv-runtime/src/plan.rs`, scheduler and runtime integration tests.
+- **Lossless window encoding** (`lowering.rs`): `node_op_to_fragment` now calls `encode_window_execution_spec` (lossless JSON prefix `stream:spec:v1:`) instead of lossy `encode_stream_fragment`. Session window encoding bug (window_size_ms=0) eliminated.
+- **Strict window validation** (`window.rs`): `validate_window_execution_spec` now rejects sliding windows without explicit `slide_ms` and session windows without explicit `session_gap_ms`.
+
+### Phase 2 — P1 fixes
+- **`task_fragment.rs`**: Added `KeyBy` and `StateTtl` to streaming classification in `execution_kind_from_legacy`. Deepened `validate_job_fragments` to also validate embedded window specs. Fixed `task_body_for_profile` to avoid `.trim().to_owned()` allocation when body has no surrounding whitespace.
+- **`diff_plans`** (`lib.rs`): Now compares inputs, partitioning, estimated_rows, and output_schema in addition to label and op. Added `#[must_use]`.
+- **`streaming_plan.rs`**: `logical_plan_for_window` now returns `Result<LogicalPlan, PlanError>` and calls `validate_window_execution_spec`. Fixed slide_ms fallback.
+
+### Phase 3 — P2 design fixes
+- **`graph.rs`**: Reject duplicate input edges within the same node.
+- **`streaming.rs`**: Added `serde` derives, constructors with validation, and tests for `TemporalJoinSpec`, `IntervalJoinSpec`, `SideOutput`.
+- **`r17.rs`**: Fixed `im` typo, added constructors with validation, tests for all types (DataSource, EmbedderConfig, VectorSinkPlanConfig, RefreshPolicy, RagIndexSpec, FeatureDef, FeatureSchema, FeatureStore).
+
+### Phase 4 — P3 polish
+- **`describe_plan`** (`lib.rs`): Replaced `push_str(&format!(...))` loops with `write!` macro. Added `#[must_use]` to `with_coalesced_partition_count`.
+- **`SendableRecordBatchStream` removed** from `krishiv-plan`. Moved to `krishiv-api::streaming_dataframe::KrishivStream`. Removed `arrow` and `futures` from `krishiv-plan/Cargo.toml`. Updated `krishiv-sql` (local `SqlStream` alias), `krishiv-python`, `krishiv-api`.
+- Removed public exports of `encode_task_fragment` and `decode_task_fragment` from `krishiv-plan`. Only `encode_typed_task_fragment` is public.
+
+Validation:
+```bash
+cargo check --workspace                            # ✓
+cargo test -p krishiv-plan --lib                   # ✓ 77 passed
+cargo test -p krishiv-runtime --lib                # ✓ 304 passed
+cargo test -p krishiv-scheduler --lib              # ✓ 282 passed
+cargo test -p krishiv-executor --lib               # ✓ 183 passed
+```
+
+---
+
 ## krishiv-proto Wire Audit Resolution (2026-06-06)
 
 Implemented the full `krishiv-proto` audit resolution plan. All P0/P1 bugs fixed, management wire conversions added.

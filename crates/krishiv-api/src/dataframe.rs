@@ -24,7 +24,7 @@ pub enum ExecutionResult {
     /// Query produced a finite set of record batches.
     Batch(Vec<RecordBatch>),
     /// Query produces an unbounded stream of record batches.
-    Stream(krishiv_plan::SendableRecordBatchStream),
+    Stream(crate::streaming_dataframe::KrishivStream),
 }
 
 impl ExecutionResult {
@@ -310,7 +310,7 @@ impl DataFrame {
     }
 
     /// Asynchronously execute and return a record batch stream.
-    pub async fn execute_stream_async(&self) -> Result<krishiv_plan::SendableRecordBatchStream> {
+    pub async fn execute_stream_async(&self) -> Result<crate::streaming_dataframe::KrishivStream> {
         let job_id = self.start_job("local-streaming");
         self.update_job(&job_id, "local-streaming", JobState::Running);
 
@@ -339,7 +339,7 @@ impl DataFrame {
                 )
                 .await?;
                 let stream = futures::stream::iter(batches.into_iter().map(Ok));
-                Ok(Box::pin(stream) as krishiv_plan::SendableRecordBatchStream)
+                Ok(Box::pin(stream) as crate::streaming_dataframe::KrishivStream)
             } else {
                 Err(KrishivError::unsupported(
                     "remote execution requires a SQL query",

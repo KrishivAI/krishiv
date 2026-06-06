@@ -1,10 +1,14 @@
 //! Build streaming [`PhysicalPlan`] values from window configuration.
 
-use crate::window::WindowExecutionSpec;
+use crate::window::{WindowExecutionSpec, validate_window_execution_spec};
 use crate::{ExecutionKind, LogicalPlan, PhysicalPlan, PlanError, PlanNode, lower_to_physical};
 
 /// Build a logical streaming plan for a bounded windowed collect.
-pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSpec) -> LogicalPlan {
+pub fn logical_plan_for_window(
+    name: impl Into<String>,
+    spec: &WindowExecutionSpec,
+) -> Result<LogicalPlan, PlanError> {
+    validate_window_execution_spec(spec)?;
     let name = name.into();
     let mut plan = LogicalPlan::new(name.clone(), ExecutionKind::Streaming);
     plan.add_node(PlanNode::new(
@@ -23,30 +27,11 @@ pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSp
         })
         .with_inputs(["source".to_string()]),
     );
-    let window_op = match spec.window_kind {
-        crate::window::WindowKind::Tumbling => crate::NodeOp::TumblingWindow {
-            key_column: spec.key_column.clone(),
-            event_time_column: spec.event_time_column.clone(),
-            window_size_ms: spec.window_size_ms,
-            aggs: spec.agg_exprs.clone(),
-        },
-        crate::window::WindowKind::Sliding => crate::NodeOp::SlidingWindow {
-            key_column: spec.key_column.clone(),
-            event_time_column: spec.event_time_column.clone(),
-            window_size_ms: spec.window_size_ms,
-            slide_ms: spec.slide_ms.unwrap_or(spec.window_size_ms),
-            aggs: spec.agg_exprs.clone(),
-        },
-        crate::window::WindowKind::Session => crate::NodeOp::SessionWindow {
-            key_column: spec.key_column.clone(),
-            event_time_column: spec.event_time_column.clone(),
-            session_gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
-            aggs: spec.agg_exprs.clone(),
-        },
-    };
     plan.add_node(
         PlanNode::new("window", "window".to_string(), ExecutionKind::Streaming)
-            .with_op(window_op)
+            .with_op(crate::NodeOp::Window {
+                spec: Box::new(spec.clone()),
+            })
             .with_inputs(["keyby".to_string()]),
     );
     if let Some(ttl_ms) = spec.state_ttl_ms {
@@ -60,7 +45,7 @@ pub fn logical_plan_for_window(name: impl Into<String>, spec: &WindowExecutionSp
             .with_inputs(["window".to_string()]),
         );
     }
-    plan
+    Ok(plan)
 }
 
 /// Lower a window spec to a physical plan (copies logical nodes with ops).
@@ -68,7 +53,7 @@ pub fn physical_plan_for_window(
     name: impl Into<String>,
     spec: &WindowExecutionSpec,
 ) -> Result<PhysicalPlan, PlanError> {
-    let logical = logical_plan_for_window(name, spec);
+    let logical = logical_plan_for_window(name, spec)?;
     lower_to_physical(&logical)
 }
 
@@ -84,5 +69,15 @@ mod tests {
         assert_eq!(physical.kind(), ExecutionKind::Streaming);
         assert!(physical.nodes().len() >= 3);
         physical.validate().expect("valid physical graph");
+    }
+
+    #[test]
+    fn logical_plan_for_window_validates_spec() {
+        use crate::window::{WindowExecutionSpec, WindowKind};
+        let mut spec = WindowExecutionSpec::tumbling("k", "ts", 1000);
+        spec.window_kind = WindowKind::Sliding;
+        // slide_ms is None — must fail after strict validation
+        let err = logical_plan_for_window("test", &spec).expect_err("should require slide_ms");
+        assert!(err.to_string().contains("slide_ms"), "unexpected: {err}");
     }
 }

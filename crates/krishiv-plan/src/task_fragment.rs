@@ -34,13 +34,13 @@ impl TypedTaskFragment {
         if fragment.starts_with("stream:") {
             return ExecutionKind::Streaming;
         }
-        if let Some(op) = crate::decode_task_fragment(fragment) {
+        if let Some(op) = crate::lowering::decode_task_fragment(fragment) {
             return match op {
-                NodeOp::TumblingWindow { .. }
-                | NodeOp::SlidingWindow { .. }
-                | NodeOp::SessionWindow { .. }
+                NodeOp::Window { .. }
                 | NodeOp::StreamSource { .. }
-                | NodeOp::Watermark { .. } => ExecutionKind::Streaming,
+                | NodeOp::Watermark { .. }
+                | NodeOp::KeyBy { .. }
+                | NodeOp::StateTtl { .. } => ExecutionKind::Streaming,
                 _ => ExecutionKind::Batch,
             };
         }
@@ -80,10 +80,11 @@ pub fn task_body_for_profile(
     fragment: &str,
     profile: krishiv_common::DurabilityProfile,
 ) -> Result<String, PlanError> {
-    Ok(TypedTaskFragment::decode_for_profile(fragment, profile)?
-        .body
-        .trim()
-        .to_owned())
+    let body = TypedTaskFragment::decode_for_profile(fragment, profile)?.body;
+    if body.len() == body.trim().len() {
+        return Ok(body);
+    }
+    Ok(body.trim().to_owned())
 }
 
 /// Validate every task fragment in a job spec.
@@ -93,7 +94,20 @@ pub fn validate_job_fragments(
 ) -> Result<(), PlanError> {
     for stage in spec.stages() {
         for task in stage.tasks() {
-            TypedTaskFragment::decode_for_profile(task.description(), profile)?;
+            let typed = TypedTaskFragment::decode_for_profile(task.description(), profile)?;
+            // Validate window specs embedded in the fragment body.
+            if typed.body.starts_with(crate::window::WINDOW_EXECUTION_SPEC_PREFIX) {
+                crate::window::decode_window_execution_spec(&typed.body)?;
+            } else if typed.body.starts_with("stream:tw:")
+                || typed.body.starts_with("stream:sw:")
+                || typed.body.starts_with("stream:ses:")
+            {
+                crate::window::decode_window_execution_spec(&typed.body)?;
+            } else if let Some(op) = crate::lowering::decode_task_fragment(&typed.body) {
+                if let NodeOp::Window { spec } = op {
+                    crate::window::validate_window_execution_spec(&spec)?;
+                }
+            }
         }
     }
     Ok(())
@@ -101,7 +115,7 @@ pub fn validate_job_fragments(
 
 /// Encode a plan node as a typed task fragment string for the scheduler/executor.
 pub fn encode_typed_task_fragment(node: &PlanNode) -> Result<String, PlanError> {
-    let body = crate::encode_task_fragment(node);
+    let body = crate::lowering::encode_task_fragment(node);
     TypedTaskFragment::new(node.kind(), body).encode()
 }
 
@@ -117,13 +131,10 @@ mod tests {
 
     #[test]
     fn round_trip_typed_fragment() {
-        let node =
-            PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
-                key_column: String::new(),
-                event_time_column: String::new(),
-                window_size_ms: 1_000,
-                aggs: vec![],
-            });
+        use crate::window::WindowExecutionSpec;
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 1_000);
+        let node = PlanNode::new("w", "win", ExecutionKind::Streaming)
+            .with_op(NodeOp::Window { spec: Box::new(spec) });
         let encoded = encode_typed_task_fragment(&node).expect("encode");
         let decoded = TypedTaskFragment::decode_or_legacy(&encoded);
         assert_eq!(decoded.execution_kind, ExecutionKind::Streaming);

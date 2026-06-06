@@ -43,6 +43,11 @@ pub use streaming::{ContinuousInputError, ContinuousTableInput};
 /// SQL result alias.
 pub type SqlResult<T> = Result<T, SqlError>;
 
+/// Pinned stream of record batches with `String` error type.
+pub type SqlStream = std::pin::Pin<
+    Box<dyn futures::stream::Stream<Item = Result<RecordBatch, String>> + Send>,
+>;
+
 // ── Plan cache (single-lock, race-free) ──────────────────────────────────────
 
 /// Whether the [`SqlEngine`] internal builder should attempt to register the
@@ -1300,7 +1305,7 @@ pub trait KrishivDataFrameOps: Send + Sync {
     /// The original SQL query string, if any.
     fn query(&self) -> Option<&str>;
     /// Execute and return a record batch stream.
-    async fn execute_stream(&self) -> SqlResult<krishiv_plan::SendableRecordBatchStream>;
+    async fn execute_stream(&self) -> SqlResult<SqlStream>;
 }
 
 /// Krishiv-owned wrapper around a DataFusion DataFrame.
@@ -1362,7 +1367,7 @@ impl SqlDataFrame {
     }
 
     /// Execute and return a record batch stream.
-    pub async fn execute_stream(&self) -> SqlResult<krishiv_plan::SendableRecordBatchStream> {
+    pub async fn execute_stream(&self) -> SqlResult<SqlStream> {
         let df_stream = self.dataframe.clone().execute_stream().await?;
         use futures::StreamExt;
         let mapped = df_stream.map(|res| res.map_err(|e| e.to_string()));
@@ -1431,7 +1436,7 @@ impl KrishivDataFrameOps for SqlDataFrame {
     fn query(&self) -> Option<&str> {
         SqlDataFrame::query(self)
     }
-    async fn execute_stream(&self) -> SqlResult<krishiv_plan::SendableRecordBatchStream> {
+    async fn execute_stream(&self) -> SqlResult<SqlStream> {
         SqlDataFrame::execute_stream(self).await
     }
 }

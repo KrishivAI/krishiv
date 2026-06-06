@@ -4255,8 +4255,6 @@ dependencies = [
 name = "krishiv-plan"
 version = "0.1.0"
 dependencies = [
- "arrow",
- "futures",
  "krishiv-common",
  "krishiv-proto",
  "serde",

@@ -1,6 +1,6 @@
 //! Physical plan lowering: typed [`NodeOp`] → executor task fragments (ADR-DIST-04).
 
-use crate::window::{WindowAgg, WindowExecutionSpec, WindowKind, encode_stream_fragment};
+use crate::window::{encode_window_execution_spec};
 use crate::{NodeOp, PlanNode};
 use krishiv_common::validate::{is_safe_identifier, validate_safe_id};
 
@@ -40,49 +40,7 @@ pub fn decode_task_fragment(fragment: &str) -> Option<NodeOp> {
 
 fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
     match op {
-        NodeOp::TumblingWindow {
-            key_column,
-            event_time_column,
-            window_size_ms,
-            aggs,
-        } => Some(encode_stream_fragment(&window_spec(
-            WindowKind::Tumbling,
-            key_column.clone(),
-            event_time_column.clone(),
-            *window_size_ms,
-            None,
-            None,
-            aggs,
-        ))),
-        NodeOp::SlidingWindow {
-            key_column,
-            event_time_column,
-            window_size_ms,
-            slide_ms,
-            aggs,
-        } => Some(encode_stream_fragment(&window_spec(
-            WindowKind::Sliding,
-            key_column.clone(),
-            event_time_column.clone(),
-            *window_size_ms,
-            Some(*slide_ms),
-            None,
-            aggs,
-        ))),
-        NodeOp::SessionWindow {
-            key_column,
-            event_time_column,
-            session_gap_ms,
-            aggs,
-        } => Some(encode_stream_fragment(&window_spec(
-            WindowKind::Session,
-            key_column.clone(),
-            event_time_column.clone(),
-            0,
-            None,
-            Some(*session_gap_ms),
-            aggs,
-        ))),
+        NodeOp::Window { spec } => encode_window_execution_spec(spec).ok(),
         NodeOp::Scan { table, .. } => {
             // Validate and quote the table identifier to prevent SQL injection
             // through the fragment string. Double-quoted identifiers are the
@@ -109,35 +67,6 @@ fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
     }
 }
 
-fn window_spec(
-    window_kind: WindowKind,
-    key_column: String,
-    event_time_column: String,
-    window_size_ms: u64,
-    slide_ms: Option<u64>,
-    session_gap_ms: Option<u64>,
-    aggs: &[WindowAgg],
-) -> WindowExecutionSpec {
-    WindowExecutionSpec {
-        key_column,
-        key_column_type: String::from("utf8"),
-        event_time_column,
-        watermark_lag_ms: 0,
-        window_kind,
-        window_size_ms,
-        slide_ms,
-        session_gap_ms,
-        agg_exprs: if aggs.is_empty() {
-            WindowExecutionSpec::default_count_agg()
-        } else {
-            aggs.to_vec()
-        },
-        state_ttl_ms: None,
-        source_watermark_lags: std::collections::HashMap::new(),
-        source_id_column: None,
-    }
-}
-
 fn legacy_node_description(node: &PlanNode) -> String {
     if node.inputs().is_empty() {
         format!("{} [{}] {}", node.id(), node.kind(), node.label())
@@ -158,18 +87,15 @@ mod tests {
     use crate::PlanNode;
 
     #[test]
-    fn tumbling_node_op_lowers_to_stream_fragment() {
+    fn window_node_op_lowers_to_lossless_stream_fragment() {
         use crate::ExecutionKind;
-        let node = PlanNode::new("w1", "window", ExecutionKind::Streaming).with_op(
-            NodeOp::TumblingWindow {
-                key_column: String::new(),
-                event_time_column: String::new(),
-                window_size_ms: 5_000,
-                aggs: vec![WindowAgg::count("count")],
-            },
-        );
+        use crate::window::{WindowExecutionSpec, WindowAgg};
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 5_000);
+        let node = PlanNode::new("w1", "window", ExecutionKind::Streaming)
+            .with_op(NodeOp::Window { spec: Box::new(spec) });
         let frag = encode_task_fragment(&node);
-        assert!(frag.starts_with("stream:tw:"));
+        assert!(frag.starts_with("stream:spec:v1:"), "expected lossless format, got: {frag}");
+        let _ = WindowAgg::count("count");
     }
 
     #[test]

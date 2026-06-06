@@ -167,18 +167,35 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
             "window_size_ms must be greater than zero",
         )));
     }
-    if spec.window_kind == WindowKind::Sliding && spec.slide_ms.unwrap_or(spec.window_size_ms) == 0
-    {
-        return Err(PlanError::Validation(String::from(
-            "sliding window slide_ms must be greater than zero",
-        )));
+    if spec.window_kind == WindowKind::Sliding {
+        match spec.slide_ms {
+            None => {
+                return Err(PlanError::Validation(String::from(
+                    "sliding window requires explicit slide_ms",
+                )));
+            }
+            Some(0) => {
+                return Err(PlanError::Validation(String::from(
+                    "sliding window slide_ms must be greater than zero",
+                )));
+            }
+            Some(_) => {}
+        }
     }
-    if spec.window_kind == WindowKind::Session
-        && spec.session_gap_ms.unwrap_or(spec.window_size_ms) == 0
-    {
-        return Err(PlanError::Validation(String::from(
-            "session window session_gap_ms must be greater than zero",
-        )));
+    if spec.window_kind == WindowKind::Session {
+        match spec.session_gap_ms {
+            None => {
+                return Err(PlanError::Validation(String::from(
+                    "session window requires explicit session_gap_ms",
+                )));
+            }
+            Some(0) => {
+                return Err(PlanError::Validation(String::from(
+                    "session window session_gap_ms must be greater than zero",
+                )));
+            }
+            Some(_) => {}
+        }
     }
     if spec.state_ttl_ms == Some(0) {
         return Err(PlanError::Validation(String::from(

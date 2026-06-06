@@ -20,7 +20,9 @@ pub use dataframe::{DataFrame, ExecutionResult};
 pub use error::{KrishivError, Result};
 pub use session::{Session, SessionBuilder};
 pub use stream::{KeyedStream, Stream};
-pub use streaming_dataframe::{NamedSideOutputStream, StreamingDataFrame, StreamingOutputStreams};
+pub use streaming_dataframe::{
+    KrishivStream, NamedSideOutputStream, StreamingDataFrame, StreamingOutputStreams,
+};
 pub use types::{DeploymentTarget, ExecutionMode, QueryResult, StreamBatch, StreamMode};
 pub use window::{
     MultiSourceWatermarkSpec, SessionWindowedStream, SlidingWindowedStream, StateTtlConfig,

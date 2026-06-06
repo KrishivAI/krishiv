@@ -25,8 +25,8 @@ async fn in_process_batch_job_submits_with_plan_op_lowering() {
         table: String::from("t"),
         filters: vec![],
     });
-    let fragment = krishiv_plan::encode_task_fragment(&node);
-    assert!(fragment.starts_with("sql:"));
+    let fragment = krishiv_plan::encode_typed_task_fragment(&node).expect("encode");
+    assert!(fragment.contains("sql:"));
     let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage")
         .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), fragment));
     let spec = JobSpec::new(job_id.clone(), "e2e", JobKind::Batch).with_stage(stage);
@@ -39,16 +39,13 @@ async fn in_process_batch_job_submits_with_plan_op_lowering() {
 
 #[test]
 fn in_process_streaming_window_lowers_to_stream_fragment() {
-    use krishiv_plan::window::WindowAgg;
-    let node =
-        PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
-            key_column: String::new(),
-            event_time_column: String::new(),
-            window_size_ms: 1_000,
-            aggs: vec![WindowAgg::count("count")],
-        });
-    let frag = krishiv_plan::encode_task_fragment(&node);
-    assert!(frag.starts_with("stream:tw:"));
+    use krishiv_plan::window::WindowExecutionSpec;
+    use krishiv_plan::encode_typed_task_fragment;
+    let spec = WindowExecutionSpec::tumbling("user_id", "ts", 1_000);
+    let node = PlanNode::new("w", "win", ExecutionKind::Streaming)
+        .with_op(NodeOp::Window { spec: Box::new(spec) });
+    let frag = encode_typed_task_fragment(&node).expect("encode");
+    assert!(frag.contains("stream:spec:v1:"), "expected lossless format, got: {frag}");
     let plan = PhysicalPlan::new("stream-plan", ExecutionKind::Streaming).with_node(node);
     assert_eq!(plan.kind(), ExecutionKind::Streaming);
 }

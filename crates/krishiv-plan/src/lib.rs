@@ -164,33 +164,9 @@ pub enum NodeOp {
         event_time_column: String,
         lag_ms: u64,
     },
-    /// Tumbling event-time window.
-    TumblingWindow {
-        #[serde(default)]
-        key_column: String,
-        #[serde(default)]
-        event_time_column: String,
-        window_size_ms: u64,
-        aggs: Vec<window::WindowAgg>,
-    },
-    /// Sliding event-time window.
-    SlidingWindow {
-        #[serde(default)]
-        key_column: String,
-        #[serde(default)]
-        event_time_column: String,
-        window_size_ms: u64,
-        slide_ms: u64,
-        aggs: Vec<window::WindowAgg>,
-    },
-    /// Session window on inactivity gap.
-    SessionWindow {
-        #[serde(default)]
-        key_column: String,
-        #[serde(default)]
-        event_time_column: String,
-        session_gap_ms: u64,
-        aggs: Vec<window::WindowAgg>,
+    /// Windowed streaming operator (tumbling, sliding, or session window).
+    Window {
+        spec: Box<window::WindowExecutionSpec>,
     },
     /// Bounded or unbounded stream source.
     StreamSource { source_id: String, bounded: bool },
@@ -508,6 +484,7 @@ impl PhysicalPlan {
     }
 
     /// Set the coalesced partition count (called by `CoalesceRule::apply`).
+    #[must_use]
     pub fn with_coalesced_partition_count(mut self, count: usize) -> Self {
         self.coalesced_partition_count = Some(count);
         self
@@ -557,6 +534,7 @@ impl PhysicalPlan {
 }
 
 fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[PlanNode]) -> String {
+    use std::fmt::Write;
     let mut output = format!("{plan_type} plan: {name}\nkind: {kind}\nnodes:");
     if nodes.is_empty() {
         output.push_str(" <empty>");
@@ -564,23 +542,18 @@ fn describe_plan(plan_type: &str, name: &str, kind: ExecutionKind, nodes: &[Plan
     }
 
     for node in nodes {
-        output.push_str(&format!(
-            "\n- {} [{}] {}",
-            node.id(),
-            node.kind(),
-            node.label()
-        ));
+        write!(output, "\n- {} [{}] {}", node.id(), node.kind(), node.label()).unwrap();
         if !node.inputs().is_empty() {
-            output.push_str(&format!(" <- {}", node.inputs().join(", ")));
+            write!(output, " <- {}", node.inputs().join(", ")).unwrap();
         }
         if node.partitioning() != &Partitioning::Unpartitioned {
-            output.push_str(&format!(" [partitioning: {}]", node.partitioning()));
+            write!(output, " [partitioning: {}]", node.partitioning()).unwrap();
         }
         if node.broadcast_eligible() {
             output.push_str(" [broadcast-eligible]");
         }
         if let Some(rows) = node.estimated_rows() {
-            output.push_str(&format!(" [est-rows: {rows}]"));
+            write!(output, " [est-rows: {rows}]").unwrap();
         }
     }
 
@@ -612,8 +585,10 @@ impl PlanDiff {
 
 /// Compute the structural diff between two physical plans.
 ///
-/// Nodes are matched by id. A node is "changed" if its label or operator type
-/// differs between `before` and `after`.
+/// Nodes are matched by id. A node is "changed" if any of its label, operator,
+/// inputs, partitioning, estimated row count, or output schema differs between
+/// `before` and `after`.
+#[must_use]
 pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
     use std::collections::HashMap;
 
@@ -628,8 +603,13 @@ pub fn diff_plans(before: &PhysicalPlan, after: &PhysicalPlan) -> PlanDiff {
         match before_map.get(id) {
             None => added.push((*id).to_owned()),
             Some(before_node) => {
-                if before_node.label() != after_node.label() || before_node.op() != after_node.op()
-                {
+                let structurally_different = before_node.label() != after_node.label()
+                    || before_node.op() != after_node.op()
+                    || before_node.inputs() != after_node.inputs()
+                    || before_node.partitioning() != after_node.partitioning()
+                    || before_node.estimated_rows() != after_node.estimated_rows()
+                    || before_node.output_schema() != after_node.output_schema();
+                if structurally_different {
                     changed.push((*id).to_owned());
                 }
             }
@@ -901,5 +881,55 @@ mod tests {
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.changed, vec!["n1"]);
+    }
+
+    #[test]
+    fn diff_plans_detects_changed_partitioning() {
+        let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
+        before.add_node(
+            PlanNode::new("n1", "label", ExecutionKind::Batch)
+                .with_partitioning(Partitioning::Unpartitioned),
+        );
+        let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
+        after.add_node(
+            PlanNode::new("n1", "label", ExecutionKind::Batch)
+                .with_partitioning(Partitioning::Broadcast),
+        );
+        let diff = super::diff_plans(&before, &after);
+        assert_eq!(diff.changed, vec!["n1"]);
+    }
+
+    #[test]
+    fn diff_plans_detects_changed_estimated_rows() {
+        let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
+        before.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(100)));
+        let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
+        after.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch).with_estimated_rows(Some(200)));
+        let diff = super::diff_plans(&before, &after);
+        assert_eq!(diff.changed, vec!["n1"]);
+    }
+
+    #[test]
+    fn diff_plans_detects_changed_inputs() {
+        let mut before = PhysicalPlan::new("test", ExecutionKind::Batch);
+        before.add_node(PlanNode::new("src", "source", ExecutionKind::Batch));
+        before.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch).with_inputs(["src"]));
+        let mut after = PhysicalPlan::new("test", ExecutionKind::Batch);
+        after.add_node(PlanNode::new("src", "source", ExecutionKind::Batch));
+        after.add_node(PlanNode::new("n1", "label", ExecutionKind::Batch)); // no inputs
+        let diff = super::diff_plans(&before, &after);
+        assert_eq!(diff.changed, vec!["n1"]);
+    }
+
+    #[test]
+    fn graph_rejects_duplicate_input_edges() {
+        let plan = LogicalPlan::new("dup-edges", ExecutionKind::Batch)
+            .with_node(PlanNode::new("src", "source", ExecutionKind::Batch))
+            .with_node(
+                PlanNode::new("n1", "node", ExecutionKind::Batch)
+                    .with_inputs(["src", "src"]),
+            );
+        let err = plan.validate().expect_err("duplicate inputs must fail");
+        assert!(err.to_string().contains("duplicate input"), "unexpected: {err}");
     }
 }

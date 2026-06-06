@@ -99,7 +99,7 @@ impl PyDataFrame {
 
 #[pyclass(name = "DataFrameStream")]
 pub struct PyDataFrameStream {
-    stream: std::sync::Arc<tokio::sync::Mutex<krishiv_plan::SendableRecordBatchStream>>,
+    stream: std::sync::Arc<tokio::sync::Mutex<krishiv_api::KrishivStream>>,
 }
 
 #[pymethods]

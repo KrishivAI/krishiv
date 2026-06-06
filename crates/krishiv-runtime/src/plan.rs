@@ -1,7 +1,7 @@
 //! Physical plan classification helpers (ADR-12.5).
 
 use krishiv_exec::{AggExpr, AggFunction};
-use krishiv_plan::window::WindowAggKind;
+use krishiv_plan::window::{WindowAggKind, WindowKind};
 use krishiv_plan::{ExecutionKind, NodeOp, PhysicalPlan};
 
 use crate::RuntimeError;
@@ -37,6 +37,8 @@ pub fn streaming_spec_from_plan(
     let mut window_size_ms = 0u64;
     let mut agg_exprs = LocalWindowExecutionSpec::default_count_agg();
     let mut state_ttl_ms = None;
+    let mut source_watermark_lags = std::collections::HashMap::new();
+    let mut source_id_column = None;
 
     for node in plan.nodes() {
         let Some(op) = node.op() else {
@@ -51,57 +53,23 @@ pub fn streaming_spec_from_plan(
                 event_time_column = time_col.clone();
                 watermark_lag_ms = *lag_ms;
             }
-            NodeOp::TumblingWindow {
-                key_column: key,
-                event_time_column: time_col,
-                window_size_ms: win,
-                aggs,
-                ..
-            } => {
-                if !key.is_empty() {
-                    key_column = key.clone();
-                }
-                if !time_col.is_empty() {
-                    event_time_column = time_col.clone();
-                }
-                window_size_ms = *win;
-                window_kind = Some(LocalWindowKind::Tumbling);
-                agg_exprs = window_aggs_to_exec(aggs);
-            }
-            NodeOp::SlidingWindow {
-                key_column: key,
-                event_time_column: time_col,
-                window_size_ms: win,
-                slide_ms: slide,
-                aggs,
-                ..
-            } => {
-                if !key.is_empty() {
-                    key_column = key.clone();
-                }
-                if !time_col.is_empty() {
-                    event_time_column = time_col.clone();
-                }
-                window_size_ms = *win;
-                window_kind = Some(LocalWindowKind::Sliding { slide_ms: *slide });
-                agg_exprs = window_aggs_to_exec(aggs);
-            }
-            NodeOp::SessionWindow {
-                key_column: key,
-                event_time_column: time_col,
-                session_gap_ms: gap,
-                aggs,
-                ..
-            } => {
-                if !key.is_empty() {
-                    key_column = key.clone();
-                }
-                if !time_col.is_empty() {
-                    event_time_column = time_col.clone();
-                }
-                window_size_ms = *gap;
-                window_kind = Some(LocalWindowKind::Session { gap_ms: *gap });
-                agg_exprs = window_aggs_to_exec(aggs);
+            NodeOp::Window { spec } => {
+                key_column = spec.key_column.clone();
+                event_time_column = spec.event_time_column.clone();
+                watermark_lag_ms = spec.watermark_lag_ms;
+                window_size_ms = spec.window_size_ms;
+                agg_exprs = window_aggs_to_exec(&spec.agg_exprs);
+                source_watermark_lags = spec.source_watermark_lags.clone();
+                source_id_column = spec.source_id_column.clone();
+                window_kind = Some(match spec.window_kind {
+                    WindowKind::Tumbling => LocalWindowKind::Tumbling,
+                    WindowKind::Sliding => LocalWindowKind::Sliding {
+                        slide_ms: spec.slide_ms.unwrap_or(spec.window_size_ms),
+                    },
+                    WindowKind::Session => LocalWindowKind::Session {
+                        gap_ms: spec.session_gap_ms.unwrap_or(spec.window_size_ms),
+                    },
+                });
             }
             NodeOp::StateTtl { ttl_ms } => state_ttl_ms = Some(*ttl_ms),
             _ => {}
@@ -131,8 +99,8 @@ pub fn streaming_spec_from_plan(
         window_size_ms,
         agg_exprs,
         state_ttl_ms,
-        source_watermark_lags: std::collections::HashMap::new(),
-        source_id_column: None,
+        source_watermark_lags,
+        source_id_column,
     })
 }
 
@@ -160,8 +128,8 @@ fn window_aggs_to_exec(aggs: &[krishiv_plan::window::WindowAgg]) -> Vec<AggExpr>
 
 #[cfg(test)]
 mod tests {
-    use krishiv_plan::window::WindowAgg;
-    use krishiv_plan::{ExecutionKind, PhysicalPlan, PlanNode};
+    use krishiv_plan::window::{WindowAgg, WindowExecutionSpec};
+    use krishiv_plan::{ExecutionKind, NodeOp, PhysicalPlan, PlanNode};
 
     use super::*;
 
@@ -226,19 +194,16 @@ mod tests {
     }
 
     #[test]
-    fn streaming_spec_from_tumbling_window_node() {
+    fn streaming_spec_from_window_node() {
+        let spec = WindowExecutionSpec::tumbling("user_id", "ts", 60_000);
         let plan = PhysicalPlan::new("events", ExecutionKind::Streaming).with_node(
-            PlanNode::new("w", "win", ExecutionKind::Streaming).with_op(NodeOp::TumblingWindow {
-                key_column: String::from("user_id"),
-                event_time_column: String::from("ts"),
-                window_size_ms: 60_000,
-                aggs: vec![WindowAgg::count("count")],
-            }),
+            PlanNode::new("w", "win", ExecutionKind::Streaming)
+                .with_op(NodeOp::Window { spec: Box::new(spec) }),
         );
-        let spec = streaming_spec_from_plan(&plan).expect("spec");
-        assert_eq!(spec.key_column, "user_id");
-        assert_eq!(spec.event_time_column, "ts");
-        assert_eq!(spec.window_size_ms, 60_000);
-        assert!(matches!(spec.window_kind, LocalWindowKind::Tumbling));
+        let local_spec = streaming_spec_from_plan(&plan).expect("spec");
+        assert_eq!(local_spec.key_column, "user_id");
+        assert_eq!(local_spec.event_time_column, "ts");
+        assert_eq!(local_spec.window_size_ms, 60_000);
+        assert!(matches!(local_spec.window_kind, LocalWindowKind::Tumbling));
     }
 }

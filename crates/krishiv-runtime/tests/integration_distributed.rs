@@ -406,7 +406,7 @@ async fn coordinator_executor_lifecycle() {
             filters: vec![],
         },
     );
-    let fragment = krishiv_plan::encode_task_fragment(&node);
+    let fragment = krishiv_plan::encode_typed_task_fragment(&node).expect("encode");
     let stage = StageSpec::new(StageId::try_new("s1").unwrap(), "stage")
         .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), fragment));
     let spec = JobSpec::new(job_id.clone(), "lifecycle", JobKind::Batch).with_stage(stage);

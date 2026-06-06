@@ -47,7 +47,7 @@ async fn resolve_input_batches(
 
 async fn resolve_input_stream(
     pipeline: &StreamPipeline,
-) -> Result<krishiv_plan::SendableRecordBatchStream, krishiv_api::KrishivError> {
+) -> Result<krishiv_api::KrishivStream, krishiv_api::KrishivError> {
     if let Some(name) = pipeline.source_id.strip_prefix("memory:") {
         let batches = pipeline
             .session

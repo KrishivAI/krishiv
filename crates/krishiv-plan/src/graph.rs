@@ -47,7 +47,14 @@ pub(crate) fn validate_plan(
     let mut indegrees = vec![0usize; nodes.len()];
     let mut dependents = vec![Vec::new(); nodes.len()];
     for (node_index, node) in nodes.iter().enumerate() {
+        let mut seen_inputs = std::collections::HashSet::new();
         for input in node.inputs() {
+            if !seen_inputs.insert(input.as_str()) {
+                return Err(PlanError::Validation(format!(
+                    "{plan_type} plan '{name}' node '{}' has duplicate input reference '{input}'",
+                    node.id()
+                )));
+            }
             if input.trim().is_empty() {
                 return Err(PlanError::Validation(format!(
                     "{plan_type} plan '{name}' node '{}' contains a blank input reference",
