@@ -21,7 +21,18 @@ pub struct KeyGroupRange {
 impl KeyGroupRange {
     /// Create an inclusive key-group range.
     pub fn new(start: u32, end: u32) -> Self {
+        debug_assert!(start <= end, "KeyGroupRange start {start} > end {end}");
         Self { start, end }
+    }
+
+    /// Create an inclusive key-group range, returning an error if `start > end`.
+    pub fn try_new(start: u32, end: u32) -> Result<Self, String> {
+        if start > end {
+            return Err(format!(
+                "KeyGroupRange start {start} must not exceed end {end}"
+            ));
+        }
+        Ok(Self { start, end })
     }
 
     /// Full single-node/default key-group range.

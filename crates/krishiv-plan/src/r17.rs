@@ -1,4 +1,4 @@
-//! R17 plan types: RAG index specs and hybrid feature store.
+im//! R17 plan types: RAG index specs and hybrid feature store.
 
 use serde::{Deserialize, Serialize};
 

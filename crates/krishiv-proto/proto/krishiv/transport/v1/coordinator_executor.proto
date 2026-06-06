@@ -85,6 +85,23 @@ message StreamingProgressReport {
   uint64 timestamp_ms = 8;
 }
 
+message HeartbeatHotKeyReport {
+  string key = 1;
+  uint64 estimated_count = 2;
+  uint64 max_error = 3;
+  double heat_score = 4;
+  string job_id = 5;
+  string source_id = 6;
+}
+
+// Per-task streaming re-attach state reported by the executor on the first
+// heartbeat after a coordinator restart (re-attach protocol).
+message StreamingTaskStateWire {
+  string task_id = 1;
+  uint64 watermark_ms = 2;
+  bytes source_offset = 3;
+}
+
 message ExecutorHeartbeatRequest {
   TransportVersion version = 1;
   string executor_id = 2;
@@ -103,6 +120,10 @@ message ExecutorHeartbeatRequest {
   repeated LlmQuotaReport llm_quota_reports = 12;
   // Streaming progress snapshots from continuous tasks.
   repeated StreamingProgressReport streaming_progress = 13;
+  // R7.2: hot-key frequency estimates from the executor's SpaceSaving tracker.
+  repeated HeartbeatHotKeyReport hot_key_reports = 14;
+  // Re-attach protocol: per-task streaming state for coordinator-restart recovery.
+  repeated StreamingTaskStateWire streaming_task_states = 15;
 }
 
 message InitiateCheckpointCommand {
@@ -123,6 +144,19 @@ message ExecutorHeartbeatResponse {
   repeated HeartbeatThrottleCommand source_throttles = 7;
 }
 
+message ShuffleWriteConfigWire {
+  string stage_id = 1;
+  uint64 num_partitions = 2;
+  repeated string key_columns = 3;
+  uint64 lease_token = 4;
+}
+
+message ShuffleReadConfigWire {
+  string stage_id = 1;
+  uint64 partition_id = 2;
+  uint64 lease_token = 3;
+}
+
 message ExecutorTaskAssignment {
   TransportVersion version = 1;
   string job_id = 2;
@@ -140,6 +174,9 @@ message ExecutorTaskAssignment {
   bool has_key_group_range = 14;
   uint64 cpu_limit_nanos = 15;
   uint64 memory_limit_bytes = 16;
+  // R4a: shuffle write/read configuration (omitted for non-shuffle tasks).
+  ShuffleWriteConfigWire shuffle_write = 17;
+  ShuffleReadConfigWire shuffle_read = 18;
 }
 
 message InputPartition {
@@ -165,6 +202,8 @@ message InputPartitionDescriptor {
   uint32 shuffle_partition_id = 13;
   // InlineIpc fields: Arrow IPC stream bytes delivered in-band with the task assignment.
   bytes ipc_bytes = 14;
+  // WatermarkHint: upstream stage watermark for window operator initialisation.
+  int64 watermark_ms = 15;
 }
 
 message MemoryKafkaRecord {
@@ -203,12 +242,21 @@ message TaskStatusRequest {
   TaskOutputMetadata output_metadata = 10;
 }
 
+// Structured shuffle partition output (replaces the parallel shuffle_partition_*
+// arrays from before the wire schema was stabilised).
+message ShufflePartitionOutputWire {
+  uint32 partition_id = 1;
+  uint64 size_bytes = 2;
+  string flight_endpoint = 3;
+}
+
 message TaskOutputMetadata {
   string output_kind = 1;
   uint64 row_count = 2;
   uint64 batch_count = 3;
   uint64 column_count = 4;
-  // Shuffle partition outputs: parallel arrays (partition_id, size_bytes, flight_endpoint).
+  // Deprecated parallel arrays — superseded by shuffle_partitions (field 14).
+  // Kept for decoding messages produced before the schema migration.
   repeated uint32 shuffle_partition_ids = 5;
   repeated uint64 shuffle_partition_bytes = 6;
   repeated string shuffle_flight_endpoints = 7;
@@ -219,6 +267,10 @@ message TaskOutputMetadata {
   uint64 spill_bytes = 11;
   // Arrow IPC stream bytes for each inline result batch (SQL / window collect).
   repeated bytes inline_record_batch_ipc = 12;
+  // Peak memory used by this task in bytes (AQE input).
+  uint64 memory_bytes = 13;
+  // Structured shuffle partition outputs (preferred over fields 5-7).
+  repeated ShufflePartitionOutputWire shuffle_partitions = 14;
 }
 
 message TaskCancellationRequest {
@@ -266,6 +318,8 @@ enum InputPartitionDescriptorKind {
   INPUT_PARTITION_DESCRIPTOR_KIND_SHUFFLE_FLIGHT = 5;
   // Arrow IPC stream bytes delivered inline with the task assignment.
   INPUT_PARTITION_DESCRIPTOR_KIND_INLINE_IPC = 6;
+  // Upstream stage watermark hint for window operator initialisation.
+  INPUT_PARTITION_DESCRIPTOR_KIND_WATERMARK_HINT = 7;
 }
 
 enum OutputContractDescriptorKind {

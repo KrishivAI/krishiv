@@ -16,7 +16,6 @@ pub mod streaming_plan;
 pub mod task_fragment;
 pub mod window;
 pub use graph::lower_to_physical;
-pub use lowering::{decode_task_fragment, encode_task_fragment};
 pub use r17::{
     ChunkerConfig, DataSource, EmbedderConfig, FeatureDef, FeatureSchema, FeatureStore,
     RagIndexSpec, RefreshPolicy, VectorSinkPlanConfig,
@@ -25,12 +24,6 @@ pub use task_fragment::{
     TypedTaskFragment, encode_typed_task_fragment, execution_kind_from_fragment,
     task_body_for_profile, validate_job_fragments,
 };
-
-pub type SendableRecordBatchStream = std::pin::Pin<
-    Box<
-        dyn futures::stream::Stream<Item = Result<arrow::record_batch::RecordBatch, String>> + Send,
-    >,
->;
 
 /// Errors returned by plan encoding, decoding, and validation operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

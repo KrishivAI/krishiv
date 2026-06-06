@@ -13,6 +13,8 @@ pub struct TriggerSavepointRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerSavepointResponse {
     pub epoch: u64,
+    /// Optional human-readable status message from the coordinator.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

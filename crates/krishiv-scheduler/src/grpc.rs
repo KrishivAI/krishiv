@@ -357,7 +357,10 @@ impl CoordinatorManagementService for CoordinatorExecutorTonicService {
         let epoch = coordinator
             .savepoint_job(&req.job_id, label)
             .map_err(status_from_scheduler_error)?;
-        Ok(tonic::Response::new(TriggerSavepointResponse { epoch }))
+        Ok(tonic::Response::new(TriggerSavepointResponse {
+            epoch,
+            message: String::new(),
+        }))
     }
 
     async fn restore_job(

@@ -182,6 +182,16 @@ pub fn executor_heartbeat_request_to_wire(
             .iter()
             .map(streaming_progress_report_to_wire)
             .collect(),
+        hot_key_reports: value
+            .hot_key_reports()
+            .iter()
+            .map(hot_key_report_to_wire)
+            .collect(),
+        streaming_task_states: value
+            .streaming_task_states()
+            .iter()
+            .map(streaming_task_state_to_wire)
+            .collect(),
     }
 }
 
@@ -241,6 +251,23 @@ pub fn executor_heartbeat_request_from_wire(
                 .map(streaming_progress_report_from_wire)
                 .collect(),
         );
+    }
+    if !value.hot_key_reports.is_empty() {
+        req = req.with_hot_key_reports(
+            value
+                .hot_key_reports
+                .into_iter()
+                .map(hot_key_report_from_wire)
+                .collect(),
+        );
+    }
+    if !value.streaming_task_states.is_empty() {
+        let states = value
+            .streaming_task_states
+            .into_iter()
+            .map(streaming_task_state_from_wire)
+            .collect::<WireResult<Vec<_>>>()?;
+        req = req.with_streaming_task_states(states);
     }
 
     Ok(req)
@@ -311,19 +338,20 @@ pub fn executor_heartbeat_response_from_wire(
     if !value.initiate_checkpoints.is_empty() {
         use crate::ids::{FencingToken, JobId};
         use crate::task::InitiateCheckpointCommand;
-        let cmds: Vec<InitiateCheckpointCommand> = value
+        let cmds = value
             .initiate_checkpoints
             .into_iter()
-            .filter_map(|cmd| {
-                let job_id = JobId::try_new(cmd.job_id).ok()?;
-                let fencing_token = FencingToken::try_new(cmd.fencing_token).ok()?;
-                Some(InitiateCheckpointCommand {
+            .map(|cmd| {
+                let job_id = JobId::try_new(cmd.job_id).map_err(WireError::from_id)?;
+                let fencing_token =
+                    FencingToken::try_new(cmd.fencing_token).map_err(WireError::from_id)?;
+                Ok(InitiateCheckpointCommand {
                     job_id,
                     epoch: cmd.epoch,
                     fencing_token,
                 })
             })
-            .collect();
+            .collect::<WireResult<Vec<_>>>()?;
         response = response.with_checkpoint_commands(cmds);
     }
     Ok(response)
@@ -375,6 +403,49 @@ fn streaming_progress_report_from_wire(
         source_offset: value.source_offset,
         timestamp_ms: value.timestamp_ms,
     }
+}
+
+fn hot_key_report_to_wire(value: &crate::HeartbeatHotKeyReport) -> v1::HeartbeatHotKeyReport {
+    v1::HeartbeatHotKeyReport {
+        key: value.key.clone(),
+        estimated_count: value.estimated_count,
+        max_error: value.max_error,
+        heat_score: value.heat_score,
+        job_id: value.job_id.clone(),
+        source_id: value.source_id.clone(),
+    }
+}
+
+fn hot_key_report_from_wire(value: v1::HeartbeatHotKeyReport) -> crate::HeartbeatHotKeyReport {
+    crate::HeartbeatHotKeyReport {
+        key: value.key,
+        estimated_count: value.estimated_count,
+        max_error: value.max_error,
+        heat_score: value.heat_score,
+        job_id: value.job_id,
+        source_id: value.source_id,
+    }
+}
+
+fn streaming_task_state_to_wire(
+    value: &crate::StreamingTaskState,
+) -> v1::StreamingTaskStateWire {
+    v1::StreamingTaskStateWire {
+        task_id: value.task_id.as_str().to_owned(),
+        watermark_ms: value.watermark_ms,
+        source_offset: value.source_offset.clone(),
+    }
+}
+
+fn streaming_task_state_from_wire(
+    value: v1::StreamingTaskStateWire,
+) -> WireResult<crate::StreamingTaskState> {
+    let task_id = TaskId::try_new(value.task_id).map_err(WireError::from_id)?;
+    Ok(crate::StreamingTaskState::new(
+        task_id,
+        value.watermark_ms,
+        value.source_offset,
+    ))
 }
 
 fn llm_throttle_command_to_wire(value: &crate::LlmThrottleCommand) -> v1::LlmThrottleCommand {
@@ -453,6 +524,8 @@ pub fn executor_task_assignment_to_wire(
         has_key_group_range: true,
         cpu_limit_nanos: value.cpu_limit_nanos().unwrap_or(0),
         memory_limit_bytes: value.memory_limit_bytes().unwrap_or(0),
+        shuffle_write: value.shuffle_write().map(shuffle_write_config_to_wire),
+        shuffle_read: value.shuffle_read().map(shuffle_read_config_to_wire),
     }
 }
 
@@ -502,6 +575,12 @@ pub fn executor_task_assignment_from_wire(
     }
     if value.memory_limit_bytes > 0 {
         assignment = assignment.with_memory_limit_bytes(value.memory_limit_bytes);
+    }
+    if let Some(sw) = value.shuffle_write {
+        assignment = assignment.with_shuffle_write(shuffle_write_config_from_wire(sw)?);
+    }
+    if let Some(sr) = value.shuffle_read {
+        assignment = assignment.with_shuffle_read(shuffle_read_config_from_wire(sr)?);
     }
     Ok(assignment)
 }
@@ -608,8 +687,7 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
         row_count: value.row_count(),
         batch_count: value.batch_count(),
         column_count: value.column_count(),
-        // Shuffle partition and runtime stats are carried in-process for R4;
-        // proto encoding is deferred until the wire schema stabilises.
+        // Keep deprecated parallel arrays for backward compat with older decoders.
         shuffle_partition_ids: value
             .shuffle_partitions()
             .iter()
@@ -630,6 +708,16 @@ fn task_output_metadata_to_wire(value: &TaskOutputMetadata) -> v1::TaskOutputMet
         cpu_nanos: value.runtime_stats().map_or(0, |s| s.cpu_nanos),
         spill_bytes: value.runtime_stats().map_or(0, |s| s.spill_bytes),
         inline_record_batch_ipc: value.inline_record_batch_ipc().to_vec(),
+        memory_bytes: value.runtime_stats().map_or(0, |s| s.memory_bytes),
+        shuffle_partitions: value
+            .shuffle_partitions()
+            .iter()
+            .map(|p| v1::ShufflePartitionOutputWire {
+                partition_id: p.partition_id,
+                size_bytes: p.size_bytes,
+                flight_endpoint: p.flight_endpoint.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -637,13 +725,22 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
     if value.output_kind.trim().is_empty() {
         return Err(WireError::new("task output metadata kind cannot be empty"));
     }
-    let shuffle_partitions: Vec<ShufflePartitionOutput> = value
-        .shuffle_partition_ids
-        .into_iter()
-        .zip(value.shuffle_partition_bytes)
-        .zip(value.shuffle_flight_endpoints)
-        .map(|((id, bytes), endpoint)| ShufflePartitionOutput::new(id, bytes, endpoint))
-        .collect();
+    // Prefer structured shuffle_partitions (field 14); fall back to deprecated parallel arrays.
+    let shuffle_partitions: Vec<ShufflePartitionOutput> = if !value.shuffle_partitions.is_empty() {
+        value
+            .shuffle_partitions
+            .into_iter()
+            .map(|p| ShufflePartitionOutput::new(p.partition_id, p.size_bytes, p.flight_endpoint))
+            .collect()
+    } else {
+        value
+            .shuffle_partition_ids
+            .into_iter()
+            .zip(value.shuffle_partition_bytes)
+            .zip(value.shuffle_flight_endpoints)
+            .map(|((id, bytes), endpoint)| ShufflePartitionOutput::new(id, bytes, endpoint))
+            .collect()
+    };
     let mut meta = TaskOutputMetadata::new(
         value.output_kind,
         value.row_count,
@@ -659,13 +756,14 @@ fn task_output_metadata_from_wire(value: v1::TaskOutputMetadata) -> WireResult<T
     let has_stats = value.input_rows > 0
         || value.output_rows > 0
         || value.cpu_nanos > 0
-        || value.spill_bytes > 0;
+        || value.spill_bytes > 0
+        || value.memory_bytes > 0;
     if has_stats {
         meta = meta.with_runtime_stats(TaskRuntimeStats {
             input_rows: value.input_rows,
             output_rows: value.output_rows,
             cpu_nanos: value.cpu_nanos,
-            memory_bytes: 0,
+            memory_bytes: value.memory_bytes,
             spill_bytes: value.spill_bytes,
         });
     }
@@ -722,6 +820,54 @@ fn executor_descriptor_from_wire(value: v1::ExecutorDescriptor) -> WireResult<Ex
         descriptor = descriptor.with_barrier_endpoint(value.barrier_endpoint);
     }
     Ok(descriptor)
+}
+
+fn shuffle_write_config_to_wire(value: &crate::io::ShuffleWriteConfig) -> v1::ShuffleWriteConfigWire {
+    v1::ShuffleWriteConfigWire {
+        stage_id: value.stage_id.as_str().to_owned(),
+        num_partitions: value.num_partitions as u64,
+        key_columns: value.key_columns.clone(),
+        lease_token: value.lease_token,
+    }
+}
+
+fn shuffle_write_config_from_wire(
+    value: v1::ShuffleWriteConfigWire,
+) -> WireResult<crate::io::ShuffleWriteConfig> {
+    require_non_empty(&value.stage_id, "shuffle write stage id")?;
+    let num_partitions = value
+        .num_partitions
+        .try_into()
+        .map_err(|_| WireError::new("shuffle write num_partitions overflows usize"))?;
+    Ok(crate::io::ShuffleWriteConfig {
+        stage_id: StageId::try_new(value.stage_id).map_err(WireError::from_id)?,
+        num_partitions,
+        key_columns: value.key_columns,
+        lease_token: value.lease_token,
+    })
+}
+
+fn shuffle_read_config_to_wire(value: &crate::io::ShuffleReadConfig) -> v1::ShuffleReadConfigWire {
+    v1::ShuffleReadConfigWire {
+        stage_id: value.stage_id.as_str().to_owned(),
+        partition_id: value.partition_id as u64,
+        lease_token: value.lease_token,
+    }
+}
+
+fn shuffle_read_config_from_wire(
+    value: v1::ShuffleReadConfigWire,
+) -> WireResult<crate::io::ShuffleReadConfig> {
+    require_non_empty(&value.stage_id, "shuffle read stage id")?;
+    let partition_id = value
+        .partition_id
+        .try_into()
+        .map_err(|_| WireError::new("shuffle read partition_id overflows usize"))?;
+    Ok(crate::io::ShuffleReadConfig {
+        stage_id: StageId::try_new(value.stage_id).map_err(WireError::from_id)?,
+        partition_id,
+        lease_token: value.lease_token,
+    })
 }
 
 fn task_attempt_ref_to_wire(value: &TaskAttemptRef) -> v1::TaskAttemptRef {
@@ -837,36 +983,17 @@ fn input_partition_descriptor_to_wire(
             ipc_bytes: ipc_bytes.clone(),
             ..Default::default()
         },
-        // InMemory and WatermarkHint are in-process only; they must never
-        // cross the wire. Serialise them as empty/noop InlineIpc entries so
-        // the proto schema doesn't need to change for these internal variants.
-        InputPartitionDescriptor::InMemory {
-            table_name,
-            batches,
-        } => {
-            use arrow::ipc::writer::StreamWriter;
-            let schema = batches
-                .first()
-                .map(|b| b.schema())
-                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
-            let mut buf = Vec::new();
-            if let Ok(mut writer) = StreamWriter::try_new(&mut buf, &schema) {
-                for b in batches.iter() {
-                    let _ = writer.write(b);
-                }
-                let _ = writer.finish();
-            }
-            v1::InputPartitionDescriptor {
-                kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
-                table_name: table_name.clone(),
-                ipc_bytes: buf,
-                ..Default::default()
-            }
+        // InMemory is in-process only and must never reach the wire.
+        InputPartitionDescriptor::InMemory { table_name, .. } => {
+            panic!(
+                "InputPartitionDescriptor::InMemory (table_name={table_name:?}) \
+                 is in-process only and cannot be serialised to the wire; \
+                 use InlineIpc for remote task assignments"
+            );
         }
         InputPartitionDescriptor::WatermarkHint { watermark_ms } => v1::InputPartitionDescriptor {
-            kind: v1::InputPartitionDescriptorKind::InlineIpc as i32,
-            table_name: format!("__watermark_hint_{watermark_ms}"),
-            ipc_bytes: vec![],
+            kind: v1::InputPartitionDescriptorKind::WatermarkHint as i32,
+            watermark_ms: *watermark_ms,
             ..Default::default()
         },
     }
@@ -948,6 +1075,11 @@ fn input_partition_descriptor_from_wire(
             Ok(InputPartitionDescriptor::InlineIpc {
                 table_name: value.table_name,
                 ipc_bytes: value.ipc_bytes,
+            })
+        }
+        v1::InputPartitionDescriptorKind::WatermarkHint => {
+            Ok(InputPartitionDescriptor::WatermarkHint {
+                watermark_ms: value.watermark_ms,
             })
         }
     }
@@ -1348,4 +1480,180 @@ pub fn drain_continuous_output_response_from_wire(
         disposition: transport_disposition_from_wire(value.disposition)?,
         ipc_bytes: value.ipc_bytes,
     })
+}
+
+// ── CoordinatorManagement wire conversions ───────────────────────────────────
+
+pub fn trigger_savepoint_request_to_wire(
+    value: crate::management::TriggerSavepointRequest,
+) -> v1::TriggerSavepointRequest {
+    v1::TriggerSavepointRequest {
+        job_id: value.job_id.as_str().to_owned(),
+        label: value.label,
+    }
+}
+
+pub fn trigger_savepoint_request_from_wire(
+    value: v1::TriggerSavepointRequest,
+) -> WireResult<crate::management::TriggerSavepointRequest> {
+    Ok(crate::management::TriggerSavepointRequest {
+        job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+        label: value.label,
+    })
+}
+
+pub fn trigger_savepoint_response_to_wire(
+    value: crate::management::TriggerSavepointResponse,
+) -> v1::TriggerSavepointResponse {
+    v1::TriggerSavepointResponse {
+        epoch: value.epoch,
+        message: value.message,
+    }
+}
+
+pub fn trigger_savepoint_response_from_wire(
+    value: v1::TriggerSavepointResponse,
+) -> crate::management::TriggerSavepointResponse {
+    crate::management::TriggerSavepointResponse {
+        epoch: value.epoch,
+        message: value.message,
+    }
+}
+
+pub fn restore_job_request_to_wire(
+    value: crate::management::RestoreJobRequest,
+) -> v1::RestoreJobRequest {
+    v1::RestoreJobRequest {
+        job_id: value.job_id.as_str().to_owned(),
+        epoch: value.epoch,
+        storage_path: value.storage_path,
+    }
+}
+
+pub fn restore_job_request_from_wire(
+    value: v1::RestoreJobRequest,
+) -> WireResult<crate::management::RestoreJobRequest> {
+    Ok(crate::management::RestoreJobRequest {
+        job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+        epoch: value.epoch,
+        storage_path: value.storage_path,
+    })
+}
+
+pub fn restore_job_response_to_wire(
+    value: crate::management::RestoreJobResponse,
+) -> v1::RestoreJobResponse {
+    v1::RestoreJobResponse {
+        accepted: value.accepted,
+        message: value.message,
+    }
+}
+
+pub fn restore_job_response_from_wire(
+    value: v1::RestoreJobResponse,
+) -> crate::management::RestoreJobResponse {
+    crate::management::RestoreJobResponse {
+        accepted: value.accepted,
+        message: value.message,
+    }
+}
+
+pub fn list_checkpoints_request_to_wire(
+    value: crate::management::ListCheckpointsRequest,
+) -> v1::ListCheckpointsRequest {
+    v1::ListCheckpointsRequest {
+        job_id: value.job_id.as_str().to_owned(),
+    }
+}
+
+pub fn list_checkpoints_request_from_wire(
+    value: v1::ListCheckpointsRequest,
+) -> WireResult<crate::management::ListCheckpointsRequest> {
+    Ok(crate::management::ListCheckpointsRequest {
+        job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+    })
+}
+
+pub fn list_checkpoints_response_to_wire(
+    value: crate::management::ListCheckpointsResponse,
+) -> v1::ListCheckpointsResponse {
+    v1::ListCheckpointsResponse {
+        epochs: value
+            .epochs
+            .into_iter()
+            .map(|e| v1::CheckpointEpochInfo {
+                epoch: e.epoch,
+                is_savepoint: e.is_savepoint,
+                savepoint_label: e.savepoint_label.unwrap_or_default(),
+            })
+            .collect(),
+    }
+}
+
+pub fn list_checkpoints_response_from_wire(
+    value: v1::ListCheckpointsResponse,
+) -> crate::management::ListCheckpointsResponse {
+    crate::management::ListCheckpointsResponse {
+        epochs: value
+            .epochs
+            .into_iter()
+            .map(|e| crate::management::CheckpointEpochInfo {
+                epoch: e.epoch,
+                is_savepoint: e.is_savepoint,
+                savepoint_label: if e.savepoint_label.is_empty() {
+                    None
+                } else {
+                    Some(e.savepoint_label)
+                },
+            })
+            .collect(),
+    }
+}
+
+pub fn inspect_state_request_to_wire(
+    value: crate::management::InspectStateRequest,
+) -> v1::InspectStateRequest {
+    v1::InspectStateRequest {
+        job_id: value.job_id.as_str().to_owned(),
+        operator_id: value.operator_id,
+    }
+}
+
+pub fn inspect_state_request_from_wire(
+    value: v1::InspectStateRequest,
+) -> WireResult<crate::management::InspectStateRequest> {
+    Ok(crate::management::InspectStateRequest {
+        job_id: JobId::try_new(value.job_id).map_err(WireError::from_id)?,
+        operator_id: value.operator_id,
+    })
+}
+
+pub fn inspect_state_response_to_wire(
+    value: crate::management::InspectStateResponse,
+) -> v1::InspectStateResponse {
+    v1::InspectStateResponse {
+        snapshots: value
+            .snapshots
+            .into_iter()
+            .map(|s| v1::StateSnapshotInfo {
+                task_id: s.task_id,
+                snapshot_path: s.snapshot_path,
+            })
+            .collect(),
+    }
+}
+
+pub fn inspect_state_response_from_wire(
+    value: v1::InspectStateResponse,
+) -> crate::management::InspectStateResponse {
+    crate::management::InspectStateResponse {
+        snapshots: value
+            .snapshots
+            .into_iter()
+            .map(|s| crate::management::StateSnapshotInfo {
+                task_id: s.task_id,
+                snapshot_path: s.snapshot_path,
+            })
+            .collect(),
+    }
 }

@@ -1,5 +1,44 @@
 # Krishiv Implementation Status
 
+## krishiv-proto Wire Audit Resolution (2026-06-06)
+
+Implemented the full `krishiv-proto` audit resolution plan. All P0/P1 bugs fixed, management wire conversions added.
+
+### Phase 1 — P0 wire data-loss fixes
+- **`wire.rs` heartbeat request**: Added `hot_key_reports` (R7.2 SpaceSaving) and `streaming_task_states` (re-attach protocol) serialization/deserialization. Added `hot_key_report_to/from_wire` and `streaming_task_state_to/from_wire` helpers. `streaming_task_state_from_wire` uses `map(...)?` (not `filter_map`) so invalid task IDs propagate as errors.
+- **`wire.rs` task assignment**: Added `shuffle_write`/`shuffle_read` (R4a) serialization/deserialization. Added `shuffle_write_config_to/from_wire` and `shuffle_read_config_to/from_wire` helpers.
+- **`wire.rs` task output metadata**: Emit both `memory_bytes` (field 13) and structured `shuffle_partitions` (field 14) alongside deprecated parallel arrays. On decode, prefer `shuffle_partitions`; fall back to deprecated parallel arrays. `memory_bytes` now round-trips (was silently zeroed).
+- **`wire.rs` heartbeat response**: Replaced `filter_map(|cmd| { ... .ok()? })` with `map(|cmd| { ... })?` so invalid job IDs or fencing tokens in checkpoint commands propagate as `WireError` instead of being silently dropped.
+
+### Phase 2 — P1 wire semantic fixes
+- **`wire.rs` WatermarkHint**: Replaced magic `__watermark_hint_{ms}` table-name encoding with proper `INPUT_PARTITION_DESCRIPTOR_KIND_WATERMARK_HINT = 7` kind + `watermark_ms` field. Added decode branch in `input_partition_descriptor_from_wire`.
+- **`wire.rs` InMemory**: Replaced silent IPC encode-and-ignore with an explicit `panic!` that names the variant and gives diagnostic guidance. `InMemory` must never cross the wire.
+- **`task.rs` KeyGroupRange**: Added `debug_assert!(start <= end)` to `KeyGroupRange::new`. Added `KeyGroupRange::try_new` returning `Result<Self, String>` for callsites that need validation at runtime.
+
+### Phase 3 — Missing wire conversions
+- **`wire.rs` management**: Added `trigger_savepoint_request/response_to/from_wire`, `restore_job_request/response_to/from_wire`, `list_checkpoints_request/response_to/from_wire`, `inspect_state_request/response_to/from_wire` for all `CoordinatorManagementService` RPCs.
+- **`management.rs` TriggerSavepointResponse**: Added missing `message: String` field (aligns with `TriggerSavepointResponse.message = 2` in proto). Updated `krishiv-scheduler/src/grpc.rs` construction site.
+
+### Proto changes (prior session)
+- Added `HeartbeatHotKeyReport` message (fields 14), `StreamingTaskStateWire` message (field 15) to `ExecutorHeartbeatRequest`.
+- Added `ShuffleWriteConfigWire` (field 17) and `ShuffleReadConfigWire` (field 18) to `ExecutorTaskAssignment`.
+- Added `ShufflePartitionOutputWire` message and `shuffle_partitions = 14` + `memory_bytes = 13` to `TaskOutputMetadata`.
+- Added `INPUT_PARTITION_DESCRIPTOR_KIND_WATERMARK_HINT = 7` and `watermark_ms = 15` to `InputPartitionDescriptor`.
+
+Validation:
+```bash
+cargo check -p krishiv-proto                       # ✓
+cargo test -p krishiv-proto                        # ✓ 61 passed
+cargo check --workspace                            # ✓
+```
+
+Next useful command:
+```bash
+cargo clippy -p krishiv-proto --all-targets
+```
+
+---
+
 ## Production Stabilization Waves 1–4 — Data Correctness, Scheduler, Runtime, Observability (2026-06-06)
 
 ### Wave 1 — Data Correctness
