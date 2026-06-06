@@ -1391,12 +1391,15 @@ impl ExecutorTaskRunner {
                 continue;
             };
             // Use the most-recently observed coordinator fencing token so the
-            // ack is not rejected after a leadership election.  Falls back to
-            // FencingToken::initial() only before any real checkpoint request
-            // has been received (which is safe: no prior leader exists yet).
+            // ack is not rejected after a leadership election.
             let raw_token = self.cached_coordinator_fencing_token.load(Ordering::SeqCst);
-            let fencing_token =
-                FencingToken::try_new(raw_token.max(1)).unwrap_or_else(|_| FencingToken::initial());
+            let fencing_token = if raw_token == 0 {
+                // No checkpoint received yet; no prior leader exists.
+                FencingToken::initial()
+            } else {
+                FencingToken::try_new(raw_token)
+                    .expect("cached fencing token must be non-zero after first checkpoint")
+            };
             let req = InitiateCheckpointRequest {
                 job_id,
                 epoch: barrier.epoch,

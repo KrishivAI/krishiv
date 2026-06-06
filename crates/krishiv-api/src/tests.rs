@@ -952,7 +952,7 @@ async fn remote_execution_without_fallback_uses_flight_server() {
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(make_flight_sql_server())
+            .add_service(make_flight_sql_server().expect("make flight sql server"))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");

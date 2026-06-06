@@ -9,12 +9,12 @@
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use krishiv_proto::{
     ConnectorCapabilityFlags, CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorId,
@@ -24,16 +24,26 @@ use krishiv_scheduler::{
     Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, NamespaceQuotaSnapshot,
     ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Shared UI result alias.
 pub type UiResult<T> = Result<T, UiError>;
 
 /// Shared state for the R2 status server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UiState {
     coordinator: SharedCoordinator,
     metrics_cache: Arc<std::sync::Mutex<(String, std::time::Instant)>>,
+    sql: Option<Arc<krishiv_sql::SqlEngine>>,
+}
+
+impl std::fmt::Debug for UiState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiState")
+            .field("coordinator", &self.coordinator)
+            .field("has_sql", &self.sql.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl UiState {
@@ -50,7 +60,14 @@ impl UiState {
                 String::new(),
                 std::time::Instant::now() - std::time::Duration::from_secs(100),
             ))),
+            sql: None,
         }
+    }
+
+    /// Attach a SQL engine to enable the query editor.
+    pub fn with_sql_engine(mut self, engine: krishiv_sql::SqlEngine) -> Self {
+        self.sql = Some(Arc::new(engine));
+        self
     }
 }
 
@@ -63,6 +80,9 @@ pub enum UiError {
     /// Scheduler operation failed.
     #[error("{0}")]
     Scheduler(#[from] SchedulerError),
+    /// SQL execution failed.
+    #[error("sql error: {0}")]
+    Sql(String),
     /// Shared coordinator lock was poisoned.
     #[error("coordinator status lock was poisoned")]
     LockPoisoned,
@@ -71,12 +91,18 @@ pub enum UiError {
     Template(#[from] askama::Error),
 }
 
+impl From<krishiv_sql::SqlError> for UiError {
+    fn from(e: krishiv_sql::SqlError) -> Self {
+        UiError::Sql(e.to_string())
+    }
+}
+
 impl IntoResponse for UiError {
     fn into_response(self) -> Response {
         let status = match self {
             Self::Scheduler(SchedulerError::UnknownJob { .. }) => StatusCode::NOT_FOUND,
             Self::Id(_) => StatusCode::BAD_REQUEST,
-            Self::Scheduler(_) | Self::LockPoisoned | Self::Template(_) => {
+            Self::Scheduler(_) | Self::LockPoisoned | Self::Template(_) | Self::Sql(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
@@ -129,6 +155,12 @@ fn resolve_ui_token() -> Option<String> {
             }
         }
     }
+    if krishiv_common::profile_requires_authenticated_ui(
+        krishiv_common::resolve_durability_profile(),
+    ) {
+        eprintln!("krishiv-ui: no UI token configured; denying all protected routes (production fail-closed)");
+        return Some(String::new());
+    }
     None
 }
 
@@ -165,10 +197,13 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
+        .route("/api/v1/sql", post(api_sql_execute))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
         .route("/ui/jobs/{job_id}/checkpoints", get(ui_job_checkpoints_page))
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
+        .route("/ui/submit", get(ui_submit))
+        .route("/ui/health", get(ui_health))
         .with_state(state.clone());
 
     let protected = if let Some(expected) = token {
@@ -188,6 +223,13 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
 }
 
 async fn require_bearer(request: axum::extract::Request, next: Next, expected: &str) -> Response {
+    if expected.is_empty() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "authentication not configured",
+        )
+            .into_response();
+    }
     let auth = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -513,6 +555,65 @@ impl CheckpointsTemplate {
     }
 }
 
+#[derive(Template)]
+#[template(path = "submit.html")]
+struct SubmitTemplate {
+    coordinator_id: String,
+    coordinator_state: String,
+}
+
+#[derive(Template)]
+#[template(path = "health.html")]
+struct HealthTemplate {
+    coordinator_id: String,
+    coordinator_state: String,
+    executors: Vec<ExecutorView>,
+    jobs: Vec<JobSummaryView>,
+}
+
+impl HealthTemplate {
+    fn healthy_executors(&self) -> usize {
+        self.executors.iter().filter(|e| e.state == "healthy" || e.state == "active").count()
+    }
+    fn lost_executors(&self) -> usize {
+        self.executors.iter().filter(|e| e.state == "lost").count()
+    }
+    fn memory_used_pct(&self) -> f64 {
+        let used: u64 = self.executors.iter().filter_map(|e| e.memory_used_bytes).sum();
+        let limit: u64 = self.executors.iter().filter_map(|e| e.memory_limit_bytes).sum();
+        if limit > 0 { used as f64 / limit as f64 * 100.0 } else { 0.0 }
+    }
+    fn memory_used_pct_int(&self) -> u64 {
+        self.memory_used_pct() as u64
+    }
+}
+
+#[derive(Serialize)]
+pub struct SqlQueryResponse {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub error: Option<String>,
+    pub row_count: usize,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SqlQueryRequest {
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JobsFilter {
+    pub state: Option<String>,
+    pub kind: Option<String>,
+}
+
+impl JobsFilter {
+    fn has_any(&self) -> bool {
+        self.state.is_some() || self.kind.is_some()
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok\n"
 }
@@ -645,6 +746,92 @@ async fn api_queues(State(state): State<UiState>) -> Result<Json<QueuesResponse>
     }))
 }
 
+async fn ui_submit(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let snapshot = status_snapshot_inner(&coordinator);
+    let template = SubmitTemplate {
+        coordinator_id: snapshot.coordinator_id,
+        coordinator_state: snapshot.coordinator_state,
+    };
+    Ok(Html(template.render()?))
+}
+
+async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let snapshot = status_snapshot_inner(&coordinator);
+    let template = HealthTemplate {
+        coordinator_id: snapshot.coordinator_id,
+        coordinator_state: snapshot.coordinator_state,
+        executors: coordinator
+            .executor_snapshots()
+            .iter()
+            .map(ExecutorView::from_record)
+            .collect(),
+        jobs: coordinator
+            .job_snapshots()
+            .iter()
+            .map(JobSummaryView::from_snapshot)
+            .collect(),
+    };
+    Ok(Html(template.render()?))
+}
+
+async fn api_sql_execute(
+    State(state): State<UiState>,
+    Json(req): Json<SqlQueryRequest>,
+) -> Json<SqlQueryResponse> {
+    let engine = match &state.sql {
+        Some(e) => e.clone(),
+        None => {
+            return Json(SqlQueryResponse {
+                columns: vec![],
+                rows: vec![],
+                error: Some("SQL engine not available. Start the UI with SQL support enabled.".to_string()),
+                row_count: 0,
+                elapsed_ms: 0,
+            });
+        }
+    };
+
+    let start = std::time::Instant::now();
+    match engine.sql(&req.query).await {
+        Ok(df) => {
+            match df.collect().await {
+                Ok(batches) => {
+                    let (columns, rows) = extract_columns_and_rows(&batches);
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    let row_count = rows.len();
+                    Json(SqlQueryResponse {
+                        columns,
+                        rows,
+                        error: None,
+                        row_count,
+                        elapsed_ms: elapsed,
+                    })
+                }
+                Err(e) => {
+                    Json(SqlQueryResponse {
+                        columns: vec![],
+                        rows: vec![],
+                        error: Some(format!("execution error: {e}")),
+                        row_count: 0,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            Json(SqlQueryResponse {
+                columns: vec![],
+                rows: vec![],
+                error: Some(format!("sql error: {e}")),
+                row_count: 0,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            })
+        }
+    }
+}
+
 async fn api_job_checkpoints(
     State(state): State<UiState>,
     Path(job_id_str): Path<String>,
@@ -664,12 +851,20 @@ async fn api_job_checkpoints(
     }))
 }
 
-async fn ui_jobs(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+async fn ui_jobs(
+    State(state): State<UiState>,
+    filter: Query<JobsFilter>,
+) -> Result<Html<String>, UiError> {
     let snapshot = status_snapshot(&state).await?;
+    let jobs = if filter.has_any() {
+        filter_jobs(snapshot.jobs, &filter)
+    } else {
+        snapshot.jobs
+    };
     let template = JobsTemplate {
         coordinator_id: snapshot.coordinator_id,
         coordinator_state: snapshot.coordinator_state,
-        jobs: snapshot.jobs,
+        jobs,
         executors: snapshot.executors,
     };
     Ok(Html(template.render()?))
@@ -773,6 +968,78 @@ fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> Status
             .iter()
             .map(ExecutorView::from_record)
             .collect(),
+    }
+}
+
+fn filter_jobs(jobs: Vec<JobSummaryView>, filter: &JobsFilter) -> Vec<JobSummaryView> {
+    jobs.into_iter()
+        .filter(|j| {
+            if let Some(ref state) = filter.state {
+                if !j.state.eq_ignore_ascii_case(state) {
+                    return false;
+                }
+            }
+            if let Some(ref kind) = filter.kind {
+                if !j.kind.eq_ignore_ascii_case(kind) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+fn extract_columns_and_rows(batches: &[arrow::record_batch::RecordBatch]) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
+    if batches.is_empty() {
+        return (vec![], vec![]);
+    }
+    let columns: Vec<String> = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                let array = batch.column(col_idx);
+                let val = if array.is_null(row_idx) {
+                    serde_json::Value::Null
+                } else {
+                    scalar_array_to_json(array.as_ref(), row_idx)
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+    }
+    (columns, rows)
+}
+
+fn scalar_array_to_json(array: &dyn arrow::array::Array, idx: usize) -> serde_json::Value {
+    use arrow::array::*;
+    use arrow::datatypes::*;
+    match array.data_type() {
+        DataType::Int8 => array.as_any().downcast_ref::<Int8Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::Int16 => array.as_any().downcast_ref::<Int16Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::Int32 => array.as_any().downcast_ref::<Int32Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::Int64 => array.as_any().downcast_ref::<Int64Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::UInt8 => array.as_any().downcast_ref::<UInt8Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::UInt16 => array.as_any().downcast_ref::<UInt16Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::UInt32 => array.as_any().downcast_ref::<UInt32Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::UInt64 => array.as_any().downcast_ref::<UInt64Array>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null),
+        DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().map(|a| serde_json::Value::Number(serde_json::Number::from_f64(a.value(idx) as f64).unwrap_or(serde_json::Number::from(0)))).unwrap_or(serde_json::Value::Null),
+        DataType::Float64 => array.as_any().downcast_ref::<Float64Array>().map(|a| serde_json::Value::Number(serde_json::Number::from_f64(a.value(idx)).unwrap_or(serde_json::Number::from(0)))).unwrap_or(serde_json::Value::Null),
+        DataType::Boolean => array.as_any().downcast_ref::<BooleanArray>().map(|a| serde_json::Value::Bool(a.value(idx))).unwrap_or(serde_json::Value::Null),
+        DataType::Utf8 => array.as_any().downcast_ref::<StringArray>().map(|a| serde_json::Value::String(a.value(idx).to_string())).unwrap_or(serde_json::Value::Null),
+        DataType::LargeUtf8 => array.as_any().downcast_ref::<LargeStringArray>().map(|a| serde_json::Value::String(a.value(idx).to_string())).unwrap_or(serde_json::Value::Null),
+        DataType::Timestamp(_, _) => {
+            let v = array.as_any().downcast_ref::<TimestampSecondArray>().map(|a| serde_json::Value::Number(a.value(idx).into())).unwrap_or(serde_json::Value::Null);
+            v
+        }
+        _ => serde_json::Value::String(format!("{:?}", array.data_type())),
     }
 }
 
@@ -1236,5 +1503,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_jobs_rejects_all_requests_when_empty_token() {
+        // Empty expected token simulates fail-closed when auth is required but
+        // no token is configured in production.
+        let response = router_with_token(demo_state().unwrap(), Some(""))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .header("authorization", "Bearer anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_jobs_rejects_empty_token_even_with_matching_empty_bearer() {
+        let response = router_with_token(demo_state().unwrap(), Some(""))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .header("authorization", "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -231,7 +231,7 @@ async fn flight_sql_server_submit_sql_verify() {
 
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(make_flight_sql_server())
+            .add_service(make_flight_sql_server().expect("make flight sql server"))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");
@@ -295,7 +295,7 @@ async fn flight_sql_register_parquet_query() {
 
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(make_flight_sql_server())
+            .add_service(make_flight_sql_server().expect("make flight sql server"))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");
@@ -454,7 +454,7 @@ async fn distributed_backend_end_to_end() {
 
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(make_flight_sql_server())
+            .add_service(make_flight_sql_server().expect("make flight sql server"))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");
@@ -487,7 +487,7 @@ async fn flight_sql_continuous_stream_register_push_drain() {
 
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(make_flight_sql_server())
+            .add_service(make_flight_sql_server().expect("make flight sql server"))
             .serve_with_incoming(incoming)
             .await
             .expect("serve");

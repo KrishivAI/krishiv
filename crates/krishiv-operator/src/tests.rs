@@ -15,6 +15,7 @@ mod operator_tests {
         detect_executor_pod_launch_failure, job_spec_from_resource, krishivjob_api_resource,
         resource_from_dynamic_object, status_patch,
     };
+    use crate::pod_manager::build_executor_pod;
     use krishiv_scheduler::{Coordinator, LeaderElection as _};
     use kube::core::DynamicObject;
     use serde_json::json;
@@ -228,6 +229,55 @@ mod operator_tests {
         assert_eq!(secret.name, "krishiv-executor-task-auth");
         assert_eq!(secret.key, "token");
         assert_eq!(secret.optional, Some(false));
+    }
+
+    #[test]
+    fn build_pod_omits_hostpath_volume() {
+        let resource = sample_resource();
+        let pod = build_executor_pod(&resource, "sample-batch-exec-0", "exec-0", 0, "job-0", "http://krishiv-coordinator:9090");
+        let spec = pod.spec.expect("pod spec");
+        assert!(
+            spec.volumes.is_none() || spec.volumes.as_ref().unwrap().is_empty(),
+            "executor pod must not mount hostPath volumes"
+        );
+        let container = spec.containers.first().expect("executor container");
+        assert!(
+            container.volume_mounts.is_none()
+                || container.volume_mounts.as_ref().unwrap().is_empty(),
+            "executor container must not have volume mounts"
+        );
+    }
+
+    #[test]
+    fn build_pod_injects_only_allowlisted_env_vars_from_args() {
+        let mut resource = sample_resource();
+        resource.spec.args = vec![
+            String::from("KRISHIV_HEARTBEAT_INTERVAL_SECS=5"),
+            String::from("KRISHIV_HTTP_ADDR=0.0.0.0:8080"),
+            String::from("KRISHIV_COORDINATOR_BEARER_TOKEN=secret"),
+            String::from("FOO_BAR=baz"),
+            String::from("PATH=/evil"),
+        ];
+        let pod = build_executor_pod(&resource, "sample-batch-exec-0", "exec-0", 0, "job-0", "http://krishiv-coordinator:9090");
+        let spec = pod.spec.expect("pod spec");
+        let container = spec.containers.first().expect("executor container");
+        let env = container.env.as_ref().expect("executor env");
+
+        let env_names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        assert!(env_names.contains(&"KRISHIV_HEARTBEAT_INTERVAL_SECS"));
+        assert!(env_names.contains(&"KRISHIV_HTTP_ADDR"));
+
+        // Auth tokens are always added by build_executor_pod via secret refs,
+        // but they must never be injectable from resource.spec.args.
+        let coordinator_token = env.iter().find(|e| e.name == "KRISHIV_COORDINATOR_BEARER_TOKEN").expect("coordinator token env");
+        assert!(
+            coordinator_token.value.is_none(),
+            "auth token must come from a secret ref, not from args"
+        );
+        assert!(coordinator_token.value_from.is_some(), "auth token must have a secret ref");
+
+        assert!(!env_names.contains(&"FOO_BAR"), "arbitrary env vars must be rejected");
+        assert!(!env_names.contains(&"PATH"), "sensitive env vars must be rejected");
     }
 
     #[test]

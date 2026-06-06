@@ -326,4 +326,19 @@ mod tests {
             krishiv_proto::CoordinatorState::Standby
         );
     }
+
+    #[test]
+    fn single_node_leader_fencing_token_is_monotonic() {
+        let leader = SingleNodeLeader::new();
+        let initial = leader.fencing_token();
+        assert_eq!(initial, 1);
+
+        let bumped = leader.bump_fencing_token();
+        assert_eq!(bumped, 2);
+        assert_eq!(leader.fencing_token(), 2);
+
+        let bumped_again = leader.bump_fencing_token();
+        assert_eq!(bumped_again, 3);
+        assert_eq!(leader.fencing_token(), 3);
+    }
 }

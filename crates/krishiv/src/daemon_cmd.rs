@@ -4,7 +4,7 @@ use krishiv_common::async_util::block_on;
 use krishiv_scheduler::{
     coordinator_daemon_help, job_coordinator_daemon_help, parse_coordinator_daemon_config,
     parse_job_coordinator_daemon_config, run_clusterd_daemon, run_job_coordinator_daemon,
-    run_standalone_coordinator,
+    run_standalone_coordinator, SharedCoordinator,
 };
 
 use crate::cli::CliResponse;
@@ -39,13 +39,16 @@ fn run_coordinator(args: &[String]) -> i32 {
             print!("{}", coordinator_daemon_help());
             0
         }
-        Ok(config) => match block_on(run_standalone_coordinator(config)) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("{e}");
-                2
+        Ok(config) => {
+            let factory = build_ui_http_factory();
+            match block_on(run_standalone_coordinator(config, factory)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    2
+                }
             }
-        },
+        }
         Err(e) => {
             eprintln!("{e}");
             2
@@ -59,18 +62,34 @@ fn run_clusterd(args: &[String]) -> i32 {
             print!("{}", coordinator_daemon_help());
             0
         }
-        Ok(config) => match block_on(run_clusterd_daemon(config)) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("{e}");
-                2
+        Ok(config) => {
+            let factory = build_ui_http_factory();
+            match block_on(run_clusterd_daemon(config, factory)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{e}");
+                    2
+                }
             }
-        },
+        }
         Err(e) => {
             eprintln!("{e}");
             2
         }
     }
+}
+
+#[cfg(feature = "ui")]
+fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>> {
+    Some(Box::new(|shared: SharedCoordinator| {
+        let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared);
+        krishiv_ui::router(ui_state)
+    }))
+}
+
+#[cfg(not(feature = "ui"))]
+fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>> {
+    None
 }
 
 fn run_job_coordinator(args: &[String]) -> i32 {

@@ -226,6 +226,31 @@ pub fn validate_window_execution_spec(spec: &WindowExecutionSpec) -> Result<(), 
     Ok(())
 }
 
+/// Escape `:` and `\` in compact-fragment values so that the colon separator
+/// cannot be confused with literal characters inside column names or source ids.
+fn escape_compact_value(s: &str) -> String {
+    s.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+/// Reverse [`escape_compact_value`].
+fn unescape_compact_value(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next == ':' || next == '\\' {
+                    chars.next();
+                    result.push(next);
+                    continue;
+                }
+            }
+        }
+        result.push(ch);
+    }
+    result
+}
+
 /// Encode a window spec as an executor plan fragment description.
 pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
     let aggs: Vec<String> = if spec.agg_exprs.is_empty() {
@@ -243,7 +268,10 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
 
     let extra = match spec.window_kind {
         WindowKind::Tumbling => String::new(),
-        WindowKind::Sliding => format!(":slide={}", spec.slide_ms.unwrap_or(spec.window_size_ms)),
+        WindowKind::Sliding => format!(
+            ":slide={}",
+            spec.slide_ms.unwrap_or(spec.window_size_ms)
+        ),
         WindowKind::Session => format!(
             ":gap={}",
             spec.session_gap_ms.unwrap_or(spec.window_size_ms)
@@ -261,7 +289,7 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
     let srcid = spec
         .source_id_column
         .as_deref()
-        .map(|c| format!(":srcid={c}"))
+        .map(|c| format!(":srcid={}", escape_compact_value(c)))
         .unwrap_or_default();
 
     let srcs = if spec.source_watermark_lags.is_empty() {
@@ -272,14 +300,19 @@ pub fn encode_stream_fragment(spec: &WindowExecutionSpec) -> String {
         pairs.sort_by_key(|(k, _)| k.as_str());
         let encoded: Vec<String> = pairs
             .iter()
-            .map(|(id, lag)| format!("{id}:{lag}"))
+            .map(|(id, lag)| {
+                format!("{}:{lag}", escape_compact_value(id))
+            })
             .collect();
         format!(":srcs={}", encoded.join(","))
     };
 
     format!(
         "{prefix}:key={}:time={}:win={}:lag={}:{agg}{extra}{ttl}{srcid}{srcs}",
-        spec.key_column, spec.event_time_column, spec.window_size_ms, spec.watermark_lag_ms,
+        escape_compact_value(&spec.key_column),
+        escape_compact_value(&spec.event_time_column),
+        spec.window_size_ms,
+        spec.watermark_lag_ms,
     )
 }
 
@@ -350,8 +383,8 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             ))
         })?;
         match k.trim() {
-            "key" => key_col = Some(v.trim().to_owned()),
-            "time" => time_col = Some(v.trim().to_owned()),
+            "key" => key_col = Some(unescape_compact_value(v.trim())),
+            "time" => time_col = Some(unescape_compact_value(v.trim())),
             "win" => {
                 window_ms = Some(
                     v.trim()
@@ -388,19 +421,32 @@ pub fn parse_stream_fragment(fragment: &str) -> Result<ParsedStreamFragment, Pla
             }
             "agg" => agg_kind = Some(v.trim().to_owned()),
             "col" => agg_col = Some(v.trim().to_owned()),
-            "srcid" => source_id_column = Some(v.trim().to_owned()),
+            "srcid" => source_id_column = Some(unescape_compact_value(v.trim())),
             "srcs" => {
-                // Format: id1:lag1,id2:lag2
+                // Format: id1:lag1,id2:lag2  (ids may contain escaped colons)
                 for pair in v.split(',') {
                     let pair = pair.trim();
                     if pair.is_empty() {
                         continue;
                     }
-                    let (id, lag_str) = pair.split_once(':').ok_or_else(|| {
-                        PlanError::Parse(format!("srcs entry must be id:lag_ms; got '{pair}'"))
+                    // Split on the first non-escaped colon.
+                    let split_idx = pair
+                        .char_indices()
+                        .find(|(idx, ch)| {
+                            *ch == ':' && !is_escaped_colon(pair, *idx)
+                        })
+                        .map(|(idx, _)| idx);
+                    let split_idx = split_idx.ok_or_else(|| {
+                        PlanError::Parse(format!(
+                            "srcs entry must be id:lag_ms; got '{pair}'"
+                        ))
                     })?;
+                    let id = unescape_compact_value(&pair[..split_idx]);
+                    let lag_str = &pair[split_idx + ':'.len_utf8()..];
                     let lag: u64 = lag_str.trim().parse().map_err(|e| {
-                        PlanError::Parse(format!("invalid lag in srcs entry '{pair}': {e}"))
+                        PlanError::Parse(format!(
+                            "invalid lag in srcs entry '{pair}': {e}"
+                        ))
                     })?;
                     source_watermark_lags.insert(id.trim().to_owned(), lag);
                 }
@@ -485,12 +531,32 @@ const STREAM_FIELD_PREFIXES: &[&str] = &[
     "key=", "time=", "win=", "lag=", "slide=", "gap=", "ttl=", "agg=", "col=", "srcid=", "srcs=",
 ];
 
+/// Return `true` if the colon at byte position `idx` is escaped by an odd
+/// number of consecutive backslashes immediately preceding it.
+fn is_escaped_colon(payload: &str, idx: usize) -> bool {
+    let mut backslash_count = 0usize;
+    let mut i = idx;
+    while i > 0 {
+        i -= 1;
+        if payload.as_bytes()[i] == b'\\' {
+            backslash_count += 1;
+        } else {
+            break;
+        }
+    }
+    backslash_count % 2 == 1
+}
+
 fn split_stream_fields(payload: &str) -> Vec<&str> {
     let mut fields = Vec::new();
     let mut field_start = 0usize;
 
     for (idx, ch) in payload.char_indices() {
         if ch != ':' || idx == field_start {
+            continue;
+        }
+        // Skip escaped colons so values like `key=col\:name` are not split.
+        if is_escaped_colon(payload, idx) {
             continue;
         }
         let after_colon = &payload[idx + ch.len_utf8()..];
@@ -652,5 +718,69 @@ mod tests {
             err.to_string().contains("invalid lag in srcs entry"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn roundtrip_fragment_with_colon_in_column_name() {
+        let spec = WindowExecutionSpec {
+            key_column: "ns:user_id".into(),
+            event_time_column: "ts:ms".into(),
+            watermark_lag_ms: 100,
+            window_kind: WindowKind::Tumbling,
+            window_size_ms: 5_000,
+            slide_ms: None,
+            session_gap_ms: None,
+            agg_exprs: vec![WindowAgg::count("count")],
+            state_ttl_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+        };
+        let frag = encode_stream_fragment(&spec);
+        let parsed = parse_stream_fragment(&frag).expect("parse escaped fragment");
+        assert_eq!(parsed.key_col, "ns:user_id");
+        assert_eq!(parsed.time_col, "ts:ms");
+    }
+
+    #[test]
+    fn roundtrip_fragment_with_backslash_in_column_name() {
+        let spec = WindowExecutionSpec {
+            key_column: "path\\to".into(),
+            event_time_column: "ts".into(),
+            watermark_lag_ms: 0,
+            window_kind: WindowKind::Tumbling,
+            window_size_ms: 1_000,
+            slide_ms: None,
+            session_gap_ms: None,
+            agg_exprs: vec![WindowAgg::count("count")],
+            state_ttl_ms: None,
+            source_watermark_lags: HashMap::new(),
+            source_id_column: None,
+        };
+        let frag = encode_stream_fragment(&spec);
+        let parsed = parse_stream_fragment(&frag).expect("parse escaped backslash");
+        assert_eq!(parsed.key_col, "path\\to");
+    }
+
+    #[test]
+    fn roundtrip_multi_source_with_colon_in_source_id() {
+        let mut source_watermark_lags = HashMap::new();
+        source_watermark_lags.insert("ns:orders".to_string(), 1_000);
+        let spec = WindowExecutionSpec {
+            key_column: "customer_id".into(),
+            event_time_column: "event_ts".into(),
+            watermark_lag_ms: 100,
+            window_kind: WindowKind::Tumbling,
+            window_size_ms: 60_000,
+            slide_ms: None,
+            session_gap_ms: None,
+            agg_exprs: vec![WindowAgg::count("count")],
+            state_ttl_ms: None,
+            source_watermark_lags,
+            source_id_column: Some("src:col".into()),
+        };
+        let frag = encode_stream_fragment(&spec);
+        let parsed = parse_stream_fragment(&frag).expect("parse escaped multi-source");
+        assert_eq!(parsed.source_id_column.as_deref(), Some("src:col"));
+        assert_eq!(parsed.source_watermark_lags.get("ns:orders"), Some(&1_000));
     }
 }

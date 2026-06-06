@@ -14,13 +14,5 @@ spec:
           cd /krishiv
           source .venv/bin/activate
           python examples/python/benchmark_10_scenarios.py
-        volumeMounts:
-        - name: krishiv-repo
-          mountPath: /krishiv
-      volumes:
-      - name: krishiv-repo
-        hostPath:
-          path: /home/code/krishiv
-          type: Directory
       restartPolicy: Never
   backoffLimit: 0

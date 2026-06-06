@@ -19,8 +19,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, EnvVarSource, HostPathVolumeSource, ObjectFieldSelector, Pod, PodSpec,
-    PodTemplateSpec, SecretKeySelector, Volume, VolumeMount,
+    Container, EnvVar, EnvVarSource, ObjectFieldSelector, Pod, PodSpec, PodTemplateSpec,
+    SecretKeySelector,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Client;
@@ -63,6 +63,22 @@ const DEFAULT_COORDINATOR_AUTH_SECRET_NAME: &str = "krishiv-coordinator-auth";
 const DEFAULT_COORDINATOR_AUTH_SECRET_KEY: &str = "token";
 const DEFAULT_EXECUTOR_TASK_AUTH_SECRET_NAME: &str = "krishiv-executor-task-auth";
 const DEFAULT_EXECUTOR_TASK_AUTH_SECRET_KEY: &str = "token";
+
+/// Explicit allow-list of environment variable names that may be injected from
+/// `KrishivJobResource.spec.args` into executor Pods.  All other keys are
+/// silently ignored to prevent arbitrary env-var injection (security hardening).
+const ALLOWED_EXECUTOR_ENV_VARS: &[&str] = &[
+    "KRISHIV_HEARTBEAT_INTERVAL_SECS",
+    "KRISHIV_HTTP_ADDR",
+    "KRISHIV_TASK_GRPC_ADDR",
+    "KRISHIV_BARRIER_GRPC_ADDR",
+    "KRISHIV_SHUFFLE_DIR",
+    "KRISHIV_SHUFFLE_URI",
+    "KRISHIV_STATE_DIR",
+    "KRISHIV_CHECKPOINT_STORAGE",
+    "KRISHIV_DURABILITY_PROFILE",
+    "KAFKA_BOOTSTRAP_SERVERS",
+];
 
 /// Manages the lifecycle of executor Pods spawned for a `KrishivJob`.
 #[derive(Clone)]
@@ -219,7 +235,7 @@ impl PodLifecycleManager {
         Ok(())
     }
 
-    fn build_pod(
+    pub(crate) fn build_pod(
         &self,
         resource: &KrishivJobResource,
         pod_name: &str,
@@ -227,128 +243,127 @@ impl PodLifecycleManager {
         idx: usize,
         job_id: &str,
     ) -> Pod {
-        let job_name = &resource.metadata.name;
-        let namespace = resource.metadata.namespace_or_default().to_owned();
+        build_executor_pod(resource, pod_name, executor_id, idx, job_id, &self.coordinator_endpoint)
+    }
+}
 
-        let mut labels: BTreeMap<String, String> = resource.spec.labels.clone();
-        labels.insert(JOB_LABEL.to_owned(), job_name.clone());
-        labels.insert(EXECUTOR_IDX_LABEL.to_owned(), idx.to_string());
-        labels.insert(EXECUTOR_ID_LABEL.to_owned(), executor_id.to_owned());
+/// Build an executor Pod for a `KrishivJobResource` without a live kube client.
+///
+/// Extracted from `PodLifecycleManager::build_pod` so it can be tested without
+/// constructing a `kube::Client`.
+pub(crate) fn build_executor_pod(
+    resource: &KrishivJobResource,
+    pod_name: &str,
+    executor_id: &str,
+    idx: usize,
+    job_id: &str,
+    coordinator_endpoint: &str,
+) -> Pod {
+    let job_name = &resource.metadata.name;
+    let namespace = resource.metadata.namespace_or_default().to_owned();
 
-        // Owner reference — Kubernetes will GC the pod when the KrishivJob is deleted.
-        // Only set owner references when a UID is available; an empty UID causes
-        // the Kubernetes API to reject the owner reference.
-        let owner_refs = resource
-            .metadata
-            .uid
-            .as_deref()
-            .filter(|_| resource.metadata.generation >= 0)
-            .map(|uid| {
-                vec![OwnerReference {
-                    api_version: format!("{API_GROUP}/{API_VERSION}"),
-                    kind: KIND.to_owned(),
-                    name: job_name.clone(),
-                    uid: uid.to_owned(),
-                    controller: Some(true),
-                    block_owner_deletion: Some(true),
-                }]
-            })
-            .unwrap_or_default();
+    let mut labels: BTreeMap<String, String> = resource.spec.labels.clone();
+    labels.insert(JOB_LABEL.to_owned(), job_name.clone());
+    labels.insert(EXECUTOR_IDX_LABEL.to_owned(), idx.to_string());
+    labels.insert(EXECUTOR_ID_LABEL.to_owned(), executor_id.to_owned());
 
-        let mut env_vars = vec![
-            pod_ip_env_var(),
-            EnvVar {
-                name: ENV_COORDINATOR_ENDPOINT.to_owned(),
-                value: Some(self.coordinator_endpoint.clone()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: ENV_EXECUTOR_ID.to_owned(),
-                value: Some(executor_id.to_owned()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: ENV_JOB_ID.to_owned(),
-                value: Some(job_id.to_owned()),
-                ..Default::default()
-            },
-            EnvVar {
-                name: ENV_TASK_SLOTS.to_owned(),
-                value: Some("1".to_owned()),
-                ..Default::default()
-            },
-        ];
+    // Owner reference — Kubernetes will GC the pod when the KrishivJob is deleted.
+    // Only set owner references when a UID is available; an empty UID causes
+    // the Kubernetes API to reject the owner reference.
+    let owner_refs = resource
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|_| resource.metadata.generation >= 0)
+        .map(|uid| {
+            vec![OwnerReference {
+                api_version: format!("{API_GROUP}/{API_VERSION}"),
+                kind: KIND.to_owned(),
+                name: job_name.clone(),
+                uid: uid.to_owned(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]
+        })
+        .unwrap_or_default();
 
-        // Allow the job spec to inject additional environment variables via args
-        // that follow the KEY=VALUE convention (executor interprets them on start).
-        // (Full env-var injection would require a CRD schema extension; this is
-        // a minimal path that avoids a breaking change to the CRD spec.)
-        for arg in &resource.spec.args {
-            if let Some((k, v)) = arg.split_once('=')
-                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !k.is_empty()
-                && k != ENV_REQUIRE_EXECUTOR_TASK_AUTH
-                && k != ENV_COORDINATOR_BEARER_TOKEN
-                && k != ENV_EXECUTOR_TASK_BEARER_TOKEN
-            {
-                env_vars.push(EnvVar {
-                    name: k.to_owned(),
-                    value: Some(v.to_owned()),
-                    ..Default::default()
-                });
-            }
-        }
-        env_vars.push(executor_task_auth_required_env_var());
-        env_vars.push(coordinator_bearer_token_env_var());
-        env_vars.push(executor_task_bearer_token_env_var());
-
-        let container = Container {
-            name: "executor".to_owned(),
-            image: Some(resource.spec.image.clone()),
-            command: if resource.spec.entrypoint.is_empty() {
-                None
-            } else {
-                Some(resource.spec.entrypoint.clone())
-            },
-            args: Some(executor_args(&self.coordinator_endpoint)),
-            env: Some(env_vars),
-            volume_mounts: Some(vec![VolumeMount {
-                name: "krishiv-src".to_owned(),
-                mount_path: "/home/code/krishiv".to_owned(),
-                ..Default::default()
-            }]),
+    let mut env_vars = vec![
+        pod_ip_env_var(),
+        EnvVar {
+            name: ENV_COORDINATOR_ENDPOINT.to_owned(),
+            value: Some(coordinator_endpoint.to_owned()),
             ..Default::default()
-        };
-
-        // Map the CRD restart policy to the Kubernetes Pod restart policy.
-        let restart_policy = match resource.spec.restart_policy {
-            crate::crd::job::RestartPolicy::Never => "Never".to_owned(),
-            crate::crd::job::RestartPolicy::OnFailure => "OnFailure".to_owned(),
-        };
-
-        Pod {
-            metadata: KubeObjectMeta {
-                name: Some(pod_name.to_owned()),
-                namespace: Some(namespace),
-                labels: Some(labels),
-                owner_references: Some(owner_refs),
-                ..Default::default()
-            },
-            spec: Some(PodSpec {
-                containers: vec![container],
-                restart_policy: Some(restart_policy),
-                volumes: Some(vec![Volume {
-                    name: "krishiv-src".to_owned(),
-                    host_path: Some(HostPathVolumeSource {
-                        path: "/home/code/krishiv".to_owned(),
-                        type_: Some("DirectoryOrCreate".to_owned()),
-                    }),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
+        },
+        EnvVar {
+            name: ENV_EXECUTOR_ID.to_owned(),
+            value: Some(executor_id.to_owned()),
             ..Default::default()
+        },
+        EnvVar {
+            name: ENV_JOB_ID.to_owned(),
+            value: Some(job_id.to_owned()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: ENV_TASK_SLOTS.to_owned(),
+            value: Some("1".to_owned()),
+            ..Default::default()
+        },
+    ];
+
+    // Allow the job spec to inject additional environment variables via args
+    // that follow the KEY=VALUE convention (executor interprets them on start).
+    // Only keys listed in ALLOWED_EXECUTOR_ENV_VARS are forwarded; everything
+    // else is silently ignored to prevent arbitrary env-var injection.
+    for arg in &resource.spec.args {
+        if let Some((k, v)) = arg.split_once('=')
+            && !k.is_empty()
+            && ALLOWED_EXECUTOR_ENV_VARS.contains(&k)
+        {
+            env_vars.push(EnvVar {
+                name: k.to_owned(),
+                value: Some(v.to_owned()),
+                ..Default::default()
+            });
         }
+    }
+    env_vars.push(executor_task_auth_required_env_var());
+    env_vars.push(coordinator_bearer_token_env_var());
+    env_vars.push(executor_task_bearer_token_env_var());
+
+    let container = Container {
+        name: "executor".to_owned(),
+        image: Some(resource.spec.image.clone()),
+        command: if resource.spec.entrypoint.is_empty() {
+            None
+        } else {
+            Some(resource.spec.entrypoint.clone())
+        },
+        args: Some(executor_args(coordinator_endpoint)),
+        env: Some(env_vars),
+        ..Default::default()
+    };
+
+    // Map the CRD restart policy to the Kubernetes Pod restart policy.
+    let restart_policy = match resource.spec.restart_policy {
+        crate::crd::job::RestartPolicy::Never => "Never".to_owned(),
+        crate::crd::job::RestartPolicy::OnFailure => "OnFailure".to_owned(),
+    };
+
+    Pod {
+        metadata: KubeObjectMeta {
+            name: Some(pod_name.to_owned()),
+            namespace: Some(namespace),
+            labels: Some(labels),
+            owner_references: Some(owner_refs),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![container],
+            restart_policy: Some(restart_policy),
+            ..Default::default()
+        }),
+        ..Default::default()
     }
 }
 

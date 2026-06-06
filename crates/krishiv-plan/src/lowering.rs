@@ -2,6 +2,7 @@
 
 use crate::window::{WindowAgg, WindowExecutionSpec, WindowKind, encode_stream_fragment};
 use crate::{NodeOp, PlanNode};
+use krishiv_common::validate::{is_safe_identifier, validate_safe_id};
 
 const PLAN_OP_PREFIX: &str = "planop:";
 
@@ -82,13 +83,25 @@ fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
             Some(*session_gap_ms),
             aggs,
         ))),
-        NodeOp::Scan { table, .. } => Some(format!("sql:SELECT * FROM {table}")),
+        NodeOp::Scan { table, .. } => {
+            // Validate and quote the table identifier to prevent SQL injection
+            // through the fragment string. Double-quoted identifiers are the
+            // SQL- standard escape mechanism; embedded quotes are doubled.
+            validate_safe_id(table, "scan table").ok()?;
+            let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+            Some(format!("sql:SELECT * FROM {quoted}"))
+        }
         NodeOp::Filter { .. } | NodeOp::Project { .. } | NodeOp::Aggregate { .. } => {
             serde_json::to_string(op)
                 .ok()
                 .map(|json| format!("{PLAN_OP_PREFIX}{json}"))
         }
-        NodeOp::StreamSource { source_id, .. } => Some(format!("stream-source:{source_id}")),
+        NodeOp::StreamSource { source_id, .. } => {
+            if !is_safe_identifier(source_id) {
+                return None;
+            }
+            Some(format!("stream-source:{source_id}"))
+        }
         NodeOp::StateTtl { ttl_ms } => Some(format!("stream-ttl:{ttl_ms}")),
         other => serde_json::to_string(other)
             .ok()
@@ -165,5 +178,63 @@ mod tests {
         };
         let frag = format!("{PLAN_OP_PREFIX}{}", serde_json::to_string(&op).unwrap());
         assert_eq!(decode_task_fragment(&frag), Some(op));
+    }
+
+    use crate::ExecutionKind;
+
+    #[test]
+    fn scan_table_is_double_quoted_in_fragment() {
+        let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("orders"),
+            filters: vec![],
+        });
+        let frag = encode_task_fragment(&node);
+        assert_eq!(frag, "sql:SELECT * FROM \"orders\"");
+    }
+
+    #[test]
+    fn scan_table_escapes_embedded_quotes() {
+        let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("o\"rders"),
+            filters: vec![],
+        });
+        let frag = encode_task_fragment(&node);
+        assert_eq!(frag, "sql:SELECT * FROM \"o\"\"rders\"");
+    }
+
+    #[test]
+    fn scan_table_with_path_traversal_rejected() {
+        let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("../etc/passwd"),
+            filters: vec![],
+        });
+        let frag = encode_task_fragment(&node);
+        // Falls through to legacy_node_description because validation fails.
+        assert!(frag.starts_with("scan [batch]"));
+    }
+
+    #[test]
+    fn stream_source_with_safe_id_encoded() {
+        let node = PlanNode::new("src", "source", ExecutionKind::Streaming).with_op(
+            NodeOp::StreamSource {
+                source_id: String::from("kafka-orders"),
+                bounded: false,
+            },
+        );
+        let frag = encode_task_fragment(&node);
+        assert_eq!(frag, "stream-source:kafka-orders");
+    }
+
+    #[test]
+    fn stream_source_with_unsafe_id_rejected() {
+        let node = PlanNode::new("src", "source", ExecutionKind::Streaming).with_op(
+            NodeOp::StreamSource {
+                source_id: String::from("source/id"),
+                bounded: false,
+            },
+        );
+        let frag = encode_task_fragment(&node);
+        // Falls through to legacy_node_description because validation fails.
+        assert!(frag.starts_with("src [streaming]"));
     }
 }

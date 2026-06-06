@@ -723,28 +723,32 @@ fn encode_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, KrishivActionE
 /// Build a gRPC `FlightServiceServer` wrapping `KrishivFlightSqlService`.
 ///
 /// **Beta API**: may change between minor releases.
-pub fn make_flight_sql_server()
--> arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService> {
-    let service =
-        KrishivFlightSqlService::with_host(FlightExecutionHost::from_env().expect("flight host"));
-    arrow_flight::flight_service_server::FlightServiceServer::new(configure_flight_auth_from_env(
-        service,
+pub fn make_flight_sql_server(
+) -> Result<arrow_flight::flight_service_server::FlightServiceServer<KrishivFlightSqlService>, String> {
+    let service = KrishivFlightSqlService::with_host(
+        FlightExecutionHost::from_env().map_err(|e| e.to_string())?
+    );
+    Ok(arrow_flight::flight_service_server::FlightServiceServer::new(
+        configure_flight_auth_from_env(service)?
     ))
 }
 
 /// Attach auth from `KRISHIV_API_KEYS` when configured; fail in production when absent.
-fn configure_flight_auth_from_env(mut service: KrishivFlightSqlService) -> KrishivFlightSqlService {
+fn configure_flight_auth_from_env(
+    service: KrishivFlightSqlService,
+) -> Result<KrishivFlightSqlService, String> {
     match auth_provider_from_env() {
-        Ok(Some(auth)) => service.with_auth(auth),
-        Ok(None) => service,
+        Ok(Some(auth)) => Ok(service.with_auth(auth)),
+        Ok(None) => Ok(service),
         Err(message) => {
             if krishiv_common::profile_requires_authenticated_flight(
                 krishiv_common::resolve_durability_profile(),
             ) {
-                panic!("{message}");
+                Err(message)
+            } else {
+                eprintln!("krishiv-flight-sql: {message}; serving anonymously (dev only)");
+                Ok(service)
             }
-            eprintln!("krishiv-flight-sql: {message}; serving anonymously (dev only)");
-            service
         }
     }
 }
@@ -800,8 +804,9 @@ pub async fn run_flight_server(
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("krishiv-flight-server listening on http://{addr}");
+    let server = make_flight_sql_server()?;
     tonic::transport::Server::builder()
-        .add_service(make_flight_sql_server())
+        .add_service(server)
         .serve(addr)
         .await?;
     Ok(())
@@ -858,7 +863,7 @@ mod tests {
 
     #[test]
     fn make_flight_sql_server_compiles() {
-        let _ = make_flight_sql_server();
+        let _ = make_flight_sql_server().expect("make flight sql server");
     }
 
     #[tokio::test]

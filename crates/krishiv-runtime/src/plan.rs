@@ -108,11 +108,14 @@ pub fn streaming_spec_from_plan(
         }
     }
 
-    if window_kind.is_none() {
-        return Err(RuntimeError::plan_rejected(
-            "streaming plan has no window operator node",
-        ));
-    }
+    let window_kind = match window_kind {
+        Some(wk) => wk,
+        None => {
+            return Err(RuntimeError::plan_rejected(
+                "streaming plan has no window operator node",
+            ));
+        }
+    };
     if key_column.is_empty() || event_time_column.is_empty() {
         return Err(RuntimeError::plan_rejected(
             "streaming plan missing key or event-time column",
@@ -123,7 +126,7 @@ pub fn streaming_spec_from_plan(
         key_column,
         event_time_column,
         watermark_lag_ms,
-        window_kind: window_kind.unwrap(),
+        window_kind,
         window_size_ms,
         agg_exprs,
         state_ttl_ms,

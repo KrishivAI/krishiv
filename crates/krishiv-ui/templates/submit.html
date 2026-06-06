@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQL Editor - Krishiv</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4/dist/ext/json-enc.js"></script>
+</head>
+<body>
+  {% include "nav.html" %}
+
+  <main>
+    <h1>SQL Query Editor</h1>
+
+    <form hx-post="/api/v1/sql" hx-target="#results" hx-indicator="#spinner" hx-ext="json-enc">
+      <textarea name="query" rows="8" cols="80" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
+      <br>
+      <button type="submit">Run Query</button>
+      <span id="spinner" class="htmx-indicator">Running...</span>
+    </form>
+
+    <div id="results">
+      <p>Submit a query to see results.</p>
+    </div>
+  </main>
+
+  <template id="result-template">
+    <table>
+      <thead>
+        <tr></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p class="meta"></p>
+  </template>
+
+  <script>
+    document.body.addEventListener('htmx:beforeSwap', function(evt) {
+      if (evt.detail.target && evt.detail.target.id === 'results') {
+        try {
+          var data = JSON.parse(evt.detail.xhr.responseText);
+        } catch(e) {
+          // not JSON, let htmx handle normally
+          return;
+        }
+        evt.detail.shouldSwap = true;
+        evt.detail.isError = false;
+
+        var clone = document.getElementById('result-template').content.cloneNode(true);
+
+        if (data.error) {
+          clone.querySelector('p.meta').textContent = 'Error: ' + data.error;
+          evt.detail.target.innerHTML = '';
+          evt.detail.target.appendChild(clone);
+          return;
+        }
+
+        var thead = clone.querySelector('thead tr');
+        data.columns.forEach(function(col) {
+          var th = document.createElement('th');
+          th.textContent = col;
+          thead.appendChild(th);
+        });
+
+        var tbody = clone.querySelector('tbody');
+        data.rows.forEach(function(row) {
+          var tr = document.createElement('tr');
+          row.forEach(function(cell) {
+            var td = document.createElement('td');
+            td.textContent = cell === null ? 'NULL' : String(cell);
+            tr.appendChild(td);
+          });
+          tbody.appendChild(tr);
+        });
+
+        var meta = clone.querySelector('p.meta');
+        meta.textContent = data.row_count + ' row(s) in ' + data.elapsed_ms + ' ms';
+
+        evt.detail.target.innerHTML = '';
+        evt.detail.target.appendChild(clone);
+      }
+    });
+  </script>
+</body>
+</html>

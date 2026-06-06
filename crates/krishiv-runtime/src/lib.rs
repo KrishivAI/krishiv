@@ -406,7 +406,7 @@ mod distributed_flight_tests {
 
         let server = tokio::spawn(async move {
             Server::builder()
-                .add_service(make_flight_sql_server())
+                .add_service(make_flight_sql_server().expect("make flight sql server"))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("serve");

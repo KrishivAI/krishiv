@@ -16,5 +16,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
         print!("{}", coordinator_daemon_help());
         return Ok(());
     }
-    run_standalone_coordinator(config).await
+    run_standalone_coordinator(config, None).await
 }

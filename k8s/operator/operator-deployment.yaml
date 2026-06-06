@@ -74,13 +74,7 @@ spec:
             - name: coordinator-auth
               mountPath: /var/run/krishiv/coordinator-auth
               readOnly: true
-            - name: tpch-data
-              mountPath: /home/code/krishiv/tpch_sf10
       volumes:
         - name: coordinator-auth
           secret:
             secretName: krishiv-coordinator-auth
-        - name: tpch-data
-          hostPath:
-            path: /home/code/krishiv/tpch_sf10
-            type: Directory

@@ -58,11 +58,4 @@ spec:
                 secretKeyRef:
                   name: krishiv-executor-task-auth
                   key: token
-          volumeMounts:
-            - name: tpch-data
-              mountPath: /home/code/krishiv/tpch_sf10
-      volumes:
-        - name: tpch-data
-          hostPath:
-            path: /home/code/krishiv/tpch_sf10
-            type: Directory
+      volumes: []

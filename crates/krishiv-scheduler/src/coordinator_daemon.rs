@@ -275,6 +275,7 @@ pub async fn run_cluster_control_plane(
 pub async fn spawn_coordinator_sidecars(
     coordinator: &SharedCoordinator,
     config: &CoordinatorDaemonConfig,
+    extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(shuffle_dir) = &config.shuffle_dir {
         let store: Arc<LocalDiskShuffleStore> =
@@ -332,7 +333,12 @@ pub async fn spawn_coordinator_sidecars(
         );
         let http_config = config.clone();
         tokio::spawn(async move {
-            let router = coordinator_http_router(http_coordinator, &http_config);
+            let router = coordinator_http_router(http_coordinator.clone(), &http_config);
+            let router = if let Some(factory) = extra_http_factory {
+                router.merge(factory(http_coordinator))
+            } else {
+                router
+            };
             let _ = axum::serve(http_listener, router).await;
         });
     }
@@ -1003,6 +1009,7 @@ pub fn coordinator_daemon_help() -> &'static str {
 /// Standalone active coordinator (bare metal / VM).
 pub async fn run_standalone_coordinator(
     config: CoordinatorDaemonConfig,
+    extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
 ) -> Result<(), Box<dyn Error>> {
     let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
     validate_runtime_security_config(
@@ -1017,9 +1024,15 @@ pub async fn run_standalone_coordinator(
     };
     let coordinator = build_shared_coordinator(&config)?;
     if config.durability_profile != DurabilityProfile::DevLocal {
-        coordinator.sync_leader_fencing_token(1);
+        // Standalone coordinators must start with a monotonic fencing token.
+        // A fresh SingleNodeLeader begins at 1; bump once so the token
+        // advances across restarts and checkpoints from a prior run are not
+        // rejected by validate_fencing_token_for_restore (A8).
+        let leader = SingleNodeLeader::new();
+        let token = leader.bump_fencing_token();
+        coordinator.sync_leader_fencing_token(token);
     }
-    spawn_coordinator_sidecars(&coordinator, &config).await?;
+    spawn_coordinator_sidecars(&coordinator, &config, extra_http_factory).await?;
     // Standalone must spawn orchestration loops for task dispatch and heartbeat management.
     let _handles = coordinator.spawn_orchestration_loops();
     let listener = TcpListener::bind(config.grpc_addr).await?;
@@ -1060,7 +1073,13 @@ pub async fn run_standalone_coordinator(
 }
 
 /// Cluster control plane daemon (`krishiv-clusterd`).
-pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), Box<dyn Error>> {
+///
+/// When `extra_http_factory` is provided, the returned routes are merged
+/// into the coordinator's HTTP server.
+pub async fn run_clusterd_daemon(
+    config: CoordinatorDaemonConfig,
+    extra_http_factory: Option<Box<dyn FnOnce(SharedCoordinator) -> Router + Send>>,
+) -> Result<(), Box<dyn Error>> {
     let grpc_auth_configured = configure_coordinator_grpc_auth(&config);
     validate_runtime_security_config(
         &config,
@@ -1081,7 +1100,7 @@ pub async fn run_clusterd_daemon(config: CoordinatorDaemonConfig) -> Result<(), 
         shared.clone(),
         leader,
     ));
-    spawn_coordinator_sidecars(&shared, &config).await?;
+    spawn_coordinator_sidecars(&shared, &config, extra_http_factory).await?;
     let listener = TcpListener::bind(config.grpc_addr).await?;
     println!(
         "Krishiv clusterd (CCP) {} gRPC listening on {} (leader-backend={})",

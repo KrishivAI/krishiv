@@ -104,23 +104,20 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = RuntimeResult<T>>,
 {
-    let mut last_err = None;
-    for (attempt, &delay_ms) in std::iter::once(&0u64)
-        .chain(RETRY_DELAYS_MS.iter())
-        .enumerate()
-    {
+    let delays = std::iter::once(0).chain(RETRY_DELAYS_MS.iter().copied());
+    for (attempt, delay_ms) in delays.enumerate() {
         if delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) if attempt < RETRY_DELAYS_MS.len() && is_transient_status(&e) => {
-                last_err = Some(e);
+                // Transient error on a non-final attempt — keep retrying.
             }
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.expect("loop always sets last_err before reaching here"))
+    unreachable!("all transient retries exhaust the delay list and return early; non-transient errors return immediately")
 }
 
 /// Map a physical plan to a SQL statement understood by the Krishiv Flight SQL service.

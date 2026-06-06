@@ -16,5 +16,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
         print!("{}", coordinator_daemon_help());
         return Ok(());
     }
-    run_clusterd_daemon(config).await
+    run_clusterd_daemon(config, None).await
 }

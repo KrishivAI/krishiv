@@ -2830,6 +2830,15 @@ mod tests {
         assert!(validate_fencing_token_for_restore(&meta, 5).is_err());
     }
 
+    #[test]
+    fn validate_fencing_token_for_restore_rejects_zero_token() {
+        let mut meta = sample_metadata(1);
+        meta.fencing_token = 1;
+        // Token=0 means "no leader" and must be rejected even when the
+        // stored token is lower.
+        assert!(validate_fencing_token_for_restore(&meta, 0).is_err());
+    }
+
     // ── ReplayBundle with savepoint fields ──────────────────────────────
 
     #[test]

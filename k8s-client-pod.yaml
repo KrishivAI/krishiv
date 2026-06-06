@@ -33,7 +33,3 @@ spec:
       runAsUser: 1000
   securityContext:
     fsGroup: 1000
-  volumes:
-  - name: code
-    hostPath:
-      path: /home/code/krishiv

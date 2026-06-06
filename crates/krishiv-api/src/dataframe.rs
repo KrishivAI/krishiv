@@ -267,23 +267,28 @@ impl DataFrame {
 
         let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;
 
-        let result = if uses_remote && self.sql_query.is_some() {
-            let query = self.sql_query.as_deref().unwrap();
-            let tables = self
-                .registered_parquet
-                .iter()
-                .map(|entry| {
-                    BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
-                })
-                .collect::<Vec<_>>();
-            crate::session::runtime_collect_batch_sql(
-                Arc::clone(&self.runtime),
-                query,
-                &tables,
-                false,
-            )
-            .await
-            .map(QueryResult::new)
+        let result = if uses_remote {
+            if let Some(query) = self.sql_query.as_deref() {
+                let tables = self
+                    .registered_parquet
+                    .iter()
+                    .map(|entry| {
+                        BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
+                    })
+                    .collect::<Vec<_>>();
+                crate::session::runtime_collect_batch_sql(
+                    Arc::clone(&self.runtime),
+                    query,
+                    &tables,
+                    false,
+                )
+                .await
+                .map(QueryResult::new)
+            } else {
+                Err(KrishivError::unsupported(
+                    "remote execution requires a SQL query",
+                ))
+            }
         } else if let Some(dataframe) = &self.sql_dataframe {
             dataframe
                 .collect()
@@ -317,24 +322,29 @@ impl DataFrame {
 
         let uses_remote = self.runtime.uses_remote_execution() && !self.force_local;
 
-        let result = if uses_remote && self.sql_query.is_some() {
-            let query = self.sql_query.as_deref().unwrap();
-            let tables = self
-                .registered_parquet
-                .iter()
-                .map(|entry| {
-                    BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
-                })
-                .collect::<Vec<_>>();
-            let batches = crate::session::runtime_collect_batch_sql(
-                Arc::clone(&self.runtime),
-                query,
-                &tables,
-                false,
-            )
-            .await?;
-            let stream = futures::stream::iter(batches.into_iter().map(Ok));
-            Ok(Box::pin(stream) as krishiv_plan::SendableRecordBatchStream)
+        let result = if uses_remote {
+            if let Some(query) = self.sql_query.as_deref() {
+                let tables = self
+                    .registered_parquet
+                    .iter()
+                    .map(|entry| {
+                        BatchTableRegistration::new(entry.key().clone(), entry.value().clone())
+                    })
+                    .collect::<Vec<_>>();
+                let batches = crate::session::runtime_collect_batch_sql(
+                    Arc::clone(&self.runtime),
+                    query,
+                    &tables,
+                    false,
+                )
+                .await?;
+                let stream = futures::stream::iter(batches.into_iter().map(Ok));
+                Ok(Box::pin(stream) as krishiv_plan::SendableRecordBatchStream)
+            } else {
+                Err(KrishivError::unsupported(
+                    "remote execution requires a SQL query",
+                ))
+            }
         } else if let Some(dataframe) = &self.sql_dataframe {
             if !self.force_local {
                 self.runtime

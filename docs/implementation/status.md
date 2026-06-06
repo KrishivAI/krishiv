@@ -1,5 +1,152 @@
 # Krishiv Implementation Status
 
+## Production Stabilization Wave 0.6 — Library Panic Cleanup (2026-06-06)
+
+### Runtime
+- `krishiv-runtime/src/plan.rs`: Replaced `window_kind.unwrap()` after an `is_none()` check with an explicit `match` that returns the error before constructing `LocalWindowExecutionSpec`.
+- `krishiv-runtime/src/flight_client.rs`: Removed the now-dead `last_err` variable from `with_transient_retry`; replaced the `expect("loop always sets last_err")` with `unreachable!(...)` since every retry path returns early.
+
+### API
+- `krishiv-api/src/dataframe.rs`: Replaced two `is_some()` + `unwrap()` pairs in `collect()` and `execute_stream_async()` with `if let Some(...)` to eliminate panic paths.
+
+### Status
+- `krishiv-udf`, `krishiv-plan`, `krishiv-scheduler`, `krishiv-checkpoint`, `krishiv-connectors`, `krishiv-state` library panics were already addressed in prior sprints; no new changes required.
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly check -p krishiv-api -p krishiv-runtime -p krishiv-flight-sql -p krishiv-operator -p krishiv-scheduler -p krishiv-ui
+cargo +nightly test -p krishiv-runtime --lib --no-fail-fast
+cargo +nightly test -p krishiv-api --lib --no-fail-fast
+cargo +nightly test -p krishiv-ui --lib --no-fail-fast
+cargo +nightly test -p krishiv-flight-sql --lib make_flight_sql_server_compiles -- --nocapture
+cargo +nightly test -p krishiv-operator --lib --no-fail-fast
+```
+
+Next useful commands:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test -p krishiv-scheduler --lib --no-fail-fast
+```
+
+---
+
+## Production Stabilization Wave 0.5 — Profile Guards (completed, no-op)
+
+All remaining profile guards (`requires_file_backed_state`, `profile_forbids_native_scalar_udfs`, `forbids_simulation_connectors`, `allows_remote_sql_comment_fallback`) were already wired in prior sprints across `krishiv-state`, `krishiv-udf`, `krishiv-sql`, `krishiv-connectors`, `krishiv-executor`, and `krishiv-runtime`.
+
+---
+
+## Production Stabilization Wave 0.4 — K8s Manifest Security (2026-06-06)
+
+### Operator `hostPath` removal
+- Removed `hostPath` volume and volume mount from `PodLifecycleManager::build_pod`; executor pods no longer mount the host filesystem.
+- Extracted `build_executor_pod` as a standalone `pub(crate)` function so unit tests can verify pod construction without creating a `kube::Client`.
+- Removed `HostPathVolumeSource` and `VolumeMount` imports from `pod_manager.rs`.
+
+### Env-var allow-list validation
+- Replaced the permissive alphanumeric+underscore check in `build_pod` arg parsing with an explicit `ALLOWED_EXECUTOR_ENV_VARS` constant.
+- Allowed vars: `KRISHIV_HEARTBEAT_INTERVAL_SECS`, `KRISHIV_HTTP_ADDR`, `KRISHIV_TASK_GRPC_ADDR`, `KRISHIV_BARRIER_GRPC_ADDR`, `KRISHIV_SHUFFLE_DIR`, `KRISHIV_SHUFFLE_URI`, `KRISHIV_STATE_DIR`, `KRISHIV_CHECKPOINT_STORAGE`, `KRISHIV_DURABILITY_PROFILE`, `KAFKA_BOOTSTRAP_SERVERS`.
+- Auth tokens (`KRISHIV_COORDINATOR_BEARER_TOKEN`, `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN`, `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH`) and arbitrary keys are silently rejected.
+- Added tests: `build_pod_omits_hostpath_volume`, `build_pod_injects_only_allowlisted_env_vars_from_args`.
+- All 42 `krishiv-operator` lib tests pass.
+
+### Static manifest cleanup
+- Removed `hostPath` volumes and their mounts from:
+  - `k8s/operator/operator-deployment.yaml`
+  - `k8s/operator/executor-deployment.yaml`
+  - `k8s-client-pod.yaml`
+  - `k8s/jobs/kafka-streaming-sql.yaml`
+  - `k8s/jobs/benchmark.yaml`
+  - `k8s/jobs/python-examples.yaml`
+
+### Scheduler daemon signature fixes (regression from Wave 0.2)
+- Fixed `spawn_coordinator_sidecars` caller in `run_clusterd_daemon` to pass `extra_http_factory`.
+- Fixed `run_clusterd_daemon` and `run_standalone_coordinator` signatures to use `Router` (not `Router<SharedCoordinator>`) for the factory return type, matching axum 0.8's type system.
+- Updated callers in `krishiv/src/daemon_cmd.rs` and `krishiv-scheduler/src/bin/krishiv_clusterd.rs` to pass `None`.
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly check -p krishiv-operator --tests
+cargo +nightly test -p krishiv-operator --lib --no-fail-fast
+cargo +nightly check -p krishiv-scheduler --lib
+cargo +nightly check -p krishiv-ui --lib
+cargo +nightly check -p krishiv-flight-sql --lib
+```
+
+Next useful commands:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test -p krishiv-scheduler --lib --no-fail-fast
+```
+
+---
+
+## Production Stabilization Wave 0.3 — Auth/UI Fail-Closed (2026-06-06)
+
+### UI fail-closed
+- `resolve_ui_token()` now returns `Some(String::new())` (fail-closed) when no `KRISHIV_UI_TOKEN` or `KRISHIV_UI_TOKEN_FILE` is configured under durable profiles, instead of returning `None` and serving protected routes anonymously.
+- `require_bearer` rejects all requests when the expected token is empty, preventing `Authorization: Bearer ` from bypassing the fail-closed guard.
+- Added tests: `api_jobs_rejects_all_requests_when_empty_token`, `api_jobs_rejects_empty_token_even_with_matching_empty_bearer`.
+- All 18 `krishiv-ui` lib tests pass.
+
+### Flight SQL panic removal
+- `configure_flight_auth_from_env` now returns `Result<KrishivFlightSqlService, String>` instead of panicking when `KRISHIV_API_KEYS` is required but absent under durable profiles.
+- `make_flight_sql_server` now returns `Result<FlightServiceServer<...>, String>` instead of using `.expect("flight host")`.
+- `run_flight_server` propagates the `Result` from `make_flight_sql_server`.
+- Updated all 6 call sites across `krishiv-runtime`, `krishiv-api`, and `krishiv-runtime/tests/integration_distributed.rs` to `.unwrap()` the `Result` in test code.
+- `krishiv-flight-sql` lib test `make_flight_sql_server_compiles` passes.
+
+Validation:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly check -p krishiv-ui -p krishiv-flight-sql -p krishiv-runtime -p krishiv-api
+cargo +nightly test -p krishiv-ui --lib --no-fail-fast
+cargo +nightly test -p krishiv-flight-sql --lib make_flight_sql_server_compiles -- --nocapture
+cargo +nightly test -p krishiv-runtime --lib distributed_backend_submits_plan_over_flight_sql -- --nocapture
+cargo +nightly test -p krishiv-api remote_execution_without_fallback_uses_flight_server -- --nocapture
+cargo +nightly test -p krishiv-runtime --test integration_distributed flight_sql_server_submit_sql_verify -- --nocapture
+```
+
+Next useful commands:
+```bash
+export TMPDIR=/workspace/target/tmp
+cargo +nightly test -p krishiv-runtime --test integration_distributed --no-fail-fast
+```
+
+---
+
+## krishiv-ui Improvements (2026-06-06)
+
+Added operator-focused UI improvements to `krishiv-ui`:
+
+- **Auto-refresh via htmx** — jobs list, job detail, and executor detail pages poll every 15s via htmx `hx-trigger` with `hx-select` partial swaps. No page scroll or state is lost on refresh.
+- **Dark mode** — CSS `prefers-color-scheme: dark` media query with a manual toggle button. All components have dark variants.
+- **Executor detail page** — new `/ui/executors/{executor_id}` and `/api/v1/executors/{executor_id}` routes showing executor identity, state, slots, heartbeat, lease generation, memory usage, and running tasks.
+- **Checkpoint page** — new `/ui/jobs/{job_id}/checkpoints` route with a visual epoch timeline (dots connected by lines) and a table listing all epochs with latest-epoch highlighting.
+- **DAG visualization** — job detail page now renders stages as a horizontal flow with state badges, retry counts, and arrows between stages.
+- **Streaming observability** — `TaskView` now exposes watermark display, source offset hex, and failure count. Templates render them in the task table with links to executor detail pages.
+- **Task failure details** — failed tasks show a prominent inline error banner with the full failure reason string.
+- **Executor links in job view** — executor names in job/detail tables link to executor detail pages.
+- **Resource usage and priority** — jobs list table includes priority and CPU nanoseconds columns.
+- **Memory in executor tables** — executor tables show memory used/limit in MB.
+- **Streaming tag** — streaming jobs get a highlighted `streaming` badge in the jobs list.
+
+Validation:
+```bash
+cargo check -p krishiv-ui
+cargo test -p krishiv-ui
+cargo check -p krishiv
+```
+
+Next useful commands:
+```bash
+cargo run -p krishiv-ui -- --demo
+```
+
+---
+
 ## Iceberg REST Catalog Contract Hardening (2026-06-06)
 
 Completed the remote Iceberg REST catalog and Python binding production-readiness slice:

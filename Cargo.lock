@@ -3889,6 +3889,7 @@ name = "krishiv"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "axum 0.8.9",
  "dotenvy",
  "krishiv-api",
  "krishiv-checkpoint",
@@ -3905,6 +3906,7 @@ dependencies = [
  "krishiv-scheduler",
  "krishiv-shuffle",
  "krishiv-udf",
+ "krishiv-ui",
  "libc",
  "parquet 58.3.0",
  "serde",
@@ -4474,12 +4476,16 @@ dependencies = [
 name = "krishiv-ui"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "askama",
  "axum 0.8.9",
+ "datafusion",
+ "futures",
  "krishiv-common",
  "krishiv-metrics",
  "krishiv-proto",
  "krishiv-scheduler",
+ "krishiv-sql",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

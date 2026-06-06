@@ -224,6 +224,13 @@ impl Coordinator {
                 .map(|coord| coord.fencing_token().as_u64())
         });
         if let Some(current_token) = token {
+            if current_token == 0 {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "restore rejected for job {job_id}: fencing token is zero (no leader)"
+                    ),
+                });
+            }
             validate_fencing_token_for_restore(&meta, current_token).map_err(|e| {
                 SchedulerError::InvalidJob {
                     message: format!("restore rejected for job {job_id}: {e}"),

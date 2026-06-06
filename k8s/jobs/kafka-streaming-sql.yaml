@@ -17,13 +17,5 @@ spec:
         env:
         - name: BOOTSTRAP
           value: "redpanda-0.redpanda-service.default.svc.cluster.local:9092"
-        volumeMounts:
-        - name: krishiv-repo
-          mountPath: /krishiv
-      volumes:
-      - name: krishiv-repo
-        hostPath:
-          path: /home/code/krishiv
-          type: Directory
       restartPolicy: Never
   backoffLimit: 0
