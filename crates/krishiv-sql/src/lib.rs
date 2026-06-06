@@ -1799,8 +1799,8 @@ mod view_cache_tests {
 
 #[cfg(test)]
 mod tests {
-    use krishiv_optimizer::{Cost, CostModel, Optimizer};
-    use krishiv_plan::LogicalPlan;
+    use krishiv_optimizer::{Cost, CostModel, Optimizer, OptimizerError, OptimizerRule};
+    use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
     use super::{
         SqlEngine, SqlError, explain_sql, explain_sql_optimized, explain_sql_with_cost, plan_sql,
@@ -1874,6 +1874,35 @@ mod tests {
             output.contains("optimizer: no rules applied"),
             "output did not contain expected optimizer message: {output}"
         );
+    }
+
+    #[test]
+    fn explain_sql_optimized_propagates_invalid_rule_output() {
+        struct InvalidRule;
+        impl OptimizerRule for InvalidRule {
+            fn name(&self) -> &str {
+                "invalid"
+            }
+
+            fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+                Some(
+                    plan.clone().with_node(
+                        PlanNode::new("dangling", "dangling", ExecutionKind::Batch)
+                            .with_inputs(["missing"]),
+                    ),
+                )
+            }
+        }
+
+        let mut optimizer = Optimizer::new();
+        optimizer.add_rule(Box::new(InvalidRule));
+
+        let error = explain_sql_optimized("select 1", &optimizer).expect_err("optimizer must fail");
+
+        assert!(matches!(
+            error,
+            SqlError::Optimizer(OptimizerError::InvalidRuleOutput { .. })
+        ));
     }
 
     #[test]

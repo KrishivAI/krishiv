@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ executor.executor_id }} · Krishiv R2 Status</title>
+    <link rel="stylesheet" href="/assets/krishiv.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  </head>
+  <body>
+    <main class="shell"
+          hx-get="/ui/executors/{{ executor.executor_id }}"
+          hx-trigger="every 15s"
+          hx-select="main"
+          hx-swap="outerHTML"
+          hx-indicator="#refresh-note">
+      <header class="topbar">
+        <div class="brand">
+          <strong>{{ executor.executor_id }}</strong>
+          <span>Executor is <span class="state {{ executor.state }}">{{ executor.state }}</span></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="refresh-note" id="refresh-note">auto-refreshing every 15s</span>
+          <button class="theme-toggle" onclick="document.documentElement.style.colorScheme=document.documentElement.style.colorScheme==='dark'?'light':'dark'">🌓</button>
+        </div>
+      </header>
+
+      <div class="meta" style="margin-bottom:16px">
+        <a href="/ui">All jobs</a> · Coordinator {{ coordinator_id }} is {{ coordinator_state }}
+      </div>
+
+      <div class="executor-card">
+        <div class="info-grid">
+          <div class="info-item">
+            <span>ID</span>
+            <span>{{ executor.executor_id }}</span>
+          </div>
+          <div class="info-item">
+            <span>State</span>
+            <span><span class="state {{ executor.state }}">{{ executor.state }}</span></span>
+          </div>
+          <div class="info-item">
+            <span>Host</span>
+            <span>{{ executor.host }}</span>
+          </div>
+          <div class="info-item">
+            <span>Slots</span>
+            <span>{{ executor.slots }}</span>
+          </div>
+          <div class="info-item">
+            <span>Running Tasks</span>
+            <span>{{ executor.running_tasks.len() }}</span>
+          </div>
+          <div class="info-item">
+            <span>Heartbeat Tick</span>
+            <span>{{ executor.last_heartbeat_tick }}</span>
+          </div>
+          <div class="info-item">
+            <span>Lease Generation</span>
+            <span>{{ executor.lease_generation }}</span>
+          </div>
+          <div class="info-item">
+            <span>Memory Used</span>
+            <span>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}-{% endif %}</span>
+          </div>
+          <div class="info-item">
+            <span>Memory Limit</span>
+            <span>{% if executor.memory_limit_bytes.is_some() %}{{ executor.memory_limit_bytes.unwrap() / 1048576 }} MB{% else %}-{% endif %}</span>
+          </div>
+          <div class="info-item">
+            <span>Active Task Count</span>
+            <span>{% if executor.active_task_count.is_some() %}{{ executor.active_task_count.unwrap() }}{% else %}-{% endif %}</span>
+          </div>
+        </div>
+      </div>
+
+      <section class="section">
+        <h2>Running Tasks ({{ executor.running_tasks.len() }})</h2>
+        {% if executor.running_tasks.len() == 0 %}
+        <div class="empty">No tasks are currently assigned to this executor.</div>
+        {% else %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Task ID</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for task_id in executor.running_tasks %}
+              <tr>
+                <td><a href="/ui/jobs?task={{ task_id }}">{{ task_id }}</a></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% endif %}
+      </section>
+    </main>
+  </body>
+</html>

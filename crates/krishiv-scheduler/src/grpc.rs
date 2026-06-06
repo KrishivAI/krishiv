@@ -869,7 +869,8 @@ pub(crate) fn status_from_scheduler_error(error: SchedulerError) -> tonic::Statu
         }
         SchedulerError::NoExecutors
         | SchedulerError::InvalidJob { .. }
-        | SchedulerError::InvalidPlan { .. } => tonic::Status::invalid_argument(error.to_string()),
+        | SchedulerError::InvalidPlan { .. }
+        | SchedulerError::Optimizer(_) => tonic::Status::invalid_argument(error.to_string()),
         SchedulerError::Transport { .. }
         | SchedulerError::ExecutorUnavailable { .. }
         | SchedulerError::Store { .. } => tonic::Status::unavailable(error.to_string()),

@@ -121,8 +121,6 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lakehouse::schema_registry_confluent, m)?)?;
     m.add_class::<lakehouse::PyHudiWriteResult>()?;
     m.add_class::<lakehouse::PySchemaRegistryConfig>()?;
-    m.add_class::<lakehouse::PyGlueCatalog>()?;
-    m.add_class::<lakehouse::PyNessieCatalog>()?;
     m.add_class::<lakehouse::PyIcebergRestCatalog>()?;
 
     sinks::register_sinks_module(m.py(), m)?;

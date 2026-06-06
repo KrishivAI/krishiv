@@ -1,6 +1,6 @@
 //! R18 lakehouse Python bindings.
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::{PyDataFrame, PySession, RUNTIME};
@@ -102,24 +102,20 @@ pub fn write_hudi_upsert(
 }
 
 #[pyfunction]
-#[pyo3(signature = (url, subject, format="avro"))]
-pub fn schema_registry_confluent(
-    url: String,
-    subject: String,
-    format: &str,
-) -> PyResult<PySchemaRegistryConfig> {
-    let fmt = match format.to_lowercase().as_str() {
+#[pyo3(signature = (url, format="avro"))]
+pub fn schema_registry_confluent(url: String, format: &str) -> PyResult<PySchemaRegistryConfig> {
+    let fmt = match format.to_ascii_lowercase().as_str() {
+        "avro" => krishiv_schema_registry::RegistryFormat::Avro,
         "protobuf" => krishiv_schema_registry::RegistryFormat::Protobuf,
-        "json" => krishiv_schema_registry::RegistryFormat::Json,
-        _ => krishiv_schema_registry::RegistryFormat::Avro,
+        unsupported => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported schema registry format '{unsupported}'; expected avro or protobuf"
+            )));
+        }
     };
-    Ok(PySchemaRegistryConfig {
-        inner: krishiv_schema_registry::SchemaRegistryConfig {
-            url,
-            subject,
-            format: fmt,
-        },
-    })
+    let config = krishiv_schema_registry::SchemaRegistryConfig::new(url, fmt)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(PySchemaRegistryConfig { inner: config })
 }
 
 #[pyclass(name = "SchemaRegistryConfig")]
@@ -130,108 +126,16 @@ pub struct PySchemaRegistryConfig {
 }
 
 use krishiv_catalog::iceberg_rest::{
-    GenericRestCatalog, GlueRestCatalog, IcebergCatalogClient, IcebergTableId, NessieCatalog,
-    RestCatalogConfig,
+    GenericRestCatalog, IcebergCatalogClient, IcebergTableId, RestCatalogConfig,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
-/// AWS Glue Iceberg catalog (R18 S3.1).
+/// Generic Apache Iceberg REST catalog.
 ///
-/// Connects to the Glue REST-compatible endpoint and exposes table operations
-/// (`list_tables`, `load_table_metadata`). Requires valid AWS credentials in
-/// the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.).
-#[pyclass(name = "GlueCatalog")]
-pub struct PyGlueCatalog {
-    inner: Arc<GlueRestCatalog>,
-}
-
-#[pymethods]
-impl PyGlueCatalog {
-    #[new]
-    #[pyo3(signature = (region, database, rest_url, timeout_ms=None))]
-    pub fn new(
-        region: String,
-        database: String,
-        rest_url: String,
-        timeout_ms: Option<u64>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            inner: Arc::new(GlueRestCatalog::with_timeout(
-                region, database, rest_url, timeout_ms,
-            )),
-        })
-    }
-
-    /// List all table names in `namespace`.
-    pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
-        // Use block_in_place when a tokio handle is available so we yield the
-        // worker thread instead of blocking it — important for async Python
-        // frameworks and multi-threaded tokio runtimes.
-        RUNTIME
-            .block_on(self.inner.list_tables(&namespace))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Load table metadata for `namespace.table_name` as a JSON string.
-    pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
-        let table_id = IcebergTableId {
-            namespace,
-            name: table_name,
-        };
-        RUNTIME
-            .block_on(self.inner.load_table_metadata(&table_id))
-            .map(|v| v.to_string())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-}
-
-/// Nessie Iceberg catalog (R18 S3.1).
-///
-/// Connects to a Project Nessie server via its REST API. Wraps a
-/// `GenericRestCatalog` with Nessie-specific URL construction.
-#[pyclass(name = "NessieCatalog")]
-pub struct PyNessieCatalog {
-    inner: Arc<NessieCatalog>,
-}
-
-#[pymethods]
-impl PyNessieCatalog {
-    #[new]
-    #[pyo3(signature = (uri, reference="main", timeout_ms=None))]
-    pub fn new(uri: String, reference: &str, timeout_ms: Option<u64>) -> PyResult<Self> {
-        Ok(Self {
-            inner: Arc::new(NessieCatalog::with_timeout(uri, reference, timeout_ms)),
-        })
-    }
-
-    /// List all table names in `namespace`.
-    pub fn list_tables(&self, namespace: String) -> PyResult<Vec<String>> {
-        // Use block_in_place when a tokio handle is available so we yield the
-        // worker thread instead of blocking it — important for async Python
-        // frameworks and multi-threaded tokio runtimes.
-        RUNTIME
-            .block_on(self.inner.list_tables(&namespace))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Load table metadata for `namespace.table_name` as a JSON string.
-    pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
-        let table_id = IcebergTableId {
-            namespace,
-            name: table_name,
-        };
-        RUNTIME
-            .block_on(self.inner.load_table_metadata(&table_id))
-            .map(|v| v.to_string())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-}
-
-/// Generic Iceberg REST catalog (R18 S3.1).
-///
-/// Compatible with any Iceberg REST catalog implementation (Tabular, AWS Glue
-/// via generic REST, self-hosted). See the Iceberg REST catalog specification
-/// for the expected API surface.
+/// The caller is responsible for supplying authentication compatible with the
+/// target service. Provider-specific signing and reference protocols are not
+/// inferred from the URL.
 #[pyclass(name = "IcebergRestCatalog")]
 pub struct PyIcebergRestCatalog {
     inner: Arc<GenericRestCatalog>,
@@ -240,17 +144,59 @@ pub struct PyIcebergRestCatalog {
 #[pymethods]
 impl PyIcebergRestCatalog {
     #[new]
-    #[pyo3(signature = (url, warehouse=None, timeout_ms=None))]
-    pub fn new(url: String, warehouse: Option<String>, timeout_ms: Option<u64>) -> PyResult<Self> {
-        let config = RestCatalogConfig {
-            base_url: url,
-            warehouse,
-            prefix: "v1".to_string(),
-            bearer_token: None,
-            timeout_ms,
-        };
+    #[pyo3(signature = (
+        url,
+        warehouse=None,
+        timeout_ms=None,
+        *,
+        bearer_token=None,
+        catalog_prefix=None,
+        page_size=None,
+        max_response_bytes=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        url: String,
+        warehouse: Option<String>,
+        timeout_ms: Option<u64>,
+        bearer_token: Option<String>,
+        catalog_prefix: Option<String>,
+        page_size: Option<u32>,
+        max_response_bytes: Option<usize>,
+    ) -> PyResult<Self> {
+        let mut config = RestCatalogConfig::new(url).map_err(catalog_config_error)?;
+        if let Some(warehouse) = warehouse {
+            config = config
+                .with_warehouse(warehouse)
+                .map_err(catalog_config_error)?;
+        }
+        if let Some(timeout_ms) = timeout_ms {
+            config = config
+                .with_timeout(Duration::from_millis(timeout_ms))
+                .map_err(catalog_config_error)?;
+        }
+        if let Some(token) = bearer_token {
+            config = config
+                .with_bearer_token(token)
+                .map_err(catalog_config_error)?;
+        }
+        if let Some(prefix) = catalog_prefix {
+            config = config
+                .with_catalog_prefix(prefix)
+                .map_err(catalog_config_error)?;
+        }
+        if let Some(page_size) = page_size {
+            config = config
+                .with_page_size(page_size)
+                .map_err(catalog_config_error)?;
+        }
+        if let Some(limit) = max_response_bytes {
+            config = config
+                .with_max_response_bytes(limit)
+                .map_err(catalog_config_error)?;
+        }
         Ok(Self {
-            inner: Arc::new(GenericRestCatalog::new(config)),
+            inner: Arc::new(GenericRestCatalog::new(config).map_err(catalog_config_error)?),
         })
     }
 
@@ -266,10 +212,7 @@ impl PyIcebergRestCatalog {
 
     /// Load table metadata for `namespace.table_name` as a JSON string.
     pub fn load_table_metadata(&self, namespace: String, table_name: String) -> PyResult<String> {
-        let table_id = IcebergTableId {
-            namespace,
-            name: table_name,
-        };
+        let table_id = IcebergTableId::new(namespace, table_name).map_err(catalog_config_error)?;
         RUNTIME
             .block_on(self.inner.load_table_metadata(&table_id))
             .map(|v| v.to_string())
@@ -277,30 +220,13 @@ impl PyIcebergRestCatalog {
     }
 }
 
+fn catalog_config_error(error: krishiv_catalog::CatalogError) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
-
-    #[test]
-    fn glue_catalog_new_stores_region_and_database() {
-        let cat = PyGlueCatalog::new(
-            "us-east-1".into(),
-            "analytics".into(),
-            "http://glue.us-east-1.amazonaws.com".into(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(cat.inner.region, "us-east-1");
-        assert_eq!(cat.inner.database, "analytics");
-    }
-
-    #[test]
-    fn nessie_catalog_new_succeeds() {
-        let cat =
-            PyNessieCatalog::new("http://nessie.example.com/api".into(), "main", None).unwrap();
-        // Constructor must not panic or error — no live server needed.
-        let _ = cat;
-    }
 
     #[test]
     fn iceberg_rest_catalog_new_succeeds() {
@@ -308,6 +234,10 @@ mod catalog_tests {
             "http://catalog.example.com".into(),
             Some("my_warehouse".into()),
             None,
+            Some("secret".into()),
+            Some("tenant".into()),
+            Some(500),
+            Some(1024 * 1024),
         )
         .unwrap();
         let _ = cat;
@@ -315,9 +245,55 @@ mod catalog_tests {
 
     #[test]
     fn iceberg_rest_catalog_new_without_warehouse_succeeds() {
-        let cat =
-            PyIcebergRestCatalog::new("http://catalog.example.com".into(), None, None).unwrap();
+        let cat = PyIcebergRestCatalog::new(
+            "http://catalog.example.com".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let _ = cat;
+    }
+
+    #[test]
+    fn iceberg_rest_catalog_rejects_invalid_configuration() {
+        assert!(
+            PyIcebergRestCatalog::new("not-a-url".into(), None, None, None, None, None, None,)
+                .is_err()
+        );
+        assert!(
+            PyIcebergRestCatalog::new(
+                "https://catalog.example.com".into(),
+                None,
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_registry_config_rejects_unknown_format() {
+        let error = schema_registry_confluent("https://registry.example".into(), "yaml")
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported schema registry format")
+        );
+    }
+
+    #[test]
+    fn schema_registry_config_validates_url() {
+        assert!(schema_registry_confluent("not-a-url".into(), "avro").is_err());
+        assert!(schema_registry_confluent("https://registry.example".into(), "avro").is_ok());
     }
 
     // ── Catalog HTTP error-path tests ─────────────────────────────────────────
@@ -325,34 +301,17 @@ mod catalog_tests {
     // Use a port that is not listening so the HTTP request fails immediately.
 
     #[test]
-    fn glue_catalog_list_tables_returns_err_on_unreachable_server() {
-        let cat = PyGlueCatalog::new(
-            "us-east-1".into(),
-            "test_db".into(),
-            "http://127.0.0.1:19999".into(), // non-listening port
+    fn iceberg_rest_catalog_list_tables_returns_err_on_unreachable_server() {
+        let cat = PyIcebergRestCatalog::new(
+            "http://127.0.0.1:19999".into(),
+            None,
+            Some(100),
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
-        let result = cat.list_tables("test_namespace".into());
-        assert!(
-            result.is_err(),
-            "list_tables must return Err when the server is unreachable, not panic"
-        );
-    }
-
-    #[test]
-    fn nessie_catalog_list_tables_returns_err_on_unreachable_server() {
-        let cat = PyNessieCatalog::new("http://127.0.0.1:19999".into(), "main", None).unwrap();
-        let result = cat.list_tables("warehouse".into());
-        assert!(
-            result.is_err(),
-            "NessieCatalog::list_tables must return Err when unreachable"
-        );
-    }
-
-    #[test]
-    fn iceberg_rest_catalog_list_tables_returns_err_on_unreachable_server() {
-        let cat = PyIcebergRestCatalog::new("http://127.0.0.1:19999".into(), None, None).unwrap();
         let result = cat.list_tables("default".into());
         assert!(
             result.is_err(),
@@ -361,18 +320,21 @@ mod catalog_tests {
     }
 
     #[test]
-    fn glue_catalog_load_metadata_returns_err_on_unreachable_server() {
-        let cat = PyGlueCatalog::new(
-            "eu-west-1".into(),
-            "my_db".into(),
+    fn iceberg_rest_catalog_load_metadata_validates_identifier_before_io() {
+        let cat = PyIcebergRestCatalog::new(
             "http://127.0.0.1:19999".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
-        let result = cat.load_table_metadata("ns".into(), "tbl".into());
+        let result = cat.load_table_metadata("ns".into(), " ".into());
         assert!(
             result.is_err(),
-            "load_table_metadata must return Err when unreachable"
+            "load_table_metadata must reject an invalid identifier before network I/O"
         );
     }
 }

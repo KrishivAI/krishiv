@@ -1,1493 +1,1537 @@
-//! Iceberg REST Catalog client (R18 S3.1).
+//! Production-oriented client for the Apache Iceberg REST Catalog API.
+
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use tokio::sync::OnceCell;
+use url::Url;
+use uuid::Uuid;
 
 use crate::{CatalogError, CatalogResult};
 
+const API_VERSION_SEGMENT: &str = "v1";
+const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PAGE_SIZE: u32 = 1_000;
+const MAX_PAGE_SIZE: u32 = 10_000;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const MAX_LIST_PAGES: usize = 10_000;
+const MAX_LISTED_TABLES: usize = 1_000_000;
+const MAX_IDENTIFIER_BYTES: usize = 1_024;
+const DEFAULT_NAMESPACE_SEPARATOR: &str = "%1F";
+const USER_AGENT_VALUE: &str = concat!("krishiv-catalog/", env!("CARGO_PKG_VERSION"));
+
 /// REST catalog configuration.
-#[derive(Debug, Clone)]
+///
+/// Construction validates the endpoint and all resource ceilings. Credentials
+/// are deliberately omitted from `Debug`.
+#[derive(Clone)]
 pub struct RestCatalogConfig {
-    pub base_url: String,
-    pub warehouse: Option<String>,
-    pub prefix: String,
-    pub bearer_token: Option<String>,
-    /// HTTP request timeout in milliseconds.
-    /// - `None` (default): falls back to `DEFAULT_CATALOG_TIMEOUT_MS` (30 s).
-    /// - `Some(0)`: no timeout (requests may block indefinitely).
-    /// - `Some(n)`: timeout after `n` milliseconds.
-    pub timeout_ms: Option<u64>,
+    base_url: Url,
+    warehouse: Option<String>,
+    catalog_prefix: Option<String>,
+    bearer_token: Option<String>,
+    timeout: Duration,
+    page_size: u32,
+    max_response_bytes: usize,
 }
 
-/// Default HTTP request timeout for catalog operations (30 seconds).
-pub const DEFAULT_CATALOG_TIMEOUT_MS: u64 = 30_000;
+impl RestCatalogConfig {
+    /// Create a validated configuration for an Iceberg REST catalog.
+    pub fn new(base_url: impl AsRef<str>) -> CatalogResult<Self> {
+        let base_url =
+            Url::parse(base_url.as_ref()).map_err(|error| CatalogError::InvalidConfiguration {
+                message: format!("invalid catalog URL: {error}"),
+            })?;
+        validate_base_url(&base_url)?;
 
-/// Iceberg table identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        Ok(Self {
+            base_url,
+            warehouse: None,
+            catalog_prefix: None,
+            bearer_token: None,
+            timeout: DEFAULT_CATALOG_TIMEOUT,
+            page_size: DEFAULT_PAGE_SIZE,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+        })
+    }
+
+    /// Select the warehouse passed to the mandatory `/v1/config` request.
+    pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> CatalogResult<Self> {
+        let warehouse =
+            validate_non_blank("warehouse", warehouse.into(), MAX_IDENTIFIER_BYTES * 4)?;
+        self.warehouse = Some(warehouse);
+        Ok(self)
+    }
+
+    /// Supply a client-side catalog prefix.
+    ///
+    /// Server defaults are applied first and server overrides are applied last,
+    /// as required by the Iceberg REST configuration contract.
+    pub fn with_catalog_prefix(mut self, prefix: impl Into<String>) -> CatalogResult<Self> {
+        let prefix = prefix.into();
+        split_catalog_prefix(&prefix)?;
+        self.catalog_prefix = Some(prefix);
+        Ok(self)
+    }
+
+    /// Attach a bearer token to configuration and catalog requests.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> CatalogResult<Self> {
+        self.bearer_token = Some(validate_non_blank(
+            "bearer token",
+            token.into(),
+            MAX_IDENTIFIER_BYTES * 16,
+        )?);
+        Ok(self)
+    }
+
+    /// Set the end-to-end request timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> CatalogResult<Self> {
+        if timeout.is_zero() {
+            return Err(CatalogError::InvalidConfiguration {
+                message: "catalog request timeout must be positive".to_string(),
+            });
+        }
+        self.timeout = timeout;
+        Ok(self)
+    }
+
+    /// Set the requested list page size.
+    pub fn with_page_size(mut self, page_size: u32) -> CatalogResult<Self> {
+        if !(1..=MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(CatalogError::InvalidConfiguration {
+                message: format!(
+                    "catalog page size must be between 1 and {MAX_PAGE_SIZE}, got {page_size}"
+                ),
+            });
+        }
+        self.page_size = page_size;
+        Ok(self)
+    }
+
+    /// Set the maximum successful response body retained in memory.
+    pub fn with_max_response_bytes(mut self, limit: usize) -> CatalogResult<Self> {
+        if limit == 0 {
+            return Err(CatalogError::InvalidConfiguration {
+                message: "catalog response limit must be positive".to_string(),
+            });
+        }
+        self.max_response_bytes = limit;
+        Ok(self)
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    pub fn warehouse(&self) -> Option<&str> {
+        self.warehouse.as_deref()
+    }
+
+    pub fn catalog_prefix(&self) -> Option<&str> {
+        self.catalog_prefix.as_deref()
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    pub fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
+    }
+}
+
+impl fmt::Debug for RestCatalogConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestCatalogConfig")
+            .field("base_url", &self.base_url)
+            .field("has_warehouse", &self.warehouse.is_some())
+            .field("catalog_prefix", &self.catalog_prefix)
+            .field("has_bearer_token", &self.bearer_token.is_some())
+            .field("timeout", &self.timeout)
+            .field("page_size", &self.page_size)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
+}
+
+/// Validated Iceberg table identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IcebergTableId {
-    pub namespace: String,
-    pub name: String,
+    namespace: String,
+    name: String,
 }
 
-/// Partition field evolution request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionFieldSpec {
-    pub name: String,
-    pub source_column: String,
-    pub transform: String,
+impl IcebergTableId {
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> CatalogResult<Self> {
+        Ok(Self {
+            namespace: validate_non_blank(
+                "table namespace",
+                namespace.into(),
+                MAX_IDENTIFIER_BYTES,
+            )?,
+            name: validate_non_blank("table name", name.into(), MAX_IDENTIFIER_BYTES)?,
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> String {
+        format!("{}.{}", self.namespace, self.name)
+    }
 }
 
-/// Trait for Iceberg REST catalog operations.
+/// Validated load-table response.
+#[derive(Clone, PartialEq)]
+pub struct LoadedIcebergTable {
+    metadata_location: String,
+    metadata: serde_json::Value,
+    config: BTreeMap<String, String>,
+}
+
+impl LoadedIcebergTable {
+    pub fn metadata_location(&self) -> &str {
+        &self.metadata_location
+    }
+
+    pub fn metadata(&self) -> &serde_json::Value {
+        &self.metadata
+    }
+
+    pub fn into_metadata(self) -> serde_json::Value {
+        self.metadata
+    }
+
+    /// Per-table configuration returned by the catalog.
+    ///
+    /// This map may contain credentials and must not be logged.
+    pub fn config(&self) -> &BTreeMap<String, String> {
+        &self.config
+    }
+}
+
+impl fmt::Debug for LoadedIcebergTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let format_version = self
+            .metadata
+            .get("format-version")
+            .and_then(serde_json::Value::as_u64);
+        let table_uuid = self
+            .metadata
+            .get("table-uuid")
+            .and_then(serde_json::Value::as_str);
+        formatter
+            .debug_struct("LoadedIcebergTable")
+            .field("has_metadata_location", &true)
+            .field("format_version", &format_version)
+            .field("table_uuid", &table_uuid)
+            .field("config_keys", &self.config.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Read-only operations implemented by the Iceberg REST catalog client.
+///
+/// Table mutations are intentionally absent until Krishiv has a typed commit
+/// request model with Iceberg requirements and updates.
 #[async_trait]
 pub trait IcebergCatalogClient: Send + Sync {
     async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>>;
-    async fn load_table_metadata(&self, table: &IcebergTableId)
-    -> CatalogResult<serde_json::Value>;
-    async fn add_partition_field(
+
+    async fn load_table(&self, table: &IcebergTableId) -> CatalogResult<LoadedIcebergTable>;
+
+    async fn load_table_metadata(
         &self,
         table: &IcebergTableId,
-        field: PartitionFieldSpec,
-    ) -> CatalogResult<()>;
-    async fn drop_partition_field(
-        &self,
-        table: &IcebergTableId,
-        partition_name: &str,
-    ) -> CatalogResult<()>;
-    async fn replace_partition_spec(
-        &self,
-        table: &IcebergTableId,
-        fields: Vec<PartitionFieldSpec>,
-    ) -> CatalogResult<()>;
+    ) -> CatalogResult<serde_json::Value> {
+        Ok(self.load_table(table).await?.into_metadata())
+    }
 }
 
-/// Generic Iceberg REST catalog (Nessie, Tabular, self-hosted).
+#[derive(Debug)]
+struct ResolvedCatalogConfig {
+    prefix_segments: Vec<String>,
+    namespace_separator: String,
+    endpoints: Option<HashSet<String>>,
+}
+
+/// Generic Apache Iceberg REST catalog.
 #[derive(Clone)]
 pub struct GenericRestCatalog {
     config: RestCatalogConfig,
     client: Client,
+    resolved: Arc<OnceCell<ResolvedCatalogConfig>>,
 }
 
 impl GenericRestCatalog {
-    pub fn new(config: RestCatalogConfig) -> Self {
-        let timeout_ms = config.timeout_ms.unwrap_or(DEFAULT_CATALOG_TIMEOUT_MS);
-        let mut builder = Client::builder();
-        if timeout_ms > 0 {
-            builder = builder.timeout(Duration::from_millis(timeout_ms));
-        }
-        let client = builder.build().expect("failed to build HTTP client");
-        Self { config, client }
+    /// Build a catalog with Krishiv's bounded default HTTP client.
+    pub fn new(config: RestCatalogConfig) -> CatalogResult<Self> {
+        let connect_timeout = config.timeout.min(DEFAULT_CONNECT_TIMEOUT);
+        let client = Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(config.timeout)
+            .user_agent(USER_AGENT_VALUE)
+            .build()
+            .map_err(|error| CatalogError::InvalidConfiguration {
+                message: format!("failed to build catalog HTTP client: {error}"),
+            })?;
+        Self::with_http_client(config, client)
     }
 
-    fn url(&self, path: &str) -> String {
-        let base = format!(
-            "{}/{}",
-            self.config.base_url.trim_end_matches('/'),
-            self.config.prefix.trim_matches('/')
-        );
-        let mut url = url::Url::parse(&base).expect("invalid base URL");
-        url.path_segments_mut()
-            .expect("cannot be a cannot-be-a-base URL")
-            .extend(path.trim_start_matches('/').split('/'));
-        url.to_string()
-    }
-
-    async fn get_json(&self, url: String) -> CatalogResult<serde_json::Value> {
-        let mut req = self.client.get(url);
-        if let Some(token) = &self.config.bearer_token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await.map_err(|e| CatalogError::Http {
-            status: 0,
-            message: e.to_string(),
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(CatalogError::Http {
-                status,
-                message: resp.text().await.unwrap_or_default(),
-            });
-        }
-        resp.json().await.map_err(|e| CatalogError::Http {
-            status: 0,
-            message: e.to_string(),
+    /// Build a catalog with a caller-configured HTTP client.
+    ///
+    /// This supports custom trust roots, proxies, and authentication headers.
+    /// The validated per-request timeout and response ceiling still apply.
+    pub fn with_http_client(config: RestCatalogConfig, client: Client) -> CatalogResult<Self> {
+        validate_base_url(&config.base_url)?;
+        Ok(Self {
+            config,
+            client,
+            resolved: Arc::new(OnceCell::new()),
         })
+    }
+
+    async fn resolved_config(&self) -> CatalogResult<&ResolvedCatalogConfig> {
+        self.resolved
+            .get_or_try_init(|| async { self.fetch_catalog_config().await })
+            .await
+    }
+
+    async fn fetch_catalog_config(&self) -> CatalogResult<ResolvedCatalogConfig> {
+        let mut url = append_url_segments(&self.config.base_url, [API_VERSION_SEGMENT, "config"])?;
+        if let Some(warehouse) = self.config.warehouse() {
+            url.query_pairs_mut().append_pair("warehouse", warehouse);
+        }
+
+        let response: CatalogConfigResponse = self
+            .execute_json(
+                self.request(Method::GET, url),
+                "fetch catalog configuration",
+                NotFoundKind::None,
+            )
+            .await?;
+
+        let prefix = response
+            .overrides
+            .get("prefix")
+            .map(String::as_str)
+            .or(self.config.catalog_prefix())
+            .or_else(|| response.defaults.get("prefix").map(String::as_str))
+            .unwrap_or_default();
+        let prefix_segments = split_catalog_prefix(prefix)?;
+        let namespace_separator = response
+            .overrides
+            .get("namespace-separator")
+            .or_else(|| response.defaults.get("namespace-separator"))
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_NAMESPACE_SEPARATOR);
+        let namespace_separator = decode_namespace_separator(namespace_separator)?;
+
+        let endpoints = response
+            .endpoints
+            .map(validate_advertised_endpoints)
+            .transpose()?;
+
+        Ok(ResolvedCatalogConfig {
+            prefix_segments,
+            namespace_separator,
+            endpoints,
+        })
+    }
+
+    fn request(&self, method: Method, url: Url) -> RequestBuilder {
+        let mut request = self
+            .client
+            .request(method, url)
+            .timeout(self.config.timeout)
+            .header(ACCEPT, "application/json")
+            .header(USER_AGENT, USER_AGENT_VALUE);
+        if let Some(token) = &self.config.bearer_token {
+            request = request.bearer_auth(token);
+        }
+        request
+    }
+
+    fn catalog_url(&self, resolved: &ResolvedCatalogConfig, suffix: &[&str]) -> CatalogResult<Url> {
+        let mut segments = Vec::with_capacity(1 + resolved.prefix_segments.len() + suffix.len());
+        segments.push(API_VERSION_SEGMENT);
+        segments.extend(resolved.prefix_segments.iter().map(String::as_str));
+        segments.extend_from_slice(suffix);
+        append_url_segments(&self.config.base_url, segments)
+    }
+
+    async fn execute_json<T>(
+        &self,
+        request: RequestBuilder,
+        operation: &'static str,
+        not_found: NotFoundKind,
+    ) -> CatalogResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| CatalogError::Transport {
+                operation: operation.to_string(),
+                message: error.to_string(),
+            })?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = read_error_body(response, operation).await;
+            return match (status, not_found) {
+                (StatusCode::NOT_FOUND, NotFoundKind::Namespace(name)) => {
+                    Err(CatalogError::SchemaNotFound { name })
+                }
+                (StatusCode::NOT_FOUND, NotFoundKind::Table(name)) => {
+                    Err(CatalogError::TableNotFound { name })
+                }
+                _ => Err(CatalogError::Http {
+                    status: status.as_u16(),
+                    message: describe_error_body(&body),
+                }),
+            };
+        }
+
+        let body = read_bounded_body(response, self.config.max_response_bytes, operation).await?;
+        serde_json::from_slice(&body).map_err(|error| CatalogError::InvalidResponse {
+            operation: operation.to_string(),
+            message: format!(
+                "response is not valid JSON at line {}, column {}: {error}",
+                error.line(),
+                error.column()
+            ),
+        })
+    }
+
+    fn require_endpoint(
+        resolved: &ResolvedCatalogConfig,
+        endpoint: RequiredEndpoint,
+    ) -> CatalogResult<()> {
+        let Some(endpoints) = &resolved.endpoints else {
+            return Ok(());
+        };
+        if endpoint.matches(endpoints, &resolved.prefix_segments) {
+            Ok(())
+        } else {
+            Err(CatalogError::UnsupportedOperation {
+                operation: endpoint.operation().to_string(),
+            })
+        }
+    }
+}
+
+impl fmt::Debug for GenericRestCatalog {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenericRestCatalog")
+            .field("config", &self.config)
+            .field("configuration_resolved", &self.resolved.get().is_some())
+            .finish()
     }
 }
 
 #[async_trait]
 impl IcebergCatalogClient for GenericRestCatalog {
     async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>> {
-        let url = self.url(&format!("namespaces/{namespace}/tables"));
-        let body = self.get_json(url).await?;
-        let ids = body
-            .get("identifiers")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| id.get("name").and_then(|n| n.as_str()).map(str::to_string))
-            .collect())
-    }
+        let namespace = validate_non_blank(
+            "table namespace",
+            namespace.to_string(),
+            MAX_IDENTIFIER_BYTES,
+        )?;
+        let resolved = self.resolved_config().await?;
+        Self::require_endpoint(resolved, RequiredEndpoint::ListTables)?;
 
-    async fn load_table_metadata(
-        &self,
-        table: &IcebergTableId,
-    ) -> CatalogResult<serde_json::Value> {
-        let url = self.url(&format!(
-            "namespaces/{}/tables/{}",
-            table.namespace, table.name
-        ));
-        self.get_json(url).await
-    }
+        let mut table_names = Vec::new();
+        let mut identifiers = HashSet::new();
+        let mut seen_page_tokens = HashSet::new();
+        let mut page_token = String::new();
 
-    async fn add_partition_field(
-        &self,
-        table: &IcebergTableId,
-        field: PartitionFieldSpec,
-    ) -> CatalogResult<()> {
-        let url = self.url(&format!(
-            "namespaces/{}/tables/{}/partition-specs/add",
-            table.namespace, table.name
-        ));
-        let mut req = self.client.post(url).json(&field);
-        if let Some(token) = &self.config.bearer_token {
-            req = req.bearer_auth(token);
+        for _ in 0..MAX_LIST_PAGES {
+            let mut url =
+                self.catalog_url(resolved, &["namespaces", namespace.as_str(), "tables"])?;
+            url.query_pairs_mut()
+                .append_pair("pageToken", &page_token)
+                .append_pair("pageSize", &self.config.page_size.to_string());
+
+            let page: ListTablesResponse = self
+                .execute_json(
+                    self.request(Method::GET, url),
+                    "list catalog tables",
+                    NotFoundKind::Namespace(namespace.clone()),
+                )
+                .await?;
+
+            for identifier in page.identifiers {
+                validate_identifier_response(
+                    &identifier,
+                    &namespace,
+                    &resolved.namespace_separator,
+                )?;
+                let key = (identifier.namespace, identifier.name.clone());
+                if !identifiers.insert(key) {
+                    return Err(CatalogError::InvalidResponse {
+                        operation: "list catalog tables".to_string(),
+                        message: format!(
+                            "server returned duplicate table identifier '{}'",
+                            identifier.name
+                        ),
+                    });
+                }
+                if table_names.len() == MAX_LISTED_TABLES {
+                    return Err(CatalogError::InvalidResponse {
+                        operation: "list catalog tables".to_string(),
+                        message: format!(
+                            "listing exceeds the maximum of {MAX_LISTED_TABLES} tables"
+                        ),
+                    });
+                }
+                table_names.push(identifier.name);
+            }
+
+            let Some(next_page_token) = page.next_page_token else {
+                return Ok(table_names);
+            };
+            if next_page_token.is_empty() {
+                return Err(CatalogError::InvalidResponse {
+                    operation: "list catalog tables".to_string(),
+                    message: "server returned an empty next-page-token".to_string(),
+                });
+            }
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(CatalogError::InvalidResponse {
+                    operation: "list catalog tables".to_string(),
+                    message: "server repeated a pagination token".to_string(),
+                });
+            }
+            page_token = next_page_token;
         }
-        let resp = req.send().await.map_err(|e| CatalogError::Http {
-            status: 0,
-            message: e.to_string(),
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(CatalogError::Http {
-                status,
-                message: resp.text().await.unwrap_or_default(),
+
+        Err(CatalogError::InvalidResponse {
+            operation: "list catalog tables".to_string(),
+            message: format!("listing exceeded the maximum of {MAX_LIST_PAGES} pages"),
+        })
+    }
+
+    async fn load_table(&self, table: &IcebergTableId) -> CatalogResult<LoadedIcebergTable> {
+        let resolved = self.resolved_config().await?;
+        Self::require_endpoint(resolved, RequiredEndpoint::LoadTable)?;
+        let url = self.catalog_url(
+            resolved,
+            &["namespaces", table.namespace(), "tables", table.name()],
+        )?;
+        let response: LoadTableResponse = self
+            .execute_json(
+                self.request(Method::GET, url),
+                "load catalog table",
+                NotFoundKind::Table(table.display_name()),
+            )
+            .await?;
+        validate_loaded_table(response)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogConfigResponse {
+    defaults: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    endpoints: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListTablesResponse {
+    identifiers: Vec<TableIdentifierResponse>,
+    #[serde(rename = "next-page-token", default)]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TableIdentifierResponse {
+    namespace: Vec<String>,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadTableResponse {
+    #[serde(rename = "metadata-location")]
+    metadata_location: String,
+    metadata: serde_json::Value,
+    #[serde(default)]
+    config: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequiredEndpoint {
+    ListTables,
+    LoadTable,
+}
+
+impl RequiredEndpoint {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::ListTables => "listing Iceberg tables",
+            Self::LoadTable => "loading an Iceberg table",
+        }
+    }
+
+    fn template(self) -> &'static str {
+        match self {
+            Self::ListTables => "GET /v1/{prefix}/namespaces/{namespace}/tables",
+            Self::LoadTable => "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        }
+    }
+
+    fn matches(self, endpoints: &HashSet<String>, prefix_segments: &[String]) -> bool {
+        if endpoints.contains(self.template()) {
+            return true;
+        }
+
+        let prefix = prefix_segments.join("/");
+        let concrete = match self {
+            Self::ListTables if prefix.is_empty() => {
+                "GET /v1/namespaces/{namespace}/tables".to_string()
+            }
+            Self::LoadTable if prefix.is_empty() => {
+                "GET /v1/namespaces/{namespace}/tables/{table}".to_string()
+            }
+            Self::ListTables => {
+                format!("GET /v1/{prefix}/namespaces/{{namespace}}/tables")
+            }
+            Self::LoadTable => {
+                format!("GET /v1/{prefix}/namespaces/{{namespace}}/tables/{{table}}")
+            }
+        };
+        endpoints.contains(&concrete)
+    }
+}
+
+enum NotFoundKind {
+    None,
+    Namespace(String),
+    Table(String),
+}
+
+fn validate_base_url(url: &Url) -> CatalogResult<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CatalogError::InvalidConfiguration {
+            message: format!(
+                "catalog URL scheme must be http or https, got '{}'",
+                url.scheme()
+            ),
+        });
+    }
+    if url.host_str().is_none() {
+        return Err(CatalogError::InvalidConfiguration {
+            message: "catalog URL must include a host".to_string(),
+        });
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CatalogError::InvalidConfiguration {
+            message: "catalog URL must not contain embedded credentials".to_string(),
+        });
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(CatalogError::InvalidConfiguration {
+            message: "catalog URL must not contain a query string or fragment".to_string(),
+        });
+    }
+    if url.cannot_be_a_base() {
+        return Err(CatalogError::InvalidConfiguration {
+            message: "catalog URL cannot be used as a hierarchical base URL".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_non_blank(label: &str, value: String, max_bytes: usize) -> CatalogResult<String> {
+    if value.trim().is_empty() {
+        return Err(CatalogError::InvalidConfiguration {
+            message: format!("{label} must not be blank"),
+        });
+    }
+    if value.trim() != value {
+        return Err(CatalogError::InvalidConfiguration {
+            message: format!("{label} must not have leading or trailing whitespace"),
+        });
+    }
+    if value.contains('\0') {
+        return Err(CatalogError::InvalidConfiguration {
+            message: format!("{label} must not contain NUL"),
+        });
+    }
+    if value.len() > max_bytes {
+        return Err(CatalogError::InvalidConfiguration {
+            message: format!("{label} exceeds the maximum of {max_bytes} bytes"),
+        });
+    }
+    Ok(value)
+}
+
+fn split_catalog_prefix(prefix: &str) -> CatalogResult<Vec<String>> {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    prefix
+        .split('/')
+        .map(|segment| {
+            if segment.is_empty() || matches!(segment, "." | "..") {
+                return Err(CatalogError::InvalidConfiguration {
+                    message: format!("catalog prefix contains invalid segment '{segment}'"),
+                });
+            }
+            validate_non_blank(
+                "catalog prefix segment",
+                segment.to_string(),
+                MAX_IDENTIFIER_BYTES,
+            )
+        })
+        .collect()
+}
+
+fn validate_advertised_endpoints(endpoints: Vec<String>) -> CatalogResult<HashSet<String>> {
+    let mut validated = HashSet::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let endpoint = validate_non_blank("advertised endpoint", endpoint, 4_096)?;
+        if !validated.insert(endpoint.clone()) {
+            return Err(CatalogError::InvalidResponse {
+                operation: "fetch catalog configuration".to_string(),
+                message: format!("server advertised endpoint '{endpoint}' more than once"),
             });
         }
-        Ok(())
+    }
+    Ok(validated)
+}
+
+fn decode_namespace_separator(encoded: &str) -> CatalogResult<String> {
+    let query = format!("separator={encoded}");
+    let decoded = url::form_urlencoded::parse(query.as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| CatalogError::InvalidResponse {
+            operation: "fetch catalog configuration".to_string(),
+            message: "namespace-separator could not be decoded".to_string(),
+        })?;
+    if decoded.is_empty() || decoded.contains('\0') || decoded.len() > 16 {
+        return Err(CatalogError::InvalidResponse {
+            operation: "fetch catalog configuration".to_string(),
+            message: "namespace-separator must decode to between 1 and 16 non-NUL bytes"
+                .to_string(),
+        });
+    }
+    Ok(decoded)
+}
+
+fn append_url_segments<I, S>(base_url: &Url, segments: I) -> CatalogResult<Url>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut url = base_url.clone();
+    let mut path = url
+        .path_segments_mut()
+        .map_err(|_| CatalogError::InvalidConfiguration {
+            message: "catalog URL cannot accept path segments".to_string(),
+        })?;
+    path.pop_if_empty();
+    for segment in segments {
+        path.push(segment.as_ref());
+    }
+    drop(path);
+    Ok(url)
+}
+
+async fn read_bounded_body(
+    mut response: Response,
+    limit: usize,
+    operation: &str,
+) -> CatalogResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(CatalogError::ResponseTooLarge {
+            operation: operation.to_string(),
+            limit_bytes: limit,
+        });
     }
 
-    async fn drop_partition_field(
-        &self,
-        table: &IcebergTableId,
-        partition_name: &str,
-    ) -> CatalogResult<()> {
-        let url = self.url(&format!(
-            "namespaces/{}/tables/{}/partition-specs/{partition_name}",
-            table.namespace, table.name
-        ));
-        let mut req = self.client.delete(url);
-        if let Some(token) = &self.config.bearer_token {
-            req = req.bearer_auth(token);
-        }
-        let resp = req.send().await.map_err(|e| CatalogError::Http {
-            status: 0,
-            message: e.to_string(),
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(CatalogError::Http {
-                status,
-                message: resp.text().await.unwrap_or_default(),
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| CatalogError::Transport {
+            operation: operation.to_string(),
+            message: format!("failed while reading response body: {error}"),
+        })?
+    {
+        let next_len =
+            body.len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| CatalogError::ResponseTooLarge {
+                    operation: operation.to_string(),
+                    limit_bytes: limit,
+                })?;
+        if next_len > limit {
+            return Err(CatalogError::ResponseTooLarge {
+                operation: operation.to_string(),
+                limit_bytes: limit,
             });
         }
-        Ok(())
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_error_body(mut response: Response, operation: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < ERROR_BODY_LIMIT_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return body,
+            Err(error) => {
+                let fallback = format!("failed to read error response during {operation}: {error}");
+                return fallback.into_bytes();
+            }
+        };
+        let remaining = ERROR_BODY_LIMIT_BYTES - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            body.extend_from_slice(b" [truncated]");
+            return body;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
+fn describe_error_body(body: &[u8]) -> String {
+    #[derive(Deserialize)]
+    struct ErrorEnvelope {
+        error: ErrorDetail,
+    }
+    #[derive(Deserialize)]
+    struct ErrorDetail {
+        message: String,
+        #[serde(rename = "type")]
+        error_type: Option<String>,
+        code: Option<u16>,
     }
 
-    async fn replace_partition_spec(
-        &self,
-        table: &IcebergTableId,
-        fields: Vec<PartitionFieldSpec>,
-    ) -> CatalogResult<()> {
-        let url = self.url(&format!(
-            "namespaces/{}/tables/{}/partition-specs/replace",
-            table.namespace, table.name
-        ));
-        let mut req = self
-            .client
-            .put(url)
-            .json(&serde_json::json!({ "fields": fields }));
-        if let Some(token) = &self.config.bearer_token {
-            req = req.bearer_auth(token);
+    if let Ok(envelope) = serde_json::from_slice::<ErrorEnvelope>(body) {
+        let mut message = envelope.error.message;
+        if let Some(error_type) = envelope.error.error_type {
+            message = format!("{error_type}: {message}");
         }
-        let resp = req.send().await.map_err(|e| CatalogError::Http {
-            status: 0,
-            message: e.to_string(),
+        if let Some(code) = envelope.error.code {
+            message = format!("{message} (catalog code {code})");
+        }
+        return message;
+    }
+
+    let text = String::from_utf8_lossy(body).trim().to_string();
+    if text.is_empty() {
+        "catalog returned an empty error response".to_string()
+    } else {
+        text
+    }
+}
+
+fn validate_identifier_response(
+    identifier: &TableIdentifierResponse,
+    requested_namespace: &str,
+    namespace_separator: &str,
+) -> CatalogResult<()> {
+    if identifier.namespace.is_empty() {
+        return Err(CatalogError::InvalidResponse {
+            operation: "list catalog tables".to_string(),
+            message: format!(
+                "table identifier '{}' has an empty namespace",
+                identifier.name
+            ),
+        });
+    }
+    for namespace_part in &identifier.namespace {
+        validate_response_string("list catalog tables", "namespace component", namespace_part)?;
+    }
+    let response_namespace = identifier.namespace.join(namespace_separator);
+    if response_namespace != requested_namespace {
+        return Err(CatalogError::InvalidResponse {
+            operation: "list catalog tables".to_string(),
+            message: format!(
+                "server returned table '{}' from namespace '{}' while listing '{}'",
+                identifier.name, response_namespace, requested_namespace
+            ),
+        });
+    }
+    validate_response_string("list catalog tables", "table name", &identifier.name)
+}
+
+fn validate_loaded_table(response: LoadTableResponse) -> CatalogResult<LoadedIcebergTable> {
+    validate_response_string(
+        "load catalog table",
+        "metadata-location",
+        &response.metadata_location,
+    )?;
+    validate_absolute_uri(
+        "load catalog table",
+        "metadata-location",
+        &response.metadata_location,
+    )?;
+    for key in response.config.keys() {
+        validate_response_string("load catalog table", "table config key", key)?;
+    }
+
+    let metadata = response
+        .metadata
+        .as_object()
+        .ok_or_else(|| CatalogError::InvalidResponse {
+            operation: "load catalog table".to_string(),
+            message: "metadata must be a JSON object".to_string(),
         })?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            return Err(CatalogError::Http {
-                status,
-                message: resp.text().await.unwrap_or_default(),
-            });
-        }
-        Ok(())
+    let format_version = metadata
+        .get("format-version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CatalogError::InvalidResponse {
+            operation: "load catalog table".to_string(),
+            message: "metadata format-version must be an integer".to_string(),
+        })?;
+    if !(1..=3).contains(&format_version) {
+        return Err(CatalogError::InvalidResponse {
+            operation: "load catalog table".to_string(),
+            message: format!("unsupported Iceberg format-version {format_version}"),
+        });
     }
+
+    let table_uuid = metadata
+        .get("table-uuid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CatalogError::InvalidResponse {
+            operation: "load catalog table".to_string(),
+            message: "metadata table-uuid must be a string".to_string(),
+        })?;
+    Uuid::parse_str(table_uuid).map_err(|error| CatalogError::InvalidResponse {
+        operation: "load catalog table".to_string(),
+        message: format!("metadata table-uuid is invalid: {error}"),
+    })?;
+
+    if let Some(location) = metadata.get("location") {
+        let location = location
+            .as_str()
+            .ok_or_else(|| CatalogError::InvalidResponse {
+                operation: "load catalog table".to_string(),
+                message: "metadata location must be a string".to_string(),
+            })?;
+        validate_response_string("load catalog table", "metadata location", location)?;
+        validate_absolute_uri("load catalog table", "metadata location", location)?;
+    }
+
+    Ok(LoadedIcebergTable {
+        metadata_location: response.metadata_location,
+        metadata: response.metadata,
+        config: response.config,
+    })
 }
 
-/// AWS Glue Iceberg REST shim (REST endpoint required).
-#[derive(Clone)]
-pub struct GlueRestCatalog {
-    inner: GenericRestCatalog,
-    pub region: String,
-    pub database: String,
+fn validate_response_string(operation: &str, label: &str, value: &str) -> CatalogResult<()> {
+    if value.trim().is_empty() {
+        return Err(CatalogError::InvalidResponse {
+            operation: operation.to_string(),
+            message: format!("{label} must not be blank"),
+        });
+    }
+    if value.contains('\0') {
+        return Err(CatalogError::InvalidResponse {
+            operation: operation.to_string(),
+            message: format!("{label} must not contain NUL"),
+        });
+    }
+    if value.len() > MAX_IDENTIFIER_BYTES * 16 {
+        return Err(CatalogError::InvalidResponse {
+            operation: operation.to_string(),
+            message: format!("{label} is unreasonably large"),
+        });
+    }
+    Ok(())
 }
 
-impl GlueRestCatalog {
-    pub fn new(
-        region: impl Into<String>,
-        database: impl Into<String>,
-        rest_url: impl Into<String>,
-    ) -> Self {
-        Self::with_timeout(region, database, rest_url, None)
+fn validate_absolute_uri(operation: &str, label: &str, value: &str) -> CatalogResult<()> {
+    let uri = Url::parse(value).map_err(|error| CatalogError::InvalidResponse {
+        operation: operation.to_string(),
+        message: format!("{label} must be an absolute URI: {error}"),
+    })?;
+    if uri.cannot_be_a_base() {
+        return Err(CatalogError::InvalidResponse {
+            operation: operation.to_string(),
+            message: format!("{label} must be a hierarchical URI"),
+        });
     }
-
-    pub fn with_timeout(
-        region: impl Into<String>,
-        database: impl Into<String>,
-        rest_url: impl Into<String>,
-        timeout_ms: Option<u64>,
-    ) -> Self {
-        let region = region.into();
-        let database = database.into();
-        Self {
-            inner: GenericRestCatalog::new(RestCatalogConfig {
-                base_url: rest_url.into(),
-                warehouse: Some(format!("glue://{region}/{database}")),
-                prefix: "v1".into(),
-                bearer_token: None,
-                timeout_ms,
-            }),
-            region,
-            database,
-        }
-    }
-}
-
-#[async_trait]
-impl IcebergCatalogClient for GlueRestCatalog {
-    async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>> {
-        self.inner.list_tables(namespace).await
-    }
-    async fn load_table_metadata(
-        &self,
-        table: &IcebergTableId,
-    ) -> CatalogResult<serde_json::Value> {
-        self.inner.load_table_metadata(table).await
-    }
-    async fn add_partition_field(
-        &self,
-        table: &IcebergTableId,
-        field: PartitionFieldSpec,
-    ) -> CatalogResult<()> {
-        self.inner.add_partition_field(table, field).await
-    }
-    async fn drop_partition_field(
-        &self,
-        table: &IcebergTableId,
-        partition_name: &str,
-    ) -> CatalogResult<()> {
-        self.inner.drop_partition_field(table, partition_name).await
-    }
-    async fn replace_partition_spec(
-        &self,
-        table: &IcebergTableId,
-        fields: Vec<PartitionFieldSpec>,
-    ) -> CatalogResult<()> {
-        self.inner.replace_partition_spec(table, fields).await
-    }
-}
-
-/// Nessie catalog wrapper.
-#[derive(Clone)]
-pub struct NessieCatalog {
-    inner: GenericRestCatalog,
-}
-
-impl NessieCatalog {
-    pub fn new(uri: impl Into<String>, reference: impl Into<String>) -> Self {
-        Self::with_timeout(uri, reference, None)
-    }
-
-    pub fn with_timeout(
-        uri: impl Into<String>,
-        reference: impl Into<String>,
-        timeout_ms: Option<u64>,
-    ) -> Self {
-        let uri = uri.into();
-        let reference = reference.into();
-        Self {
-            inner: GenericRestCatalog::new(RestCatalogConfig {
-                base_url: uri,
-                warehouse: Some(reference),
-                prefix: "v1".into(),
-                bearer_token: None,
-                timeout_ms,
-            }),
-        }
-    }
-}
-
-#[async_trait]
-impl IcebergCatalogClient for NessieCatalog {
-    async fn list_tables(&self, namespace: &str) -> CatalogResult<Vec<String>> {
-        self.inner.list_tables(namespace).await
-    }
-    async fn load_table_metadata(
-        &self,
-        table: &IcebergTableId,
-    ) -> CatalogResult<serde_json::Value> {
-        self.inner.load_table_metadata(table).await
-    }
-    async fn add_partition_field(
-        &self,
-        table: &IcebergTableId,
-        field: PartitionFieldSpec,
-    ) -> CatalogResult<()> {
-        self.inner.add_partition_field(table, field).await
-    }
-    async fn drop_partition_field(
-        &self,
-        table: &IcebergTableId,
-        partition_name: &str,
-    ) -> CatalogResult<()> {
-        self.inner.drop_partition_field(table, partition_name).await
-    }
-    async fn replace_partition_spec(
-        &self,
-        table: &IcebergTableId,
-        fields: Vec<PartitionFieldSpec>,
-    ) -> CatalogResult<()> {
-        self.inner.replace_partition_spec(table, fields).await
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use wiremock::matchers::{header, method, path};
+    use std::time::Duration;
+
+    use reqwest::Client;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // -----------------------------------------------------------------------
-    // Happy path: list tables
-    // -----------------------------------------------------------------------
+    use super::*;
 
-    #[tokio::test]
-    async fn generic_rest_lists_tables() {
-        let server = MockServer::start().await;
+    async fn mount_config(server: &MockServer, body: serde_json::Value) {
         Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [{"namespace": ["ns"], "name": "t1"}]
-            })))
-            .mount(&server)
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
             .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert_eq!(tables, vec!["t1".to_string()]);
     }
 
-    #[tokio::test]
-    async fn generic_rest_lists_multiple_tables() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [
-                    {"namespace": ["ns"], "name": "alpha"},
-                    {"namespace": ["ns"], "name": "beta"},
-                    {"namespace": ["ns"], "name": "gamma"}
-                ]
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let mut tables = catalog.list_tables("ns").await.unwrap();
-        tables.sort();
-        assert_eq!(tables, vec!["alpha", "beta", "gamma"]);
+    fn test_catalog(server: &MockServer) -> GenericRestCatalog {
+        GenericRestCatalog::new(RestCatalogConfig::new(server.uri()).unwrap()).unwrap()
     }
 
-    // -----------------------------------------------------------------------
-    // Edge case: empty identifiers
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_lists_tables_empty_identifiers() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": []
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert!(tables.is_empty());
-    }
-
-    #[tokio::test]
-    async fn generic_rest_lists_tables_no_identifiers_key() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "something_else": []
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert!(tables.is_empty());
-    }
-
-    #[tokio::test]
-    async fn generic_rest_lists_tables_identifiers_not_array() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": "not_an_array"
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert!(tables.is_empty());
-    }
-
-    #[tokio::test]
-    async fn generic_rest_lists_tables_missing_name_field() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [{"namespace": ["ns"]}]
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert!(tables.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // Happy path: load table metadata
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_load_table_metadata() {
-        let server = MockServer::start().await;
-        let metadata = serde_json::json!({
-            "format-version": 2,
-            "table-uuid": "test-uuid",
-            "location": "s3://bucket/path",
-        });
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/my_ns/tables/my_table"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "my_ns".into(),
-            name: "my_table".into(),
-        };
-        let result = catalog.load_table_metadata(&table_id).await.unwrap();
-        assert_eq!(result["format-version"], 2);
-        assert_eq!(result["table-uuid"], "test-uuid");
-    }
-
-    // -----------------------------------------------------------------------
-    // Happy path: add partition field
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_add_partition_field() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/add"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let field = PartitionFieldSpec {
-            name: "day".into(),
-            source_column: "event_date".into(),
-            transform: "day".into(),
-        };
-        catalog.add_partition_field(&table_id, field).await.unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // Happy path: drop partition field
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_drop_partition_field() {
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/day"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog
-            .drop_partition_field(&table_id, "day")
-            .await
-            .unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // Happy path: replace partition spec
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_replace_partition_spec() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/replace"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let fields = vec![
-            PartitionFieldSpec {
-                name: "day".into(),
-                source_column: "date_col".into(),
-                transform: "day".into(),
+    fn valid_load_response() -> serde_json::Value {
+        json!({
+            "metadata-location": "s3://warehouse/db/table/metadata/v1.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "4d9d09d7-927d-47f6-9063-06e62f070a3b",
+                "location": "s3://warehouse/db/table"
             },
-            PartitionFieldSpec {
-                name: "month".into(),
-                source_column: "date_col".into(),
-                transform: "month".into(),
-            },
-        ];
-        catalog
-            .replace_partition_spec(&table_id, fields)
-            .await
-            .unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // Error case: HTTP error on list tables
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_list_tables_http_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("namespace not found"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let err = catalog.list_tables("ns").await.unwrap_err();
-        match err {
-            CatalogError::Http { status, message } => {
-                assert_eq!(status, 404);
-                assert!(message.contains("namespace not found"));
+            "config": {
+                "token": "table-secret"
             }
-            other => panic!("expected Http error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn generic_rest_load_metadata_http_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables/bad_table"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("table not found"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "bad_table".into(),
-        };
-        let err = catalog.load_table_metadata(&table_id).await.unwrap_err();
-        match err {
-            CatalogError::Http { status, .. } => assert_eq!(status, 404),
-            other => panic!("expected Http error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn generic_rest_add_partition_field_http_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/add"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let field = PartitionFieldSpec {
-            name: "day".into(),
-            source_column: "date_col".into(),
-            transform: "day".into(),
-        };
-        let err = catalog
-            .add_partition_field(&table_id, field)
-            .await
-            .unwrap_err();
-        match err {
-            CatalogError::Http { status, .. } => assert_eq!(status, 400),
-            other => panic!("expected Http error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn generic_rest_drop_partition_field_http_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/day"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let err = catalog
-            .drop_partition_field(&table_id, "day")
-            .await
-            .unwrap_err();
-        match err {
-            CatalogError::Http { status, .. } => assert_eq!(status, 500),
-            other => panic!("expected Http error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn generic_rest_replace_spec_http_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/replace"))
-            .respond_with(ResponseTemplate::new(409).set_body_string("conflict"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let err = catalog
-            .replace_partition_spec(&table_id, vec![])
-            .await
-            .unwrap_err();
-        match err {
-            CatalogError::Http { status, .. } => assert_eq!(status, 409),
-            other => panic!("expected Http error, got {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Bearer token authentication
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_bearer_token_sent() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .and(header("authorization", "Bearer my-secret-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [{"namespace": ["ns"], "name": "t1"}]
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: Some("my-secret-token".into()),
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert_eq!(tables, vec!["t1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn generic_rest_no_bearer_token_no_auth_header() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": []
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert!(tables.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // URL construction: trailing/leading slashes
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn url_construction_trailing_slash_base() {
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: "http://localhost:8080/".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let url = catalog.url("namespaces/ns/tables");
-        assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
+        })
     }
 
     #[test]
-    fn url_construction_leading_slash_path() {
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: "http://localhost:8080".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let url = catalog.url("/namespaces/ns/tables");
-        assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
-    }
-
-    #[test]
-    fn url_construction_both_slashes() {
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: "http://localhost:8080/".into(),
-            warehouse: None,
-            prefix: "/v1/".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let url = catalog.url("/namespaces/ns/tables");
-        assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
-    }
-
-    #[test]
-    fn url_construction_no_slashes() {
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: "http://localhost:8080".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let url = catalog.url("namespaces/ns/tables");
-        assert_eq!(url, "http://localhost:8080/v1/namespaces/ns/tables");
-    }
-
-    // -----------------------------------------------------------------------
-    // Special characters in namespace/table names
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_namespace_with_special_chars() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/my-ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [{"namespace": ["my-ns"], "name": "t1"}]
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let tables = catalog.list_tables("my-ns").await.unwrap();
-        assert_eq!(tables, vec!["t1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn generic_rest_table_with_special_chars() {
-        let server = MockServer::start().await;
-        let metadata = serde_json::json!({
-            "format-version": 2,
-            "table-uuid": "special-uuid"
-        });
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables/my-table_name"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "my-table_name".into(),
-        };
-        let result = catalog.load_table_metadata(&table_id).await.unwrap();
-        assert_eq!(result["format-version"], 2);
-    }
-
-    // -----------------------------------------------------------------------
-    // IcebergTableId: Clone, PartialEq, Eq, Hash
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn iceberg_table_id_clone() {
-        let id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let cloned = id.clone();
-        assert_eq!(id, cloned);
-    }
-
-    #[test]
-    fn iceberg_table_id_eq() {
-        let a = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let b = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let c = IcebergTableId {
-            namespace: "ns".into(),
-            name: "other".into(),
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn iceberg_table_id_hash() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let a = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let b = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let mut h1 = DefaultHasher::new();
-        let mut h2 = DefaultHasher::new();
-        a.hash(&mut h1);
-        b.hash(&mut h2);
-        assert_eq!(h1.finish(), h2.finish());
-    }
-
-    // -----------------------------------------------------------------------
-    // IcebergTableId: Serialize / Deserialize
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn iceberg_table_id_serde_roundtrip() {
-        let id = IcebergTableId {
-            namespace: "my_ns".into(),
-            name: "my_table".into(),
-        };
-        let json = serde_json::to_string(&id).unwrap();
-        let deserialized: IcebergTableId = serde_json::from_str(&json).unwrap();
-        assert_eq!(id, deserialized);
-    }
-
-    // -----------------------------------------------------------------------
-    // PartitionFieldSpec: Serialize / Deserialize
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn partition_field_spec_serde_roundtrip() {
-        let spec = PartitionFieldSpec {
-            name: "day".into(),
-            source_column: "event_date".into(),
-            transform: "day".into(),
-        };
-        let json = serde_json::to_string(&spec).unwrap();
-        let deserialized: PartitionFieldSpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(spec.name, deserialized.name);
-        assert_eq!(spec.source_column, deserialized.source_column);
-        assert_eq!(spec.transform, deserialized.transform);
-    }
-
-    // -----------------------------------------------------------------------
-    // RestCatalogConfig: Clone and Debug
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn rest_catalog_config_clone() {
-        let config = RestCatalogConfig {
-            base_url: "http://localhost".into(),
-            warehouse: Some("wh".into()),
-            prefix: "v1".into(),
-            bearer_token: Some("tok".into()),
-            timeout_ms: None,
-        };
-        let cloned = config.clone();
-        assert_eq!(config.base_url, cloned.base_url);
-        assert_eq!(config.warehouse, cloned.warehouse);
-        assert_eq!(config.prefix, cloned.prefix);
-        assert_eq!(config.bearer_token, cloned.bearer_token);
-    }
-
-    #[test]
-    fn rest_catalog_config_debug() {
-        let config = RestCatalogConfig {
-            base_url: "http://localhost".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        };
-        let dbg = format!("{config:?}");
-        assert!(dbg.contains("RestCatalogConfig"));
-    }
-
-    // -----------------------------------------------------------------------
-    // GlueRestCatalog construction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn glue_rest_catalog_construction() {
-        let catalog = GlueRestCatalog::new("us-east-1", "mydb", "http://localhost:8181");
-        assert_eq!(catalog.region, "us-east-1");
-        assert_eq!(catalog.database, "mydb");
-    }
-
-    #[test]
-    fn glue_rest_catalog_warehouse_format() {
-        let catalog = GlueRestCatalog::new("eu-west-1", "analytics", "http://localhost:8181");
-        let expected = Some("glue://eu-west-1/analytics".to_string());
-        assert_eq!(catalog.inner.config.warehouse, expected);
-    }
-
-    #[test]
-    fn glue_rest_catalog_prefix_is_v1() {
-        let catalog = GlueRestCatalog::new("us-west-2", "db", "http://localhost:8181");
-        assert_eq!(catalog.inner.config.prefix, "v1");
-    }
-
-    #[test]
-    fn glue_rest_catalog_no_bearer_token() {
-        let catalog = GlueRestCatalog::new("us-east-1", "db", "http://localhost:8181");
-        assert!(catalog.inner.config.bearer_token.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // GlueRestCatalog: delegates to inner GenericRestCatalog
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn glue_rest_catalog_list_tables() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [{"namespace": ["ns"], "name": "t1"}]
-            })))
-            .mount(&server)
-            .await;
-        let catalog = GlueRestCatalog::new("us-east-1", "db", server.uri());
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert_eq!(tables, vec!["t1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn glue_rest_catalog_load_metadata() {
-        let server = MockServer::start().await;
-        let metadata = serde_json::json!({"format-version": 2});
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables/t1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .mount(&server)
-            .await;
-        let catalog = GlueRestCatalog::new("us-east-1", "db", server.uri());
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t1".into(),
-        };
-        let result = catalog.load_table_metadata(&table_id).await.unwrap();
-        assert_eq!(result["format-version"], 2);
-    }
-
-    #[tokio::test]
-    async fn glue_rest_catalog_add_partition() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/add"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = GlueRestCatalog::new("us-east-1", "db", server.uri());
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog
-            .add_partition_field(
-                &table_id,
-                PartitionFieldSpec {
-                    name: "d".into(),
-                    source_column: "c".into(),
-                    transform: "identity".into(),
-                },
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn glue_rest_catalog_drop_partition() {
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/d"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = GlueRestCatalog::new("us-east-1", "db", server.uri());
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog.drop_partition_field(&table_id, "d").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn glue_rest_catalog_replace_spec() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/replace"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = GlueRestCatalog::new("us-east-1", "db", server.uri());
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog
-            .replace_partition_spec(&table_id, vec![])
-            .await
-            .unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // NessieCatalog construction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn nessie_catalog_construction() {
-        let catalog = NessieCatalog::new("http://nessie:8080", "main");
-        assert_eq!(catalog.inner.config.base_url, "http://nessie:8080");
-        assert_eq!(catalog.inner.config.warehouse, Some("main".into()));
-        assert_eq!(catalog.inner.config.prefix, "v1");
-        assert!(catalog.inner.config.bearer_token.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // NessieCatalog: delegates to inner GenericRestCatalog
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn nessie_catalog_list_tables() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "identifiers": [{"namespace": ["ns"], "name": "t1"}]
-            })))
-            .mount(&server)
-            .await;
-        let catalog = NessieCatalog::new(server.uri(), "main");
-        let tables = catalog.list_tables("ns").await.unwrap();
-        assert_eq!(tables, vec!["t1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn nessie_catalog_load_metadata() {
-        let server = MockServer::start().await;
-        let metadata = serde_json::json!({"format-version": 2, "table-uuid": "nessie"});
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables/t1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .mount(&server)
-            .await;
-        let catalog = NessieCatalog::new(server.uri(), "main");
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t1".into(),
-        };
-        let result = catalog.load_table_metadata(&table_id).await.unwrap();
-        assert_eq!(result["table-uuid"], "nessie");
-    }
-
-    #[tokio::test]
-    async fn nessie_catalog_add_partition() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/add"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = NessieCatalog::new(server.uri(), "main");
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog
-            .add_partition_field(
-                &table_id,
-                PartitionFieldSpec {
-                    name: "m".into(),
-                    source_column: "ts".into(),
-                    transform: "month".into(),
-                },
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn nessie_catalog_drop_partition() {
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/m"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = NessieCatalog::new(server.uri(), "main");
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog.drop_partition_field(&table_id, "m").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn nessie_catalog_replace_spec() {
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/replace"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
-        let catalog = NessieCatalog::new(server.uri(), "main");
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        catalog
-            .replace_partition_spec(
-                &table_id,
-                vec![PartitionFieldSpec {
-                    name: "y".into(),
-                    source_column: "dt".into(),
-                    transform: "year".into(),
-                }],
-            )
-            .await
-            .unwrap();
-    }
-
-    // -----------------------------------------------------------------------
-    // GenericRestCatalog: Clone
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn generic_rest_catalog_clone() {
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: "http://localhost".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let cloned = catalog.clone();
-        assert_eq!(cloned.config.base_url, "http://localhost");
-    }
-
-    // -----------------------------------------------------------------------
-    // GenericRestCatalog: empty body / malformed JSON
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_load_metadata_invalid_json() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/namespaces/ns/tables/t"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let err = catalog.load_table_metadata(&table_id).await.unwrap_err();
-        match err {
-            CatalogError::Http { message, .. } => {
-                assert!(message.contains("expected value") || message.contains("error"));
-            }
-            other => panic!("expected Http error for invalid JSON, got {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // GlueRestCatalog: Clone
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn glue_rest_catalog_clone() {
-        let catalog = GlueRestCatalog::new("us-east-1", "db", "http://localhost");
-        let cloned = catalog.clone();
-        assert_eq!(cloned.region, "us-east-1");
-        assert_eq!(cloned.database, "db");
-    }
-
-    // -----------------------------------------------------------------------
-    // NessieCatalog: Clone
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn nessie_catalog_clone() {
-        let catalog = NessieCatalog::new("http://localhost", "main");
-        let cloned = catalog.clone();
-        assert_eq!(cloned.inner.config.base_url, "http://localhost");
-    }
-
-    // -----------------------------------------------------------------------
-    // Error: HTTP error on POST with 500
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn generic_rest_add_partition_server_error() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/namespaces/ns/tables/t/partition-specs/add"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
-            .mount(&server)
-            .await;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: server.uri(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        });
-        let table_id = IcebergTableId {
-            namespace: "ns".into(),
-            name: "t".into(),
-        };
-        let field = PartitionFieldSpec {
-            name: "d".into(),
-            source_column: "c".into(),
-            transform: "day".into(),
-        };
-        let err = catalog
-            .add_partition_field(&table_id, field)
-            .await
-            .unwrap_err();
-        match err {
-            CatalogError::Http { status, .. } => assert_eq!(status, 500),
-            other => panic!("expected Http error, got {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // CatalogError Display for Http
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn catalog_error_http_display() {
-        let err = CatalogError::Http {
-            status: 403,
-            message: "forbidden".into(),
-        };
-        assert_eq!(err.to_string(), "HTTP error 403: forbidden");
-    }
-
-    #[test]
-    fn catalog_error_debug() {
-        let err = CatalogError::TableNotFound { name: "t".into() };
-        let dbg = format!("{err:?}");
-        assert!(dbg.contains("TableNotFound"));
-    }
-
-    // ── Timeout configuration ─────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn catalog_custom_timeout_applied_on_unreachable_server() {
-        // A 1 ms timeout pointed at a non-listening port must return an error
-        // quickly, confirming the timeout is respected.
-        use std::time::Instant;
-        let catalog = GenericRestCatalog::new(RestCatalogConfig {
-            base_url: "http://127.0.0.1:19999".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: Some(1), // 1 millisecond — far shorter than any real latency
-        });
-        let start = Instant::now();
-        let result = catalog.list_tables("ns").await;
-        let elapsed = start.elapsed();
-        assert!(result.is_err(), "request to non-listening port must fail");
+    fn configuration_rejects_unsafe_or_unbounded_values() {
+        assert!(RestCatalogConfig::new("file:///tmp/catalog").is_err());
+        assert!(RestCatalogConfig::new("https://user:secret@example.com").is_err());
+        assert!(RestCatalogConfig::new("https://example.com?token=secret").is_err());
         assert!(
-            elapsed.as_secs() < 5,
-            "1 ms timeout must not block for seconds; elapsed: {:?}",
-            elapsed
+            RestCatalogConfig::new("https://example.com")
+                .unwrap()
+                .with_timeout(Duration::ZERO)
+                .is_err()
+        );
+        assert!(
+            RestCatalogConfig::new("https://example.com")
+                .unwrap()
+                .with_page_size(0)
+                .is_err()
+        );
+        assert!(
+            RestCatalogConfig::new("https://example.com")
+                .unwrap()
+                .with_max_response_bytes(0)
+                .is_err()
         );
     }
 
     #[test]
-    fn timeout_none_uses_default() {
-        // Constructing with timeout_ms: None must use DEFAULT_CATALOG_TIMEOUT_MS.
-        let config = RestCatalogConfig {
-            base_url: "http://example.com".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: None,
-        };
-        let _catalog = GenericRestCatalog::new(config); // Must not panic
+    fn configuration_debug_redacts_bearer_token() {
+        let config = RestCatalogConfig::new("https://example.com")
+            .unwrap()
+            .with_bearer_token("top-secret")
+            .unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("top-secret"));
+        assert!(debug.contains("has_bearer_token: true"));
     }
 
     #[test]
-    fn timeout_zero_disables_timeout() {
-        // timeout_ms: Some(0) means no timeout — must construct without panic.
-        let config = RestCatalogConfig {
-            base_url: "http://example.com".into(),
-            warehouse: None,
-            prefix: "v1".into(),
-            bearer_token: None,
-            timeout_ms: Some(0),
-        };
-        let _catalog = GenericRestCatalog::new(config);
+    fn table_identifier_is_validated() {
+        assert!(IcebergTableId::new("", "events").is_err());
+        assert!(IcebergTableId::new("analytics", " ").is_err());
+        assert!(IcebergTableId::new(" analytics", "events").is_err());
+        let table = IcebergTableId::new("analytics", "events").unwrap();
+        assert_eq!(table.namespace(), "analytics");
+        assert_eq!(table.name(), "events");
+    }
+
+    #[test]
+    fn url_segments_are_encoded_and_base_path_is_preserved() {
+        let base = Url::parse("https://example.com/catalog/api/").unwrap();
+        let url = append_url_segments(&base, ["v1", "namespaces", "a/b", "tables"]).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/catalog/api/v1/namespaces/a%2Fb/tables"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_negotiation_applies_warehouse_auth_and_server_prefix_override() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(query_param("warehouse", "s3://warehouse"))
+            .and(header("authorization", "Bearer catalog-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "defaults": { "prefix": "default" },
+                "overrides": { "prefix": "tenant/prod" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/tenant/prod/namespaces/analytics/tables"))
+            .and(query_param("pageToken", ""))
+            .and(query_param("pageSize", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [
+                    { "namespace": ["analytics"], "name": "events" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = RestCatalogConfig::new(server.uri())
+            .unwrap()
+            .with_warehouse("s3://warehouse")
+            .unwrap()
+            .with_catalog_prefix("client")
+            .unwrap()
+            .with_bearer_token("catalog-secret")
+            .unwrap();
+        let catalog = GenericRestCatalog::new(config).unwrap();
+
+        assert_eq!(
+            catalog.list_tables("analytics").await.unwrap(),
+            vec!["events"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_follows_pagination_and_negotiates_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "defaults": {},
+                "overrides": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .and(query_param("pageToken", ""))
+            .and(query_param("pageSize", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [
+                    { "namespace": ["ns"], "name": "a" },
+                    { "namespace": ["ns"], "name": "b" }
+                ],
+                "next-page-token": "page-2"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .and(query_param("pageToken", "page-2"))
+            .and(query_param("pageSize", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [
+                    { "namespace": ["ns"], "name": "c" }
+                ],
+                "next-page-token": null
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let config = RestCatalogConfig::new(server.uri())
+            .unwrap()
+            .with_page_size(2)
+            .unwrap();
+        let catalog = GenericRestCatalog::new(config).unwrap();
+
+        assert_eq!(
+            catalog.list_tables("ns").await.unwrap(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            catalog.list_tables("ns").await.unwrap(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_rejects_repeated_page_token() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [],
+                "next-page-token": "same"
+            })))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server).list_tables("ns").await.unwrap_err();
+        assert!(matches!(error, CatalogError::InvalidResponse { .. }));
+        assert!(error.to_string().contains("repeated a pagination token"));
+    }
+
+    #[tokio::test]
+    async fn list_tables_rejects_malformed_and_duplicate_identifiers() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [
+                    { "namespace": ["ns"], "name": "events" },
+                    { "namespace": ["ns"], "name": "events" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server).list_tables("ns").await.unwrap_err();
+        assert!(error.to_string().contains("duplicate table identifier"));
+    }
+
+    #[tokio::test]
+    async fn list_tables_validates_multipart_namespace_with_server_separator() {
+        let server = MockServer::start().await;
+        mount_config(
+            &server,
+            json!({
+                "defaults": {},
+                "overrides": { "namespace-separator": "%2E" }
+            }),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/accounting.tax/tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [
+                    { "namespace": ["accounting", "tax"], "name": "payments" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            test_catalog(&server)
+                .list_tables("accounting.tax")
+                .await
+                .unwrap(),
+            vec!["payments"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tables_rejects_identifier_from_another_namespace() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": [
+                    { "namespace": ["other"], "name": "events" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server).list_tables("ns").await.unwrap_err();
+        assert!(error.to_string().contains("while listing 'ns'"));
+    }
+
+    #[tokio::test]
+    async fn list_tables_rejects_missing_identifiers() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server).list_tables("ns").await.unwrap_err();
+        assert!(matches!(error, CatalogError::InvalidResponse { .. }));
+    }
+
+    #[tokio::test]
+    async fn advertised_capabilities_are_enforced() {
+        let server = MockServer::start().await;
+        mount_config(
+            &server,
+            json!({
+                "defaults": {},
+                "overrides": {},
+                "endpoints": [
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+                ]
+            }),
+        )
+        .await;
+
+        let error = test_catalog(&server).list_tables("ns").await.unwrap_err();
+        assert!(matches!(error, CatalogError::UnsupportedOperation { .. }));
+    }
+
+    #[tokio::test]
+    async fn list_not_found_maps_to_schema_not_found() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/missing/tables"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": {
+                    "message": "namespace is missing",
+                    "type": "NoSuchNamespaceException",
+                    "code": 404
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server)
+            .list_tables("missing")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogError::SchemaNotFound { name } if name == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_table_returns_validated_envelope_and_redacts_config_debug() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(valid_load_response()))
+            .mount(&server)
+            .await;
+
+        let table = IcebergTableId::new("ns", "events").unwrap();
+        let loaded = test_catalog(&server).load_table(&table).await.unwrap();
+        assert_eq!(
+            loaded.metadata_location(),
+            "s3://warehouse/db/table/metadata/v1.json"
+        );
+        assert_eq!(loaded.metadata()["format-version"], 2);
+        assert_eq!(loaded.config().get("token").unwrap(), "table-secret");
+        assert!(!format!("{loaded:?}").contains("table-secret"));
+        assert!(!format!("{loaded:?}").contains("s3://warehouse"));
+    }
+
+    #[tokio::test]
+    async fn load_table_metadata_compatibility_helper_returns_only_metadata() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(valid_load_response()))
+            .mount(&server)
+            .await;
+
+        let metadata = test_catalog(&server)
+            .load_table_metadata(&IcebergTableId::new("ns", "events").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(metadata["format-version"], 2);
+        assert!(metadata.get("metadata-location").is_none());
+    }
+
+    #[tokio::test]
+    async fn load_table_rejects_invalid_metadata_contract() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        let mut response = valid_load_response();
+        response["metadata"]["table-uuid"] = json!("not-a-uuid");
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server)
+            .load_table(&IcebergTableId::new("ns", "events").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::InvalidResponse { .. }));
+        assert!(error.to_string().contains("table-uuid is invalid"));
+    }
+
+    #[tokio::test]
+    async fn load_table_rejects_relative_metadata_location() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        let mut response = valid_load_response();
+        response["metadata-location"] = json!("metadata/v1.json");
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server)
+            .load_table(&IcebergTableId::new("ns", "events").unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must be an absolute URI"));
+    }
+
+    #[tokio::test]
+    async fn load_table_not_found_maps_to_table_not_found() {
+        let server = MockServer::start().await;
+        mount_config(&server, json!({ "defaults": {}, "overrides": {} })).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server)
+            .load_table(&IcebergTableId::new("ns", "missing").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogError::TableNotFound { name } if name == "ns.missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_body_limit_is_enforced_without_content_length_reliance() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    json!({
+                        "defaults": {},
+                        "overrides": {},
+                        "padding": "x".repeat(2_000)
+                    })
+                    .to_string(),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let config = RestCatalogConfig::new(server.uri())
+            .unwrap()
+            .with_max_response_bytes(128)
+            .unwrap();
+        let error = GenericRestCatalog::new(config)
+            .unwrap()
+            .list_tables("ns")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::ResponseTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn iceberg_error_envelope_preserves_type_message_and_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": {
+                    "message": "catalog unavailable",
+                    "type": "ServiceUnavailableException",
+                    "code": 503
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let error = test_catalog(&server).list_tables("ns").await.unwrap_err();
+        assert!(matches!(error, CatalogError::Http { status: 503, .. }));
+        let message = error.to_string();
+        assert!(message.contains("ServiceUnavailableException"));
+        assert!(message.contains("catalog unavailable"));
+        assert!(message.contains("catalog code 503"));
+    }
+
+    #[tokio::test]
+    async fn custom_http_client_is_supported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(header("x-catalog-tenant", "tenant-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "defaults": {},
+                "overrides": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/ns/tables"))
+            .and(header("x-catalog-tenant", "tenant-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "identifiers": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-catalog-tenant", "tenant-a".parse().unwrap());
+        let client = Client::builder().default_headers(headers).build().unwrap();
+        let catalog = GenericRestCatalog::with_http_client(
+            RestCatalogConfig::new(server.uri()).unwrap(),
+            client,
+        )
+        .unwrap();
+        assert!(catalog.list_tables("ns").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_reported_as_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json(json!({ "defaults": {}, "overrides": {} })),
+            )
+            .mount(&server)
+            .await;
+
+        let config = RestCatalogConfig::new(server.uri())
+            .unwrap()
+            .with_timeout(Duration::from_millis(10))
+            .unwrap();
+        let error = GenericRestCatalog::new(config)
+            .unwrap()
+            .list_tables("ns")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::Transport { .. }));
     }
 }

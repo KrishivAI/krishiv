@@ -271,6 +271,16 @@ impl CdcEventSource for InMemoryCdcEventSource {
     }
 }
 
+/// Wire format used for raw CDC records decoded through Schema Registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CdcSchemaRegistryFormat {
+    /// Confluent-framed Avro. This is the compatibility default.
+    #[default]
+    Avro,
+    /// Confluent-framed Protobuf.
+    Protobuf,
+}
+
 /// Configuration for a CDC-to-lakehouse pipeline.
 #[derive(Debug, Clone)]
 pub struct CdcToLakehousePipeline {
@@ -286,6 +296,8 @@ pub struct CdcToLakehousePipeline {
     pub primary_key_columns: Vec<String>,
     /// Optional Confluent Schema Registry URL.
     pub schema_registry_url: Option<String>,
+    /// Payload format used when `raw_bytes` records are decoded.
+    pub schema_registry_format: CdcSchemaRegistryFormat,
     /// Number of CDC events to accumulate before writing a single Arrow batch.
     ///
     /// Defaults to 1000. Higher values reduce write amplification; lower values
@@ -312,6 +324,7 @@ impl CdcToLakehousePipeline {
             iceberg_table: iceberg_table.into(),
             primary_key_columns,
             schema_registry_url: None,
+            schema_registry_format: CdcSchemaRegistryFormat::default(),
             batch_size: 1000,
             schema_evolution: true,
         }
@@ -320,6 +333,13 @@ impl CdcToLakehousePipeline {
     /// Attach a schema registry URL.
     pub fn with_schema_registry(mut self, url: impl Into<String>) -> Self {
         self.schema_registry_url = Some(url.into());
+        self
+    }
+
+    /// Select the format used for binary schema-registry records.
+    #[must_use]
+    pub fn with_schema_registry_format(mut self, format: CdcSchemaRegistryFormat) -> Self {
+        self.schema_registry_format = format;
         self
     }
 
@@ -339,17 +359,55 @@ impl CdcToLakehousePipeline {
 
     /// Validate the pipeline configuration. Returns an error if required fields are missing.
     pub fn validate(&self) -> Result<(), String> {
-        if self.source_topic.is_empty() {
+        if self.source_topic.trim().is_empty() {
             return Err("source_topic must not be empty".into());
         }
-        if self.kafka_brokers.is_empty() {
-            return Err("kafka_brokers must not be empty".into());
+        if self.kafka_brokers.is_empty()
+            || self
+                .kafka_brokers
+                .iter()
+                .any(|broker| broker.trim().is_empty())
+        {
+            return Err("kafka_brokers must contain only non-blank addresses".into());
         }
-        if self.iceberg_table.is_empty() {
+        if self.iceberg_catalog.trim().is_empty() {
+            return Err("iceberg_catalog must not be empty".into());
+        }
+        if self.iceberg_table.trim().is_empty() {
             return Err("iceberg_table must not be empty".into());
         }
-        if self.primary_key_columns.is_empty() {
+        if self.primary_key_columns.is_empty()
+            || self
+                .primary_key_columns
+                .iter()
+                .any(|column| column.trim().is_empty())
+        {
             return Err("primary_key_columns must not be empty for upsert semantics".into());
+        }
+        let unique_primary_keys = self
+            .primary_key_columns
+            .iter()
+            .map(|column| column.trim())
+            .collect::<std::collections::HashSet<_>>();
+        if unique_primary_keys.len() != self.primary_key_columns.len() {
+            return Err("primary_key_columns must not contain duplicates".into());
+        }
+        if self.batch_size == 0 {
+            return Err("batch_size must be greater than zero".into());
+        }
+        if self
+            .schema_registry_url
+            .as_deref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            return Err("schema_registry_url must not be blank".into());
+        }
+        #[cfg(not(feature = "schema-registry"))]
+        if self.schema_registry_url.is_some() {
+            return Err(
+                "schema_registry_url requires the krishiv-connectors schema-registry feature"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -381,7 +439,9 @@ impl CdcToLakehousePipeline {
         let registry_client = self
             .schema_registry_url
             .as_deref()
-            .map(|url| krishiv_schema_registry::SchemaRegistryClient::new(url));
+            .map(krishiv_schema_registry::SchemaRegistryClient::new)
+            .transpose()
+            .map_err(|error| format!("invalid schema-registry configuration: {error}"))?;
         #[cfg(not(feature = "schema-registry"))]
         let _ = &self.schema_registry_url; // suppress unused warning
 
@@ -399,40 +459,52 @@ impl CdcToLakehousePipeline {
                 }
             }
 
-            // Decode records: use schema-registry when raw_bytes are present and
-            // a registry URL is configured; otherwise fall back to Debezium JSON.
+            let binary_record_count = raw
+                .iter()
+                .filter(|record| record.raw_bytes.is_some())
+                .count();
+            if binary_record_count != 0 && binary_record_count != raw.len() {
+                return Err(
+                    "CDC source returned a mixed batch of binary and plain-text records".into(),
+                );
+            }
+
+            // Decode binary records using the explicitly configured registry
+            // format; otherwise parse Debezium JSON envelopes.
             #[cfg(feature = "schema-registry")]
             let batch_result: Result<RecordBatch, String> = {
-                if let Some(ref client) = registry_client {
-                    // Check whether this batch carries binary payloads.
-                    let has_bytes = raw.iter().any(|r| r.raw_bytes.is_some());
-                    if has_bytes {
-                        // Decode all records via schema registry and concatenate.
-                        let mut batches = Vec::with_capacity(raw.len());
-                        for (i, record) in raw.iter().enumerate() {
-                            let bytes = record
-                                .raw_bytes
-                                .as_deref()
-                                .unwrap_or(record.payload.as_bytes());
-                            let (_schema, decoded) =
-                                client.decode_any(bytes).await.map_err(|e| {
-                                    format!("schema-registry decode error at index {i}: {e}")
-                                })?;
-                            batches.extend(decoded);
+                if binary_record_count == raw.len() {
+                    let client = registry_client.as_ref().ok_or_else(|| {
+                        "binary CDC records require schema_registry_url".to_string()
+                    })?;
+                    let format = match self.schema_registry_format {
+                        CdcSchemaRegistryFormat::Avro => {
+                            krishiv_schema_registry::RegistryFormat::Avro
                         }
-                        if batches.is_empty() {
-                            continue;
+                        CdcSchemaRegistryFormat::Protobuf => {
+                            krishiv_schema_registry::RegistryFormat::Protobuf
                         }
-                        arrow::compute::concat_batches(&batches[0].schema(), &batches)
-                            .map_err(|e| format!("concat error: {e}"))
-                    } else {
-                        // No binary payloads — fall through to Debezium JSON path.
-                        let events = parse_debezium_records(&raw)?;
-                        if events.is_empty() {
-                            continue;
-                        }
-                        build_batch_from_events(&events).map_err(|e| format!("batch error: {e}"))
+                    };
+                    let mut batches = Vec::with_capacity(raw.len());
+                    for (i, record) in raw.iter().enumerate() {
+                        let bytes = record.raw_bytes.as_deref().ok_or_else(|| {
+                            "CDC binary batch shape changed during decoding".to_string()
+                        })?;
+                        let (_schema, decoded) = client
+                            .decode_with_format(bytes, format)
+                            .await
+                            .map_err(|error| {
+                                format!("schema-registry decode error at index {i}: {error}")
+                            })?;
+                        batches.extend(decoded);
                     }
+                    if batches.is_empty() {
+                        return Err(
+                            "schema-registry decoder produced no rows for a non-empty source batch"
+                                .into(),
+                        );
+                    }
+                    concat_registry_batches(&batches)
                 } else {
                     let events = parse_debezium_records(&raw)?;
                     if events.is_empty() {
@@ -443,6 +515,12 @@ impl CdcToLakehousePipeline {
             };
             #[cfg(not(feature = "schema-registry"))]
             let batch_result: Result<RecordBatch, String> = {
+                if binary_record_count != 0 {
+                    return Err(
+                        "binary CDC records require the krishiv-connectors schema-registry feature"
+                            .into(),
+                    );
+                }
                 let events = parse_debezium_records(&raw)?;
                 if events.is_empty() {
                     continue;
@@ -527,6 +605,12 @@ impl CdcToLakehousePipeline {
                 } else {
                     break;
                 }
+            }
+            if raw.iter().any(|record| record.raw_bytes.is_some()) {
+                return Err(
+                    "binary schema-registry records are not supported by the Iceberg CDC sink path"
+                        .into(),
+                );
             }
 
             let events = raw
@@ -626,31 +710,131 @@ struct CdcSchemaEvolutionState {
 impl CdcSchemaEvolutionState {
     fn normalize(&mut self, batch: RecordBatch) -> Result<RecordBatch, String> {
         let merged = match &self.schema {
-            Some(existing) => merge_string_schemas(existing, &batch.schema()),
-            None => batch.schema(),
+            Some(existing) => merge_compatible_schemas(existing, &batch.schema())?,
+            None => {
+                validate_unique_schema_fields(&batch.schema())?;
+                batch.schema()
+            }
         };
-        self.schema = Some(merged.clone());
-        krishiv_exec::schema_normalize::SchemaNormalizeOperator::new(merged)
-            .normalize(&batch)
-            .map_err(|e| e.to_string())
+        let normalized =
+            krishiv_exec::schema_normalize::SchemaNormalizeOperator::new(merged.clone())
+                .normalize(&batch)
+                .map_err(|e| e.to_string())?;
+        self.schema = Some(merged);
+        Ok(normalized)
     }
 }
 
-fn merge_string_schemas(left: &Schema, right: &Schema) -> Arc<Schema> {
-    let mut fields = left
+#[cfg(any(feature = "schema-registry", test))]
+fn concat_registry_batches(batches: &[RecordBatch]) -> Result<RecordBatch, String> {
+    let Some(first) = batches.first() else {
+        return Err("cannot concatenate an empty schema-registry batch list".into());
+    };
+    let mut target = first.schema();
+    validate_unique_schema_fields(&target)?;
+    for batch in &batches[1..] {
+        target = merge_compatible_schemas(&target, &batch.schema())?;
+    }
+    let normalizer = krishiv_exec::schema_normalize::SchemaNormalizeOperator::new(target.clone());
+    let normalized = batches
+        .iter()
+        .map(|batch| {
+            normalizer
+                .normalize(batch)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    arrow::compute::concat_batches(&target, &normalized)
+        .map_err(|error| format!("schema-registry batch concatenation failed: {error}"))
+}
+
+fn merge_compatible_schemas(left: &Schema, right: &Schema) -> Result<Arc<Schema>, String> {
+    validate_unique_schema_fields(left)?;
+    validate_unique_schema_fields(right)?;
+
+    let right_by_name = right
         .fields()
         .iter()
-        .map(|field| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    for field in right.fields() {
-        if !fields
-            .iter()
-            .any(|existing| existing.name() == field.name())
-        {
-            fields.push(field.as_ref().clone());
+        .map(|field| (field.name().as_str(), field.as_ref()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let left_names = left
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut fields = Vec::with_capacity(left.fields().len() + right.fields().len());
+
+    for left_field in left.fields() {
+        let field = if let Some(right_field) = right_by_name.get(left_field.name().as_str()) {
+            merge_compatible_field(left_field, right_field)?
+        } else {
+            arrow::datatypes::Field::new(left_field.name(), left_field.data_type().clone(), true)
+                .with_metadata(left_field.metadata().clone())
+        };
+        fields.push(field);
+    }
+    for right_field in right.fields() {
+        if !left_names.contains(right_field.name().as_str()) {
+            fields.push(
+                arrow::datatypes::Field::new(
+                    right_field.name(),
+                    right_field.data_type().clone(),
+                    true,
+                )
+                .with_metadata(right_field.metadata().clone()),
+            );
         }
     }
-    Arc::new(Schema::new(fields))
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn validate_unique_schema_fields(schema: &Schema) -> Result<(), String> {
+    let mut names = std::collections::HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if !names.insert(field.name()) {
+            return Err(format!("duplicate Arrow field '{}'", field.name()));
+        }
+    }
+    Ok(())
+}
+
+fn merge_compatible_field(
+    left: &arrow::datatypes::Field,
+    right: &arrow::datatypes::Field,
+) -> Result<arrow::datatypes::Field, String> {
+    if left.metadata() != right.metadata() {
+        return Err(format!(
+            "field '{}' changed metadata across schema versions",
+            left.name()
+        ));
+    }
+    let data_type = compatible_data_type(left.data_type(), right.data_type()).ok_or_else(|| {
+        format!(
+            "field '{}' changed incompatibly from {:?} to {:?}",
+            left.name(),
+            left.data_type(),
+            right.data_type()
+        )
+    })?;
+    Ok(arrow::datatypes::Field::new(
+        left.name(),
+        data_type,
+        left.is_nullable() || right.is_nullable(),
+    )
+    .with_metadata(left.metadata().clone()))
+}
+
+fn compatible_data_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    if left == right {
+        return Some(left.clone());
+    }
+    if left == &DataType::Null {
+        return Some(right.clone());
+    }
+    if right == &DataType::Null {
+        return Some(left.clone());
+    }
+    krishiv_exec::schema_normalize::SchemaNormalizeOperator::widening_target(left, right)
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,6 +1376,210 @@ mod tests {
             vec!["id".into()],
         );
         assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_batch_concat_normalizes_compatible_schema_versions() {
+        use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+
+        let first = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(StringArray::from(vec!["second"])),
+            ],
+        )
+        .unwrap();
+
+        let merged = concat_registry_batches(&[first, second]).unwrap();
+
+        assert_eq!(merged.num_rows(), 2);
+        assert_eq!(merged.schema().field(0).data_type(), &DataType::Int64);
+        assert!(merged.schema().field(1).is_nullable());
+        assert!(merged.column(1).is_null(0));
+    }
+
+    #[test]
+    fn registry_batch_concat_rejects_incompatible_type_drift() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let first = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["1"]))],
+        )
+        .unwrap();
+
+        let error = concat_registry_batches(&[first, second]).unwrap_err();
+
+        assert!(error.contains("changed incompatibly"));
+    }
+
+    #[test]
+    fn schema_evolution_state_rolls_back_after_incompatible_batch() {
+        use arrow::array::{Int64Array, StringArray};
+
+        let mut state = CdcSchemaEvolutionState::default();
+        let initial = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        state.normalize(initial).unwrap();
+        let incompatible = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["bad"]))],
+        )
+        .unwrap();
+
+        assert!(state.normalize(incompatible).is_err());
+        assert_eq!(state.schema.unwrap().field(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn pipeline_validate_rejects_zero_batch_and_duplicate_primary_keys() {
+        let zero_batch = CdcToLakehousePipeline::new(
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into()],
+        )
+        .with_batch_size(0);
+        assert_eq!(
+            zero_batch.validate().unwrap_err(),
+            "batch_size must be greater than zero"
+        );
+
+        let duplicate_keys = CdcToLakehousePipeline::new(
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into(), "id".into()],
+        );
+        assert_eq!(
+            duplicate_keys.validate().unwrap_err(),
+            "primary_key_columns must not contain duplicates"
+        );
+    }
+
+    #[cfg(not(feature = "schema-registry"))]
+    #[test]
+    fn pipeline_rejects_registry_config_when_capability_is_not_compiled() {
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into()],
+        )
+        .with_schema_registry("http://registry:8081");
+
+        assert!(
+            pipeline
+                .validate()
+                .unwrap_err()
+                .contains("schema-registry feature")
+        );
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn registry_cdc_rejects_mixed_binary_and_plain_batches() {
+        struct MixedSource {
+            records: Option<Vec<RawCdcRecord>>,
+        }
+
+        impl CdcEventSource for MixedSource {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, String> {
+                Ok(Vec::new())
+            }
+
+            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, String> {
+                Ok(self.records.take().unwrap_or_default())
+            }
+        }
+
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into()],
+        )
+        .with_schema_registry("http://registry:8081");
+        let source = MixedSource {
+            records: Some(vec![
+                RawCdcRecord::with_bytes(br#"{"id":1}"#.to_vec(), 0, 1),
+                RawCdcRecord::new(
+                    r#"{"op":"c","source":{"table":"orders"},"after":{"id":2}}"#,
+                    0,
+                    2,
+                ),
+            ]),
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let error = pipeline
+            .run_with_source(source, |_| Ok(()), shutdown_rx)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("mixed batch"));
+    }
+
+    #[cfg(feature = "schema-registry")]
+    #[tokio::test]
+    async fn registry_cdc_requires_registry_for_binary_records() {
+        struct BinarySource {
+            records: Option<Vec<RawCdcRecord>>,
+        }
+
+        impl CdcEventSource for BinarySource {
+            fn poll_events(&mut self, _max: usize) -> Result<Vec<String>, String> {
+                Ok(Vec::new())
+            }
+
+            fn poll_records(&mut self, _max: usize) -> Result<Vec<RawCdcRecord>, String> {
+                Ok(self.records.take().unwrap_or_default())
+            }
+        }
+
+        let pipeline = CdcToLakehousePipeline::new(
+            "orders.cdc",
+            vec!["kafka:9092".into()],
+            "iceberg",
+            "warehouse.orders",
+            vec!["id".into()],
+        );
+        let source = BinarySource {
+            records: Some(vec![RawCdcRecord::with_bytes(
+                br#"{"id":1}"#.to_vec(),
+                0,
+                1,
+            )]),
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let error = pipeline
+            .run_with_source(source, |_| Ok(()), shutdown_rx)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("require schema_registry_url"));
     }
 
     #[test]

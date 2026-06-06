@@ -7,8 +7,7 @@
 
 pub mod iceberg_rest;
 pub use iceberg_rest::{
-    GenericRestCatalog, GlueRestCatalog, IcebergCatalogClient, IcebergTableId, NessieCatalog,
-    PartitionFieldSpec, RestCatalogConfig,
+    GenericRestCatalog, IcebergCatalogClient, IcebergTableId, LoadedIcebergTable, RestCatalogConfig,
 };
 
 use std::collections::BTreeMap;
@@ -33,9 +32,27 @@ pub enum CatalogError {
     /// The provided schema is structurally invalid.
     #[error("invalid schema: {message}")]
     InvalidSchema { message: String },
+    /// Remote catalog configuration is malformed or unsafe.
+    #[error("invalid catalog configuration: {message}")]
+    InvalidConfiguration { message: String },
+    /// A remote catalog request could not be completed.
+    #[error("catalog transport error during {operation}: {message}")]
+    Transport { operation: String, message: String },
     /// An HTTP request to a remote catalog service failed.
     #[error("HTTP error {status}: {message}")]
     Http { status: u16, message: String },
+    /// A successful remote response did not satisfy the catalog contract.
+    #[error("invalid catalog response during {operation}: {message}")]
+    InvalidResponse { operation: String, message: String },
+    /// A remote response exceeded the configured memory ceiling.
+    #[error("catalog response during {operation} exceeded {limit_bytes} bytes")]
+    ResponseTooLarge {
+        operation: String,
+        limit_bytes: usize,
+    },
+    /// The server explicitly does not advertise a required endpoint.
+    #[error("catalog server does not support {operation}")]
+    UnsupportedOperation { operation: String },
 }
 
 /// Convenience result alias for catalog operations.
@@ -647,14 +664,17 @@ pub mod datafusion_bridge {
                         mem_arc as Arc<dyn datafusion::datasource::TableProvider>,
                     ))
                 }
-                Err(_) => Ok(None),
+                Err(crate::CatalogError::TableNotFound { .. }) => Ok(None),
+                Err(error) => Err(datafusion::error::DataFusionError::External(Box::new(
+                    error,
+                ))),
             }
         }
 
         fn table_exist(&self, name: &str) -> bool {
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
             use crate::CatalogProvider as KrishivCatalogProvider;
-            catalog.get_table(name).is_ok()
+            catalog.list_tables().iter().any(|table| table == name)
         }
     }
 }
@@ -1975,9 +1995,27 @@ mod tests {
             CatalogError::InvalidSchema {
                 message: "d".into(),
             },
+            CatalogError::InvalidConfiguration {
+                message: "bad URL".into(),
+            },
+            CatalogError::Transport {
+                operation: "load table".into(),
+                message: "timed out".into(),
+            },
             CatalogError::Http {
                 status: 500,
                 message: "e".into(),
+            },
+            CatalogError::InvalidResponse {
+                operation: "list tables".into(),
+                message: "missing identifiers".into(),
+            },
+            CatalogError::ResponseTooLarge {
+                operation: "load table".into(),
+                limit_bytes: 1024,
+            },
+            CatalogError::UnsupportedOperation {
+                operation: "committing a table".into(),
             },
         ];
         for err in errors {
@@ -2231,6 +2269,39 @@ mod tests {
                     message: "forbidden".to_string(),
                 },
                 "HTTP error 403: forbidden",
+            ),
+            (
+                CatalogError::InvalidConfiguration {
+                    message: "bad URL".to_string(),
+                },
+                "invalid catalog configuration: bad URL",
+            ),
+            (
+                CatalogError::Transport {
+                    operation: "list tables".to_string(),
+                    message: "timed out".to_string(),
+                },
+                "catalog transport error during list tables: timed out",
+            ),
+            (
+                CatalogError::InvalidResponse {
+                    operation: "load table".to_string(),
+                    message: "missing metadata".to_string(),
+                },
+                "invalid catalog response during load table: missing metadata",
+            ),
+            (
+                CatalogError::ResponseTooLarge {
+                    operation: "load table".to_string(),
+                    limit_bytes: 4096,
+                },
+                "catalog response during load table exceeded 4096 bytes",
+            ),
+            (
+                CatalogError::UnsupportedOperation {
+                    operation: "committing a table".to_string(),
+                },
+                "catalog server does not support committing a table",
             ),
         ];
         for (err, expected) in cases {

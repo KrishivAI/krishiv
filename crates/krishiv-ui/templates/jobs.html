@@ -5,15 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Krishiv R2 Status</title>
     <link rel="stylesheet" href="/assets/krishiv.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   </head>
   <body>
-    <main class="shell">
+    <main class="shell"
+          hx-get="/ui"
+          hx-trigger="every 15s"
+          hx-select="main"
+          hx-swap="outerHTML"
+          hx-indicator="#refresh-note">
       <header class="topbar">
         <div class="brand">
           <strong>Krishiv R2 Status</strong>
           <span>Coordinator {{ coordinator_id }} is <span class="state {{ coordinator_state }}">{{ coordinator_state }}</span></span>
         </div>
-        <div class="meta">Static scheduler · single active coordinator</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="refresh-note" id="refresh-note">auto-refreshing every 15s</span>
+          <button class="theme-toggle" onclick="document.documentElement.style.colorScheme=document.documentElement.style.colorScheme==='dark'?'light':'dark'">🌓</button>
+        </div>
       </header>
 
       <section class="summary" aria-label="Status summary">
@@ -37,24 +46,26 @@
                 <th>State</th>
                 <th>Stages</th>
                 <th>Tasks</th>
-                <th>Assigned</th>
                 <th>Running</th>
                 <th>Succeeded</th>
                 <th>Failed</th>
+                <th>Priority</th>
+                <th>CPU (ns)</th>
               </tr>
             </thead>
             <tbody>
               {% for job in jobs %}
               <tr>
                 <td><a href="/ui/jobs/{{ job.job_id }}">{{ job.job_id }}</a></td>
-                <td>{{ job.kind }}</td>
+                <td>{% if job.kind == "streaming" %}<span class="tag streaming">{{ job.kind }}</span>{% else %}{{ job.kind }}{% endif %}</td>
                 <td><span class="state {{ job.state }}">{{ job.state }}</span></td>
                 <td>{{ job.stage_count }}</td>
                 <td>{{ job.task_count }}</td>
-                <td>{{ job.assigned_task_count }}</td>
                 <td>{{ job.running_task_count }}</td>
                 <td>{{ job.succeeded_task_count }}</td>
-                <td>{{ job.failed_task_count }}</td>
+                <td>{% if job.failed_task_count > 0 %}<strong style="color:var(--bad)">{{ job.failed_task_count }}</strong>{% else %}{{ job.failed_task_count }}{% endif %}</td>
+                <td><span class="tag">{{ job.priority }}</span></td>
+                <td><span class="tag">{{ job.resource_usage.cpu_nanos }}</span></td>
               </tr>
               {% endfor %}
             </tbody>
@@ -77,18 +88,20 @@
                 <th>Slots</th>
                 <th>Host</th>
                 <th>Running Tasks</th>
-                <th>Last Heartbeat Tick</th>
+                <th>Heartbeat Tick</th>
+                <th>Memory</th>
               </tr>
             </thead>
             <tbody>
               {% for executor in executors %}
               <tr>
-                <td>{{ executor.executor_id }}</td>
+                <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
                 <td><span class="state {{ executor.state }}">{{ executor.state }}</span></td>
                 <td>{{ executor.slots }}</td>
                 <td>{{ executor.host }}</td>
                 <td>{{ executor.running_tasks.len() }}</td>
                 <td>{{ executor.last_heartbeat_tick }}</td>
+                <td>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }}MB{% else %}-{% endif %}</td>
               </tr>
               {% endfor %}
             </tbody>

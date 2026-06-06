@@ -10,6 +10,32 @@
   --warn: #b45309;
   --bad: #b91c1c;
   --good: #15803d;
+  --dag-bg: #eef3f7;
+  --dag-text: #334155;
+  --dag-arrow: #94a3b8;
+  --tag-bg: #eef3f7;
+  --hover: #f1f5f9;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --line: #334155;
+    --accent: #14b8a6;
+    --accent-dark: #2dd4bf;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --good: #4ade80;
+    --dag-bg: #1e293b;
+    --dag-text: #cbd5e1;
+    --dag-arrow: #475569;
+    --tag-bg: #334155;
+    --hover: #1e293b;
+  }
 }
 
 * {
@@ -120,8 +146,8 @@ td {
 }
 
 th {
-  background: #eef3f7;
-  color: #334155;
+  background: var(--dag-bg);
+  color: var(--text);
   font-size: 12px;
   text-transform: uppercase;
 }
@@ -160,12 +186,224 @@ tr:last-child td {
   color: var(--warn);
 }
 
+.state.succeeded,
+.state.committed {
+  background: #dff7ec;
+  color: var(--good);
+}
+
+.state.cancelled {
+  background: #f1f5f9;
+  color: var(--muted);
+}
+
+.state.retrying,
+.state.planning {
+  background: #fef3c7;
+  color: var(--warn);
+}
+
 .empty {
   background: var(--panel);
   border: 1px dashed var(--line);
   border-radius: 8px;
   color: var(--muted);
   padding: 18px;
+}
+
+/* ── Dark mode toggle ── */
+
+.theme-toggle {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 6px 10px;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* ── DAG visualization ── */
+
+.dag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 16px 0;
+}
+
+.dag-stage {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  flex-shrink: 0;
+  min-width: 140px;
+  padding: 12px 14px;
+}
+
+.dag-stage-head {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.dag-stage-head .state {
+  font-size: 10px;
+  padding: 3px 6px;
+}
+
+.dag-stage-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.dag-stage-info {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dag-arrow {
+  color: var(--dag-arrow);
+  flex-shrink: 0;
+  font-size: 18px;
+}
+
+/* ── Task failure detail ── */
+
+.failure-detail {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  color: var(--bad);
+  font-size: 12px;
+  margin-top: 4px;
+  max-width: 400px;
+  overflow: hidden;
+  padding: 6px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .failure-detail {
+    background: #451a1a;
+    border-color: #7f1d1d;
+  }
+}
+
+/* ── Executor detail card ── */
+
+.executor-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.executor-card h2 {
+  font-size: 16px;
+  margin: 0 0 16px;
+}
+
+.info-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+
+.info-item {
+  display: grid;
+  gap: 2px;
+}
+
+.info-item span:first-child {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.info-item span:last-child {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* ── Checkpoint timeline ── */
+
+.ckpt-timeline {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  overflow-x: auto;
+  padding: 20px 0;
+}
+
+.ckpt-node {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+}
+
+.ckpt-dot {
+  background: var(--accent);
+  border-radius: 50%;
+  height: 12px;
+  width: 12px;
+}
+
+.ckpt-dot.latest {
+  background: var(--accent-dark);
+  box-shadow: 0 0 0 3px var(--accent);
+}
+
+.ckpt-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.ckpt-line {
+  border-top: 2px solid var(--line);
+  flex-shrink: 0;
+  height: 0;
+  min-width: 24px;
+}
+
+/* ── Tag / badge ── */
+
+.tag {
+  background: var(--tag-bg);
+  border-radius: 4px;
+  color: var(--muted);
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.tag.streaming {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+@media (prefers-color-scheme: dark) {
+  .tag.streaming {
+    background: #1e3a5f;
+    color: #93c5fd;
+  }
+}
+
+/* ── Auto-refresh indicator ── */
+
+.refresh-note {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 @media (max-width: 760px) {
@@ -180,5 +418,15 @@ tr:last-child td {
 
   .summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dag {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .dag-arrow {
+    transform: rotate(90deg);
+    text-align: center;
   }
 }

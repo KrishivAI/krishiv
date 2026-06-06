@@ -198,6 +198,15 @@ impl Optimizer {
                     }
                 })?;
             if let Some(new_plan) = outcome {
+                if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
+                    return Err(OptimizerError::InvalidRuleOutput {
+                        optimizer: "logical",
+                        rule: rule_name,
+                        source: PlanError::Validation(String::from(
+                            "logical optimizer rules must preserve plan name and execution kind",
+                        )),
+                    });
+                }
                 new_plan
                     .validate()
                     .map_err(|source| OptimizerError::InvalidRuleOutput {
@@ -260,7 +269,7 @@ impl ThresholdSkewRule {
         let n = rows.len();
         let mid = n / 2;
         if n.is_multiple_of(2) {
-            (rows[mid - 1] + rows[mid]) as f64 / 2.0
+            (rows[mid - 1] as f64 + rows[mid] as f64) / 2.0
         } else {
             rows[mid] as f64
         }
@@ -341,7 +350,8 @@ impl CoalesceRule {
     /// Compute coalesce advice from per-partition stats, without modifying the plan.
     ///
     /// Groups consecutive partitions whose `memory_bytes < min_partition_bytes`
-    /// into single groups. Non-small partitions are singleton groups.
+    /// without allowing a group to exceed `target_partition_bytes`. Non-small
+    /// partitions are singleton groups.
     ///
     /// Example: `[small, small, big, small]` → `[[0,1], [2], [3]]`
     pub fn advise(&self, stats: &[RuntimeStats]) -> CoalesceAdvice {
@@ -351,14 +361,23 @@ impl CoalesceRule {
 
         let mut groups: Vec<Vec<usize>> = Vec::new();
         let mut current_small: Vec<usize> = Vec::new();
+        let mut current_small_bytes = 0u128;
+        let target_bytes = u128::from(self.target_partition_bytes.max(1));
 
         for (i, s) in stats.iter().enumerate() {
             if s.memory_bytes < self.min_partition_bytes {
+                let partition_bytes = u128::from(s.memory_bytes);
+                if !current_small.is_empty() && current_small_bytes + partition_bytes > target_bytes
+                {
+                    groups.push(std::mem::take(&mut current_small));
+                    current_small_bytes = 0;
+                }
                 current_small.push(i);
+                current_small_bytes += partition_bytes;
             } else {
                 if !current_small.is_empty() {
-                    groups.push(current_small.clone());
-                    current_small.clear();
+                    groups.push(std::mem::take(&mut current_small));
+                    current_small_bytes = 0;
                 }
                 groups.push(vec![i]);
             }
@@ -368,22 +387,6 @@ impl CoalesceRule {
         }
 
         CoalesceAdvice { groups }
-    }
-
-    /// Compute the target partition count based on total bytes and `target_partition_bytes`.
-    ///
-    /// Returns `ceil(total_bytes / target_partition_bytes)`, with a minimum of 1.
-    fn target_partitions_from_stats(&self, stats: &[RuntimeStats]) -> usize {
-        let total_bytes = stats
-            .iter()
-            .fold(0u128, |total, stat| total + u128::from(stat.memory_bytes));
-        if total_bytes == 0 || self.target_partition_bytes == 0 {
-            return 1;
-        }
-        let target = total_bytes
-            .div_ceil(u128::from(self.target_partition_bytes))
-            .max(1);
-        usize::try_from(target).unwrap_or(usize::MAX)
     }
 }
 
@@ -408,10 +411,7 @@ impl AqeRule for CoalesceRule {
             return None;
         }
 
-        let target_partitions = self
-            .target_partitions_from_stats(stats)
-            .min(advice.groups.len())
-            .max(1);
+        let target_partitions = advice.groups.len().max(1);
         if target_partitions >= original_count {
             return None;
         }
@@ -443,15 +443,24 @@ impl AqeRule for CoalesceRule {
         }
 
         let label = format!("CoalescePartitions({original_count} → {target_partitions})");
-        if let Some(&terminal_index) = terminal_indexes.first()
-            && matches!(
-                plan.nodes()[terminal_index].op(),
-                Some(NodeOp::CoalescePartitions { .. })
-            )
-        {
+        let existing_coalesce_index = terminal_indexes.first().and_then(|&terminal_index| {
+            let terminal = &plan.nodes()[terminal_index];
+            if matches!(terminal.op(), Some(NodeOp::CoalescePartitions { .. })) {
+                return Some(terminal_index);
+            }
+            if matches!(terminal.op(), Some(NodeOp::Sink { .. })) && terminal.inputs().len() == 1 {
+                let input_id = &terminal.inputs()[0];
+                return plan.nodes().iter().position(|node| {
+                    node.id() == input_id
+                        && matches!(node.op(), Some(NodeOp::CoalescePartitions { .. }))
+                });
+            }
+            None
+        });
+        if let Some(existing_coalesce_index) = existing_coalesce_index {
             let mut updated = PhysicalPlan::new(plan.name(), plan.kind());
             for (index, node) in plan.nodes().iter().enumerate() {
-                let node = if index == terminal_index {
+                let node = if index == existing_coalesce_index {
                     node.clone()
                         .with_label(label.clone())
                         .with_op(NodeOp::CoalescePartitions { target_partitions })
@@ -557,15 +566,17 @@ impl SmallFilePlanner {
 
         let mut groups: Vec<Vec<String>> = Vec::new();
         let mut current: Vec<String> = Vec::new();
-        let mut current_bytes: u64 = 0;
+        let mut current_bytes = 0u128;
+        let target_bytes = u128::from(self.target_bytes);
 
         for file in files {
-            if !current.is_empty() && current_bytes + file.size_bytes > self.target_bytes {
+            let file_bytes = u128::from(file.size_bytes);
+            if !current.is_empty() && current_bytes + file_bytes > target_bytes {
                 groups.push(std::mem::take(&mut current));
                 current_bytes = 0;
             }
             current.push(file.path.clone());
-            current_bytes += file.size_bytes;
+            current_bytes += file_bytes;
         }
         if !current.is_empty() {
             groups.push(current);
@@ -665,7 +676,7 @@ impl AqeOptimizer {
                 optimizer: "AQE",
                 source,
             })?;
-        let is_streaming = StreamingAqeGuard::plan_is_streaming(&plan);
+        let input_is_streaming = StreamingAqeGuard::plan_is_streaming(&plan);
         let mut current = plan;
         let mut applied = Vec::new();
 
@@ -678,6 +689,15 @@ impl AqeOptimizer {
                     message: panic_payload_message(payload),
                 })?;
             if let Some(new_plan) = outcome {
+                if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
+                    return Err(OptimizerError::InvalidRuleOutput {
+                        optimizer: "AQE",
+                        rule: rule_name,
+                        source: PlanError::Validation(String::from(
+                            "AQE rules must preserve plan name and execution kind",
+                        )),
+                    });
+                }
                 new_plan
                     .validate()
                     .map_err(|source| OptimizerError::InvalidRuleOutput {
@@ -692,7 +712,7 @@ impl AqeOptimizer {
             }
         }
 
-        if !is_streaming {
+        if !input_is_streaming && !StreamingAqeGuard::plan_is_streaming(&current) {
             for rule in &self.guarded_rules {
                 let rule_name = rule.name().to_string();
                 let outcome = catch_unwind(AssertUnwindSafe(|| rule.apply(current.clone(), stats)))
@@ -702,6 +722,15 @@ impl AqeOptimizer {
                         message: panic_payload_message(payload),
                     })?;
                 if let Some(new_plan) = outcome {
+                    if new_plan.name() != current.name() || new_plan.kind() != current.kind() {
+                        return Err(OptimizerError::InvalidRuleOutput {
+                            optimizer: "AQE",
+                            rule: rule_name,
+                            source: PlanError::Validation(String::from(
+                                "AQE rules must preserve plan name and execution kind",
+                            )),
+                        });
+                    }
                     new_plan
                         .validate()
                         .map_err(|source| OptimizerError::InvalidRuleOutput {
@@ -727,40 +756,7 @@ impl Default for AqeOptimizer {
     }
 }
 
-// ── Production optimizer rules (P2-3) ───────────────────────────────────────────
-
-/// Remove duplicate column names from `Project` nodes while preserving original order.
-pub struct ProjectionPruningRule;
-
-impl OptimizerRule for ProjectionPruningRule {
-    fn name(&self) -> &str {
-        "projection-pruning"
-    }
-
-    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
-        let mut nodes: Vec<PlanNode> = plan.nodes().to_vec();
-        let mut changed = false;
-        for node in &mut nodes {
-            if let Some(NodeOp::Project { columns }) = node.op() {
-                let original_len = columns.len();
-                let mut seen = std::collections::HashSet::new();
-                let mut pruned = columns.clone();
-                pruned.retain(|c| seen.insert(c.clone()));
-                if pruned.len() != original_len {
-                    changed = true;
-                    *node = node.clone().with_op(NodeOp::Project { columns: pruned });
-                }
-            }
-        }
-        changed.then(|| {
-            let mut out = LogicalPlan::new(plan.name(), plan.kind());
-            for node in nodes {
-                out.add_node(node);
-            }
-            out
-        })
-    }
-}
+// ── Logical optimizer rules ─────────────────────────────────────────────────
 
 /// Push `Filter` predicates down into `TableScan` nodes.
 ///
@@ -789,14 +785,13 @@ impl OptimizerRule for PredicatePushdownRule {
             nodes.iter().enumerate().map(|(i, n)| (n.id(), i)).collect();
 
         // Collect pushdown candidates: filter nodes whose input is a scan.
-        struct Pushdown {
+        struct FilterPushdown {
             filter_idx: usize,
-            scan_idx: usize,
-            pushable: Vec<String>,
+            scan_pushes: Vec<(usize, Vec<String>)>,
             remaining: Vec<String>,
         }
 
-        let mut pushdowns: Vec<Pushdown> = Vec::new();
+        let mut pushdowns: Vec<FilterPushdown> = Vec::new();
 
         for (i, node) in nodes.iter().enumerate() {
             let predicate = match node.op() {
@@ -822,11 +817,14 @@ impl OptimizerRule for PredicatePushdownRule {
 
             // Filter-above-Join: descend through join nodes to collect
             // both left and right scan inputs for per-side pushdown.
-            for join_idx in direct_inputs
-                .iter()
-                .copied()
-                .filter(|&idx| matches!(nodes[idx].op(), Some(NodeOp::Join { .. })))
-            {
+            for join_idx in direct_inputs.iter().copied().filter(|&idx| {
+                matches!(
+                    nodes[idx].op(),
+                    Some(NodeOp::Join {
+                        join_type: krishiv_plan::JoinType::Inner
+                    })
+                )
+            }) {
                 for child_id in nodes[join_idx].inputs() {
                     if let Some(&child_idx) = id_to_idx.get(child_id.as_str()) {
                         if matches!(nodes[child_idx].op(), Some(NodeOp::Scan { .. })) {
@@ -835,6 +833,8 @@ impl OptimizerRule for PredicatePushdownRule {
                     }
                 }
             }
+            scan_indices.sort_unstable();
+            scan_indices.dedup();
 
             if scan_indices.is_empty() {
                 continue;
@@ -848,46 +848,53 @@ impl OptimizerRule for PredicatePushdownRule {
                 continue;
             }
 
-            for scan_idx in scan_indices {
-                let scan_node = &nodes[scan_idx];
+            let scan_contracts = scan_indices
+                .iter()
+                .map(|&scan_idx| {
+                    let scan_node = &nodes[scan_idx];
+                    let columns = scan_node
+                        .output_schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name())
+                        .collect::<Vec<_>>();
+                    let table = match scan_node.op() {
+                        Some(NodeOp::Scan { table, .. }) => table.as_str(),
+                        _ => "",
+                    };
+                    (scan_idx, table, columns)
+                })
+                .collect::<Vec<_>>();
+            let mut scan_pushes = std::collections::HashMap::<usize, Vec<String>>::new();
+            let mut remaining = Vec::new();
 
-                let scan_columns: Vec<&str> = scan_node
-                    .output_schema()
-                    .fields()
+            for conjunct in conjuncts {
+                let columns = extract_column_refs(&conjunct);
+                let matching_scans = scan_contracts
                     .iter()
-                    .map(|f| f.name())
-                    .collect();
-
-                let table_name = match scan_node.op() {
-                    Some(NodeOp::Scan { table, .. }) => table.as_str(),
-                    _ => "",
-                };
-
-                let mut pushable: Vec<String> = Vec::new();
-                let mut remaining: Vec<String> = Vec::new();
-
-                for conjunct in &conjuncts {
-                    let cols = extract_column_refs(conjunct);
-                    let can_push = !cols.is_empty()
-                        && cols
-                            .iter()
-                            .all(|c| column_belongs_to_scan(c, table_name, &scan_columns));
-
-                    if can_push {
-                        pushable.push(conjunct.to_string());
-                    } else {
-                        remaining.push(conjunct.to_string());
-                    }
+                    .filter_map(|(scan_idx, table, scan_columns)| {
+                        (!columns.is_empty()
+                            && columns
+                                .iter()
+                                .all(|column| column_belongs_to_scan(column, table, scan_columns)))
+                        .then_some(*scan_idx)
+                    })
+                    .collect::<Vec<_>>();
+                if let [scan_idx] = matching_scans.as_slice() {
+                    scan_pushes.entry(*scan_idx).or_default().push(conjunct);
+                } else {
+                    remaining.push(conjunct);
                 }
+            }
 
-                if !pushable.is_empty() {
-                    pushdowns.push(Pushdown {
-                        filter_idx: i,
-                        scan_idx,
-                        pushable,
-                        remaining,
-                    });
-                }
+            if !scan_pushes.is_empty() {
+                let mut scan_pushes = scan_pushes.into_iter().collect::<Vec<_>>();
+                scan_pushes.sort_by_key(|(scan_idx, _)| *scan_idx);
+                pushdowns.push(FilterPushdown {
+                    filter_idx: i,
+                    scan_pushes,
+                    remaining,
+                });
             }
         }
 
@@ -899,14 +906,15 @@ impl OptimizerRule for PredicatePushdownRule {
         let mut to_remove: Vec<usize> = Vec::new();
 
         for pd in &pushdowns {
-            // Push conjuncts into the scan node's filters list.
-            if let Some(NodeOp::Scan { table, filters }) = new_nodes[pd.scan_idx].op() {
-                let mut new_filters = filters.clone();
-                new_filters.extend(pd.pushable.iter().cloned());
-                new_nodes[pd.scan_idx] = new_nodes[pd.scan_idx].clone().with_op(NodeOp::Scan {
-                    table: table.clone(),
-                    filters: new_filters,
-                });
+            for (scan_idx, pushable) in &pd.scan_pushes {
+                if let Some(NodeOp::Scan { table, filters }) = new_nodes[*scan_idx].op() {
+                    let mut new_filters = filters.clone();
+                    new_filters.extend(pushable.iter().cloned());
+                    new_nodes[*scan_idx] = new_nodes[*scan_idx].clone().with_op(NodeOp::Scan {
+                        table: table.clone(),
+                        filters: new_filters,
+                    });
+                }
             }
 
             if pd.remaining.is_empty() {
@@ -953,8 +961,8 @@ impl OptimizerRule for PredicatePushdownRule {
 
 /// Extract likely column-name identifiers from a predicate expression string.
 ///
-/// Splits on non-alphanumeric characters (except `_` and `.`) and keeps tokens
-/// that contain at least one ASCII letter and are not SQL reserved words.
+/// Skips string literals and function names, retaining unquoted and quoted
+/// identifier paths such as `column` and `table.column`.
 fn extract_column_refs(predicate: &str) -> Vec<String> {
     const SQL_KEYWORDS: &[&str] = &[
         "AND", "OR", "NOT", "IN", "IS", "NULL", "TRUE", "FALSE", "WHERE", "SELECT", "FROM", "AS",
@@ -963,15 +971,69 @@ fn extract_column_refs(predicate: &str) -> Vec<String> {
         "CAST",
     ];
 
-    let mut refs: Vec<String> = predicate
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
-        .filter(|w| !w.is_empty())
-        .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
-        .filter(|w| !SQL_KEYWORDS.contains(&w.to_uppercase().as_str()))
-        .map(|w| w.to_string())
-        .collect();
-
-    refs.dedup();
+    let chars = predicate.char_indices().collect::<Vec<_>>();
+    let mut refs = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < chars.len() {
+        let (_, ch) = chars[cursor];
+        if ch == '\'' {
+            cursor += 1;
+            while cursor < chars.len() {
+                if chars[cursor].1 == '\'' {
+                    if cursor + 1 < chars.len() && chars[cursor + 1].1 == '\'' {
+                        cursor += 2;
+                        continue;
+                    }
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '`' {
+            let quote = ch;
+            let start = chars[cursor].0 + ch.len_utf8();
+            cursor += 1;
+            while cursor < chars.len() && chars[cursor].1 != quote {
+                cursor += 1;
+            }
+            let end = chars
+                .get(cursor)
+                .map_or(predicate.len(), |(offset, _)| *offset);
+            if end > start {
+                refs.push(predicate[start..end].to_string());
+            }
+            cursor = cursor.saturating_add(1);
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = chars[cursor].0;
+            cursor += 1;
+            while cursor < chars.len()
+                && (chars[cursor].1.is_ascii_alphanumeric()
+                    || chars[cursor].1 == '_'
+                    || chars[cursor].1 == '.')
+            {
+                cursor += 1;
+            }
+            let end = chars
+                .get(cursor)
+                .map_or(predicate.len(), |(offset, _)| *offset);
+            let token = &predicate[start..end];
+            let next_non_whitespace = chars[cursor..]
+                .iter()
+                .find_map(|(_, next)| (!next.is_whitespace()).then_some(*next));
+            if next_non_whitespace != Some('(')
+                && !SQL_KEYWORDS.contains(&token.to_uppercase().as_str())
+                && !refs.iter().any(|existing| existing == token)
+            {
+                refs.push(token.to_string());
+            }
+            continue;
+        }
+        cursor += 1;
+    }
     refs
 }
 
@@ -982,19 +1044,13 @@ fn split_predicate_conjuncts(predicate: &str) -> Vec<String> {
     use sqlparser::parser::Parser;
 
     let dialect = GenericDialect {};
-    // Try parsing as a full WHERE clause; if that fails, fall back to naive split.
-    let where_clause = if predicate.to_uppercase().starts_with("WHERE ") {
-        predicate.to_string()
-    } else {
-        format!("WHERE {predicate}")
-    };
-    let Ok(mut stmts) = Parser::parse_sql(&dialect, &where_clause) else {
-        // Fall back to naive split on " AND " for unparseable predicates.
-        return predicate
-            .split(" AND ")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+    let expression = predicate
+        .strip_prefix("WHERE ")
+        .or_else(|| predicate.strip_prefix("where "))
+        .unwrap_or(predicate);
+    let statement = format!("SELECT * FROM __krishiv_predicate WHERE {expression}");
+    let Ok(mut stmts) = Parser::parse_sql(&dialect, &statement) else {
+        return Vec::new();
     };
     let Some(stmt) = stmts.pop() else {
         return vec![predicate.to_string()];
@@ -1033,8 +1089,8 @@ fn collect_binary_conjuncts(expr: &sqlparser::ast::Expr, op: &str) -> Vec<String
 
 /// Check whether `col` (possibly qualified like `"t.id"`) belongs to `scan_table`
 /// with the given column names.  C5: When a column reference has an explicit
-/// qualifier, require it to plausibly refer to `scan_table` (exact match, prefix,
-/// or abbreviation).  Otherwise fall back to unqualified column match.
+/// qualifier, require an exact case-insensitive table match. Aliases are not
+/// represented in `PlanNode`, so guessing them would permit unsafe pushdown.
 fn column_belongs_to_scan(col: &str, scan_table: &str, scan_columns: &[&str]) -> bool {
     if let Some(dot_pos) = col.rfind('.') {
         let qualifier = &col[..dot_pos];
@@ -1042,8 +1098,7 @@ fn column_belongs_to_scan(col: &str, scan_table: &str, scan_columns: &[&str]) ->
         if !qualifier.is_empty() {
             let scan_lower = scan_table.to_ascii_lowercase();
             let qual_lower = qualifier.to_ascii_lowercase();
-            // Accept alias/prefix: "o" matches "orders", "orders" matches "orders"
-            if scan_lower.starts_with(&qual_lower) || qual_lower == scan_lower {
+            if qual_lower == scan_lower {
                 return scan_columns.contains(&unqualified);
             }
             // Reject qualification that doesn't match this table at all.
@@ -1054,60 +1109,10 @@ fn column_belongs_to_scan(col: &str, scan_table: &str, scan_columns: &[&str]) ->
     scan_columns.contains(&col)
 }
 
-/// Drop no-op `Project` nodes that select zero columns.
-pub struct EmptyProjectionRemovalRule;
-
-impl OptimizerRule for EmptyProjectionRemovalRule {
-    fn name(&self) -> &str {
-        "empty-projection-removal"
-    }
-
-    fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
-        let nodes: Vec<PlanNode> = plan.nodes().to_vec();
-        let mut removed: Vec<(String, Vec<String>)> = Vec::new();
-        let mut new_nodes: Vec<PlanNode> = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            if matches!(node.op(), Some(NodeOp::Project { columns }) if columns.is_empty()) {
-                removed.push((node.id().to_string(), node.inputs().to_vec()));
-            } else {
-                new_nodes.push(node);
-            }
-        }
-        if removed.is_empty() {
-            return None;
-        }
-        for (removed_id, removed_inputs) in &removed {
-            for node in &mut new_nodes {
-                let inputs: Vec<String> = node.inputs().to_vec();
-                if inputs.contains(removed_id) {
-                    let new_inputs: Vec<String> = inputs
-                        .iter()
-                        .flat_map(|input| {
-                            if input == removed_id {
-                                removed_inputs.clone()
-                            } else {
-                                vec![input.clone()]
-                            }
-                        })
-                        .collect();
-                    *node = node.clone().with_inputs(new_inputs);
-                }
-            }
-        }
-        let mut out = LogicalPlan::new(plan.name(), plan.kind());
-        for node in new_nodes {
-            out.add_node(node);
-        }
-        Some(out)
-    }
-}
-
-/// Default logical optimizer with production rules enabled.
+/// Default logical optimizer with semantics-preserving rules enabled.
 pub fn default_logical_optimizer() -> Optimizer {
     let mut optimizer = Optimizer::new();
-    optimizer.add_rule(Box::new(ProjectionPruningRule));
     optimizer.add_rule(Box::new(PredicatePushdownRule));
-    optimizer.add_rule(Box::new(EmptyProjectionRemovalRule));
     optimizer
 }
 
@@ -1129,9 +1134,9 @@ mod tests {
     use krishiv_plan::{ExecutionKind, FieldType, LogicalPlan, NodeOp, PhysicalPlan, PlanNode};
 
     use super::{
-        AqeOptimizer, AqeRule, CoalesceAdvice, CoalesceRule, Cost, EmptyProjectionRemovalRule,
-        Optimizer, OptimizerRule, RuntimeStats, SmallFilePlanner, SplitPlanAdvice,
-        StreamingAqeGuard, default_logical_optimizer,
+        AqeOptimizer, AqeRule, CoalesceAdvice, CoalesceRule, Cost, Optimizer, OptimizerError,
+        OptimizerRule, RuntimeStats, SmallFilePlanner, SplitPlanAdvice, StreamingAqeGuard,
+        default_logical_optimizer,
     };
 
     fn empty_plan() -> LogicalPlan {
@@ -1152,7 +1157,7 @@ mod tests {
     fn optimizer_no_rules_is_noop() {
         let optimizer = Optimizer::new();
         let plan = plan_with_node();
-        let result = optimizer.optimize(plan.clone());
+        let result = optimizer.optimize(plan.clone()).expect("optimize");
 
         assert_eq!(result.plan, plan);
         assert!(result.applied_rules.is_empty());
@@ -1162,7 +1167,7 @@ mod tests {
     fn optimizer_default_is_noop() {
         let optimizer = Optimizer::default();
         let plan = empty_plan();
-        let result = optimizer.optimize(plan.clone());
+        let result = optimizer.optimize(plan.clone()).expect("optimize");
 
         assert_eq!(result.plan, plan);
         assert!(result.applied_rules.is_empty());
@@ -1188,13 +1193,142 @@ mod tests {
         optimizer.add_rule(Box::new(NoOpRule));
 
         let plan = plan_with_node();
-        let result = optimizer.optimize(plan.clone());
+        let result = optimizer.optimize(plan.clone()).expect("optimize");
 
         assert_eq!(result.plan, plan);
         assert!(
             result.applied_rules.is_empty(),
             "no-op rule must not appear in applied_rules"
         );
+    }
+
+    #[test]
+    fn optimizer_rejects_invalid_input_plan() {
+        let optimizer = Optimizer::new();
+        let invalid = LogicalPlan::new("invalid", ExecutionKind::Batch).with_node(
+            PlanNode::new("sink", "sink", ExecutionKind::Batch).with_inputs(["missing"]),
+        );
+
+        let error = optimizer.optimize(invalid).expect_err("invalid input");
+
+        assert!(matches!(
+            error,
+            OptimizerError::InvalidInput {
+                optimizer: "logical",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn optimizer_rejects_invalid_rule_output() {
+        struct InvalidOutputRule;
+        impl OptimizerRule for InvalidOutputRule {
+            fn name(&self) -> &str {
+                "invalid-output"
+            }
+
+            fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+                Some(plan.clone().with_node(PlanNode::new(
+                    "scan",
+                    "duplicate",
+                    ExecutionKind::Batch,
+                )))
+            }
+        }
+
+        let mut optimizer = Optimizer::new();
+        optimizer.add_rule(Box::new(InvalidOutputRule));
+
+        let error = optimizer
+            .optimize(plan_with_node())
+            .expect_err("invalid rule output");
+
+        assert!(matches!(
+            error,
+            OptimizerError::InvalidRuleOutput {
+                optimizer: "logical",
+                ref rule,
+                ..
+            } if rule == "invalid-output"
+        ));
+    }
+
+    #[test]
+    fn optimizer_contains_rule_panics() {
+        struct PanickingRule;
+        impl OptimizerRule for PanickingRule {
+            fn name(&self) -> &str {
+                "panicking"
+            }
+
+            fn apply(&self, _plan: &LogicalPlan) -> Option<LogicalPlan> {
+                panic!("rule failed")
+            }
+        }
+
+        let mut optimizer = Optimizer::new();
+        optimizer.add_rule(Box::new(PanickingRule));
+
+        let error = optimizer
+            .optimize(plan_with_node())
+            .expect_err("panic must be contained");
+
+        assert!(matches!(
+            error,
+            OptimizerError::RulePanicked {
+                optimizer: "logical",
+                ref rule,
+                ref message,
+            } if rule == "panicking" && message == "rule failed"
+        ));
+    }
+
+    #[test]
+    fn optimizer_rejects_rule_that_changes_plan_identity() {
+        struct RenameRule;
+        impl OptimizerRule for RenameRule {
+            fn name(&self) -> &str {
+                "rename"
+            }
+
+            fn apply(&self, _plan: &LogicalPlan) -> Option<LogicalPlan> {
+                Some(LogicalPlan::new("renamed", ExecutionKind::Batch))
+            }
+        }
+
+        let mut optimizer = Optimizer::new();
+        optimizer.add_rule(Box::new(RenameRule));
+
+        let error = optimizer
+            .optimize(empty_plan())
+            .expect_err("identity changes must fail");
+
+        assert!(matches!(
+            error,
+            OptimizerError::InvalidRuleOutput { ref rule, .. } if rule == "rename"
+        ));
+        assert!(error.to_string().contains("preserve plan name"));
+    }
+
+    #[test]
+    fn optimizer_ignores_some_unchanged_plan() {
+        struct CloneRule;
+        impl OptimizerRule for CloneRule {
+            fn name(&self) -> &str {
+                "clone"
+            }
+
+            fn apply(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+                Some(plan.clone())
+            }
+        }
+
+        let mut optimizer = Optimizer::new();
+        optimizer.add_rule(Box::new(CloneRule));
+        let result = optimizer.optimize(plan_with_node()).expect("optimize");
+
+        assert!(result.applied_rules.is_empty());
     }
 
     // ── rules that change the plan ────────────────────────────────────────
@@ -1219,7 +1353,7 @@ mod tests {
         let mut optimizer = Optimizer::new();
         optimizer.add_rule(Box::new(AddNodeRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
 
         assert_eq!(result.applied_rules, vec!["add-node"]);
         assert_eq!(result.plan.nodes().len(), 1);
@@ -1232,7 +1366,7 @@ mod tests {
         optimizer.add_rule(Box::new(AddNodeRule));
         optimizer.add_rule(Box::new(NoOpRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
 
         assert_eq!(result.applied_rules, vec!["add-node"]);
     }
@@ -1244,7 +1378,7 @@ mod tests {
         let mut optimizer = Optimizer::new();
         optimizer.add_rule(Box::new(NoOpRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
         assert_eq!(result.describe(), "optimizer: no rules applied");
     }
 
@@ -1253,7 +1387,7 @@ mod tests {
         let mut optimizer = Optimizer::new();
         optimizer.add_rule(Box::new(AddNodeRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
         assert_eq!(result.describe(), "optimizer applied: add-node");
     }
 
@@ -1276,7 +1410,7 @@ mod tests {
         optimizer.add_rule(Box::new(AddNodeRule));
         optimizer.add_rule(Box::new(AnotherRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
         assert!(result.describe().contains("add-node"));
         assert!(result.describe().contains("another-rule"));
     }
@@ -1346,6 +1480,14 @@ mod tests {
         let rule = ThresholdSkewRule::new(2.0);
         let hot = rule.detect_hot_partitions(&stats);
         assert!(hot.is_empty(), "exact boundary should not be flagged");
+    }
+
+    #[test]
+    fn skew_rule_even_median_handles_u64_max() {
+        let stats = make_stats_with_rows(&[u64::MAX, u64::MAX]);
+        let rule = ThresholdSkewRule::new(2.0);
+
+        assert!(rule.detect_hot_partitions(&stats).is_empty());
     }
 
     // P1.16 — median fix for even-length arrays
@@ -1428,6 +1570,75 @@ mod tests {
         let rule = CoalesceRule::new(128 * 1024 * 1024);
         let result = rule.apply(plan, &stats);
         assert!(result.is_none(), "no coalescing should return None");
+    }
+
+    #[test]
+    fn coalesce_rule_connects_before_terminal_sink_and_is_idempotent() {
+        let plan = PhysicalPlan::new("sink-plan", ExecutionKind::Batch)
+            .with_node(PlanNode::new("scan", "scan", ExecutionKind::Batch))
+            .with_node(
+                PlanNode::new("sink", "sink", ExecutionKind::Batch)
+                    .with_inputs(["scan"])
+                    .with_op(NodeOp::Sink {
+                        format: "memory".to_string(),
+                    }),
+            );
+        let stats = vec![
+            RuntimeStats {
+                memory_bytes: 10,
+                ..RuntimeStats::default()
+            },
+            RuntimeStats {
+                memory_bytes: 10,
+                ..RuntimeStats::default()
+            },
+        ];
+        let rule = CoalesceRule::new(100).with_target_partition_bytes(100);
+
+        let first = rule.apply(plan, &stats).expect("first rewrite");
+        first.validate().expect("valid first rewrite");
+        let coalesce = first
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.op(), Some(NodeOp::CoalescePartitions { .. })))
+            .expect("coalesce node");
+        let sink = first
+            .nodes()
+            .iter()
+            .find(|node| node.id() == "sink")
+            .expect("sink node");
+        assert_eq!(coalesce.inputs(), &["scan"]);
+        assert_eq!(sink.inputs(), &[coalesce.id()]);
+        assert_eq!(first.coalesced_partition_count(), Some(1));
+
+        let second = rule.apply(first.clone(), &stats).expect("second rewrite");
+        second.validate().expect("valid second rewrite");
+        assert_eq!(second.nodes().len(), first.nodes().len());
+        assert_eq!(
+            second
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.op(), Some(NodeOp::CoalescePartitions { .. })))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn coalesce_rule_is_intrinsically_disabled_for_streaming() {
+        let plan = PhysicalPlan::new("stream", ExecutionKind::Streaming);
+        let stats = vec![
+            RuntimeStats {
+                memory_bytes: 1,
+                ..RuntimeStats::default()
+            },
+            RuntimeStats {
+                memory_bytes: 1,
+                ..RuntimeStats::default()
+            },
+        ];
+
+        assert!(CoalesceRule::new(100).apply(plan, &stats).is_none());
     }
 
     // ── SmallFilePlanner ──────────────────────────────────────────────────
@@ -1533,8 +1744,8 @@ mod tests {
         aqe.add_guarded_rule(Box::new(CoalesceRule::new(1)));
 
         let stats = stats_small(2);
-        let (_, batch_fired) = aqe.apply(batch_plan(), &stats);
-        let (_, stream_fired) = aqe.apply(streaming_plan(), &stats);
+        let (_, batch_fired) = aqe.apply(batch_plan(), &stats).expect("aqe");
+        let (_, stream_fired) = aqe.apply(streaming_plan(), &stats).expect("aqe");
 
         assert!(
             batch_fired.is_empty(),
@@ -1552,7 +1763,7 @@ mod tests {
         aqe.add_guarded_rule(Box::new(CoalesceRule::new(1)));
         let plan = streaming_plan();
         let stats = stats_small(3);
-        let (returned_plan, _) = aqe.apply(plan.clone(), &stats);
+        let (returned_plan, _) = aqe.apply(plan.clone(), &stats).expect("aqe");
         assert_eq!(returned_plan, plan);
     }
 
@@ -1644,9 +1855,7 @@ mod tests {
         );
     }
 
-    // ── ProjectionPruningRule ─────────────────────────────────────────────
-
-    use super::ProjectionPruningRule;
+    // ── Logical rule test helpers ─────────────────────────────────────────
 
     fn scan_with_schema(
         id: &str,
@@ -1681,41 +1890,6 @@ mod tests {
             .with_op(NodeOp::Project {
                 columns: columns.iter().map(|s| s.to_string()).collect(),
             })
-    }
-
-    #[test]
-    fn projection_pruning_preserves_order() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema(
-                "s",
-                "t",
-                &[("a", FieldType::Int32), ("b", FieldType::Utf8)],
-            ))
-            .with_node(project_node("p", &["s"], &["b", "a", "b", "a"]));
-
-        let result = ProjectionPruningRule.apply(&plan).unwrap();
-
-        let project_node = result.nodes().iter().find(|n| n.id() == "p").unwrap();
-        if let Some(NodeOp::Project { columns }) = project_node.op() {
-            // Should be ["b", "a"] — first occurrence order preserved, not sorted to ["a", "b"]
-            assert_eq!(columns, &["b", "a"]);
-        } else {
-            panic!("expected Project node");
-        }
-    }
-
-    #[test]
-    fn projection_pruning_noop_when_no_duplicates() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema(
-                "s",
-                "t",
-                &[("a", FieldType::Int32), ("b", FieldType::Utf8)],
-            ))
-            .with_node(project_node("p", &["s"], &["a", "b"]));
-
-        let result = ProjectionPruningRule.apply(&plan);
-        assert!(result.is_none(), "no duplicates → no change");
     }
 
     // ── PredicatePushdownRule ──────────────────────────────────────────────
@@ -1817,8 +1991,11 @@ mod tests {
                 "orders",
                 &[("id", FieldType::Int64), ("amount", FieldType::Float64)],
             ))
-            // Qualified column "o.id" should match scan column "id" via unqualified suffix
-            .with_node(filter_node("f", &["s"], "o.id = 5 AND o.amount > 100"));
+            .with_node(filter_node(
+                "f",
+                &["s"],
+                "orders.id = 5 AND orders.amount > 100",
+            ));
 
         let result = PredicatePushdownRule.apply(&plan).unwrap();
 
@@ -1829,11 +2006,20 @@ mod tests {
         let scan = result.nodes().iter().find(|n| n.id() == "s").unwrap();
         if let Some(NodeOp::Scan { filters, .. }) = scan.op() {
             assert_eq!(filters.len(), 2);
-            assert!(filters.contains(&"o.id = 5".to_string()));
-            assert!(filters.contains(&"o.amount > 100".to_string()));
+            assert!(filters.contains(&"orders.id = 5".to_string()));
+            assert!(filters.contains(&"orders.amount > 100".to_string()));
         } else {
             panic!("expected Scan node");
         }
+    }
+
+    #[test]
+    fn predicate_pushdown_does_not_guess_table_aliases() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema("s", "orders", &[("id", FieldType::Int64)]))
+            .with_node(filter_node("f", &["s"], "o.id = 5"));
+
+        assert!(PredicatePushdownRule.apply(&plan).is_none());
     }
 
     #[test]
@@ -2397,6 +2583,24 @@ mod tests {
     }
 
     #[test]
+    fn small_file_planner_handles_u64_size_overflow() {
+        let files = vec![
+            make_file("max.parquet", u64::MAX),
+            make_file("one.parquet", 1),
+        ];
+
+        let advice = SmallFilePlanner::new(u64::MAX).plan(&files);
+
+        assert_eq!(
+            advice.task_groups,
+            vec![
+                vec!["max.parquet".to_string()],
+                vec!["one.parquet".to_string()]
+            ]
+        );
+    }
+
+    #[test]
     fn small_file_planner_zero_byte_files_target_zero() {
         let files = vec![make_file("e1.parquet", 0), make_file("e2.parquet", 0)];
         let planner = SmallFilePlanner::new(0);
@@ -2442,7 +2646,8 @@ mod tests {
             "always-fire"
         }
         fn apply(&self, plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
-            Some(plan.with_node(PlanNode::new("extra", "extra", ExecutionKind::Batch)))
+            let node_id = format!("extra-{}", plan.nodes().len());
+            Some(plan.with_node(PlanNode::new(node_id, "extra", ExecutionKind::Batch)))
         }
     }
 
@@ -2461,7 +2666,7 @@ mod tests {
     fn aqe_optimizer_empty_no_rules() {
         let aqe = AqeOptimizer::new();
         let plan = batch_plan();
-        let (result, applied) = aqe.apply(plan.clone(), &[]);
+        let (result, applied) = aqe.apply(plan.clone(), &[]).expect("aqe");
         assert_eq!(result, plan);
         assert!(applied.is_empty());
     }
@@ -2470,7 +2675,7 @@ mod tests {
     fn aqe_optimizer_empty_default() {
         let aqe = AqeOptimizer::default();
         let plan = batch_plan();
-        let (result, applied) = aqe.apply(plan.clone(), &[]);
+        let (result, applied) = aqe.apply(plan.clone(), &[]).expect("aqe");
         assert_eq!(result, plan);
         assert!(applied.is_empty());
     }
@@ -2480,7 +2685,7 @@ mod tests {
         let mut aqe = AqeOptimizer::new();
         aqe.add_rule(Box::new(AlwaysFireRule));
         let plan = batch_plan();
-        let (result, applied) = aqe.apply(plan, &[]);
+        let (result, applied) = aqe.apply(plan, &[]).expect("aqe");
         assert_eq!(applied, vec!["always-fire"]);
         assert!(!result.nodes().is_empty());
     }
@@ -2490,7 +2695,7 @@ mod tests {
         let mut aqe = AqeOptimizer::new();
         aqe.add_guarded_rule(Box::new(AlwaysFireRule));
         let stats = stats_small(2);
-        let (_, applied) = aqe.apply(batch_plan(), &stats);
+        let (_, applied) = aqe.apply(batch_plan(), &stats).expect("aqe");
         assert_eq!(applied, vec!["always-fire"]);
     }
 
@@ -2499,7 +2704,7 @@ mod tests {
         let mut aqe = AqeOptimizer::new();
         aqe.add_guarded_rule(Box::new(AlwaysFireRule));
         let stats = stats_small(2);
-        let (_, applied) = aqe.apply(streaming_plan(), &stats);
+        let (_, applied) = aqe.apply(streaming_plan(), &stats).expect("aqe");
         assert!(
             applied.is_empty(),
             "guarded rules should be skipped for streaming"
@@ -2512,7 +2717,7 @@ mod tests {
         aqe.add_rule(Box::new(AlwaysFireRule));
         aqe.add_guarded_rule(Box::new(AlwaysFireRule));
         let stats = stats_small(2);
-        let (_, applied) = aqe.apply(batch_plan(), &stats);
+        let (_, applied) = aqe.apply(batch_plan(), &stats).expect("aqe");
         assert_eq!(applied, vec!["always-fire", "always-fire"]);
     }
 
@@ -2522,7 +2727,7 @@ mod tests {
         aqe.add_rule(Box::new(AlwaysFireRule));
         aqe.add_guarded_rule(Box::new(AlwaysFireRule));
         let stats = stats_small(2);
-        let (_, applied) = aqe.apply(streaming_plan(), &stats);
+        let (_, applied) = aqe.apply(streaming_plan(), &stats).expect("aqe");
         assert_eq!(applied, vec!["always-fire"]);
     }
 
@@ -2532,8 +2737,91 @@ mod tests {
         aqe.add_rule(Box::new(NeverFireRule));
         aqe.add_guarded_rule(Box::new(NeverFireRule));
         let stats = stats_small(2);
-        let (_, applied) = aqe.apply(batch_plan(), &stats);
+        let (_, applied) = aqe.apply(batch_plan(), &stats).expect("aqe");
         assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn aqe_optimizer_rejects_invalid_input_plan() {
+        let aqe = AqeOptimizer::new();
+        let invalid = PhysicalPlan::new("invalid", ExecutionKind::Batch).with_node(
+            PlanNode::new("sink", "sink", ExecutionKind::Batch).with_inputs(["missing"]),
+        );
+
+        let error = aqe.apply(invalid, &[]).expect_err("invalid input");
+
+        assert!(matches!(
+            error,
+            OptimizerError::InvalidInput {
+                optimizer: "AQE",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn aqe_optimizer_rejects_invalid_rule_output() {
+        struct InvalidAqeRule;
+        impl AqeRule for InvalidAqeRule {
+            fn name(&self) -> &str {
+                "invalid-aqe"
+            }
+
+            fn apply(&self, plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+                Some(
+                    plan.with_node(
+                        PlanNode::new("dangling", "dangling", ExecutionKind::Batch)
+                            .with_inputs(["missing"]),
+                    ),
+                )
+            }
+        }
+
+        let mut aqe = AqeOptimizer::new();
+        aqe.add_rule(Box::new(InvalidAqeRule));
+
+        let error = aqe
+            .apply(batch_plan(), &[])
+            .expect_err("invalid rule output");
+
+        assert!(matches!(
+            error,
+            OptimizerError::InvalidRuleOutput {
+                optimizer: "AQE",
+                ref rule,
+                ..
+            } if rule == "invalid-aqe"
+        ));
+    }
+
+    #[test]
+    fn aqe_optimizer_contains_rule_panics() {
+        struct PanickingAqeRule;
+        impl AqeRule for PanickingAqeRule {
+            fn name(&self) -> &str {
+                "panicking-aqe"
+            }
+
+            fn apply(&self, _plan: PhysicalPlan, _stats: &[RuntimeStats]) -> Option<PhysicalPlan> {
+                panic!("aqe rule failed")
+            }
+        }
+
+        let mut aqe = AqeOptimizer::new();
+        aqe.add_rule(Box::new(PanickingAqeRule));
+
+        let error = aqe
+            .apply(batch_plan(), &[])
+            .expect_err("panic must be contained");
+
+        assert!(matches!(
+            error,
+            OptimizerError::RulePanicked {
+                optimizer: "AQE",
+                ref rule,
+                ref message,
+            } if rule == "panicking-aqe" && message == "aqe rule failed"
+        ));
     }
 
     #[test]
@@ -2563,7 +2851,7 @@ mod tests {
         aqe.add_guarded_rule(Box::new(AlwaysFireRule));
         aqe.add_guarded_rule(Box::new(AlwaysFireRule));
         let stats = stats_small(2);
-        let (_, applied) = aqe.apply(streaming_plan(), &stats);
+        let (_, applied) = aqe.apply(streaming_plan(), &stats).expect("aqe");
         assert!(applied.is_empty());
     }
 
@@ -2607,178 +2895,6 @@ mod tests {
             .with_node(PlanNode::new("n1", "a", ExecutionKind::Batch))
             .with_node(PlanNode::new("n2", "b", ExecutionKind::Batch));
         assert!(!StreamingAqeGuard::plan_is_streaming(&plan));
-    }
-
-    // ── EmptyProjectionRemovalRule ─────────────────────────────────────────
-
-    #[test]
-    fn empty_projection_removal_removes_empty_project() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(scan_with_schema("s", "t", &[("a", FieldType::Int32)]))
-            .with_node(project_node("p", &["s"], &[]));
-
-        let result = EmptyProjectionRemovalRule.apply(&plan);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert!(!result.nodes().iter().any(|n| n.id() == "p"));
-    }
-
-    #[test]
-    fn empty_projection_removal_noop_when_no_empty() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(project_node(
-            "p",
-            &[],
-            &["a", "b"],
-        ));
-
-        let result = EmptyProjectionRemovalRule.apply(&plan);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn empty_projection_removal_mixed_nodes() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(project_node("p1", &[], &["a"]))
-            .with_node(project_node("p2", &[], &[]))
-            .with_node(project_node("p3", &[], &["b"]));
-
-        let result = EmptyProjectionRemovalRule.apply(&plan);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert_eq!(result.nodes().len(), 2);
-        assert!(result.nodes().iter().any(|n| n.id() == "p1"));
-        assert!(result.nodes().iter().any(|n| n.id() == "p3"));
-        assert!(!result.nodes().iter().any(|n| n.id() == "p2"));
-    }
-
-    #[test]
-    fn empty_projection_removal_only_empty_nodes() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(project_node("p1", &[], &[]))
-            .with_node(project_node("p2", &[], &[]));
-
-        let result = EmptyProjectionRemovalRule.apply(&plan);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert!(result.nodes().is_empty());
-    }
-
-    #[test]
-    fn empty_projection_removal_name() {
-        assert_eq!(
-            EmptyProjectionRemovalRule.name(),
-            "empty-projection-removal"
-        );
-    }
-
-    #[test]
-    fn empty_projection_removal_preserves_non_empty_projects() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(project_node(
-            "p",
-            &[],
-            &["x", "y", "z"],
-        ));
-
-        let result = EmptyProjectionRemovalRule.apply(&plan);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn empty_projection_removal_empty_plan() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch);
-        let result = EmptyProjectionRemovalRule.apply(&plan);
-        assert!(result.is_none());
-    }
-
-    // ── ProjectionPruningRule additional tests ──────────────────────────────
-
-    #[test]
-    fn projection_pruning_single_column_no_duplicates() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(project_node(
-            "p",
-            &[],
-            &["a"],
-        ));
-
-        let result = ProjectionPruningRule.apply(&plan);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn projection_pruning_all_duplicates() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(project_node(
-            "p",
-            &[],
-            &["a", "a", "a", "a"],
-        ));
-
-        let result = ProjectionPruningRule.apply(&plan).unwrap();
-        let project = result.nodes().iter().find(|n| n.id() == "p").unwrap();
-        if let Some(NodeOp::Project { columns }) = project.op() {
-            assert_eq!(columns, &["a"]);
-        } else {
-            panic!("expected Project node");
-        }
-    }
-
-    #[test]
-    fn projection_pruning_multiple_project_nodes() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
-            .with_node(project_node("p1", &[], &["a", "a", "b"]))
-            .with_node(project_node("p2", &[], &["c", "c", "c"]));
-
-        let result = ProjectionPruningRule.apply(&plan).unwrap();
-        let p1 = result.nodes().iter().find(|n| n.id() == "p1").unwrap();
-        let p2 = result.nodes().iter().find(|n| n.id() == "p2").unwrap();
-        if let Some(NodeOp::Project { columns }) = p1.op() {
-            assert_eq!(columns, &["a", "b"]);
-        } else {
-            panic!("expected Project node for p1");
-        }
-        if let Some(NodeOp::Project { columns }) = p2.op() {
-            assert_eq!(columns, &["c"]);
-        } else {
-            panic!("expected Project node for p2");
-        }
-    }
-
-    #[test]
-    fn projection_pruning_no_project_nodes() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch).with_node(scan_with_schema(
-            "s",
-            "t",
-            &[("a", FieldType::Int32)],
-        ));
-
-        let result = ProjectionPruningRule.apply(&plan);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn projection_pruning_name() {
-        assert_eq!(ProjectionPruningRule.name(), "projection-pruning");
-    }
-
-    #[test]
-    fn projection_pruning_empty_plan() {
-        let plan = LogicalPlan::new("test", ExecutionKind::Batch);
-        let result = ProjectionPruningRule.apply(&plan);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn projection_pruning_many_duplicates() {
-        let cols: Vec<&str> = (0..20).map(|_| "x").collect();
-        let plan =
-            LogicalPlan::new("test", ExecutionKind::Batch).with_node(project_node("p", &[], &cols));
-
-        let result = ProjectionPruningRule.apply(&plan).unwrap();
-        let project = result.nodes().iter().find(|n| n.id() == "p").unwrap();
-        if let Some(NodeOp::Project { columns }) = project.op() {
-            assert_eq!(columns, &["x"]);
-        } else {
-            panic!("expected Project node");
-        }
     }
 
     // ── PredicatePushdownRule additional tests ──────────────────────────────
@@ -2932,7 +3048,7 @@ mod tests {
     // ── default_logical_optimizer ───────────────────────────────────────────
 
     #[test]
-    fn default_logical_optimizer_has_all_rules() {
+    fn default_logical_optimizer_applies_only_semantics_preserving_rules() {
         let optimizer = default_logical_optimizer();
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
             .with_node(scan_with_schema(
@@ -2943,20 +3059,30 @@ mod tests {
             .with_node(filter_node("f", &["s"], "a > 0"))
             .with_node(project_node("p", &["f"], &["a", "a", "b"]));
 
-        let result = optimizer.optimize(plan);
+        let result = optimizer.optimize(plan).expect("optimize");
         assert!(!result.applied_rules.is_empty());
         assert!(
             result
                 .applied_rules
                 .contains(&"predicate-pushdown".to_string())
         );
+        let project = result
+            .plan
+            .nodes()
+            .iter()
+            .find(|node| node.id() == "p")
+            .expect("project");
+        assert!(matches!(
+            project.op(),
+            Some(NodeOp::Project { columns }) if columns == &["a", "a", "b"]
+        ));
     }
 
     #[test]
     fn default_logical_optimizer_empty_plan_noop() {
         let optimizer = default_logical_optimizer();
         let plan = LogicalPlan::new("test", ExecutionKind::Batch);
-        let result = optimizer.optimize(plan.clone());
+        let result = optimizer.optimize(plan.clone()).expect("optimize");
         assert_eq!(result.plan, plan);
         assert!(result.applied_rules.is_empty());
     }
@@ -3091,7 +3217,7 @@ mod tests {
         optimizer.add_rule(Box::new(FirstRule));
         optimizer.add_rule(Box::new(SecondRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
         assert_eq!(result.applied_rules, vec!["first", "second"]);
         assert_eq!(result.plan.nodes().len(), 2);
     }
@@ -3103,7 +3229,7 @@ mod tests {
             optimizer.add_rule(Box::new(NoOpRule));
         }
         let plan = plan_with_node();
-        let result = optimizer.optimize(plan.clone());
+        let result = optimizer.optimize(plan.clone()).expect("optimize");
         assert_eq!(result.plan, plan);
         assert!(result.applied_rules.is_empty());
     }
@@ -3126,14 +3252,14 @@ mod tests {
         let mut optimizer = Optimizer::new();
         optimizer.add_rule(Box::new(TestRule));
 
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
         assert_eq!(result.describe(), "optimizer applied: test-rule");
     }
 
     #[test]
     fn optimize_result_describe_empty() {
         let optimizer = Optimizer::new();
-        let result = optimizer.optimize(empty_plan());
+        let result = optimizer.optimize(empty_plan()).expect("optimize");
         assert_eq!(result.describe(), "optimizer: no rules applied");
     }
 
@@ -3199,7 +3325,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_pushdown_through_join_leaves_cross_predicate_in_filter() {
+    fn predicate_pushdown_through_join_removes_fully_owned_predicates() {
         // Filter(ts > 0 AND order_id > 100): ts on left, order_id on right.
         // Both single-side conjuncts are pushed into their respective scans.
         let plan = LogicalPlan::new("test", ExecutionKind::Batch)
@@ -3229,5 +3355,58 @@ mod tests {
                 "order_id predicate must be pushed into orders scan"
             );
         }
+        assert!(
+            result.nodes().iter().all(|node| node.id() != "f"),
+            "filter must be removed after every conjunct is pushed exactly once"
+        );
+    }
+
+    #[test]
+    fn predicate_pushdown_keeps_ambiguous_join_column_in_filter() {
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "left",
+                "left_table",
+                &[("id", FieldType::Int64)],
+            ))
+            .with_node(scan_with_schema(
+                "right",
+                "right_table",
+                &[("id", FieldType::Int64)],
+            ))
+            .with_node(join_node("join", "left", "right"))
+            .with_node(filter_node("filter", &["join"], "id > 0"));
+
+        assert!(
+            PredicatePushdownRule.apply(&plan).is_none(),
+            "an unqualified column present on both join sides is not safe to push"
+        );
+    }
+
+    #[test]
+    fn predicate_pushdown_does_not_cross_outer_join() {
+        let join = PlanNode::new("join", "left join", ExecutionKind::Batch)
+            .with_inputs(["left", "right"])
+            .with_op(NodeOp::Join {
+                join_type: krishiv_plan::JoinType::Left,
+            });
+        let plan = LogicalPlan::new("test", ExecutionKind::Batch)
+            .with_node(scan_with_schema(
+                "left",
+                "left_table",
+                &[("left_id", FieldType::Int64)],
+            ))
+            .with_node(scan_with_schema(
+                "right",
+                "right_table",
+                &[("right_id", FieldType::Int64)],
+            ))
+            .with_node(join)
+            .with_node(filter_node("filter", &["join"], "right_id > 0"));
+
+        assert!(
+            PredicatePushdownRule.apply(&plan).is_none(),
+            "pushing a post-join predicate through an outer join can change semantics"
+        );
     }
 }

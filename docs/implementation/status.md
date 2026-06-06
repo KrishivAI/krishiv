@@ -1,5 +1,135 @@
 # Krishiv Implementation Status
 
+## Iceberg REST Catalog Contract Hardening (2026-06-06)
+
+Completed the remote Iceberg REST catalog and Python binding production-readiness slice:
+
+- Replaced infallible catalog construction and panic-based URL assembly with privately validated `RestCatalogConfig`, typed `Url` storage, positive request timeouts, bounded page sizes, bounded response bodies, and fallible HTTP-client construction.
+- Added caller-supplied `reqwest::Client` support for custom trust roots, proxies, and provider-specific headers while preserving Krishiv's per-request timeout and response-size limits.
+- Added lazy, shared, cancellation-safe `/v1/config` negotiation with warehouse selection, defaults/client/overrides prefix precedence, namespace-separator decoding, and advertised-endpoint capability enforcement.
+- Preserved base paths and percent-encoded every dynamic URL segment so namespace and table identifiers cannot alter catalog routing.
+- Replaced status-zero HTTP errors with typed configuration, transport, HTTP status, invalid-response, response-too-large, unsupported-operation, namespace-not-found, and table-not-found errors.
+- Bounded successful responses to a configurable 64 MiB default and error diagnostics to 64 KiB, while preserving structured Iceberg error type, message, and code.
+- Implemented Iceberg pagination using `pageToken`, `pageSize`, and `next-page-token`, with repeated/empty token detection, page/table ceilings, strict identifier decoding, duplicate rejection, and requested-namespace validation.
+- Added typed `LoadedIcebergTable` responses and validated metadata location URIs, Iceberg format versions 1 through 3, UUID-shaped table IDs, optional table locations, and per-table config maps.
+- Redacted bearer tokens, per-table config values, metadata values, warehouse values, and metadata locations from debug output.
+- Removed nonstandard partition mutation endpoints that did not implement Iceberg commit requirements/updates.
+- Removed the Rust/Python Glue and Nessie wrappers because they did not implement AWS SigV4 or Nessie reference semantics; retained one explicit generic Iceberg REST client with bearer-token and custom-client authentication hooks.
+- Changed Python catalog construction failures to `ValueError`, retained request failures as `RuntimeError`, exposed bearer token/prefix/page/response controls, and validated table identifiers before network I/O.
+- Added focused compile-covered tests for unsafe configuration, credential redaction, config precedence, authentication, base-path and segment encoding, custom clients, pagination, namespace separators, malformed/duplicate identifiers, capability rejection, not-found mapping, load-envelope validation, URI/UUID rejection, response ceilings, structured errors, and timeouts.
+
+Validation:
+```bash
+cargo fmt --all
+cargo check -p krishiv-catalog --tests --offline
+cargo check -p krishiv-python --tests --offline
+cargo check --workspace --tests --offline
+git diff --check
+```
+
+Notes:
+- Per sprint rules, focused tests were compiled with `cargo check --tests` but not executed; full test, clippy, and build validation remains reserved for the final slice.
+- Table mutation support now fails by absence rather than routing to private mock endpoints. A future mutation slice must model Iceberg commit requirements and updates, including schema/partition field IDs and commit-state-unknown handling.
+- AWS Glue and Project Nessie can still be used through the generic REST client only when callers supply the authentication headers and service-specific URL/reference configuration those providers require.
+- Workspace check passed with the pre-existing executor barrier dead-code warnings and Flight SQL `unused_mut` warning.
+
+Next useful commands:
+```bash
+cargo check -p krishiv-catalog --tests --offline
+cargo check -p krishiv-python --tests --offline
+cargo check --workspace --tests --offline
+```
+
+---
+
+## Schema Registry and Schema Evolution Contract Hardening (2026-06-06)
+
+Completed the schema-registry, CDC schema-evolution, Arrow normalization, and catalog error-boundary production-readiness slice:
+
+- Replaced infallible schema-registry construction and string-only HTTP errors with validated URLs, typed configuration/request/status/response-size/response-shape errors, bounded timeouts, a registry user agent, preserved HTTP status diagnostics, and a 4 MiB response ceiling.
+- Added caller-supplied `reqwest::Client` support for production authentication headers, custom trust roots, proxies, and timeout policy.
+- Added cancellation-safe per-schema request coalescing so concurrent cache misses issue one registry request without retaining abandoned lock entries.
+- Replaced the unbounded raw-schema cache with count- and byte-bounded LRU storage and cached parsed Avro/protobuf schemas under the same eviction lifecycle.
+- Made `SchemaRegistryConfig` privately validated at construction and removed the unused subject field, dynamic-schema `arrow_schema` placeholder, false format auto-detection, nonstandard JSON protobuf descriptor, and syntactic-only JSON Schema capability.
+- Kept only explicit Confluent Avro and Protobuf wire formats; Python now rejects unknown/JSON formats and malformed registry URLs immediately.
+- Made Avro conversion preserve exact primitive widths, enums/fixed/UUID, nullable unions, date/time/timestamp logical types, nullability, and value/type agreement while rejecting multi-variant unions and unsupported nested/complex schemas instead of stringifying debug values.
+- Hardened protobuf schema and payload handling for real `.proto` text, unique/valid names and field numbers, proto2/proto3 presence, required fields, proto3 defaults, signed/unsigned/fixed scalar widths, wire-type agreement, message-index routing, UTF-8, truncation, overflow, and exact Arrow value types.
+- Rejected repeated, map, oneof, unsupported scalar, nested-message routing, non-default message-index, and unknown-only payload contracts instead of emitting partial or all-null rows.
+- Added an explicit CDC schema-registry format with Avro compatibility default, feature-capability validation, binary-without-registry rejection, mixed binary/plain batch rejection, empty-decode rejection, and explicit failure for unsupported binary Iceberg CDC ingestion.
+- Added validated multi-schema Arrow merging for batches containing multiple schema IDs, safe numeric widening, nullable fill for version-absent fields, metadata/type-drift rejection, duplicate-column rejection, and transactional schema-evolution state updates.
+- Hardened the shared schema normalizer to reject arbitrary nullable casts, lossy `Int64 -> Float64`, missing non-nullable fields, duplicate schemas, and unsupported narrowing while supporting complete safe integer widening and nullable null-type promotion.
+- Changed the DataFusion catalog bridge to map only true table-not-found errors to `None` and propagate all other catalog failures.
+- Added focused compile-covered tests for registry URL/status/size/cache/concurrency/cancellation behavior, parsed-cache eviction, Avro fidelity and fail-closed behavior, protobuf schema/presence/wire/value contracts, CDC capability and schema merging, normalizer safety, and Python validation.
+
+Validation:
+```bash
+cargo fmt --all
+cargo check -p krishiv-schema-registry --tests --offline
+cargo check -p krishiv-exec --tests --offline
+cargo check -p krishiv-connectors --tests --offline
+cargo check -p krishiv-connectors --tests --features schema-registry --offline
+cargo check -p krishiv-catalog --tests --offline
+cargo check -p krishiv-python --tests --offline
+cargo check --workspace --tests --offline
+git diff --check
+```
+
+Notes:
+- Per sprint rules, focused tests were compiled with `cargo check --tests` but not executed; full test, clippy, and build validation remains reserved for the final slice.
+- Avro nested/collection/decimal schemas and protobuf repeated/map/oneof/nested-message routing return explicit decode errors rather than partially decoded output.
+- The Iceberg CDC sink remains JSON-envelope-only and now rejects binary schema-registry records before staging any data.
+- Workspace check passed with the pre-existing executor barrier dead-code warnings and Flight SQL `unused_mut` warning.
+
+Next useful commands:
+```bash
+cargo check -p krishiv-schema-registry --tests --offline
+cargo check -p krishiv-connectors --tests --features schema-registry --offline
+cargo check --workspace --tests --offline
+```
+
+---
+
+## Optimizer Rule and DAG Contract Hardening (2026-06-06)
+
+Completed the logical/AQE optimizer and scheduler DAG-conversion production-readiness slice:
+
+- Changed logical and AQE optimizer pipelines to return typed `OptimizerError` results.
+- Validated optimizer inputs and every rule output, including plan-name and execution-kind preservation.
+- Contained panics from custom logical and AQE rules and reported the responsible rule name.
+- Ignored `Some(unchanged_plan)` results instead of falsely recording a rule as applied.
+- Removed the unused `StreamRule` placeholder contract.
+- Removed duplicate-column and empty-projection rewrites because both can change observable projection schema or row semantics.
+- Reworked predicate pushdown around parsed SQL conjunctions, per-conjunct scan ownership, exact table qualifiers, literal/function skipping, ambiguous-column rejection, and inner-join-only traversal.
+- Made parse failures and unsupported outer-join cases fail closed without rewriting.
+- Made `CoalesceRule` intrinsically skip streaming/hybrid plans, build target-size-bounded groups, preserve a valid connected DAG, insert before terminal sinks, reuse an existing coalesce node on repeated AQE passes, and keep node/count metadata consistent.
+- Hardened skew, coalesce, and small-file arithmetic against `u64` overflow.
+- Propagated optimizer errors through SQL and scheduler APIs and mapped scheduler optimizer rejection to gRPC `invalid_argument`.
+- Validated logical/physical plans before scheduler job conversion and replaced fragment-encoding fallback text with typed conversion errors.
+- Replaced scheduler's quadratic/fallback topological ordering with checked `O(nodes + edges)` ordering that handles duplicate edges correctly.
+- Added focused coverage for invalid input/output graphs, panic containment, identity changes, unchanged-rule reporting, connected/idempotent coalescing, streaming guards, overflow, predicate ownership, ambiguous columns, aliases, outer joins, SQL propagation, and scheduler conversion.
+
+Validation:
+```bash
+cargo fmt --all
+cargo check -p krishiv-optimizer --tests --offline
+cargo check -p krishiv-sql --tests --offline
+cargo check -p krishiv-scheduler --tests --offline
+cargo check --workspace --tests --offline
+git diff --check
+```
+
+Notes:
+- Per sprint rules, focused tests were compiled with `cargo check --tests` but not executed; full test, clippy, and build validation remains reserved for the final slice.
+- Workspace check passed with the pre-existing executor barrier dead-code warnings and Flight SQL `unused_mut` warning.
+
+Next useful commands:
+```bash
+cargo check -p krishiv-optimizer --tests --offline
+cargo check --workspace --tests --offline
+```
+
+---
+
 ## Validated Physical Plan Graph Lowering (2026-06-06)
 
 Completed the physical-plan graph integrity and placeholder-contract production-readiness slice:

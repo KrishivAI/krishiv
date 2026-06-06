@@ -57,20 +57,44 @@ impl SchemaNormalizeOperator {
     }
 
     pub fn normalize(&self, batch: &RecordBatch) -> Result<RecordBatch, ExecError> {
-        if batch.schema() == self.target {
+        let source_schema = batch.schema();
+        let mut source_indices = HashMap::with_capacity(source_schema.fields().len());
+        for (index, field) in source_schema.fields().iter().enumerate() {
+            if source_indices
+                .insert(field.name().as_str(), index)
+                .is_some()
+            {
+                return Err(ExecError::IncompatibleSchemaEvolution(format!(
+                    "source schema contains duplicate column {}",
+                    field.name()
+                )));
+            }
+        }
+        let mut target_names = std::collections::HashSet::with_capacity(self.target.fields().len());
+        for field in self.target.fields() {
+            if !target_names.insert(field.name().as_str()) {
+                return Err(ExecError::IncompatibleSchemaEvolution(format!(
+                    "target schema contains duplicate column {}",
+                    field.name()
+                )));
+            }
+        }
+        if source_schema == self.target {
             return Ok(batch.clone());
         }
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.target.fields().len());
         for field in self.target.fields() {
             let lookup = self.source_column(field.name());
-            let value = if let Ok(idx) = batch.schema().index_of(lookup) {
-                let col = batch.column(idx);
+            let value = if let Some(index) = source_indices.get(lookup) {
+                let col = batch.column(*index);
                 Self::cast_column(col, field)?
+            } else if !field.is_nullable() {
+                return Err(ExecError::IncompatibleSchemaEvolution(format!(
+                    "missing non-nullable column {}",
+                    field.name()
+                )));
             } else {
-                Arc::new(arrow::array::new_null_array(
-                    field.data_type(),
-                    batch.num_rows(),
-                ))
+                arrow::array::new_null_array(field.data_type(), batch.num_rows())
             };
             columns.push(value);
         }
@@ -82,11 +106,13 @@ impl SchemaNormalizeOperator {
         if col.data_type() == target_field.data_type() {
             return Ok(col.clone());
         }
-        if Self::is_widen(col.data_type(), target_field.data_type()) {
-            return cast(col, target_field.data_type())
-                .map_err(|e| ExecError::IncompatibleSchemaEvolution(e.to_string()));
+        if col.data_type() == &DataType::Null && target_field.is_nullable() {
+            return Ok(arrow::array::new_null_array(
+                target_field.data_type(),
+                col.len(),
+            ));
         }
-        if target_field.is_nullable() {
+        if Self::is_widen(col.data_type(), target_field.data_type()) {
             return cast(col, target_field.data_type())
                 .map_err(|e| ExecError::IncompatibleSchemaEvolution(e.to_string()));
         }
@@ -99,22 +125,42 @@ impl SchemaNormalizeOperator {
     }
 
     fn is_widen(from: &DataType, to: &DataType) -> bool {
-        matches!(
-            (from, to),
-            (DataType::Int8, DataType::Int16)
-                | (DataType::Int8, DataType::Int32)
-                | (DataType::Int16, DataType::Int32)
-                | (DataType::Int16, DataType::Int64)
-                | (DataType::Int32, DataType::Int64)
-                | (DataType::Int32, DataType::Float64)
-                | (DataType::Int64, DataType::Float64)
-                | (DataType::UInt8, DataType::UInt16)
-                | (DataType::UInt8, DataType::UInt32)
-                | (DataType::UInt16, DataType::UInt32)
-                | (DataType::UInt16, DataType::UInt64)
-                | (DataType::UInt32, DataType::UInt64)
-                | (DataType::Float32, DataType::Float64)
-        )
+        from != to && Self::widening_target(from, to).as_ref() == Some(to)
+    }
+
+    /// Return the common type when both inputs can be widened without loss.
+    pub fn widening_target(left: &DataType, right: &DataType) -> Option<DataType> {
+        if left == right {
+            return Some(left.clone());
+        }
+        match (left, right) {
+            (DataType::Int8, DataType::Int16) | (DataType::Int16, DataType::Int8) => {
+                Some(DataType::Int16)
+            }
+            (DataType::Int8 | DataType::Int16, DataType::Int32)
+            | (DataType::Int32, DataType::Int8 | DataType::Int16) => Some(DataType::Int32),
+            (DataType::Int8 | DataType::Int16 | DataType::Int32, DataType::Int64)
+            | (DataType::Int64, DataType::Int8 | DataType::Int16 | DataType::Int32) => {
+                Some(DataType::Int64)
+            }
+            (DataType::Int8 | DataType::Int16 | DataType::Int32, DataType::Float64)
+            | (DataType::Float64, DataType::Int8 | DataType::Int16 | DataType::Int32) => {
+                Some(DataType::Float64)
+            }
+            (DataType::UInt8, DataType::UInt16) | (DataType::UInt16, DataType::UInt8) => {
+                Some(DataType::UInt16)
+            }
+            (DataType::UInt8 | DataType::UInt16, DataType::UInt32)
+            | (DataType::UInt32, DataType::UInt8 | DataType::UInt16) => Some(DataType::UInt32),
+            (DataType::UInt8 | DataType::UInt16 | DataType::UInt32, DataType::UInt64)
+            | (DataType::UInt64, DataType::UInt8 | DataType::UInt16 | DataType::UInt32) => {
+                Some(DataType::UInt64)
+            }
+            (DataType::Float32, DataType::Float64) | (DataType::Float64, DataType::Float32) => {
+                Some(DataType::Float64)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -142,6 +188,22 @@ mod tests {
         let out = SchemaNormalizeOperator::new(target).normalize(&b).unwrap();
         assert_eq!(out.num_columns(), 2);
         assert_eq!(out.column(1).null_count(), 1);
+    }
+
+    #[test]
+    fn missing_non_nullable_column_is_rejected() {
+        let src = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let b = batch(src, vec![Arc::new(Int64Array::from(vec![1_i64]))]);
+        let target = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("required", DataType::Utf8, false),
+        ]));
+
+        let err = SchemaNormalizeOperator::new(target)
+            .normalize(&b)
+            .unwrap_err();
+
+        assert!(matches!(err, ExecError::IncompatibleSchemaEvolution(_)));
     }
 
     #[test]
@@ -190,6 +252,81 @@ mod tests {
         let err = SchemaNormalizeOperator::new(target)
             .normalize(&b)
             .unwrap_err();
+        assert!(matches!(err, ExecError::IncompatibleSchemaEvolution(_)));
+    }
+
+    #[test]
+    fn nullable_target_does_not_allow_incompatible_cast() {
+        let src = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)]));
+        let b = batch(src, vec![Arc::new(StringArray::from(vec![Some("1")]))]);
+        let target = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+
+        let err = SchemaNormalizeOperator::new(target)
+            .normalize(&b)
+            .unwrap_err();
+
+        assert!(matches!(err, ExecError::IncompatibleSchemaEvolution(_)));
+    }
+
+    #[test]
+    fn int8_widens_transitively_to_int64() {
+        use arrow::array::Int8Array;
+
+        let src = Arc::new(Schema::new(vec![Field::new("x", DataType::Int8, false)]));
+        let b = batch(src, vec![Arc::new(Int8Array::from(vec![7]))]);
+        let target = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+
+        let out = SchemaNormalizeOperator::new(target).normalize(&b).unwrap();
+
+        assert_eq!(out.column(0).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn int64_to_float64_is_rejected_as_lossy() {
+        let src = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let b = batch(
+            src,
+            vec![Arc::new(Int64Array::from(vec![9_007_199_254_740_993]))],
+        );
+        let target = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)]));
+
+        let err = SchemaNormalizeOperator::new(target)
+            .normalize(&b)
+            .unwrap_err();
+
+        assert!(matches!(err, ExecError::IncompatibleSchemaEvolution(_)));
+    }
+
+    #[test]
+    fn null_column_promotes_to_nullable_concrete_type() {
+        let src = Arc::new(Schema::new(vec![Field::new("x", DataType::Null, true)]));
+        let b = batch(src, vec![arrow::array::new_null_array(&DataType::Null, 2)]);
+        let target = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+
+        let out = SchemaNormalizeOperator::new(target).normalize(&b).unwrap();
+
+        assert_eq!(out.column(0).data_type(), &DataType::Int64);
+        assert_eq!(out.column(0).null_count(), 2);
+    }
+
+    #[test]
+    fn duplicate_source_columns_are_rejected_even_when_schema_matches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let b = batch(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int64Array::from(vec![2_i64])),
+            ],
+        );
+
+        let err = SchemaNormalizeOperator::new(schema)
+            .normalize(&b)
+            .unwrap_err();
+
         assert!(matches!(err, ExecError::IncompatibleSchemaEvolution(_)));
     }
 }

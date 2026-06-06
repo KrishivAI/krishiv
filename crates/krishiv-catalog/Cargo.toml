@@ -17,7 +17,9 @@ datafusion = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 url = "2"
+uuid = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

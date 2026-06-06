@@ -163,9 +163,12 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
             get(api_job_checkpoints),
         )
         .route("/api/v1/executors", get(api_executors))
+        .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/ui", get(ui_jobs))
         .route("/ui/jobs/{job_id}", get(ui_job_detail))
+        .route("/ui/jobs/{job_id}/checkpoints", get(ui_job_checkpoints_page))
+        .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .with_state(state.clone());
 
     let protected = if let Some(expected) = token {
@@ -402,12 +405,18 @@ pub struct TaskView {
     pub assigned_executor: String,
     /// Current attempt number.
     pub attempt: u32,
-    /// Last failure reason reported by the executor, if any.
-    pub last_failure_reason: Option<String>,
+    /// Number of consecutive failures.
+    pub failure_count: u32,
+    /// Last failure reason reported by the executor, if any (empty string when none).
+    pub failure_reason_display: String,
     /// Source connector capability flags for this task, if declared.
     pub source_capabilities: Option<ConnectorCapabilityView>,
     /// Sink connector capability flags for this task, if declared.
     pub sink_capabilities: Option<ConnectorCapabilityView>,
+    /// Last event-time watermark display, or "-" when not available.
+    pub last_watermark_display: String,
+    /// Last committed source offset bytes, hex-encoded, or "-" when not available.
+    pub last_source_offset_display: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -432,6 +441,24 @@ pub struct ExecutorView {
     pub memory_limit_bytes: Option<u64>,
     /// Active task count as reported by the last heartbeat, if any.
     pub active_task_count: Option<u32>,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Response for `GET /api/v1/executors/{executor_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorDetailResponse {
+    pub executor: ExecutorView,
+}
+
+/// Response for `GET /api/v1/jobs/{job_id}/checkpoints` HTML rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckpointsView {
+    pub job_id: String,
+    pub epochs: Vec<u64>,
+    pub latest_epoch: Option<u64>,
 }
 
 #[derive(Template)]
@@ -460,6 +487,30 @@ struct JobTemplate {
     coordinator_state: String,
     job: JobDetailView,
     executors: Vec<ExecutorView>,
+}
+
+#[derive(Template)]
+#[template(path = "executor.html")]
+struct ExecutorTemplate {
+    coordinator_id: String,
+    coordinator_state: String,
+    executor: ExecutorView,
+}
+
+#[derive(Template)]
+#[template(path = "checkpoints.html")]
+struct CheckpointsTemplate {
+    coordinator_id: String,
+    coordinator_state: String,
+    job_id: String,
+    epochs: Vec<u64>,
+    latest_epoch: Option<u64>,
+}
+
+impl CheckpointsTemplate {
+    fn is_latest(&self, epoch: &u64) -> bool {
+        self.latest_epoch.as_ref() == Some(epoch)
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -638,6 +689,64 @@ async fn ui_job_detail(
     Ok(Html(template.render()?))
 }
 
+async fn api_executor_detail(
+    State(state): State<UiState>,
+    Path(executor_id): Path<String>,
+) -> Result<Json<ExecutorDetailResponse>, UiError> {
+    let snapshot = api_executor_detail_inner(&state, &executor_id).await?;
+    Ok(Json(ExecutorDetailResponse { executor: snapshot }))
+}
+
+async fn ui_executor_detail(
+    State(state): State<UiState>,
+    Path(executor_id): Path<String>,
+) -> Result<Html<String>, UiError> {
+    let snapshot = status_snapshot(&state).await?;
+    let executor = api_executor_detail_inner(&state, &executor_id).await?;
+    let template = ExecutorTemplate {
+        coordinator_id: snapshot.coordinator_id,
+        coordinator_state: snapshot.coordinator_state,
+        executor,
+    };
+    Ok(Html(template.render()?))
+}
+
+async fn ui_job_checkpoints_page(
+    State(state): State<UiState>,
+    Path(job_id): Path<String>,
+) -> Result<Html<String>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let snapshot = status_snapshot_inner(&coordinator);
+    let jid = JobId::try_new(job_id.clone()).map_err(|e| UiError::Id(e.to_string()))?;
+    coordinator.job_detail_snapshot(&jid)?;
+    let epochs = coordinator.list_job_checkpoints(&jid)?;
+    let latest_epoch = epochs.last().copied();
+    let template = CheckpointsTemplate {
+        coordinator_id: snapshot.coordinator_id,
+        coordinator_state: snapshot.coordinator_state,
+        job_id: job_id.clone(),
+        epochs,
+        latest_epoch,
+    };
+    Ok(Html(template.render()?))
+}
+
+async fn api_executor_detail_inner(state: &UiState, executor_id: &str) -> UiResult<ExecutorView> {
+    let coordinator = state.coordinator.read().await;
+    let executors = coordinator.executor_snapshots();
+    let eid = krishiv_proto::ExecutorId::try_new(executor_id.to_owned())
+        .map_err(|e| UiError::Id(e.to_string()))?;
+    executors
+        .iter()
+        .find(|e| e.executor_id() == &eid)
+        .map(ExecutorView::from_record)
+        .ok_or_else(|| {
+            UiError::Scheduler(krishiv_scheduler::SchedulerError::UnknownExecutor {
+                executor_id: eid.clone(),
+            })
+        })
+}
+
 async fn stylesheet() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/css; charset=utf-8")],
@@ -647,7 +756,11 @@ async fn stylesheet() -> impl IntoResponse {
 
 async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
     let coordinator = state.coordinator.read().await;
-    Ok(StatusView {
+    Ok(status_snapshot_inner(&coordinator))
+}
+
+fn status_snapshot_inner(coordinator: &krishiv_scheduler::Coordinator) -> StatusView {
+    StatusView {
         coordinator_id: coordinator.coordinator_id().to_string(),
         coordinator_state: coordinator.state().to_string(),
         jobs: coordinator
@@ -660,7 +773,7 @@ async fn status_snapshot(state: &UiState) -> UiResult<StatusView> {
             .iter()
             .map(ExecutorView::from_record)
             .collect(),
-    })
+    }
 }
 
 async fn job_detail(state: &UiState, job_id: &str) -> UiResult<JobDetailView> {
@@ -713,23 +826,39 @@ impl JobDetailView {
                     tasks: stage
                         .tasks()
                         .iter()
-                        .map(|task| TaskView {
-                            task_id: task.task_id().to_string(),
-                            state: task.state().to_string(),
-                            assigned_executor: task
-                                .assigned_executor()
-                                .map(ToString::to_string)
-                                .unwrap_or_else(|| String::from("-")),
-                            attempt: task.attempt(),
-                            last_failure_reason: task.last_failure_reason().map(ToOwned::to_owned),
-                            source_capabilities: task
-                                .source_capabilities
-                                .as_ref()
-                                .map(ConnectorCapabilityView::from_flags),
-                            sink_capabilities: task
-                                .sink_capabilities
-                                .as_ref()
-                                .map(ConnectorCapabilityView::from_flags),
+                        .map(|task| {
+                            let wm = task.last_watermark_ms();
+                            let off = task.last_source_offset();
+                            TaskView {
+                                task_id: task.task_id().to_string(),
+                                state: task.state().to_string(),
+                                assigned_executor: task
+                                    .assigned_executor()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| String::from("-")),
+                                attempt: task.attempt(),
+                                failure_count: task.failure_count(),
+                                failure_reason_display: task
+                                    .last_failure_reason()
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_default(),
+                                source_capabilities: task
+                                    .source_capabilities
+                                    .as_ref()
+                                    .map(ConnectorCapabilityView::from_flags),
+                                sink_capabilities: task
+                                    .sink_capabilities
+                                    .as_ref()
+                                    .map(ConnectorCapabilityView::from_flags),
+                                last_watermark_display: match wm {
+                                    Some(ms) => ms.to_string(),
+                                    None => String::from("-"),
+                                },
+                                last_source_offset_display: match off {
+                                    Some(b) => hex_encode(b),
+                                    None => String::from("-"),
+                                },
+                            }
                         })
                         .collect(),
                 })

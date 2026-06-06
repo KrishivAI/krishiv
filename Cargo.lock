@@ -3994,6 +3994,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
+ "uuid",
  "wiremock",
 ]
 
@@ -4245,6 +4246,7 @@ version = "0.1.0"
 dependencies = [
  "krishiv-plan",
  "sqlparser",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -4387,6 +4389,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]

@@ -1471,37 +1471,56 @@ fn job_spec_from_exchange_stages(
 fn topo_sort_plan_nodes(nodes: &[PlanNode]) -> SchedulerResult<Vec<&PlanNode>> {
     use std::collections::{HashMap, VecDeque};
 
-    let by_id: HashMap<&str, &PlanNode> = nodes.iter().map(|n| (n.id(), n)).collect();
-    let mut in_degree: HashMap<&str, usize> = nodes.iter().map(|n| (n.id(), 0)).collect();
-    for node in nodes {
+    let indexes = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id(), index))
+        .collect::<HashMap<_, _>>();
+    let mut in_degrees = vec![0usize; nodes.len()];
+    let mut dependents = vec![Vec::new(); nodes.len()];
+    for (node_index, node) in nodes.iter().enumerate() {
         for input in node.inputs() {
-            if by_id.contains_key(input.as_str()) {
-                *in_degree.entry(node.id()).or_default() += 1;
-            }
+            let input_index = indexes.get(input.as_str()).copied().ok_or_else(|| {
+                SchedulerError::InvalidPlan {
+                    message: format!("node '{}' references missing input '{input}'", node.id()),
+                }
+            })?;
+            in_degrees[node_index] = in_degrees[node_index].checked_add(1).ok_or_else(|| {
+                SchedulerError::InvalidPlan {
+                    message: format!("node '{}' has too many input edges", node.id()),
+                }
+            })?;
+            dependents[input_index].push(node_index);
         }
     }
-    let mut queue: VecDeque<&PlanNode> = nodes
+    let mut queue = in_degrees
         .iter()
-        .filter(|n| in_degree.get(n.id()).copied().unwrap_or(0) == 0)
-        .collect();
-    let mut ordered: Vec<&PlanNode> = Vec::with_capacity(nodes.len());
-    while let Some(node) = queue.pop_front() {
-        ordered.push(node);
-        for other in nodes {
-            if other.inputs().iter().any(|inp| inp == node.id()) {
-                let deg =
-                    in_degree
-                        .get_mut(other.id())
-                        .ok_or_else(|| SchedulerError::InvalidPlan {
-                            message: format!(
-                                "topological sort lost in-degree state for node '{}'",
-                                other.id()
-                            ),
-                        })?;
-                *deg = deg.saturating_sub(1);
-                if *deg == 0 {
-                    queue.push_back(other);
-                }
+        .enumerate()
+        .filter_map(|(index, in_degree)| (*in_degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut ordered = Vec::with_capacity(nodes.len());
+    while let Some(node_index) = queue.pop_front() {
+        ordered.push(&nodes[node_index]);
+        for &dependent_index in &dependents[node_index] {
+            let in_degree =
+                in_degrees
+                    .get_mut(dependent_index)
+                    .ok_or_else(|| SchedulerError::InvalidPlan {
+                        message: format!(
+                            "topological sort lost in-degree state for node '{}'",
+                            nodes[dependent_index].id()
+                        ),
+                    })?;
+            *in_degree = in_degree
+                .checked_sub(1)
+                .ok_or_else(|| SchedulerError::InvalidPlan {
+                    message: format!(
+                        "topological sort underflowed in-degree for node '{}'",
+                        nodes[dependent_index].id()
+                    ),
+                })?;
+            if *in_degree == 0 {
+                queue.push_back(dependent_index);
             }
         }
     }
@@ -1549,6 +1568,38 @@ mod exchange_stage_tests {
             spec.stages()[1].upstream_stage_ids().len(),
             1,
             "downstream stage must declare upstream dependency"
+        );
+    }
+
+    #[test]
+    fn physical_plan_conversion_rejects_invalid_graph() {
+        let plan = PhysicalPlan::new("invalid", ExecutionKind::Batch).with_node(
+            PlanNode::new("sink", "sink", ExecutionKind::Batch).with_inputs(["missing"]),
+        );
+        let job_id = JobId::try_new("job-invalid-plan").unwrap();
+
+        let error = job_spec_from_physical_plan(job_id, &plan).expect_err("invalid graph");
+
+        assert!(matches!(error, SchedulerError::InvalidPlan { .. }));
+        assert!(error.to_string().contains("missing input 'missing'"));
+    }
+
+    #[test]
+    fn topological_sort_handles_duplicate_edges() {
+        let nodes = vec![
+            PlanNode::new("scan", "scan", ExecutionKind::Batch),
+            PlanNode::new("self-join", "self join", ExecutionKind::Batch)
+                .with_inputs(["scan", "scan"])
+                .with_op(NodeOp::Join {
+                    join_type: krishiv_plan::JoinType::Inner,
+                }),
+        ];
+
+        let ordered = topo_sort_plan_nodes(&nodes).expect("topological order");
+
+        assert_eq!(
+            ordered.iter().map(|node| node.id()).collect::<Vec<_>>(),
+            vec!["scan", "self-join"]
         );
     }
 
