@@ -18,7 +18,7 @@ block-beta
     columns 1
     b1("Session Builder")
     b2("DataFrame / Stream API")
-    b3("Catalog Bridge<br/><i>krishiv-catalog</i>")
+    b3("Catalog Bridge<br/><i>krishiv-sql::catalog</i>")
   end
 
   block:Planning:2:3
@@ -78,7 +78,7 @@ block-beta
     columns 2
     k1("UDF<br/><i>krishiv-udf</i>")
     k2("AI / RAG<br/><i>krishiv-ai</i>")
-    k3("Schema Registry<br/><i>krishiv-schema-registry</i>")
+    k3("Schema Registry<br/><i>krishiv-connectors::schema_registry</i>")
     k4("K8s Operator<br/><i>krishiv-operator</i>")
   end
 
@@ -117,7 +117,6 @@ flowchart LR
   STATE["krishiv-state"]
   CKPT["krishiv-checkpoint"]
   CONN["krishiv-connectors"]
-  CATALOG["krishiv-catalog"]
   OPT["krishiv-optimizer"]
   COMMON["krishiv-common<br/>Shared utilities"]
   FLIGHT["krishiv-flight-sql"]
@@ -127,7 +126,6 @@ flowchart LR
   GOV["krishiv-governance"]
   UDF["krishiv-udf"]
   AI["krishiv-ai"]
-  SR["krishiv-schema-registry"]
   OPS["krishiv-operator"]
   LH["krishiv-lakehouse"]
 
@@ -135,7 +133,6 @@ flowchart LR
   CLI --> SQL
   CLI --> RUNTIME
   API --> SQL
-  API --> CATALOG
   API --> COMMON
   SQL --> PLAN
   SQL --> COMMON
@@ -160,9 +157,6 @@ flowchart LR
   EXEC --> CKPT
   EXEC --> COMMON
   CONN --> COMMON
-  CONN --> SR
-  CATALOG --> COMMON
-  CATALOG --> SR
   OPT --> PLAN
   FLIGHT --> API
   FLIGHT --> COMMON
@@ -172,7 +166,6 @@ flowchart LR
   OPS --> SCHED
   LH --> CONN
   AI --> STATE
-  AI --> SR
 
   COMMON --> PROTO
 ```

@@ -105,15 +105,15 @@ pub fn write_hudi_upsert(
 #[pyo3(signature = (url, format="avro"))]
 pub fn schema_registry_confluent(url: String, format: &str) -> PyResult<PySchemaRegistryConfig> {
     let fmt = match format.to_ascii_lowercase().as_str() {
-        "avro" => krishiv_schema_registry::RegistryFormat::Avro,
-        "protobuf" => krishiv_schema_registry::RegistryFormat::Protobuf,
+        "avro" => krishiv_connectors::schema_registry::RegistryFormat::Avro,
+        "protobuf" => krishiv_connectors::schema_registry::RegistryFormat::Protobuf,
         unsupported => {
             return Err(PyValueError::new_err(format!(
                 "unsupported schema registry format '{unsupported}'; expected avro or protobuf"
             )));
         }
     };
-    let config = krishiv_schema_registry::SchemaRegistryConfig::new(url, fmt)
+    let config = krishiv_connectors::schema_registry::SchemaRegistryConfig::new(url, fmt)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(PySchemaRegistryConfig { _inner: config })
 }
@@ -121,10 +121,10 @@ pub fn schema_registry_confluent(url: String, format: &str) -> PyResult<PySchema
 #[pyclass(name = "SchemaRegistryConfig")]
 #[doc = "**Alpha**: The config struct is accepted but not yet consumed by any source or sink in the Python API. Schema fetching is deferred."]
 pub struct PySchemaRegistryConfig {
-    pub(crate) _inner: krishiv_schema_registry::SchemaRegistryConfig,
+    pub(crate) _inner: krishiv_connectors::schema_registry::SchemaRegistryConfig,
 }
 
-use krishiv_catalog::iceberg_rest::{
+use krishiv_sql::catalog::iceberg_rest::{
     GenericRestCatalog, IcebergCatalogClient, IcebergTableId, RestCatalogConfig,
 };
 use std::sync::Arc;
@@ -219,7 +219,7 @@ impl PyIcebergRestCatalog {
     }
 }
 
-fn catalog_config_error(error: krishiv_catalog::CatalogError) -> PyErr {
+fn catalog_config_error(error: krishiv_sql::catalog::CatalogError) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 

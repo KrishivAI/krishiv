@@ -4,7 +4,7 @@
 //! rejection, checkpoint prepare/commit atomicity, policy enforcement, and
 //! dead-letter sink failure handling.
 
-use krishiv_chaos::{FaultInjector, FaultMode};
+use krishiv_common::chaos::{FaultInjector, FaultMode};
 
 /// Fencing token logic rejects a stale coordinator (token < current).
 #[test]

@@ -11,6 +11,8 @@ pub mod feature_store;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod parquet;
+#[cfg(feature = "schema-registry")]
+pub mod schema_registry;
 pub mod s3;
 pub mod transactional;
 #[cfg(feature = "kafka")]

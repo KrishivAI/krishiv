@@ -16,7 +16,14 @@ path = "src/lib.rs"
 default = ["kafka"]
 kafka = ["dep:rdkafka"]
 state = ["dep:krishiv-state"]
-schema-registry = ["dep:krishiv-schema-registry"]
+schema-registry = [
+    "dep:apache-avro",
+    "dep:async-trait",
+    "dep:dashmap",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:prost",
+]
 
 [dependencies]
 arrow = { workspace = true }
@@ -29,20 +36,26 @@ krishiv-exec = { path = "../krishiv-exec" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-state = { path = "../krishiv-state", optional = true }
-krishiv-schema-registry = { path = "../krishiv-schema-registry", optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
 regex = "1"
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
 
-
+# schema-registry feature dependencies (Confluent Schema Registry deserialization)
+apache-avro = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["json"], optional = true }
+serde = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 proptest = "1"
+wiremock = { workspace = true }
 
 [lints]
 workspace = true

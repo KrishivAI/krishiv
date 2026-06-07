@@ -14,7 +14,7 @@ use tokio::sync::OnceCell;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{CatalogError, CatalogResult};
+use super::{CatalogError, CatalogResult};
 
 const API_VERSION_SEGMENT: &str = "v1";
 const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,7 +27,7 @@ const MAX_LIST_PAGES: usize = 10_000;
 const MAX_LISTED_TABLES: usize = 1_000_000;
 const MAX_IDENTIFIER_BYTES: usize = 1_024;
 const DEFAULT_NAMESPACE_SEPARATOR: &str = "%1F";
-const USER_AGENT_VALUE: &str = concat!("krishiv-catalog/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT_VALUE: &str = concat!("krishiv-sql-catalog/", env!("CARGO_PKG_VERSION"));
 
 /// REST catalog configuration.
 ///

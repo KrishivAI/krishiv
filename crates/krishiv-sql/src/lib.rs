@@ -17,12 +17,13 @@ use arrow::util::pretty::pretty_format_batches;
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
-use krishiv_catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
+use catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
 
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
 pub mod cep_sql;
+pub mod catalog;
 pub mod create_function_ddl;
 mod lakehouse;
 pub mod live_table;
@@ -1817,7 +1818,7 @@ mod tests {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
-        use krishiv_catalog::{
+        use catalog::{
             CatalogField, FieldType, InMemoryCatalog, TableMetadata, TableSchema,
         };
         use std::sync::{Arc, RwLock};

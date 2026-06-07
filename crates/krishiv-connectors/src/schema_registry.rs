@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! Confluent Schema Registry deserialization for Kafka payloads (R18 S3.3).
 
 use std::collections::VecDeque;
@@ -144,7 +143,7 @@ impl SchemaRegistryClient {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .user_agent(concat!(
-                "krishiv-schema-registry/",
+                "krishiv-connectors-schema-registry/",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()

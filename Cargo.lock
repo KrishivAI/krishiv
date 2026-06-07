@@ -3985,24 +3985,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-catalog"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "dashmap",
- "datafusion",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
 name = "krishiv-cep"
 version = "0.1.0"
 dependencies = [
@@ -4010,21 +3992,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "krishiv-chaos"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "krishiv-checkpoint",
- "krishiv-common",
- "krishiv-connectors",
- "krishiv-governance",
- "krishiv-operator",
- "krishiv-proto",
- "krishiv-scheduler",
- "tokio",
 ]
 
 [[package]]
@@ -4052,6 +4019,12 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "hex",
+ "krishiv-checkpoint",
+ "krishiv-connectors",
+ "krishiv-governance",
+ "krishiv-operator",
+ "krishiv-proto",
+ "krishiv-scheduler",
  "sha2",
  "thiserror 1.0.69",
  "tokio",
@@ -4062,25 +4035,31 @@ dependencies = [
 name = "krishiv-connectors"
 version = "0.1.0"
 dependencies = [
+ "apache-avro 0.17.0",
  "arrow",
+ "async-trait",
  "bytes",
+ "dashmap",
  "futures",
  "krishiv-common",
  "krishiv-exec",
  "krishiv-lakehouse",
  "krishiv-proto",
- "krishiv-schema-registry",
  "krishiv-state",
  "object_store",
  "parquet 58.3.0",
  "proptest",
+ "prost 0.14.3",
  "rdkafka",
  "regex",
+ "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -4294,7 +4273,6 @@ dependencies = [
  "futures",
  "krishiv-ai",
  "krishiv-api",
- "krishiv-catalog",
  "krishiv-common",
  "krishiv-connectors",
  "krishiv-exec",
@@ -4302,7 +4280,6 @@ dependencies = [
  "krishiv-lakehouse",
  "krishiv-plan",
  "krishiv-runtime",
- "krishiv-schema-registry",
  "krishiv-sql",
  "krishiv-state",
  "krishiv-udf",
@@ -4380,25 +4357,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krishiv-schema-registry"
-version = "0.1.0"
-dependencies = [
- "apache-avro 0.17.0",
- "arrow",
- "async-trait",
- "bytes",
- "dashmap",
- "prost 0.14.3",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "wiremock",
-]
-
-[[package]]
 name = "krishiv-shuffle"
 version = "0.1.0"
 dependencies = [
@@ -4431,9 +4389,9 @@ dependencies = [
  "arrow",
  "async-trait",
  "chrono",
+ "dashmap",
  "datafusion",
  "futures",
- "krishiv-catalog",
  "krishiv-cep",
  "krishiv-common",
  "krishiv-connectors",
@@ -4443,11 +4401,17 @@ dependencies = [
  "krishiv-plan",
  "krishiv-udf",
  "regex",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
  "sqlparser",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
  "tracing",
+ "url",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

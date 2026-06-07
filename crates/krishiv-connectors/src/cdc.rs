@@ -447,7 +447,7 @@ impl CdcToLakehousePipeline {
         let registry_client = self
             .schema_registry_url
             .as_deref()
-            .map(krishiv_schema_registry::SchemaRegistryClient::new)
+            .map(crate::schema_registry::SchemaRegistryClient::new)
             .transpose()
             .map_err(|error| {
                 ConnectorError::Cdc(format!("invalid schema-registry configuration: {error}"))
@@ -489,10 +489,10 @@ impl CdcToLakehousePipeline {
                     })?;
                     let format = match self.schema_registry_format {
                         CdcSchemaRegistryFormat::Avro => {
-                            krishiv_schema_registry::RegistryFormat::Avro
+                            crate::schema_registry::RegistryFormat::Avro
                         }
                         CdcSchemaRegistryFormat::Protobuf => {
-                            krishiv_schema_registry::RegistryFormat::Protobuf
+                            crate::schema_registry::RegistryFormat::Protobuf
                         }
                     };
                     let mut batches = Vec::with_capacity(raw.len());

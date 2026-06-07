@@ -30,7 +30,7 @@ Core implementation choices:
 | `krishiv` | User-facing facade and CLI binary. |
 | `krishiv-common` | Shared utilities used across runtime and engine crates. |
 | `krishiv-api` | Session, DataFrame, Stream, and public Rust API surface. |
-| `krishiv-sql` | DataFusion integration, SQL execution helpers, SQL policy hooks. |
+| `krishiv-sql` | DataFusion integration, SQL execution helpers, SQL policy hooks, catalog and table-provider abstractions (`catalog` module). |
 | `krishiv-plan` | Logical and physical plan structures plus task fragment encoding. |
 | `krishiv-runtime` | Embedded, single-node, and remote runtime routing. |
 | `krishiv-exec` | Arrow operator runtime, queues, barriers, windows, joins, stateful ops. |
@@ -41,7 +41,6 @@ Core implementation choices:
 | `krishiv-state` | In-memory, redb-backed, TTL, migration, and incremental state support. |
 | `krishiv-checkpoint` | Checkpoint/savepoint metadata, storage, fencing, restore helpers. |
 | `krishiv-connectors` | Connector traits and Parquet/Kafka/S3-style integration paths. |
-| `krishiv-catalog` | Catalog and table-provider abstractions. |
 | `krishiv-optimizer` | Optimizer rule and adaptive-planning support. |
 | `krishiv-operator` | Kubernetes CRD and operator integration. |
 | `krishiv-ui` | Status API and web UI assets. |
@@ -53,8 +52,7 @@ Core implementation choices:
 | `krishiv-udf` | UDF contracts and execution limits. |
 | `krishiv-ai` | AI/RAG and embedding support. |
 | `krishiv-vector-sinks` | Vector sink contracts and implementations. |
-| `krishiv-schema-registry` | Schema registry helpers. |
-| `krishiv-bench`, `krishiv-chaos`, `krishiv-cep` | Benchmarks, fault testing, and CEP support. |
+| `krishiv-bench`, `krishiv-cep` | Benchmarks and CEP support. Fault-injection/chaos tests live in `krishiv-common`'s `chaos` feature + `tests/chaos_suite.rs`. Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
 
 ## Runtime Modes
 

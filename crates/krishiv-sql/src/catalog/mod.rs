@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 //! Catalog abstractions for Krishiv.
 //!
 //! This crate defines `TableProvider`, `CatalogProvider`, schema types, and
@@ -545,9 +543,9 @@ pub mod datafusion_bridge {
     /// The bridge exposes a single schema named `"public"` that mirrors
     /// the tables registered in the underlying [`InMemoryCatalog`].
     ///
-    /// [`InMemoryCatalog`]: crate::InMemoryCatalog
+    /// [`InMemoryCatalog`]: super::InMemoryCatalog
     pub struct DataFusionCatalogBridge {
-        catalog: Arc<RwLock<crate::InMemoryCatalog>>,
+        catalog: Arc<RwLock<super::InMemoryCatalog>>,
         schema_name: String,
         /// MemTable cache shared across the inner `DataFusionSchemaBridge`
         /// instances DataFusion requests. Avoids re-cloning the entire
@@ -560,8 +558,8 @@ pub mod datafusion_bridge {
     impl DataFusionCatalogBridge {
         /// Create a bridge from an [`InMemoryCatalog`] shared reference.
         ///
-        /// [`InMemoryCatalog`]: crate::InMemoryCatalog
-        pub fn new(catalog: Arc<RwLock<crate::InMemoryCatalog>>) -> Self {
+        /// [`InMemoryCatalog`]: super::InMemoryCatalog
+        pub fn new(catalog: Arc<RwLock<super::InMemoryCatalog>>) -> Self {
             Self {
                 catalog,
                 schema_name: "public".to_string(),
@@ -616,7 +614,7 @@ pub mod datafusion_bridge {
     // -----------------------------------------------------------------------
 
     struct DataFusionSchemaBridge {
-        catalog: Arc<RwLock<crate::InMemoryCatalog>>,
+        catalog: Arc<RwLock<super::InMemoryCatalog>>,
         cache: std::sync::Arc<dashmap::DashMap<String, Arc<MemTable>>>,
     }
 
@@ -634,7 +632,7 @@ pub mod datafusion_bridge {
 
         fn table_names(&self) -> Vec<String> {
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
-            use crate::CatalogProvider as KrishivCatalogProvider;
+            use super::CatalogProvider as KrishivCatalogProvider;
             catalog.list_tables()
         }
 
@@ -651,7 +649,7 @@ pub mod datafusion_bridge {
                 ));
             }
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
-            use crate::CatalogProvider as KrishivCatalogProvider;
+            use super::CatalogProvider as KrishivCatalogProvider;
             match catalog.get_table(name) {
                 Ok(table_provider) => {
                     let arrow_schema = Arc::new(table_provider.schema().to_arrow_schema());
@@ -664,7 +662,7 @@ pub mod datafusion_bridge {
                         mem_arc as Arc<dyn datafusion::datasource::TableProvider>,
                     ))
                 }
-                Err(crate::CatalogError::TableNotFound { .. }) => Ok(None),
+                Err(super::CatalogError::TableNotFound { .. }) => Ok(None),
                 Err(error) => Err(datafusion::error::DataFusionError::External(Box::new(
                     error,
                 ))),
@@ -673,7 +671,7 @@ pub mod datafusion_bridge {
 
         fn table_exist(&self, name: &str) -> bool {
             let catalog = self.catalog.read().unwrap_or_else(|p| p.into_inner());
-            use crate::CatalogProvider as KrishivCatalogProvider;
+            use super::CatalogProvider as KrishivCatalogProvider;
             catalog.list_tables().iter().any(|table| table == name)
         }
     }
@@ -790,7 +788,7 @@ mod tests {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 
         let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let names = bridge.schema_names();
         assert_eq!(names, vec!["public"]);
     }
@@ -803,7 +801,7 @@ mod tests {
             cat.register_table(TableMetadata::new("orders", make_schema()))
                 .unwrap();
         }
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = {
             use datafusion::catalog::CatalogProvider as DfCatalogProvider;
             bridge.schema("public").unwrap()
@@ -822,7 +820,7 @@ mod tests {
             cat.register_table(TableMetadata::new("orders", make_schema()))
                 .unwrap();
         }
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = {
             use datafusion::catalog::CatalogProvider as DfCatalogProvider;
             bridge.schema("public").unwrap()
@@ -844,7 +842,7 @@ mod tests {
             cat.register_table(TableMetadata::new("orders", make_schema()))
                 .unwrap();
         }
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = {
             use datafusion::catalog::CatalogProvider as DfCatalogProvider;
             bridge.schema("public").unwrap()
@@ -883,7 +881,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+            Arc::new(super::datafusion_bridge::DataFusionCatalogBridge::new(
                 catalog,
             )),
         );
@@ -898,7 +896,7 @@ mod tests {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 
         let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let result = bridge.schema("nonexistent");
         assert!(result.is_none());
     }
@@ -1725,7 +1723,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            std::sync::Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+            std::sync::Arc::new(super::datafusion_bridge::DataFusionCatalogBridge::new(
                 catalog,
             )),
         );
@@ -1773,7 +1771,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+            Arc::new(super::datafusion_bridge::DataFusionCatalogBridge::new(
                 catalog,
             )),
         );
@@ -1813,7 +1811,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+            Arc::new(super::datafusion_bridge::DataFusionCatalogBridge::new(
                 catalog,
             )),
         );
@@ -1858,7 +1856,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+            Arc::new(super::datafusion_bridge::DataFusionCatalogBridge::new(
                 catalog,
             )),
         );
@@ -1882,7 +1880,7 @@ mod tests {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 
         let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         assert!(bridge.schema("custom").is_none());
         assert!(bridge.schema("public").is_some());
     }
@@ -1896,11 +1894,11 @@ mod tests {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 
         let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         assert!(
             bridge
                 .as_any()
-                .downcast_ref::<crate::datafusion_bridge::DataFusionCatalogBridge>()
+                .downcast_ref::<super::datafusion_bridge::DataFusionCatalogBridge>()
                 .is_some()
         );
     }
@@ -1914,7 +1912,7 @@ mod tests {
         use datafusion::catalog::CatalogProvider as DfCatalogProvider;
 
         let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let names = bridge.schema_names();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0], "public");
@@ -2053,7 +2051,7 @@ mod tests {
         use std::sync::Arc;
 
         let catalog = Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = bridge.schema("public").unwrap();
         let result = schema_provider.table("nonexistent").await.unwrap();
         assert!(result.is_none());
@@ -2074,7 +2072,7 @@ mod tests {
             cat.register_table(TableMetadata::new("mytable", make_schema()))
                 .unwrap();
         }
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = bridge.schema("public").unwrap();
         let result = schema_provider.table("mytable").await.unwrap();
         assert!(result.is_some());
@@ -2097,7 +2095,7 @@ mod tests {
             cat.register_table(TableMetadata::new("beta", make_schema()))
                 .unwrap();
         }
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = bridge.schema("public").unwrap();
         let mut names = schema_provider.table_names();
         names.sort();
@@ -2114,7 +2112,7 @@ mod tests {
         use std::sync::Arc;
 
         let catalog = Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let schema_provider = bridge.schema("public").unwrap();
         let names = schema_provider.table_names();
         assert!(names.is_empty());
@@ -2136,7 +2134,7 @@ mod tests {
             cat.register_table(TableMetadata::new("b", make_schema()))
                 .unwrap();
         }
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let sp = bridge.schema("public").unwrap();
         assert!(sp.table_exist("a"));
         assert!(sp.table_exist("b"));
@@ -2150,7 +2148,7 @@ mod tests {
     #[test]
     fn datafusion_bridge_debug() {
         let catalog = std::sync::Arc::new(std::sync::RwLock::new(InMemoryCatalog::new()));
-        let bridge = crate::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
+        let bridge = super::datafusion_bridge::DataFusionCatalogBridge::new(catalog);
         let dbg = format!("{bridge:?}");
         assert!(dbg.contains("DataFusionCatalogBridge"));
     }
@@ -2219,7 +2217,7 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_catalog(
             "krishiv",
-            Arc::new(crate::datafusion_bridge::DataFusionCatalogBridge::new(
+            Arc::new(super::datafusion_bridge::DataFusionCatalogBridge::new(
                 catalog,
             )),
         );
