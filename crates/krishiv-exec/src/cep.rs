@@ -258,6 +258,49 @@ mod tests {
         );
     }
 
+    /// Regression (Wave 1 — Unbounded Memory Growth): the per-key CEP state
+    /// map must not grow without bound. Once `max_keys` is exceeded, the
+    /// least-recently-active key must be evicted so memory stays bounded
+    /// under high key cardinality.
+    #[test]
+    fn cep_operator_evicts_least_recently_active_key_beyond_max_keys() {
+        let pattern = Pattern::begin("a")
+            .followed_by("b")
+            .within(Duration::from_secs(1))
+            .compile()
+            .unwrap();
+        let mut op = CepOperator::new(pattern, "k").with_max_keys(2);
+        use arrow::array::{Int32Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+        let batch = |v: i32| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![v]))],
+            )
+            .unwrap()
+        };
+
+        op.process_batch(b"k1".to_vec(), "a", batch(1), 100);
+        op.process_batch(b"k2".to_vec(), "a", batch(2), 200);
+        assert_eq!(op.states.len(), 2, "two keys should fit within max_keys");
+
+        // A third distinct key pushes the map over max_keys; the
+        // least-recently-active key (k1, last_event_ms = 100) must be evicted.
+        op.process_batch(b"k3".to_vec(), "a", batch(3), 300);
+        assert_eq!(
+            op.states.len(),
+            2,
+            "state map must stay capped at max_keys regardless of key cardinality"
+        );
+        assert!(
+            !op.states.contains_key(&b"k1".to_vec()),
+            "least-recently-active key k1 must have been evicted"
+        );
+        assert!(op.states.contains_key(&b"k2".to_vec()));
+        assert!(op.states.contains_key(&b"k3".to_vec()));
+    }
+
     #[test]
     fn cep_state_round_trips_through_backend() {
         use krishiv_state::{FjallStateBackend, Namespace};

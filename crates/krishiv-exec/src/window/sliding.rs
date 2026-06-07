@@ -420,4 +420,65 @@ mod sliding_state_tests {
             );
         }
     }
+
+    /// Regression (Wave 1 — Data Correctness): `new()` must reject
+    /// `slide_ms == 0` (would loop forever in `window_starts`),
+    /// `window_size_ms == 0`, and sizes/slides exceeding `i64::MAX` (would
+    /// overflow the `checked_add`/`s + size` arithmetic in `window_starts`).
+    #[test]
+    fn new_rejects_zero_and_overflowing_size_or_slide() {
+        let base = SlidingWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 1000,
+            slide_ms: 0,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+        };
+        assert!(matches!(
+            SlidingWindowOperator::new(base.clone()),
+            Err(ExecError::InvalidWindowConfig(_))
+        ));
+
+        let zero_window = SlidingWindowSpec {
+            window_size_ms: 0,
+            slide_ms: 500,
+            ..base.clone()
+        };
+        assert!(matches!(
+            SlidingWindowOperator::new(zero_window),
+            Err(ExecError::InvalidWindowConfig(_))
+        ));
+
+        let overflowing_size = SlidingWindowSpec {
+            window_size_ms: i64::MAX as u64 + 1,
+            slide_ms: 500,
+            ..base.clone()
+        };
+        assert!(matches!(
+            SlidingWindowOperator::new(overflowing_size),
+            Err(ExecError::InvalidWindowConfig(_))
+        ));
+
+        let overflowing_slide = SlidingWindowSpec {
+            window_size_ms: 1000,
+            slide_ms: i64::MAX as u64 + 1,
+            ..base.clone()
+        };
+        assert!(matches!(
+            SlidingWindowOperator::new(overflowing_slide),
+            Err(ExecError::InvalidWindowConfig(_))
+        ));
+
+        let valid = SlidingWindowSpec {
+            window_size_ms: 1000,
+            slide_ms: 500,
+            ..base
+        };
+        assert!(SlidingWindowOperator::new(valid).is_ok());
+    }
 }

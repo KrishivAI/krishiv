@@ -460,6 +460,41 @@ mod tests {
             .expect("S3Source must restore typed Parquet offsets");
     }
 
+    /// Regression (Wave 1 — Large File OOM): `S3Sink` must bound the total
+    /// in-memory size of buffered batches via `max_pending_bytes`, rejecting
+    /// further writes once the cap is exceeded rather than buffering an
+    /// unbounded amount of data and risking OOM on large files/streams.
+    /// `flush` must reset the byte accounting so the sink can resume writes.
+    #[tokio::test]
+    async fn s3_sink_rejects_write_over_pending_byte_cap_and_resets_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let path = Path::from("byte_capped.parquet");
+
+        let first = make_batch(&[1, 2], &["alice", "bob"]);
+        let cap = first.get_array_memory_size();
+        let mut sink = S3Sink::new(Arc::clone(&store), path.clone()).with_max_pending_bytes(cap);
+
+        sink.write_batch(first).await.unwrap();
+
+        let second = make_batch(&[3, 4], &["carol", "dave"]);
+        let err = sink.write_batch(second).await.unwrap_err();
+        match err {
+            ConnectorError::ObjectStore { message, .. } => {
+                assert!(
+                    message.contains("pending byte limit"),
+                    "expected a pending byte limit error, got: {message}"
+                );
+            }
+            other => panic!("expected ConnectorError::ObjectStore, got: {other:?}"),
+        }
+
+        // Flushing resets pending_bytes, so writes can resume afterward.
+        sink.flush().await.unwrap();
+        sink.write_batch(make_batch(&[5], &["erin"])).await.unwrap();
+    }
+
     #[tokio::test]
     async fn s3_sink_capabilities() {
         let dir = tempfile::tempdir().unwrap();

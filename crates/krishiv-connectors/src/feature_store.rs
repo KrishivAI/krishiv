@@ -452,6 +452,75 @@ mod tests {
         assert_eq!(v.get("score"), Some(&0.5));
     }
 
+    /// Regression (Wave 1 — Unbounded Memory Growth): `live` only ever grows
+    /// via `append`/`reload_from_fragments`, so long-running streams with
+    /// TTL'd rows would otherwise accumulate unbounded memory.
+    /// `compact_expired` must drop rows whose TTL has elapsed (rebuilding the
+    /// entity index), retain rows with no TTL or whose TTL has not elapsed,
+    /// and report the number of rows removed.
+    #[test]
+    fn compact_expired_drops_only_ttl_elapsed_rows_and_shrinks_live_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FeatureStoreSink::open(dir.path(), "users").unwrap();
+
+        let mut expiring_key = BTreeMap::new();
+        expiring_key.insert("user_id".into(), "expiring".into());
+        let mut fresh_key = BTreeMap::new();
+        fresh_key.insert("user_id".into(), "fresh".into());
+        let mut permanent_key = BTreeMap::new();
+        permanent_key.insert("user_id".into(), "permanent".into());
+
+        store
+            .append(&[
+                FeatureRow {
+                    entity_key: expiring_key.clone(),
+                    feature_values: BTreeMap::from([("age".into(), 30.0)]),
+                    created_at_ms: 1_000,
+                    ttl_ms: Some(500),
+                },
+                FeatureRow {
+                    entity_key: fresh_key.clone(),
+                    feature_values: BTreeMap::from([("age".into(), 25.0)]),
+                    created_at_ms: 1_000,
+                    ttl_ms: Some(10_000),
+                },
+                FeatureRow {
+                    entity_key: permanent_key.clone(),
+                    feature_values: BTreeMap::from([("age".into(), 40.0)]),
+                    created_at_ms: 1_000,
+                    ttl_ms: None,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(store.live.read().unwrap().len(), 3);
+
+        // now_ms = 1_600: the "expiring" row's TTL (500ms since created_at_ms
+        // 1_000) has elapsed, but "fresh" (TTL 10_000ms) and "permanent"
+        // (no TTL) have not.
+        let removed = store.compact_expired(1_600).unwrap();
+        assert_eq!(removed, 1, "exactly the expired row must be removed");
+        assert_eq!(
+            store.live.read().unwrap().len(),
+            2,
+            "live set must shrink after compaction"
+        );
+
+        // The expired row is gone from lookups; the others remain queryable.
+        assert!(store.lookup(&expiring_key, 1_600).unwrap().is_empty());
+        assert_eq!(
+            store.lookup(&fresh_key, 1_600).unwrap().get("age"),
+            Some(&25.0)
+        );
+        assert_eq!(
+            store.lookup(&permanent_key, 1_600).unwrap().get("age"),
+            Some(&40.0)
+        );
+
+        // Re-running compaction at the same watermark removes nothing further.
+        assert_eq!(store.compact_expired(1_600).unwrap(), 0);
+    }
+
     #[test]
     fn feature_store_parquet_append_survives_restart() {
         let dir = tempfile::tempdir().unwrap();

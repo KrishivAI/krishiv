@@ -1116,6 +1116,24 @@ mod tests {
         assert_eq!(m.tasks_failed.load(Ordering::Relaxed), 1);
     }
 
+    /// Regression (Wave 4 — Observability & Shutdown): `inc_executor_lost`
+    /// must increment the `executor_lost` counter and the value must be
+    /// rendered as `krishiv_executor_lost_total` in the Prometheus exposition
+    /// (the counter and its renderer line were both added in this wave).
+    #[test]
+    fn inc_executor_lost_increments_and_renders() {
+        let m = KrishivMetrics::default();
+        m.inc_executor_lost();
+        m.inc_executor_lost();
+        assert_eq!(m.executor_lost.load(Ordering::Relaxed), 2);
+
+        let rendered = m.render_prometheus();
+        assert!(
+            rendered.contains("krishiv_executor_lost_total 2"),
+            "expected rendered metrics to include krishiv_executor_lost_total 2, got: {rendered}"
+        );
+    }
+
     #[test]
     fn add_shuffle_bytes_written_accumulates() {
         let m = KrishivMetrics::default();

@@ -1589,4 +1589,70 @@ mod parse_tests {
             "circuit breaker counter must be zero after reset"
         );
     }
+
+    /// Regression (Wave 4 — Observability & Shutdown): `readyz` must return
+    /// 503 when the coordinator is `Active` but has no executor that
+    /// `can_accept_work` (it previously only checked coordinator state,
+    /// reporting "ready" even though no work could actually be scheduled),
+    /// and 200 once a healthy executor is registered.
+    #[tokio::test]
+    async fn readyz_requires_a_healthy_executor() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{ExecutorDescriptor, ExecutorHeartbeat, ExecutorId, ExecutorState};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-readyz").unwrap(),
+        ));
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+
+        // No executors registered yet — coordinator is Active but cannot
+        // accept work.
+        let router = coordinator_http_router(coordinator.clone(), &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "readyz must report unavailable when no healthy executors are registered"
+        );
+
+        // Register and heartbeat an executor into a healthy state.
+        let exec_id = ExecutorId::try_new("exec-readyz").unwrap();
+        {
+            let mut c = coordinator.write().await;
+            c.register_executor(ExecutorDescriptor::new(exec_id.clone(), "localhost", 4))
+                .unwrap();
+            c.executor_heartbeat(ExecutorHeartbeat::new(exec_id, ExecutorState::Healthy))
+                .unwrap();
+        }
+
+        let router = coordinator_http_router(coordinator.clone(), &config);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "readyz must report ready once a healthy executor can accept work"
+        );
+    }
 }

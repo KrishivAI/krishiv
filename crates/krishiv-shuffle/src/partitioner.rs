@@ -208,3 +208,74 @@ fn fill_buckets<F>(
         bucket_indices[bucket].push(row as u32);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{Field, Schema};
+
+    fn batch_with_nulls() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(2),
+                None,
+                None,
+            ]))],
+        )
+        .unwrap()
+    }
+
+    /// Regression (Wave 1 — Data Correctness): null partition keys must be
+    /// routed to a deterministic bucket (bucket 0) and counted via
+    /// `null_key_count`, rather than silently dropped or panicking on the
+    /// missing hash input.
+    #[test]
+    fn null_keys_route_to_bucket_zero_and_are_counted() {
+        let partitioner = HashPartitioner::new("k", 4);
+        let batch = batch_with_nulls();
+        let buckets = partitioner.partition(&batch).unwrap();
+
+        assert_eq!(buckets.len(), 4);
+        assert_eq!(
+            partitioner.null_key_count(),
+            3,
+            "all three null keys must be counted"
+        );
+        // Every null-keyed row lands in bucket 0 (non-null keys may also hash
+        // there, so bucket 0 holds at least the null rows).
+        assert!(
+            buckets[0].num_rows() >= 3,
+            "bucket 0 must contain all null-keyed rows, got {} rows",
+            buckets[0].num_rows()
+        );
+        let total_rows: usize = buckets.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5, "no rows must be dropped during partitioning");
+    }
+
+    /// Regression (Wave 1 — Data Correctness): `Clone` must reset the
+    /// null-key counter rather than sharing or copying the source's atomic
+    /// count, so a cloned partitioner starts with a clean accounting state.
+    #[test]
+    fn clone_resets_null_key_counter() {
+        let partitioner = HashPartitioner::new("k", 4);
+        partitioner.partition(&batch_with_nulls()).unwrap();
+        assert_eq!(partitioner.null_key_count(), 3);
+
+        let cloned = partitioner.clone();
+        assert_eq!(
+            cloned.null_key_count(),
+            0,
+            "clone must start with a reset null-key counter"
+        );
+        assert_eq!(
+            partitioner.null_key_count(),
+            3,
+            "cloning must not affect the source counter"
+        );
+    }
+}

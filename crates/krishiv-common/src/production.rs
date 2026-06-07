@@ -21,8 +21,17 @@ pub const DURABILITY_PROFILE_ENV: &str = "KRISHIV_DURABILITY_PROFILE";
 
 /// Resolve the active durability profile from the environment.
 pub fn resolve_durability_profile() -> DurabilityProfile {
-    std::env::var(DURABILITY_PROFILE_ENV)
-        .ok()
+    resolve_durability_profile_from(std::env::var(DURABILITY_PROFILE_ENV).ok())
+}
+
+/// Resolve a durability profile from an already-read env value.
+///
+/// Factored out of `resolve_durability_profile` so the parse-failure fallback
+/// (an invalid `KRISHIV_DURABILITY_PROFILE` value silently resolving to
+/// `DevLocal` with a logged warning) can be exercised directly in tests
+/// without mutating process-global environment state.
+fn resolve_durability_profile_from(value: Option<String>) -> DurabilityProfile {
+    value
         .and_then(|value| match value.parse() {
             Ok(profile) => Some(profile),
             Err(e) => {
@@ -225,5 +234,36 @@ mod tests {
         assert!(forbids_simulation_connectors(
             DurabilityProfile::DistributedDurable
         ));
+    }
+
+    /// Regression: a malformed `KRISHIV_DURABILITY_PROFILE` value must fall back
+    /// to `DevLocal` (with a logged warning) rather than panicking or silently
+    /// resolving to a more-durable profile than configured.
+    #[test]
+    fn malformed_durability_profile_value_falls_back_to_dev_local() {
+        assert_eq!(
+            resolve_durability_profile_from(Some("not-a-real-profile".to_string())),
+            DurabilityProfile::DevLocal
+        );
+        assert_eq!(
+            resolve_durability_profile_from(Some(String::new())),
+            DurabilityProfile::DevLocal
+        );
+    }
+
+    #[test]
+    fn missing_durability_profile_env_falls_back_to_dev_local() {
+        assert_eq!(
+            resolve_durability_profile_from(None),
+            DurabilityProfile::DevLocal
+        );
+    }
+
+    #[test]
+    fn valid_durability_profile_value_is_honored() {
+        assert_eq!(
+            resolve_durability_profile_from(Some("single-node-durable".to_string())),
+            DurabilityProfile::SingleNodeDurable
+        );
     }
 }

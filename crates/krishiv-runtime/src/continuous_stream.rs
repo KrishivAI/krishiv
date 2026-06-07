@@ -816,6 +816,37 @@ mod tests {
         assert!(!out.is_empty(), "closed window must produce output batches");
     }
 
+    /// Regression (Wave 3 — Runtime/Flight/Continuous Stream): `drain_job`
+    /// must delegate to `drain_job_up_to(DEFAULT_MAX_DRAIN_BATCHES)` rather
+    /// than draining unboundedly (`usize::MAX`), so a single call cannot be
+    /// made to buffer unbounded memory by enqueuing more pending batches than
+    /// one drain can consume.
+    #[test]
+    fn drain_job_caps_consumption_at_default_max_drain_batches() {
+        let registry = ContinuousStreamRegistry::new_unbounded();
+        registry
+            .register_job(
+                "j-capped-drain",
+                WindowExecutionSpec::tumbling("user_id", "ts", 10_000),
+            )
+            .unwrap();
+        let extra = 5;
+        let total = ContinuousStreamRegistry::DEFAULT_MAX_DRAIN_BATCHES + extra;
+        for i in 0..total {
+            registry
+                .push_input("j-capped-drain", vec![batch(i as i64 * 100)])
+                .unwrap();
+        }
+        assert_eq!(registry.pending_batch_depth("j-capped-drain").unwrap(), total);
+
+        let _ = registry.drain_job("j-capped-drain").unwrap();
+        assert_eq!(
+            registry.pending_batch_depth("j-capped-drain").unwrap(),
+            extra,
+            "drain_job must consume at most DEFAULT_MAX_DRAIN_BATCHES batches per call"
+        );
+    }
+
     #[test]
     fn multi_batch_push_is_admitted_atomically() {
         let registry = ContinuousStreamRegistry::with_max_pending_batches(2);

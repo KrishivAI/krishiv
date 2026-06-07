@@ -269,7 +269,44 @@ pub async fn drive_barrier_dispatches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use krishiv_proto::wire::v1::BarrierAck;
     use krishiv_proto::{CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorState};
+
+    /// Regression (Wave 2 — Scheduler Hardening): `apply_barrier_acks` must
+    /// drive every ack through `handle_checkpoint_ack` and handle every
+    /// `CheckpointAckResponse` variant explicitly (it previously discarded
+    /// the response with `let _ = ...`, hiding rejected acks from operators).
+    /// A rejected ack (here, `JobNotFound` for an unknown job) must not
+    /// short-circuit processing of the remaining acks in the batch.
+    #[test]
+    fn apply_barrier_acks_handles_rejected_and_accepted_acks_without_panicking() {
+        let mut coord = Coordinator::active(CoordinatorId::try_new("barrier-acks").unwrap());
+        let job_id = JobId::try_new("missing-job").unwrap();
+        let acks = vec![
+            (
+                TaskId::try_new("t0").unwrap(),
+                BarrierAck {
+                    epoch: 1,
+                    job_id: job_id.as_str().to_string(),
+                    task_id: "t0".into(),
+                    state_handle: None,
+                },
+            ),
+            (
+                TaskId::try_new("t1").unwrap(),
+                BarrierAck {
+                    epoch: 1,
+                    job_id: job_id.as_str().to_string(),
+                    task_id: "t1".into(),
+                    state_handle: None,
+                },
+            ),
+        ];
+
+        // Job does not exist, so every ack resolves to `JobNotFound`. The
+        // call must process both acks (not panic, not bail out early).
+        coord.apply_barrier_acks(&job_id, 1, FencingToken::try_new(1).unwrap(), &acks);
+    }
 
     #[test]
     fn pending_plan_skips_executor_without_barrier_endpoint() {

@@ -431,6 +431,44 @@ mod state_tests {
         restored.restore_from_state(&backend, &ns).expect("restore");
         assert_eq!(restored.open_window_count(), 1);
     }
+
+    /// Regression (Wave 1 — Data Correctness): `validate_spec` must reject
+    /// `window_size_ms == 0` and values exceeding `i64::MAX` rather than
+    /// letting `window_start`'s `event_time_ms / size` divide by zero or
+    /// silently truncate via `as i64`.
+    #[test]
+    fn validate_spec_rejects_zero_and_overflowing_window_size() {
+        let base = TumblingWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            window_size_ms: 0,
+            agg_exprs: vec![AggExpr {
+                input_column: "v".into(),
+                output_column: "sum_v".into(),
+                function: AggFunction::Sum,
+            }],
+        };
+        assert!(matches!(
+            TumblingWindowOperator::validate_spec(&base),
+            Err(ExecError::InvalidWindowConfig(_))
+        ));
+
+        let overflowing = TumblingWindowSpec {
+            window_size_ms: i64::MAX as u64 + 1,
+            ..base.clone()
+        };
+        assert!(matches!(
+            TumblingWindowOperator::validate_spec(&overflowing),
+            Err(ExecError::InvalidWindowConfig(_))
+        ));
+
+        let valid = TumblingWindowSpec {
+            window_size_ms: 1000,
+            ..base
+        };
+        assert!(TumblingWindowOperator::validate_spec(&valid).is_ok());
+    }
 }
 
 /// Property-based aggregation-correctness tests for `TumblingWindowOperator`.

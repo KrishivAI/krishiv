@@ -320,6 +320,26 @@ mod tests {
         assert!(!batches.is_empty());
     }
 
+    /// Regression (Wave 2 — Panic Propagation): `run_blocking` must convert a
+    /// panicking closure into a `Status::internal` error rather than letting
+    /// the panic unwind across the thread boundary and take down the server.
+    /// `#[tokio::test]` defaults to a current-thread runtime, so this exercises
+    /// the `std::thread::scope` fallback branch (the one that can observe a
+    /// joined thread's panic) rather than `block_in_place`.
+    #[tokio::test]
+    async fn run_blocking_converts_closure_panic_to_internal_status() {
+        let result: Result<i32, Status> = run_blocking(|| -> Result<i32, krishiv_runtime::RuntimeError> {
+            panic!("intentional panic from run_blocking test")
+        });
+        let status = result.expect_err("a panicking closure must surface as an error");
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.message().contains("run_blocking thread panicked"),
+            "expected a 'run_blocking thread panicked' message, got: {}",
+            status.message()
+        );
+    }
+
     #[tokio::test]
     async fn proxy_mode_has_coordinator_http_set() {
         let host =

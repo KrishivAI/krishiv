@@ -190,4 +190,59 @@ mod tests {
         let n = router.poll_and_route(&mut source, 10).unwrap();
         assert_eq!(n, 1);
     }
+
+    /// Regression (Wave 2 — Error Propagation): routing an event for a table
+    /// with no registered route must surface a `ConnectorError::Cdc` (not
+    /// panic or silently drop the event), and `poll_and_route` must propagate
+    /// that error to the caller rather than swallowing it.
+    #[test]
+    fn route_event_for_unknown_table_returns_cdc_error() {
+        let router = CdcRouter::new();
+        let err = router
+            .route_event(&event("missing_table", "1", CdcOp::Insert))
+            .unwrap_err();
+        match err {
+            ConnectorError::Cdc(msg) => {
+                assert!(
+                    msg.contains("missing_table"),
+                    "error must name the unrouted table, got: {msg}"
+                );
+            }
+            other => panic!("expected ConnectorError::Cdc, got: {other:?}"),
+        }
+    }
+
+    /// Regression (Wave 2 — Error Propagation): an event with neither a
+    /// `before` nor `after` payload must surface a `ConnectorError::Cdc`
+    /// rather than panicking on the missing batch.
+    #[test]
+    fn route_event_with_no_payload_returns_cdc_error() {
+        let mut router = CdcRouter::new();
+        router.register_table("orders", schema(), None);
+        let mut event = event("orders", "1", CdcOp::Insert);
+        event.after = None;
+        let err = router.route_event(&event).unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::Cdc(msg) if msg.contains("missing payload")),
+            "expected a 'missing payload' ConnectorError::Cdc, got: {err:?}"
+        );
+    }
+
+    /// Regression (Wave 2 — Error Propagation): `poll_and_route` must
+    /// propagate a `ConnectorError` from `route_event` to the caller (e.g.
+    /// when the parsed event targets an unregistered table) instead of
+    /// swallowing it the way malformed-event parse failures are swallowed.
+    #[test]
+    fn poll_and_route_propagates_route_event_error() {
+        let router = CdcRouter::new();
+        let json = r#"{"op":"c","after":{"id":"9"},"source":{"table":"unrouted"}}"#;
+        let mut source = InMemoryCdcEventSource::new([json]);
+        let mut router = router;
+        router.register_table("placeholder", schema(), None);
+        let err = router.poll_and_route(&mut source, 10).unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::Cdc(msg) if msg.contains("unrouted")),
+            "expected route_event's error to propagate through poll_and_route, got: {err:?}"
+        );
+    }
 }

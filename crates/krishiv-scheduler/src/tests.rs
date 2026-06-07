@@ -202,6 +202,47 @@ mod scheduler_tests {
         ));
     }
 
+    /// Extract a Prometheus counter value rendered as `<name> <value>` (no
+    /// labels) from a full exposition body, for delta-based assertions on the
+    /// process-global metrics singleton (which other parallel tests may also
+    /// increment, so only monotonic growth — not an absolute value — is safe
+    /// to assert).
+    fn prometheus_counter_value(rendered: &str, metric_name: &str) -> u64 {
+        let prefix = format!("{metric_name} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("metric {metric_name} not found in:\n{rendered}"))
+    }
+
+    /// Regression (Wave 4 — Observability & Shutdown): `mark_executor_lost`
+    /// must call `inc_executor_lost` so heartbeat-timeout losses are visible
+    /// in `krishiv_executor_lost_total` (the metric call was added alongside
+    /// the counter and Prometheus renderer line in this wave).
+    #[test]
+    fn mark_executor_lost_increments_executor_lost_metric() {
+        let executor_id = ExecutorId::try_new("exec-metric-lost").unwrap();
+        let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-metric").unwrap());
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 1))
+            .unwrap();
+
+        let before = prometheus_counter_value(
+            &krishiv_metrics::global_metrics().render_prometheus(),
+            "krishiv_executor_lost_total",
+        );
+        coordinator.mark_executor_lost(&executor_id).unwrap();
+        let after = prometheus_counter_value(
+            &krishiv_metrics::global_metrics().render_prometheus(),
+            "krishiv_executor_lost_total",
+        );
+        assert!(
+            after > before,
+            "mark_executor_lost must increment krishiv_executor_lost_total (before={before}, after={after})"
+        );
+    }
+
     #[test]
     fn lost_executor_can_reregister_with_next_lease_generation() {
         let executor_id = ExecutorId::try_new("exec-1").unwrap();
@@ -318,6 +359,84 @@ mod scheduler_tests {
         assert_eq!(metadata.row_count(), 2);
         assert_eq!(metadata.batch_count(), 1);
         assert_eq!(metadata.column_count(), 2);
+    }
+
+    /// Regression (Wave 4 — Observability & Shutdown): `apply_task_update`
+    /// must call `inc_tasks_succeeded` / `inc_tasks_failed` on the
+    /// corresponding terminal transitions, so `krishiv_tasks_succeeded_total`
+    /// / `krishiv_tasks_failed_total` reflect actual job outcomes.
+    #[test]
+    fn apply_task_update_increments_succeeded_and_failed_metrics() {
+        let executor_id = ExecutorId::try_new("exec-metric-task").unwrap();
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-metric-task").unwrap());
+        let lease_generation = coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-a", 2))
+            .unwrap();
+
+        let succeeded_job_id = JobId::try_new("job-metric-succeeded").unwrap();
+        coordinator
+            .submit_job(single_task_job(succeeded_job_id.clone()))
+            .unwrap();
+        let succeeded_assignment = coordinator
+            .launch_assigned_task_assignments(&succeeded_job_id)
+            .unwrap()
+            .remove(0);
+
+        let failed_job_id = JobId::try_new("job-metric-failed").unwrap();
+        coordinator
+            .submit_job(single_task_job(failed_job_id.clone()))
+            .unwrap();
+        let failed_assignment = coordinator
+            .launch_assigned_task_assignments(&failed_job_id)
+            .unwrap()
+            .remove(0);
+
+        let rendered_before = krishiv_metrics::global_metrics().render_prometheus();
+        let succeeded_before =
+            prometheus_counter_value(&rendered_before, r#"krishiv_tasks_total{status="succeeded"}"#);
+        let failed_before = prometheus_counter_value(&rendered_before, r#"krishiv_tasks_total{status="failed"}"#);
+
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    succeeded_job_id.clone(),
+                    succeeded_assignment.stage_id().clone(),
+                    succeeded_assignment.task_id().clone(),
+                    executor_id.clone(),
+                    TaskState::Succeeded,
+                    succeeded_assignment.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease_generation),
+            )
+            .unwrap();
+        coordinator
+            .apply_task_update(
+                TaskStatusUpdate::new(
+                    failed_job_id.clone(),
+                    failed_assignment.stage_id().clone(),
+                    failed_assignment.task_id().clone(),
+                    executor_id,
+                    TaskState::Failed,
+                    failed_assignment.attempt_id().as_u32(),
+                )
+                .with_lease_generation(lease_generation),
+            )
+            .unwrap();
+
+        let rendered_after = krishiv_metrics::global_metrics().render_prometheus();
+        let succeeded_after =
+            prometheus_counter_value(&rendered_after, r#"krishiv_tasks_total{status="succeeded"}"#);
+        let failed_after = prometheus_counter_value(&rendered_after, r#"krishiv_tasks_total{status="failed"}"#);
+
+        assert!(
+            succeeded_after > succeeded_before,
+            "Succeeded transition must increment krishiv_tasks_total{{status=\"succeeded\"}} (before={succeeded_before}, after={succeeded_after})"
+        );
+        assert!(
+            failed_after > failed_before,
+            "Failed transition must increment krishiv_tasks_total{{status=\"failed\"}} (before={failed_before}, after={failed_after})"
+        );
     }
 
     #[test]
@@ -3108,6 +3227,58 @@ mod scheduler_tests {
         let ack = make_ack(&unknown_job_id, "task-1", 1, FencingToken::initial(), None);
         let response = coordinator.handle_checkpoint_ack(ack);
         assert_eq!(response, CheckpointAckResponse::JobNotFound);
+    }
+
+    /// Regression (Wave 4 — Observability & Shutdown): the async checkpoint
+    /// ack path (`handle_checkpoint_ack_async`, used by the gRPC service) must
+    /// record `inc_checkpoint_committed` on quorum just like the synchronous
+    /// path — the metric call was previously present only in
+    /// `handle_checkpoint_ack`, leaving async-routed commits invisible in
+    /// `krishiv_checkpoint_epochs_total{status="committed"}`.
+    #[tokio::test]
+    async fn async_checkpoint_ack_quorum_increments_committed_metric() {
+        let storage = LocalFsCheckpointStorage::ephemeral().unwrap();
+        let storage_path = storage.base_dir().to_string_lossy().to_string();
+
+        let mut coordinator =
+            Coordinator::active(CoordinatorId::try_new("coord-ck-async-metric").unwrap());
+        let executor_id = ExecutorId::try_new("exec-ck-async-metric").unwrap();
+        coordinator
+            .register_executor(ExecutorDescriptor::new(executor_id.clone(), "pod-ck", 1))
+            .unwrap();
+
+        let job_id = JobId::try_new("job-ck-async-metric").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "async-ck-metric", JobKind::Streaming)
+            .with_checkpoint(5000, &storage_path)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("task-1").unwrap(), "stream:tw"),
+                ),
+            );
+        coordinator.submit_job(spec).unwrap();
+
+        {
+            let coord = coordinator.checkpoint_coordinator_mut(&job_id).unwrap();
+            coord.set_expected_task_count(1);
+            coord.initiate().unwrap();
+        }
+
+        let ack = make_ack(&job_id, "task-1", 1, FencingToken::initial(), None);
+        let (response, _pending) = coordinator.handle_checkpoint_ack_async(ack).await;
+        assert_eq!(
+            response,
+            CheckpointAckResponse::Accepted,
+            "quorum ack must be accepted"
+        );
+
+        let rendered = krishiv_metrics::global_metrics().render_prometheus();
+        assert!(
+            rendered.contains(&format!(
+                "krishiv_checkpoint_epochs_total{{job_id=\"{}\",status=\"committed\"}} 1",
+                job_id.as_str()
+            )),
+            "async ack quorum must record inc_checkpoint_committed for the job, got: {rendered}"
+        );
     }
 
     #[test]

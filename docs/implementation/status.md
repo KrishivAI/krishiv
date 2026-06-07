@@ -1,5 +1,60 @@
 # Krishiv Implementation Status
 
+## Roadmap Phase 5 (Testing) regression sweep — continued (2026-06-07)
+
+Continued implementing roadmap.md Phase 5 testing items 155-175 (regression
+tests for prior-wave fixes plus untriaged coverage gaps):
+
+- `krishiv-common::production`: extracted `resolve_durability_profile_from`
+  (env-free helper) to test the malformed/missing/valid env-value fallback
+  paths without `env::set_var` (blocked by edition-2024 `unsafe fn` +
+  crate-level `#![forbid(unsafe_code)]`).
+- `krishiv-exec`: regression tests for `TumblingWindowOperator::validate_spec`
+  and `SlidingWindowOperator::new` rejecting zero/overflowing window sizes;
+  CEP `CepOperator` per-key state eviction at `max_keys` (bounds memory under
+  high key cardinality).
+- `krishiv-shuffle`: new `partitioner` test module — null-key routing/counting
+  and `Clone` resetting the null-key counter.
+- `krishiv-scheduler`: `barrier_dispatch` ack-handling regression test;
+  `mark_executor_lost`/`apply_task_update`/async-checkpoint-ack metric-delta
+  tests; `coordinator_daemon` `/readyz` health-gating test.
+- `krishiv-runtime`: `ContinuousStreamRegistry::drain_job` max-drain-batches
+  cap regression test.
+- `krishiv-metrics`: `inc_executor_lost` increment+render regression test.
+- `krishiv-ui`: poison-recovery test for `UiState.metrics_cache` (spawns a
+  thread that panics while holding the lock, asserts `/metrics` still serves
+  `200 OK` via `.lock().unwrap_or_else(|e| e.into_inner())`).
+- `krishiv-connectors`:
+  - `cdc_router`: `ConnectorError::Cdc` propagation tests for unknown-table
+    routes, missing-payload events, and `poll_and_route` error propagation.
+  - `feature_store`: `compact_expired` regression test (drops only
+    TTL-elapsed rows, shrinks `live`/rebuilds the entity index, idempotent).
+  - `s3`: `S3Sink::with_max_pending_bytes` regression test (rejects writes
+    over the byte cap with `pending byte limit` error; `flush` resets
+    accounting so writes can resume).
+- `krishiv-flight-sql`: `run_blocking` panic-propagation regression test
+  (current-thread runtime exercises the `std::thread::scope` fallback;
+  asserts a panicking closure surfaces as `Status::internal` with
+  `"run_blocking thread panicked"`, not an unwinding panic).
+
+Also confirmed already-adequate (no new test needed): interval-join buffer
+cap + per-key eviction (`buffer_limit_drops_oldest_events_when_exceeded`,
+`per_key_evict_cleans_all_keys` already cover unbounded-growth concerns).
+
+Validation:
+```bash
+cargo test -p krishiv-common -p krishiv-exec -p krishiv-shuffle \
+  -p krishiv-runtime -p krishiv-metrics -p krishiv-scheduler \
+  -p krishiv-connectors -p krishiv-flight-sql -p krishiv-ui --lib
+```
+All pass except the pre-existing `krishiv-ui::tests::ui_jobs_renders_html`
+failure (`body.contains("Krishiv R2 Status")`), confirmed via `git stash` to
+fail identically on a clean `main` — unrelated to this sweep.
+
+Next: items still to triage from the Phase 5 list — verify no further
+untriaged "DONE on checklist but no real test" gaps remain across
+`krishiv-connectors` (Kafka/CDC), `krishiv-chaos`, and `krishiv-lakehouse`.
+
 ## krishiv-plan Full Audit Resolution (2026-06-06)
 
 Implemented the complete `krishiv-plan` audit resolution plan. No deprecated code, no backward compatibility shims.

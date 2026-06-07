@@ -1392,6 +1392,47 @@ mod tests {
         assert!(body.contains("krishiv_max_executor_heartbeat_age_ticks"));
     }
 
+    /// Regression (Wave 1 — Lock Poisoning Recovery): if the `metrics_cache`
+    /// mutex is poisoned by a panicking holder, the `/metrics` handler must
+    /// recover via `.lock().unwrap_or_else(|e| e.into_inner())` and continue
+    /// serving rather than panicking/cascading the poison to every caller.
+    #[tokio::test]
+    async fn metrics_handler_recovers_from_poisoned_cache_lock() {
+        let state = empty_state().unwrap();
+        let cache = state.metrics_cache.clone();
+
+        let poison_result = std::thread::spawn(move || {
+            let _guard = cache.lock().unwrap();
+            panic!("intentional poison for metrics_cache mutex");
+        })
+        .join();
+        assert!(poison_result.is_err(), "spawned thread must have panicked");
+        assert!(
+            state.metrics_cache.is_poisoned(),
+            "metrics_cache mutex must be poisoned after the panicking holder"
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "metrics endpoint must recover from a poisoned cache lock, got body: {body}"
+        );
+        assert!(body.contains("krishiv_running_tasks"));
+    }
+
     #[tokio::test]
     async fn metrics_reflects_live_coordinator_state() {
         let response = router(demo_state().unwrap())
