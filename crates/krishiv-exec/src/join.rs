@@ -146,7 +146,9 @@ fn join_output_schema_multi(
     right: &RecordBatch,
     right_keys: &[String],
 ) -> Arc<Schema> {
-    let right_key_set: std::collections::HashSet<String> = right_keys.iter().cloned().collect();
+    // Cache key-set lookup to O(1) per field rather than O(k) linear scan.
+    let right_key_set: std::collections::HashSet<&str> =
+        right_keys.iter().map(|s| s.as_str()).collect();
     let mut fields: Vec<Field> = left
         .schema()
         .fields()
@@ -154,8 +156,7 @@ fn join_output_schema_multi(
         .map(|f| f.as_ref().clone())
         .collect();
     for f in right.schema().fields() {
-        let fname = f.name().to_string();
-        if right_key_set.contains(&fname) {
+        if right_key_set.contains(f.name().as_str()) {
             continue;
         }
         let name = if left.schema().field_with_name(f.name()).is_ok() {
@@ -610,18 +611,42 @@ fn build_outer_join_batch(
     unmatched_left: &[u32],
     out_schema: Arc<Schema>,
 ) -> ExecResult<RecordBatch> {
+    // Left columns: matched rows first, then unmatched rows.
     let mut all_left: Vec<u32> = left_indices.to_vec();
     all_left.extend_from_slice(unmatched_left);
-
-    let mut null_right_indices: Vec<u32> = vec![0; unmatched_left.len()];
-    let mut all_right: Vec<u32> = right_indices.to_vec();
-    all_right.append(&mut null_right_indices);
-
     let left_idx_arr: ArrayRef = Arc::new(UInt32Array::from(all_left));
-    let right_idx_arr: ArrayRef = Arc::new(UInt32Array::from(all_right));
+
+    // Right columns: matched rows get their real index; unmatched rows get None
+    // so Arrow's `take` produces null values rather than copying row 0.
+    let mut right_idx_opt: Vec<Option<u32>> =
+        right_indices.iter().map(|&r| Some(r)).collect();
+    right_idx_opt.extend(std::iter::repeat(None).take(unmatched_left.len()));
+    let right_idx_arr: ArrayRef = Arc::new(UInt32Array::from(right_idx_opt));
+
+    // Right non-key columns must be nullable when there are unmatched left rows:
+    // those rows receive Arrow nulls, which requires the column to be declared nullable.
+    let n_left = left.num_columns();
+    let nullable_schema: Arc<Schema> = if !unmatched_left.is_empty() {
+        Arc::new(Schema::new(
+            out_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    if i >= n_left {
+                        Field::new(f.name(), f.data_type().clone(), true)
+                    } else {
+                        f.as_ref().clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        out_schema
+    };
 
     let mut columns: Vec<ArrayRef> = Vec::new();
-    for i in 0..left.num_columns() {
+    for i in 0..n_left {
         columns.push(
             take(left.column(i), &left_idx_arr, None)
                 .map_err(|e| ExecError::Arrow(e.to_string()))?,
@@ -632,13 +657,11 @@ fn build_outer_join_batch(
             continue;
         }
         let col = right.column(i);
-        let taken = take(col, &right_idx_arr, None).map_err(|e| ExecError::Arrow(e.to_string()))?;
-        // For unmatched left rows, the right column should be null.
-        // take returns null for null indices, so we need the right column
-        // for matched rows and null for unmatched. We use the mixed indices.
-        columns.push(taken);
+        columns.push(
+            take(col, &right_idx_arr, None).map_err(|e| ExecError::Arrow(e.to_string()))?,
+        );
     }
-    RecordBatch::try_new(out_schema, columns).map_err(|e| ExecError::Arrow(e.to_string()))
+    RecordBatch::try_new(nullable_schema, columns).map_err(|e| ExecError::Arrow(e.to_string()))
 }
 
 fn build_composite_key_static(
@@ -656,6 +679,59 @@ fn build_composite_key_static(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
+
+    #[test]
+    fn left_outer_join_unmatched_rows_produce_null_right_columns() {
+        // left: id=[1,2], val=[10,20]   right: id=[1], rval=[100]
+        // row id=2 is unmatched → rval must be null (not row-0 value 100)
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("rval", DataType::Int32, false),
+        ]));
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![100])),
+            ],
+        )
+        .unwrap();
+
+        let join = HashJoin::new("id", "id").with_kind(JoinKind::LeftOuter);
+        let result = join.join(&left, &right).unwrap();
+
+        assert_eq!(result.num_rows(), 2, "left outer must emit both left rows");
+
+        let rval_col = result.column_by_name("rval").unwrap();
+        let rvals = rval_col.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Find row with id=2 (unmatched) — its rval must be null.
+        let ids = result.column_by_name("id").unwrap();
+        let id_arr = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+        for i in 0..result.num_rows() {
+            if id_arr.value(i) == 2 {
+                assert!(
+                    rvals.is_null(i),
+                    "unmatched left row must have null right column, got {}",
+                    rvals.value(i)
+                );
+            }
+        }
+    }
 
     #[test]
     fn extract_agg_key_rejects_null_values() {

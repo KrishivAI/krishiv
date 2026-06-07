@@ -20,9 +20,6 @@ pub enum BarrierAlignError {
     },
 }
 
-/// Error when barrier alignment times out (backward-compat alias).
-pub type CheckpointAlignmentTimeout = BarrierAlignError;
-
 /// Buffers records on faster inputs until all inputs have seen the barrier epoch.
 #[derive(Debug)]
 pub struct BarrierAligner {

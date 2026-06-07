@@ -2238,6 +2238,52 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn validate_job_rejects_cyclic_stage_deps() {
+        // stage-1 → stage-2 → stage-1 creates a cycle; validate_job must reject it.
+        let job_id = JobId::try_new("job-cycle").unwrap();
+        let spec = JobSpec::new(job_id, "cyclic", JobKind::Batch)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-1").unwrap(), "s1")
+                    .with_upstream_stage(StageId::try_new("stage-2").unwrap())
+                    .with_task(TaskSpec::new(TaskId::try_new("task-1").unwrap(), "t1")),
+            )
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-2").unwrap(), "s2")
+                    .with_upstream_stage(StageId::try_new("stage-1").unwrap())
+                    .with_task(TaskSpec::new(TaskId::try_new("task-2").unwrap(), "t2")),
+            );
+        let result = crate::job::validate_job(&spec);
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidJob { ref message }) if message.contains("cyclic")),
+            "expected InvalidJob with 'cyclic' message, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn apply_status_update_rejects_attempt_zero() {
+        let task_id = TaskId::try_new("task-attempt-zero").unwrap();
+        let executor_id = ExecutorId::try_new("exec-zero").unwrap();
+        let mut task = crate::job::TaskRecord::from_spec(krishiv_proto::TaskSpec::new(
+            task_id.clone(),
+            "some description",
+        ));
+        // task.attempt is 0 — simulate a status update arriving before launch.
+        let update = TaskStatusUpdate::new(
+            JobId::try_new("job-zero").unwrap(),
+            StageId::try_new("stage-zero").unwrap(),
+            task_id.clone(),
+            executor_id,
+            krishiv_proto::TaskState::Running,
+            0,
+        );
+        let result = task.apply_status_update(&update);
+        assert!(
+            matches!(result, Err(SchedulerError::InvalidJob { .. })),
+            "attempt 0 must return InvalidJob (never launched), got {result:?}"
+        );
+    }
+
+    #[test]
     fn in_memory_metadata_store_round_trips() {
         let coord_id = CoordinatorId::try_new("coord-1").unwrap();
         let job_id = JobId::try_new("job-1").unwrap();
@@ -4094,6 +4140,26 @@ mod scheduler_tests {
         assert!(
             coordinator.trigger_checkpoint_for_job(&job_id).is_err(),
             "trigger must fail when job has no checkpoint coordinator"
+        );
+    }
+
+    #[test]
+    fn checkpoint_epoch_overflow_returns_error() {
+        let job_id = JobId::try_new("job-epoch-overflow").unwrap();
+        let storage: Arc<dyn CheckpointStorage> =
+            Arc::new(LocalFsCheckpointStorage::ephemeral().unwrap());
+        let mut coord =
+            CheckpointCoordinator::new_for_test(job_id, storage, 1_000, 1);
+        // Manually push current_epoch to u64::MAX so the next checked_add overflows.
+        coord.current_epoch = u64::MAX;
+        let result = coord.initiate();
+        assert!(
+            result.is_err(),
+            "initiating past u64::MAX must return Err, got {result:?}"
+        );
+        assert!(
+            result.unwrap_err().contains("overflow"),
+            "error must mention overflow"
         );
     }
 

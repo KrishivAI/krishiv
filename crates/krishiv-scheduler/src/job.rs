@@ -16,6 +16,9 @@ use crate::{ExecutorHeartbeatAge, SchedulerError, SchedulerResult, TaskUpdateOut
 
 const MAX_KEY_GROUPS: u32 = 32_768;
 
+/// Conservative per-job UDF execution time cap (ms) — 1 hour.
+const UDF_EXECUTION_TIME_CAP_MS: u64 = 60 * 60 * 1_000;
+
 fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRange {
     let p = parallelism.max(1) as u32;
     let idx = task_index as u32;
@@ -29,11 +32,6 @@ fn key_group_range_for_task(task_index: usize, parallelism: usize) -> KeyGroupRa
 }
 
 /// Result of a `Coordinator::submit_job` call.
-///
-/// R7.1 introduces `Queued` when admission control cannot immediately place the
-/// job.  All current callers receive `Accepted` because `InMemoryQueueManager`
-/// always admits.  Code that discards the outcome (`.unwrap()`, `?`) requires
-/// no change; code that pattern-matches must handle both variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitOutcome {
     /// Job was admitted and is now scheduled.
@@ -44,8 +42,6 @@ pub enum SubmitOutcome {
     Queued { position: usize },
 }
 
-// ── R7.1 Resource governance types ───────────────────────────────────────────
-
 /// Accumulated resource consumption for one job.
 ///
 /// Populated from `TaskRuntimeStats` as tasks complete. Used by the status API
@@ -55,22 +51,20 @@ pub enum SubmitOutcome {
 pub struct ResourceUsage {
     /// Total CPU nanoseconds consumed by all completed tasks.
     pub cpu_nanos: u64,
-    /// Peak memory bytes observed across all completed tasks.
-    pub memory_peak_bytes: u64,
+    /// Peak memory bytes observed across all completed tasks (max across tasks, not sum).
+    pub memory_peak_task_bytes: u64,
+    /// Sum of memory bytes across all completed tasks.
+    pub memory_total_bytes: u64,
     /// Number of completed tasks that have reported stats.
     pub task_count: u32,
 }
 
 impl ResourceUsage {
-    /// Empty usage.
-    pub fn zero() -> Self {
-        Self::default()
-    }
-
     /// Absorb stats from one completed task.
     pub fn add_task_stats(&mut self, cpu_nanos: u64, memory_bytes: u64) {
         self.cpu_nanos = self.cpu_nanos.saturating_add(cpu_nanos);
-        self.memory_peak_bytes = self.memory_peak_bytes.max(memory_bytes);
+        self.memory_peak_task_bytes = self.memory_peak_task_bytes.max(memory_bytes);
+        self.memory_total_bytes = self.memory_total_bytes.saturating_add(memory_bytes);
         self.task_count = self.task_count.saturating_add(1);
     }
 }
@@ -99,9 +93,6 @@ pub struct StaticScheduler;
 
 impl StaticScheduler {
     /// Place tasks round-robin across schedulable executors.
-    ///
-    /// P2.5: Accepts borrowed descriptors so callers avoid cloning the full
-    /// descriptor vec on every `submit_job` call.
     pub fn place(
         spec: &JobSpec,
         executors: &[&ExecutorDescriptor],
@@ -123,7 +114,7 @@ impl StaticScheduler {
     }
 }
 
-/// Placement v2: prefer executors with the most free slots (WS-10.7).
+/// Placement v2: prefer executors with the most free slots.
 #[derive(Debug, Clone, Default)]
 pub struct SlotAwareScheduler;
 
@@ -146,7 +137,7 @@ impl SlotAwareScheduler {
                 .iter()
                 .enumerate()
                 .max_by_key(|(_, slots)| **slots)
-                .unwrap();
+                .ok_or(SchedulerError::NoExecutors)?;
             slot_budget[idx] = slot_budget[idx].saturating_sub(1);
             assignments.push(TaskAssignment::new(
                 task.task_id().clone(),
@@ -173,13 +164,8 @@ pub struct JobRecord {
 
 impl JobRecord {
     /// Conservative per-job execution time cap (ms) for sandboxed UDFs.
-    /// Higher layers (SqlEngine / executor runner) combine this with the job's
-    /// memory limit to build a real `krishiv_udf::ResourceLimits` when calling
-    /// `sync_scalar_udfs_with_limits`. This keeps scheduler free of direct udf
-    /// types while still providing the raw values needed for Track E enforcement.
     pub fn udf_execution_time_cap_ms(&self) -> Option<u64> {
-        // 1 hour conservative default for long-lived jobs; can be tightened per job spec in future.
-        Some(60 * 60 * 1000)
+        Some(UDF_EXECUTION_TIME_CAP_MS)
     }
 
     /// Memory budget (bytes) for sandboxed UDF execution for this job, taken
@@ -201,7 +187,7 @@ impl JobRecord {
             max_stage_retries,
             stages,
             shuffle_output: HashMap::new(),
-            resource_usage: ResourceUsage::zero(),
+            resource_usage: ResourceUsage::default(),
         }
     }
 
@@ -271,9 +257,8 @@ impl JobRecord {
         let mut assignments = Vec::new();
         self.state = JobState::Running;
 
-        // P2.10: Build a HashSet once for O(1) upstream-ready checks instead of
+        // Build a HashSet once for O(1) upstream-ready checks instead of
         // O(stages²) Vec::contains per stage in the outer loop.
-        // Clone the IDs so the set owns its data and does not borrow self.stages.
         let succeeded_stage_ids: std::collections::HashSet<StageId> = self
             .stages
             .iter()
@@ -318,12 +303,6 @@ impl JobRecord {
                         }
                     })?;
 
-                    // PRR Parallel - Circuit Breaker (IMM-1 complete in this slice):
-                    // Skip launching to executors that have too many consecutive failures.
-                    // This prevents wasting work on known-bad executors.
-                    // Threshold logic lives in ExecutorRegistry.
-                    // For now we log; full re-assignment can be added next.
-                    // (The registry already has executors_over_failure_threshold)
                     let lease_generation = executor_leases
                         .iter()
                         .find_map(|(known_executor, lease_generation)| {
@@ -368,7 +347,7 @@ impl JobRecord {
                     } else {
                         vec![InputPartition::new(
                             task.task_id().as_str(),
-                            default_input_partition_description(&task_description),
+                            task_description.clone(),
                         )]
                     };
                     let mut assignment = ExecutorTaskAssignment::new(
@@ -580,14 +559,6 @@ impl JobRecord {
     }
 }
 
-fn default_input_partition_description(task_description: &str) -> String {
-    if task_description.starts_with("stream:") {
-        return "stream-kafka:memory:0:0:key=a,ts=100,val=1|key=b,ts=200,val=1|key=a,ts=300,val=1"
-            .to_owned();
-    }
-    task_description.to_owned()
-}
-
 /// Stage record owned by a job coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRecord {
@@ -643,47 +614,34 @@ impl StageRecord {
         update: TaskStatusUpdate,
         max_stage_retries: u32,
     ) -> SchedulerResult<TaskUpdateOutcome> {
-        // GAP-3: Per-task retry configuration from the stage spec.
         let max_task_attempts = self.spec.max_task_attempts();
 
-        let task = self
+        let task_idx = self
             .tasks
-            .iter_mut()
-            .find(|task| task.task_id() == update.task_id())
+            .iter()
+            .position(|task| task.task_id() == update.task_id())
             .ok_or_else(|| SchedulerError::UnknownTask {
                 task_id: update.task_id().clone(),
             })?;
 
-        let outcome = task.apply_status_update(&update)?;
+        let outcome = self.tasks[task_idx].apply_status_update(&update)?;
         if outcome == TaskUpdateOutcome::Duplicate {
             return Ok(outcome);
         }
 
         if update.state() == TaskState::Failed {
-            // GAP-3: Try per-task retry first.  If this specific task still has
-            // attempts remaining, reset only that task to Pending rather than
-            // retrying the entire stage (which would reset even succeeded tasks).
-            let task_failure_count = {
-                let task = self
-                    .tasks
-                    .iter_mut()
-                    .find(|t| t.task_id() == update.task_id())
-                    .unwrap(); // we already found this task above
-                task.failure_count = task.failure_count.saturating_add(1);
-                task.failure_count
-            };
+            // Try per-task retry first: if this specific task still has attempts remaining,
+            // reset only that task to Pending rather than retrying the entire stage
+            // (which would reset even succeeded tasks).
+            let task = &mut self.tasks[task_idx];
+            task.failure_count = task.failure_count.saturating_add(1);
+            let task_failure_count = task.failure_count;
+
             if task_failure_count < max_task_attempts {
-                // Retry just this task.
-                if let Some(task) = self
-                    .tasks
-                    .iter_mut()
-                    .find(|t| t.task_id() == update.task_id())
-                {
-                    task.state = TaskState::Pending;
-                    task.assigned_executor = None;
-                    task.launch_in_flight = false;
-                    // Keep failure_count and last_failure_reason for diagnostics.
-                }
+                let task = &mut self.tasks[task_idx];
+                task.state = TaskState::Pending;
+                task.assigned_executor = None;
+                task.launch_in_flight = false;
                 self.refresh_state();
                 return Ok(TaskUpdateOutcome::Applied);
             }
@@ -712,8 +670,8 @@ impl StageRecord {
         self.retry_count = self.retry_count.saturating_add(1);
         self.state = StageState::Retrying;
 
-        // P1.24: Always reset to Pending so the scheduler can re-queue and re-assign.
-        // Using Assigned here would bypass the placement logic on the next schedule pass.
+        // Reset to Pending so the scheduler can re-queue and re-assign.
+        // Assigned would bypass placement logic on the next schedule pass.
         for task in &mut self.tasks {
             task.state = TaskState::Pending;
             task.assigned_executor = None;
@@ -721,7 +679,6 @@ impl StageRecord {
         }
     }
 
-    /// P2.7: Single-pass over tasks instead of four separate iterator passes.
     pub(crate) fn refresh_state(&mut self) {
         let mut all_succeeded = true;
         let mut any_failed = false;
@@ -783,8 +740,7 @@ pub struct TaskRecord {
     pub(crate) launch_in_flight: bool,
     pub(crate) output_metadata: Option<TaskOutputMetadata>,
     pub(crate) last_failure_reason: Option<String>,
-    /// GAP-3: How many times this specific task has failed.  Used by
-    /// `apply_task_update` to decide whether to retry the task or fail it.
+    /// How many times this specific task has failed; drives per-task retry budget.
     pub(crate) failure_count: u32,
     /// Number of times this task's executor was lost (marked Lost/timeout).
     /// Incremented each time `reset_running_tasks_for_lost_executor` rescheduled
@@ -797,9 +753,8 @@ pub struct TaskRecord {
     /// Connector-specific encoding; `None` for batch tasks.
     pub(crate) last_source_offset: Option<Vec<u8>>,
     /// Wall-clock timestamp (ms since UNIX epoch) when the task most recently
-    /// transitioned to Running state. Used by the coordinator stall-detection
-    /// loop (R5) to identify tasks that have been in-flight for too long without
-    /// completing, which may indicate a deadlocked or hung operator.
+    /// Wall-clock ms when the task most recently entered Running state.
+    /// Used by stall detection to identify hung tasks.
     pub(crate) assigned_at_ms: Option<u64>,
 }
 
@@ -889,15 +844,16 @@ impl TaskRecord {
         &mut self,
         update: &TaskStatusUpdate,
     ) -> SchedulerResult<TaskUpdateOutcome> {
-        if update.attempt() != self.attempt {
-            return Err(SchedulerError::StaleTaskAttempt {
-                task_id: self.task_id().clone(),
-                expected: self.attempt,
-                received: update.attempt(),
+        if self.attempt == 0 {
+            return Err(SchedulerError::InvalidJob {
+                message: format!(
+                    "task {} received status update at attempt 0 — task was never launched",
+                    self.task_id()
+                ),
             });
         }
 
-        if self.attempt == 0 {
+        if update.attempt() != self.attempt {
             return Err(SchedulerError::StaleTaskAttempt {
                 task_id: self.task_id().clone(),
                 expected: self.attempt,
@@ -939,8 +895,8 @@ impl TaskRecord {
         if self.state == TaskState::Failed {
             self.last_failure_reason = update.message().map(ToOwned::to_owned);
         }
-        // R5: Record assignment time when the task starts running so the
-        // coordinator stall-detection loop can identify hung tasks.
+        // Record assignment time when the task starts running so the stall-detection loop
+        // can identify hung tasks.
         if self.state == TaskState::Running {
             self.assigned_at_ms =
                 Some(u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0));
@@ -1114,7 +1070,6 @@ pub struct TaskSnapshot {
     pub(crate) attempt: u32,
     pub(crate) output_metadata: Option<TaskOutputMetadata>,
     pub(crate) last_failure_reason: Option<String>,
-    /// GAP-3: Number of times this specific task has failed (for observability).
     pub(crate) failure_count: u32,
     /// Capability flags declared by the source connector for this task, if known.
     pub source_capabilities: Option<ConnectorCapabilityFlags>,
@@ -1230,10 +1185,6 @@ pub fn job_spec_from_logical_plan(job_id: JobId, plan: &LogicalPlan) -> Schedule
 }
 
 /// Convert a Krishiv physical plan into an R2 distributed job spec.
-///
-/// GAP-SH-04: If the plan carries a `coalesced_partition_count` (set by the
-/// AQE `CoalesceRule`), that count overrides the default one-task-per-node
-/// layout so the scheduler generates the correct number of downstream tasks.
 pub fn job_spec_from_physical_plan(job_id: JobId, plan: &PhysicalPlan) -> SchedulerResult<JobSpec> {
     plan.validate()
         .map_err(|error| SchedulerError::InvalidPlan {
@@ -1271,10 +1222,48 @@ pub(crate) fn validate_job(spec: &JobSpec) -> SchedulerResult<()> {
                         upstream_id
                     ),
                 });
-            }
+        }
         }
     }
-    // P0.19: O(n) duplicate task-id detection using a HashSet instead of O(n²) Vec scan.
+    // Cycle detection in stage dependency graph using Kahn's algorithm.
+    {
+        let n = spec.stages().len();
+        let stage_id_to_idx: std::collections::HashMap<&StageId, usize> = spec
+            .stages()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.stage_id(), i))
+            .collect();
+        let mut in_degree = vec![0usize; n];
+        for stage in spec.stages() {
+            let idx = *stage_id_to_idx.get(stage.stage_id()).expect("stage just indexed");
+            in_degree[idx] = in_degree[idx].saturating_add(stage.upstream_stage_ids().len());
+        }
+        let mut queue: std::collections::VecDeque<usize> = in_degree
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &d)| (d == 0).then_some(i))
+            .collect();
+        let mut processed = 0usize;
+        while let Some(idx) = queue.pop_front() {
+            processed += 1;
+            let current_id = spec.stages()[idx].stage_id();
+            for (ds_idx, ds_stage) in spec.stages().iter().enumerate() {
+                if ds_stage.upstream_stage_ids().contains(current_id) {
+                    in_degree[ds_idx] = in_degree[ds_idx].saturating_sub(1);
+                    if in_degree[ds_idx] == 0 {
+                        queue.push_back(ds_idx);
+                    }
+                }
+            }
+        }
+        if processed != n {
+            return Err(SchedulerError::InvalidJob {
+                message: String::from("stage dependency graph is cyclic"),
+            });
+        }
+    }
+    // O(n) duplicate task-id detection using a HashSet.
     let mut seen_task_ids: std::collections::HashSet<&TaskId> =
         std::collections::HashSet::with_capacity(spec.task_count());
     for stage in spec.stages() {
@@ -1368,8 +1357,6 @@ fn job_spec_from_plan_parts(
 
     let mut stage = StageSpec::new(stage_id, format!("{job_name}-stage"));
 
-    // GAP-SH-04: If AQE CoalesceRule set a target partition count, generate
-    // exactly that many tasks instead of one-per-plan-node.
     if let Some(count) = coalesced_partition_count {
         let task_count = count.max(1);
         for i in 0..task_count {

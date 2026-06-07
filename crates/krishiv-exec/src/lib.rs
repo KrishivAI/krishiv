@@ -30,6 +30,9 @@ pub enum ExecError {
     /// Incoming batch schema cannot be evolved to the target schema.
     #[error("incompatible schema evolution: {0}")]
     IncompatibleSchemaEvolution(String),
+    /// A CEP pattern matching error occurred.
+    #[error("cep error: {0}")]
+    Cep(String),
 }
 
 impl From<arrow::error::ArrowError> for ExecError {
@@ -64,13 +67,11 @@ pub mod schema_normalize;
 pub mod side_output;
 pub mod temporal_join;
 #[cfg(test)]
-pub mod watermark_e2e;
+mod watermark_e2e;
 pub mod watermark_util;
 pub mod window;
 
 pub use chunk::ChunkOperator;
-
-// ── Re-exports for backwards-compatible crate-level API ───────────────────────
 
 pub use adaptive::{
     AdaptiveDecisionKind, AdaptiveDecisionLog, AdaptiveOverrideConfig, HeavyHittersTracker,
@@ -1477,9 +1478,9 @@ mod tests {
         assert!(clear.rows_per_second.is_none());
     }
 
-    // ── IntervalJoinState tests ──────────────────────────────────────────────
+    // ── PerKeyIntervalJoin tests ─────────────────────────────────────────────
 
-    use super::interval_join::{IntervalJoinSpec, IntervalJoinState};
+    use super::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
 
     fn make_interval_batch(col_name: &str, values: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1492,18 +1493,19 @@ mod tests {
 
     #[test]
     fn interval_join_basic_match() {
-        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+        let mut join = PerKeyIntervalJoin::new(IntervalJoinSpec {
             lower_bound_ms: -100,
             upper_bound_ms: 100,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         });
         // left event at t=1000
         let left = make_interval_batch("lv", vec![1]);
-        state.push_left(1000, left.clone());
+        join.push_left("k", 1000, left.clone());
 
         // right event at t=1050 → delta=50, within [-100,100]
         let right = make_interval_batch("rv", vec![2]);
-        let matches = state.push_right(1050, right);
+        let matches = join.push_right("k", 1050, right);
         assert_eq!(matches.len(), 1);
         // left batch in match should equal the original left
         assert_eq!(matches[0].0.schema(), left.schema());
@@ -1512,26 +1514,28 @@ mod tests {
 
     #[test]
     fn interval_join_empty_right_produces_no_match() {
-        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+        let mut join = PerKeyIntervalJoin::new(IntervalJoinSpec {
             lower_bound_ms: -100,
             upper_bound_ms: 100,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         });
         // push left with no right events buffered
         let left = make_interval_batch("lv", vec![1]);
-        let matches = state.push_left(1000, left);
+        let matches = join.push_left("k", 1000, left);
         assert!(matches.is_empty());
     }
 
     #[test]
     fn interval_join_empty_left_produces_no_match() {
-        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+        let mut join = PerKeyIntervalJoin::new(IntervalJoinSpec {
             lower_bound_ms: -100,
             upper_bound_ms: 100,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         });
         let right = make_interval_batch("rv", vec![1]);
-        let matches = state.push_right(1000, right);
+        let matches = join.push_right("k", 1000, right);
         assert!(matches.is_empty());
     }
 
@@ -1539,10 +1543,11 @@ mod tests {
     fn interval_join_schema_mismatch_still_joins() {
         // Left and right have different schemas — interval join is on event time,
         // not column names, so both RecordBatches pass through untouched.
-        let mut state = IntervalJoinState::new(IntervalJoinSpec {
+        let mut join = PerKeyIntervalJoin::new(IntervalJoinSpec {
             lower_bound_ms: -50,
             upper_bound_ms: 50,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         });
 
         let left_schema = Arc::new(Schema::new(vec![
@@ -1557,7 +1562,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.push_left(1000, left.clone());
+        join.push_left("k", 1000, left.clone());
 
         let right_schema = Arc::new(Schema::new(vec![
             Field::new("ts", DataType::Int64, false),
@@ -1571,7 +1576,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let matches = state.push_right(1020, right);
+        let matches = join.push_right("k", 1020, right);
 
         assert_eq!(matches.len(), 1);
         // Verify schemas are preserved from each side

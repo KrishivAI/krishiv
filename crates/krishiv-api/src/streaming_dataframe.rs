@@ -5,7 +5,7 @@ use arrow::array::{Array, Int64Array};
 use arrow::record_batch::RecordBatch;
 use futures::Stream;
 use futures::StreamExt;
-use krishiv_exec::interval_join::{IntervalJoinSpec, IntervalJoinState};
+use krishiv_exec::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
 use krishiv_exec::side_output::{SideOutput, SideOutputRouter};
 use krishiv_exec::temporal_join::{TemporalJoinSpec, VersionedTableState};
 use krishiv_exec::{AggExpr, ExecError, WatermarkState};
@@ -378,7 +378,7 @@ fn receiver_exec_stream(
 /// Stream-table as-of (temporal) join.
 ///
 /// For each row in `stream_batches`, looks up the latest table snapshot in
-/// `table_snapshots` whose `spec.table_version_col` timestamp is ≤ the row's
+/// `table_snapshots` whose `version_col` timestamp is ≤ the row's
 /// `spec.stream_time_col` value and returns the matched table batch. Rows with
 /// no matching version are included with `None` table columns (left join) or
 /// excluded (inner join, when `spec.inner_join = true`).
@@ -386,13 +386,14 @@ pub fn temporal_join(
     stream_batches: &[RecordBatch],
     table_snapshots: &[RecordBatch],
     spec: &TemporalJoinSpec,
+    version_col: &str,
     lookback_ms: i64,
 ) -> Result<Vec<(RecordBatch, Option<RecordBatch>)>> {
     let mut state = VersionedTableState::new(lookback_ms);
     for snap in table_snapshots {
         let ver_idx = snap
             .schema()
-            .index_of(&spec.table_version_col)
+            .index_of(version_col)
             .map_err(|e| KrishivError::Runtime {
                 message: e.to_string(),
             })?;
@@ -401,10 +402,7 @@ pub fn temporal_join(
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or_else(|| KrishivError::Runtime {
-                message: format!(
-                    "table_version_col '{}' must be Int64",
-                    spec.table_version_col
-                ),
+                message: format!("version_col '{version_col}' must be Int64"),
             })?;
         for i in 0..snap.num_rows() {
             if !ver_col.is_null(i) {
@@ -459,7 +457,7 @@ pub fn interval_join(
     right_time_col: &str,
     spec: IntervalJoinSpec,
 ) -> Result<Vec<(RecordBatch, RecordBatch)>> {
-    let mut state = IntervalJoinState::new(spec);
+    let mut join = PerKeyIntervalJoin::new(spec);
     let mut pairs = Vec::new();
 
     // Helper: extract i64 event time from a single-column lookup.
@@ -486,7 +484,7 @@ pub fn interval_join(
         let times = get_times(batch, left_time_col)?;
         for (i, &t) in times.iter().enumerate() {
             let row = batch.slice(i, 1);
-            let matched = state.push_left(t, row);
+            let matched = join.push_left("", t, row);
             pairs.extend(matched);
         }
     }
@@ -494,7 +492,7 @@ pub fn interval_join(
         let times = get_times(batch, right_time_col)?;
         for (i, &t) in times.iter().enumerate() {
             let row = batch.slice(i, 1);
-            let matched = state.push_right(t, row);
+            let matched = join.push_right("", t, row);
             pairs.extend(matched);
         }
     }
@@ -754,12 +752,11 @@ mod tests {
 
         let spec = TemporalJoinSpec {
             stream_time_col: "stream_ts".to_string(),
-            table_version_col: "version_ts".to_string(),
             join_keys: vec![],
             inner_join: false,
         };
 
-        let pairs = temporal_join(&[stream], &[table], &spec, 60_000).unwrap();
+        let pairs = temporal_join(&[stream], &[table], &spec, "version_ts", 60_000).unwrap();
         assert_eq!(
             pairs.len(),
             1,
@@ -784,12 +781,11 @@ mod tests {
 
         let spec = TemporalJoinSpec {
             stream_time_col: "stream_ts".to_string(),
-            table_version_col: "version_ts".to_string(),
             join_keys: vec![],
             inner_join: true,
         };
 
-        let pairs = temporal_join(&[stream], &[table], &spec, 60_000).unwrap();
+        let pairs = temporal_join(&[stream], &[table], &spec, "version_ts", 60_000).unwrap();
         assert!(
             pairs.is_empty(),
             "inner join must exclude rows with no table match"
@@ -803,12 +799,11 @@ mod tests {
 
         let spec = TemporalJoinSpec {
             stream_time_col: "stream_ts".to_string(),
-            table_version_col: "version_ts".to_string(),
             join_keys: vec![],
             inner_join: false,
         };
 
-        let pairs = temporal_join(&[stream], &[table], &spec, 60_000).unwrap();
+        let pairs = temporal_join(&[stream], &[table], &spec, "version_ts", 60_000).unwrap();
         assert_eq!(pairs.len(), 1);
         assert!(
             pairs[0].1.is_none(),
@@ -826,6 +821,7 @@ mod tests {
             lower_bound_ms: 0,
             upper_bound_ms: 100,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         assert_eq!(pairs.len(), 1, "events within window should match");
@@ -841,6 +837,7 @@ mod tests {
             lower_bound_ms: 0,
             upper_bound_ms: 100,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty(), "events outside window must not match");
@@ -856,6 +853,7 @@ mod tests {
             lower_bound_ms: 0,
             upper_bound_ms: 200,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         };
         let pairs = interval_join(&[left], &[right], "event_ts", "event_ts", spec).unwrap();
         // 1050-1000=50 ✓, 1080-1000=80 ✓, 2000-1000=1000 ✗
@@ -868,6 +866,7 @@ mod tests {
             lower_bound_ms: 0,
             upper_bound_ms: 1000,
             key_column: "k".into(),
+            max_buffer_per_side: 1000,
         };
         let pairs = interval_join(&[], &[], "event_ts", "event_ts", spec).unwrap();
         assert!(pairs.is_empty());

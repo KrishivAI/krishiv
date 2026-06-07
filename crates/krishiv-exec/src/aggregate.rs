@@ -72,9 +72,9 @@ impl<'a> PreDowncastCol<'a> {
         match self {
             Self::Int32(arr) => Ok(arr.value(row) as i64),
             Self::Int64(arr) => Ok(arr.value(row)),
-            _ => Err(ExecError::Arrow(format!(
-                "int64_value called on unsupported column type"
-            ))),
+            _ => Err(ExecError::Arrow(
+                "int64_value called on unsupported column type".into(),
+            )),
         }
     }
 
@@ -83,9 +83,9 @@ impl<'a> PreDowncastCol<'a> {
             Self::Int32(arr) => Ok(arr.value(row) as f64),
             Self::Int64(arr) => Ok(arr.value(row) as f64),
             Self::Float64(arr) => Ok(arr.value(row)),
-            _ => Err(ExecError::Arrow(format!(
-                "float64_value called on unsupported column type"
-            ))),
+            _ => Err(ExecError::Arrow(
+                "float64_value called on unsupported column type".into(),
+            )),
         }
     }
 }
@@ -123,12 +123,12 @@ pub struct AggExpr {
 #[derive(Debug)]
 pub struct AggState {
     /// Integer aggregates: count, sum, min, max.
-    pub values: Vec<i64>,
+    pub(crate) values: Vec<i64>,
     /// Tracks whether Min/Max has received at least one value.
-    pub has_value: Vec<bool>,
+    pub(crate) has_value: Vec<bool>,
     /// Sum for `Avg` (all numeric types promoted to f64).
-    pub avg_sums: Vec<f64>,
-    pub avg_counts: Vec<u64>,
+    pub(crate) avg_sums: Vec<f64>,
+    pub(crate) avg_counts: Vec<u64>,
 }
 
 impl AggState {
@@ -319,7 +319,9 @@ fn update_agg_state_pre(
     for (i, expr) in agg_exprs.iter().enumerate() {
         match expr.function {
             AggFunction::Count => {
-                state.values[i] += 1;
+                state.values[i] = state.values[i].checked_add(1).ok_or_else(|| {
+                    ExecError::InvalidInput("count overflow: i64::MAX reached".into())
+                })?;
                 state.has_value[i] = true;
             }
             AggFunction::Sum | AggFunction::Min | AggFunction::Max => {
@@ -332,7 +334,11 @@ fn update_agg_state_pre(
                 let v = col.int64_value(row)?;
                 match expr.function {
                     AggFunction::Sum => {
-                        state.values[i] += v;
+                        state.values[i] = state.values[i].checked_add(v).ok_or_else(|| {
+                            ExecError::InvalidInput(
+                                "sum overflow in pre-downcast path: i64::MAX reached".into(),
+                            )
+                        })?;
                         state.has_value[i] = true;
                     }
                     AggFunction::Min => {
@@ -566,5 +572,31 @@ impl LocalAggregator {
         }
 
         Ok(RecordBatch::try_new(out_schema, columns)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_overflow_returns_error() {
+        // Directly exercise update_agg_state_pre with a state that has count = i64::MAX.
+        // The next increment must return Err(InvalidInput) rather than wrapping.
+        let exprs = vec![AggExpr {
+            function: AggFunction::Count,
+            input_column: String::new(),
+            output_column: "cnt".into(),
+        }];
+        let mut state = AggState::new(&exprs);
+        state.values[0] = i64::MAX;
+        state.has_value[0] = true;
+
+        // pre_cols entry is None for Count (input column is ignored).
+        let result = update_agg_state_pre(&mut state, &exprs, &[None], 0);
+        assert!(
+            matches!(result, Err(ExecError::InvalidInput(_))),
+            "count at i64::MAX must return Err(InvalidInput), got {result:?}"
+        );
     }
 }

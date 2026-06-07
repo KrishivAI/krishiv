@@ -1,7 +1,7 @@
 //! Watermark propagation end-to-end helpers (R16 S6.2).
 
 use crate::cep::CepOperator;
-use crate::interval_join::{IntervalJoinSpec, IntervalJoinState};
+use crate::interval_join::{IntervalJoinSpec, PerKeyIntervalJoin};
 use crate::side_output::{SideOutput, SideOutputRouter};
 use crate::window::{MultiSourceWatermarkState, WatermarkState};
 use krishiv_cep::{CompiledPattern, PatternStage};
@@ -12,7 +12,7 @@ pub struct WatermarkE2ePipeline {
     pub watermark: WatermarkState,
     pub multi_source: MultiSourceWatermarkState,
     pub side_router: SideOutputRouter,
-    pub interval: IntervalJoinState,
+    pub interval: PerKeyIntervalJoin,
     pub cep: CepOperator,
 }
 
@@ -35,10 +35,11 @@ impl WatermarkE2ePipeline {
             watermark: WatermarkState::new(500),
             multi_source: MultiSourceWatermarkState::new(),
             side_router: SideOutputRouter::new(SideOutput::new("late", 200), "ts"),
-            interval: IntervalJoinState::new(IntervalJoinSpec {
+            interval: PerKeyIntervalJoin::new(IntervalJoinSpec {
                 lower_bound_ms: -100,
                 upper_bound_ms: 100,
                 key_column: "k".into(),
+                max_buffer_per_side: 1000,
             }),
             cep: CepOperator::new(pattern, "k"),
         }

@@ -208,6 +208,19 @@ mod tests {
     }
 
     #[test]
+    fn cep_hex_key_round_trip_with_null_bytes() {
+        // Keys that contain null bytes (0x00) and other non-UTF8 byte sequences
+        // must survive encode_key_hex → decode_key_hex without data loss.
+        let key_with_nulls: Vec<u8> = vec![0x00, 0x01, 0xFF, 0x00, 0xAB];
+        let encoded = encode_key_hex(&key_with_nulls);
+        let decoded = decode_key_hex(&encoded).expect("valid hex must decode");
+        assert_eq!(decoded, key_with_nulls, "hex round-trip must preserve null bytes");
+
+        // Also verify that an odd-length hex string is rejected.
+        assert!(decode_key_hex("abc").is_none(), "odd-length hex must return None");
+    }
+
+    #[test]
     fn cep_state_round_trips_through_backend() {
         use krishiv_state::{FjallStateBackend, Namespace};
 

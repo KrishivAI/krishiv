@@ -333,7 +333,7 @@ impl Coordinator {
             })
             .unwrap_or((
                 false,
-                ResourceUsage::zero(),
+                ResourceUsage::default(),
                 JobState::Accepted,
                 String::new(),
                 String::new(),

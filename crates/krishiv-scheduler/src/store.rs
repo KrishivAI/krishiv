@@ -250,6 +250,7 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 }
 
+#[cfg(feature = "etcd")]
 const JSON_METADATA_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +294,7 @@ impl TryFrom<PersistedExecutorDescriptor> for ExecutorDescriptor {
     }
 }
 
+#[cfg(feature = "etcd")]
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PersistedMetadata {
     #[serde(default = "default_json_metadata_schema_version")]
@@ -305,6 +307,7 @@ pub(crate) struct PersistedMetadata {
     pub(crate) executor_descriptors: Vec<PersistedExecutorDescriptor>,
 }
 
+#[cfg(feature = "etcd")]
 impl PersistedMetadata {
     pub(crate) fn validate_schema_version(&self) -> SchedulerResult<()> {
         if self.schema_version > JSON_METADATA_SCHEMA_VERSION {
@@ -319,10 +322,12 @@ impl PersistedMetadata {
     }
 }
 
+#[cfg(feature = "etcd")]
 fn default_json_metadata_schema_version() -> u32 {
     JSON_METADATA_SCHEMA_VERSION
 }
 
+#[cfg(feature = "etcd")]
 fn default_json_metadata_store_kind() -> String {
     String::from("krishiv.scheduler.metadata")
 }
@@ -955,6 +960,7 @@ pub(crate) fn parse_task_state(value: &str) -> SchedulerResult<TaskState> {
 }
 
 /// Serialize coordinator metadata for etcd or other blob stores.
+#[cfg(feature = "etcd")]
 pub(crate) fn encode_metadata_snapshot(
     events: &[EventLogEvent],
     jobs: &[JobRecord],
@@ -962,7 +968,8 @@ pub(crate) fn encode_metadata_snapshot(
     encode_metadata_snapshot_with_executors(events, jobs, &[])
 }
 
-/// Like [`encode_metadata_snapshot`] but also includes executor descriptors (R10).
+/// Like [`encode_metadata_snapshot`] but also includes executor descriptors.
+#[cfg(feature = "etcd")]
 pub(crate) fn encode_metadata_snapshot_with_executors(
     events: &[EventLogEvent],
     jobs: &[JobRecord],
@@ -1257,6 +1264,7 @@ impl NonBlockingStoreHandle {
 }
 
 /// Restore coordinator metadata from a serialized snapshot blob.
+#[cfg(feature = "etcd")]
 pub(crate) fn decode_metadata_snapshot(
     bytes: &[u8],
 ) -> SchedulerResult<(Vec<EventLogEvent>, Vec<JobRecord>)> {
@@ -1264,7 +1272,8 @@ pub(crate) fn decode_metadata_snapshot(
     Ok((events, jobs))
 }
 
-/// Like [`decode_metadata_snapshot`] but also restores executor descriptors (R10).
+/// Like [`decode_metadata_snapshot`] but also restores executor descriptors.
+#[cfg(feature = "etcd")]
 pub(crate) fn decode_metadata_snapshot_with_executors(
     bytes: &[u8],
 ) -> SchedulerResult<(

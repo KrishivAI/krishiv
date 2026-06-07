@@ -6,10 +6,11 @@ use krishiv_plan::window::{
 };
 use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
 
-/// Open or create a state backend for a bounded-window operator.
+/// Open or create a state backend for a window operator.
 ///
-/// Mirrors the same function in `continuous.rs` for the bounded execution path.
-fn open_state_backend(
+/// Shared between `operator_runtime.rs` (bounded/streaming execution) and
+/// `continuous.rs` (continuous drain-cycle execution).
+pub(crate) fn open_state_backend(
     state_dir: Option<&std::path::Path>,
     tag: &str,
     ttl_ms: Option<u64>,
@@ -398,6 +399,7 @@ pub fn execute_streaming_window(
 /// Convert legacy runtime local spec fields into a plan `WindowExecutionSpec`.
 pub fn local_spec_to_window_execution(
     key_column: String,
+    key_column_type: String,
     event_time_column: String,
     watermark_lag_ms: u64,
     window_kind: LocalWindowKindBridge,
@@ -412,7 +414,7 @@ pub fn local_spec_to_window_execution(
     };
     WindowExecutionSpec {
         key_column,
-        key_column_type: String::from("utf8"),
+        key_column_type,
         event_time_column,
         watermark_lag_ms,
         window_kind: kind,
@@ -458,6 +460,23 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn local_spec_to_window_execution_int32_key_type() {
+        let spec = local_spec_to_window_execution(
+            "user_id".into(),
+            "int32".into(),
+            "ts".into(),
+            0,
+            LocalWindowKindBridge::Tumbling,
+            5_000,
+            vec![],
+            None,
+        );
+        assert_eq!(spec.key_column_type, "int32");
+        assert_eq!(spec.key_column, "user_id");
+        assert_eq!(spec.window_size_ms, 5_000);
+    }
 
     #[test]
     fn multi_source_watermark_min_across_sources() {

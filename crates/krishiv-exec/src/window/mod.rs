@@ -188,7 +188,7 @@ impl MultiSourceWatermarkState {
         if watermark_ms > *entry {
             *entry = watermark_ms;
         }
-        self.last_update_ms.insert(source_id.to_owned(), wall_ms());
+        self.last_update_ms.insert(source_id.to_owned(), elapsed_ms());
         // Track whether the *effective* watermark (minimum across all sources) advanced.
         let effective = self.effective_watermark_ms();
         if effective > self.prev_effective_watermark_ms {
@@ -230,7 +230,7 @@ impl MultiSourceWatermarkState {
         let Some(timeout_ms) = self.idle_timeout_ms else {
             return;
         };
-        let now = wall_ms();
+        let now = elapsed_ms();
         for source_id in self.last_update_ms.keys().cloned().collect::<Vec<_>>() {
             let Some(&last) = self.last_update_ms.get(&source_id) else {
                 continue;
@@ -264,7 +264,7 @@ impl MultiSourceWatermarkState {
     }
 }
 
-fn wall_ms() -> u64 {
+fn elapsed_ms() -> u64 {
     static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     BASE.get_or_init(std::time::Instant::now)
         .elapsed()

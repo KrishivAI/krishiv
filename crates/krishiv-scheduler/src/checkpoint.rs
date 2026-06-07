@@ -38,7 +38,7 @@ pub enum CheckpointCoordinatorState {
     Failed { epoch: u64, reason: String },
 }
 
-/// Per-job checkpoint coordinator (R6).
+/// Per-job checkpoint coordinator.
 ///
 /// Created when a streaming job with `checkpoint_interval_ms.is_some()` is submitted.
 /// Drives the barrier protocol: initiates epochs, collects executor acks, writes
@@ -108,8 +108,7 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// **Test-only**: create a checkpoint coordinator with a default coordinator id.
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn new_for_test(
         job_id: JobId,
         storage: Arc<dyn CheckpointStorage>,
@@ -125,7 +124,7 @@ impl CheckpointCoordinator {
         )
     }
 
-    /// Update quorum size to match currently running tasks (SCH-3).
+    /// Update quorum size to match currently running tasks.
     pub fn set_expected_task_count(&mut self, count: usize) {
         self.expected_task_count = count;
     }
@@ -141,7 +140,9 @@ impl CheckpointCoordinator {
                 self.job_id
             ));
         }
-        self.current_epoch += 1;
+        self.current_epoch = self.current_epoch.checked_add(1).ok_or_else(|| {
+            format!("checkpoint epoch overflowed for job {}", self.job_id)
+        })?;
         self.elapsed_ms = 0;
         self.awaiting_elapsed_ms = 0;
         self.pending_acks.clear();
@@ -372,7 +373,7 @@ impl CheckpointCoordinator {
             kafka_offsets: None,
         };
 
-        // GAP-CP-03: Validate fencing token before committing to storage.
+        // Validate fencing token before committing to storage.
         krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())
             .map_err(|e| format!("fencing token mismatch for job {}: {e}", self.job_id))?;
 
@@ -599,7 +600,7 @@ impl CheckpointCoordinator {
             kafka_offsets: None,
         };
 
-        // GAP-CP-03: Validate fencing token before committing to storage.
+        // Validate fencing token before committing to storage.
         // Rejects any attempt to write a checkpoint whose token doesn't match
         // the current coordinator generation, preventing split-brain writes.
         krishiv_checkpoint::validate_fencing_token(&metadata, self.fencing_token.as_u64())

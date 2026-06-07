@@ -1,110 +1,105 @@
 //! Content-hash memoization cache (R14 S2.2).
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use dashmap::DashMap;
 
 use crate::ExecError;
 
+struct MemoCacheInner {
+    map: HashMap<[u8; 32], RecordBatch>,
+    order: VecDeque<[u8; 32]>,
+}
+
 /// LRU memo cache keyed by SHA-256 content hash.
+///
+/// Uses a single `Mutex<MemoCacheInner>` to eliminate the TOCTOU race that
+/// exists when a separate `DashMap` and order-`Mutex` are used together.
+/// Stores `RecordBatch` values directly to avoid IPC serialization overhead.
+/// Hit/miss counters use `AtomicU64` for lock-free reads.
 #[derive(Debug)]
 pub struct MemoCache {
     max_entries: usize,
-    map: DashMap<[u8; 32], Vec<u8>>,
-    order: Mutex<VecDeque<[u8; 32]>>,
-    hits: Mutex<u64>,
-    misses: Mutex<u64>,
+    inner: Mutex<MemoCacheInner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl std::fmt::Debug for MemoCacheInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoCacheInner")
+            .field("len", &self.map.len())
+            .finish()
+    }
 }
 
 impl MemoCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             max_entries: max_entries.max(1),
-            map: DashMap::new(),
-            order: Mutex::new(VecDeque::new()),
-            hits: Mutex::new(0),
-            misses: Mutex::new(0),
+            inner: Mutex::new(MemoCacheInner {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
     pub fn lookup(&self, key: [u8; 32]) -> Option<RecordBatch> {
-        let bytes = self.map.get(&key)?;
-        *self.hits.lock().ok()? += 1;
-        decode_batch(&bytes).ok()
+        let inner = self.inner.lock().ok()?;
+        inner.map.get(&key).cloned()
     }
 
     pub fn store(&self, key: [u8; 32], batch: RecordBatch) -> Result<(), ExecError> {
-        let encoded = encode_batch(&batch)?;
-        let mut order = self
-            .order
+        let mut inner = self
+            .inner
             .lock()
             .map_err(|_| ExecError::Arrow("memo cache lock poisoned".into()))?;
 
-        if self.map.contains_key(&key) {
-            order.retain(|k| k != &key);
+        if inner.map.contains_key(&key) {
+            inner.order.retain(|k| k != &key);
         }
-        order.push_back(key);
-        self.map.insert(key, encoded);
+        inner.order.push_back(key);
+        inner.map.insert(key, batch);
 
-        while order.len() > self.max_entries {
-            if let Some(evicted) = order.pop_front() {
-                self.map.remove(&evicted);
+        while inner.order.len() > self.max_entries {
+            if let Some(evicted) = inner.order.pop_front() {
+                inner.map.remove(&evicted);
             }
         }
         Ok(())
     }
 
     pub fn cache_info(&self) -> (u64, u64, usize) {
-        let hits = self.hits.lock().map(|h| *h).unwrap_or(0);
-        let misses = self.misses.lock().map(|m| *m).unwrap_or(0);
-        let size = self.map.len();
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let size = self
+            .inner
+            .lock()
+            .map(|g| g.map.len())
+            .unwrap_or(0);
         (hits, misses, size)
     }
 
     pub fn lookup_or_miss(&self, key: [u8; 32]) -> Option<RecordBatch> {
         if let Some(batch) = self.lookup(key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(batch);
         }
-        if let Ok(mut misses) = self.misses.lock() {
-            *misses += 1;
-        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
-}
-
-fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ExecError> {
-    let mut buf = Vec::with_capacity(4096);
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
-            .map_err(|e| ExecError::Arrow(e.to_string()))?;
-        writer
-            .write(batch)
-            .map_err(|e| ExecError::Arrow(e.to_string()))?;
-        writer
-            .finish()
-            .map_err(|e| ExecError::Arrow(e.to_string()))?;
-    }
-    Ok(buf)
-}
-
-fn decode_batch(bytes: &[u8]) -> Result<RecordBatch, ExecError> {
-    let cursor = std::io::Cursor::new(bytes);
-    let mut reader =
-        StreamReader::try_new(cursor, None).map_err(|e| ExecError::Arrow(e.to_string()))?;
-    reader
-        .next()
-        .transpose()
-        .map_err(|e| ExecError::Arrow(e.to_string()))?
-        .ok_or_else(|| ExecError::Arrow("empty memo ipc stream".into()))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -179,5 +174,27 @@ mod tests {
                 .value(0),
             10
         );
+    }
+
+    #[test]
+    fn memo_concurrent_store_no_race() {
+        let cache = Arc::new(MemoCache::new(100));
+        let mut handles = vec![];
+        for i in 0u8..8 {
+            let c = Arc::clone(&cache);
+            handles.push(thread::spawn(move || {
+                let mut key = [0u8; 32];
+                key[0] = i;
+                c.store(key, batch(i as i64)).unwrap();
+                // Immediately look it up — must find the value we just stored.
+                let hit = c.lookup(key);
+                assert!(hit.is_some(), "concurrent store then lookup must succeed for thread {i}");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        let (_, _, size) = cache.cache_info();
+        assert_eq!(size, 8, "all 8 unique keys must be present after concurrent stores");
     }
 }

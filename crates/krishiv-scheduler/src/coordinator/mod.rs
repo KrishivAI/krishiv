@@ -1,4 +1,4 @@
-//! R2 coordinator skeleton.
+//! Coordinator state machine and shared handle.
 
 use dashmap::DashMap;
 use krishiv_checkpoint::{
@@ -81,7 +81,7 @@ fn generate_coordinator_id() -> SchedulerResult<CoordinatorId> {
     })
 }
 
-/// R2 coordinator skeleton.
+/// Active coordinator.
 ///
 /// Intentionally does *not* derive `Clone`.  Cloning the coordinator would
 /// only deep-copy `HashMap` fields while aliasing the `Arc` fields
@@ -124,9 +124,8 @@ pub struct Coordinator {
     /// Reverse index from job_id to task_ids for O(tasks_per_job) cleanup.
     /// Built in `index_streaming_tasks`, used in `remove_streaming_task_index`.
     pub(crate) streaming_job_task_index: HashMap<JobId, Vec<TaskId>>,
-    /// M6: Sharded gRPC channel cache keyed by executor endpoint string.
-    /// DashMap provides per-shard locking so lookups for different endpoints
-    /// proceed in parallel.  Avoids a full TCP+TLS handshake per task push.
+    /// Sharded gRPC channel cache keyed by executor endpoint string.
+    /// DashMap avoids a full TCP+TLS handshake per task push.
     pub(crate) executor_channels: Arc<DashMap<String, tonic::transport::Channel>>,
     pub(crate) checkpoint_notify_sent: HashSet<(JobId, ExecutorId, u64)>,
     /// (job_id, epoch) pairs for which a gRPC barrier round-trip was dispatched.
@@ -158,10 +157,7 @@ pub struct Coordinator {
     /// Notify channel for waking daemon tick and other waiters on state change.
     pub(crate) notify: Arc<Notify>,
 
-    /// Track B (two-tier): Per-job JobCoordinator instances.
-    /// Each owns its JobRecord and will progressively own per-job launch decisions,
-    /// heartbeat windows, checkpoint coordination, and recovery logic.
-    /// The outer Coordinator (CCP) becomes thin routing + admission + cross-job concerns.
+    /// Per-job coordinators. Each owns its JobRecord and per-job launch decisions.
     pub(crate) job_coordinators: HashMap<JobId, Arc<crate::job_coordinator::JobCoordinator>>,
 }
 
@@ -184,17 +180,12 @@ impl fmt::Debug for Coordinator {
     }
 }
 
-/// Shared handle to the active coordinator owned by an R2 runtime process.
-///
-/// # Lock Sharding (H2 partial)
+/// Shared handle to the active coordinator.
 ///
 /// The outer `inner` lock guards the full `Coordinator` state. The dedicated
 /// `executor_inner` and `checkpoint_inner` locks provide finer-grained access
 /// to the hottest paths (heartbeat processing and checkpoint acks) without
 /// requiring the full coordinator write lock.
-///
-/// Migration path: hot gRPC handlers should prefer the dedicated inner locks;
-/// the outer lock is held only for operations that need full coordinator state.
 #[derive(Debug, Clone)]
 pub struct SharedCoordinator {
     inner: Arc<RwLock<Coordinator>>,
@@ -297,11 +288,9 @@ impl SharedCoordinator {
         inner.executors.list()
     }
 
-    /// Advance the heartbeat clock by one tick (P0-4).
+    /// Advance the heartbeat clock by one tick.
     pub async fn advance_heartbeat_tick(&self) -> SchedulerResult<Vec<ExecutorId>> {
-        tracing::debug!(
-            "advancing heartbeat tick (per-job JCP delegation and Notify will react in two-tier model)"
-        );
+        tracing::debug!("advancing heartbeat tick");
         let lost = {
             let mut coord = self.inner.write().await;
             let lost = coord.advance_heartbeat_clock(1)?;
@@ -326,9 +315,6 @@ impl SharedCoordinator {
             lost
         };
 
-        // Real JCP usage (Track B ownership): delegate per-job heartbeat staleness,
-        // loss recovery, and launch eligibility to the owning JobCoordinator.
-        // The outer Coordinator now asks the JCP rather than walking job state directly.
         // Clone JCP Arcs outside the read guard so .await calls do not hold the lock.
         let jc_snapshots: Vec<(JobId, Arc<crate::job_coordinator::JobCoordinator>)> = {
             let coord = self.inner.read().await;
@@ -386,34 +372,35 @@ impl SharedCoordinator {
         notify.notified().await;
     }
 
-    /// Launch and push all assigned tasks for non-terminal jobs (P0-4).
+    /// Launch and push all assigned tasks for non-terminal jobs.
     pub async fn drive_pending_task_launches(&self) -> SchedulerResult<usize> {
         tracing::debug!("driving pending task launches for non-terminal jobs");
 
-        // Real delegation (Track B): Build the list of jobs to drive using JCP-owned
-        // queries where possible. This moves filtering and decision data into the per-job
-        // coordinator.
+        // Build the list of jobs to drive, sorted by priority descending so
+        // higher-priority jobs consume executor slots first.
         let job_ids = {
             let coord = self.read().await;
-            let mut ids = Vec::new();
+            let mut id_pairs: Vec<(u8, JobId)> = Vec::new();
             for (job_id, jc) in coord.job_coordinators.iter() {
-                if jc.read_record().state().is_terminal() {
+                let (is_terminal, priority) = {
+                    let record = jc.read_record();
+                    (record.state().is_terminal(), record.spec.priority())
+                };
+                if is_terminal {
                     continue;
                 }
                 if let Some(_jc) = coord.job_coordinator(job_id) {
                     if jc.should_consider_for_launch().await {
-                        ids.push(job_id.clone());
+                        id_pairs.push((priority, job_id.clone()));
                     }
                 } else {
-                    // Fallback for jobs without JCP yet (transitional).
-                    ids.push(job_id.clone());
+                    id_pairs.push((priority, job_id.clone()));
                 }
             }
-            ids
+            id_pairs.sort_by(|a, b| b.0.cmp(&a.0));
+            id_pairs.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         };
 
-        // Real delegation (Track B): query per-job JCP surface for launch decision data.
-        // Pure async .await delegation — no block_on in this hot path.
         for job_id in &job_ids {
             let jc = {
                 let coord = self.inner.read().await;
@@ -435,10 +422,6 @@ impl SharedCoordinator {
                 );
             }
         }
-
-        // Real delegation step (Track B): the outer Coordinator will consult per-job
-        // JobCoordinator instances (via has_in_flight_tasks, stage_count, etc.) for
-        // launch and heartbeat decisions. The owned JCP methods above are the seam.
 
         // Phase 1: collect all assignment targets and channels.
         struct JobLaunch {
@@ -670,7 +653,7 @@ fn quota_policy_from_env() -> QuotaPolicy {
 }
 
 impl Coordinator {
-    /// Create an active R2 coordinator.
+    /// Create an active coordinator.
     pub fn active(coordinator_id: CoordinatorId) -> Self {
         Self::active_with_config(coordinator_id, CoordinatorConfig::default())
     }
@@ -839,7 +822,7 @@ impl Coordinator {
         &self.notify
     }
 
-    /// Promote a standby coordinator to active leader (P0-5 / P3-19).
+    /// Promote a standby coordinator to active leader.
     pub fn promote_to_active(&mut self) {
         self.state = CoordinatorState::Active;
     }

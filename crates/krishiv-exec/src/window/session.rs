@@ -216,7 +216,7 @@ impl SessionWindowOperator {
             })?;
 
         let late_threshold = self.prev_watermark_ms;
-        let gap = self.spec.session_gap_ms as i64;
+        let gap = i64::try_from(self.spec.session_gap_ms).unwrap_or(i64::MAX);
         let mut output = Vec::new();
 
         for row in 0..batch.num_rows() {
@@ -260,7 +260,7 @@ impl SessionWindowOperator {
 
     /// Flush sessions whose inactivity gap has passed the watermark.
     pub fn flush_closed_sessions(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
-        let gap = self.spec.session_gap_ms as i64;
+        let gap = i64::try_from(self.spec.session_gap_ms).unwrap_or(i64::MAX);
         // Use saturating_add to prevent i64 overflow when last_event_time_ms is
         // near i64::MAX (e.g. from a malformed event).  An overflow would wrap
         // to a negative value, making every session appear closed spuriously.
@@ -477,5 +477,37 @@ mod session_state_tests {
     fn session_state_parse_key_bad_prefix_returns_none() {
         let key = b"tw:other";
         assert!(parse_session_state_key(key).is_none());
+    }
+
+    #[test]
+    fn session_gap_ms_max_u64_does_not_panic() {
+        // session_gap_ms = u64::MAX overflows on `as i64` cast; try_from saturates to i64::MAX.
+        let spec = SessionWindowSpec {
+            key_column: "k".into(),
+            key_column_type: "utf8".into(),
+            event_time_column: "ts".into(),
+            session_gap_ms: u64::MAX,
+            agg_exprs: vec![AggExpr {
+                input_column: String::new(),
+                output_column: "cnt".into(),
+                function: AggFunction::Count,
+            }],
+        };
+        let mut op = SessionWindowOperator::new(spec);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![100i64])),
+            ],
+        )
+        .unwrap();
+        // Must not panic; session gap = i64::MAX so session never closes.
+        let out = op.process_batch(&batch, 1000).unwrap();
+        assert!(out.is_empty(), "session with gap=i64::MAX should not close at watermark 1000");
     }
 }

@@ -1,6 +1,5 @@
 //! Coordinator gRPC adapters.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use krishiv_checkpoint::CheckpointStorage;

@@ -13,7 +13,6 @@ use crate::{ExecError, ExecResult};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemporalJoinSpec {
     pub stream_time_col: String,
-    pub table_version_col: String,
     pub join_keys: Vec<String>,
     pub inner_join: bool,
 }
@@ -140,15 +139,17 @@ impl TemporalJoinOperator {
                 if table_schema.is_none() {
                     table_schema = Some(table_version.schema());
                 }
-                // Build joined row: stream columns + table columns.
-                let mut row_cols: Vec<ArrayRef> = Vec::new();
-                for col_idx in 0..stream_batch.num_columns() {
-                    row_cols.push(slice_column(stream_batch.column(col_idx), row, 1));
+                // Emit one joined output row per row in the table version snapshot.
+                for table_row in 0..table_version.num_rows() {
+                    let mut row_cols: Vec<ArrayRef> = Vec::new();
+                    for col_idx in 0..stream_batch.num_columns() {
+                        row_cols.push(slice_column(stream_batch.column(col_idx), row, 1));
+                    }
+                    for col_idx in 0..table_version.num_columns() {
+                        row_cols.push(slice_column(table_version.column(col_idx), table_row, 1));
+                    }
+                    output_columns.push(row_cols);
                 }
-                for col_idx in 0..table_version.num_columns() {
-                    row_cols.push(slice_column(table_version.column(col_idx), 0, 1));
-                }
-                output_columns.push(row_cols);
             } else if !self.spec.inner_join {
                 // Left outer: emit stream row with null table columns.
                 let mut row_cols: Vec<ArrayRef> = Vec::new();
@@ -186,7 +187,6 @@ impl TemporalJoinOperator {
         }
 
         // Combine all row columns into full columns.
-        let _num_stream_cols = stream_batch.num_columns();
         let total_cols = output_columns[0].len();
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(total_cols);
         for col_idx in 0..total_cols {
@@ -205,12 +205,14 @@ impl TemporalJoinOperator {
     }
 }
 
+/// Build a composite join key using ASCII record separator `\x1c` to avoid
+/// ambiguity with user data that may contain `|` or other printable characters.
 fn build_join_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> String {
-    let parts: Vec<String> = key_indices
+    key_indices
         .iter()
         .map(|&idx| format_column_value(batch.column(idx), row))
-        .collect();
-    parts.join("|")
+        .collect::<Vec<_>>()
+        .join("\x1c")
 }
 
 fn format_column_value(array: &dyn Array, row: usize) -> String {
@@ -432,12 +434,10 @@ mod tests {
     fn temporal_join_spec_fields() {
         let spec = TemporalJoinSpec {
             stream_time_col: "event_ts".into(),
-            table_version_col: "version".into(),
             join_keys: vec!["id".into()],
             inner_join: true,
         };
         assert_eq!(spec.stream_time_col, "event_ts");
-        assert_eq!(spec.table_version_col, "version");
         assert_eq!(spec.join_keys, vec!["id"]);
         assert!(spec.inner_join);
     }
@@ -448,7 +448,6 @@ mod tests {
     fn temporal_join_inner_join_matches() {
         let spec = TemporalJoinSpec {
             stream_time_col: "ts".into(),
-            table_version_col: "version".into(),
             join_keys: vec!["id".into()],
             inner_join: true,
         };
@@ -474,7 +473,6 @@ mod tests {
     fn temporal_join_inner_no_match_produces_empty() {
         let spec = TemporalJoinSpec {
             stream_time_col: "ts".into(),
-            table_version_col: "version".into(),
             join_keys: vec!["id".into()],
             inner_join: true,
         };
@@ -496,7 +494,6 @@ mod tests {
     fn temporal_join_as_of_returns_previous_version() {
         let spec = TemporalJoinSpec {
             stream_time_col: "ts".into(),
-            table_version_col: "version".into(),
             join_keys: vec!["id".into()],
             inner_join: true,
         };
@@ -518,7 +515,6 @@ mod tests {
     fn temporal_join_with_duplicate_join_keys() {
         let spec = TemporalJoinSpec {
             stream_time_col: "ts".into(),
-            table_version_col: "version".into(),
             join_keys: vec!["id".into()],
             inner_join: true,
         };
@@ -531,5 +527,78 @@ mod tests {
         let stream = stream_batch(vec!["a", "b"], vec![1500, 1500]);
         let result = op.join(&stream).unwrap();
         assert_eq!(result.num_rows(), 2);
+    }
+
+    #[test]
+    fn temporal_join_multi_row_table_version_emits_one_row_per_table_row() {
+        // A table version batch with 2 rows — each stream event should produce
+        // 2 joined output rows (one per table row), not just row 0.
+        let spec = TemporalJoinSpec {
+            stream_time_col: "ts".into(),
+            join_keys: vec!["id".into()],
+            inner_join: true,
+        };
+        let mut op = TemporalJoinOperator::new(spec, 10_000);
+
+        // Table version with 2 rows for key "a".
+        let two_row_table = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", arrow::datatypes::DataType::Utf8, false),
+                Field::new("score", arrow::datatypes::DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        op.upsert_version("a", 1000, two_row_table);
+
+        let stream = stream_batch(vec!["a"], vec![2000]);
+        let result = op.join(&stream).unwrap();
+        // Must emit 2 rows: one for each table row.
+        assert_eq!(result.num_rows(), 2, "multi-row table version must produce one output row per table row");
+        let score_col = result.column(result.schema().index_of("score").unwrap());
+        let scores = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut score_vals: Vec<i64> = (0..2).map(|i| scores.value(i)).collect();
+        score_vals.sort();
+        assert_eq!(score_vals, vec![10, 20]);
+    }
+
+    #[test]
+    fn temporal_join_key_containing_pipe_not_confused_with_separator() {
+        // Join key value contains "|" — must not be confused with composite key separator.
+        let spec = TemporalJoinSpec {
+            stream_time_col: "ts".into(),
+            join_keys: vec!["id".into()],
+            inner_join: true,
+        };
+        let mut op = TemporalJoinOperator::new(spec, 10_000);
+
+        // Register table state for key "a|b" (contains a pipe).
+        op.upsert_version("a|b", 1000, table_batch("a|b", 42));
+
+        // Also register for key "a" to ensure "a|b" doesn't match "a".
+        op.upsert_version("a", 1000, table_batch("a", 99));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Utf8, false),
+            Field::new("ts", arrow::datatypes::DataType::Int64, false),
+            Field::new("val", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let stream = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a|b"])),
+                Arc::new(Int64Array::from(vec![1500i64])),
+                Arc::new(Int64Array::from(vec![0i64])),
+            ],
+        )
+        .unwrap();
+        let result = op.join(&stream).unwrap();
+        assert_eq!(result.num_rows(), 1);
+        let score_col = result.column(result.schema().index_of("score").unwrap());
+        let scores = score_col.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(scores.value(0), 42, "key 'a|b' must match its own table version, not key 'a'");
     }
 }

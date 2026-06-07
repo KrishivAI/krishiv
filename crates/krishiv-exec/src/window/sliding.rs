@@ -120,13 +120,29 @@ impl SlidingWindowOperator {
     }
 
     /// All window starts (multiples of `slide`) that contain `event_time_ms`.
+    ///
+    /// Uses checked arithmetic throughout to avoid overflow for timestamps near
+    /// i64::MIN or i64::MAX.  Returns an empty vec when all window starts would
+    /// underflow rather than panicking.
     fn window_starts(event_time_ms: i64, size_ms: u64, slide_ms: u64) -> Vec<i64> {
         let slide = slide_ms as i64;
         let size = size_ms as i64;
 
         let q = event_time_ms / slide;
         let r = event_time_ms % slide;
-        let first = if r < 0 { (q - 1) * slide } else { q * slide };
+        // Compute the latest window start ≤ event_time_ms with checked arithmetic
+        // so that event times near i64::MIN cannot overflow.
+        let first = if r < 0 {
+            match q.checked_sub(1).and_then(|q1| q1.checked_mul(slide)) {
+                Some(f) => f,
+                None => return vec![],
+            }
+        } else {
+            match q.checked_mul(slide) {
+                Some(f) => f,
+                None => return vec![],
+            }
+        };
 
         let count = match (size as u64).checked_add(slide_ms).and_then(|n| n.checked_sub(1)) {
             Some(n) => (n / slide_ms) as usize,
@@ -134,11 +150,19 @@ impl SlidingWindowOperator {
         };
         let mut starts = Vec::with_capacity(count.min(1024));
         let mut s = first;
-        while let Some(sum) = s.checked_add(size) {
-            if sum <= event_time_ms { break; }
+        loop {
+            let sum = match s.checked_add(size) {
+                Some(v) => v,
+                None => break,
+            };
+            if sum <= event_time_ms {
+                break;
+            }
             starts.push(s);
-            if s.checked_sub(slide).is_none() { break; }
-            s -= slide;
+            match s.checked_sub(slide) {
+                Some(next) => s = next,
+                None => break,
+            }
         }
         starts
     }
@@ -350,5 +374,32 @@ mod sliding_state_tests {
     fn sliding_state_parse_key_bad_prefix_returns_none() {
         let key = b"tw:other";
         assert!(parse_sliding_state_key(key).is_none());
+    }
+
+    #[test]
+    fn window_starts_near_i64_min_does_not_panic() {
+        // Timestamps near i64::MIN should return an empty vec or a valid small
+        // set of starts rather than panicking or overflowing.
+        let very_negative = i64::MIN + 1;
+        let starts = SlidingWindowOperator::window_starts(very_negative, 1000, 500);
+        // Result must either be empty (underflow path) or contain valid i64 values.
+        for &s in &starts {
+            let end = s.checked_add(1000).expect("window end must not overflow");
+            assert!(
+                end > very_negative,
+                "every window start must produce an end > event_time"
+            );
+        }
+    }
+
+    #[test]
+    fn window_starts_i64_min_exactly_does_not_panic() {
+        let starts = SlidingWindowOperator::window_starts(i64::MIN, 2000, 1000);
+        for &s in &starts {
+            assert!(
+                s.checked_add(2000).is_some(),
+                "window end must not overflow i64"
+            );
+        }
     }
 }

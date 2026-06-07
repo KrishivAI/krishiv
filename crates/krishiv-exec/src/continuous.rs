@@ -4,9 +4,7 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 use krishiv_plan::window::{WindowExecutionSpec, WindowKind, validate_window_execution_spec};
-use krishiv_state::{FjallStateBackend, StateBackend, TtlConfig, TtlStateBackend};
-
-use crate::operator_runtime::window_agg_to_expr;
+use crate::operator_runtime::{open_state_backend, window_agg_to_expr};
 use crate::watermark_util::advance_effective_watermark;
 use crate::window::MultiSourceWatermarkState;
 use crate::{
@@ -62,41 +60,6 @@ impl WatermarkTracker {
     /// C2: Apply idle-source policy so stalled sources don't hold back all windows.
     fn apply_idle_source_policy(&mut self) {
         self.multi.apply_idle_source_policy();
-    }
-}
-
-/// Open or create a state backend for a window operator.
-///
-/// `state_dir` drives the durability profile:
-/// - `None` → `FjallStateBackend::ephemeral()` (dev-local, in-memory via tempdir)
-/// - `Some(dir)` → `FjallStateBackend::open(dir/tag)` (single-node-durable or distributed)
-///
-/// The `tag` suffix distinguishes multiple operators sharing the same state dir
-/// (e.g. `tumbling`, `sliding`, `session`).
-fn open_state_backend(
-    state_dir: Option<&std::path::Path>,
-    tag: &str,
-    ttl_ms: Option<u64>,
-) -> ExecResult<Box<dyn StateBackend>> {
-    let backend = match state_dir {
-        None => FjallStateBackend::ephemeral()
-            .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?,
-        Some(dir) => {
-            let path = dir.join(tag);
-            std::fs::create_dir_all(&path).map_err(|e| {
-                ExecError::InvalidWindowConfig(format!(
-                    "failed to create state dir '{}': {e}",
-                    path.display()
-                ))
-            })?;
-            FjallStateBackend::open(&path)
-                .map_err(|e| ExecError::InvalidWindowConfig(e.to_string()))?
-        }
-    };
-    if let Some(ms) = ttl_ms {
-        Ok(Box::new(TtlStateBackend::new(backend, TtlConfig::new(ms))))
-    } else {
-        Ok(Box::new(backend))
     }
 }
 
@@ -355,18 +318,21 @@ impl ContinuousWindowExecutor {
             self.last_watermark_ms = wm;
             raw.extend(self.operator.process_batch(batch, wm)?);
         }
-        if self.quality_hook.is_none() || raw.is_empty() {
+        if raw.is_empty() {
             return Ok(raw);
         }
-        let hook = self.quality_hook.as_mut().unwrap();
-        let mut output = Vec::with_capacity(raw.len());
-        for batch in raw {
-            let (accepted, _rejected_count) = hook.filter(batch)?;
-            if accepted.num_rows() > 0 {
-                output.push(accepted);
+        if let Some(hook) = self.quality_hook.as_mut() {
+            let mut output = Vec::with_capacity(raw.len());
+            for batch in raw {
+                let (accepted, _rejected_count) = hook.filter(batch)?;
+                if accepted.num_rows() > 0 {
+                    output.push(accepted);
+                }
             }
+            Ok(output)
+        } else {
+            Ok(raw)
         }
-        Ok(output)
     }
 
     /// Process one drain cycle atomically with respect to retained operator state.

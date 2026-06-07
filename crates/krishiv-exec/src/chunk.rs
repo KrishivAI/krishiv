@@ -13,6 +13,8 @@ use crate::{ExecError, ExecResult};
 pub struct ChunkOperator {
     chunker: Arc<dyn TextChunker>,
     text_col: String,
+    /// Cumulative count of null rows skipped during `execute`.
+    pub nulls_skipped: u64,
 }
 
 impl ChunkOperator {
@@ -21,11 +23,12 @@ impl ChunkOperator {
         Self {
             chunker,
             text_col: text_col.into(),
+            nulls_skipped: 0,
         }
     }
 
     /// Apply chunking to a batch containing `text_col`.
-    pub fn execute(&self, batch: &RecordBatch) -> ExecResult<RecordBatch> {
+    pub fn execute(&mut self, batch: &RecordBatch) -> ExecResult<RecordBatch> {
         let text_array = batch
             .column_by_name(&self.text_col)
             .ok_or_else(|| ExecError::ColumnNotFound(self.text_col.clone()))?
@@ -39,6 +42,7 @@ impl ChunkOperator {
         let mut row_indices = Vec::new();
         for row in 0..text_array.len() {
             if text_array.is_null(row) {
+                self.nulls_skipped += 1;
                 continue;
             }
             let chunks: Vec<Chunk> = self.chunker.chunk(text_array.value(row));
@@ -74,7 +78,7 @@ mod tests {
     #[test]
     fn chunk_operator_produces_rows_per_chunk() {
         let chunker: Arc<dyn krishiv_ai::TextChunker> = Arc::new(RecursiveTextChunker::new(20, 0));
-        let op = ChunkOperator::new(chunker, "text");
+        let mut op = ChunkOperator::new(chunker, "text");
 
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
@@ -95,7 +99,7 @@ mod tests {
     #[test]
     fn chunk_operator_missing_column_returns_error() {
         let chunker: Arc<dyn krishiv_ai::TextChunker> = Arc::new(RecursiveTextChunker::new(20, 0));
-        let op = ChunkOperator::new(chunker, "missing_col");
+        let mut op = ChunkOperator::new(chunker, "missing_col");
 
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
         let batch =

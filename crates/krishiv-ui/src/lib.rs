@@ -359,8 +359,10 @@ pub struct JobCheckpointsResponse {
 pub struct ResourceUsageView {
     /// Total CPU nanoseconds consumed by completed tasks.
     pub cpu_nanos: u64,
-    /// Peak memory bytes observed across completed tasks.
-    pub memory_peak_bytes: u64,
+    /// Peak memory bytes observed across completed tasks (max over tasks, not sum).
+    pub memory_peak_task_bytes: u64,
+    /// Sum of memory bytes across all completed tasks.
+    pub memory_total_bytes: u64,
     /// Number of completed tasks that reported stats.
     pub task_count: u32,
 }
@@ -369,7 +371,8 @@ impl ResourceUsageView {
     fn from_usage(u: &ResourceUsage) -> Self {
         Self {
             cpu_nanos: u.cpu_nanos,
-            memory_peak_bytes: u.memory_peak_bytes,
+            memory_peak_task_bytes: u.memory_peak_task_bytes,
+            memory_total_bytes: u.memory_total_bytes,
             task_count: u.task_count,
         }
     }

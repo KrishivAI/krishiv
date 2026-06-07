@@ -39,6 +39,8 @@ pub struct HeavyHittersTracker {
     index: HashMap<String, usize>,
     /// Total items processed.
     total: u64,
+    /// Cached position of the minimum-count entry; avoids O(n) scan on eviction.
+    min_pos: usize,
 }
 
 impl HeavyHittersTracker {
@@ -49,6 +51,7 @@ impl HeavyHittersTracker {
             counters: Vec::with_capacity(capacity),
             index: HashMap::new(),
             total: 0,
+            min_pos: 0,
         }
     }
 
@@ -65,26 +68,32 @@ impl HeavyHittersTracker {
 
         if self.counters.len() < self.capacity {
             let pos = self.counters.len();
+            // New entries start with count=1; track min_pos if this is the smallest.
+            if pos == 0 || self.counters[self.min_pos].1 > 1 {
+                self.min_pos = pos;
+            }
             self.counters.push((key.clone(), 1, 0));
             self.index.insert(key, pos);
             return;
         }
 
         // Replace the minimum-count entry (SpaceSaving eviction rule).
-        let min_pos = self
+        // Use cached min_pos — O(1) lookup instead of O(n) scan.
+        let min_pos = self.min_pos;
+        let min_count = self.counters[min_pos].1;
+        let old_key = self.counters[min_pos].0.clone();
+        self.index.remove(&old_key);
+        self.counters[min_pos] = (key.clone(), min_count + 1, min_count);
+        self.index.insert(key, min_pos);
+
+        // Re-scan for the new minimum after eviction (unavoidable after replacement).
+        self.min_pos = self
             .counters
             .iter()
             .enumerate()
             .min_by_key(|(_, (_, count, _))| *count)
             .map(|(i, _)| i)
             .unwrap_or(0);
-
-        let min_count = self.counters[min_pos].1;
-        // Remove old key from index before overwriting.
-        let old_key = self.counters[min_pos].0.clone();
-        self.index.remove(&old_key);
-        self.counters[min_pos] = (key.clone(), min_count + 1, min_count);
-        self.index.insert(key, min_pos);
     }
 
     /// Return the top-K entries by estimated count, highest first.
@@ -129,6 +138,7 @@ impl HeavyHittersTracker {
         self.counters.clear();
         self.index.clear();
         self.total = 0;
+        self.min_pos = 0;
     }
 }
 
@@ -204,10 +214,13 @@ impl RateLimiter {
 // ── R7.2 Slow-sink detection ─────────────────────────────────────────────────
 
 /// Running statistics for one sink's write latency.
+///
+/// Uses Welford's online algorithm for the mean to avoid integer saturation
+/// that would occur with a running total on high-frequency sinks.
 #[derive(Debug, Clone, Default)]
 pub struct SinkLatencyTracker {
     write_count: u64,
-    total_latency_ms: u64,
+    running_mean: f64,
     max_latency_ms: u64,
 }
 
@@ -215,17 +228,15 @@ impl SinkLatencyTracker {
     /// Record one write operation with `latency_ms` duration.
     pub fn record_write(&mut self, latency_ms: u64) {
         self.write_count += 1;
-        self.total_latency_ms = self.total_latency_ms.saturating_add(latency_ms);
+        // Welford: mean_n = mean_{n-1} + (x - mean_{n-1}) / n
+        self.running_mean +=
+            (latency_ms as f64 - self.running_mean) / self.write_count as f64;
         self.max_latency_ms = self.max_latency_ms.max(latency_ms);
     }
 
     /// Average write latency in milliseconds.
     pub fn avg_latency_ms(&self) -> f64 {
-        if self.write_count == 0 {
-            0.0
-        } else {
-            self.total_latency_ms as f64 / self.write_count as f64
-        }
+        self.running_mean
     }
 
     /// Maximum observed write latency.

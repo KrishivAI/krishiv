@@ -55,11 +55,7 @@ macro_rules! state_backed_window_op {
             }
 
             pub fn $flush_method(&mut self, watermark_ms: i64) -> ExecResult<Vec<RecordBatch>> {
-                let out = self.inner.$flush_method(watermark_ms)?;
-                self.inner
-                    .persist_to_state(self.state.as_mut(), &self.namespace)
-                    .map_err(|e| ExecError::Arrow(e.to_string()))?;
-                Ok(out)
+                self.inner.$flush_method(watermark_ms)
             }
 
             pub fn checkpoint(&mut self) -> ExecResult<()> {

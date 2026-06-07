@@ -154,9 +154,9 @@ impl QuotaQueueManager {
 
     /// Atomically persist `namespace_policies` to `state_path`.
     ///
-    /// Writes to `<state_path>.tmp` first, then renames to `<state_path>` so a
-    /// partial write never corrupts the on-disk state. Errors are logged at
-    /// `WARN` level and never propagated — persistence is best-effort.
+    /// Serializes to JSON on the calling thread (fast), then spawns a detached
+    /// thread for the actual disk write so the coordinator lock is not held
+    /// across blocking I/O. Errors are logged at WARN — persistence is best-effort.
     fn persist(&self) {
         let Some(ref path) = self.state_path else {
             return;
@@ -174,24 +174,26 @@ impl QuotaQueueManager {
             }
         };
 
-        let tmp_path = path.with_extension("tmp");
-        if let Err(e) = fs::write(&tmp_path, &json) {
-            tracing::warn!(
-                path = %tmp_path.display(),
-                error = %e,
-                "QuotaQueueManager: failed to write temporary state file"
-            );
-            return;
-        }
-
-        if let Err(e) = fs::rename(&tmp_path, path) {
-            tracing::warn!(
-                src = %tmp_path.display(),
-                dst = %path.display(),
-                error = %e,
-                "QuotaQueueManager: failed to rename temporary state file"
-            );
-        }
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let tmp_path = path.with_extension("tmp");
+            if let Err(e) = fs::write(&tmp_path, &json) {
+                tracing::warn!(
+                    path = %tmp_path.display(),
+                    error = %e,
+                    "QuotaQueueManager: failed to write temporary state file"
+                );
+                return;
+            }
+            if let Err(e) = fs::rename(&tmp_path, &path) {
+                tracing::warn!(
+                    src = %tmp_path.display(),
+                    dst = %path.display(),
+                    error = %e,
+                    "QuotaQueueManager: failed to rename temporary state file"
+                );
+            }
+        });
     }
 
     fn policy_for(&self, namespace_id: Option<&str>) -> &QuotaPolicy {

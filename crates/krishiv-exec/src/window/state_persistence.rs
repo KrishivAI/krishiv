@@ -21,12 +21,12 @@ use crate::aggregate::AggState;
 /// * `backend` - The state backend to write to
 /// * `namespace` - The namespace for this operator's state
 /// * `accumulators` - The window accumulators to persist
-/// * `key_prefix` - The 3-byte prefix for state keys (e.g., `b"tw:"`, `b"sw:"`, `b"ses:"`)
+/// * `key_prefix` - The prefix bytes for state keys (e.g., `b"tw:"`, `b"sw:"`, `b"ses:"`)
 pub fn persist_window_accumulators(
     backend: &mut dyn StateBackend,
     namespace: &Namespace,
     accumulators: &HashMap<(String, i64), AggState>,
-    key_prefix: &[u8; 3],
+    key_prefix: &[u8],
 ) -> StateResult<()> {
     // Remove all previously persisted entries so closed windows don't
     // survive into the next checkpoint snapshot.
@@ -54,7 +54,7 @@ pub fn persist_window_accumulators(
 
         // Length-prefix encoding: prefix | key_len_le_u32 | key_bytes | win_start_le_i64
         let key_bytes = key.as_bytes();
-        let mut state_key = Vec::with_capacity(3 + 4 + key_bytes.len() + 8);
+        let mut state_key = Vec::with_capacity(key_prefix.len() + 4 + key_bytes.len() + 8);
         state_key.extend_from_slice(key_prefix);
         state_key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
         state_key.extend_from_slice(key_bytes);
@@ -83,19 +83,20 @@ pub fn persist_window_accumulators(
 /// # Arguments
 /// * `backend` - The state backend to read from
 /// * `namespace` - The namespace for this operator's state
-/// * `key_prefix` - The 3-byte prefix for state keys (e.g., `b"tw:"`, `b"sw:"`, `b"ses:"`)
+/// * `key_prefix` - The prefix bytes for state keys (e.g., `b"tw:"`, `b"sw:"`, `b"ses:"`)
 ///
 /// # Returns
 /// A map of `(key, window_start) -> AggState` restored from the backend.
 pub fn restore_window_accumulators(
     backend: &dyn StateBackend,
     namespace: &Namespace,
-    key_prefix: &[u8; 3],
+    key_prefix: &[u8],
 ) -> StateResult<HashMap<(String, i64), AggState>> {
     let mut restored = HashMap::new();
+    let plen = key_prefix.len();
 
     for key_bytes in backend.list_keys(namespace)? {
-        if key_bytes.len() < 3 || &key_bytes[..3] != key_prefix {
+        if key_bytes.len() < plen || &key_bytes[..plen] != key_prefix {
             continue;
         }
         let Some(payload) = backend.get(namespace, &key_bytes)? else {
@@ -176,13 +177,14 @@ pub fn restore_operator_watermark_ms(
 /// Format: `prefix | key_len_le_u32 | key_bytes | win_start_le_i64`
 ///
 /// Returns `None` if the key doesn't match the expected prefix or is too short.
-fn parse_window_state_key(key_bytes: &[u8], prefix: &[u8; 3]) -> Option<(String, i64)> {
+fn parse_window_state_key(key_bytes: &[u8], prefix: &[u8]) -> Option<(String, i64)> {
+    let plen = prefix.len();
     // Must start with the expected prefix
-    if key_bytes.len() < 3 || &key_bytes[..3] != prefix {
+    if key_bytes.len() < plen || &key_bytes[..plen] != prefix {
         return None;
     }
 
-    let rest = &key_bytes[3..];
+    let rest = &key_bytes[plen..];
 
     // Need at least 4 bytes for key_len + 8 bytes for win_start
     if rest.len() < 12 {
@@ -220,11 +222,10 @@ mod tests {
 
     #[test]
     fn parse_window_state_key_valid() {
-        let prefix = b"tw:";
+        let prefix: &[u8] = b"tw:";
         let key = "my_key";
         let win_start = 1000i64;
 
-        // Build a valid key
         let key_bytes = key.as_bytes();
         let mut state_key = Vec::new();
         state_key.extend_from_slice(prefix);
@@ -237,25 +238,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_window_state_key_longer_prefix() {
+        let prefix: &[u8] = b"sess:";
+        let key = "k1";
+        let win_start = 500i64;
+
+        let key_bytes = key.as_bytes();
+        let mut state_key = Vec::new();
+        state_key.extend_from_slice(prefix);
+        state_key.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+        state_key.extend_from_slice(key_bytes);
+        state_key.extend_from_slice(&win_start.to_le_bytes());
+
+        let result = parse_window_state_key(&state_key, prefix);
+        assert_eq!(result, Some(("k1".to_string(), 500)));
+    }
+
+    #[test]
     fn parse_window_state_key_wrong_prefix() {
-        let prefix = b"tw:";
+        let prefix: &[u8] = b"tw:";
         let state_key = b"sw:xxxx";
         assert!(parse_window_state_key(state_key, prefix).is_none());
     }
 
     #[test]
     fn parse_window_state_key_too_short() {
-        let prefix = b"tw:";
+        let prefix: &[u8] = b"tw:";
         let state_key = b"tw:";
         assert!(parse_window_state_key(state_key, prefix).is_none());
     }
 
     #[test]
     fn parse_window_state_key_empty_key() {
-        let prefix = b"tw:";
+        let prefix: &[u8] = b"tw:";
         let win_start = 1000i64;
 
-        // Build a key with empty string
         let mut state_key = Vec::new();
         state_key.extend_from_slice(prefix);
         state_key.extend_from_slice(&0u32.to_le_bytes()); // key_len = 0
