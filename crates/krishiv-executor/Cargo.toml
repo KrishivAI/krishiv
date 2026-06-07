@@ -16,7 +16,7 @@ dashmap = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
 krishiv-checkpoint = { path = "../krishiv-checkpoint" }
 krishiv-metrics = { path = "../krishiv-metrics" }
-krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["kafka", "lakehouse"] }
 krishiv-ai = { path = "../krishiv-ai" }
 krishiv-exec = { path = "../krishiv-exec" }
 krishiv-plan = { path = "../krishiv-plan" }

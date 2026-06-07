@@ -1,5 +1,39 @@
 # Krishiv Implementation Status
 
+## Connector registry consolidation (2026-06-07)
+
+Implemented the connector driver/registry pattern across four phases:
+
+1. **Phase 1 — registry in `krishiv-connectors`**: added `ConnectorKind`,
+   `ConnectorRegistry`, `SourceDriver` / `SinkDriver` / `TwoPhaseSinkDriver`,
+   `DynSource`, built-in drivers for Parquet/S3/Kafka/two-phase Parquet, and
+   `default_registry()`.
+2. **Phase 2 — vector sinks**: moved `krishiv-ai::vector_sinks` into
+   `krishiv-connectors::vector` (feature `vector-sinks`); `krishiv-ai` now
+   re-exports via a compatibility shim.
+3. **Phase 3 — lakehouse**: kept implementation in `krishiv-lakehouse` (physical
+   move blocked by `exec ↔ lakehouse ↔ connectors` dependency graph); added
+   `connector_registry` kind constants and `ConnectorKind::{Iceberg,Delta,Hudi}`
+   for discovery. Broke the `connectors → exec` edge by moving
+   `StreamQualityHook` to `krishiv-common` and adding
+   `connectors::schema_normalize` for CDC paths.
+4. **Phase 4 — defaults**: `krishiv-connectors` default features are now
+   `["parquet"]` (was `["kafka"]`); SQL/executor/python enable
+   `kafka`/`lakehouse` explicitly.
+
+Validation:
+```bash
+cargo check -p krishiv-connectors --features parquet
+cargo check -p krishiv-connectors --features "parquet,s3,kafka,two-phase,lakehouse,vector-sinks"
+cargo test -p krishiv-connectors --lib --features "parquet,s3,kafka,two-phase,lakehouse,vector-sinks" registry::tests
+cargo check -p krishiv-sql -p krishiv-executor -p krishiv-ai
+```
+
+Next useful command:
+```bash
+cargo test -p krishiv-connectors --lib --features full
+```
+
 ## Crate consolidation: chaos / schema-registry / catalog merge (2026-06-07)
 
 Implemented a 3-step workspace crate-consolidation refactor to reduce the

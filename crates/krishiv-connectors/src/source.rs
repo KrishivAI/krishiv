@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::future::Future;
+use std::pin::Pin;
 
 use crate::capabilities::ConnectorCapabilities;
 use crate::error::ConnectorResult;
@@ -78,5 +79,47 @@ pub trait CheckpointSource: Source {
     fn restore_encoded_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
         let offset = Self::Offset::decode(encoded)?;
         self.restore_offset(&offset)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DynSource
+// ---------------------------------------------------------------------------
+
+/// Dyn-compatible version of [`Source`] that boxes async return types.
+///
+/// Because [`Source`] uses `impl Future` returns it is not object-safe. This
+/// trait provides a blanket implementation over every `T: Source + Send` and
+/// can be used as `Box<dyn DynSource>` wherever dynamic dispatch is needed.
+pub trait DynSource: Send {
+    fn capabilities(&self) -> ConnectorCapabilities;
+
+    fn read_batch_dyn(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Option<arrow::record_batch::RecordBatch>>> + Send + '_>>;
+
+    fn current_offset_dyn(&self) -> Option<Box<dyn Any + Send>>;
+
+    fn reset_dyn(&mut self);
+}
+
+impl<T: Source + Send> DynSource for T {
+    fn capabilities(&self) -> ConnectorCapabilities {
+        self.capabilities()
+    }
+
+    fn read_batch_dyn(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = ConnectorResult<Option<arrow::record_batch::RecordBatch>>> + Send + '_>>
+    {
+        Box::pin(self.read_batch())
+    }
+
+    fn current_offset_dyn(&self) -> Option<Box<dyn Any + Send>> {
+        self.current_offset()
+    }
+
+    fn reset_dyn(&mut self) {
+        self.reset();
     }
 }

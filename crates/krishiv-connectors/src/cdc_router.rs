@@ -59,7 +59,7 @@ impl CdcRouter {
                 .target_schema
                 .clone()
         };
-        let normalized = krishiv_exec::SchemaNormalizeOperator::new(target_schema)
+        let normalized = crate::schema_normalize::SchemaNormalizeOperator::new(target_schema)
             .normalize(batch)
             .map_err(|e| ConnectorError::Cdc(e.to_string()))?;
         let op = match event.op {
