@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use krishiv_lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
+use crate::lakehouse::{DeltaOp, DeltaStore, MemoryDeltaStore};
 
 use crate::ConnectorError;
 use crate::cdc::{CdcEvent, CdcEventSource, CdcOp};

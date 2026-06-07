@@ -8,7 +8,7 @@ use krishiv_connectors::{
     LocalParquetTwoPhaseCommitSink, QualityAction, Sink, Source, TwoPhaseCommitSink,
     parquet::{ParquetSink, ParquetSource},
 };
-use krishiv_lakehouse::{
+use krishiv_connectors::lakehouse::{
     IcebergScanOptions, IcebergTableRef, LakehouseTable, MemoryLakehouseTable, MultiWriterGuard,
     SchemaField, SchemaVersion,
 };

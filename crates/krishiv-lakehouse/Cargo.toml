@@ -6,32 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-arrow = { workspace = true }
-async-trait = { workspace = true }
-bytes = { workspace = true }
-futures = { workspace = true }
-thiserror = { workspace = true }
-chrono = { workspace = true }
-iceberg = { workspace = true, optional = true }
-object_store = { workspace = true, features = ["aws", "fs"] }
-parquet = { workspace = true }
-redb = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-url = "2"
-rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse"] }
 
 [features]
 default = []
-iceberg = ["dep:iceberg"]
-delta = []
-kafka = ["dep:rdkafka"]
+iceberg = ["krishiv-connectors/iceberg"]
+delta = ["krishiv-connectors/delta"]
+hudi = ["krishiv-connectors/hudi"]
+kafka = ["krishiv-connectors/kafka"]
 exactly-once-integration = []
 
 [dev-dependencies]
-krishiv-connectors = { path = "../krishiv-connectors" }
+krishiv-connectors = { path = "../krishiv-connectors", features = ["lakehouse", "kafka"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 

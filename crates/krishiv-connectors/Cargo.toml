@@ -31,10 +31,10 @@ schema-registry = [
 ]
 state = ["dep:krishiv-state"]
 
-# Lakehouse integration (implementation remains in `krishiv-lakehouse`)
-lakehouse = ["dep:krishiv-lakehouse"]
-iceberg = ["lakehouse", "krishiv-lakehouse/iceberg"]
-delta = ["lakehouse", "krishiv-lakehouse/delta"]
+# Lakehouse table formats (implementation in `crate::lakehouse`)
+lakehouse = ["dep:async-trait", "dep:chrono", "dep:redb", "dep:serde", "dep:url"]
+iceberg = ["lakehouse", "dep:iceberg"]
+delta = ["lakehouse"]
 hudi = ["lakehouse"]
 
 # Vector sinks (migrated from `krishiv-ai::vector_sinks`)
@@ -70,8 +70,11 @@ bytes = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse", optional = true }
 krishiv-proto = { path = "../krishiv-proto" }
+chrono = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+iceberg = { workspace = true, optional = true }
 krishiv-state = { path = "../krishiv-state", optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.36", optional = true, default-features = false, features = ["tokio"] }

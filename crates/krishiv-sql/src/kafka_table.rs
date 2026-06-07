@@ -1,13 +1,10 @@
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
-use datafusion::catalog::TableProviderFactory;
 use datafusion::catalog::streaming::StreamingTable;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::CreateExternalTable;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
@@ -18,7 +15,7 @@ use krishiv_connectors::kafka::{KafkaConfig, KafkaSource};
 // use manual commit aligned with checkpoint barriers.
 const STREAMING_AUTO_COMMIT_MS: u64 = 1_000;
 
-fn kafka_auto_commit_interval_ms() -> Option<u64> {
+pub(crate) fn kafka_auto_commit_interval_ms() -> Option<u64> {
     let profile = std::env::var("KRISHIV_DURABILITY_PROFILE")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -30,7 +27,7 @@ fn kafka_auto_commit_interval_ms() -> Option<u64> {
     }
 }
 
-pub struct KafkaPartitionStream {
+pub(crate) struct KafkaPartitionStream {
     schema: SchemaRef,
     source: Arc<tokio::sync::Mutex<KafkaSource>>,
 }
@@ -111,11 +108,11 @@ impl PartitionStream for KafkaPartitionStream {
     }
 }
 
-/// Project and cast a raw Kafka batch to the declared table schema.
+/// Project and cast a raw connector batch to the declared table schema.
 ///
 /// Missing columns → typed null arrays.
 /// Cast failures → null arrays with a tracing warning (no silent data loss).
-fn project_batch(batch: &RecordBatch, schema: &SchemaRef) -> RecordBatch {
+pub(crate) fn project_batch(batch: &RecordBatch, schema: &SchemaRef) -> RecordBatch {
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         let col = if let Ok(idx) = batch.schema().index_of(field.name()) {
@@ -165,70 +162,3 @@ pub fn create_kafka_streaming_table(
     Ok(Arc::new(table))
 }
 
-/// DataFusion `TableProviderFactory` for `CREATE EXTERNAL TABLE … STORED AS KAFKA`.
-///
-/// Shares the engine's `streaming_sources` set so `SqlEngine::is_streaming_query`
-/// correctly identifies DDL-registered Kafka tables.
-pub struct KafkaTableFactory {
-    /// Shared with the owning `SqlEngine` so DDL-created tables are tracked.
-    pub streaming_sources: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
-}
-
-impl std::fmt::Debug for KafkaTableFactory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KafkaTableFactory").finish()
-    }
-}
-
-#[async_trait]
-impl TableProviderFactory for KafkaTableFactory {
-    async fn create(
-        &self,
-        _state: &dyn datafusion::catalog::Session,
-        cmd: &CreateExternalTable,
-    ) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let topic = cmd.location.clone();
-        let mut bootstrap_servers = "127.0.0.1:9092".to_string();
-        let mut group_id = "krishiv-sql".to_string();
-        for (k, v) in &cmd.options {
-            if k == "bootstrap.servers" {
-                bootstrap_servers = v.clone();
-            }
-            if k == "group.id" {
-                group_id = v.clone();
-            }
-        }
-
-        let schema: Arc<arrow::datatypes::Schema> = cmd.schema.as_ref().inner().clone();
-        let config = KafkaConfig {
-            bootstrap_servers,
-            topic,
-            group_id,
-            auto_commit_interval_ms: kafka_auto_commit_interval_ms(),
-            security_protocol: None,
-            ssl_ca_location: None,
-            ssl_certificate_location: None,
-            ssl_key_location: None,
-            ssl_key_password: None,
-            sasl_username: None,
-            sasl_password: None,
-            sasl_mechanisms: None,
-            enable_idempotence: None,
-            transactional_id: None,
-        };
-
-        let source =
-            KafkaSource::new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let partition = Arc::new(KafkaPartitionStream::new(schema.clone(), source));
-        let table = StreamingTable::try_new(schema, vec![partition])?;
-
-        // Register the table name so SqlEngine::is_streaming_query detects it.
-        let table_name = cmd.name.table().to_string();
-        self.streaming_sources
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(table_name);
-
-        Ok(Arc::new(table))
-    }
-}

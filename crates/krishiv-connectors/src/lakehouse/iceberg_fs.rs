@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-use crate::{IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion};
+use super::{IcebergScanOptions, IcebergTableRef, LakehouseError, LakehouseTable, SchemaVersion};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FsLayerMeta {
@@ -293,16 +293,19 @@ impl LakehouseTable for IcebergFsTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
+    use crate::lakehouse::{SchemaField, SchemaVersion};
+
+    use super::*;
+
     fn schema_version() -> SchemaVersion {
         SchemaVersion {
             schema_id: 1,
-            fields: vec![crate::SchemaField {
+            fields: vec![SchemaField {
                 id: 1,
                 name: "x".to_string(),
                 required: true,

@@ -14,7 +14,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::json;
 
-use crate::{LakehouseError, LakehouseResult};
+use super::{LakehouseError, LakehouseResult};
 
 fn delta_log_dir(root: &Path) -> PathBuf {
     root.join("_delta_log")

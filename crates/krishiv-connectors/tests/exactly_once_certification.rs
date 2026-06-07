@@ -105,7 +105,7 @@ fn s3_parquet_to_kafka_uses_transactional_sink() {
 #[tokio::test]
 async fn live_kafka_cdc_to_iceberg_certification() -> Result<(), Box<dyn std::error::Error>> {
     use krishiv_connectors::cdc::{CdcToLakehousePipeline, KafkaCdcConfig, RdkafkaCdcEventSource};
-    use krishiv_lakehouse::{
+    use krishiv_connectors::lakehouse::{
         IcebergTableRef, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, SchemaField,
         SchemaVersion,
     };

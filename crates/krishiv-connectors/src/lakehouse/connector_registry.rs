@@ -3,7 +3,7 @@
 //! Iceberg, Delta, and Hudi table I/O remain in this crate because the
 //! lakehouse stack is shared by SQL, exec, and CDC paths. Use
 //! [`krishiv_connectors::ConnectorKind`] for discovery and keep format-specific
-//! writes in `krishiv-lakehouse` APIs.
+//! writes in `crate::lakehouse` APIs.
 
 /// Canonical configuration kind strings for lakehouse integrations.
 pub const ICEBERG_KIND: &str = "iceberg";

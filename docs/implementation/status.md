@@ -1,5 +1,41 @@
 # Krishiv Implementation Status
 
+## Connector follow-ups and lakehouse merge (2026-06-07)
+
+Completed connector consolidation follow-ups on branch
+`cursor/connector-registry-consolidation-9bc6`:
+
+1. **SQL DDL factories via registry** (`krishiv-sql::connector_table`):
+   - Registered `PARQUET`, `S3`, and `KAFKA` `TableProviderFactory` hooks in
+     `SqlEngine::build_local`, delegating config validation to
+     `ConnectorRegistry::default_registry()`.
+   - Bounded Parquet/S3 tables materialize through registry-opened sources;
+     Kafka DDL reuses `KafkaPartitionStream` with registry-validated config.
+   - Removed standalone `KafkaTableFactory`; `kafka_table` keeps streaming helpers.
+2. **Physical lakehouse merge**: moved `krishiv-lakehouse` implementation into
+   `krishiv-connectors::lakehouse` (feature `lakehouse`). `krishiv-lakehouse`
+   is now a thin facade re-exporting `krishiv_connectors::lakehouse::*`.
+   Updated `cdc` / `cdc_router` and integration tests to use the internal module.
+3. **Cleanup**: added `tmp/` to `.gitignore`; fixed lakehouse test imports after
+   the move; updated connector integration tests to stop depending on the facade
+   crate from `krishiv-connectors` tests.
+
+Validation:
+```bash
+cargo check -p krishiv-connectors --features "parquet,lakehouse,iceberg,delta,kafka"
+cargo check -p krishiv-lakehouse -p krishiv-sql -p krishiv-exec -p krishiv-executor
+TMPDIR=/workspace/tmp cargo test -p krishiv-connectors --lib --features lakehouse -- lakehouse::
+TMPDIR=/workspace/tmp cargo test -p krishiv-connectors --lib --features "parquet,s3,kafka,two-phase,lakehouse,vector-sinks" registry::tests
+```
+
+Note: `krishiv-sql::udtf_ddl_tests::sql_body_udtf_rejects_wrong_arity_and_non_literal_arguments`
+still fails on this branch (pre-existing UDTF arity guard; unrelated to connector work).
+
+Next useful command:
+```bash
+TMPDIR=/workspace/tmp cargo test -p krishiv-connectors --lib --features full
+```
+
 ## Connector registry consolidation (2026-06-07)
 
 Implemented the connector driver/registry pattern across four phases:

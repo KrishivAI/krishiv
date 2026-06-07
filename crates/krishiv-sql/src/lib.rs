@@ -24,6 +24,7 @@ use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
 pub mod catalog;
 pub mod cep_sql;
+mod connector_table;
 pub mod create_function_ddl;
 mod lakehouse;
 pub mod live_table;
@@ -334,11 +335,9 @@ impl SqlEngine {
             .with_default_features()
             .build();
         let mut table_factories = dummy_state.table_factories().clone();
-        table_factories.insert(
-            "KAFKA".to_string(),
-            Arc::new(crate::kafka_table::KafkaTableFactory {
-                streaming_sources: streaming_sources.clone(),
-            }),
+        crate::connector_table::register_connector_table_factories(
+            &mut table_factories,
+            streaming_sources.clone(),
         );
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()

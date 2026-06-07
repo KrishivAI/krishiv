@@ -35,7 +35,7 @@ pub enum ConnectorKind {
     Weaviate,
     #[cfg(feature = "vector-sinks")]
     Pinecone,
-    /// Lakehouse table I/O (implemented in `krishiv-lakehouse`, not opened via batch drivers).
+    /// Lakehouse table I/O (implemented in `crate::lakehouse`, not opened via batch drivers).
     #[cfg(feature = "lakehouse")]
     Iceberg,
     #[cfg(feature = "lakehouse")]
