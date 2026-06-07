@@ -225,18 +225,18 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
 /// Build the UI-specific routes (jobs, executors, SQL editor, health dashboard)
 /// for embedding inside the coordinator HTTP server.
 ///
-/// Skips `/healthz`, `/readyz`, `/metrics`, and `/assets/*` — the coordinator
-/// already serves those. Only includes `/`, `/ui*`, and `/api/v1/*` routes.
+/// Skips `/healthz`, `/readyz`, and `/metrics` — the coordinator already serves
+/// those. Includes `/assets/*`, `/`, `/ui*`, and `/api/v1/*` routes.
 pub fn embedded_router(state: UiState) -> Router {
+    let public = Router::new().route("/assets/krishiv.css", get(stylesheet));
+
     let protected = Router::new()
         .route("/", get(|| async { Redirect::temporary("/ui") }))
-        .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/jobs/{job_id}", get(api_job_detail))
         .route(
             "/api/v1/jobs/{job_id}/checkpoints",
             get(api_job_checkpoints),
         )
-        .route("/api/v1/executors", get(api_executors))
         .route("/api/v1/executors/{executor_id}", get(api_executor_detail))
         .route("/api/v1/queues", get(api_queues))
         .route("/api/v1/sql", post(api_sql_execute))
@@ -258,6 +258,7 @@ pub fn embedded_router(state: UiState) -> Router {
     };
 
     Router::new()
+        .merge(public)
         .merge(protected)
         .with_state(state)
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
 use arrow::record_batch::RecordBatch;
@@ -456,7 +457,7 @@ pub fn interval_join(
     left_time_col: &str,
     right_time_col: &str,
     spec: IntervalJoinSpec,
-) -> Result<Vec<(RecordBatch, RecordBatch)>> {
+) -> Result<Vec<(Arc<RecordBatch>, Arc<RecordBatch>)>> {
     let mut join = PerKeyIntervalJoin::new(spec);
     let mut pairs = Vec::new();
 

@@ -35,7 +35,7 @@ default = ["local"]
 # Build presets
 minimal = []
 local   = ["embedded", "single-node"]
-full    = ["single-node", "distributed", "k8s", "ui", "kafka", "iceberg", "delta"]
+full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "delta"]
 
 # Deployment capability surfaces (gate optional dep families)
 embedded    = []                                                 # baseline; no optional deps
@@ -44,7 +44,6 @@ distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster
 bare-metal  = ["distributed"]                                    # alias: process-managed cluster
 cluster     = ["distributed"]                                    # alias: distributed
 k8s         = ["distributed", "dep:krishiv-operator", "krishiv-operator/k8s"]
-ui          = ["dep:krishiv-operator", "krishiv-operator/ui", "dep:krishiv-ui"]
 
 # Optional dependency families
 flight-sql = ["dep:krishiv-flight-sql"]
@@ -65,7 +64,7 @@ krishiv-connectors = { path = "../krishiv-connectors" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-metrics = { path = "../krishiv-metrics" }
 krishiv-operator = { path = "../krishiv-operator", optional = true, default-features = false }
-krishiv-ui = { path = "../krishiv-ui", optional = true }
+krishiv-ui = { path = "../krishiv-ui" }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-executor = { path = "../krishiv-executor" }

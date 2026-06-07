@@ -10,7 +10,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::{Html, IntoResponse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use krishiv_common::durability::DurabilityProfile;
 use krishiv_proto::{CoordinatorId, CoordinatorState};
@@ -366,11 +366,6 @@ pub fn coordinator_http_router(
         .route("/metrics", get(metrics));
 
     let protected = Router::new()
-        .route(
-            "/",
-            get(|| async { axum::response::Redirect::temporary("/ui") }),
-        )
-        .route("/ui", get(live_ui))
         .route("/api/v1/jobs", get(api_jobs))
         .route("/api/v1/executors", get(api_executors))
         .route(
@@ -578,68 +573,6 @@ async fn api_job_diagnose(
     };
 
     Json(report).into_response()
-}
-
-async fn live_ui(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
-    let coord = coordinator.read().await;
-    let (state, jobs, executors) = (
-        format!("{:?}", coord.state()),
-        coord.job_snapshots(),
-        coord.executor_snapshots(),
-    );
-
-    let mut body = String::from(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Krishiv Cluster</title>\
-         <style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:32px;color:#17202a}\
-         table{border-collapse:collapse;width:100%;margin:16px 0 28px}th,td{border-bottom:1px solid #d8dee4;padding:8px;text-align:left}\
-         th{background:#f6f8fa}.meta{color:#57606a}.ok{color:#116329;font-weight:600}</style></head><body>",
-    );
-    body.push_str("<h1>Krishiv Cluster</h1>");
-    body.push_str(&format!(
-        "<p class=\"meta\">Coordinator state: <span class=\"ok\">{state}</span></p>"
-    ));
-    body.push_str("<h2>Executors</h2><table><thead><tr><th>Executor</th><th>Host</th><th>Slots</th><th>State</th><th>Running Tasks</th><th>Lease</th><th>Last Heartbeat Tick</th></tr></thead><tbody>");
-    if executors.is_empty() {
-        body.push_str("<tr><td colspan=\"7\">No executors registered.</td></tr>");
-    } else {
-        for record in executors {
-            let descriptor = record.descriptor();
-            body.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                record.executor_id(),
-                descriptor.host(),
-                descriptor.slots(),
-                record.state(),
-                record.running_tasks().len(),
-                record.lease_generation().as_u64(),
-                record.last_heartbeat_tick(),
-            ));
-        }
-    }
-    body.push_str("</tbody></table>");
-    body.push_str("<h2>Jobs</h2><table><thead><tr><th>Job</th><th>Kind</th><th>State</th><th>Stages</th><th>Tasks</th><th>Assigned</th><th>Running</th><th>Succeeded</th><th>Failed</th></tr></thead><tbody>");
-    if jobs.is_empty() {
-        body.push_str("<tr><td colspan=\"9\">No jobs submitted yet.</td></tr>");
-    } else {
-        for job in jobs {
-            body.push_str(&format!(
-                "<tr><td>{}</td><td>{:?}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                job.job_id(),
-                job.kind(),
-                job.state(),
-                job.stage_count(),
-                job.task_count(),
-                job.assigned_task_count(),
-                job.running_task_count(),
-                job.succeeded_task_count(),
-                job.failed_task_count(),
-            ));
-        }
-    }
-    body.push_str("</tbody></table><p class=\"meta\">JSON: <a href=\"/api/v1/jobs\">jobs</a> · <a href=\"/api/v1/executors\">executors</a> · <a href=\"/metrics\">metrics</a></p></body></html>");
-    Html(body)
 }
 
 async fn readyz(
