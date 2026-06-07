@@ -6,6 +6,7 @@
 
 use arrow::record_batch::RecordBatch;
 
+pub mod connector_registry;
 mod as_of;
 mod delta;
 mod delta_lake;

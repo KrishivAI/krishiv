@@ -189,22 +189,7 @@ impl WindowOperatorState {
 // ── StreamQualityHook ─────────────────────────────────────────────────────────
 
 /// Optional quality-gate hook for the streaming drain cycle (R10).
-///
-/// Implementations run data-quality rules against each emitted output batch.
-/// Accepted rows are returned; rejected rows are routed to a dead-letter output.
-/// The trait is defined here (in exec) so that `ContinuousWindowExecutor` can
-/// hold it without creating a circular dependency on `krishiv-connectors`.
-///
-/// Implement this trait in `krishiv-connectors` using `CompiledDataQualityConfig`
-/// and `DeadLetterSink`, then inject it via
-/// [`ContinuousWindowExecutor::with_quality_hook`].
-pub trait StreamQualityHook: Send {
-    /// Apply quality rules to one output `batch`.
-    ///
-    /// Returns the accepted sub-batch (possibly smaller than the input) and
-    /// the number of rejected rows routed to the dead-letter output.
-    fn filter(&mut self, batch: RecordBatch) -> ExecResult<(RecordBatch, usize)>;
-}
+pub use krishiv_common::StreamQualityHook;
 
 /// Retains window operator state between continuous streaming drain cycles.
 pub struct ContinuousWindowExecutor {
@@ -334,7 +319,9 @@ impl ContinuousWindowExecutor {
         if let Some(hook) = self.quality_hook.as_mut() {
             let mut output = Vec::with_capacity(raw.len());
             for batch in raw {
-                let (accepted, rejected_count) = hook.filter(batch)?;
+                let (accepted, rejected_count) = hook
+                    .filter(batch)
+                    .map_err(ExecError::Arrow)?;
                 if rejected_count > 0 {
                     self.rejected_rows_total =
                         self.rejected_rows_total.saturating_add(rejected_count as u64);

@@ -742,7 +742,7 @@ impl CdcSchemaEvolutionState {
             }
         };
         let normalized =
-            krishiv_exec::schema_normalize::SchemaNormalizeOperator::new(merged.clone())
+            crate::schema_normalize::SchemaNormalizeOperator::new(merged.clone())
                 .normalize(&batch)
                 .map_err(|e| e.to_string())?;
         self.schema = Some(merged);
@@ -760,7 +760,7 @@ fn concat_registry_batches(batches: &[RecordBatch]) -> Result<RecordBatch, Strin
     for batch in &batches[1..] {
         target = merge_compatible_schemas(&target, &batch.schema())?;
     }
-    let normalizer = krishiv_exec::schema_normalize::SchemaNormalizeOperator::new(target.clone());
+    let normalizer = crate::schema_normalize::SchemaNormalizeOperator::new(target.clone());
     let normalized = batches
         .iter()
         .map(|batch| {
@@ -859,7 +859,7 @@ fn compatible_data_type(left: &DataType, right: &DataType) -> Option<DataType> {
     if right == &DataType::Null {
         return Some(left.clone());
     }
-    krishiv_exec::schema_normalize::SchemaNormalizeOperator::widening_target(left, right)
+    crate::schema_normalize::SchemaNormalizeOperator::widening_target(left, right)
 }
 
 // ---------------------------------------------------------------------------

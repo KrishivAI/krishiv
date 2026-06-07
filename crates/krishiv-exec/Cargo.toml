@@ -11,6 +11,7 @@ dashmap = { workspace = true }
 smallvec = "1"
 thiserror = { workspace = true }
 krishiv-ai = { path = "../krishiv-ai" }
+krishiv-common = { path = "../krishiv-common" }
 krishiv-cep = { path = "../krishiv-cep" }
 krishiv-lakehouse = { path = "../krishiv-lakehouse" }
 krishiv-plan = { path = "../krishiv-plan" }

@@ -1,5 +1,7 @@
 
 //! Vector store sinks for embedding upsert and nearest-neighbor query (R17).
+//!
+//! Lives in `krishiv-connectors` so vector sinks share the connector registry.
 
 pub mod batch;
 pub mod config;
@@ -540,7 +542,7 @@ mod tests {
     // S2 regression: validate_identifier prevents injection
     #[test]
     fn validate_identifier_rejects_bad_names() {
-        use crate::traits::validate_identifier;
+        use super::traits::validate_identifier;
         assert!(validate_identifier("good_name").is_ok());
         assert!(validate_identifier("_leading_underscore_ok").is_ok());
         assert!(validate_identifier("bad-name").is_err());

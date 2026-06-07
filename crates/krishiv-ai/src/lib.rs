@@ -8,6 +8,7 @@ pub mod embed;
 pub mod llm;
 pub mod memo;
 pub mod rag;
+#[path = "vector_sinks.rs"]
 pub mod vector_sinks;
 
 pub use chunk::{

@@ -14,12 +14,14 @@ pub mod durability;
 pub mod hash;
 pub mod partition;
 pub mod production;
+pub mod stream_quality;
 pub mod validate;
 
 pub use durability::{
     CheckpointDurability, DurabilityProfile, DurabilityProfileParseError, DurabilityProfileSpec,
     MetadataDurability, ShuffleDurability, StateDurability,
 };
+pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 pub use production::{
     ALLOW_ANONYMOUS_HTTP_ENV, ALLOW_LEGACY_FRAGMENTS_ENV, DURABILITY_PROFILE_ENV,
     NativeScalarUdfPolicy, PRODUCTION_ENV, allow_anonymous_http_override,

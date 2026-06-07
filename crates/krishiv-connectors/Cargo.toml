@@ -9,20 +9,58 @@ license.workspace = true
 path = "src/lib.rs"
 
 [features]
-# kafka is default so production builds include the real Kafka connector without
-# requiring an explicit feature flag. O1: rdkafka is already in [dependencies]
-# as optional; enabling it by default has no API surface change for users who
-# never call KafkaSource/KafkaSink.
-default = ["kafka"]
+# Lean embedded baseline: local Parquet only. Enable `kafka`, `lakehouse`, or
+# `vector-sinks` explicitly for integration families.
+default = ["parquet"]
+
+# Core batch/object-store connectors
+parquet = []
+s3 = []
+two-phase = ["parquet"]
+
+# Streaming
 kafka = ["dep:rdkafka"]
-state = ["dep:krishiv-state"]
 schema-registry = [
+    "kafka",
     "dep:apache-avro",
     "dep:async-trait",
     "dep:dashmap",
     "dep:reqwest",
     "dep:serde",
     "dep:prost",
+]
+state = ["dep:krishiv-state"]
+
+# Lakehouse integration (implementation remains in `krishiv-lakehouse`)
+lakehouse = ["dep:krishiv-lakehouse"]
+iceberg = ["lakehouse", "krishiv-lakehouse/iceberg"]
+delta = ["lakehouse", "krishiv-lakehouse/delta"]
+hudi = ["lakehouse"]
+
+# Vector sinks (migrated from `krishiv-ai::vector_sinks`)
+vector-sinks = [
+    "dep:async-trait",
+    "dep:dashmap",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:twox-hash",
+]
+qdrant = ["vector-sinks", "dep:qdrant-client"]
+pgvector = ["vector-sinks", "dep:sqlx"]
+
+# Convenience presets
+local = ["parquet", "s3", "kafka", "two-phase"]
+full = [
+    "local",
+    "lakehouse",
+    "iceberg",
+    "delta",
+    "hudi",
+    "vector-sinks",
+    "qdrant",
+    "pgvector",
+    "schema-registry",
+    "state",
 ]
 
 [dependencies]
@@ -32,8 +70,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 krishiv-common = { path = "../krishiv-common" }
-krishiv-exec = { path = "../krishiv-exec" }
-krishiv-lakehouse = { path = "../krishiv-lakehouse" }
+krishiv-lakehouse = { path = "../krishiv-lakehouse", optional = true }
 krishiv-proto = { path = "../krishiv-proto" }
 krishiv-state = { path = "../krishiv-state", optional = true }
 object_store = { workspace = true }
@@ -43,7 +80,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
 
-# schema-registry feature dependencies (Confluent Schema Registry deserialization)
+# schema-registry feature dependencies
 apache-avro = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
@@ -51,7 +88,13 @@ reqwest = { workspace = true, features = ["json"], optional = true }
 serde = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 
+# vector-sinks feature dependencies
+qdrant-client = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+twox-hash = { workspace = true, optional = true }
+
 [dev-dependencies]
+mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 proptest = "1"
