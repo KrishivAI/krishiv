@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ executor.executor_id }} · Krishiv R2 Status</title>
+    <title>{{ executor.executor_id }} · Krishiv</title>
     <link rel="stylesheet" href="/assets/krishiv.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   </head>
@@ -14,62 +14,53 @@
           hx-select="main"
           hx-swap="outerHTML"
           hx-indicator="#refresh-note">
-      <header class="topbar">
-        <div class="brand">
-          <strong>{{ executor.executor_id }}</strong>
-          <span>Executor is <span class="state {{ executor.state }}">{{ executor.state }}</span></span>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <span class="refresh-note" id="refresh-note">auto-refreshing every 15s</span>
-          <button class="theme-toggle" onclick="document.documentElement.style.colorScheme=document.documentElement.style.colorScheme==='dark'?'light':'dark'">🌓</button>
-        </div>
-      </header>
+      {% include "nav.html" %}
 
-      <div class="meta" style="margin-bottom:16px">
-        <a href="/ui">All jobs</a> · Coordinator {{ coordinator_id }} is {{ coordinator_state }}
+      <div class="breadcrumb">
+        <a href="/ui">Jobs</a><span class="sep">/</span>{{ executor.executor_id }}
       </div>
 
-      <div class="executor-card">
+      <div class="info-card">
         <div class="info-grid">
           <div class="info-item">
-            <span>ID</span>
-            <span>{{ executor.executor_id }}</span>
+            <span class="label">ID</span>
+            <span class="value">{{ executor.executor_id }}</span>
           </div>
           <div class="info-item">
-            <span>State</span>
-            <span><span class="state {{ executor.state }}">{{ executor.state }}</span></span>
+            <span class="label">State</span>
+            <span class="value"><span class="state-dot {{ executor.state }}">{{ executor.state }}</span></span>
           </div>
           <div class="info-item">
-            <span>Host</span>
-            <span>{{ executor.host }}</span>
+            <span class="label">Host</span>
+            <span class="value">{{ executor.host }}</span>
           </div>
           <div class="info-item">
-            <span>Slots</span>
-            <span>{{ executor.slots }}</span>
+            <span class="label">Slots</span>
+            <span class="value">{{ executor.slots }}</span>
           </div>
           <div class="info-item">
-            <span>Running Tasks</span>
-            <span>{{ executor.running_tasks.len() }}</span>
+            <span class="label">Running Tasks</span>
+            <span class="value">{{ executor.running_tasks.len() }}</span>
           </div>
           <div class="info-item">
-            <span>Heartbeat Tick</span>
-            <span>{{ executor.last_heartbeat_tick }}</span>
+            <span class="label">Heartbeat Tick</span>
+            <span class="value">{{ executor.last_heartbeat_tick }}</span>
           </div>
           <div class="info-item">
-            <span>Lease Generation</span>
-            <span>{{ executor.lease_generation }}</span>
+            <span class="label">Lease Generation</span>
+            <span class="value">{{ executor.lease_generation }}</span>
           </div>
           <div class="info-item">
-            <span>Memory Used</span>
-            <span>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}-{% endif %}</span>
+            <span class="label">Memory Used</span>
+            <span class="value">{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</span>
           </div>
           <div class="info-item">
-            <span>Memory Limit</span>
-            <span>{% if executor.memory_limit_bytes.is_some() %}{{ executor.memory_limit_bytes.unwrap() / 1048576 }} MB{% else %}-{% endif %}</span>
+            <span class="label">Memory Limit</span>
+            <span class="value">{% if executor.memory_limit_bytes.is_some() %}{{ executor.memory_limit_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</span>
           </div>
           <div class="info-item">
-            <span>Active Task Count</span>
-            <span>{% if executor.active_task_count.is_some() %}{{ executor.active_task_count.unwrap() }}{% else %}-{% endif %}</span>
+            <span class="label">Active Task Count</span>
+            <span class="value">{% if executor.active_task_count.is_some() %}{{ executor.active_task_count.unwrap() }}{% else %}&mdash;{% endif %}</span>
           </div>
         </div>
       </div>
@@ -89,7 +80,7 @@
             <tbody>
               {% for task_id in executor.running_tasks %}
               <tr>
-                <td><a href="/ui/jobs?task={{ task_id }}">{{ task_id }}</a></td>
+                <td>{{ task_id }}</td>
               </tr>
               {% endfor %}
             </tbody>
@@ -97,6 +88,8 @@
         </div>
         {% endif %}
       </section>
+
+      <span id="refresh-note" class="refresh-note" hidden>refreshing</span>
     </main>
   </body>
 </html>

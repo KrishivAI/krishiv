@@ -1,6 +1,10 @@
 <nav>
-  <a href="/ui">Jobs</a>
-  <a href="/ui/health">Health</a>
-  <a href="/ui/submit">SQL</a>
-  <button onclick="document.body.classList.toggle('dark')" style="float:right">Toggle Dark Mode</button>
+  <span class="brand">Krishiv</span>
+  <div class="links">
+    <a href="/ui">Jobs</a>
+    <a href="/ui/health">Health</a>
+    <a href="/ui/metrics">Metrics</a>
+    <a href="/ui/submit">SQL</a>
+    <button class="theme-toggle" onclick="document.documentElement.style.colorScheme=document.documentElement.style.colorScheme==='dark'?'light':'dark'" title="Toggle theme">🌓</button>
+  </div>
 </nav>

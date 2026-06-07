@@ -3,37 +3,43 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Health Dashboard - Krishiv</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <title>Health · Krishiv</title>
+  <link rel="stylesheet" href="/assets/krishiv.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 </head>
 <body>
-  {% include "nav.html" %}
+  <main class="shell">
+    {% include "nav.html" %}
+    <h1 class="page-heading">Cluster Health</h1>
 
-  <main>
-    <h1>Cluster Health Dashboard</h1>
-
-    <section>
+    <section class="section">
       <h2>Summary</h2>
-      <div class="health-summary">
+      <div class="health-grid">
         <div class="health-stat healthy">
-          <strong>Healthy Executors:</strong> {{ self.healthy_executors() }}
+          <span class="stat-label">Healthy Executors</span>
+          <span class="stat-value">{{ self.healthy_executors() }}</span>
         </div>
         <div class="health-stat {% if self.lost_executors() > 0 %}degraded{% else %}healthy{% endif %}">
-          <strong>Lost/Unhealthy:</strong> {{ self.lost_executors() }}
+          <span class="stat-label">Lost / Unhealthy</span>
+          <span class="stat-value">{{ self.lost_executors() }}</span>
         </div>
         <div class="health-stat">
-          <strong>Memory Used:</strong> {{ self.memory_used_pct_int() }}%
+          <span class="stat-label">Memory Used</span>
+          <span class="stat-value">{{ self.memory_used_pct_int() }}%</span>
         </div>
         <div class="health-stat">
-          <strong>Total Jobs:</strong> {{ jobs.len() }}
+          <span class="stat-label">Total Jobs</span>
+          <span class="stat-value">{{ jobs.len() }}</span>
         </div>
       </div>
     </section>
 
-    <section>
+    <section class="section">
       <h2>Executors</h2>
-      <div class="executor-grid">
+      {% if executors.len() == 0 %}
+      <div class="empty">No executors registered.</div>
+      {% else %}
+      <div class="executor-cards">
         {% for ex in executors %}
         <div class="executor-card {% if ex.state == "Active" %}card-ok{% else %}card-warn{% endif %}">
           <div class="card-header">
@@ -64,6 +70,7 @@
         </div>
         {% endfor %}
       </div>
+      {% endif %}
     </section>
   </main>
 </body>

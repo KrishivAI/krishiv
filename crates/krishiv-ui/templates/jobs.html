@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Krishiv R2 Status</title>
+    <title>Krishiv</title>
     <link rel="stylesheet" href="/assets/krishiv.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   </head>
@@ -14,23 +14,26 @@
           hx-select="main"
           hx-swap="outerHTML"
           hx-indicator="#refresh-note">
-      <header class="topbar">
-        <div class="brand">
-          <strong>Krishiv R2 Status</strong>
-          <span>Coordinator {{ coordinator_id }} is <span class="state {{ coordinator_state }}">{{ coordinator_state }}</span></span>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <span class="refresh-note" id="refresh-note">auto-refreshing every 15s</span>
-          <button class="theme-toggle" onclick="document.documentElement.style.colorScheme=document.documentElement.style.colorScheme==='dark'?'light':'dark'">🌓</button>
-        </div>
-      </header>
+      {% include "nav.html" %}
 
-      <section class="summary" aria-label="Status summary">
-        <div class="metric"><span>Jobs</span><strong>{{ jobs.len() }}</strong></div>
-        <div class="metric"><span>Executors</span><strong>{{ executors.len() }}</strong></div>
-        <div class="metric"><span>Running Tasks</span><strong>{{ self.running_tasks() }}</strong></div>
-        <div class="metric"><span>Failed Tasks</span><strong>{{ self.failed_tasks() }}</strong></div>
-      </section>
+      <div class="metrics">
+        <div class="metric">
+          <div class="label">Jobs</div>
+          <div class="value">{{ jobs.len() }}</div>
+        </div>
+        <div class="metric">
+          <div class="label">Executors</div>
+          <div class="value">{{ executors.len() }}</div>
+        </div>
+        <div class="metric">
+          <div class="label">Running Tasks</div>
+          <div class="value">{{ self.running_tasks() }}</div>
+        </div>
+        <div class="metric">
+          <div class="label">Failed Tasks</div>
+          <div class="value {% if self.failed_tasks() > 0 %}bad{% endif %}">{{ self.failed_tasks() }}</div>
+        </div>
+      </div>
 
       <section class="section">
         <h2>Jobs</h2>
@@ -58,12 +61,12 @@
               <tr>
                 <td><a href="/ui/jobs/{{ job.job_id }}">{{ job.job_id }}</a></td>
                 <td>{% if job.kind == "streaming" %}<span class="tag streaming">{{ job.kind }}</span>{% else %}{{ job.kind }}{% endif %}</td>
-                <td><span class="state {{ job.state }}">{{ job.state }}</span></td>
+                <td><span class="state-dot {{ job.state }}">{{ job.state }}</span></td>
                 <td>{{ job.stage_count }}</td>
                 <td>{{ job.task_count }}</td>
                 <td>{{ job.running_task_count }}</td>
                 <td>{{ job.succeeded_task_count }}</td>
-                <td>{% if job.failed_task_count > 0 %}<strong style="color:var(--bad)">{{ job.failed_task_count }}</strong>{% else %}{{ job.failed_task_count }}{% endif %}</td>
+                <td>{% if job.failed_task_count > 0 %}<strong class="bad">{{ job.failed_task_count }}</strong>{% else %}{{ job.failed_task_count }}{% endif %}</td>
                 <td><span class="tag">{{ job.priority }}</span></td>
                 <td><span class="tag">{{ job.resource_usage.cpu_nanos }}</span></td>
               </tr>
@@ -96,12 +99,12 @@
               {% for executor in executors %}
               <tr>
                 <td><a href="/ui/executors/{{ executor.executor_id }}">{{ executor.executor_id }}</a></td>
-                <td><span class="state {{ executor.state }}">{{ executor.state }}</span></td>
+                <td><span class="state-dot {{ executor.state }}">{{ executor.state }}</span></td>
                 <td>{{ executor.slots }}</td>
                 <td>{{ executor.host }}</td>
                 <td>{{ executor.running_tasks.len() }}</td>
                 <td>{{ executor.last_heartbeat_tick }}</td>
-                <td>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }}MB{% else %}-{% endif %}</td>
+                <td>{% if executor.memory_used_bytes.is_some() %}{{ executor.memory_used_bytes.unwrap() / 1048576 }} MB{% else %}&mdash;{% endif %}</td>
               </tr>
               {% endfor %}
             </tbody>
@@ -109,6 +112,8 @@
         </div>
         {% endif %}
       </section>
+
+      <span id="refresh-note" class="refresh-note" hidden>refreshing</span>
     </main>
   </body>
 </html>

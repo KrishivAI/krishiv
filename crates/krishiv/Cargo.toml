@@ -70,6 +70,7 @@ krishiv-scheduler = { path = "../krishiv-scheduler" }
 krishiv-executor = { path = "../krishiv-executor" }
 krishiv-flight-sql = { path = "../krishiv-flight-sql", optional = true }
 krishiv-shuffle = { path = "../krishiv-shuffle", optional = true }
+krishiv-sql = { path = "../krishiv-sql" }
 krishiv-udf = { path = "../krishiv-udf" }
 arrow = { workspace = true }
 axum = { workspace = true }

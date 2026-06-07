@@ -3,36 +3,36 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SQL Editor - Krishiv</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <title>SQL · Krishiv</title>
+  <link rel="stylesheet" href="/assets/krishiv.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <script src="https://unpkg.com/htmx.org@2.0.4/dist/ext/json-enc.js"></script>
 </head>
 <body>
-  {% include "nav.html" %}
+  <main class="shell">
+    {% include "nav.html" %}
+    <h1 class="page-heading">SQL Editor</h1>
 
-  <main>
-    <h1>SQL Query Editor</h1>
-
-    <form hx-post="/api/v1/sql" hx-target="#results" hx-indicator="#spinner" hx-ext="json-enc">
-      <textarea name="query" rows="8" cols="80" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
-      <br>
-      <button type="submit">Run Query</button>
-      <span id="spinner" class="htmx-indicator">Running...</span>
+    <form class="sql-form" hx-post="/api/v1/sql" hx-target="#results" hx-indicator="#spinner" hx-ext="json-enc">
+      <textarea name="query" rows="8" placeholder="SELECT * FROM ...">SELECT 1 AS col</textarea>
+      <div class="toolbar">
+        <button type="submit" class="btn">Run Query</button>
+        <span id="spinner" class="htmx-indicator">Running&hellip;</span>
+      </div>
     </form>
 
     <div id="results">
-      <p>Submit a query to see results.</p>
+      <div class="empty">Submit a query to see results.</div>
     </div>
   </main>
 
   <template id="result-template">
-    <table>
-      <thead>
-        <tr></tr>
-      </thead>
-      <tbody></tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead><tr></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
     <p class="meta"></p>
   </template>
 
@@ -41,10 +41,7 @@
       if (evt.detail.target && evt.detail.target.id === 'results') {
         try {
           var data = JSON.parse(evt.detail.xhr.responseText);
-        } catch(e) {
-          // not JSON, let htmx handle normally
-          return;
-        }
+        } catch(e) { return; }
         evt.detail.shouldSwap = true;
         evt.detail.isError = false;
 
@@ -75,8 +72,7 @@
           tbody.appendChild(tr);
         });
 
-        var meta = clone.querySelector('p.meta');
-        meta.textContent = data.row_count + ' row(s) in ' + data.elapsed_ms + ' ms';
+        clone.querySelector('p.meta').textContent = data.row_count + ' row(s) in ' + data.elapsed_ms + ' ms';
 
         evt.detail.target.innerHTML = '';
         evt.detail.target.appendChild(clone);

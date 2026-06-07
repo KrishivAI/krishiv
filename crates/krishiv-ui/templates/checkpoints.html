@@ -3,24 +3,16 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Checkpoints · {{ job_id }} · Krishiv R2 Status</title>
+    <title>Checkpoints · {{ job_id }} · Krishiv</title>
     <link rel="stylesheet" href="/assets/krishiv.css">
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   </head>
   <body>
     <main class="shell">
-      <header class="topbar">
-        <div class="brand">
-          <strong>Checkpoints: {{ job_id }}</strong>
-          <span>{{ epochs.len() }} epoch{% if epochs.len() != 1 %}s{% endif %}</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <button class="theme-toggle" onclick="document.documentElement.style.colorScheme=document.documentElement.style.colorScheme==='dark'?'light':'dark'">🌓</button>
-        </div>
-      </header>
+      {% include "nav.html" %}
 
-      <div class="meta" style="margin-bottom:16px">
-        <a href="/ui">All jobs</a> · <a href="/ui/jobs/{{ job_id }}">{{ job_id }}</a> · Coordinator {{ coordinator_id }} is {{ coordinator_state }}
+      <div class="breadcrumb">
+        <a href="/ui">Jobs</a><span class="sep">/</span><a href="/ui/jobs/{{ job_id }}">{{ job_id }}</a><span class="sep">/</span>Checkpoints
       </div>
 
       {% if epochs.len() == 0 %}
@@ -57,7 +49,7 @@
               {% for epoch in epochs %}
               <tr>
                 <td>{{ epoch }}</td>
-                <td>{% if self.is_latest(epoch) %}<span class="state committed">committed</span>{% else %}<span class="tag">historical</span>{% endif %}</td>
+                <td>{% if self.is_latest(epoch) %}<span class="state-dot committed">committed</span>{% else %}<span class="tag">historical</span>{% endif %}</td>
               </tr>
               {% endfor %}
             </tbody>

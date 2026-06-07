@@ -24,6 +24,7 @@ use krishiv_scheduler::{
     Coordinator, ExecutorRecord, JobDetailSnapshot, JobSnapshot, NamespaceQuotaSnapshot,
     ResourceUsage, SchedulerError, SharedCoordinator, StabilityMetrics,
 };
+use krishiv_scheduler::metrics::SchedulerMetrics;
 use serde::{Deserialize, Serialize};
 
 /// Shared UI result alias.
@@ -204,6 +205,7 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .route("/ui/submit", get(ui_submit))
         .route("/ui/health", get(ui_health))
+        .route("/ui/metrics", get(ui_metrics))
         .with_state(state.clone());
 
     let protected = if let Some(expected) = token {
@@ -245,7 +247,8 @@ pub fn embedded_router(state: UiState) -> Router {
         .route("/ui/jobs/{job_id}/checkpoints", get(ui_job_checkpoints_page))
         .route("/ui/executors/{executor_id}", get(ui_executor_detail))
         .route("/ui/submit", get(ui_submit))
-        .route("/ui/health", get(ui_health));
+        .route("/ui/health", get(ui_health))
+        .route("/ui/metrics", get(ui_metrics));
 
     let protected = if let Some(expected) = resolve_ui_token().as_deref() {
         let expected = expected.to_string();
@@ -632,6 +635,16 @@ impl HealthTemplate {
     }
 }
 
+#[derive(Template)]
+#[template(path = "metrics.html")]
+struct MetricsTemplate {
+    scheduler: SchedulerMetrics,
+    stability: StabilityMetrics,
+    jobs_count: usize,
+    executors_count: usize,
+    avg_duration_ms: u64,
+}
+
 #[derive(Serialize)]
 pub struct SqlQueryResponse {
     pub columns: Vec<String>,
@@ -816,6 +829,26 @@ async fn ui_health(State(state): State<UiState>) -> Result<Html<String>, UiError
             .iter()
             .map(JobSummaryView::from_snapshot)
             .collect(),
+    };
+    Ok(Html(template.render()?))
+}
+
+async fn ui_metrics(State(state): State<UiState>) -> Result<Html<String>, UiError> {
+    let coordinator = state.coordinator.read().await;
+    let snapshot = status_snapshot_inner(&coordinator);
+    let scheduler = krishiv_scheduler::metrics::scheduler_metrics();
+    let stability = coordinator.stability_metrics();
+    let avg = if scheduler.tasks_assigned_total > 0 {
+        scheduler.task_assignment_duration_ms_sum / scheduler.tasks_assigned_total
+    } else {
+        0
+    };
+    let template = MetricsTemplate {
+        scheduler,
+        stability,
+        jobs_count: snapshot.jobs.len(),
+        executors_count: snapshot.executors.len(),
+        avg_duration_ms: avg,
     };
     Ok(Html(template.render()?))
 }

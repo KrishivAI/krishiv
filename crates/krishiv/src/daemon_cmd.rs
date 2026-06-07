@@ -81,7 +81,9 @@ fn run_clusterd(args: &[String]) -> i32 {
 
 fn build_ui_http_factory() -> Option<Box<dyn FnOnce(SharedCoordinator) -> axum::Router<()> + Send>> {
     Some(Box::new(|shared: SharedCoordinator| {
-        let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared);
+        let engine = krishiv_sql::SqlEngine::new();
+        let ui_state = krishiv_ui::UiState::from_shared_coordinator(shared)
+            .with_sql_engine(engine);
         krishiv_ui::embedded_router(ui_state)
     }))
 }
