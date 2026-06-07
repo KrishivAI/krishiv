@@ -191,24 +191,22 @@ impl IcebergFsTable {
             move |(mut iter, rows_seen)| {
                 let row_limit = row_limit;
                 async move {
-                    loop {
-                        let Some(batch) = iter.next() else {
-                            return Ok::<_, LakehouseError>(None);
-                        };
-                        let n = batch.num_rows() as u64;
-                        let Some(limit) = row_limit else {
-                            return Ok(Some((batch, (iter, rows_seen + n))));
-                        };
-                        if rows_seen >= limit {
-                            return Ok(None);
-                        }
-                        let remaining = limit - rows_seen;
-                        if n <= remaining {
-                            return Ok(Some((batch, (iter, rows_seen + n))));
-                        } else {
-                            let take = remaining as usize;
-                            return Ok(Some((batch.slice(0, take), (iter, limit))));
-                        }
+                    let Some(batch) = iter.next() else {
+                        return Ok::<_, LakehouseError>(None);
+                    };
+                    let n = batch.num_rows() as u64;
+                    let Some(limit) = row_limit else {
+                        return Ok(Some((batch, (iter, rows_seen + n))));
+                    };
+                    if rows_seen >= limit {
+                        return Ok(None);
+                    }
+                    let remaining = limit - rows_seen;
+                    if n <= remaining {
+                        Ok(Some((batch, (iter, rows_seen + n))))
+                    } else {
+                        let take = remaining as usize;
+                        Ok(Some((batch.slice(0, take), (iter, limit))))
                     }
                 }
             },

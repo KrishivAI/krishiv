@@ -14,16 +14,16 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
+use catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
 use datafusion::dataframe::DataFrame as DataFusionDataFrame;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion::sql::sqlparser::{ast::visit_relations, dialect::GenericDialect, parser::Parser};
-use catalog::{InMemoryCatalog, datafusion_bridge::DataFusionCatalogBridge};
 
 use krishiv_optimizer::{CostModel, Optimizer};
 use krishiv_plan::{ExecutionKind, LogicalPlan, PlanNode};
 
-pub mod cep_sql;
 pub mod catalog;
+pub mod cep_sql;
 pub mod create_function_ddl;
 mod lakehouse;
 pub mod live_table;
@@ -45,9 +45,8 @@ pub use streaming::{ContinuousInputError, ContinuousTableInput};
 pub type SqlResult<T> = Result<T, SqlError>;
 
 /// Pinned stream of record batches with `String` error type.
-pub type SqlStream = std::pin::Pin<
-    Box<dyn futures::stream::Stream<Item = Result<RecordBatch, String>> + Send>,
->;
+pub type SqlStream =
+    std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, String>> + Send>>;
 
 // ── Plan cache (single-lock, race-free) ──────────────────────────────────────
 
@@ -1815,13 +1814,14 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_table_resolved_in_sql() {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use catalog::{
+        use crate::catalog::{
             CatalogField, FieldType, InMemoryCatalog, TableMetadata, TableSchema,
         };
         use std::sync::{Arc, RwLock};
+
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
 
         let catalog = Arc::new(RwLock::new(InMemoryCatalog::new()));
         let schema = TableSchema::new(vec![CatalogField::new("id", FieldType::Int64, false)]);

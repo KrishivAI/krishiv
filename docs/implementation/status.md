@@ -1,5 +1,56 @@
 # Krishiv Implementation Status
 
+## Crate consolidation: chaos / schema-registry / catalog merge (2026-06-07)
+
+Implemented a 3-step workspace crate-consolidation refactor to reduce the
+number of standalone crates with thin or overlapping responsibilities:
+
+1. **Removed `krishiv-chaos`**: folded its test suite into `krishiv-common`
+   as a `chaos_suite` module (no production code lived in the crate, only
+   chaos-testing harnesses/tests).
+2. **Merged `krishiv-schema-registry` into `krishiv-connectors`** as a
+   feature-gated `schema_registry` module (`feature = "schema-registry"`).
+   Updated `krishiv-connectors::cdc` to reference
+   `crate::schema_registry::{SchemaRegistryClient, RegistryFormat}`, and
+   `krishiv-python` now depends on `krishiv-connectors` with
+   `features = ["schema-registry"]` instead of the standalone crate
+   (`lakehouse.rs` references became `krishiv_connectors::schema_registry::*`).
+3. **Merged `krishiv-catalog` into `krishiv-sql`** as a `catalog` module
+   (including `catalog::iceberg_rest`). All internal `crate::X` references in
+   the moved module were rewritten to `super::X` (the module's old crate root
+   is now `krishiv_sql::catalog`, not `krishiv_sql`). `krishiv-python`
+   references became `krishiv_sql::catalog::*`.
+
+Removed both `krishiv-schema-registry` and `krishiv-catalog` crate
+directories and their workspace `members`/`default-members` entries; updated
+`docs/README.md` and `docs/architecture.md` crate tables/diagrams to reflect
+the new module locations.
+
+### Incidental fix
+While validating with `cargo clippy --workspace --all-targets`, found that
+`crates/krishiv-lakehouse/src/iceberg_fs.rs:194` (pre-existing, last touched
+2026-06-05, unrelated to this refactor) tripped `clippy::never_loop`
+(deny-by-default in the current toolchain): a `loop { ... }` whose every
+branch returned on the first iteration. Removed the redundant `loop`
+wrapper — this was blocking *any* `cargo clippy` run because
+`krishiv-lakehouse` is a transitive dependency of the merged crates.
+
+Validation:
+```bash
+cargo check --workspace
+cargo test -p krishiv-connectors --lib   # 126/126 passed (incl. schema_registry suite)
+cargo test -p krishiv-sql --lib          # 136/136 passed (incl. catalog suite + catalog_table_resolved_in_sql)
+cargo fmt --check                        # clean for all touched files
+cargo clippy -p krishiv-sql -p krishiv-connectors -p krishiv-common \
+  -p krishiv-python -p krishiv-lakehouse --all-targets   # clean — no new warnings in
+                                                          # catalog/schema_registry/chaos_suite/cdc paths
+```
+
+Next useful command: `cargo clippy --workspace --all-targets` (should now
+complete cleanly end-to-end with the lakehouse fix in place).
+
+---
+
 ## Roadmap Phase 5 (Testing) regression sweep — continued (2026-06-07)
 
 Continued implementing roadmap.md Phase 5 testing items 155-175 (regression
